@@ -85,6 +85,7 @@ struct NgramCorpusObj : public tvm::ffi::Object {
       const tvm::ffi::TensorView tree_mask_tv,
       int64_t bonus_topk,
       int64_t max_trie_depth,
+      double wide_bonus_ratio,
       const tvm::ffi::TensorView out_stats) {
     if (bonus_topk < 0 || max_trie_depth <= 0) {
       throw std::runtime_error("precompute_drafts_stateful received invalid bonus_topk or max_trie_depth");
@@ -115,7 +116,8 @@ struct NgramCorpusObj : public tvm::ffi::Object {
         draft_tokens,
         tree_mask,
         static_cast<size_t>(bonus_topk),
-        static_cast<size_t>(max_trie_depth));
+        static_cast<size_t>(max_trie_depth),
+        wide_bonus_ratio);
     if (out_stats.size(0) < 3) {
       throw std::runtime_error("out_stats buffer too small for precompute_drafts_stateful");
     }

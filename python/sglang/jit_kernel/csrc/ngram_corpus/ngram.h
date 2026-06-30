@@ -118,7 +118,8 @@ class Ngram {
       const std::vector<int32_t>& draft_tokens,
       const std::vector<uint8_t>& tree_mask,
       size_t bonus_topk,
-      size_t max_trie_depth);
+      size_t max_trie_depth,
+      double wide_bonus_ratio);
 
   SelectPrecomputedDraftsResult selectPrecomputedDrafts(
       const std::vector<int64_t>& state_ids,

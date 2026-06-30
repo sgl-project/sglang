@@ -705,6 +705,9 @@ class Envs:
 
     # Ngram
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+    # Fraction of early draft-tree tokens whose precompute bonus candidates use
+    # full bonus_topk.
+    SGLANG_NGRAM_PRECOMPUTE_WIDE_BONUS_RATIO = EnvFloat(0.5)
     # Log ngram precompute hit-rate stats every N forward steps; <=0 disables.
     SGLANG_LOG_NGRAM_PRECOMPUTE_STATS_INTERVAL = EnvInt(0)
 

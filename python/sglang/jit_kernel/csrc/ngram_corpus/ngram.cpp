@@ -2,6 +2,7 @@
 
 #include "trie.h"
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <limits>
 #include <stdexcept>
@@ -78,6 +79,17 @@ std::vector<int32_t> directChildTokens(
 
 bool containsToken(const std::vector<int32_t>& tokens, int32_t token) {
   return std::find(tokens.begin(), tokens.end(), token) != tokens.end();
+}
+
+size_t wideBonusTokenCount(size_t draft_token_num, double wide_bonus_ratio) {
+  if (draft_token_num == 0) {
+    return 0;
+  }
+  if (!std::isfinite(wide_bonus_ratio)) {
+    wide_bonus_ratio = 0.0;
+  }
+  const auto ratio = std::clamp(wide_bonus_ratio, 0.0, 1.0);
+  return std::min(draft_token_num, static_cast<size_t>(std::ceil(static_cast<double>(draft_token_num) * ratio)));
 }
 
 }  // namespace
@@ -349,7 +361,8 @@ PrecomputeDraftsStats Ngram::precomputeDrafts(
     const std::vector<int32_t>& draft_tokens,
     const std::vector<uint8_t>& tree_mask,
     size_t bonus_topk,
-    size_t max_trie_depth) {
+    size_t max_trie_depth,
+    double wide_bonus_ratio) {
   if (state_ids.size() != base_tokens.size() || state_ids.size() != base_total_lens.size()) {
     throw std::runtime_error("precomputeDrafts expects state_ids, base_tokens, and base_total_lens to match in size");
   }
@@ -365,9 +378,10 @@ PrecomputeDraftsStats Ngram::precomputeDrafts(
   std::unique_lock<std::mutex> lock(mutex_);
   precomputed_cache_.clear();
   precomputed_bonus_candidates_.clear();
-  const auto max_phase2_entries = bs * (bonus_topk + d);
+  const auto wide_bonus_token_count = wideBonusTokenCount(d, wide_bonus_ratio);
+  const auto max_phase2_entries = bs * (wide_bonus_token_count * bonus_topk + (d - wide_bonus_token_count));
   precomputed_cache_.reserve(max_phase2_entries);
-  precomputed_bonus_candidates_.reserve(bs * d);
+  precomputed_bonus_candidates_.reserve(bs);
 
   struct Phase2Entry {
     int64_t state_id;
@@ -417,8 +431,7 @@ PrecomputeDraftsStats Ngram::precomputeDrafts(
       auto current_child_tokens = directChildTokens(req_draft_tokens, tree_mask, row_mask_offset, d, node);
       std::unordered_set<int32_t> seen_bonus;
       std::vector<int32_t> path_bonus_candidates;
-      // Keep root wide for bonus-token accuracy; keep non-root narrow to avoid path * bonus combinatorial blow-up.
-      const size_t path_bonus_topk = path_cols.size() == 1 ? bonus_topk : std::min<size_t>(bonus_topk, 1);
+      const auto path_bonus_topk = node < wide_bonus_token_count ? bonus_topk : std::min<size_t>(bonus_topk, 1);
       if (path_bonus_topk == 0) {
         continue;
       }
@@ -447,7 +460,7 @@ PrecomputeDraftsStats Ngram::precomputeDrafts(
         }
       }
 
-      if (!path_bonus_candidates.empty()) {
+      if (!path_bonus_candidates.empty() && path_cols.size() == 1) {
         precomputed_bonus_candidates_[PathKey{state_id, path_cols}] = std::move(path_bonus_candidates);
       }
     }
@@ -526,17 +539,12 @@ SelectPrecomputedDraftsResult Ngram::selectPrecomputedDrafts(
     }
 
     const auto bonus_token = accept_tokens[i * d + static_cast<size_t>(accept_len - 1)];
-    const PathKey path_key{state_ids[i], path_cols};
-    auto bonus_iter = precomputed_bonus_candidates_.find(path_key);
-    if (bonus_iter != precomputed_bonus_candidates_.end() && containsToken(bonus_iter->second, bonus_token)) {
-      out.bonus_prediction_hit[i] = 1;
-      ++out.bonus_prediction_hit_ct;
-    }
-
     const PathBonusKey cache_key{state_ids[i], path_cols, bonus_token};
     auto cache_iter = precomputed_cache_.find(cache_key);
     if (cache_iter != precomputed_cache_.end()) {
+      out.bonus_prediction_hit[i] = 1;
       out.precomputed_cache_hit[i] = 1;
+      ++out.bonus_prediction_hit_ct;
       ++out.precomputed_cache_hit_ct;
       std::copy(cache_iter->second.token.begin(), cache_iter->second.token.end(), out.result.token.begin() + i * d);
       std::copy(cache_iter->second.mask.begin(), cache_iter->second.mask.end(), out.result.mask.begin() + i * d * d);

@@ -340,7 +340,6 @@ std::vector<int32_t> Trie::getRootCandidatesRecency(
   auto anchors = match(context, len, state, total_len);
   candidates.reserve(max_candidates);
   std::unordered_set<int32_t> seen_tokens;
-  std::queue<const TrieNode*> fallback_queue;
 
   auto add_candidate = [&candidates, &seen_tokens, max_candidates](int32_t token) -> bool {
     if (seen_tokens.insert(token).second) {
@@ -355,21 +354,6 @@ std::vector<int32_t> Trie::getRootCandidatesRecency(
       if (add_candidate(child->token)) {
         return candidates;
       }
-      fallback_queue.emplace(child);
-    }
-  }
-
-  while (!fallback_queue.empty() && candidates.size() < max_candidates) {
-    const auto node = fallback_queue.front();
-    fallback_queue.pop();
-
-    size_t scanned = 0;
-    for (auto iter = node->lru.begin();
-         iter != node->lru.end() && scanned < param.max_bfs_breadth && candidates.size() < max_candidates;
-         ++iter, ++scanned) {
-      const auto child = *iter;
-      add_candidate(child->token);
-      fallback_queue.emplace(child);
     }
   }
 
@@ -387,7 +371,6 @@ std::vector<int32_t> Trie::getRootCandidatesFrequency(
   auto anchors = match(context, len, state, total_len);
   candidates.reserve(max_candidates);
   std::unordered_set<int32_t> seen_tokens;
-  std::queue<const TrieNode*> fallback_queue;
 
   auto add_candidate = [&candidates, &seen_tokens, max_candidates](int32_t token) -> bool {
     if (seen_tokens.insert(token).second) {
@@ -401,21 +384,6 @@ std::vector<int32_t> Trie::getRootCandidatesFrequency(
       if (add_candidate(child->token)) {
         return candidates;
       }
-      fallback_queue.emplace(child);
-    }
-  }
-
-  while (!fallback_queue.empty() && candidates.size() < max_candidates) {
-    const auto node = fallback_queue.front();
-    fallback_queue.pop();
-
-    size_t scanned = 0;
-    for (auto* child : node->sorted_children) {
-      if (scanned++ >= param.max_bfs_breadth || candidates.size() >= max_candidates) {
-        break;
-      }
-      add_candidate(child->token);
-      fallback_queue.emplace(child);
     }
   }
 

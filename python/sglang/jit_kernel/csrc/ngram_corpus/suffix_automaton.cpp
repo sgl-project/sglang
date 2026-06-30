@@ -291,7 +291,6 @@ std::vector<int32_t> SuffixAutomaton::getRootCandidatesRecency(
   auto anchors = match(context, len, param.max_trie_depth);
   candidates.reserve(max_candidates);
   std::unordered_set<int32_t> seen_tokens;
-  std::queue<int> fallback_queue;
 
   auto add_candidate = [&candidates, &seen_tokens, max_candidates](int32_t token) -> bool {
     if (seen_tokens.insert(token).second) {
@@ -306,22 +305,6 @@ std::vector<int32_t> SuffixAutomaton::getRootCandidatesRecency(
       if (add_candidate(token)) {
         return candidates;
       }
-      fallback_queue.emplace(child_state);
-    }
-  }
-
-  while (!fallback_queue.empty() && candidates.size() < max_candidates) {
-    const auto state = fallback_queue.front();
-    fallback_queue.pop();
-
-    const auto& children = states_[state].children_by_recency;
-    size_t scanned = 0;
-    for (const auto& [token, child_state] : children) {
-      if (scanned++ >= param.max_bfs_breadth || candidates.size() >= max_candidates) {
-        break;
-      }
-      add_candidate(token);
-      fallback_queue.emplace(child_state);
     }
   }
 
@@ -338,7 +321,6 @@ std::vector<int32_t> SuffixAutomaton::getRootCandidatesFrequency(
   auto anchors = match(context, len, param.max_trie_depth);
   candidates.reserve(max_candidates);
   std::unordered_set<int32_t> seen_tokens;
-  std::queue<int> fallback_queue;
 
   auto add_candidate = [&candidates, &seen_tokens, max_candidates](int32_t token) -> bool {
     if (seen_tokens.insert(token).second) {
@@ -353,22 +335,6 @@ std::vector<int32_t> SuffixAutomaton::getRootCandidatesFrequency(
       if (add_candidate(token)) {
         return candidates;
       }
-      fallback_queue.emplace(child_state);
-    }
-  }
-
-  while (!fallback_queue.empty() && candidates.size() < max_candidates) {
-    const auto state = fallback_queue.front();
-    fallback_queue.pop();
-
-    const auto& children = states_[state].children_by_freq;
-    size_t scanned = 0;
-    for (const auto& [token, child_state] : children) {
-      if (scanned++ >= param.max_bfs_breadth || candidates.size() >= max_candidates) {
-        break;
-      }
-      add_candidate(token);
-      fallback_queue.emplace(child_state);
     }
   }
 

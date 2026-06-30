@@ -106,6 +106,7 @@ def get_ngram_corpus_cls():
             tree_mask,
             bonus_topk: int,
             max_trie_depth: int,
+            wide_bonus_ratio: float = 0.5,
         ) -> Tuple[int, int, int]:
             tokens_flat, offsets = _to_csr(base_tokens)
             state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
@@ -123,6 +124,7 @@ def get_ngram_corpus_cls():
                 tree_mask_t,
                 bonus_topk,
                 max_trie_depth,
+                wide_bonus_ratio,
                 out_stats,
             )
             stats = out_stats.numpy().astype(np.int64).tolist()

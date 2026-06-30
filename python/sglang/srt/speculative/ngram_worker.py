@@ -67,6 +67,20 @@ class NGRAMWorker(BaseSpecWorker):
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.precompute_bonus_topk = max(1, self.draft_token_num)
+        self.precompute_wide_bonus_ratio = (
+            envs.SGLANG_NGRAM_PRECOMPUTE_WIDE_BONUS_RATIO.get()
+        )
+        if (
+            self.precompute_wide_bonus_ratio < 0.0
+            or self.precompute_wide_bonus_ratio > 1.0
+        ):
+            logger.warning(
+                "Clamping SGLANG_NGRAM_PRECOMPUTE_WIDE_BONUS_RATIO=%s to [0, 1].",
+                self.precompute_wide_bonus_ratio,
+            )
+            self.precompute_wide_bonus_ratio = min(
+                1.0, max(0.0, self.precompute_wide_bonus_ratio)
+            )
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         # req_to_token_pool / token_to_kv_pool_allocator are set in
@@ -700,6 +714,7 @@ class NGRAMWorker(BaseSpecWorker):
                 cur_tree_mask,
                 self.precompute_bonus_topk,
                 self.max_trie_depth,
+                self.precompute_wide_bonus_ratio,
             )
         )
 

@@ -139,6 +139,7 @@ class NgramCorpus:
         tree_mask,
         bonus_topk: int,
         max_trie_depth: int,
+        wide_bonus_ratio: float = 0.5,
     ) -> Tuple[int, int, int]:
         state_ids = [self._get_state_id(rid) for rid in req_ids]
         return self._obj.precompute_drafts_stateful_wrapper(
@@ -149,6 +150,7 @@ class NgramCorpus:
             tree_mask,
             bonus_topk,
             max_trie_depth,
+            wide_bonus_ratio,
         )
 
     def precomputed_root_bonus_tokens(self, req_ids: List[str]) -> List[int]:

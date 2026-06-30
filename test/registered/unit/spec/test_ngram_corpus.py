@@ -760,6 +760,28 @@ class TestNgramCorpusPrecomputeConsistency(CustomTestCase):
             max_trie_depth,
         )
         self.assertGreaterEqual(stats[2], bs)
+        root_only_stats = corpus.precompute_drafts(
+            req_ids,
+            base_tokens,
+            base_total_lens,
+            current_drafts,
+            current_masks,
+            bonus_topk,
+            max_trie_depth,
+            1.0 / draft_token_num,
+        )
+        wide_bonus_stats = corpus.precompute_drafts(
+            req_ids,
+            base_tokens,
+            base_total_lens,
+            current_drafts,
+            current_masks,
+            bonus_topk,
+            max_trie_depth,
+            0.5,
+        )
+        self.assertGreater(wide_bonus_stats[1], root_only_stats[1])
+        self.assertGreater(wide_bonus_stats[2], root_only_stats[2])
         root_bonus_tokens = corpus.precomputed_root_bonus_tokens(req_ids)
         self.assertTrue(
             all(token >= 0 for token in root_bonus_tokens),
@@ -1118,6 +1140,9 @@ class TestNgramCorpusPrecomputePerf(CustomTestCase):
         max_trie_depth = int(os.getenv("NGRAM_PRECOMPUTE_PERF_MAX_DEPTH", "18"))
         repeats = int(os.getenv("NGRAM_PRECOMPUTE_PERF_REPEATS", "20"))
         precompute_repeats = int(os.getenv("NGRAM_PRECOMPUTE_PERF_PRE_REPEATS", "5"))
+        wide_bonus_ratio = float(
+            os.getenv("NGRAM_PRECOMPUTE_PERF_WIDE_BONUS_RATIO", "0.5")
+        )
         batch_sizes = self._parse_int_list_env(
             "NGRAM_PRECOMPUTE_PERF_BATCH_SIZES",
             [1, 8, 32, 128],
@@ -1129,7 +1154,8 @@ class TestNgramCorpusPrecomputePerf(CustomTestCase):
         print(
             "\nNgram precompute perf "
             f"(draft={draft_token_num}, max_depth={max_trie_depth}, "
-            f"select_repeats={repeats}, precompute_repeats={precompute_repeats})"
+            f"select_repeats={repeats}, precompute_repeats={precompute_repeats}, "
+            f"wide_bonus_ratio={wide_bonus_ratio})"
         )
         for bs in batch_sizes:
             req_ids = [f"precompute-perf-bs{bs}-{i}" for i in range(bs)]
@@ -1151,6 +1177,7 @@ class TestNgramCorpusPrecomputePerf(CustomTestCase):
                     tree_mask,
                     draft_token_num,
                     max_trie_depth,
+                    wide_bonus_ratio,
                 ),
                 precompute_repeats,
             )
