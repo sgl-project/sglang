@@ -725,6 +725,9 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
                     "model.language_model.layers.0.linear_attn.in_proj_z": {
                         "quant_algo": "FP8"
                     },
+                    "model.language_model.layers.0.linear_attn.out_proj": {
+                        "quant_algo": "FP8"
+                    },
                     "model.language_model.layers.0.mlp.experts": {
                         "quant_algo": "NVFP4",
                         "group_size": 16,
@@ -762,6 +765,12 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         )
         self.assertEqual(
             quant_config._resolve_quant_algo(
+                "model.language_model.layers.0.linear_attn.out_proj"
+            ),
+            "FP8",
+        )
+        self.assertEqual(
+            quant_config._resolve_quant_algo(
                 "model.language_model.layers.0.mlp.experts"
             ),
             "NVFP4",
@@ -783,6 +792,17 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
                 "model.language_model.layers.0.linear_attn.in_proj_ba"
             )
         )
+        self.assertIsNone(
+            quant_config._resolve_quant_algo(
+                "model.language_model.layers.0.linear_attn.conv1d"
+            )
+        )
+        self.assertIsNone(
+            quant_config._resolve_quant_algo(
+                "model.language_model.layers.0.mlp.gate"
+            )
+        )
+        self.assertIsNone(quant_config._resolve_quant_algo("model.visual.blocks.0"))
         self.assertIsNone(quant_config._resolve_quant_algo("lm_head"))
         self.assertIsNone(
             quant_config._resolve_quant_algo("mtp.layers.0.mlp.experts")

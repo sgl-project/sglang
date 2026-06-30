@@ -1156,7 +1156,9 @@ class ModelConfig:
         quant_algo = json_quant_configs.get("quant_algo", None)
 
         if quant_algo == "MIXED_PRECISION":
-            quantized_layers = json_quant_configs.get("quantized_layers", {})
+            # MIXED_PRECISION is also used by legacy W4A8 checkpoints. ModelOpt
+            # mixed checkpoints identify their NVFP4 modules in the layer map.
+            quantized_layers = json_quant_configs.get("quantized_layers") or {}
             has_modelopt_nvfp4_layers = any(
                 str(layer_info.get("quant_algo", "")).upper() == "NVFP4"
                 for layer_info in quantized_layers.values()
