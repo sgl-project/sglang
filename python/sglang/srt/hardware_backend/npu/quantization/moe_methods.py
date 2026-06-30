@@ -381,18 +381,24 @@ class NPUW8A8Mxfp8MoEMethod(_NPUMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
 
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")   # [E, N, K]
-        scale: torch.Tensor = getattr(layer, f"{weight_prefix}_weight_scale")  # [E, N, groups]
+        scale: torch.Tensor = getattr(layer, f"{weight_prefix}_weight_scale")  # [E, N, num_groups ]
 
         # 1) Weight: transpose to [E, K, N]
         weight.data = weight.data.transpose(1, 2).contiguous()
 
-        # 2) Scale: pad if number of groups is odd, then pack into [E, groups//2, N, 2]
-        groups = scale.shape[-1]
-        if groups % 2 != 0:
+        # 2) Scale: pad if number of num_groups is odd, then pack into [E, num_groups //2, N, 2]
+        num_groups = scale.shape[-1]
+        expected_groups = weight.shape[-1] // self.group_size
+        if num_groups != expected_groups:
+            logger.warning(
+                f"Scale group count {num_groups} does not match expected {expected_groups} "
+                f"for group_size={self.group_size}. The weight layout may be incorrect."
+            )
+        if num_groups  % 2 != 0:
             scale = torch.nn.functional.pad(scale, (0, 1))
-            groups += 1
-        scale.data = scale.data.reshape(scale.shape[0], scale.shape[1], groups // 2, 2)
-        # transpose: [E, N, groups//2, 2] -> [E, groups//2, N, 2]
+            num_groups  += 1
+        scale.data = scale.data.reshape(scale.shape[0], scale.shape[1], num_groups  // 2, 2)
+        # transpose: [E, N, num_groups //2, 2] -> [E, num_groups //2, N, 2]
         scale.data = scale.data.transpose(1, 2).contiguous()
 
         setattr(
