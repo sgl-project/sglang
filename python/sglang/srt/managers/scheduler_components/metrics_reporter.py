@@ -189,7 +189,7 @@ class SchedulerMetricsReporter:
     def _init_fpm(self):
         """Initialize Forward Pass Metrics (FPM) publisher if configured.
 
-        Normally FPM is published only by the real FPM rank (attn_tp_rank == 0 on
+        Normally FPM is published only by the real FPM rank (attention TP0/CP0 on
         the last pp_rank). The self-benchmark, however, drives its sweep off
         observe_forward_pass, which only fires when enable_fpm is True. Since the
         benchmark is built and advances on EVERY rank, we force FPM on for the
@@ -201,6 +201,7 @@ class SchedulerMetricsReporter:
         is_fpm_rank = (
             self.scheduler.server_args.enable_forward_pass_metrics
             and self.scheduler.ps.attn_tp_rank == 0
+            and self.scheduler.ps.attn_cp_rank == 0
             and self.scheduler.ps.pp_rank == self.scheduler.ps.pp_size - 1
         )
         benchmark_forces_fpm = (
