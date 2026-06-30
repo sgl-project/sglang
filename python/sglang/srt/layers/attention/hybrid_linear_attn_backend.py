@@ -35,7 +35,9 @@ class MambaAttnBackendBase(AttentionBackend):
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        self.enable_unified_memory_pool = model_runner.enable_unified_memory_pool
+        self.enable_unified_memory_pool = (
+            get_global_server_args().enable_unified_memory_pool
+        )
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
         # Radix-prefix-cache mamba track DESTINATION slots. A SINGLE backend-owned
