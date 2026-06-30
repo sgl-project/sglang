@@ -1287,6 +1287,41 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(m.device_indices), len(seq))
         tree.sanity_check()
 
+    def test_swa_insert_keeps_full_leaf_when_entire_span_is_outside_window(self):
+        # A leaf survives on its Full value alone: even when the whole span is
+        # past the SWA window (swa_evicted_seqlen >= total), the Full leaf must
+        # be materialized (and the Full KV kept) so the prefix stays cacheable.
+        # Runs across all SWA configs, including page_size > sliding_window_size
+        # (the dsv4-style edge case).
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        tree, allocator, _ = build_fixture(self.cfg)
+
+        tokens = self._make_seq(1, 2)
+        value = self._alloc(allocator, len(tokens))
+        if value is None:
+            self.skipTest("insufficient pool for this config")
+        full_available_before = allocator.full_attn_allocator.available_size()
+
+        tree.insert(
+            InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=value,
+                prev_prefix_len=0,
+                swa_evicted_seqlen=len(tokens),
+            )
+        )
+
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(), full_available_before
+        )
+        node = next(iter(tree.root_node.children.values()))
+        self.assertTrue(
+            torch.equal(node.component_data[ComponentType.FULL].value, value)
+        )
+        self.assertIsNone(node.component_data[ComponentType.SWA].value)
+        tree.sanity_check()
+
     def test_swa_evict_cascades(self):
         """Evict SWA tokens via swa_num_tokens — cascades to lower-priority components."""
         if not self.cfg.has_swa:
