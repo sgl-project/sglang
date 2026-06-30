@@ -40,6 +40,19 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     return get_tp_group().fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps)
 
 
+def tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    emit_bf16: bool = False,
+):
+    """Fused TP all-reduce + RMSNorm + MXFP4 quant."""
+    return get_tp_group().fused_allreduce_rmsnorm_mxfp4_quant(
+        input_, residual_inp_, weight_, eps, emit_bf16=emit_bf16
+    )
+
+
 def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
     input_: torch.Tensor,
     residual_inp_: torch.Tensor,
@@ -63,6 +76,22 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
     )
 
 
+def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+) -> Optional[Tuple[torch.Tensor, ...]]:
+    """Fused TP all-reduce + RMSNorm + per-token FP8 quant in a single kernel.
+
+    Returns ``(fp8_output, residual_out, per_token_scale)`` with
+    ``per_token_scale`` shaped ``(M, 1)``, or ``None`` when the backend cannot
+    service the request. Callers MUST handle ``None`` by falling back to the
+    fused-AR-RMSNorm + separate per-token-quant path.
+    """
+    return get_tp_group().fused_allreduce_rmsnorm_quant_per_token(
+        input_, residual_inp_, weight_, eps
+    )
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:

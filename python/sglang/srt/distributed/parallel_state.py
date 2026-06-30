@@ -82,6 +82,16 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 
 
+def _should_use_1stage_mxfp4_ar(input_: torch.Tensor) -> bool:
+    tokens, hidden_size = input_.shape
+    if hidden_size == 7168:
+        # CUDA-graph microbench: direct MXFP4 epilogue is faster through 56
+        # tokens, while fallback wins from 64 tokens onward.
+        return tokens <= 56
+    total_bytes = input_.numel() * input_.element_size()
+    return total_bytes <= 128 * 1024
+
+
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
         return None
@@ -736,6 +746,38 @@ class GroupCoordinator:
         )
         return fused_outputs
 
+    def fused_allreduce_rmsnorm_mxfp4_quant(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        emit_bf16: bool = False,
+    ):
+        """Attempt fused all-reduce + RMSNorm + MXFP4 quant via AITER custom AR."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+        if not hasattr(ca_comm, "custom_fused_ar_rms_mxfp4_quant"):
+            return None
+
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        else:
+            use_1stage_ar = _should_use_1stage_mxfp4_ar(input_)
+
+        try:
+            return ca_comm.custom_fused_ar_rms_mxfp4_quant(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                use_1stage_ar,
+                emit_bf16=emit_bf16,
+            )
+        except Exception:
+            return None
+
     def fused_allreduce_rmsnorm_quant_per_group(
         self,
         input_: torch.Tensor,
@@ -807,6 +849,62 @@ class GroupCoordinator:
         except Exception:
             return None
 
+
+    def fused_allreduce_rmsnorm_quant_per_token(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> Optional[Tuple[torch.Tensor, ...]]:
+        """Attempt fused all-reduce + RMSNorm + per-token FP8 quant in ONE kernel.
+
+        ROCm/aiter/gfx95-only entry point backed by the aiter custom-all-reduce
+        ``custom_fused_ar_rms_quant`` (``post_per_token_quant=True``). Returns
+        ``(fp8, residual_out, per_token_scale)`` with ``per_token_scale`` shaped
+        ``(M, 1)``, or ``None`` when the backend cannot service the request so
+        the caller can fall back to the ``fused_allreduce_rmsnorm`` + separate
+        per-token-quant path.
+
+        Unlike the per-group entry point this kernel does not emit a bf16
+        sidecar, so GDN-style layers that need an unquantized normed output must
+        use the 2-kernel fallback.
+        """
+        if not (is_hip() and is_gfx95_supported()):
+            return None
+
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+        if not hasattr(ca_comm, "custom_fused_ar_rms_quant"):
+            return None
+
+        # Mirror the per-group eligibility gate so we fail fast without entering
+        # the HIP kernel dispatch.
+        K = input_.shape[-1]
+        if K > 16384:
+            return None
+        total_bytes = input_.numel() * input_.element_size()
+        if total_bytes == 0 or total_bytes > 8 * 1024 * 8192:
+            return None
+        if self.world_size == 6:
+            return None
+
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        else:
+            use_1stage_ar = total_bytes <= 128 * 1024
+
+        try:
+            return ca_comm.custom_fused_ar_rms_quant(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                use_1stage_ar,
+            )
+        except Exception:
+            return None
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
     ) -> torch.Tensor:

@@ -95,6 +95,7 @@ if _is_cuda or _is_xpu or _is_musa:
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
 _aiter_per_1x128_quant = None
+_aiter_per_token_quant = None
 _aiter_fp8_dtype = None
 _use_aiter_bpreshuffle_gfx95 = False
 if _use_aiter:
@@ -111,6 +112,9 @@ if _use_aiter:
     # keep_bf16 fallback path in ``_forward_with_allreduce_fusion_quant_per_group``
     # does not re-import aiter on every forward.
     _aiter_per_1x128_quant = _aiter.get_hip_quant(_aiter.QuantType.per_1x128)
+    # Per-token HIP quant functor for the fused AR+RMSNorm+per-token-FP8-quant
+    # path. Cached so the fallback path does not re-import aiter every forward.
+    _aiter_per_token_quant = _aiter.get_hip_quant(_aiter.QuantType.per_Token)
     _aiter_fp8_dtype = _aiter.dtypes.fp8
 
     _has_aiter_layer_norm = True  # aiter provides the layer_norm functions
@@ -330,6 +334,95 @@ def _forward_with_allreduce_fusion_quant_per_group(
         transpose_scale=_use_aiter_bpreshuffle_gfx95,
     )
     return (bf16_out, fp8_out, scale_out), residual_out
+
+
+def _forward_with_allreduce_fusion_quant_per_token(
+    norm_module,
+    x: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    weight: torch.Tensor,
+    use_attn_tp_group: bool = True,
+    keep_bf16: bool = False,
+):
+    """Fused AR + RMSNorm + per-token FP8 quant (ROCm/aiter path).
+
+    This is the per-token counterpart of
+    ``_forward_with_allreduce_fusion_quant_per_group``. It targets FP8 GEMM
+    consumers that expect per-token (1xK) activation scales — e.g. attention
+    ``qkv_proj`` / GDN ``in_proj_qkvz`` prepared with
+    ``SGLANG_USE_AITER_FP8_PER_TOKEN`` — for which the per-1x128 group scales
+    produced by the per-group path would be the wrong layout.
+
+    Returns one of:
+
+    * ``((fp8, scale), residual)``        when ``keep_bf16=False``
+    * ``((bf16, fp8, scale), residual)``  when ``keep_bf16=True``
+    * ``None``                            when no fused path is available
+
+    Uses the single-kernel aiter ``custom_fused_ar_rms_quant``
+    (``post_per_token_quant=True``) when possible, collapsing AR+RMSNorm and the
+    per-token quant into one launch. Falls back to a 2-kernel path (fused
+    AR+RMSNorm + separate per-token quant) when the single kernel declines the
+    shape or when ``keep_bf16=True`` (the single kernel emits no bf16 sidecar).
+    ``scale`` is always returned with shape ``(M, 1)`` to match the per-token
+    a8w8 GEMM.
+
+    ``keep_bf16`` mirrors the per-group helper: GDN layers need the
+    unquantized bf16 normed output for the small ``in_proj_ba`` projection in
+    addition to ``(fp8, scale)`` for the FP8 ``in_proj_qkvz``.
+    """
+    if residual is None or not _use_aiter or _aiter_per_token_quant is None:
+        return None
+
+    from sglang.srt.distributed import (
+        get_attn_tensor_model_parallel_world_size,
+        get_moe_expert_parallel_world_size,
+        get_moe_tensor_parallel_world_size,
+        tensor_model_parallel_fused_allreduce_rmsnorm,
+        tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token,
+    )
+
+    if use_attn_tp_group:
+        world_size = get_attn_tensor_model_parallel_world_size()
+    else:
+        if get_moe_expert_parallel_world_size() > 1:
+            world_size = get_moe_expert_parallel_world_size()
+        else:
+            world_size = get_moe_tensor_parallel_world_size()
+    if world_size <= 1:
+        return None
+
+    # Preferred: single fused AR+RMSNorm+per-token-quant kernel (collapses the
+    # AR+RMSNorm and the standalone per-token quant launches into one). The
+    # single kernel does not emit a bf16 sidecar, so it only serves the
+    # keep_bf16=False case (e.g. attention qkv_proj, or GDN when in_proj_ba is
+    # also quantized). keep_bf16=True (GDN bf16 gating consumer) uses the
+    # 2-kernel fallback below.
+    if not keep_bf16:
+        result = tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token(
+            x, residual, weight, norm_module.variance_epsilon
+        )
+        if result is not None:
+            fp8_out, residual_out, scale_out = result
+            if scale_out.dim() == 1:
+                scale_out = scale_out.view(-1, 1)
+            return (fp8_out, scale_out), residual_out
+
+    # Fallback: fused AR+RMSNorm then a separate per-token quant. Still removes
+    # the standalone all-reduce vs. unfused, and is the only path able to emit
+    # the bf16 sidecar required when keep_bf16=True.
+    fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
+        x, residual, weight, norm_module.variance_epsilon
+    )
+    if fused_result is None:
+        return None
+    bf16_out, residual_out = fused_result
+    fp8_out, scale_out = _aiter_per_token_quant(bf16_out, quant_dtype=_aiter_fp8_dtype)
+    if scale_out.dim() == 1:
+        scale_out = scale_out.view(-1, 1)
+    if keep_bf16:
+        return (bf16_out, fp8_out, scale_out), residual_out
+    return (fp8_out, scale_out), residual_out
 
 
 class RMSNorm(MultiPlatformOp):
@@ -711,6 +804,24 @@ class RMSNorm(MultiPlatformOp):
             self, x, residual, self.weight, group_size, use_attn_tp_group, keep_bf16
         )
 
+    def forward_with_allreduce_fusion_quant_per_token(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        use_attn_tp_group: bool = True,
+        keep_bf16: bool = False,
+    ):
+        """Fused AR + RMSNorm + per-token FP8 quant (ROCm/aiter path).
+
+        Returns ``((fp8, scale), residual)`` when ``keep_bf16=False``;
+        ``((bf16, fp8, scale), residual)`` when ``keep_bf16=True``; or ``None``
+        when no fused path is available (caller falls back to the plain fused
+        AR+RMSNorm path).
+        """
+        return _forward_with_allreduce_fusion_quant_per_token(
+            self, x, residual, self.weight, use_attn_tp_group, keep_bf16
+        )
+
 
 class LayerNorm(MultiPlatformOp):
     def __init__(
@@ -988,6 +1099,23 @@ class GemmaRMSNorm(MultiPlatformOp):
             residual,
             self.gemma_weight,
             group_size,
+            use_attn_tp_group,
+            keep_bf16,
+        )
+
+    def forward_with_allreduce_fusion_quant_per_token(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        use_attn_tp_group: bool = True,
+        keep_bf16: bool = False,
+    ):
+        """Fused AR + RMSNorm + per-token FP8 quant (Gemma-style: weight + 1)."""
+        return _forward_with_allreduce_fusion_quant_per_token(
+            self,
+            x,
+            residual,
+            self.gemma_weight,
             use_attn_tp_group,
             keep_bf16,
         )
