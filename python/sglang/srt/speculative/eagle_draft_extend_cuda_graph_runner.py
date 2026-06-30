@@ -220,12 +220,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             else:
                 vocab_size = self.model_runner.model_config.vocab_size
 
-            next_token_logits_buffer = torch.zeros(
-                (
-                    self.max_bs * self.num_tokens_per_bs,
-                    vocab_size,
-                ),
-                dtype=torch.float,
+            next_token_logits_buffer = (
+                self.model_runner.graph_shared_output.get_logits_buffer(
+                    vocab_size, rows=self.max_bs * self.num_tokens_per_bs
+                )
             )
 
         seq_lens_cpu = torch.full(
