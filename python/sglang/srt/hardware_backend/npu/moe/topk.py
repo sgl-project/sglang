@@ -5,8 +5,11 @@ from sgl_kernel_npu.norm.l1_norm import l1_norm
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
-from sglang.srt.layers.moe.topk import StandardTopKOutput, select_experts
-from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    capture_routed_experts_if_allowed,
+    select_experts,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -41,6 +44,26 @@ def fused_topk_npu(
             )
         topk_weights = topk_weights.to(torch.float32)
 
+    # sqrtsoftplus (DSV4 noaux_tc): the NPU op only scores sigmoid/softmax, so use
+    # a torch path. top-k over (scores + bias); weights from un-biased scores.
+    elif topk_config.scoring_func == "sqrtsoftplus":
+        scores = torch.nn.functional.softplus(router_logits.float()).sqrt()
+        scores_for_choice = (
+            scores + correction_bias.unsqueeze(0).float()
+            if correction_bias is not None
+            else scores
+        )
+        _, topk_ids = torch.topk(
+            scores_for_choice, k=topk_config.top_k, dim=-1, sorted=False
+        )
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights = scores.gather(1, topk_ids)
+        if renormalize:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        else:
+            topk_weights = topk_weights * topk_config.routed_scaling_factor
+        topk_weights = topk_weights.to(torch.float32)
+
     # Support grouped top-k or correction bias or sigmoid or routed_scaling_factor
     elif (
         correction_bias is not None
@@ -60,12 +83,14 @@ def fused_topk_npu(
             group_count=topk_config.num_expert_group if use_grouped_topk else 1,
             group_select_mode=(1 if use_grouped_topk else 0),
             renorm=0,
-            norm_type=1,  # 1 for sigmoid, 0 for softmax
+            # 1 for sigmoid, 0 for softmax
+            norm_type=(0 if topk_config.scoring_func == "softmax" else 1),
             routed_scaling_factor=(
                 1 if renormalize else topk_config.routed_scaling_factor
             ),
             eps=float(1e-20),
         )
+        topk_weights = topk_weights.to(torch.float32)
 
     # torch native is not yet supported num_token_non_padded
     # Fallback to torch native implementation
@@ -83,10 +108,6 @@ def fused_topk_npu(
     if expert_location_dispatch_info is not None:
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
-    if (cap := get_global_experts_capturer()) is not None:
-        cap.capture(
-            layer_id=layer_id,
-            topk_indices=topk_ids,
-        )
+    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)

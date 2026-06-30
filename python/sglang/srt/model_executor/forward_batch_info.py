@@ -45,6 +45,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.utils.dcp_utils import DecodeContextParallelMetadata
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
@@ -218,6 +219,65 @@ def compute_local_num_token_non_padded(
 
 
 @dataclass
+class DSV4OutCacheLoc:
+    """Per-forward-pass KV cache allocation for DeepSeek-V4 on NPU.
+
+    Bundles slot indices for full/SWA pools, the two compressed-KV pools
+    (c4/c128), and the two compressed-state pools (c4_state/c128_state).
+    Populated by the NPU V4 allocator (DSV4NPUTokenToKVPoolAllocator) when
+    the model is DeepSeek-V4 on NPU; left as ``None`` on ForwardBatch
+    otherwise. CUDA's DSV4 path doesn't construct this bundle (state is
+    derived via translate_kv_loc_to_compress_state_loc there).
+
+    All fields are token-level slot ids in their respective pools (NOT page
+    ids). Attention backends convert to page ids via ``// page_size`` when
+    constructing PA_ND block tables.
+
+    State fields default to ``None`` so the bundle is constructible from
+    paths that allocate KV but not state (or vice versa); the NPU allocator
+    fills all six on real alloc, CUDA paths leave state ones None and use
+    the ring-hash translation instead.
+    """
+
+    out_full_loc: torch.Tensor
+    out_swa_loc: torch.Tensor
+    out_c4_loc: torch.Tensor
+    out_c128_loc: torch.Tensor
+    out_c4_state_loc: Optional[torch.Tensor] = None
+    out_c128_state_loc: Optional[torch.Tensor] = None
+
+
+@dataclass
+class DSV4StateLens:
+    """Per-extend/decode c4/c128 compress-state pool allocation lens (DSV4-NPU).
+
+    Built by ``ScheduleBatch._compute_dsv4_state_lens_{extend,decode}`` and
+    threaded through ``mem_cache/common.py`` to
+    ``DSV4NPUTokenToKVPoolAllocator.alloc_{extend,decode}``, which consumes:
+
+      * ``c{4,128}_prefix_lens`` / ``..._cpu`` — per-req prev cumulative
+        state-slot count (the paged allocator's ``prefix`` contract).
+      * ``c{4,128}_seq_lens`` / ``..._cpu`` — per-req new cumulative count.
+      * ``c{4,128}_extend_num_tokens`` — total new state slots this step.
+
+    Replaces the 10 loose ``c{4,128}_state_*`` kwargs the allocator used to
+    take: scheduler only produces this object, common only forwards it, the
+    allocator only consumes it.
+    """
+
+    c4_prefix_lens: torch.Tensor
+    c4_prefix_lens_cpu: torch.Tensor
+    c4_seq_lens: torch.Tensor
+    c4_seq_lens_cpu: torch.Tensor
+    c4_extend_num_tokens: int
+    c128_prefix_lens: torch.Tensor
+    c128_prefix_lens_cpu: torch.Tensor
+    c128_seq_lens: torch.Tensor
+    c128_seq_lens_cpu: torch.Tensor
+    c128_extend_num_tokens: int
+
+
+@dataclass
 class NgramEmbeddingInfo:
     """Ngram embedding state for LongCat models."""
 
@@ -286,6 +346,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
+    # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
+    # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
+    out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed
@@ -367,8 +430,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
-    # For NSA/DSA topk_indices reuse across forward calls (e.g., EAGLE draft)
-    topk_indices: Optional[torch.Tensor] = None
+    # Gate for reusing the first MTP draft step's indexer topk across steps;
+    # the carried topk lives on spec_info (see EagleDraftInput.mtp_topk_indices).
     reuse_mtp_topk_indices: Optional[bool] = False
 
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
@@ -441,6 +504,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
 
+    # For decode context parallel
+    attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None
+
+    # Decode context parallel KV write mask.
+    dcp_kv_mask: Optional[torch.Tensor] = None
+
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
 
@@ -454,7 +523,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Attention planning state. True iff attention metadata for this batch has
     # already been planned outside ModelRunner.forward (multi-step draft
-    # pre-plan, plan-stream replay_prepare, hand-built spec batches), so the
+    # pre-plan, plan-stream load_batch, hand-built spec batches), so the
     # forward path must not plan again. Only such pre-planners may set this —
     # ModelRunner / graph runners never mark after their own planning. The
     # marker is only valid for the planning regime (backend set) it was set
@@ -480,7 +549,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         Call right next to the out-of-forward planning action
         (e.g. ``draft_attn_backend.init_forward_metadata(fb)`` or
-        ``graph_runner.replay_prepare(fb)``). Records the batch shapes so
+        ``graph_runner.load_batch(fb)``). Records the batch shapes so
         staleness is detectable; pass ``replan_equivalent=True`` only when
         a forward-path re-plan is equivalent to the pre-plan (see field
         docs).
@@ -615,6 +684,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
+            out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
@@ -793,6 +863,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
 
             model_runner.lora_manager.prepare_lora_batch(ret)
+
+        if (
+            getattr(model_runner, "dcp_size", 1) > 1
+            and ret.out_cache_loc is not None
+            and is_hip()
+        ):
+            ret.dcp_kv_mask = (
+                ret.positions % model_runner.dcp_size == model_runner.dcp_rank
+            )
 
         return ret
 
@@ -1272,6 +1351,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if getattr(spec_info, "topk_index", None) is not None:
                 spec_info.topk_index = self._pad_tensor_to_size(
                     spec_info.topk_index, bs
+                )
+            if getattr(spec_info, "draft_probs", None) is not None:
+                spec_info.draft_probs = self._pad_tensor_to_size(
+                    spec_info.draft_probs, bs
                 )
             if getattr(spec_info, "num_correct_drafts", None) is not None:
                 spec_info.num_correct_drafts = self._pad_tensor_to_size(

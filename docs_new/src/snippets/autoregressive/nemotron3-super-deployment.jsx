@@ -20,7 +20,8 @@ export const Nemotron3SuperDeployment = () => {
       title: 'Hardware Platform',
       items: [
         { id: 'h200', label: 'H200', default: false },
-        { id: 'b200', label: 'B200', default: true }
+        { id: 'b200', label: 'B200', default: true },
+        { id: 'b300', label: 'B300', default: false }
       ]
     },
     tp: {
@@ -86,6 +87,9 @@ export const Nemotron3SuperDeployment = () => {
 
     if (kvcache && kvcache !== 'none') {
       cmd += `  --kv-cache-dtype ${kvcache} \\\n`;
+    }
+    if (values.hardware === 'b300') {
+      cmd += `  --attention-backend flashinfer \\\n`;
     }
 
     for (const [key, option] of Object.entries(options)) {
