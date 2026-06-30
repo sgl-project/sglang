@@ -315,6 +315,8 @@ class ModelRunnerKVCacheMixin:
         unsupported_pool_family = None
         if is_dsv4_model:
             unsupported_pool_family = "DeepSeekV4TokenToKVPool"
+        elif current_platform.is_mlu() and not self.mambaish_config:
+            unsupported_pool_family = "MLU KV pool"
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             unsupported_pool_family = "out-of-tree platform KV pool"
         elif (
@@ -533,6 +535,25 @@ class ModelRunnerKVCacheMixin:
                 online_mtp_max_draft_tokens=(
                     self.server_args.max_speculative_num_draft_tokens or 0
                 ),
+            )
+        elif current_platform.is_mlu() and not self.mambaish_config:
+            if self.use_mla_backend:
+                raise RuntimeError(
+                    "MLU backend currently supports MHA/GQA models only; "
+                    "MLA models are not supported."
+                )
+            PoolCls = current_platform.get_mha_kv_pool_cls()
+            self.token_to_kv_pool = PoolCls(
+                self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
             )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_dsa_model:
@@ -860,7 +881,17 @@ class ModelRunnerKVCacheMixin:
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
-            if current_platform.is_out_of_tree():
+            if current_platform.is_mlu():
+                AllocatorCls = current_platform.get_paged_allocator_cls()
+                self.token_to_kv_pool_allocator = AllocatorCls(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    device=self.device,
+                    kvcache=self.token_to_kv_pool,
+                    need_sort=need_sort,
+                )
+            elif current_platform.is_out_of_tree():
                 AllocatorCls = current_platform.get_paged_allocator_cls()
                 self.token_to_kv_pool_allocator = AllocatorCls(
                     self.max_total_num_tokens,

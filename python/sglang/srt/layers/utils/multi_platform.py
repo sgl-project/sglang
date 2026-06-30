@@ -21,6 +21,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+_is_mlu = current_platform.is_mlu()
 
 
 class MultiPlatformOp(nn.Module):
@@ -100,6 +101,9 @@ class MultiPlatformOp(nn.Module):
     def forward_musa(self, *args, **kwargs):
         return self.forward_cuda(*args, **kwargs)
 
+    def forward_mlu(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
     def forward_hpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
@@ -107,7 +111,7 @@ class MultiPlatformOp(nn.Module):
         return self.forward_native(*args, **kwargs)
 
     def dispatch_forward(self):
-        # OOT platform dispatch: check registry then method lookup
+        # OOT platform dispatch: check registry then method lookup.
         if current_platform.is_out_of_tree():
             key = current_platform.get_dispatch_key_name()
             oot = self._oot_forward_registry.get(key, {})
@@ -130,5 +134,7 @@ class MultiPlatformOp(nn.Module):
             return self.forward_xpu
         elif _is_musa:
             return self.forward_musa
+        elif _is_mlu:
+            return self.forward_mlu
         else:
             return self.forward_native

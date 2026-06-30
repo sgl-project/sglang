@@ -511,6 +511,7 @@ def build_decode_registry(
     max_num_token: int,
     seq_len_fill_value: int,
     cache_loc_dtype: torch.dtype,
+    position_dtype: Optional[torch.dtype] = None,
     enable_mamba_track: bool = False,
     is_encoder_decoder: bool = False,
     encoder_len_fill_value: int = 0,
@@ -557,12 +558,22 @@ def build_decode_registry(
     def _bs(bs: int, _mt: int) -> Tuple[int, ...]:
         return (bs,)
 
+    positions_dtype = position_dtype
+    if positions_dtype is None and source is not None:
+        source_positions = getattr(source, "positions", None)
+        if source_positions is not None:
+            positions_dtype = source_positions.dtype
+    if positions_dtype is None:
+        positions_dtype = (
+            torch.int32 if torch.device(device).type == "mlu" else torch.int64
+        )
+
     slots = [
         GraphSlot("input_ids", _tokens, torch.int64, axis="tokens"),
         GraphSlot(
             "positions",
             _tokens,
-            torch.int64,
+            positions_dtype,
             axis="tokens",
             padding_policy=PaddingPolicy.ZERO,
         ),

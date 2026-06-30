@@ -31,6 +31,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -50,6 +51,7 @@ _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
 _is_musa = is_musa()
 _is_npu = is_npu()
+_is_mlu = current_platform.is_mlu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -141,6 +143,8 @@ logger = logging.getLogger(__name__)
 if _is_npu:
     import torch_npu
     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
+if _is_mlu:
+    import torch_mlu_ops
 
 
 def _forward_with_allreduce_fusion(
@@ -345,6 +349,35 @@ class RMSNorm(MultiPlatformOp):
             )
             return out, residual_out
         return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
+
+    def forward_mlu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is not None:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            out, residual_out = torch_mlu_ops.fused_rms_norm(
+                x,
+                residual,
+                self.weight.data,
+                None,
+                None,
+                self.variance_epsilon,
+                True,
+            )
+            return out, residual_out
+        return torch_mlu_ops.fused_rms_norm(
+            x,
+            None,
+            self.weight.data,
+            None,
+            None,
+            self.variance_epsilon,
+            False,
+        )
 
     def forward_aiter(
         self,
@@ -631,6 +664,22 @@ class LayerNorm(MultiPlatformOp):
         x: torch.Tensor,
     ) -> torch.Tensor:
         return self.forward_native(x)
+
+    def forward_mlu(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        gamma = self.weight if self.elementwise_affine else None
+        bias = self.bias if self.use_bias else None
+        return torch_mlu_ops.fused_layer_norm(
+            x,
+            None,
+            gamma,
+            None,
+            bias,
+            self.variance_epsilon,
+            False,
+        )
 
     def forward_cpu(
         self,

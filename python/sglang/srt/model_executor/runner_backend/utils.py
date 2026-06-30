@@ -72,6 +72,13 @@ def resolve_decode_backend(
             cuda_graph_runner, enable_memory_saver=enable_memory_saver
         )
 
+    if model_runner.device == "mlu":
+        from sglang.srt.hardware_backend.mlu.graph_runner import MLUCudaGraphBackend
+
+        return MLUCudaGraphBackend(
+            cuda_graph_runner, enable_memory_saver=enable_memory_saver
+        )
+
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(
             cuda_graph_runner,

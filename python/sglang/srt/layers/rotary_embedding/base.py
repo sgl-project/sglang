@@ -71,6 +71,33 @@ if _is_hip:
 if _is_xpu:
     from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
 
+if current_platform.is_mlu():
+    import torch_mlu_ops
+
+
+def _transform_cache(
+    cos_sin_cache: torch.Tensor, is_neox_style: bool
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert SGLang's packed RoPE cache to the layout required by MLU kernels.
+
+    ``cos_sin_cache`` is stored as ``[cos_half, sin_half]``. The MLU
+    ``apply_rotary`` kernel expects full-width cos and sin caches, so each half
+    is expanded to ``rotary_dim`` while preserving the RoPE style.
+    """
+    rotary_dim = cos_sin_cache.shape[-1]
+    assert rotary_dim % 2 == 0, f"rotary_dim must be even, got {rotary_dim}"
+
+    if is_neox_style:
+        cache = cos_sin_cache.unflatten(dim=-1, sizes=(2, -1))
+        cache = torch.tile(cache, (1, 1, 2)).flatten(start_dim=1)
+    else:
+        cache = cos_sin_cache.repeat_interleave(2, dim=-1)
+
+    cos, sin = cache.chunk(2, dim=-1)
+    sin = sin.view(-1, rotary_dim)
+    cos = cos.view(-1, rotary_dim)
+    return cos, sin
+
 
 class RotaryEmbedding(MultiPlatformOp):
     """Original rotary positional embedding."""
@@ -105,6 +132,7 @@ class RotaryEmbedding(MultiPlatformOp):
             and not (_is_musa)
             and not (_is_mps)
             and not (current_platform.is_out_of_tree())
+            and not (current_platform.is_mlu())
         ):
             # rotary_embedding from sglang.jit_kernel.rope and vllm._custom_ops has the same implementation.
             # TODO: Test on different devices and remove this conditional.
@@ -122,6 +150,12 @@ class RotaryEmbedding(MultiPlatformOp):
 
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
+        if current_platform.is_mlu():
+            mlu_cos_cache, mlu_sin_cache = _transform_cache(
+                self.cos_sin_cache, self.is_neox_style
+            )
+            self.register_buffer("mlu_cos_cache", mlu_cos_cache, persistent=False)
+            self.register_buffer("mlu_sin_cache", mlu_sin_cache, persistent=False)
 
         self._apply_rotary_emb_wrapped = apply_rotary_emb
 
@@ -208,6 +242,10 @@ class RotaryEmbedding(MultiPlatformOp):
         self.cos_sin_cache = torch.cat((self.cos_sin_cache, new_rows), dim=0).to(
             device=device, dtype=dtype
         )
+        if current_platform.is_mlu():
+            self.mlu_cos_cache, self.mlu_sin_cache = _transform_cache(
+                self.cos_sin_cache, self.is_neox_style
+            )
 
     def get_cos_sin_with_position(self, positions):
         assert positions.ndim == 1, (
@@ -431,6 +469,60 @@ class RotaryEmbedding(MultiPlatformOp):
                     self.is_neox_style,
                 )
         return query, key
+
+    def forward_mlu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[Union[FusedSetKVBufferArg, dict]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for mlu implementation"
+
+        if offsets is not None:
+            positions = positions + offsets
+        if positions.dtype != torch.int32:
+            positions = positions.to(torch.int32)
+
+        if query is not None:
+            query = self._apply_rotary_mlu_inplace(
+                positions, query, self.mlu_cos_cache, self.mlu_sin_cache
+            )
+        if key is not None:
+            key = self._apply_rotary_mlu_inplace(
+                positions, key, self.mlu_cos_cache, self.mlu_sin_cache
+            )
+        return query, key
+
+    def _apply_rotary_mlu_inplace(
+        self,
+        positions: torch.Tensor,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        x_shape = x.shape
+        num_tokens = positions.shape[-1]
+        x = x.view(num_tokens, -1, self.head_size).unsqueeze(0)
+        x_rot = x[..., : self.rotary_dim]
+
+        torch_mlu_ops.apply_rotary(
+            input=x_rot,
+            sin_cache=sin,
+            cos_cache=cos,
+            position_ids=positions,
+            cu_seqlens=None,
+            interleaved=not self.is_neox_style,
+            discrete=True,
+            dynamic_ntk=False,
+            max_seqlen=x_rot.shape[1],
+            output=x_rot,
+        )
+
+        return x.reshape(x_shape)
 
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"

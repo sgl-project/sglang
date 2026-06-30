@@ -102,6 +102,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         encoder_len_fill_value: int,
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
+        position_dtype: torch.dtype = torch.int64,
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
         hc_hidden_size: Optional[int] = None,
@@ -113,7 +114,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int64)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
-            positions = torch.zeros((max_num_token,), dtype=torch.int64)
+            positions = torch.zeros((max_num_token,), dtype=position_dtype)
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             custom_mask = torch.ones(

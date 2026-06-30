@@ -316,6 +316,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
+            position_dtype=self._position_dtype(),
             enable_mamba_track=enable_mamba_track,
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
@@ -336,6 +337,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             max_num_token=self.max_num_token,
             seq_len_fill_value=self.seq_len_fill_value,
             cache_loc_dtype=self._cache_loc_dtype(),
+            position_dtype=self._position_dtype(),
             enable_mamba_track=enable_mamba_track,
             is_encoder_decoder=self.is_encoder_decoder,
             encoder_len_fill_value=self.encoder_len_fill_value,
@@ -380,6 +382,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
     def _cache_loc_dtype(self):
+        return torch.int64
+
+    def _position_dtype(self):
         return torch.int64
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
