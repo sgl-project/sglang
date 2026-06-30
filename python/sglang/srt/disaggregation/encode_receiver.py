@@ -30,7 +30,11 @@ from sglang.srt.distributed.parallel_state import (
     get_mooncake_transfer_engine,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
+from sglang.srt.managers.io_struct import (
+    GenerateReqInput,
+    MooncakeMMUrlItem,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.server_args import ServerArgs
@@ -945,7 +949,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         for modality in modalities:
             assigned_nums = self.num_items_assigned[modality]
             num_parts = modality_num_parts[modality]
-            mm_data_modality = [d for d in mm_data_all if d["modality"] == modality]
+            mm_data_modality = [d for d in mm_data_all if d.modality == modality]
             cum_num_items = 0
             cum_idx = 0
             for idx, assigned_num in enumerate(assigned_nums):
@@ -957,7 +961,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                     {
                         "encoder_idx": idx,
                         "mm_items": [
-                            d["url"]
+                            d.url
                             for d in mm_data_modality[
                                 cum_num_items : cum_num_items + assigned_num
                             ]
@@ -1568,7 +1572,7 @@ class MMReceiverBase(ABC):
                 self.context, zmq.PULL, host=self.host
             )
             mm_data = self._extract_url_data(request_obj)
-            modalities = [m.get("modality") for m in mm_data]
+            modalities = [m.modality for m in mm_data]
             logger.info(
                 f"[{req_id}] Sending encode request to E, "
                 f"modalities={modalities}, num_items={len(mm_data)}"
@@ -1916,7 +1920,7 @@ class MMReceiverBase(ABC):
         Assign multimodal items across encoders by modality with cross-modality load balancing.
 
         Args:
-            mm_data: List of multimodal data items, each with a "modality" key
+            mm_data: List of multimodal data items, each with a modality
             encoder_num: Number of encoders
             random_shuffle: Whether to shuffle the encoder indices
 
@@ -1928,14 +1932,14 @@ class MMReceiverBase(ABC):
         if random_shuffle:
             random.shuffle(encode_idx)
         # Get unique modalities with order preserved
-        modalities = list(dict.fromkeys(mm_item.get("modality") for mm_item in mm_data))
+        modalities = list(dict.fromkeys(mm_item.modality for mm_item in mm_data))
         # Use OrderedDict to explicitly maintain modality order
         num_items_assigned = OrderedDict()
         current_offset = 0
 
         for modality in modalities:
             mm_data_modality = [
-                mm_item for mm_item in mm_data if mm_item.get("modality") == modality
+                mm_item for mm_item in mm_data if mm_item.modality == modality
             ]
             num_items = len(mm_data_modality)
             if num_items == 0:
@@ -1955,7 +1959,7 @@ class MMReceiverBase(ABC):
 
         return num_items_assigned
 
-    def _extract_url_data(self, request_obj) -> List[Dict]:
+    def _extract_url_data(self, request_obj) -> List[MooncakeMMUrlItem]:
         def flatten_mm_items(items):
             if not isinstance(items, list):
                 return [items]
@@ -1987,10 +1991,10 @@ class MMReceiverBase(ABC):
                 mm_items = flatten_mm_items(mm_items)
                 for mm_item in mm_items:
                     mm_data.append(
-                        {
-                            "url": to_raw_url(mm_item),
-                            "modality": modality,
-                        }
+                        MooncakeMMUrlItem(
+                            url=to_raw_url(mm_item),
+                            modality=modality,
+                        )
                     )
         return mm_data
 
@@ -2080,7 +2084,7 @@ class MMReceiverHTTP(MMReceiverBase):
         effective_urls = encode_urls if encode_urls is not None else self.encode_urls
 
         # get unique modalities with order preserved
-        modalities = [mm_item.get("modality") for mm_item in mm_data]
+        modalities = [mm_item.modality for mm_item in mm_data]
         modalities = list(dict.fromkeys(modalities))
         encode_requests = []
 
@@ -2098,7 +2102,7 @@ class MMReceiverHTTP(MMReceiverBase):
         for modality in modalities:
             num_items_assigned_modality = num_items_assigned.get(modality)
             mm_data_modality = [
-                mm_item for mm_item in mm_data if mm_item.get("modality") == modality
+                mm_item for mm_item in mm_data if mm_item.modality == modality
             ]
 
             num_parts = modality_num_parts[modality]
@@ -2114,7 +2118,7 @@ class MMReceiverHTTP(MMReceiverBase):
                         "encoder_idx": idx,
                         "encoder_url": effective_urls[idx],
                         "mm_items": [
-                            mm_item.get("url")
+                            mm_item.url
                             for mm_item in mm_data_modality[
                                 cum_num_items : cum_num_items + assigned_num
                             ]
@@ -2241,18 +2245,16 @@ class MMReceiverGrpc(MMReceiverBase):
 
         effective_urls = encode_urls if encode_urls is not None else self.encode_urls
 
-        # gRPC currently only supports image; flatten new dict formats to simple lists
-        if mm_data and isinstance(mm_data[0], dict):
+        # gRPC currently only supports image; flatten typed multimodal items to simple lists
+        if mm_data and isinstance(mm_data[0], MooncakeMMUrlItem):
             non_image = [
-                item.get("modality")
-                for item in mm_data
-                if item.get("modality") != Modality.IMAGE
+                item.modality for item in mm_data if item.modality != Modality.IMAGE
             ]
             if non_image:
                 raise NotImplementedError(
                     f"gRPC encode only supports IMAGE modality, got: {non_image}"
                 )
-            img_data = [item.get("url") for item in mm_data]
+            img_data = [item.url for item in mm_data]
         else:
             img_data = mm_data
         if isinstance(num_items_assigned, dict):
