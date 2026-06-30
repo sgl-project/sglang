@@ -862,6 +862,14 @@ COPY --from=framework_final /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
 # Fix DeepEP IBGDA symlink in runtime
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
 
+# Install missing runtime Python dependencies required by packages already present in the image.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install -c /sgl-workspace/constraints.txt \
+    cryptography \
+    distro \
+    pyjwt \
+    pyparsing
+
 WORKDIR /sgl-workspace/sglang
 
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
