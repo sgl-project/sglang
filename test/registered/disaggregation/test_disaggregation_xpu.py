@@ -18,7 +18,7 @@ import unittest
 import requests
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -30,7 +30,6 @@ register_cuda_ci(
     runner_config="1-gpu-small",
     disabled="Intel XPU only — not available in standard CUDA CI",
 )
-register_xpu_ci(est_time=300, suite="nightly-xpu-1-gpu", nightly=True)
 
 _XPU_AVAILABLE = torch.xpu.is_available()
 
