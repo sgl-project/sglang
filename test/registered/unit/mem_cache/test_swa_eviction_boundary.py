@@ -75,7 +75,6 @@ def _build_swa_tree(page_size, sliding_window_size, kv_size=1024, kv_size_swa=51
         head_dim=head_dim,
         swa_attention_layer_ids=swa_ids,
         full_attention_layer_ids=full_ids,
-        enable_kvcache_transpose=False,
         device=device,
     )
     allocator = SWATokenToKVPoolAllocator(
