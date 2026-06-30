@@ -18,7 +18,7 @@ from sglang.jit_kernel.dsv3_router_gemm import dsv3_router_gemm
 from sglang.jit_kernel.utils import get_jit_cuda_arch, is_hip_runtime
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, suite="base-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(est_time=5, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
 
 # sgl_kernel AOT kernel is specialized for hidden_dim=7168 only.
 SGL_KERNEL_HIDDEN_DIM = 7168
