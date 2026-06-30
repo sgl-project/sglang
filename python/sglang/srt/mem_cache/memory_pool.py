@@ -2740,32 +2740,32 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id)
 
-    def get_fp4_value_buffer(self, layer_id: int):
-        layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool.get_fp4_value_buffer(layer_id)
+
+    def get_raw_kv_buffer(self, layer_id: int) -> dict:
+        self._wait_for_layer(layer_id)
+        local_layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_raw_kv_buffer(local_layer_id)
 
     def get_fp4_key_buffer(self, layer_id: int):
-        layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool.get_fp4_key_buffer(layer_id)
+        self._wait_for_layer(layer_id)
+        local_layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_fp4_key_buffer(local_layer_id)
 
-    def get_raw_kv_buffer(self, layer_id: int):
-        layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool.get_raw_kv_buffer(layer_id)
+    def get_fp4_value_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        local_layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_fp4_value_buffer(local_layer_id)
+
+    def get_dq_kv_buffer(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.full_kv_pool.get_dq_kv_buffer()
 
     def dequant_kv_for_extend(self, layer_id: int, *args, **kwargs):
-        global_layer_id = layer_id  # save global id before converting to local
+        self._wait_for_layer(layer_id)
         local_layer_id = self._transfer_full_attention_id(layer_id)
+        kwargs.setdefault("global_layer_id", layer_id)
         return self.full_kv_pool.dequant_kv_for_extend(
-            local_layer_id, *args, global_layer_id=global_layer_id, **kwargs
+            local_layer_id, *args, **kwargs
         )
-
-    def get_dq_kv_buffer(
-        self,
-    ):
-        assert is_float4_e2m1fn_x2(
-            self.dtype
-        ), "get_dq_kv_buffer_and_page_table only available for FP4 KV pool"
-        return self.full_kv_pool.get_dq_kv_buffer()
 
     @contextmanager
     def _transfer_id_context(self, layer: RadixAttention):

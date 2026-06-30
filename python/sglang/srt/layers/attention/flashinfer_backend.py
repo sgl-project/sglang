@@ -368,6 +368,7 @@ class FlashInferAttnBackend(AttentionBackend):
             ),
         )
         self.max_context_len = model_runner.model_config.context_len
+        self.page_size = model_runner.page_size
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
         assert not (

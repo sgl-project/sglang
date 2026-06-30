@@ -297,7 +297,7 @@ class NVFP4Method(KVCacheQuantMethod):
         cache_k_fp4_sf = cache_k_fp4_sf.view(torch.uint8)
         cache_v_fp4_sf = cache_v_fp4_sf.view(torch.uint8)
 
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        from sglang.srt.model_executor.runner import get_is_capture_mode
 
         if get_is_capture_mode() and alt_stream is not None:
             current_stream = device_module.current_stream()
@@ -438,7 +438,7 @@ class BlockFP4Method(KVCacheQuantMethod):
         cache_k_fp4, cache_k_sf = KVFP4QuantizeUtil.batched_quantize(cache_k)
         cache_v_fp4, cache_v_sf = KVFP4QuantizeUtil.batched_quantize(cache_v)
 
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        from sglang.srt.model_executor.runner import get_is_capture_mode
 
         if get_is_capture_mode() and alt_stream is not None:
             current_stream = device_module.current_stream()
