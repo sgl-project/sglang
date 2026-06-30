@@ -189,6 +189,9 @@ from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
 )
 from sglang.srt.managers.scheduler_components.load_inquirer import SchedulerLoadInquirer
+from sglang.srt.managers.scheduler_components.load_publisher import (
+    SchedulerLoadPublisher,
+)
 from sglang.srt.managers.scheduler_components.logprob_result_processor import (
     SchedulerLogprobResultProcessor,
 )
@@ -1805,6 +1808,13 @@ class Scheduler(
             max_total_num_tokens=self.max_total_num_tokens,
             get_stats=lambda: self.metrics_reporter.stats,
         )
+        # Load reporting for load-aware routers — a separate publisher on its
+        # own port, independent of KV-cache events.
+        self.load_publisher = SchedulerLoadPublisher(
+            kv_events_config=self.server_args.kv_events_config,
+            ps=self.ps,
+            dp_size=self.server_args.dp_size,
+        )
 
     def init_load_inquirer(self) -> None:
         self.load_inquirer = SchedulerLoadInquirer(
@@ -3416,6 +3426,15 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+        # Router-facing load snapshot on the dedicated load PUB socket, for
+        # cache-aware-zmq load-aware selection. Independent of the DP-balancing
+        # snapshot above so it works for single workers too. Sourced from the
+        # load inquirer (live scheduler counts, not the metrics-gated stats)
+        # and only evaluated when the throttle fires.
+        self.load_publisher.publish_load_stat(
+            lambda: self.load_inquirer.get_loads(GetLoadsReqInput(include=["core"])),
+            force=batch.forward_mode.is_extend(),
+        )
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
