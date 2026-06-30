@@ -4,8 +4,11 @@ set -euo pipefail
 # Get version from git tags
 SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
 
-# Fetch tags from origin to ensure we have the latest
-if git fetch --tags origin; then
+# Fetch ONLY tags from origin (not all branches) for version detection.
+# The default `git fetch --tags origin` also pulls origin's full branch
+# refspec; on a repo with thousands of branches that can take ~30 min. A
+# tags-only refspec avoids enumerating branches and is dramatically faster.
+if git fetch --no-recurse-submodules --no-tags origin 'refs/tags/*:refs/tags/*'; then
   # Use the shared helper so stable/post releases sort above rc tags.
   VERSION_FROM_TAG=$(python3 python/tools/get_version_tag.py --tag-only || true)
   if [ -n "$VERSION_FROM_TAG" ]; then
