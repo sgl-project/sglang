@@ -125,6 +125,9 @@ class SchedulerStats:
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
+    # Layer-pipeline metrics: chunk-count delta and per-chunk ms since last log_stats.
+    kv_transfer_layer_group_chunks_delta: int = 0
+    kv_transfer_layer_group_ms_samples: List[float] = field(default_factory=list)
 
     # Utilization
     utilization: float = 0.0
@@ -544,6 +547,25 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="Histogram of KV cache transfer size in MB.",
             labelnames=labels.keys(),
             buckets=(1, 5, 10, 50, 100, 500, 1000, 5000, 10000),
+        )
+        self.kv_transfer_layer_group_chunks_total = Counter(
+            name="sglang:kv_transfer_layer_group_chunks_total",
+            documentation=(
+                "Total layer-pipeline KV chunks shipped (one increment per "
+                "successful RDMA completion); 0 when LP is off."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.kv_transfer_layer_group_ms = Histogram(
+            name="sglang:kv_transfer_layer_group_ms",
+            documentation=(
+                "Histogram of per-layer-group KV chunk transfer time in ms "
+                "(enqueue → RDMA completion)."
+            ),
+            labelnames=labels.keys(),
+            # Long-context (≥64K seqlen) groups can exceed 1s on slow links;
+            # extend to 5s so the upper bucket doesn't truncate the tail.
+            buckets=(1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000),
         )
 
         # =================================================================
@@ -1311,6 +1333,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
+        if stats.kv_transfer_layer_group_chunks_delta:
+            self.kv_transfer_layer_group_chunks_total.labels(**self.labels).inc(
+                stats.kv_transfer_layer_group_chunks_delta
+            )
+        for sample_ms in stats.kv_transfer_layer_group_ms_samples:
+            self._log_histogram(self.kv_transfer_layer_group_ms, sample_ms)
 
         # Utilization
         self._log_gauge(self.utilization, stats.utilization)

@@ -272,6 +272,8 @@ class EagleDraftWorkerBase(ABC):
 
 
 class BaseSpecWorker(ABC):
+    supports_layer_pipeline_hook = False
+
     @property
     @abstractmethod
     def target_worker(self) -> TpModelWorker:

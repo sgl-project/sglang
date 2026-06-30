@@ -402,7 +402,9 @@ class HybridCacheController(BaseHiCacheController):
         ):
             host_indices = op.host_indices
             device_indices = op.device_indices
-            resolved_pool_transfers = op.pool_transfers
+            resolved_pool_transfers = self.move_kernel_page_first_pool_transfers(
+                op.pool_transfers
+            )
         else:
             host_indices, device_indices, resolved_pool_transfers = (
                 self.move_hybrid_indices(op)
@@ -435,6 +437,40 @@ class HybridCacheController(BaseHiCacheController):
                 resolved_pool_transfers,
             )
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+
+    def move_kernel_page_first_pool_transfers(
+        self, pool_transfers: Optional[list[PoolTransfer]]
+    ) -> Optional[list[PoolTransfer]]:
+        if not pool_transfers:
+            return None
+
+        resolved_pool_transfers = []
+        for transfer in pool_transfers:
+            transfer_host_indices = transfer.host_indices
+            transfer_device_indices = transfer.device_indices
+            if (
+                transfer.name == PoolName.INDEXER
+                and transfer_host_indices is not None
+                and transfer_device_indices is not None
+            ):
+                # Main KV page_first write-back keeps CPU/CUDAHost destination
+                # indices for the staged JIT path; DSA indexer uses sgl_kernel
+                # transfer kernels that require CUDA indices even when sharing
+                # KV slot ids.
+                transfer_host_indices, transfer_device_indices = self.move_indices(
+                    transfer_host_indices, transfer_device_indices
+                )
+            resolved_pool_transfers.append(
+                PoolTransfer(
+                    name=transfer.name,
+                    host_indices=transfer_host_indices,
+                    device_indices=transfer_device_indices,
+                    keys=transfer.keys,
+                    hit_policy=transfer.hit_policy,
+                    indices_from_pool=transfer.indices_from_pool,
+                )
+            )
+        return resolved_pool_transfers
 
     def load(
         self,

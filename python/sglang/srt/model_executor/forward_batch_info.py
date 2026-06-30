@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -481,6 +481,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Encoder-decoder cross-attention mask
     cross_attention_custom_mask: Optional[torch.Tensor] = None
+
+    # Layer-pipeline hook called from RadixAttention.forward after each layer's
+    # KV is committed. Set only on disagg-prefill batches under LP; None otherwise.
+    layer_pipeline_hook: Optional[Callable[[int, "ForwardBatch"], None]] = None
 
     # For DP attention (padding / local info)
     dp_padding_mode: Optional[DpPaddingMode] = None

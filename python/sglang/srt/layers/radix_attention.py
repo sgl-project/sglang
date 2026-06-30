@@ -140,9 +140,9 @@ class RadixAttention(nn.Module):
                 unified_attention_with_output(
                     q, k, v, output, save_kv_cache, self.layer_id, **kwargs
                 )
-            return output
+            result = output
         else:
-            return get_attn_backend().forward(
+            result = get_attn_backend().forward(
                 q,
                 k,
                 v,
@@ -151,6 +151,13 @@ class RadixAttention(nn.Module):
                 save_kv_cache,
                 **kwargs,
             )
+        # Layer-pipeline hook: fires after this layer's KV bytes are committed
+        # on the compute stream. The consumer records a cuda Event here and
+        # synchronize()s before RDMA so the bytes are guaranteed visible.
+        hook = forward_batch.layer_pipeline_hook
+        if hook is not None:
+            hook(self.layer_id, forward_batch)
+        return result
 
 
 @register_custom_op(mutates_args=["output"])
