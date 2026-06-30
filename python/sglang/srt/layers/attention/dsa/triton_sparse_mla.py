@@ -44,14 +44,21 @@ try:
     from sglang.srt.utils import is_sm120_supported as _is_sm120_supported
 
     if _is_sm120_supported():
-        # num_stages=2 + BLOCK_N=64 needs ~124 KB smem at H=64, over SM120's
-        # ~99 KB. num_stages=1 drops one KV pipeline buffer (~36 KB) -> ~90 KB,
-        # which fits. If you still hit OutOfResources, set BLOCK_N=32.
-        _bn = int(os.environ.get("SGLANG_SM120_DSA_ATTN_BLOCK_N", "64"))
+        # SM120 smem cap is 101376 B. Calibrated from two measured points at
+        # H=64, BLOCK_N=64: stages=2 -> 127232 B, stages=1 -> 122880 B (so a
+        # pipeline stage is only ~4352 B; the q/kv TILES dominate, not stages).
+        # Decompose: BLOCK_N-scaling = (D_V + D_TAIL + H)*BLOCK_N = 640*BLOCK_N;
+        # fixed = 122880 - 640*64 = 81920 (q tile [H,D_V] + scratch).
+        # Predicted (stages=1):  BLOCK_N=64->122880(OOM), 32->102400(OOM, ~1KB
+        # over), 16->92160(FITS), 8->87040(FITS). So 32+ do NOT fit at H=64.
+        # Use {8, 16}: both provably fit; triton picks 16 (faster), 8 is a floor.
         _w = int(os.environ.get("SGLANG_SM120_DSA_ATTN_WARPS", "4"))
         _ns = int(os.environ.get("SGLANG_SM120_DSA_ATTN_STAGES", "1"))
+        _bn_env = os.environ.get("SGLANG_SM120_DSA_ATTN_BLOCK_N")
+        _bns = [int(_bn_env)] if _bn_env else [8, 16]
         _AUTOTUNE_CONFIGS = [
-            triton.Config({"BLOCK_N": _bn}, num_warps=_w, num_stages=_ns)
+            triton.Config({"BLOCK_N": bn}, num_warps=_w, num_stages=_ns)
+            for bn in _bns
         ]
 except Exception:  # noqa: BLE001
     pass
