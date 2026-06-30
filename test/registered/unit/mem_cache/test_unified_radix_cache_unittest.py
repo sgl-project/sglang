@@ -268,7 +268,6 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
             head_dim=cfg.head_dim,
             swa_attention_layer_ids=cfg.non_full_layer_ids,
             full_attention_layer_ids=cfg.full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
         )
         allocator = SWATokenToKVPoolAllocator(
@@ -288,7 +287,6 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
             head_num=cfg.head_num,
             head_dim=cfg.head_dim,
             full_attention_layer_ids=cfg.full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
             enable_memory_saver=False,
             mamba_pool=req_to_token_pool.mamba_pool,
@@ -443,6 +441,9 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             events = [e for e in events if e.medium == medium]
         return events
 
+    def _event_hashes(self, events):
+        return [block_hash for event in events for block_hash in event.block_hashes]
+
     def _leaf_for(self, tree, tokens):
         match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
         self.assertIsNot(match.last_device_node, tree.root_node)
@@ -512,7 +513,8 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         result = tree.evict(EvictParams(num_tokens=len(seq)))
         self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
         removed = self._removed_events(tree, StorageMedium.GPU)
-        self.assertCountEqual([e.block_hashes[0] for e in removed], stored_hashes)
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(removed[0].block_hashes, stored_hashes)
 
     def test_kv_events_split_preserves_block_hash_parentage(self):
         tree, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
@@ -554,7 +556,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
 
         tree.evict(EvictParams(num_tokens=len(seq)))
         removed_gpu = self._removed_events(tree, StorageMedium.GPU)
-        self.assertCountEqual([e.block_hashes[0] for e in removed_gpu], stored_hashes)
+        self.assertCountEqual(self._event_hashes(removed_gpu), stored_hashes)
 
         self._load_back_node(tree, node)
         restored_gpu = self._stored_events(tree, StorageMedium.GPU)
@@ -564,7 +566,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self._removed_events(tree, StorageMedium.GPU)
         tree.evict_host(len(seq))
         removed_cpu = self._removed_events(tree, StorageMedium.CPU)
-        self.assertCountEqual([e.block_hashes[0] for e in removed_cpu], stored_hashes)
+        self.assertCountEqual(self._event_hashes(removed_cpu), stored_hashes)
 
     def test_hicache_split_pending_write_through_publishes_fragments(self):
         tree, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
@@ -1027,6 +1029,47 @@ class UnifiedRadixCacheSuite:
         )
         tree.sanity_check()
 
+    def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, 8)
+        evicted_len = 4
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        kv_indices = self._alloc(allocator, len(tokens))
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+        req.kv_committed_len = len(tokens)
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.swa_evicted_seqlen = evicted_len
+
+        tree.cache_unfinished_req(req)
+
+        first = next(iter(tree.root_node.children.values()))
+        self.assertEqual(len(first.key), evicted_len)
+        self.assertIsNone(first.component_data[ComponentType.SWA].value)
+        live = next(iter(first.children.values()))
+        self.assertEqual(len(live.key), len(tokens) - evicted_len)
+        self.assertIsNotNone(live.component_data[ComponentType.SWA].value)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(len(m.device_indices), len(tokens))
+
+        tree.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        )
+        tree.sanity_check()
+
     def test_diagnostics(self):
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._insert(tree, allocator, req_to_token_pool, self._make_seq(1, 2))
@@ -1242,6 +1285,41 @@ class UnifiedRadixCacheSuite:
 
         m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
         self.assertEqual(len(m.device_indices), len(seq))
+        tree.sanity_check()
+
+    def test_swa_insert_keeps_full_leaf_when_entire_span_is_outside_window(self):
+        # A leaf survives on its Full value alone: even when the whole span is
+        # past the SWA window (swa_evicted_seqlen >= total), the Full leaf must
+        # be materialized (and the Full KV kept) so the prefix stays cacheable.
+        # Runs across all SWA configs, including page_size > sliding_window_size
+        # (the dsv4-style edge case).
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        tree, allocator, _ = build_fixture(self.cfg)
+
+        tokens = self._make_seq(1, 2)
+        value = self._alloc(allocator, len(tokens))
+        if value is None:
+            self.skipTest("insufficient pool for this config")
+        full_available_before = allocator.full_attn_allocator.available_size()
+
+        tree.insert(
+            InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=value,
+                prev_prefix_len=0,
+                swa_evicted_seqlen=len(tokens),
+            )
+        )
+
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(), full_available_before
+        )
+        node = next(iter(tree.root_node.children.values()))
+        self.assertTrue(
+            torch.equal(node.component_data[ComponentType.FULL].value, value)
+        )
+        self.assertIsNone(node.component_data[ComponentType.SWA].value)
         tree.sanity_check()
 
     def test_swa_evict_cascades(self):
