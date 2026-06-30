@@ -15,6 +15,7 @@
 
 import json
 import logging
+import os
 import warnings
 from pathlib import Path
 from typing import Optional, Union
@@ -47,6 +48,43 @@ _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
 # Class name used by transformers v5 when no tokenizer mapping exists for a model_type.
 _TOKENIZERS_BACKEND = "TokenizersBackend"
+
+
+def _ensure_evo2_tokenizer_files(tokenizer_name: str) -> None:
+    """Auto-generate tokenizer files for Evo2 models using Vortex CharLevelTokenizer.
+
+    Evo2 models use a character-level tokenizer where each byte maps to its
+    UTF-8 value (A=65, C=67, G=71, T=84). If the model directory contains a
+    config.json with tokenizer_type='CharLevelTokenizer' but no tokenizer.json,
+    this function generates the required files automatically.
+
+    Supports both local directories and HuggingFace Hub repo names
+    (e.g. ``arcinstitute/evo2_1b_base``).
+    """
+    try:
+        # Resolve config.json path — works for local dirs and HF Hub names
+        config_path = _resolve_local_or_cached_file(tokenizer_name, "config.json")
+    except FileNotFoundError:
+        return
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        logger.debug("Failed to read config.json for %s: %s", tokenizer_name, e)
+        return
+
+    try:
+        with open(config_path) as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.debug("Failed to parse config.json for %s: %s", tokenizer_name, e)
+        return
+
+    if cfg.get("tokenizer_type") != "CharLevelTokenizer":
+        return
+
+    model_dir = os.path.dirname(config_path)
+    vocab_size = cfg.get("vocab_size", 512)
+    from sglang.srt.models.evo2 import generate_evo2_tokenizer_files
+
+    generate_evo2_tokenizer_files(model_dir, vocab_size)
 
 
 def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
@@ -466,6 +504,9 @@ def get_tokenizer(
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
+    # Auto-generate tokenizer files for Evo2 models that use Vortex CharLevelTokenizer
+    _ensure_evo2_tokenizer_files(tokenizer_name)
+
     # Tiktoken format has its own backend — no fastokens patching needed.
     if tokenizer_name.endswith(".json"):
         from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer

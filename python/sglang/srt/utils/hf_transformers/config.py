@@ -60,6 +60,12 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
+
+        # Ensure Evo 2 (StripedHyena2) configs have model_type before AutoConfig
+        from sglang.srt.configs.evo2 import patch_evo2_config_json
+
+        patch_evo2_config_json(model)
+
         config = AutoConfig.from_pretrained(
             model,
             trust_remote_code=trust_remote_code,
@@ -89,6 +95,13 @@ class HfModelConfigParser(ModelConfigParserBase):
             ["LongcatFlashNgramForCausalLM"],
         ]:
             config.model_type = "longcat_flash"
+
+        if (
+            config.architectures is not None
+            and "StripedHyena2" in str(config.architectures)
+            and "evo2" in str(model)
+        ):
+            config.model_type = "evo2"
 
         text_config = get_hf_text_config(config=config)
 
