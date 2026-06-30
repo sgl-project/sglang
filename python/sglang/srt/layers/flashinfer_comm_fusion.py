@@ -44,6 +44,16 @@ def _mnnvl_supported(is_multi_node: bool) -> bool:
     return is_sm90_supported() and not is_multi_node
 
 
+def _is_blackwell_ultra() -> bool:
+    """B300 / GB300 (sm_103). FlashInfer's mnnvl fused allreduce+RMSNorm
+    kernel hits an illegal memory access on single-node sm_103, so `auto`
+    must resolve to trtllm there instead of mnnvl."""
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return major == 10 and minor == 3
+
+
 def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     """Resolve the requested FlashInfer allreduce fusion backend."""
     if not (is_sm90_supported() or is_sm100_supported()):
@@ -60,6 +70,10 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
                 "non-Blackwell systems."
             )
         if is_sm100_supported():
+            # mnnvl's fused kernel IMAs on single-node sm_103 (B300); trtllm is
+            # stable there, so prefer it for Blackwell Ultra single-node.
+            if _is_blackwell_ultra():
+                return "trtllm"
             return "mnnvl"
         return "trtllm"
 
