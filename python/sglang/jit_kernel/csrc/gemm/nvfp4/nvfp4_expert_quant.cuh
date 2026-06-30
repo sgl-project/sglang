@@ -118,7 +118,8 @@ cvt_fp16_to_fp4(
     uint32_t* output_scale_offset_by_experts,
     int32_t* mask,
     int n_experts,
-    bool low_latency) {
+    bool low_latency,
+    bool use_silu_and_mul) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   using PackedVec = PackedVec<Type>;
   static constexpr int CVT_FP4_NUM_THREADS_PER_SF = (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
@@ -127,11 +128,9 @@ cvt_fp16_to_fp4(
   // Input tensor row/col loops.
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
-  // TODO(kaixih@nvidia): For now, we assume mask is used together with
-  // silu_and_mal. Maybe we want a more general behavior of mask later. In the
-  // silu case, the input last dim doubles.
   bool use_mask = mask != nullptr;
-  int actualColsPerRow = use_mask ? colsPerRow * 2 : colsPerRow;
+  // When use_silu_and_mul is true, input last dim is 2*k (gate+up concatenated).
+  int actualColsPerRow = (use_mask || use_silu_and_mul) ? colsPerRow * 2 : colsPerRow;
 
   // Each global thread processes one element
   for (int globalIdx = tid; globalIdx < numRows * colsPerRow; globalIdx += gridDim.x * blockDim.x) {
@@ -188,7 +187,7 @@ cvt_fp16_to_fp4(
 
     int64_t inOffset = rowIdx * actualColsPerRow + colIdx;
     PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
-    if (use_mask) {
+    if (use_mask || use_silu_and_mul) {
       PackedVec in_vec_mul = reinterpret_cast<PackedVec const*>(in)[inOffset + colsPerRow];
       silu_and_mul(in_vec, in_vec_mul);
     }
@@ -335,7 +334,8 @@ cvt_fp16_to_fp4(
     uint32_t* input_offset_by_experts,
     uint32_t* output_scale_offset_by_experts,
     int32_t* mask,
-    int n_experts) {
+    int n_experts,
+    bool use_silu_and_mul) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   using PackedVec = PackedVec<Type>;
   static constexpr int CVT_FP4_NUM_THREADS_PER_SF = (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
@@ -363,7 +363,8 @@ cvt_fp16_to_fp4(
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
   bool use_mask = mask != nullptr;
-  int actualColsPerRow = use_mask ? colsPerRow * 2 : colsPerRow;
+  // When use_silu_and_mul is true, input last dim is 2*k (gate+up concatenated).
+  int actualColsPerRow = (use_mask || use_silu_and_mul) ? colsPerRow * 2 : colsPerRow;
 
   // Each global thread processes one element
   for (int globalIdx = tid; globalIdx < numRows * colsPerRow; globalIdx += gridDim.x * blockDim.x) {
@@ -402,7 +403,7 @@ cvt_fp16_to_fp4(
     int64_t inOffset = rowIdx * actualColsPerRow + colIdx;
 
     PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
-    if (use_mask) {
+    if (use_mask || use_silu_and_mul) {
       PackedVec in_vec_mul = reinterpret_cast<PackedVec const*>(in)[inOffset + colsPerRow];
       silu_and_mul(in_vec, in_vec_mul);
     }
@@ -488,7 +489,8 @@ void quant_impl(
           reinterpret_cast<uint32_t*>(input_offset_by_experts),
           reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
           reinterpret_cast<int32_t*>(mask),
-          n_experts);
+          n_experts,
+          use_silu_and_mul);
     } else {
       cvt_fp16_to_fp4<T, false, true><<<grid, block, shared_mem_size, stream>>>(
           m_topk,
@@ -500,7 +502,8 @@ void quant_impl(
           reinterpret_cast<uint32_t*>(input_offset_by_experts),
           reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
           reinterpret_cast<int32_t*>(mask),
-          n_experts);
+          n_experts,
+          use_silu_and_mul);
     }
   } else {
     if (n_experts >= 16) {
@@ -515,7 +518,8 @@ void quant_impl(
           reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
           reinterpret_cast<int32_t*>(mask),
           n_experts,
-          /* bool low_latency */ true);
+          /* bool low_latency */ true,
+          use_silu_and_mul);
     } else {
       cvt_fp16_to_fp4<T, false, true><<<grid, block, 0, stream>>>(
           m_topk,
@@ -528,7 +532,8 @@ void quant_impl(
           reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
           reinterpret_cast<int32_t*>(mask),
           n_experts,
-          /* bool low_latency */ true);
+          /* bool low_latency */ true,
+          use_silu_and_mul);
     }
   }
 }
@@ -704,6 +709,95 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
         nullptr,  // output_scale_offset_by_experts
         mask.data_ptr(),
         use_silu_and_mul,
+        m_topk,
+        k,
+        n_experts,
+        stream);
+  }
+}
+
+void silu_and_mul_scaled_fp4_experts_quant_packed_sm100a(
+    tvm::ffi::TensorView output,
+    tvm::ffi::TensorView output_scale,
+    tvm::ffi::TensorView input,
+    tvm::ffi::TensorView input_global_scale,
+    tvm::ffi::TensorView input_offset_by_experts,
+    tvm::ffi::TensorView output_scale_offset_by_experts) {
+  auto MTopK = SymbolicSize{"m_topk"};
+  auto KBy2 = SymbolicSize{"k_by_2"};
+  auto OutputCols = SymbolicSize{"output_cols"};
+  auto OutputScaleRows = SymbolicSize{"output_scale_rows"};
+  auto OutputScaleCols = SymbolicSize{"output_scale_cols"};
+  auto NExperts = SymbolicSize{"n_experts"};
+  auto OffsetSize = SymbolicSize{"offset_size"};
+  auto device = SymbolicDevice{};
+
+  TensorMatcher({MTopK, KBy2})  //
+      .with_dtype<fp16_t, bf16_t>()
+      .template with_device<kDLCUDA>(device)
+      .verify(input);
+  TensorMatcher({MTopK, OutputCols})  //
+      .with_dtype<uint8_t>()
+      .with_device(device)
+      .verify(output);
+  TensorMatcher({OutputScaleRows, OutputScaleCols})  //
+      .with_dtype<int32_t>()
+      .with_device(device)
+      .verify(output_scale);
+  TensorMatcher({NExperts})  //
+      .with_dtype<float>()
+      .with_device(device)
+      .verify(input_global_scale);
+  TensorMatcher({OffsetSize})  //
+      .with_dtype<int32_t>()
+      .with_device(device)
+      .verify(input_offset_by_experts)
+      .verify(output_scale_offset_by_experts);
+
+  const int device_id = input.device().device_id;
+  RuntimeCheck(getSMVersion(device_id) >= 100, "fp4_quant is only supported on sm100+");
+
+  const int BLOCK_SIZE = 16;
+  const auto m_topk = static_cast<int>(MTopK.unwrap());
+  const auto k_by_2 = static_cast<int>(KBy2.unwrap());
+  // Input last dim is 2*k (gate+up concatenated). The kernel does SiLU(gate)*up
+  // then FP4-quantizes the k-dim result.
+  RuntimeCheck(k_by_2 % 2 == 0, "input last dim must be even (2*k)");
+  const int k = k_by_2 / 2;
+  RuntimeCheck(k % BLOCK_SIZE == 0, "k must be a multiple of 16");
+  const auto n_experts = static_cast<int>(NExperts.unwrap());
+  const auto offset_size = static_cast<int>(OffsetSize.unwrap());
+  RuntimeCheck(offset_size == n_experts + 1, "input/output offset size mismatch");
+  RuntimeCheck(static_cast<int>(OutputCols.unwrap()) == k / 2, "output second dim mismatch");
+  const int scales_k = k / BLOCK_SIZE;
+  const int padded_k = (scales_k + 3) / 4 * 4;
+  RuntimeCheck(static_cast<int>(OutputScaleCols.unwrap()) * 4 == padded_k, "output_scale second dim mismatch");
+
+  const cudaStream_t stream = LaunchKernel::resolve_device(input.device());
+  if (host::is_type<fp16_t>(input.dtype())) {
+    quant_impl<half>(
+        output.data_ptr(),
+        output_scale.data_ptr(),
+        input.data_ptr(),
+        input_global_scale.data_ptr(),
+        input_offset_by_experts.data_ptr(),
+        output_scale_offset_by_experts.data_ptr(),
+        nullptr,  // mask
+        true,     // use_silu_and_mul
+        m_topk,
+        k,
+        n_experts,
+        stream);
+  } else {
+    quant_impl<__nv_bfloat16>(
+        output.data_ptr(),
+        output_scale.data_ptr(),
+        input.data_ptr(),
+        input_global_scale.data_ptr(),
+        input_offset_by_experts.data_ptr(),
+        output_scale_offset_by_experts.data_ptr(),
+        nullptr,  // mask
+        true,     // use_silu_and_mul
         m_topk,
         k,
         n_experts,
