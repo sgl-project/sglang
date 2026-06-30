@@ -3308,6 +3308,68 @@ class UnifiedRadixCacheSuite:
 
         tree.sanity_check()
 
+    def test_swa_write_back_internal_node_backed_up_before_tombstone(self):
+        """write_back + SWA: the sliding window force-evicts SWA from device
+        before the FULL leaf is ever evicted/backed-up. An *internal* node's
+        in-window SWA chunk must be backed up to host (not silently dropped),
+        otherwise a later host hit cannot reconstruct a valid SWA window at a
+        boundary inside that node -- a decode-time host cache-hit correctness
+        failure.
+
+        Regression guard: without the backup-before-tombstone, the internal
+        node's SWA goes to None on both device and host (GONE) while its FULL
+        stays live, so this asserts host_value is populated instead.
+        """
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self._skip_unsupported_hicache_test():
+            return
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only keeps the split topology precise")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(tree, write_policy="write_back")
+        ps = self.cfg.page_size
+        tail_size = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
+        wp = max(1, tail_size // ps)
+
+        # Long enough that _maybe_split_leaf_for_swa_lock splits the insert into
+        # an out-of-window internal node + a window-capped leaf.
+        seq = self._make_seq(1, wp + 3)
+        if allocator.full_available_size() < len(
+            seq
+        ) or allocator.swa_available_size() < len(seq):
+            self.skipTest("kv pool too small for split topology")
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        tree.writing_check(write_back=True)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        leaf = m.last_device_node
+        parent = leaf.parent
+        self.assertIsNot(parent, tree.root_node, "expected a split internal node")
+
+        ct = ComponentType.SWA
+        # Internal node currently holds SWA on device only, FULL on device.
+        self.assertIsNotNone(parent.component_data[ct].value)
+        self.assertIsNone(parent.component_data[ct].host_value)
+        self.assertFalse(parent.backuped)
+        self.assertIsNotNone(parent.component_data[ComponentType.FULL].value)
+
+        # Force SWA-only device eviction (window pressure) without evicting FULL.
+        tree.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq)))
+        tree.writing_check(write_back=True)
+
+        pcd = parent.component_data[ct]
+        self.assertIsNone(
+            pcd.value, "SWA device chunk should be tombstoned by window pressure"
+        )
+        self.assertIsNotNone(
+            pcd.host_value,
+            "write_back must back up an internal node's SWA to host before "
+            "tombstoning it, so a later host hit can restore the SWA window",
+        )
+        tree.sanity_check()
+
     def test_hicache_evict_to_host_updates_aux_lru(self):
         """Aux components (MAMBA / SWA) move from device LRU to host LRU on D->H eviction."""
         aux_types = [

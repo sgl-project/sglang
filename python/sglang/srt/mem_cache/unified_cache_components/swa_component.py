@@ -405,11 +405,39 @@ class SWAComponent(TreeComponent):
             else:
                 # Internal: tombstone SWA + cascade
                 x_next = lru.get_prev_no_lock(x)
+
+                self._maybe_backup_swa_before_tombstone(x)
                 self.cache._evict_component_and_detach_lru(
                     x, self, target=EvictLayer.DEVICE, tracker=tracker
                 )
                 self.cache._cascade_evict(x, self, tracker)
                 x = x_next
+
+    def _maybe_backup_swa_before_tombstone(self, node: UnifiedTreeNode) -> None:
+        """Back up an internal node's SWA+FULL to host before the sliding window
+        tombstones its SWA on device (HiCache write_back only).
+
+        Without this the SWA chunk is dropped, so a later host hit at a boundary
+        inside the node can't rebuild the window. write_backup leaves a host-only
+        SWA copy that LOAD_BACK restores. The D->H copy is drained synchronously
+        (writing_check) before we tombstone the device chunk, so the host copy is
+        fully materialized and a later evict_host in this sweep can't race it.
+        """
+        cache = self.cache
+        controller = cache.cache_controller
+        if controller is None or controller.write_policy != "write_back":
+            return
+        ct = self.component_type
+        cd = node.component_data[ct]
+        # Nothing to preserve if SWA already gone, already on host, or the node's
+        # FULL slice is not on device (write_backup needs live FULL indices and
+        # would otherwise orphan/duplicate the existing host backup).
+        if cd.value is None or cd.host_value is not None:
+            return
+        if node.backuped or node.component_data[BASE_COMPONENT_TYPE].value is None:
+            return
+        if cache.write_backup(node, write_back=True) > 0:
+            cache.writing_check(write_back=True)
 
     def acquire_component_lock(
         self,
