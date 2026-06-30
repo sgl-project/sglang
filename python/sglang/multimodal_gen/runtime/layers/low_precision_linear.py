@@ -101,6 +101,22 @@ class TeNvfp4LinearRunner:
         self.target = target
         self.pad_m_to = max(1, int(pad_m_to))
         self._cache: dict[str, nn.Module] = {}
+        self._weight_cache_ready: set[str] = set()
+
+    def _weight_cache_arg(self, cache_key: str, *, training: bool) -> bool | None:
+        if training:
+            return None
+        return cache_key not in self._weight_cache_ready
+
+    def _mark_weight_cache_ready(
+        self,
+        cache_key: str,
+        *,
+        training: bool,
+        is_first_microbatch: bool | None,
+    ) -> None:
+        if not training and is_first_microbatch:
+            self._weight_cache_ready.add(cache_key)
 
     def _get_linear_context(
         self,
@@ -162,6 +178,7 @@ class TeNvfp4LinearRunner:
                 te_layer.bias = bias
             te_layer.train(training)
             self._cache[cache_key] = te_layer
+            self._weight_cache_ready.discard(cache_key)
             cached = te_layer
         else:
             cached.train(training)
@@ -194,12 +211,18 @@ class TeNvfp4LinearRunner:
         if pad_rows:
             x_2d = F.pad(x_2d, (0, 0, 0, pad_rows))
 
+        is_first_microbatch = self._weight_cache_arg(cache_key, training=training)
         try:
             with fp8_autocast(enabled=True, fp8_recipe=recipe):
-                out = te_layer(x_2d)
+                out = te_layer(x_2d, is_first_microbatch=is_first_microbatch)
         except Exception as exc:
             _disable_te_nvfp4_runtime(self.target, exc)
             return None
+        self._mark_weight_cache_ready(
+            cache_key,
+            training=training,
+            is_first_microbatch=is_first_microbatch,
+        )
 
         if int(out.shape[0]) != original_m:
             out = out[:original_m]
