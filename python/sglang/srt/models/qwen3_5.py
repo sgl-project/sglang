@@ -185,10 +185,18 @@ def _enable_qwen35_fused_ar_quant() -> bool:
 
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     quant_method = getattr(linear, "quant_method", None)
-    return quant_method.__class__.__name__ == "Fp8LinearMethod" and (
+    name = quant_method.__class__.__name__
+    if name == "Fp8LinearMethod" and (
         getattr(quant_method, "block_quant", False)
         or getattr(quant_method, "use_mxfp8", False)
-    )
+    ):
+        return True
+    # Quark w8a8 FP8 with per-token (dynamic) activations consumes a pre-quantized
+    # (fp8, scale) tuple via apply_fp8_linear's aiter a8w8 bpreshuffle path (e.g.
+    # MXFP4-AttnFP8 qkv_proj). Per-tensor / static quark has no tuple path.
+    if name == "QuarkLinearMethod":
+        return bool(getattr(getattr(linear, "scheme", None), "per_token", False))
+    return False
 
 
 def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
@@ -234,6 +242,14 @@ def _detect_fused_ar_quant_format(linear) -> str:
     if weight.dtype == torch.uint8:
         return "mxfp4"
     if weight.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        # Only emit a tuple format when the consumer GEMM can ingest it;
+        # otherwise the consumer uses the plain fused AR+RMSNorm path.
+        if not _linear_accepts_fp8_tuple(linear):
+            return ""
+        # Block-quantized (1x128) consumers always use the per-group path,
+        # regardless of the per-token env flag.
+        if getattr(getattr(linear, "quant_method", None), "block_quant", False):
+            return "fp8"
         if get_bool_env_var("SGLANG_USE_AITER_FP8_PER_TOKEN", "false"):
             return "fp8_per_token"
         return "fp8"
