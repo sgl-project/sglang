@@ -51,6 +51,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+@torch._dynamo.disable()
+def _merge_state_v2_wrapper(o, s_a, o_exp, s_b):
+    """``merge_state_v2`` wrapped in ``@torch._dynamo.disable`` so the EAGLE
+    tree cascade's online-softmax merge is not traced into a CUDA-graph capture
+    (mirrors FA3's ``merge_state_v2_wrapper`` in flashattention_backend.py)."""
+    from sgl_kernel import merge_state_v2
+
+    return merge_state_v2(o, s_a, o_exp, s_b)
+
+
 # Constants
 DEFAULT_WORKSPACE_SIZE_MB = 150  # Memory workspace size in MB
 
@@ -122,6 +133,48 @@ class TRTLLMMLADecodeMetadata:
     cu_seqlens_q: Optional[torch.Tensor] = None
     seq_lens_q: Optional[torch.Tensor] = None
     seq_lens_k: Optional[torch.Tensor] = None
+
+
+@dataclass
+class TRTLLMMLATreeVerifyMetadata:
+    """Persistent CUDA-graph buffers for the EAGLE tree-verify (topk>1) cascade.
+
+    The captured ``forward_extend`` reads the live ``spec_info.custom_mask`` /
+    ``out_cache_loc`` only in eager mode. Under CUDA graph those data-dependent
+    reads would bake stale tensor addresses at capture and corrupt the tree on
+    replay, so ``init_forward_metadata_out_graph`` extracts the tree adjacency
+    and the per-query draft cache slots into these persistent buffers (allocated
+    once in ``init_cuda_graph_state``) on every capture and replay, and the
+    captured forward reads only these stable tensors.
+    """
+
+    # [max_bs, num_draft_tokens, num_draft_tokens] bool tree adjacency.
+    tree_mask: Optional[torch.Tensor] = None
+    # [max_bs, num_draft_tokens] int64 cache slots of the draft tokens.
+    draft_slots: Optional[torch.Tensor] = None
+
+
+@dataclass
+class TRTLLMMLADraftStepMetadata:
+    """Per-step tree-expanded draft-decode metadata for the topk>1 cascade.
+
+    Built once per draft pass (eager: ``_build_draft_step_meta``; CUDA graph:
+    ``_fill_draft_step_meta_graph`` into persistent buffers). Read by the
+    captured/eager ``forward_decode`` cascade.
+
+    The query during a per-step draft decode has batch ``bs*topk`` (the tree
+    frontier: request r, branch t at row ``r*topk + t``). Pass 1 attends each
+    branch's full request prefix (prefix page table repeated topk); pass 2
+    attends the branch's own linear chain of draft tokens for steps
+    ``0..step_id``.
+    """
+
+    block_kv_indices_prefix: Optional[torch.Tensor] = None  # [bs*topk, max_blocks]
+    seq_lens_prefix: Optional[torch.Tensor] = None  # [bs*topk] int32 prefix lens
+    max_seq_len_prefix: Optional[int] = None
+    draft_slots: Optional[torch.Tensor] = None  # [bs*topk, step_id+1] int64 slots
+    bs: Optional[int] = None
+    topk: Optional[int] = None
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
@@ -206,6 +259,30 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.cuda_graph_custom_mask = None
 
+        # EAGLE tree drafting (speculative_eagle_topk > 1) runs a 2-pass cascade
+        # on the cuteDSL MLA decode kernel in both the verify (forward_extend)
+        # and draft (forward_decode) paths. Cache the topk>1 check once here so
+        # the per-batch forward never recomputes it. topk==1 (chain) keeps the
+        # existing single-pass path unchanged.
+        speculative_eagle_topk = model_runner.server_args.speculative_eagle_topk or 1
+        self._tree_topk = speculative_eagle_topk
+        self._is_tree_verify = speculative_eagle_topk > 1
+        # Persistent CUDA-graph buffers for the tree-verify cascade, allocated in
+        # init_cuda_graph_state and filled out-of-graph in
+        # init_forward_metadata_out_graph. None in eager mode (live extraction).
+        self.tree_verify_cuda_graph_metadata: Optional[TRTLLMMLATreeVerifyMetadata] = (
+            None
+        )
+        self._tree_verify_graph_meta: Optional[TRTLLMMLATreeVerifyMetadata] = None
+
+        # Stamped by TRTLLMMLAMultiStepDraftBackend on its per-step backends.
+        # step_id is None on the verify backend (not a draft per-step backend).
+        self.draft_step_id: Optional[int] = None
+        self.draft_step_topk: int = 1
+        self.draft_step_num_steps: int = 1
+        self.draft_step_metadata: Optional[TRTLLMMLADraftStepMetadata] = None
+        self.draft_step_cuda_graph_buffers: Optional[dict] = None
+
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
         Calculate padded block count that satisfies both TRT-LLM and Triton constraints.
@@ -272,6 +349,241 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         return block_kv_indices
 
+    def _extract_tree_mask(
+        self, forward_batch: ForwardBatch, bs: int, T: int
+    ) -> torch.Tensor:
+        """Extract the per-request draft-token x draft-token tree adjacency from
+        the flattened ``spec_info.custom_mask``.
+
+        The mask is laid out (eagle_info.py: ``paged_kernel_lens_sum * T +
+        T*T*batch_size``) as, per request r, a row-major ``[T, prefix_len_r + T]``
+        block: row i (verify query i) has ``prefix_len_r + T`` columns; the first
+        ``prefix_len_r`` are prefix KV, the trailing T are the draft-token x
+        draft-token tree adjacency. Requests are concatenated (ragged, prefix
+        lens differ). The cascade only needs the trailing TxT sub-block (pass 1
+        handles the full prefix unconditionally). Mirrors FA3's
+        ``mask_extraction_indices`` (flashattention_backend.py).
+
+        Returns a bool tensor ``[bs, T, T]`` where ``mask[r, i, j]`` is True iff
+        verify query i of request r attends draft token j. Fully vectorized (no
+        ``.item()`` / python loop) so it is CUDA-graph capture-safe.
+        """
+        custom_mask = forward_batch.spec_info.custom_mask
+        # In is_target_verify, forward_batch.seq_lens still holds the pre-draft
+        # prefix length per request, so seq_lens == prefix.
+        prefix_lens = forward_batch.seq_lens.to(torch.int64)  # [bs]
+        device = custom_mask.device
+
+        block_cols = prefix_lens + T  # [bs] columns per row of request r
+        block_sizes = block_cols * T  # [bs] flat elems for request r
+        block_starts = torch.zeros(bs, dtype=torch.int64, device=device)
+        if bs > 1:
+            block_starts[1:] = torch.cumsum(block_sizes, dim=0)[:-1]
+
+        # Flat index of query i / draft j of request r is:
+        #   block_starts[r] + i*(prefix_r + T) + prefix_r + j.
+        i_idx = torch.arange(T, device=device).view(1, T, 1)  # [1,T,1]
+        j_idx = torch.arange(T, device=device).view(1, 1, T)  # [1,1,T]
+        idx = (
+            block_starts.view(bs, 1, 1)
+            + i_idx * block_cols.view(bs, 1, 1)
+            + prefix_lens.view(bs, 1, 1)
+            + j_idx
+        )  # [bs,T,T] int64
+        # Under CUDA graph the batch is padded (bs > real) and the ragged offset
+        # for padded rows can exceed custom_mask; clamp so padded rows read a
+        # valid (dummy) bit (their tree mask is unused -- outputs discarded).
+        idx = idx.reshape(-1).clamp_(0, custom_mask.numel() - 1)
+        return custom_mask[idx].view(bs, T, T).to(torch.bool)
+
+    def _forward_tree_verify(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        metadata: TRTLLMMLADecodeMetadata,
+    ) -> torch.Tensor:
+        """EAGLE tree-verify (topk>1) 2-pass cascade on the cuteDSL MLA decode
+        kernel.
+
+        ``q`` arrives already merged/quantized as ``[bs*T, H, D]`` (the caller
+        replicated the existing forward_extend query prep). The KV cache for the
+        draft tokens has already been written by the caller.
+
+        Pass 1 (prefix): a single NON-CAUSAL fold over the request prefix, so all
+        T draft tokens attend the full prefix and the prefix is read once
+        (cute_dsl_mla_decode causal=False, depends on flashinfer #3771). Pass 2
+        (tree): a bf16 einsum over only the T draft tokens, masked by the tree
+        adjacency. Merge via online softmax (merge_state_v2). This mirrors FA3's
+        cascade (flashattention_backend.py: shared prefix + masked expand +
+        merge_state_v2_wrapper).
+        """
+        from flashinfer.cute_dsl.attention import cute_dsl_mla_decode
+
+        spec_info = forward_batch.spec_info
+        bs = forward_batch.batch_size
+        T = spec_info.draft_token_num
+        H = layer.tp_q_head_num
+        D = layer.head_dim
+        Dv = layer.v_head_dim
+        N = bs * T
+
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache_3d = k_cache.view(-1, self.page_size, self.kv_cache_dim)
+        kv_flat = k_cache.view(-1, self.kv_cache_dim)
+
+        q4 = q.view(bs, T, H, D)
+        bmm1_scale = self._compute_decode_bmm1_scale(layer)
+
+        # cute-dsl needs its own workspace (the fold decode returns LSE; trtllm-gen
+        # does not support return_lse). Prefer the dedicated cute-dsl workspace.
+        ws = global_cute_dsl_workspace_buffer
+        if ws is None:
+            ws = self.workspace_buffer
+
+        # ---- Pass 1: PREFIX -- single non-causal fold (reads each prefix once) ----
+        # Clamp CUDA-graph padded rows (seq_len==0 / block_table==-1) to valid
+        # dummies; the cute kernel device-asserts on a 0-length / -1-page row and
+        # the padded outputs are discarded after the merge.
+        prefix_lens = forward_batch.seq_lens.to(torch.int32).clamp(min=1)  # [bs]
+        bt_prefix = metadata.block_kv_indices.clamp(min=0)  # [bs, max_blocks]
+        o_pre, lse_pre = cute_dsl_mla_decode(
+            query=q4,
+            kv_cache=kv_cache_3d,
+            workspace_buffer=ws,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=bt_prefix,
+            seq_lens=prefix_lens,
+            max_seq_len=int(metadata.max_seq_len_k),
+            softmax_scale=bmm1_scale,
+            causal=False,  # all T queries attend the full prefix (exact)
+            return_lse=True,
+        )
+        o_pre_n = o_pre.reshape(N, H, Dv)
+        lse_pre_n = lse_pre.reshape(N, H).float()  # [N, H] natural-log
+
+        # ---- Pass 2: TREE -- tree-masked attention over the T draft tokens ----
+        # The draft set is only T tokens, so compute the per-query tree-masked
+        # attention directly (einsum); exact, static-shape (graph-safe), no
+        # scratch gather. bf16 matmuls (tensor cores, fp32 accum); softmax/lse
+        # stay fp32. bmm1_scale carries q_scale*k_scale*softmax so the float
+        # matmul matches the kernel's matmul in pass 1.
+        meta = self._tree_verify_graph_meta
+        if meta is not None:
+            tree = meta.tree_mask[:bs]  # [bs, T, T] bool (persistent CG buffer)
+            ocl = meta.draft_slots[:bs].reshape(-1).clamp(0, kv_flat.shape[0] - 1)
+        else:
+            tree = self._extract_tree_mask(forward_batch, bs, T)  # eager, live
+            ocl = (
+                forward_batch.out_cache_loc.view(bs, T)
+                .reshape(-1)
+                .clamp(0, kv_flat.shape[0] - 1)
+            )
+        draft_kv = kv_flat[ocl].view(bs, T, self.kv_cache_dim).to(torch.bfloat16)
+        q_v = q4.to(torch.bfloat16)  # [bs, T(q), H, D]
+        scores = (
+            torch.einsum("bqhd,bkd->bqhk", q_v, draft_kv).float() * bmm1_scale
+        )  # [bs, Tq, H, Tk] fp32
+        neg = torch.finfo(scores.dtype).min
+        scores = scores.masked_fill(~tree[:, :, None, :], neg)
+        lse_tree_n = torch.logsumexp(scores, dim=-1).reshape(N, H)  # natural-log
+        w = torch.softmax(scores, dim=-1)
+        o_tree_n = (
+            torch.einsum("bqhk,bkd->bqhd", w.to(torch.bfloat16), draft_kv[..., :Dv])
+            .reshape(N, H, Dv)
+            .to(o_pre_n.dtype)
+        )
+
+        # ---- Merge (online softmax). merge_state_v2 wants v[N,H,Dv] + lse[N,H]
+        #      fp32 natural-log; both passes already match (no transpose). ----
+        merged, _ = _merge_state_v2_wrapper(o_pre_n, lse_pre_n, o_tree_n, lse_tree_n)
+        return merged.reshape(N, H * Dv)
+
+    def _forward_tree_draft(
+        self, query: torch.Tensor, layer: RadixAttention
+    ) -> torch.Tensor:
+        """EAGLE tree-draft (topk>1) per-step decode cascade on the cuteDSL MLA
+        decode kernel.
+
+        ``query`` arrives already merged/quantized as ``[bs*topk, H, D]`` (one
+        query per tree branch, q_len==1). The branch's draft-token KV has already
+        been written by the caller. Reads the per-step metadata built by
+        ``TRTLLMMLAMultiStepDraftBackend.init_forward_metadata`` /
+        ``_fill_draft_step_meta_graph``.
+
+        Pass 1 (prefix): each branch attends its request's full prefix (the
+        prefix page table repeated topk). Pass 2 (chain): each branch attends its
+        own linear chain of <=step_id+1 draft tokens (a bf16 einsum, no tree mask
+        -- the branches diverge only at the root). Merge via online softmax. This
+        is the simpler sibling of the verify cascade (FA3
+        flashattention_backend.py: shared prefix + per-branch expand + merge).
+        """
+        meta = self.draft_step_metadata
+        H = layer.tp_q_head_num
+        D = layer.head_dim
+        Dv = layer.v_head_dim
+        N = query.shape[0]  # bs*topk
+        assert (
+            N == meta.bs * meta.topk
+        ), f"draft query batch {N} != bs*topk {meta.bs}*{meta.topk}"
+        q4 = query.view(N, 1, H, D)  # one query per branch (q_len == 1)
+
+        bmm1_scale = self._compute_decode_bmm1_scale(layer)
+        ws = global_cute_dsl_workspace_buffer
+        if ws is None:
+            ws = self.workspace_buffer
+
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+        kv_flat = k_cache.view(-1, self.kv_cache_dim)  # [total_slots, dim]
+
+        # ---- Pass 1: PREFIX (each branch attends its request's full prefix) ----
+        # Clamp CUDA-graph padded rows (seq_len==0 / block_table==-1) to dummies.
+        bt_prefix = meta.block_kv_indices_prefix.clamp(min=0)
+        sl_prefix = meta.seq_lens_prefix.clamp(min=1)
+        o_pre, lse_pre = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=q4,
+            kv_cache=kv_cache,
+            workspace_buffer=ws,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=bt_prefix,
+            seq_lens=sl_prefix,
+            max_seq_len=int(meta.max_seq_len_prefix),
+            bmm1_scale=bmm1_scale,
+            return_lse=True,
+            backend="cute-dsl",
+        )
+        o_pre_n = o_pre.reshape(N, H, Dv)
+        lse_pre_n = lse_pre.reshape(N, H).float()  # [N, H] natural-log
+
+        # ---- Pass 2: DRAFT PATH -- attention over the branch's chain of draft
+        #      tokens (a linear chain, no tree mask among them). bf16 einsum
+        #      (exact, static-shape, graph-safe). ----
+        draft_slots = meta.draft_slots  # [N, decode_length] int64 cache slots
+        decode_length = draft_slots.shape[1]
+        ds = draft_slots.reshape(-1).to(torch.long).clamp(0, kv_flat.shape[0] - 1)
+        chain_kv = (
+            kv_flat[ds].view(N, decode_length, self.kv_cache_dim).to(torch.bfloat16)
+        )  # [N, dl, kv_dim]
+        q_n = q4.reshape(N, H, D).to(torch.bfloat16)  # [N, H, D]
+        scores = (
+            torch.einsum("nhd,nkd->nhk", q_n, chain_kv).float() * bmm1_scale
+        )  # [N, H, dl] fp32
+        lse_tree_n = torch.logsumexp(scores, dim=-1)  # [N, H] natural-log
+        w = torch.softmax(scores, dim=-1)
+        o_tree_n = torch.einsum(
+            "nhk,nkd->nhd", w.to(torch.bfloat16), chain_kv[..., :Dv]
+        ).float()  # [N, H, Dv]
+
+        # ---- Merge (online softmax). lse [N,H] fp32 natural-log; no transpose. ----
+        merged, _ = _merge_state_v2_wrapper(
+            o_pre_n, lse_pre_n, o_tree_n.to(o_pre_n.dtype), lse_tree_n.float()
+        )
+        return merged.reshape(N, H * Dv)
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
@@ -325,6 +637,47 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 dtype=torch.bool,
                 device=self.device,
             )
+
+        # EAGLE tree-verify (topk>1) persistent buffers. The verify backend has
+        # skip_prefill=False and is not a draft per-step backend. Filled
+        # out-of-graph in init_forward_metadata_out_graph; read by the captured
+        # _forward_tree_verify via _tree_verify_graph_meta.
+        if (
+            self._is_tree_verify
+            and not self.skip_prefill
+            and self.draft_step_id is None
+            and self.num_draft_tokens
+        ):
+            T = self.num_draft_tokens
+            self.tree_verify_cuda_graph_metadata = TRTLLMMLATreeVerifyMetadata(
+                tree_mask=torch.zeros(
+                    (max_bs, T, T), dtype=torch.bool, device=self.device
+                ),
+                draft_slots=torch.zeros(
+                    (max_bs, T), dtype=torch.int64, device=self.device
+                ),
+            )
+
+        # EAGLE tree-draft (topk>1) per-step persistent buffers. Stamped per-step
+        # draft backends only. step_id is fixed per backend (step i decodes
+        # length i+1). Filled in-place each capture/replay by
+        # _fill_draft_step_meta_graph; read by the captured forward_decode.
+        if self.draft_step_id is not None and self.draft_step_topk > 1:
+            topk = self.draft_step_topk
+            decode_length = self.draft_step_id + 1
+            max_blocks = self._calc_padded_blocks(self.max_context_len)
+            n = max_bs * topk
+            self.draft_step_cuda_graph_buffers = {
+                "block_kv_indices_prefix": torch.full(
+                    (n, max_blocks), -1, dtype=torch.int32, device=self.device
+                ),
+                "seq_lens_prefix": torch.zeros(
+                    (n,), dtype=torch.int32, device=self.device
+                ),
+                "draft_slots": torch.zeros(
+                    (n, decode_length), dtype=torch.int64, device=self.device
+                ),
+            }
 
         super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
 
@@ -466,8 +819,33 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_mode=forward_mode,
             )
 
+        # EAGLE tree-verify (topk>1): extract the tree adjacency + draft slots
+        # out-of-graph into the persistent buffers and point the captured forward
+        # at them. The live spec_info.custom_mask / out_cache_loc read inside the
+        # captured forward would bake stale addresses on replay.
+        if (
+            self._is_tree_verify
+            and forward_mode.is_target_verify()
+            and self.tree_verify_cuda_graph_metadata is not None
+        ):
+            T = self.num_draft_tokens
+            meta = self.tree_verify_cuda_graph_metadata
+            # seq_lens is padded to bs, so _extract_tree_mask uses bs. out_cache_loc
+            # is the caller's REAL tensor (length raw_bs*T, NOT padded): fill the
+            # real rows and zero the padded tail (padded outputs are discarded).
+            meta.tree_mask[:bs].copy_(self._extract_tree_mask(forward_batch, bs, T))
+            ocl = forward_batch.out_cache_loc
+            raw_bs = ocl.numel() // T
+            meta.draft_slots[:raw_bs].copy_(ocl.view(raw_bs, T).to(torch.int64))
+            if raw_bs < bs:
+                meta.draft_slots[raw_bs:bs].zero_()
+            self._tree_verify_graph_meta = meta
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
+        # Eager path: the tree-verify cascade uses live spec_info extraction, not
+        # the persistent CUDA-graph buffers.
+        self._tree_verify_graph_meta = None
         # Delegate to parent for non-decode modes.
         if (
             forward_batch.forward_mode.is_extend()
@@ -758,6 +1136,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             query = query.to(self.q_data_type) * llama_4_scaling
             query = query.to(self.data_type)
 
+        # EAGLE tree-draft (topk>1): the per-step draft decode query has batch
+        # bs*topk (the tree frontier). The stock metadata builds bs-row block
+        # tables, so the cascade reads its own bs*topk metadata instead. Each
+        # branch is a linear chain (no tree mask among draft tokens). Chain draft
+        # (topk==1) keeps the single-pass path below.
+        if (
+            self.draft_step_topk > 1
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and self.draft_step_metadata is not None
+        ):
+            return self._forward_tree_draft(query, layer)
+
         # Ensure query has shape [bs, acc_q_len, num_q_heads, head_dim] when seq_len 1
         if query.dim() == 3:
             query = query.unsqueeze(1)
@@ -891,6 +1281,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
 
             q = q.to(self.data_type)
+
+            # EAGLE tree-verify (topk>1): the single-pass decode kernel applies a
+            # causal-among-Q mask (query i attends every draft token j<=i), which
+            # is correct for a linear chain (topk==1) but wrong for a tree, where
+            # query i must attend only its tree ancestors. Run the 2-pass cascade
+            # instead. Chain verify (topk==1) keeps the single-pass path below.
+            if self._is_tree_verify and forward_batch.forward_mode.is_target_verify():
+                return self._forward_tree_verify(q, layer, forward_batch, metadata)
 
             if forward_batch.forward_mode.is_target_verify():
                 max_seq_len = (
@@ -1054,11 +1452,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
 
 class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
-    """Multi-step draft backend for TRT-LLM MLA used by EAGLE."""
+    """Multi-step draft backend for TRT-LLM MLA used by EAGLE.
+
+    Supports EAGLE tree drafting (speculative_eagle_topk > 1): the per-step draft
+    decode runs the 2-pass cascade on the cuteDSL MLA decode kernel (see
+    ``TRTLLMMLABackend._forward_tree_draft``). The chain path (topk == 1) keeps
+    the stock single-pass per-step decode.
+    """
 
     # Per-step draft decode never reads seq_lens_cpu / seq_lens_sum; opt out so
     # decide_needs_cpu_seq_lens' OR over the backends stays False.
     needs_cpu_seq_lens: bool = False
+
+    # Lift the FlashInferMLAMultiStepDraftBackend topk==1 guard: the per-step
+    # cuteDSL MLA cascade below handles the tree (topk > 1) draft decode.
+    supports_tree_topk: bool = True
 
     def __init__(
         self,
@@ -1069,18 +1477,174 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
     ):
         super().__init__(model_runner, topk, speculative_num_steps)
 
+        # The topk>1 cascade needs return_lse (trtllm-gen rejects it), so force
+        # the cuteDSL decode kernel on the per-step backends for tree drafting.
+        if topk > 1:
+            backend = "cute-dsl"
+
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i] = TRTLLMMLABackend(
+            per_step = TRTLLMMLABackend(
                 model_runner,
                 skip_prefill=True,
                 kv_indptr_buf=self.kv_indptr[i],
                 q_indptr_decode_buf=self.q_indptr_decode,
                 backend=backend,
             )
+            # Stamp the per-step backend so its forward_decode runs the tree
+            # cascade (step i decodes a chain of length i+1).
+            per_step.draft_step_id = i
+            per_step.draft_step_topk = topk
+            per_step.draft_step_num_steps = speculative_num_steps
+            self.attn_backends[i] = per_step
+
+    def _build_draft_step_meta(
+        self,
+        per_step_backend: TRTLLMMLABackend,
+        forward_batch: ForwardBatch,
+        step_id: int,
+    ) -> TRTLLMMLADraftStepMetadata:
+        """Build the prefix page table (repeated topk) + draft-path slot table
+        for draft ``step_id``. EAGER path (allocates fresh tensors).
+
+        ``forward_batch`` here is pre-loop: ``batch_size == bs``, ``seq_lens ==
+        [bs]`` prefix token counts, ``out_cache_loc == [bs*topk*num_steps]``.
+        """
+        topk = self.topk
+        num_steps = self.speculative_num_steps
+        bs = forward_batch.batch_size
+        device = forward_batch.seq_lens.device
+
+        seq_lens_prefix_bs = forward_batch.seq_lens.to(torch.int32)  # [bs] prefix
+        max_seq = int(seq_lens_prefix_bs.max().item())
+        max_blocks = per_step_backend._calc_padded_blocks(max_seq)
+        block_kv_indices_bs = per_step_backend._create_block_kv_indices(
+            bs,
+            max_blocks,
+            forward_batch.req_pool_indices,
+            seq_lens_prefix_bs,
+            device,
+        )  # [bs, max_blocks]
+
+        # Expand to the bs*topk query layout: row r*topk+t == request r, branch t
+        # (spec input_ids == topk_index.flatten(), (bs, topk) row-major). The same
+        # prefix page-table row is repeated across the topk branches.
+        block_kv_indices_prefix = block_kv_indices_bs.repeat_interleave(topk, dim=0)
+        seq_lens_prefix = seq_lens_prefix_bs.repeat_interleave(topk)  # [bs*topk]
+
+        # Draft-path cache slots for steps 0..step_id. EAGLE lays out the draft
+        # out_cache_loc as [bs*topk, num_steps] row-major (request r, branch t at
+        # row r*topk+t); assert it so a future layout change fails loudly here
+        # rather than silently mis-gathering draft KV.
+        assert forward_batch.out_cache_loc.numel() == bs * topk * num_steps, (
+            f"draft out_cache_loc numel {forward_batch.out_cache_loc.numel()} "
+            f"!= bs*topk*num_steps {bs}*{topk}*{num_steps}"
+        )
+        out_cache_loc = forward_batch.out_cache_loc.view(bs * topk, num_steps)
+        decode_length = step_id + 1
+        draft_slots = out_cache_loc[:, :decode_length].contiguous()  # [bs*topk, dl]
+
+        return TRTLLMMLADraftStepMetadata(
+            block_kv_indices_prefix=block_kv_indices_prefix,
+            seq_lens_prefix=seq_lens_prefix,
+            max_seq_len_prefix=max_seq,
+            draft_slots=draft_slots,
+            bs=bs,
+            topk=topk,
+        )
+
+    def _fill_draft_step_meta_graph(
+        self,
+        per_step_backend: TRTLLMMLABackend,
+        forward_batch: ForwardBatch,
+        step_id: int,
+    ) -> None:
+        """Fill the per-step persistent CUDA-graph buffers in place and point
+        ``per_step_backend.draft_step_metadata`` at them.
+
+        ``forward_batch`` is the EAGLE draft batch: ``batch_size == bs``,
+        ``seq_lens == [bs]`` prefix token counts, ``out_cache_loc ==
+        [bs*topk*num_steps]``. The buffers were allocated once in
+        ``init_cuda_graph_state``; only the destination buffers are stable (the
+        captured forward_decode bakes their base addresses), the small
+        repeat_interleave inputs allocate freely (this runs out-of-graph).
+        """
+        topk = self.topk
+        num_steps = self.speculative_num_steps
+        b = per_step_backend
+        bs = forward_batch.batch_size
+        n = bs * topk
+
+        bufs = b.draft_step_cuda_graph_buffers
+        bt_buf = bufs["block_kv_indices_prefix"]  # [max_bs*topk, max_blocks]
+        seqlens_buf = bufs["seq_lens_prefix"]  # [max_bs*topk]
+        slots_buf = bufs["draft_slots"]  # [max_bs*topk, decode_length]
+        max_blocks = bt_buf.shape[1]
+
+        # prefix seq_lens, expanded to bs*topk, filled in place.
+        seq_lens_expanded = forward_batch.seq_lens.to(torch.int32).repeat_interleave(
+            topk
+        )  # [n]
+        seqlens_buf[:n].copy_(seq_lens_expanded)
+
+        # prefix page table, expanded to bs*topk, filled in place. Reset the
+        # active slice to the no-page sentinel first so stale rows from a larger
+        # prior batch never leak into a smaller replay.
+        bt_buf[:n].fill_(-1)
+        req_pool_expanded = forward_batch.req_pool_indices.repeat_interleave(
+            topk
+        )  # [n]
+        create_flashmla_kv_indices_triton[
+            (n, get_num_kv_index_blocks_flashmla(max_blocks, b.page_size))
+        ](
+            b.req_to_token,
+            req_pool_expanded,
+            seqlens_buf[:n],
+            None,
+            bt_buf[:n],
+            b.req_to_token.stride(0),
+            max_blocks,
+            PAGED_SIZE=b.page_size,
+        )
+
+        # draft-path cache slots for steps 0..step_id, filled in place. At replay
+        # bs may be the padded bucket while out_cache_loc is still the caller's
+        # real tensor of length raw_bs*topk*num_steps. Derive raw_bs, fill the
+        # real rows, zero the padded tail (padded outputs are discarded).
+        decode_length = step_id + 1
+        assert forward_batch.out_cache_loc.numel() % (topk * num_steps) == 0, (
+            f"draft out_cache_loc numel {forward_batch.out_cache_loc.numel()} "
+            f"not divisible by topk*num_steps {topk}*{num_steps}"
+        )
+        raw_bs = forward_batch.out_cache_loc.numel() // (topk * num_steps)
+        raw_n = raw_bs * topk
+        out_cache_loc = forward_batch.out_cache_loc.view(raw_n, num_steps)
+        slots_buf[:raw_n, :decode_length].copy_(out_cache_loc[:, :decode_length])
+        if raw_n < n:
+            slots_buf[raw_n:n, :decode_length].zero_()
+
+        b.draft_step_metadata = TRTLLMMLADraftStepMetadata(
+            # Stable buffer SLICES (same storage; the captured forward_decode
+            # bakes the base address -- slicing [:n] keeps that address).
+            block_kv_indices_prefix=bt_buf[:n],
+            seq_lens_prefix=seqlens_buf[:n],
+            max_seq_len_prefix=b.max_context_len,  # static bound (future longer replays)
+            draft_slots=slots_buf[:n, :decode_length],
+            bs=bs,
+            topk=topk,
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if self.topk <= 1:
+            for i in range(self.speculative_num_steps - 1):
+                self.attn_backends[i].init_forward_metadata(forward_batch)
+            return
+        # Tree draft (topk>1). forward_batch is pre-loop: out_cache_loc is the
+        # full [bs*topk*num_steps] buffer. The cascade reads solely from
+        # draft_step_metadata, so we build it directly (the stock per-step init
+        # would only build a bs-row block table the cascade ignores).
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata(forward_batch)
+            b = self.attn_backends[i]
+            b.draft_step_metadata = self._build_draft_step_meta(b, forward_batch, i)
 
     def init_forward_metadata_out_graph(
         self,
@@ -1088,6 +1652,16 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
         in_capture: bool = False,
     ):
         from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
+        if self.topk > 1:
+            # Tree draft. forward_batch is the EAGLE draft batch (batch_size==bs,
+            # seq_lens==[bs] prefix, out_cache_loc==[bs*topk*num_steps]) at both
+            # capture and replay (replay pads to the captured bs bucket), so the
+            # [:n] buffer slices keep their baked addresses.
+            for i in range(self.speculative_num_steps - 1):
+                b = self.attn_backends[i]
+                self._fill_draft_step_meta_graph(b, forward_batch, i)
+            return
 
         if in_capture:
             return super().init_forward_metadata_out_graph(

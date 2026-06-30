@@ -925,13 +925,20 @@ class FlashInferMLAMultiStepDraftBackend:
     draft decoding steps.
     """
 
+    # The plain FlashInfer MLA draft decode kernel only supports a linear chain
+    # (topk == 1). Subclasses that implement the topk>1 tree cascade (e.g.
+    # TRTLLMMLAMultiStepDraftBackend on the cuteDSL MLA kernel) set this True to
+    # lift the guard; the topk-dependent buffer sizing below is already correct
+    # for the real topk.
+    supports_tree_topk: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
         topk: int,
         speculative_num_steps: int,
     ):
-        if topk > 1:
+        if topk > 1 and not self.supports_tree_topk:
             raise ValueError(
                 "Currently Flashinfer MLA only supports topk=1 for speculative decoding"
             )
