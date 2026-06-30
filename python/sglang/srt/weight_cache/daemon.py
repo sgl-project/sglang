@@ -76,6 +76,7 @@ class WeightCacheDaemon:
         pp_size: int = 1,
         pp_rank: int = 0,
         dp_size: int = 1,
+        ep_size: int = 1,
         load_format: str = "auto",
         dtype: str = "auto",
         quantization: Optional[str] = None,
@@ -91,6 +92,7 @@ class WeightCacheDaemon:
         self.pp_size = pp_size
         self.pp_rank = pp_rank
         self.dp_size = dp_size
+        self.ep_size = ep_size
         self.load_format = load_format
         self.dtype = dtype
         self.quantization = quantization
@@ -151,6 +153,7 @@ class WeightCacheDaemon:
         initialize_model_parallel(
             tensor_model_parallel_size=self.tp_size,
             pipeline_model_parallel_size=self.pp_size,
+            expert_model_parallel_size=self.ep_size,
         )
 
         # Initialize DP attention state (required by some models like Qwen3 MoE)
@@ -188,6 +191,7 @@ class WeightCacheDaemon:
             quantization=self.quantization,
             trust_remote_code=self.trust_remote_code,
             tp_size=self.tp_size,
+            ep_size=self.ep_size,
             load_format=self.load_format,
             model_loader_extra_config=self.model_loader_extra_config,
         )
@@ -227,6 +231,7 @@ class WeightCacheDaemon:
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             dp_size=self.dp_size,
+            ep_size=self.ep_size,
             quant_method=quant_method,
             quant_config_hash=hash_quant_config(quant_config),
             dtype=str(model_config.dtype),
@@ -451,6 +456,7 @@ def run_weight_cache_daemon(
     pp_size: int = 1,
     pp_rank: int = 0,
     dp_size: int = 1,
+    ep_size: int = 1,
     load_format: str = "auto",
     dtype: str = "auto",
     quantization: Optional[str] = None,
@@ -473,6 +479,7 @@ def run_weight_cache_daemon(
         pp_size=pp_size,
         pp_rank=pp_rank,
         dp_size=dp_size,
+        ep_size=ep_size,
         load_format=load_format,
         dtype=dtype,
         quantization=quantization,
@@ -491,6 +498,7 @@ def launch_weight_cache_daemons(
     tp_size: int = 1,
     pp_size: int = 1,
     dp_size: int = 1,
+    ep_size: int = 1,
     nnodes: int = 1,
     node_rank: int = 0,
     load_format: str = "auto",
@@ -586,6 +594,8 @@ def launch_weight_cache_daemons(
                 str(tp_rank),
                 "--dp-size",
                 str(dp_size),
+                "--ep-size",
+                str(ep_size),
                 "--pp-size",
                 str(pp_size),
                 "--pp-rank",
@@ -597,21 +607,21 @@ def launch_weight_cache_daemons(
                 "--dist-init-method",
                 dist_init_method,
             ]
-        if quantization:
-            cmd += ["--quantization", quantization]
-        if model_loader_extra_config and model_loader_extra_config != "{}":
-            cmd += ["--model-loader-extra-config", model_loader_extra_config]
-        if trust_remote_code:
-            cmd += ["--trust-remote-code"]
-        if revision:
-            cmd += ["--revision", revision]
+            if quantization:
+                cmd += ["--quantization", quantization]
+            if model_loader_extra_config and model_loader_extra_config != "{}":
+                cmd += ["--model-loader-extra-config", model_loader_extra_config]
+            if trust_remote_code:
+                cmd += ["--trust-remote-code"]
+            if revision:
+                cmd += ["--revision", revision]
 
-        proc = subprocess.Popen(cmd)
-        procs.append(proc)
-        logger.info(
-            f"Launched weight cache daemon gpu={gpu_id} "
-            f"pp_rank={pp_rank} tp_rank={tp_rank} pid={proc.pid}"
-        )
+            proc = subprocess.Popen(cmd)
+            procs.append(proc)
+            logger.info(
+                f"Launched weight cache daemon gpu={gpu_id} "
+                f"pp_rank={pp_rank} tp_rank={tp_rank} pid={proc.pid}"
+            )
 
     # Wait for all daemons on this node to become ready
     num_daemons = len(procs)
@@ -621,36 +631,38 @@ def launch_weight_cache_daemons(
         for tp_rank in tp_rank_range:
             global_rank = tp_size * pp_rank + tp_rank
             ready_path = get_ready_path(global_rank)
-        while not os.path.exists(ready_path):
-            time.sleep(check_interval)
-            elapsed += check_interval
-            if elapsed > timeout:
-                logger.error(
-                    f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} "
-                    f"did not become ready within {timeout}s"
-                )
-                for p in procs:
-                    p.terminate()
-                raise TimeoutError(
-                    f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} "
-                    f"did not become ready within {timeout}s"
-                )
-            # Check if any daemon exited prematurely
-            for p in procs:
-                retcode = p.poll()
-                if retcode is not None:
+            while not os.path.exists(ready_path):
+                time.sleep(check_interval)
+                elapsed += check_interval
+                if elapsed > timeout:
                     logger.error(
-                        f"Weight cache daemon exited prematurely "
-                        f"with code {retcode}"
+                        f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} "
+                        f"did not become ready within {timeout}s"
                     )
-                    for other in procs:
-                        if other.poll() is None:
-                            other.terminate()
-                    raise RuntimeError(
-                        f"Weight cache daemon exited prematurely "
-                        f"with code {retcode}"
+                    for p in procs:
+                        p.terminate()
+                    raise TimeoutError(
+                        f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} "
+                        f"did not become ready within {timeout}s"
                     )
-        logger.info(f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} is ready")
+                # Check if any daemon exited prematurely
+                for p in procs:
+                    retcode = p.poll()
+                    if retcode is not None:
+                        logger.error(
+                            f"Weight cache daemon exited prematurely "
+                            f"with code {retcode}"
+                        )
+                        for other in procs:
+                            if other.poll() is None:
+                                other.terminate()
+                        raise RuntimeError(
+                            f"Weight cache daemon exited prematurely "
+                            f"with code {retcode}"
+                        )
+            logger.info(
+                f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} is ready"
+            )
 
     logger.info(
         f"All {num_daemons} weight cache daemons on node {node_rank} are ready "
@@ -698,6 +710,7 @@ if __name__ == "__main__":
         "If omitted, launches daemons for all TP ranks.",
     )
     parser.add_argument("--dp-size", type=int, default=1, help="Data parallel size")
+    parser.add_argument("--ep-size", type=int, default=1, help="Expert parallel size")
     parser.add_argument("--pp-size", type=int, default=1, help="Pipeline parallel size")
     parser.add_argument("--pp-rank", type=int, default=0, help="Pipeline parallel rank")
     parser.add_argument("--nnodes", type=int, default=1, help="Total number of nodes")
@@ -747,6 +760,7 @@ if __name__ == "__main__":
             pp_size=args.pp_size,
             pp_rank=args.pp_rank,
             dp_size=args.dp_size,
+            ep_size=args.ep_size,
             load_format=args.load_format,
             dtype=args.dtype,
             quantization=args.quantization,
@@ -762,6 +776,7 @@ if __name__ == "__main__":
             tp_size=args.tp_size,
             pp_size=args.pp_size,
             dp_size=args.dp_size,
+            ep_size=args.ep_size,
             nnodes=args.nnodes,
             node_rank=args.node_rank,
             load_format=args.load_format,

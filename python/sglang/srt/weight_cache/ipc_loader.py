@@ -330,6 +330,9 @@ class IpcModelLoader(BaseModelLoader):
                 get_tensor_model_parallel_rank,
                 get_tensor_model_parallel_world_size,
             )
+            from sglang.srt.distributed.parallel_state import (
+                get_moe_expert_parallel_world_size,
+            )
 
             try:
                 tp_size = get_tensor_model_parallel_world_size()
@@ -337,6 +340,11 @@ class IpcModelLoader(BaseModelLoader):
             except Exception:
                 tp_size = 1
                 tp_rank = 0
+
+            try:
+                ep_size = get_moe_expert_parallel_world_size()
+            except Exception:
+                ep_size = 1
 
             quant_config = getattr(model_config, "hf_config", None)
             if quant_config is not None:
@@ -357,6 +365,7 @@ class IpcModelLoader(BaseModelLoader):
                 tp_size=tp_size,
                 tp_rank=tp_rank,
                 dp_size=1,  # TODO: get actual dp_size
+                ep_size=ep_size,
                 quant_method=quant_method,
                 quant_config_hash=hash_quant_config(quant_config),
                 dtype=str(model_config.dtype),

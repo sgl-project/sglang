@@ -35,6 +35,7 @@ class CacheConfig:
     tp_size: int
     tp_rank: int
     dp_size: int
+    ep_size: int
     quant_method: str  # e.g. "fp8", "gptq_marlin", "" for unquantized
     quant_config_hash: str  # SHA-256 hash of quantization config
     dtype: str  # e.g. "torch.float16"
@@ -47,6 +48,7 @@ class CacheConfig:
             and self.tp_size == other.tp_size
             and self.tp_rank == other.tp_rank
             and self.dp_size == other.dp_size
+            and self.ep_size == other.ep_size
             and self.quant_method == other.quant_method
             and self.quant_config_hash == other.quant_config_hash
             and self.dtype == other.dtype
