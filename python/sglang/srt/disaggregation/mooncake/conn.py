@@ -1343,8 +1343,14 @@ class MooncakeKVManager(CommonKVManager):
                                 # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
                                 if self.session_failures[req.mooncake_session_id] >= 1:
                                     self.failed_sessions.add(req.mooncake_session_id)
+                                    # Remove stale entry to prevent memory leak;
+                                    # a new decode instance will re-register on reconnect.
+                                    self.decode_kv_args_table.pop(
+                                        req.mooncake_session_id, None
+                                    )
                                     logger.error(
-                                        f"Session {req.mooncake_session_id} failed."
+                                        f"Session {req.mooncake_session_id} failed, "
+                                        f"removed from decode_kv_args_table."
                                     )
                             self.record_failure(
                                 kv_chunk.room,
