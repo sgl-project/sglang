@@ -254,5 +254,101 @@ def test_moe_fused_gate_shapes_and_dtypes() -> None:
     )
 
 
+def _reference_softmax(
+    gating: torch.Tensor, topk: int, renormalize: bool
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Plain-softmax topk reference (the AOT ``topk_softmax`` semantics)."""
+    num_experts = gating.size(1)
+    probs = torch.softmax(gating.float(), dim=-1)
+    work = gating.float().clone()
+    arange = torch.arange(num_experts, device=gating.device).unsqueeze(0)
+    M = gating.size(0)
+    idx = torch.empty(M, topk, dtype=torch.int32, device=gating.device)
+    wgt = torch.empty(M, topk, dtype=torch.float32, device=gating.device)
+    for k in range(topk):
+        vals, _ = work.max(dim=1, keepdim=True)
+        lane = torch.where(work == vals, arange, num_experts + 1)
+        winner = lane.min(dim=1).values.to(torch.int32)
+        idx[:, k] = winner
+        wgt[:, k] = probs.gather(1, winner.long().unsqueeze(1)).squeeze(1)
+        work.scatter_(1, winner.long().unsqueeze(1), float("-inf"))
+    if renormalize:
+        wgt = wgt / wgt.sum(dim=1, keepdim=True)
+    return wgt, idx
+
+
+@pytest.mark.parametrize("M", [1, 200, 1024])
+@pytest.mark.parametrize("num_experts,topk", [(128, 4), (256, 8), (512, 6)])
+@pytest.mark.parametrize("renormalize", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_moe_fused_gate_softmax_matches_aot(
+    M: int, num_experts: int, topk: int, renormalize: bool, dtype: torch.dtype
+) -> None:
+    """Triton softmax path matches the AOT ``topk_softmax`` it replaces in fused_topk."""
+    sgl_kernel = pytest.importorskip("sgl_kernel")
+    torch.manual_seed(num_experts * 13 + topk)
+    gating = torch.randn(M, num_experts, dtype=dtype, device=DEVICE) * 2.0
+    zero_bias = torch.zeros(num_experts, dtype=torch.float32, device=DEVICE)
+
+    tri_w, tri_i = moe_fused_gate(
+        gating, zero_bias, topk=topk, scoring_func="softmax", renormalize=renormalize
+    )
+    ref_w, ref_i = _reference_softmax(gating, topk, renormalize)
+
+    aot_w = torch.empty(M, topk, dtype=torch.float32, device=DEVICE)
+    aot_i = torch.empty(M, topk, dtype=torch.int32, device=DEVICE)
+    sgl_kernel.topk_softmax(aot_w, aot_i, gating, renormalize)
+    torch.cuda.synchronize()
+
+    dense_tri = _scatter_by_expert(tri_w, tri_i, num_experts)
+    torch.testing.assert_close(
+        dense_tri, _scatter_by_expert(ref_w, ref_i, num_experts), rtol=1e-3, atol=1e-3
+    )
+    torch.testing.assert_close(
+        dense_tri, _scatter_by_expert(aot_w, aot_i, num_experts), rtol=1e-3, atol=1e-3
+    )
+
+
+@pytest.mark.parametrize("M", [1, 200, 1024])
+@pytest.mark.parametrize("num_experts,topk", [(128, 4), (256, 8)])
+@pytest.mark.parametrize("renormalize", [True, False])
+@pytest.mark.parametrize("with_bias", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_moe_fused_gate_sigmoid_matches_aot(
+    M: int,
+    num_experts: int,
+    topk: int,
+    renormalize: bool,
+    with_bias: bool,
+    dtype: torch.dtype,
+) -> None:
+    """Triton sigmoid path matches the AOT ``topk_sigmoid`` it replaces in fused_topk."""
+    sgl_kernel = pytest.importorskip("sgl_kernel")
+    torch.manual_seed(num_experts * 17 + topk)
+    gating = torch.randn(M, num_experts, dtype=dtype, device=DEVICE) * 2.0
+    bias = (
+        torch.randn(num_experts, dtype=torch.float32, device=DEVICE) * 0.5
+        if with_bias
+        else torch.zeros(num_experts, dtype=torch.float32, device=DEVICE)
+    )
+
+    tri_w, tri_i = moe_fused_gate(
+        gating, bias, topk=topk, scoring_func="sigmoid", renormalize=renormalize
+    )
+    aot_w = torch.empty(M, topk, dtype=torch.float32, device=DEVICE)
+    aot_i = torch.empty(M, topk, dtype=torch.int32, device=DEVICE)
+    sgl_kernel.topk_sigmoid(
+        aot_w, aot_i, gating, renormalize, bias if with_bias else None
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        _scatter_by_expert(tri_w, tri_i, num_experts),
+        _scatter_by_expert(aot_w, aot_i, num_experts),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

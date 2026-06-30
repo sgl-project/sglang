@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 _SCORING_FUNC_MAP = {
     "sigmoid": 0,
     "sqrtsoftplus": 1,
+    "softmax": 2,
 }
 
 
@@ -93,12 +94,14 @@ def _router_triton_kernel(
     out_indices_ptr,  # [M, K] int32
     M,
     routed_scaling_factor,
+    moe_softcapping,
     N: tl.constexpr,
     K: tl.constexpr,  # total topk (includes fused shared experts)
     K_ROUTED: tl.constexpr,  # K - num_fused_shared_experts
     BLOCK_N: tl.constexpr,  # >= N, power of 2
     BLOCK_K: tl.constexpr,  # >= K, power of 2
-    SCORING_FUNC: tl.constexpr,  # 0 = sigmoid, 1 = sqrtsoftplus
+    SCORING_FUNC: tl.constexpr,  # 0 = sigmoid, 1 = sqrtsoftplus, 2 = softmax
+    HAS_SOFTCAP: tl.constexpr,  # tanh softcapping (softmax only)
     RENORMALIZE: tl.constexpr,
     APPLY_SCALE: tl.constexpr,  # apply_routed_scaling_factor_on_output
     USE_PDL: tl.constexpr,
@@ -125,17 +128,33 @@ def _router_triton_kernel(
     scores = tl.load(row_ptr, mask=mask_n, other=0.0).to(tl.float32)
 
     if SCORING_FUNC == 0:
-        # sigmoid(x) = 1 / (1 + exp(-x))
+        # sigmoid(x) = 1 / (1 + exp(-x)); bias is for ranking only, weight is bias-free.
         activated = tl.sigmoid(scores)
-    else:
-        # sqrt(softplus(x)) = sqrt(log1p(exp(x))); guard against overflow when x is large
+        biased = activated + bias
+    elif SCORING_FUNC == 1:
+        # sqrt(softplus(x)) = sqrt(log1p(exp(x))); guard against overflow when x is large.
         sp = tl.where(
             scores > 20.0,
             scores,  # log1p(exp(big)) = big
             tl.log(1.0 + tl.exp(scores)),
         )
         activated = tl.sqrt(sp)
-    biased = activated + bias
+        biased = activated + bias
+    else:
+        # softmax over the row: weight is the softmax probability (bias kept), with
+        # optional tanh softcapping. Ranking by the (softcapped, biased) logit is
+        # monotonic with the softmax prob, so the topk loop below ranks on `biased`.
+        logit = scores
+        if HAS_SOFTCAP:
+            # tanh(z) = 2*sigmoid(2z) - 1 (avoids relying on tl.math.tanh availability).
+            z = logit / moe_softcapping
+            logit = moe_softcapping * (2.0 * tl.sigmoid(2.0 * z) - 1.0)
+        biased = logit + bias
+        biased = tl.where(mask_n, biased, -float("inf"))
+        row_max = tl.max(biased, axis=0)
+        exp_row = tl.where(mask_n, tl.exp(biased - row_max), 0.0)
+        row_sum = tl.sum(exp_row, axis=0)
+        activated = exp_row / row_sum
 
     biased = tl.where(mask_n, biased, -float("inf"))
     offs_k = tl.arange(0, BLOCK_K)
@@ -192,6 +211,7 @@ def moe_fused_gate(
     renormalize: bool = True,
     routed_scaling_factor: float = 1.0,
     apply_routed_scaling_factor_on_output: bool = False,
+    moe_softcapping: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
 
@@ -203,7 +223,11 @@ def moe_fused_gate(
     assert (
         scoring_func_int is not None
     ), f"Unknown scoring_func '{scoring_func}', must be one of {list(_SCORING_FUNC_MAP.keys())}"
-    assert scores.dtype == torch.float32, "scores must be float32"
+    assert scores.dtype in (
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+    ), "scores must be float32/float16/bfloat16"
     assert bias.dtype == torch.float32, "bias must be float32"
     assert scores.ndim == 2, "scores must be 2D"
     assert bias.ndim == 1, "bias must be 1D"
@@ -230,12 +254,14 @@ def moe_fused_gate(
         indices,
         M,
         float(routed_scaling_factor),
+        float(moe_softcapping),
         N=N,
         K=K,
         K_ROUTED=K_routed,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
         SCORING_FUNC=scoring_func_int,
+        HAS_SOFTCAP=bool(moe_softcapping != 0.0),
         RENORMALIZE=bool(renormalize),
         APPLY_SCALE=bool(apply_routed_scaling_factor_on_output),
         USE_PDL=use_pdl,

@@ -789,6 +789,24 @@ def fused_topk(
                 num_token_non_padded=num_token_non_padded,
             )
         # ===== END TO BE REFACTORED ====
+        elif _is_cuda and envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
+            # Unified Triton router (subsumes the AOT topk_softmax CUDA kernel).
+            from sglang.jit_kernel.moe_fused_gate import (
+                moe_fused_gate as _jit_moe_fused_gate,
+            )
+
+            zero_bias = torch.zeros(
+                gating_output.shape[1],
+                dtype=torch.float32,
+                device=gating_output.device,
+            )
+            topk_weights, topk_ids = _jit_moe_fused_gate(
+                gating_output,
+                zero_bias,
+                topk,
+                scoring_func="softmax",
+                renormalize=renormalize,
+            )
         else:
             topk_softmax(
                 topk_weights,
@@ -806,6 +824,28 @@ def fused_topk(
                 num_expert_group=1,
                 topk_group=1,
                 need_renorm=renormalize,
+            )
+        elif _is_cuda and envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
+            # Unified Triton router (subsumes the AOT topk_sigmoid CUDA kernel).
+            from sglang.jit_kernel.moe_fused_gate import (
+                moe_fused_gate as _jit_moe_fused_gate,
+            )
+
+            bias_fp32 = (
+                correction_bias.to(torch.float32)
+                if correction_bias is not None
+                else torch.zeros(
+                    gating_output.shape[1],
+                    dtype=torch.float32,
+                    device=gating_output.device,
+                )
+            )
+            topk_weights, topk_ids = _jit_moe_fused_gate(
+                gating_output,
+                bias_fp32,
+                topk,
+                scoring_func="sigmoid",
+                renormalize=renormalize,
             )
         else:
             topk_sigmoid(
