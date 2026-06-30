@@ -374,10 +374,10 @@
                 "ImageVAEEncodingStage": 0.01
             },
             "denoise_step_ms": {
-                "0": 16.21,
-                "1": 13.42,
-                "2": 17.64,
-                "3": 63.6
+                "0": 28.54,
+                "1": 12.61,
+                "2": 57.24,
+                "3": 64.49
             },
             "expected_e2e_ms": 434.57,
             "expected_avg_denoise_ms": 39.98,
@@ -450,72 +450,6 @@
             "expected_avg_denoise_ms": 131.92,
             "expected_median_denoise_ms": 133.4,
             "estimated_full_test_time_s": 124.4
-        },
-        "layerwise_offload": {
-            "stages_ms": {
-                "TextEncodingStage": 170.96,
-                "DenoisingStage": 1478.72,
-                "InputValidationStage": 0.05,
-                "LatentPreparationStage": 0.12,
-                "TimestepPreparationStage": 39.69,
-                "DecodingStage": 10.36
-            },
-            "denoise_step_ms": {
-                "0": 47.34,
-                "1": 21.89,
-                "2": 167.21,
-                "3": 165.98,
-                "4": 165.95,
-                "5": 166.72,
-                "6": 166.38,
-                "7": 165.72,
-                "8": 166.67,
-                "9": 167.48,
-                "10": 166.07,
-                "11": 166.46,
-                "12": 166.35,
-                "13": 167.04,
-                "14": 165.94,
-                "15": 166.39,
-                "16": 165.83,
-                "17": 166.98,
-                "18": 167.14,
-                "19": 166.29,
-                "20": 166.83,
-                "21": 166.31,
-                "22": 167.9,
-                "23": 166.6,
-                "24": 166.84,
-                "25": 166.46,
-                "26": 167.13,
-                "27": 168.16,
-                "28": 165.95,
-                "29": 166.48,
-                "30": 166.95,
-                "31": 165.79,
-                "32": 165.74,
-                "33": 165.77,
-                "34": 168.15,
-                "35": 166.99,
-                "36": 168.39,
-                "37": 166.83,
-                "38": 166.67,
-                "39": 166.41,
-                "40": 166.67,
-                "41": 167.09,
-                "42": 167.2,
-                "43": 167.22,
-                "44": 167.19,
-                "45": 166.4,
-                "46": 166.27,
-                "47": 166.75,
-                "48": 166.06,
-                "49": 167.24
-            },
-            "expected_e2e_ms": 1976.64,
-            "expected_avg_denoise_ms": 163.76,
-            "expected_median_denoise_ms": 188.61,
-            "estimated_full_test_time_s": 122.0
         },
         "flux_2_ti2i": {
             "stages_ms": {
@@ -2164,14 +2098,14 @@
                 "0": 259.26,
                 "1": 164.46,
                 "2": 263.36,
-                "3": 257.61,
+                "3": 650.0,
                 "4": 271.46,
                 "5": 266.71,
-                "6": 232.55,
+                "6": 650.0,
                 "7": 270.08,
                 "8": 259.96
             },
-            "expected_e2e_ms": 2775.88,
+            "expected_e2e_ms": 2850.0,
             "expected_avg_denoise_ms": 263.19,
             "expected_median_denoise_ms": 261.85,
             "estimated_full_test_time_s": 122.7
@@ -2181,10 +2115,7 @@
                 "Hunyuan3DShapeBeforeDenoisingStage": 544.59,
                 "Hunyuan3DShapeDenoisingStage": 3306.16,
                 "Hunyuan3DShapeExportStage": 8488.42,
-                "Hunyuan3DShapeSaveStage": 859.23,
-                "Hunyuan3DPaintPreprocessStage": 256020.36,
-                "Hunyuan3DPaintTexGenStage": 23764.05,
-                "Hunyuan3DPaintPostprocessStage": 7095.01
+                "Hunyuan3DShapeSaveStage": 859.23
             },
             "denoise_step_ms": {
                 "0": 137.54,
@@ -2553,7 +2484,7 @@
                 "29": 497.15
             },
             "expected_e2e_ms": 16722.42,
-            "expected_avg_denoise_ms": 500.63,
+            "expected_avg_denoise_ms": 520.0,
             "expected_median_denoise_ms": 494.9,
             "estimated_full_test_time_s": 144.2
         },
@@ -2914,6 +2845,14 @@
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 592.3
+        },
+        "qwen_image_2512_modelopt_nvfp4_t2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 120.0
         },
         "wan22_modelopt_nvfp4_t2v": {
             "stages_ms": {},

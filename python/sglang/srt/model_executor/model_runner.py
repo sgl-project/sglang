@@ -166,6 +166,7 @@ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
     EagerRunner,
     PrefillCudaGraphRunner,
+    get_batch_sizes_to_capture,
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -191,6 +192,7 @@ from sglang.srt.state_capturer.indexer_topk import (
 )
 from sglang.srt.state_capturer.routed_experts import (
     RoutedExpertsCapturer,
+    disable_routed_experts_capture_for_draft,
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
@@ -373,6 +375,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.dcp_size = server_args.dcp_size
+        self.dcp_rank = self.tp_rank % self.dcp_size
         self.moe_ep_rank = moe_ep_rank
         self.moe_ep_size = moe_ep_size
         self.dp_rank = dp_rank
@@ -532,6 +536,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cpu":
             self.init_threads_binding()
 
+        # Set float32 matmul precision
+        if server_args.enable_tf32_matmul:
+            torch.set_float32_matmul_precision("high")
+
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
         self.pre_model_load_memory = self.init_torch_distributed()
@@ -541,6 +549,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
+
+        # WAR fast-path: a decode-graph forward publishes a fresh event here after
+        # load_batch; the scheduler's WAR barrier waits on it (then clears it)
+        # instead of the whole-forward wait_stream. None -> whole-forward fallback.
+        self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
 
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
@@ -687,6 +700,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.load_model()
         self._prepare_moe_topk()
 
+        # Must run before backend/graph init so no draft graph records a
+        # routed-experts capture-write kernel.
+        if self.is_draft_worker:
+            disable_routed_experts_capture_for_draft(self.model)
+
         # Load the expert backup client
         self.expert_backup_client = (
             ExpertBackupClient(self.server_args, self)
@@ -788,18 +806,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
 
-        # Snapshot free memory at the end of the weight-load phase. KV-pool
-        # profiling uses this instead of measuring at alloc_memory_pool()
-        # time: draft-model weights load between the two phases and must stay
-        # outside the --mem-fraction-static budget (deployments tune the
-        # fraction assuming draft weights live in the non-static slack).
-        self.post_model_load_memory = get_available_gpu_memory(
-            self.device,
-            self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
-        )
-
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         hf_config = self.model_config.hf_text_config
         if (
@@ -850,6 +856,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     else self.tp_group.cpu_group
                 ),
                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                swap_in_block_size=hisparse_cfg.swap_in_block_size,
             )
 
         self.init_routed_experts_capturer()
@@ -862,18 +869,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.graph_mem_usage = 0
         self.prefill_cuda_graph_runner = None
 
-    def init_backends(self, disable_cuda_graph: bool = False):
-        """Initialize attention backends and capture cuda graphs."""
-        server_args = self.server_args
-
+    def init_attention_backends(self):
+        """Initialize attention backends only (no cuda graph capture)."""
         # TODO: Refactor device-specific init branches into platform interface (separate PR).
         # Must be called BEFORE init_decode_cuda_graph() so CUDA graph capture
         # runs with aux hidden state capture enabled.
         self.init_aux_hidden_state_capture()
 
-        # Device-specific attention-backend init. cg_supported gates decode
-        # cuda-graph capture (out-of-tree / unknown platforms may not support it).
-        cg_supported = True
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
@@ -892,12 +894,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_world_group().world_size,
                     get_world_group().cpu_group,
                 )
-        elif current_platform.is_out_of_tree():
-            self.init_attention_backend()
-            cg_supported = current_platform.support_cuda_graph()
         else:
             self.init_attention_backend()
-            cg_supported = False
+
+    def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        """Capture cuda graphs. Requires init_attention_backends() to have run.
+
+        Spec draft runners pass capture_decode_cuda_graph=False
+        because they capture their own decode-style graphs separately.
+        """
 
         # The eager (no-cuda-graph) phase runner, built AFTER the attention
         # backend so its __init__ can warm up kernels (run-once) and allocate the
@@ -912,23 +917,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # eager buffer allocated above. (init_prefill_cuda_graph routes prefill
         # to the eager runner when the prefill graph is disabled.)
         self.init_prefill_cuda_graph()
-        if not disable_cuda_graph and cg_supported:
-            self.init_decode_cuda_graph()
+
+        self.decode_cuda_graph_runner = None
+        self.graph_mem_usage = 0
+
+        if capture_decode_cuda_graph:
+            if self.device in ("cuda", "musa", "cpu", "npu"):
+                self.init_decode_cuda_graph()
+            elif (
+                current_platform.is_out_of_tree()
+                and current_platform.support_cuda_graph()
+            ):
+                self.init_decode_cuda_graph()
         else:
-            self.decode_cuda_graph_runner = None
-            self.graph_mem_usage = 0
-        if disable_cuda_graph:
-            # Decode cuda graph disabled: route eager decode through the
-            # EagerRunner (the dispatch gate isinstance(..., EagerRunner) keeps
-            # _forward_raw off any replay branch).
             self.decode_cuda_graph_runner = self.eager_runner
 
         # Register forward hooks AFTER cuda-graph capture so their tensor ops are
         # not traced into any captured graph — capture stays hook-free and hooks
         # fire only on the eager forward path (capture replay never runs Python
         # hooks anyway).
-        if server_args.forward_hooks:
-            register_forward_hooks(self.model, server_args.forward_hooks)
+        if self.server_args.forward_hooks:
+            register_forward_hooks(self.model, self.server_args.forward_hooks)
 
         self.prealloc_symmetric_memory_pool()
 
@@ -958,6 +967,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.model_config.full_attention_layer_ids = full_attention_layer_ids
 
     def init_routed_experts_capturer(self):
+        if self.is_draft_worker:
+            # Capture is target-only. The draft worker runs in the same process
+            # as its target and inits after it, so installing a capturer here
+            # would overwrite the target's process-global one.
+            return
+
         if not self.server_args.disable_shared_experts_fusion and hasattr(
             self.model, "num_fused_shared_experts"
         ):
@@ -1089,6 +1104,39 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def model_specific_adjustment(self):
         server_args = self.server_args
+
+        # HRM-Text needs bidirectional prompt attention (prefill), which only the
+        # Triton backend honors and only with cuda graph / chunked prefill off
+        # (TritonAttnBackend.allow_bidirectional_attention_in_extend). Radix cache
+        # is also unsafe: the recurrent forward writes direction-dependent KV
+        # across many slots.
+        hf_config = self.model_config.hf_config
+        is_hrm_text = getattr(
+            hf_config, "model_type", None
+        ) == "hrm_text" or "HrmTextForCausalLM" in getattr(
+            hf_config, "architectures", []
+        )
+        # prefix_lm defaults to True upstream; defaulting False would skip the
+        # bidirectional-attention forcing and silently produce junk output.
+        is_prefix_lm_recurrent = is_hrm_text and getattr(hf_config, "prefix_lm", True)
+        if is_prefix_lm_recurrent:
+            if server_args.attention_backend not in (None, "triton"):
+                logger.warning(
+                    f"Overriding --attention-backend "
+                    f"{server_args.attention_backend!r} -> 'triton': only the "
+                    "Triton backend supports HRM-Text's bidirectional prefix "
+                    "attention."
+                )
+            server_args.attention_backend = "triton"
+            server_args.chunked_prefill_size = -1
+            server_args.disable_radix_cache = True
+            server_args.disable_cuda_graph = True
+            logger.warning(
+                "HRM-Text (prefix_lm) detected: forcing --attention-backend "
+                "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
+                "--disable-cuda-graph for correctness of the bidirectional "
+                "prompt attention."
+            )
 
         if self.is_multimodal:
             if not self.is_multimodal_chunked_prefill_supported:
@@ -1234,6 +1282,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 expert_model_parallel_size=self.moe_ep_size,
                 attention_context_model_parallel_size=self.attn_cp_size,
                 moe_data_model_parallel_size=self.moe_dp_size,
+                decode_context_parallel_size=self.dcp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
                 enable_symm_mem=self.server_args.enable_symm_mem,
                 recovered_rank=self.server_args.elastic_ep_rejoin,
@@ -1484,6 +1533,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.info(
                 f"Setting sliding_window_size to be attention_chunk_size: {self.sliding_window_size}"
             )
+
+        self.prefill_aware_swa = (
+            hasattr(self.model, "is_prefill_aware_swa")
+            and self.model.is_prefill_aware_swa()
+        )
 
         self.dtype = self.model_config.dtype
 
@@ -2302,7 +2356,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def max_token_pool_size(self):
         """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
-            return self.full_max_total_num_tokens
+            return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:
             return self.max_total_num_tokens
 
@@ -2543,15 +2597,32 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         graph_backend = defaultdict(
             lambda: f"{current_platform.device_name} graph",
             {
-                "cuda": "cuda graph",
-                "musa": "cuda graph",
-                "cpu": "cpu graph",
-                "npu": "npu graph",
+                "cuda": "CUDA graph",
+                "musa": "CUDA graph",
+                "cpu": "CPU graph",
+                "npu": "NPU graph",
             },
         )
+        role = "draft" if self.is_draft_worker else "target"
+        if self.spec_algorithm.is_speculative():
+            capture_name = f"{role} verify"
+            num_tokens_per_bs = (
+                self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                    self.server_args.speculative_num_draft_tokens,
+                    self.is_draft_worker,
+                )
+            )
+        else:
+            capture_name = f"{role} decode"
+            num_tokens_per_bs = 1
+        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_bs)
+        decode_backend = self.server_args.cuda_graph_config.decode.backend
         logger.info(
-            f"Capture {graph_backend[self.device]} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            f"Capture {capture_name} {graph_backend[self.device]} begin. "
+            f"backend={decode_backend}, num_tokens_per_bs={num_tokens_per_bs}, "
+            f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
         )
+
         if current_platform.is_out_of_tree():
             GraphRunnerCls = current_platform.get_graph_runner_cls()
             self.decode_cuda_graph_runner = GraphRunnerCls(self)
@@ -2572,12 +2643,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
         logger.info(
-            f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
-            f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
+            f"Capture {capture_name} {graph_backend[self.device]} end. "
+            f"elapsed={time.perf_counter() - tic:.2f} s, "
+            f"mem usage={self.graph_mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
         )
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
-        """Initialize piecewise CUDA graph runner."""
+        """Initialize prefill CUDA graph runner."""
         self.prefill_cuda_graph_runner = None
 
         if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
@@ -2599,40 +2671,36 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.is_draft_worker and not force_for_draft_worker:
             return
 
-        # EAGLE-family target worker: the prefill graph captures
-        # CaptureHiddenMode.NULL, but target prefill needs FULL hidden states to
-        # feed the draft, so can_run_graph always rejects it and prefill runs
-        # eagerly. The graph is therefore never used; capturing it (now before
-        # the decode graph) can perturb backend state on FP4 / TRTLLM-MoE paths
-        # and corrupt decode replay, so skip its capture and route prefill
-        # through the eager runner — the runtime path either way. With
-        # enable_return_hidden_states the prefill graph is FULL and usable, so
-        # only skip when it would capture NULL.
+        # Skip prefill CG for EAGLE target on tc_piecewise: that backend
+        # captures CaptureHiddenMode.NULL while runtime requests FULL, so
+        # the captured graph is dead, and capturing it perturbs FP4 /
+        # TRTLLM-MoE state and corrupts decode replay (see #28386). BCG
+        # captures FULL for EAGLE target in PrefillCudaGraphRunner.__init__
+        # (restored from #25795), so it does NOT need this skip.
         if (
             self.spec_algorithm.is_eagle()
             and not self.is_draft_worker
             and not self.server_args.enable_return_hidden_states
+            and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
         ):
             logger.info(
-                "Disable prefill CUDA graph for the EAGLE target worker: target "
-                "prefill needs FULL hidden states but the prefill graph captures "
-                "NULL, so the graph is unused; skipping its capture keeps decode "
-                "graph capture clean."
+                "Disable prefill CUDA graph for EAGLE target on tc_piecewise "
+                "to avoid FP4/MoE decode-replay corruption (#28386)."
             )
             self.prefill_cuda_graph_runner = self.eager_runner
             return
 
-        # Disable piecewise CUDA graph for non-language models
+        # Disable prefill CUDA graph for non-language models
         if not hasattr(self.model, "model"):
             logger.warning(
-                "Disable piecewise CUDA graph because the model is not a language model"
+                "Disable prefill CUDA graph because the model is not a language model"
             )
             return
 
-        # Disable piecewise CUDA graph for non capture size
+        # Disable prefill CUDA graph for non capture size
         if not self.server_args.cuda_graph_config.prefill.bs:
             logger.warning(
-                "Disable piecewise CUDA graph because the capture size is not set"
+                "Disable prefill CUDA graph because the capture size is not set"
             )
             return
 
@@ -2647,7 +2715,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             layer_model = language_model
         else:
             logger.warning(
-                "Disable piecewise CUDA graph because the model does not have a 'layers' attribute"
+                "Disable prefill CUDA graph because the model does not have a 'layers' attribute"
             )
             return
 
@@ -2719,14 +2787,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # TODO(yuwei): support Non-Standard GQA
             log_info_on_rank0(
                 logger,
-                "Disable piecewise CUDA graph because some layers do not apply Standard GQA",
+                "Disable prefill CUDA graph because some layers do not apply Standard GQA",
             )
             return
 
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        prefill_backend = self.server_args.cuda_graph_config.prefill.backend
+        role = "draft" if self.is_draft_worker else "target"
+        capture_name = f"{role} prefill"
+        capture_num_tokens = sorted(self.server_args.cuda_graph_config.prefill.bs)
         logger.info(
-            f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
+            f"Capture {capture_name} CUDA graph begin. "
+            f"backend={prefill_backend}, num_tokens={capture_num_tokens}, "
+            f"avail mem={before_mem:.2f} GB"
         )
 
         self.prefill_cuda_graph_runner = PrefillCudaGraphRunner(self)
@@ -2734,8 +2808,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         mem_usage = before_mem - after_mem
         logger.info(
-            f"Capture piecewise CUDA graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
-            f"mem usage={mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
+            f"Capture {capture_name} CUDA graph end. "
+            f"elapsed={time.perf_counter() - tic:.2f} s, "
+            f"mem usage={mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
         )
 
     def init_threads_binding(self):
@@ -2936,7 +3011,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
-        if (experts_capturer := get_global_experts_capturer()) is not None:
+        if (
+            not self.is_draft_worker
+            and (experts_capturer := get_global_experts_capturer()) is not None
+        ):
             output.routed_experts_output = experts_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
@@ -3028,13 +3106,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
                 and get_cp_strategy() is None
             ):
+                category = (
+                    "target_verify"
+                    if forward_batch.forward_mode.is_target_verify()
+                    else "extend"
+                )
                 # Prefill cuda graph (piecewise).
                 kwargs = self._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
                 # TODO: device_timer.wrap is too broad here — it also includes
                 # load_batch time. Move timing into the prefill cuda graph runner
                 # to capture only the model.forward part.
                 ctx = (
-                    self.device_timer.wrap(metadata={"category": "extend"})
+                    self.device_timer.wrap(metadata={"category": category})
                     if self.device_timer
                     else contextlib.nullcontext()
                 )
@@ -3155,8 +3238,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
 
-    def check_weights(self, action: str):
-        return self._weight_checker.handle(action=action)
+    def check_weights(self, action: str, allow_quant_error: bool = False):
+        return self._weight_checker.handle(
+            action=action, allow_quant_error=allow_quant_error
+        )
 
     def update_weights_from_ipc(self, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""

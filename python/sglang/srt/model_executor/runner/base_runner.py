@@ -78,6 +78,7 @@ def _allocate_decode_buffers(
     enable_mamba_track: bool,
     ne_token_table: Optional[torch.Tensor] = None,
     hc_hidden_size: Optional[int] = None,
+    pp_proxy_topk_size: Optional[int] = None,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers."""
     with torch.device(device):
@@ -114,6 +115,10 @@ def _allocate_decode_buffers(
             if not is_mhc:
                 pp_proxy_tensors["residual"] = torch.zeros(
                     (max_bs, hidden_size), dtype=dtype
+                )
+            if pp_proxy_topk_size is not None:
+                pp_proxy_tensors["topk_indices"] = torch.zeros(
+                    (max_num_token, pp_proxy_topk_size), dtype=torch.int32
                 )
         else:
             pp_proxy_tensors = None
@@ -297,7 +302,13 @@ class BaseRunner(ABC):
             "modelopt_fp8",
             "modelopt_mixed",
         )
-        fp8_gemm_needs_autotune = (
+        # Online MXFP8 (microscaling) linears dispatch to flashinfer's
+        # ``mm_mxfp8``, which the flashinfer fp8 autotune dummy run does not
+        # exercise correctly -- it triggers an illegal memory access inside the
+        # mxfp8 cutlass cubin. The mxfp8 gemm is fixed-config and needs no
+        # tuning, so skip autotune for these models.
+        model_uses_mxfp8 = "mxfp8" in (mr.model_config.quantization or "")
+        fp8_gemm_needs_autotune = not model_uses_mxfp8 and (
             get_fp8_gemm_runner_backend().is_flashinfer_cutlass()
             or (model_uses_modelopt_fp8 and is_sm100_supported())
         )
@@ -429,6 +440,7 @@ class BaseRunner(ABC):
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
+            pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
         )
 
     def _dummy_run(
