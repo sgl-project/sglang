@@ -91,8 +91,10 @@ QWEN3_NEXT_80B_A3B_OTHER_ARGS = [
     "bfloat16",
     "--speculative-draft-model-path",
     QWEN3_NEXT_80B_A3B_MODEL_PATH,
+    "--reasoning-parser",
+    "qwen3",
     "--tool-call-parser",
-    "qwen",
+    "qwen3_coder",
 ]
 
 
@@ -125,7 +127,7 @@ class TestQwen3Next80BA3B_aime25(TestNpuAccuracyTestCaseBase):
         "temperature": 0.7,
         "top_p": 0.8,
         "top_k": 20,
-        "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
     }
     max_concurrency = 16
 
