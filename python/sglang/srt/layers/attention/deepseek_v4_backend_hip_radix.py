@@ -589,11 +589,13 @@ class DeepseekV4HipRadixBackend(
         out_cache_loc: Optional[torch.Tensor] = None,
         extend_seq_lens: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
+        seq_lens_cpu: Optional[List[int]] = None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
         # HIP path: build target-verify metadata eagerly even when
         # SGLANG_PREP_IN_CUDA_GRAPH is enabled. The raw/lazy-upgrade route can
         # hit planner invariants during graph capture for DSV4+EAGLE.
-        seq_lens_cpu = seq_lens.tolist()
+        if seq_lens_cpu is None:
+            seq_lens_cpu = seq_lens.tolist()
         return self.init_forward_metadata_target_verify_old(
             max_seq_len=max_seq_len,
             req_pool_indices=req_pool_indices,
@@ -876,6 +878,9 @@ class DeepseekV4HipRadixBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc_padded,
                 use_prefill_cuda_graph=True,
+                # CPU mirror already available here (== seq_lens, no D2H);
+                # pass it so target_verify skips the per-iter seq_lens.tolist() sync.
+                seq_lens_cpu=seq_lens_cpu.tolist(),
             )
         elif bucket == _GraphBucket.DRAFT_EXTEND:
             num_tokens_per_bs = self.draft_extend_num_tokens_per_bs
@@ -952,6 +957,9 @@ class DeepseekV4HipRadixBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=forward_batch.out_cache_loc,
                 extend_seq_lens=forward_batch.extend_seq_lens,
+                seq_lens_cpu=(
+                    seq_lens_cpu.tolist() if seq_lens_cpu is not None else None
+                ),
             )
         elif forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu

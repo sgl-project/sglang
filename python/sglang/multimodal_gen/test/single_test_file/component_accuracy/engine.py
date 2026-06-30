@@ -17,13 +17,13 @@ from transformers import (
     UMT5EncoderModel,
 )
 
+# `AutoModelForVision2Seq` is not available in transformers 5.x.
+# `AutoModelForImageTextToText` is the supported name, so the legacy fallback
+# is gone. `AutoVisionTextModel` stays None-guarded below.
 try:
     from transformers import AutoModelForImageTextToText as AutoVisionTextModel
 except ImportError:
-    try:
-        from transformers import AutoModelForVision2Seq as AutoVisionTextModel
-    except ImportError:
-        AutoVisionTextModel = None
+    AutoVisionTextModel = None
 
 import sglang.multimodal_gen.runtime.managers.forward_context as fc_mod
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (

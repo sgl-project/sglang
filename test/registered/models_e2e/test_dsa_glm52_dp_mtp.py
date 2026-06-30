@@ -15,12 +15,13 @@ register_cuda_ci(
 )
 
 
-class TestGLM5TPMTP(
+class TestGLM52DPMTP(
     DsaMtpServerBase, DsaMtpEvalConfigDefaults, GSM8KMixin, SpecDecodingMixin
 ):
-    model = "zai-org/GLM-5-FP8"
-    mem_fraction_static = 0.8
-    bs_1_speed_thres = 150
+    model = "zai-org/GLM-5.2-FP8"
+    mem_fraction_static = 0.88
+    enable_dp_attention = True
+    bs_1_speed_thres = 70
 
 
 if __name__ == "__main__":
