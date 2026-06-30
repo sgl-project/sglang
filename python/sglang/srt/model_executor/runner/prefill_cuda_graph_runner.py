@@ -27,6 +27,7 @@ Backend selection comes from cuda_graph_config.prefill:
 
 from __future__ import annotations
 
+import inspect
 import logging
 import warnings
 from typing import TYPE_CHECKING, Dict, Optional, Union
@@ -75,6 +76,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
+from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
@@ -172,7 +174,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             max_bs=self.max_bs,
             max_num_tokens=self.max_num_tokens,
             cache_loc_dtype=self._cache_loc_dtype(),
-            is_hybrid_swa=model_runner.is_hybrid_swa,
             is_multimodal=self.is_multimodal,
             hidden_size=self.model_runner.model_config.hidden_size,
             dtype=self.model_runner.dtype,
@@ -238,24 +239,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # Static hidden_states buffer giving the captured graph a stable
         # address; load_batch refreshes it from live spec_info at replay.
-        # Draft consumes the aux-concatenated hidden states from the target
-        # (e.g. EAGLE3 stacks 3 target layers), so read the dim from the
-        # draft model's input fc when available; fall back to the per-layer
-        # dim for arches without an fc projection.
+        # Draft consumes aux-concatenated hidden states from the target
+        # (e.g. EAGLE3 stacks 3 target layers), so capture the pre-reduction
+        # width when the draft model exposes it.
         if (
             isinstance(self.backend, BreakableCudaGraphBackend)
             and model_runner.is_draft_worker
             and model_runner.spec_algorithm.is_eagle()
         ):
-            from sglang.srt.speculative.eagle_utils import get_draft_hidden_dim
-
-            inner = getattr(model_runner.model, "model", model_runner.model)
-            fc = getattr(inner, "fc", None)
-            hidden_dim = (
-                fc.in_features
-                if fc is not None and hasattr(fc, "in_features")
-                else get_draft_hidden_dim(model_runner)
-            )
+            hidden_dim = get_draft_input_from_target_hidden_dim(model_runner)
             with torch.device(self.device):
                 self.static_draft_hidden_states = torch.zeros(
                     (self.max_num_tokens, hidden_dim),
@@ -296,6 +288,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 language_model.model, "layers"
             ):
                 self.layer_model = language_model.model
+                params = list(inspect.signature(self.layer_model.forward).parameters)
+                self._input_embeds_arg_idx = (
+                    params.index("input_embeds") if "input_embeds" in params else None
+                )
             else:
                 raise RuntimeError(
                     f"BCG could not resolve inner layer_model on "
@@ -393,15 +389,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         set_is_extend_in_batch(False)
 
-        with forward_context(
-            ForwardContext(attn_backend=self.model_runner.attn_backend)
-        ), set_tc_piecewise_forward_context(
-            forward_batch,
-            self.attention_layers,
-            self.quant_config,
-            self.moe_layers,
-            self.moe_fusions,
-            dsa_indexers=self.dsa_indexers,
+        with (
+            forward_context(
+                ForwardContext(attn_backend=self.model_runner.attn_backend)
+            ),
+            set_tc_piecewise_forward_context(
+                forward_batch,
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
+                self.moe_fusions,
+                dsa_indexers=self.dsa_indexers,
+            ),
         ):
             if self.layer_model is not None:
                 return self.layer_model.forward(
@@ -877,8 +876,27 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # static_forward_batch. The outer's logits_processor /
                 # pooler then runs on top with live multi-req metadata.
                 shape_key = ShapeKey(size=self._static_num_tokens)
+                static_n = self._static_num_tokens
+
+                ie_idx = self._input_embeds_arg_idx
 
                 def replay_layer_forward(*args, **layer_kwargs):
+                    # The captured BCG graph reads activations from the static
+                    # input_embeds slot. The outer model.forward (run eagerly)
+                    # passes the live embeddings into layer_model.forward as the
+                    # 4th positional arg (or input_embeds kwarg): for multimodal
+                    # batches these are the composed text+vision embeds, for
+                    # text-only batches they are get_input_embeddings()(input_ids).
+                    # Copy them into the slot before replay so the graph sees the
+                    # current request's embeddings (mirrors main's BCG closure).
+                    if self.buffer_registry.has_slot("input_embeds"):
+                        ie = layer_kwargs.get("input_embeds")
+                        if ie is None and ie_idx is not None and len(args) > ie_idx:
+                            ie = args[ie_idx]
+                        if ie is not None:
+                            self.buffer_registry.get_slot("input_embeds").slice_for(
+                                1, static_n
+                            ).copy_(ie[:static_n])
                     return self.backend.replay(
                         shape_key, static_forward_batch, **kwargs
                     )
@@ -886,17 +904,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 original_layer_forward = self.layer_model.forward
                 self.layer_model.forward = replay_layer_forward
                 try:
-                    with forward_context(
-                        ForwardContext(attn_backend=self.model_runner.attn_backend)
-                    ), set_tc_piecewise_forward_context(
-                        static_forward_batch,
-                        self.attention_layers,
-                        self.quant_config,
-                        self.moe_layers,
-                        self.moe_fusions,
-                        dsa_indexers=self.dsa_indexers,
-                        num_tokens=static_num_tokens,
-                        raw_num_tokens=raw_num_tokens,
+                    with (
+                        forward_context(
+                            ForwardContext(attn_backend=self.model_runner.attn_backend)
+                        ),
+                        set_tc_piecewise_forward_context(
+                            static_forward_batch,
+                            self.attention_layers,
+                            self.quant_config,
+                            self.moe_layers,
+                            self.moe_fusions,
+                            dsa_indexers=self.dsa_indexers,
+                            num_tokens=static_num_tokens,
+                            raw_num_tokens=raw_num_tokens,
+                        ),
                     ):
                         output = self.model_runner.model.forward(
                             static_forward_batch.input_ids,
@@ -910,17 +931,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # TC_PIECEWISE path. backend.replay calls the compiled
                 # outer model.forward directly (torch.compile handles
                 # multi-req via bs-invariant FX-traced kernels).
-                with forward_context(
-                    ForwardContext(attn_backend=self.model_runner.attn_backend)
-                ), set_tc_piecewise_forward_context(
-                    static_forward_batch,
-                    self.attention_layers,
-                    self.quant_config,
-                    self.moe_layers,
-                    self.moe_fusions,
-                    dsa_indexers=self.dsa_indexers,
-                    num_tokens=static_num_tokens,
-                    raw_num_tokens=raw_num_tokens,
+                with (
+                    forward_context(
+                        ForwardContext(attn_backend=self.model_runner.attn_backend)
+                    ),
+                    set_tc_piecewise_forward_context(
+                        static_forward_batch,
+                        self.attention_layers,
+                        self.quant_config,
+                        self.moe_layers,
+                        self.moe_fusions,
+                        dsa_indexers=self.dsa_indexers,
+                        num_tokens=static_num_tokens,
+                        raw_num_tokens=raw_num_tokens,
+                    ),
                 ):
                     output = self.backend.replay(
                         self._static_num_tokens, static_forward_batch, **kwargs

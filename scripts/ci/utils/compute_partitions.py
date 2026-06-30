@@ -38,7 +38,7 @@ _TARGET_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
 # base-a is the critical-path entry gate; pin its fanout to smoke-coverage
 # defaults instead of est_time. max_parallel = size (no throttle).
 _BASE_A_OVERRIDES = {
-    "base-a-test-cpu": 4,
+    "base-a-test-cpu": 8,
     "base-a-test-1-gpu-small": 1,
 }
 

@@ -374,10 +374,10 @@
                 "ImageVAEEncodingStage": 0.01
             },
             "denoise_step_ms": {
-                "0": 16.21,
-                "1": 13.42,
-                "2": 17.64,
-                "3": 63.6
+                "0": 28.54,
+                "1": 12.61,
+                "2": 57.24,
+                "3": 64.49
             },
             "expected_e2e_ms": 434.57,
             "expected_avg_denoise_ms": 39.98,
@@ -2101,7 +2101,7 @@
                 "3": 650.0,
                 "4": 271.46,
                 "5": 266.71,
-                "6": 232.55,
+                "6": 650.0,
                 "7": 270.08,
                 "8": 259.96
             },
@@ -2845,6 +2845,14 @@
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 592.3
+        },
+        "qwen_image_2512_modelopt_nvfp4_t2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 120.0
         },
         "wan22_modelopt_nvfp4_t2v": {
             "stages_ms": {},
