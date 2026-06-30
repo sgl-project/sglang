@@ -30,12 +30,18 @@ from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
 
+_cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+_sm_major = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+_supports_flashinfer_linear_gdn = _sm_major == 9 or (
+    _sm_major == 10 and _cuda_major >= 13
+)
+
 
 @unittest.skipIf(
     not torch.cuda.is_available() or not is_flashinfer_available(),
     "CUDA + flashinfer are required",
 )
-class TestFlashInferGDNBackendCorrectness(CustomTestCase):
+class TestFlashInferFullAttentionWithTritonGDNCorrectness(CustomTestCase):
     # FlashInfer SM90 prefill kernels require value head dim in {64, 128, 256}.
     HEAD_K_DIM = 64
     HEAD_V_DIM = 64
@@ -319,6 +325,78 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
                     spec_kind=spec_kind,
                     head_k_dim=self.HEAD_K_DIM,
                     head_v_dim=self.HEAD_V_DIM,
+                )
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available()
+    and is_flashinfer_available()
+    and _supports_flashinfer_linear_gdn,
+    "FlashInfer linear GDN requires SM90 or SM100/SM103 with CUDA 13+",
+)
+class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
+    # FlashInfer's SM100 GDN prefill kernel requires head size 128. SM90 supports 64.
+    HEAD_DIM = 128 if _sm_major == 10 else 64
+    PREFILL_CASE = GDNAttentionCase(
+        name="flashinfer_gdn_prefill_ragged",
+        backend="triton",
+        linear_attn_prefill_backend="flashinfer",
+        forward_mode=ForwardMode.EXTEND,
+        num_k_heads=2,
+        num_v_heads=4,
+        page_size=16,
+        prefix_lens=(3, 7),
+        extend_lens=(65, 17),
+    )
+    EAGLE_VERIFY_CASES = (
+        (
+            GDNAttentionCase(
+                name="flashinfer_linear_gdn_verify_chain",
+                backend="triton",
+                linear_attn_prefill_backend="flashinfer",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_k_heads=2,
+                num_v_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+        ),
+        (
+            GDNAttentionCase(
+                name="flashinfer_linear_gdn_verify_tree_triton_fallback",
+                backend="triton",
+                linear_attn_prefill_backend="flashinfer",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_k_heads=2,
+                num_v_heads=4,
+                page_size=16,
+                prefix_lens=(5, 6),
+                extend_lens=(3, 3),
+            ),
+            2,
+        ),
+    )
+
+    def test_prefill_output_and_final_state(self):
+        run_gdn_attention_case(
+            self,
+            self.PREFILL_CASE,
+            head_k_dim=self.HEAD_DIM,
+            head_v_dim=self.HEAD_DIM,
+            max_context_len=128,
+        )
+
+    def test_verify_chain_and_tree_fallback(self):
+        for case, topk in self.EAGLE_VERIFY_CASES:
+            with self.subTest(case=case.name, topk=topk):
+                run_gdn_eagle_verify_case(
+                    self,
+                    case,
+                    topk=topk,
+                    head_k_dim=self.HEAD_DIM,
+                    head_v_dim=self.HEAD_DIM,
                 )
 
 

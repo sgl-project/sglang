@@ -56,6 +56,7 @@ class GDNAttentionCase:
     page_size: int
     prefix_lens: tuple[int, ...]
     extend_lens: tuple[int, ...] = ()
+    linear_attn_prefill_backend: str | None = None
 
     @property
     def batch_size(self) -> int:
@@ -205,6 +206,7 @@ class MockGDNModelRunner(ModelRunner):
         disable_cuda_graph: bool = True,
         disable_piecewise_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
+        speculative_eagle_topk: int = 1,
     ):
         pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
@@ -241,13 +243,15 @@ class MockGDNModelRunner(ModelRunner):
             enable_mis=False,
             linear_attn_backend="triton",
             linear_attn_decode_backend=None,
-            linear_attn_prefill_backend=None,
+            linear_attn_prefill_backend=case.linear_attn_prefill_backend,
             mamba_cache_chunk_size=64,
             max_running_requests=None,
             model_path=None,
             revision=None,
             speculative_algorithm=None,
-            speculative_eagle_topk=1 if case.forward_mode.is_target_verify() else 0,
+            speculative_eagle_topk=(
+                speculative_eagle_topk if case.forward_mode.is_target_verify() else 0
+            ),
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
             triton_attention_num_kv_splits=8,
@@ -262,10 +266,16 @@ class MockGDNModelRunner(ModelRunner):
             state_size=head_k_dim,
             conv_kernel=2,
         )
+        temporal_state_dtype = (
+            dtype
+            if case.linear_attn_prefill_backend == "flashinfer"
+            and torch.cuda.get_device_capability()[0] >= 10
+            else torch.float32
+        )
         cache_params = Mamba2CacheParams(
             shape=cache_shape,
             layers=[0],
-            dtype=Mamba2StateDType(conv=dtype, temporal=torch.float32),
+            dtype=Mamba2StateDType(conv=dtype, temporal=temporal_state_dtype),
         )
         self.req_to_token_pool = HybridReqToTokenPool(
             size=pool_batch_size,
@@ -554,6 +564,7 @@ def build_gdn_attention_fixture(
     disable_cuda_graph: bool = True,
     disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
+    speculative_eagle_topk: int = 1,
     loc_layout: str = "shuffled_pages",
 ) -> GDNAttentionFixture:
     seed = 4096 + len(case.name)
@@ -577,6 +588,7 @@ def build_gdn_attention_fixture(
         disable_cuda_graph=disable_cuda_graph,
         disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
+        speculative_eagle_topk=speculative_eagle_topk,
     )
     try:
         full_backend = ATTENTION_BACKENDS[case.backend](runner)
@@ -585,6 +597,17 @@ def build_gdn_attention_fixture(
 
     initialize_linear_attn_config(runner.server_args)
     linear_backend = GDNAttnBackend(runner)
+    if case.linear_attn_prefill_backend == "flashinfer":
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            FlashInferGDNKernel,
+        )
+
+        testcase.assertIsInstance(
+            linear_backend.kernel_dispatcher.extend_kernel, FlashInferGDNKernel
+        )
+        testcase.assertIsInstance(
+            linear_backend.kernel_dispatcher.verify_kernel, FlashInferGDNKernel
+        )
     backend = HybridLinearAttnBackend(full_backend, linear_backend, full_attn_layers=[])
     actual_module = ProjectedGDNAttention(
         num_k_heads=case.num_k_heads,
@@ -831,6 +854,7 @@ def make_gdn_case_with_prefix_lens(
         page_size=case.page_size,
         prefix_lens=prefix_lens,
         extend_lens=extend_lens,
+        linear_attn_prefill_backend=case.linear_attn_prefill_backend,
     )
 
 
@@ -1084,7 +1108,13 @@ def run_gdn_attention_case(
     expected = _pure_torch_gdn_reference(fixture, initial_ssm_states)
 
     torch.testing.assert_close(actual, expected.output, atol=GDN_ATOL, rtol=GDN_RTOL)
-    if case.forward_mode.is_decode():
+    # Prefill/extend must persist the final recurrent state for the next
+    # decode step just as decode does. Checking only token outputs would let a
+    # broken FlashInfer state writeback pass all prefill correctness cases.
+    if (
+        case.forward_mode.is_decode()
+        or case.forward_mode.is_extend_without_speculative()
+    ):
         torch.testing.assert_close(
             _ssm_states(fixture)[_cache_indices(fixture)],
             expected.final_states[_cache_indices(fixture)],

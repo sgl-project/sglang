@@ -674,6 +674,7 @@ def run_gdn_eagle_verify_case(
         max_context_len=max_context_len,
         dtype=dtype,
         device=device,
+        speculative_eagle_topk=topk,
     )
     _prepare_target_verify_batch(fixture.forward_batch, case, device)
     fixture.forward_batch.spec_info = _make_spec_verify_input(
@@ -779,6 +780,7 @@ def run_gdn_eagle_verify_cuda_graph_case(
             max_context_len=max_context_len,
             dtype=dtype,
             device=device,
+            speculative_eagle_topk=topk,
         ),
         capture_batch_size=cuda_graph_capture_batch_size,
         max_context_len=max_context_len,
