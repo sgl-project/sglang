@@ -362,6 +362,104 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
         )
 
 
+import torch
+import torch_npu
+from sglang.srt.hardware_backend.npu.moe.matmul import GroupedMatmul
+from ._base import _NPUMoEMethodBase  # adjust import as needed
+
+
+class NPUW8A8Mxfp8MoEMethod(_NPUMoEMethodBase):
+    """W8A8 MXFP8 MoE – weights float8_e4m3fn, scales uint8 (per‑group)."""
+
+    def __init__(self, group_size: int = 32):
+        super().__init__(quant_config=None)
+        self.group_size = group_size
+        self.matmul = GroupedMatmul()
+
+    # ------------------------------------------------------------------
+    # Weight processing – mirror the reference MXFP8 transformations
+    # ------------------------------------------------------------------
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, weight_prefix: str
+    ) -> None:
+        self._validate_weight_prefix(layer, weight_prefix)
+
+        weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")   # [E, N, K]
+        scale: torch.Tensor = getattr(layer, f"{weight_prefix}_weight_scale")  # [E, N, groups]
+
+        # 1) Weight: transpose to [E, K, N]
+        weight.data = weight.data.transpose(1, 2).contiguous()
+
+        # 2) Scale: pad if number of groups is odd, then pack into [E, groups//2, N, 2]
+        groups = scale.shape[-1]
+        if groups % 2 != 0:
+            # pad the last dimension (groups) to make it even
+            scale = torch.nn.functional.pad(scale, (0, 1))
+            groups += 1
+        scale.data = scale.data.reshape(scale.shape[0], scale.shape[1], groups // 2, 2)
+        # transpose: [E, N, groups//2, 2] -> [E, groups//2, N, 2]
+        scale.data = scale.data.transpose(1, 2).contiguous()
+
+        setattr(
+            layer,
+            f"{weight_prefix}_weight",
+            torch.nn.Parameter(weight.data, requires_grad=False),
+        )
+        setattr(
+            layer,
+            f"{weight_prefix}_weight_scale",
+            torch.nn.Parameter(scale.data, requires_grad=False),
+        )
+
+        # Set dispatcher output dtype – float8
+        if weight_prefix == "w13":
+            self._set_dispatcher_output_dtype(layer, torch.float8_e4m3fn)
+
+    # ------------------------------------------------------------------
+    # Forward pass with dynamic MX quantization
+    # ------------------------------------------------------------------
+    def apply(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: torch.Tensor,       # None => compute dynamically
+        output_dtype: torch.dtype,
+        weight_prefix: str,
+        group_list_type,
+    ) -> torch.Tensor:
+        # Fetch the pre-processed weight scale (already in [E, groups//2, N, 2])
+        scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
+
+        # Dynamic MX quantization of activations
+        if pertoken_scale is None:
+            # hidden_states is in bf16/fp16, output float8_e4m3fn + scale in e8m0
+            hidden_states, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
+                hidden_states, dst_type=torch.float8_e4m3fn
+            )
+            # per‑token scale shape is [tokens, 1] – squeeze to [tokens]
+            pertoken_scale = pertoken_scale.squeeze(-1)
+
+        # Grouped matmul expects these kwargs
+        scale_args: Dict[str, Any] = {
+            "scale": [scale],
+            "per_token_scale": [pertoken_scale],
+            "scale_dtype": torch.float8_e8m0fnu,
+            "pertoken_scale_dtype": torch.float8_e8m0fnu,
+            "group_sizes": [1, 1, self.group_size],
+        }
+
+        return self.matmul.forward(
+            quant_info,
+            weight_prefix,
+            hidden_states,          # now float8_e4m3fn
+            expert_tokens,
+            output_dtype,
+            group_list_type=group_list_type,
+            **scale_args,
+        )
+
+
 # ---------------------------------------------------------------------------
 #  NPUW4A8Int8MoEMethod
 # ---------------------------------------------------------------------------
