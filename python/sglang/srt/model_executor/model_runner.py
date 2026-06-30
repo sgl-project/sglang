@@ -1132,7 +1132,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 f"Failed to register parallelism config for tp_rank={self.tp_rank}: {e}"
             )
 
-    def _get_bootstrap_network_address(self) -> "NetworkAddress":
+    def _get_bootstrap_network_address(self) -> NetworkAddress:
         """Get the NetworkAddress for the EngineInfoBootstrapServer."""
         if self.server_args.dist_init_addr:
             # Multi-node: bootstrap server is on the head node (node_rank==0).

@@ -36,7 +36,7 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import terminate_process
 
-register_cuda_ci(est_time=200, suite="base-b-test-2-gpu-large")
+register_cuda_ci(est_time=200, stage="base-b", runner_config="2-gpu-large")
 
 
 def get_transfer_engine_info(url: str, rank: int) -> Dict:
