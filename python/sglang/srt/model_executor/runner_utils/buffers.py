@@ -71,9 +71,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
     out_cache_loc: torch.Tensor
     # Shared-KV-pool cuda-graph WRITE-location buffer (int64, matching the
     # v2p table dtype). Holds the full-physical write locations under the shared
-    # pool, refreshed IN-GRAPH each replay by `_capture_shared_pool_write_translate`.
-    # `None` for non-shared pools (then the capture pins / in-graph translate are
-    # no-ops, keeping baseline cg_on byte-identical).
+    # pool, refreshed IN-GRAPH each replay by the backend's
+    # `init_forward_metadata_in_graph`. `None` for non-shared pools (then the
+    # in-graph translate is a no-op, keeping baseline cg_on byte-identical).
     out_cache_loc_full_physical: Optional[torch.Tensor]
     positions: torch.Tensor
     mrope_positions: torch.Tensor

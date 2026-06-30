@@ -1149,6 +1149,19 @@ class TritonAttnBackend(AttentionBackend):
         bs = forward_batch.batch_size
         if self._translate_kv_loc_bounded is None:
             return  # non-shared → translate-free graph (Invariant 2)
+        # Full-attention WRITE path: translate the virtual `out_cache_loc` graph
+        # buffer -> physical IN PLACE into the capture-stable
+        # `out_cache_loc_full_physical` buffer (the runner points
+        # `forward_batch.out_cache_loc_full_physical` at it; `KVWriteLoc.full_loc`
+        # reads it). Recorded here so replay re-runs it on the LIVE v2p — the
+        # write-path companion to the read-path translate below, mirroring the
+        # eager `init_forward_metadata`. The runner still owns the buffer; only
+        # the translate lives in the backend.
+        if forward_batch.out_cache_loc_full_physical is not None:
+            self._translate_kv_loc(
+                forward_batch.out_cache_loc,
+                out=forward_batch.out_cache_loc_full_physical,
+            )
         # Full-attention read path: cuda_graph_kv_indices[0:kv_indptr[bs]].
         # Translate VIRTUAL -> PHYSICAL in place at replay (reads the LIVE v2p).
         self._translate_kv_loc_bounded(self.cuda_graph_kv_indices, self.kv_indptr, bs)

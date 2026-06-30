@@ -513,39 +513,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             tp_rank=get_tensor_model_parallel_rank(),
         )
 
-    def _capture_shared_pool_write_translate(
-        self, out_cache_loc: torch.Tensor, num_tokens: int
-    ) -> None:
-        """Run the shared-pool full-attention write-path v2p translate so it
-        is recorded as cuda-graph nodes at the FRONT of the captured decode
-        graph.
-
-        Reads the *virtual* ``out_cache_loc`` graph buffer + the live v2p table
-        and writes the full-physical (int64) graph buffer in place (via
-        ``out=``). ``capture_one_shape`` points the capture forward_batch's
-        ``out_cache_loc_full_physical`` at the SAME buffer, so it flows into
-        ``KVWriteLoc.full_loc`` and the captured per-layer ``set_kv_buffer``
-        writes it directly (the pool never translates). This is the shared-pool
-        replacement for an eager per-step write-loc translate on the cg_on
-        critical path. (The SWA write loc rides the backend
-        ``cuda_graph_swa_out_cache_loc`` rail, refilled by the backend at replay.)
-
-        No-op for non-shared pools — the captured graph then has zero
-        translate/clamp nodes (Invariant 2), keeping baseline cg_on
-        byte-identical.
-        """
-        if not self.model_runner.enable_shared_kv_pool:
-            return
-        alloc = self.model_runner.token_to_kv_pool_allocator
-        buffers = self.buffers
-        if buffers.out_cache_loc_full_physical is not None and hasattr(
-            alloc, "translate_kv_loc"
-        ):
-            alloc.translate_kv_loc(
-                out_cache_loc,
-                out=buffers.out_cache_loc_full_physical[:num_tokens],
-            )
-
     def capture_prepare(
         self,
         size: int,
@@ -827,25 +794,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
-                # Capture the shared-pool full-attention WRITE-path v2p translate
-                # as graph nodes at the FRONT of the decode graph, before the
-                # model forward reads the physical loc buffer via set_kv_buffer.
-                # Reads the virtual `out_cache_loc` graph buffer (refilled by the
-                # buffer registry each replay) + the live v2p; writes the
-                # full-physical graph buffer that forward_batch.out_cache_loc_full_physical
-                # points at (-> KVWriteLoc.full_loc). (The SWA write loc rides the
-                # backend `swa_out_cache_loc` rail.) No-op for non-shared pools.
-                self._capture_shared_pool_write_translate(out_cache_loc, num_tokens)
-
-                # Graph-recordable READ-path metadata prep — the upstream #27091
+                # Graph-recordable metadata prep — the upstream #27091
                 # `init_forward_metadata_in_graph` hook. For the shared pool,
-                # TritonAttnBackend.init_forward_metadata_in_graph records the
-                # kv_indices virtual->physical translate (in place, GPU-bounded
-                # by kv_indptr[bs], no .item()) at the front of the graph; base
-                # no-op otherwise (Invariant 2: a baseline graph has zero
-                # translate nodes). Must run inside the capture block: warmup
-                # mutations here are undone by on_after_cuda_graph_warmup so
-                # capture starts clean.
+                # TritonAttnBackend.init_forward_metadata_in_graph records BOTH
+                # the full-attention WRITE-path translate (virtual `out_cache_loc`
+                # -> the capture-stable `out_cache_loc_full_physical` buffer the
+                # runner points `forward_batch.out_cache_loc_full_physical` at,
+                # consumed via `KVWriteLoc.full_loc`) AND the kv_indices READ-path
+                # translate (in place, GPU-bounded by kv_indptr[bs], no .item())
+                # at the front of the graph; base no-op otherwise (Invariant 2: a
+                # baseline graph has zero translate nodes). Must run inside the
+                # capture block: warmup mutations here are undone by
+                # on_after_cuda_graph_warmup so capture starts clean. (The SWA
+                # write loc rides the backend `swa_out_cache_loc` rail.)
                 attn_backend.init_forward_metadata_in_graph(forward_batch)
 
                 # NB: the old warmup `token_to_kv_pool.invalidate_loc_cache()`
@@ -856,10 +817,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 # phase-4 base (06-08) includes #27091, so the method no longer
                 # exists on baseline SWAKVPool or (by inheritance) the shared
                 # SWA pool. The shared pool's capture instead records the
-                # translate explicitly via `_capture_shared_pool_write_translate`
-                # + `init_forward_metadata_in_graph` above, so no cache
-                # invalidation is needed. Matches rebase-orig (which dropped
-                # this call too).
+                # write + read translates via `init_forward_metadata_in_graph`
+                # above, so no cache invalidation is needed. Matches rebase-orig
+                # (which dropped this call too).
 
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
                     None
@@ -918,8 +878,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
             # Full-physical write loc lives in the attention metadata: point the
             # capture forward_batch's `out_cache_loc_full_physical` at the
-            # capture-stable graph buffer (filled IN-graph by
-            # `_capture_shared_pool_write_translate` above) so it flows into
+            # capture-stable graph buffer (filled IN-graph by the backend's
+            # `init_forward_metadata_in_graph`) so it flows into
             # `KVWriteLoc.full_loc` and the captured `set_kv_buffer` reads it —
             # no pool-side pin. (The SWA write loc rides the backend
             # `swa_out_cache_loc` rail, consumed in `SharedSWAKVPool.set_kv_buffer`.)
