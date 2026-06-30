@@ -316,6 +316,16 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             * kv_size
         )
 
+        # EAGLE/STANDALONE draft KV pool inherits max_total tokens with its
+        # full-attn layers; budget into the full term.
+        self._draft_full_layers_num = 0
+        if (
+            mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
+        ) and not mr.is_draft_worker:
+            draft_layers = getattr(mr, "eagle_draft_num_layers", None)
+            if draft_layers is not None and int(draft_layers) > 0:
+                self._draft_full_layers_num = int(draft_layers)
+
         # Bytes per token of max_total_num_tokens.
         #
         # Hybrid (full_layers > 0): max_total = full_tokens, so cell_size accounts
@@ -326,10 +336,14 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         # token beyond the sliding window can be evicted. So cell_size = S*ns,
         # with no ratio factor applied.
         if self._full_layers_num == 0:
-            self._cell_size = self._swa_per_token * self._swa_layers_num
+            self._cell_size = (
+                self._swa_per_token * self._swa_layers_num
+                + self._full_per_token * self._draft_full_layers_num
+            )
         else:
             self._cell_size = (
-                self._full_per_token * self._full_layers_num
+                self._full_per_token
+                * (self._full_layers_num + self._draft_full_layers_num)
                 + self._swa_full_tokens_ratio
                 * self._swa_per_token
                 * self._swa_layers_num
@@ -453,7 +467,9 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         # SWA pool sized tightly from the cap; the rest of the budget goes to full.
         swa_tokens = ceil_align(self._swa_cap, page_size)
         fixed_swa_bytes = swa_tokens * self._swa_per_token * self._swa_layers_num
-        full_cell_size = self._full_per_token * self._full_layers_num
+        full_cell_size = self._full_per_token * (
+            self._full_layers_num + self._draft_full_layers_num
+        )
         full_tokens = (
             int((available_bytes - fixed_swa_bytes) // full_cell_size) // page_size
         ) * page_size
