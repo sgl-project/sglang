@@ -35,17 +35,6 @@ def _as_bf16(t: torch.Tensor) -> torch.Tensor:
     return t.contiguous()
 
 
-def _as_contiguous(t: torch.Tensor) -> torch.Tensor:
-    """Ensure contiguous without dtype cast. cuLA's decode/verify kernels compute
-    in fp32/TF32 (SMEM is fp32, MMA is TF32) and accept fp32 q/k/v natively, so we
-    pass Ling's fp32 q/k/v straight through — no fp32->bf16 cast, which would add 3
-    cast kernels/layer/step that dominated the graph-replay cost.
-    """
-    if t.is_contiguous():
-        return t
-    return t.contiguous()
-
-
 # Kept as the entry point for a future all-cuLA prefill path. The current
 # linear_backend="cula" routes prefill through the seg_la kernel family with
 # [v,k] state layout (see lightning_backend.py) so only decode/verify/commit
@@ -96,7 +85,8 @@ def cula_decode(q, k, v, temporal, cache_indices, decay, scale, out):
     # cuLA decode computes in fp32 (element-wise recurrence); pass q/k/v through
     # in their native dtype (fp32 at runtime) — casting to bf16 would only add
     # cast kernels that the kernel re-converts to fp32 internally.
-    q, k, v = _as_contiguous(q), _as_contiguous(k), _as_contiguous(v)
+    if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
     # Caller must pass a bf16 output buffer; a dtype-dependent re-allocation here
     # would silently swap the buffer baked into a captured CUDA graph.
     assert out.dtype == torch.bfloat16, "cula_decode out must be bf16"
@@ -139,7 +129,7 @@ def cula_verify(
         decay: [H, 1, 1] fp32 positive slopes
         scale: float softmax scale
         T: int draft_token_num
-        out: [B*T, HV, V] bf16 preallocated output
+        out: [B*T, HV, V] fp32 preallocated output
         k_buf, v_buf: [pool_size, T, H, K] / [pool_size, T, HV, V] fp32 draft
             buffers. When provided, the kernel writes k/v into them (fused,
             write_kv=True) so the caller does NOT need separate scatter kernels.
@@ -147,6 +137,7 @@ def cula_verify(
         out reshaped to [B*T, HV, V]
     """
     _check_cula()
+    output_dtype = v.dtype
     # cuLA verify kernel loads q/k into fp32 registers (autovec_copy requires
     # matching bit-width). At runtime Ling feeds fp32 (fp32 rotary) -> no cast.
     # For non-fp32 inputs (test kit bf16), cast to fp32 (defensive, not hot path).
@@ -154,9 +145,9 @@ def cula_verify(
         q = q.to(torch.float32).contiguous()
         k = k.to(torch.float32).contiguous()
         v = v.to(torch.float32).contiguous()
-    else:
-        q, k, v = _as_contiguous(q), _as_contiguous(k), _as_contiguous(v)
-    assert out.dtype == torch.bfloat16, "cula_verify out must be bf16"
+    elif not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    assert out.dtype == torch.float32, "cula_verify out must be fp32"
     assert cache_indices.dtype == torch.int32, "cache_indices must be int32"
     B = cache_indices.shape[0]
     H = q.shape[1]
@@ -180,7 +171,7 @@ def cula_verify(
         k_buf=k_buf,
         v_buf=v_buf,
     )
-    return out
+    return out if out.dtype == output_dtype else out.to(output_dtype)
 
 
 def cula_commit(draft_k, draft_v, temporal, cache_indices, accepted_len, decay, T):

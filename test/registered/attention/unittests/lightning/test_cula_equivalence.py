@@ -108,7 +108,7 @@ class TestCulaKernelCorrectness(CustomTestCase):
         # cuLA
         pool_idx = torch.arange(B, device="cuda", dtype=torch.int32)
         s_cula = state_kmajor.transpose(-1, -2).contiguous()
-        out_cula = torch.zeros(B, T, H, D, device="cuda", dtype=torch.bfloat16)
+        out_cula = torch.zeros(B, T, H, D, device="cuda", dtype=torch.float32)
         linear_attention_verify_kvbuffer(
             q.view(B, T, H, D),
             k.view(B, T, H, D),

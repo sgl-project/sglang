@@ -181,7 +181,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 dummy_outv = torch.zeros(
                     (total, self.num_heads, self.head_dim),
                     device=self.device,
-                    dtype=out_dtype,
+                    dtype=torch.float32,
                 )
                 dummy_idx = torch.zeros(bs, dtype=torch.int32, device=self.device)
                 # Warm the write_kv=True variant (runtime uses fused draft writes).
@@ -482,7 +482,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 # cula_verify accepts fp32 q/k/v natively and fuses the draft_k/v
                 # writes (write_kv=True) -- no separate scatter kernels. draft_k/v
                 # are per-layer [pool, T, H, K] / [pool, T, HV, V] fp32 buffers.
-                out = torch.empty_like(v, dtype=torch.bfloat16)
+                out = torch.empty_like(v, dtype=torch.float32)
                 o = cula_verify(
                     q,
                     k,
