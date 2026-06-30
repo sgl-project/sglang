@@ -70,7 +70,7 @@ class MambaAttnBackendBase(AttentionBackend):
             # shared pool) slot ids before zeroing — else clear_slots would zero
             # the WRONG physical slots. Identity for the non-shared pool.
             self.req_to_token_pool.mamba_pool.clear_slots(
-                self._maybe_translate_mamba_indices(forward_batch.mamba_clear_indices)
+                self._translate_mamba_indices(forward_batch.mamba_clear_indices)
             )
         if (
             forward_batch.mamba_cow_src_indices is not None
@@ -89,36 +89,24 @@ class MambaAttnBackendBase(AttentionBackend):
                 # mamba_pool is a pure PHYSICAL store; translate both COW slot
                 # ids virtual->physical (identity for the non-shared pool).
                 self.req_to_token_pool.mamba_pool.copy_from(
-                    self._maybe_translate_mamba_indices(
-                        forward_batch.mamba_cow_src_indices
-                    ),
-                    self._maybe_translate_mamba_indices(
-                        forward_batch.mamba_cow_dst_indices
-                    ),
+                    self._translate_mamba_indices(forward_batch.mamba_cow_src_indices),
+                    self._translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
                 )
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
 
-    def _maybe_translate_mamba_indices(
-        self, mamba_indices: torch.Tensor
-    ) -> torch.Tensor:
-        """Shared KV pool: ``get_mamba_indices`` returns *virtual* per-request
-        mamba ids; translate them to *physical* slot ids. Identity for the
-        non-shared ``HybridReqToTokenPool`` (its ``translate_mamba_indices``
-        returns the indices unchanged).
+    def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
+        """Virtual->physical mamba slot-id translate (delegates to
+        ``req_to_token_pool.translate_mamba_indices``: identity for the
+        non-shared pool, allocator v2p for the shared pool).
 
-        MUST be applied EVERYWHERE the mamba indices feed the SSM/conv kernels:
-        the eager ``_forward_metadata`` AND the cuda-graph
-        ``_capture_metadata`` / ``_replay_metadata`` (which copy the indices into
-        the captured-graph's stable ``state_indices_list`` buffer). Omitting it on
-        the cuda-graph path made cg_on feed VIRTUAL ids to the captured Mamba
-        kernels as if PHYSICAL → wrong state slot → garbled/truncated output,
-        while cg_off (eager) was correct. The translate runs in replay-prep
-        (eager, before ``graph.replay()``), so it reads the LIVE v2p table
-        post-compaction; the physical result is copied into the stable buffer the
-        captured graph reads. Also gates the mamba-pool state ops (clear_slots /
-        copy_from), which write the PHYSICAL state buffer directly.
+        Apply EVERYWHERE mamba ids feed the SSM/conv kernels or the mamba-pool
+        state ops (``clear_slots`` / ``copy_from``): the eager
+        ``_forward_metadata`` AND the cuda-graph replay-prep (which copies the
+        result into the captured graph's stable ``state_indices_list``). Missing
+        it on the cuda-graph path feeds VIRTUAL ids to the captured kernels →
+        wrong state slot → garbled output.
         """
         return self.req_to_token_pool.translate_mamba_indices(mamba_indices)
 
@@ -140,16 +128,16 @@ class MambaAttnBackendBase(AttentionBackend):
         # Shared KV pool: get_mamba_indices returns *virtual* per-request ids;
         # translate to *physical* slot ids once per batch (no-op for the
         # non-shared HybridReqToTokenPool). MUST also happen on the cuda-graph
-        # capture/replay metadata path — see `_maybe_translate_mamba_indices`.
+        # capture/replay metadata path — see `_translate_mamba_indices`.
         # Translate BEFORE the cuda-graph padding sentinel below, so the
         # virtual->physical gather reads only real ids; padded rows are then
         # poisoned to -1 (the mamba kernels skip -1).
-        mamba_cache_indices = self._maybe_translate_mamba_indices(mamba_cache_indices)
+        mamba_cache_indices = self._translate_mamba_indices(mamba_cache_indices)
         if forward_batch.mamba_track_indices is not None:
             # The *_track_* index derivations below index by mamba slot too
             # (speculative path; spec is off for the shared pool today). Identity
             # for the non-shared pool.
-            forward_batch.mamba_track_indices = self._maybe_translate_mamba_indices(
+            forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
             )
         _real_bs = forward_batch._original_batch_size
@@ -332,7 +320,7 @@ class MambaAttnBackendBase(AttentionBackend):
         if not in_capture:
             _mt = forward_batch.mamba_track_indices
             if _mt is not None and _mt.numel() > 0:
-                _phys = self._maybe_translate_mamba_indices(_mt)
+                _phys = self._translate_mamba_indices(_mt)
                 if _phys is not _mt:
                     _mt.copy_(_phys)
 
@@ -618,7 +606,7 @@ class MambaAttnBackendBase(AttentionBackend):
         # Shared pool: virtual -> physical (no-op otherwise). The captured Mamba
         # kernels read state_indices_list as PHYSICAL slot ids, so we must
         # translate before copying — same as the eager _forward_metadata path.
-        mamba_indices = self._maybe_translate_mamba_indices(mamba_indices)
+        mamba_indices = self._translate_mamba_indices(mamba_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
 
         # GDN ReplaySSM (slice 1b): point at the STATIC per-bs write-cursor
@@ -686,7 +674,7 @@ class MambaAttnBackendBase(AttentionBackend):
         # v2p table in replay-prep, BEFORE the padding sentinel below. The
         # captured Mamba kernels read state_indices_list as PHYSICAL slot ids,
         # so this translate is required here.
-        mamba_indices = self._maybe_translate_mamba_indices(mamba_indices)
+        mamba_indices = self._translate_mamba_indices(mamba_indices)
         mamba_indices[bs - num_padding :] = -1
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         # GDN ReplaySSM (slice 1b): refresh the STATIC per-row write cursor the
@@ -946,7 +934,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         if not in_capture:
             _mt = forward_batch.mamba_track_indices
             if _mt is not None and _mt.numel() > 0:
-                _phys = self._maybe_translate_mamba_indices(_mt)
+                _phys = self._translate_mamba_indices(_mt)
                 if _phys is not _mt:
                     _mt.copy_(_phys)
         spec_info = forward_batch.spec_info
