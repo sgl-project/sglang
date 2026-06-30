@@ -78,8 +78,8 @@ def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
         or chunk_size is None
         or not 1 <= chunk_size <= 8192
         or model_runner.model_config.is_multimodal
-        or config.linear_key_head_dim != 128
-        or config.linear_value_head_dim != 128
+        or getattr(config, "linear_key_head_dim", None) != 128
+        or getattr(config, "linear_value_head_dim", None) != 128
         or model_runner.req_to_token_pool.mamba_pool.mamba_cache.temporal.dtype
         != torch.bfloat16
     ):

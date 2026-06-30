@@ -96,6 +96,11 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
                     self.apply_policy(make_runner(**runner_args), **hardware)
                 )
 
+    def test_rejects_gdn_config_without_qwen_head_dims(self):
+        runner = make_runner()
+        runner.hybrid_gdn_config = SimpleNamespace()
+        self.assertIsNone(self.apply_policy(runner))
+
     def test_rejects_unvalidated_runtime_modes(self):
         cases = (
             ("non_triton_base", {"linear_attn_backend": "cutedsl"}),
