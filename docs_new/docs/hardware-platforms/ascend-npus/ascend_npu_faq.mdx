@@ -138,7 +138,7 @@ The `alloc_extend_kernel` operator appears to have a memory allocation issue. Pe
 
 Modify `sglang/srt/hardware_backend/npu/allocator_npu.py` to comment out the affected branch and use the else branch instead.
 
-```text highlight=15-36
+```python highlight=15-36
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -297,7 +297,7 @@ Replace model weights, e.g., switch Qwen/Qwen3.5-27B-FP8 to Eco-Tech/Qwen3.5-27B
 
 Docker images for Ascend NPU are available in two types:
 
-- **Stable release** — validated version with a specific tag, e.g., `quay.io/ascend/sglang:v0.5.10-npu.rc1-a3`.
+- **Stable release** — validated version with a specific tag, e.g., `quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3`.
   Recommended for production deployments.
 - **Daily build** — includes the latest development changes, e.g., `quay.io/ascend/sglang:main-cann8.5.0-a3`. Use this
   if you need the latest features or bug fixes that have not yet been included in a stable release.

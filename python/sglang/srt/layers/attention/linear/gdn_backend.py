@@ -314,6 +314,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
+        # GDN ReplaySSM (slice 1a): per-layer ring slices + the once-per-forward
+        # per-row write cursor. All None unless --enable-linear-replayssm, so the
+        # legacy dispatch below is byte-identical when the flag is off.
+        replayssm_write_pos = self.forward_metadata.replayssm_write_pos
+        # GDN ReplaySSM (slice 2b): per-row force-flush at radix track
+        # boundaries (None unless --enable-linear-replayssm). When present the
+        # kernel folds the ring into temporal[slot] on the snapshot steps.
+        replayssm_force_flush = self.forward_metadata.replayssm_force_flush
+        replayssm_d = layer_cache.replayssm_d
+        replayssm_k = layer_cache.replayssm_k
+        replayssm_g = layer_cache.replayssm_g
 
         assert isinstance(mixed_qkv, torch.Tensor)
         mixed_qkv = causal_conv1d_update(
@@ -339,6 +350,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
+                replayssm_d=replayssm_d,
+                replayssm_k=replayssm_k,
+                replayssm_g=replayssm_g,
+                replayssm_write_pos=replayssm_write_pos,
+                replayssm_force_flush=replayssm_force_flush,
             )
             self._track_mamba_state_decode(
                 forward_batch, conv_states, ssm_states, cache_indices
@@ -409,6 +425,30 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
+        # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
+        # chunk_gated_delta_rule) write state back in place assuming a contiguous
+        # slot layout, so they silently drop the write to the strided envelope
+        # pool. Run them on contiguous per-sequence copies (identity-indexed) and
+        # scatter the result back. No-op for the default contiguous pool.
+        # TODO(ch-wan): drop these .contiguous() copies by making the prefill conv
+        # and chunk_gated_delta_rule kernels honor the pool's real slot stride +
+        # int64 indexing, like packed_decode / causal_conv1d_update already do.
+        needs_state_gather = (not is_target_verify) and (
+            not conv_states.is_contiguous() or not ssm_states.is_contiguous()
+        )
+        if needs_state_gather:
+            conv_states_contig = conv_states[cache_indices].contiguous()
+            ssm_states_contig = ssm_states[cache_indices].contiguous()
+            state_cache_indices = torch.arange(
+                cache_indices.shape[0],
+                device=cache_indices.device,
+                dtype=cache_indices.dtype,
+            )
+        else:
+            conv_states_contig = conv_states
+            ssm_states_contig = ssm_states
+            state_cache_indices = cache_indices
+
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
@@ -444,9 +484,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer.conv_weights,
                 layer.bias,
                 activation=layer.activation,
-                conv_states=conv_states,
+                conv_states=conv_states_contig,
                 has_initial_state=has_initial_states,
-                cache_indices=cache_indices,
+                cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
@@ -498,16 +538,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 v=value,
                 g=g,
                 beta=beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
+                ssm_states=ssm_states_contig,
+                cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
             )
 
-            if (is_npu() or is_cpu()) and last_recurrent_state is not None:
+            if is_npu() and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )
                 ssm_states[cache_indices] = last_recurrent_state
+
+            if needs_state_gather:
+                # Scatter the in-place-updated contiguous copies back to the
+                # strided envelope pool (advanced indexing handles the strides).
+                conv_states[cache_indices] = conv_states_contig
+                ssm_states[cache_indices] = ssm_states_contig
 
             if h is not None:
                 self._track_mamba_state_extend(

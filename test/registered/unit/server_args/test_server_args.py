@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
 )
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cpu_ci(est_time=12, suite="base-b-test-cpu")
+register_cpu_ci(est_time=12, suite="base-c-test-cpu")
 
 # Mock get_device() so all tests run on CPU-only CI runners
 _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
@@ -69,6 +69,42 @@ class TestPrepareServerArgs(CustomTestCase):
             self.assertEqual(parsed.mm_process_config, {"image": {"resize": 128}})
         finally:
             os.unlink(config_file)
+
+
+class TestMambaCacheStochasticRounding(unittest.TestCase):
+    def test_rejects_fp32_ssm_cache(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="float32",
+            enable_mamba_cache_stochastic_rounding=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "--mamba-ssm-dtype float16"):
+            server_args._handle_mamba_backend()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_rejects_non_cuda(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="float16",
+            enable_mamba_cache_stochastic_rounding=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "NVIDIA CUDA"):
+            server_args._handle_mamba_backend()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    def test_rejects_triton_without_sm100(self, _mock_sm100, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="float16",
+            mamba_backend="triton",
+            enable_mamba_cache_stochastic_rounding=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires SM100"):
+            server_args._handle_mamba_backend()
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
@@ -254,6 +290,48 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, r"fp8_e4m3"):
             server_args._validate_hisparse_kv_cache_dtype()
+
+
+class TestFa4PageSizeAutoForce(CustomTestCase):
+    """FA4 requires page_size 128 for non-MLA models on SM100. The auto-force
+    must trigger for `--attention-backend fa4` (combined) too, not only for the
+    explicit `--prefill-attention-backend fa4` path."""
+
+    def _make_args(self, attention_backend, prefill=None, decode=None, page_size=1):
+        args = ServerArgs(model_path="dummy")
+        args.attention_backend = attention_backend
+        args.prefill_attention_backend = prefill
+        args.decode_attention_backend = decode
+        args.page_size = page_size
+        # Short-circuit get_model_config(): the fa4 page_size branch only needs
+        # use_mla_backend() (mocked) and is_sm100_supported() (mocked), not a
+        # real model_config. Pre-set the attribute so get_model_config returns
+        # early without touching ModelConfig.from_server_args.
+        args.model_config = MagicMock()
+        args.model_config.hf_config.dual_chunk_attention_config = None
+        return args
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
+    def test_combined_attention_backend_fa4_forces_page_size_128(
+        self, _mock_mla, _mock_sm100
+    ):
+        # `--attention-backend fa4` (combined): prefill/decode fields stay None.
+        args = self._make_args(attention_backend="fa4")
+
+        args._handle_attention_backend_compatibility()
+
+        self.assertEqual(args.page_size, 128)
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
+    def test_explicit_prefill_fa4_forces_page_size_128(self, _mock_mla, _mock_sm100):
+        # `--prefill-attention-backend fa4`: the previously-covered path.
+        args = self._make_args(attention_backend=None, prefill="fa4", page_size=1)
+
+        args._handle_attention_backend_compatibility()
+
+        self.assertEqual(args.page_size, 128)
 
 
 class TestContextParallelServerArgs(CustomTestCase):
@@ -475,6 +553,52 @@ class TestPortArgs(unittest.TestCase):
         self.assertTrue(port_args.scheduler_input_ipc_name.startswith("ipc://"))
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("ipc://"))
         self.assertIsInstance(port_args.nccl_port, int)
+
+    @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
+    def test_init_new_builds_decoupled_spec_ipc_config(self, mock_temp_file):
+        mock_temp_file.return_value.name = "temp_file"
+
+        server_args = ServerArgs(model_path="dummy")
+        server_args.nccl_port = None
+        server_args.enable_dp_attention = False
+        server_args.decoupled_spec_role = "verifier"
+        server_args.decoupled_spec_bind_endpoint = "ipc:///tmp/v"
+        server_args.decoupled_spec_connect_endpoints = ["ipc:///tmp/d"]
+        server_args.decoupled_spec_rank = 0
+
+        port_args = PortArgs.init_new(server_args)
+
+        self.assertIsNotNone(port_args.decoupled_spec_ipc_config)
+        self.assertEqual(port_args.decoupled_spec_ipc_config.rank, 0)
+        self.assertEqual(
+            port_args.decoupled_spec_ipc_config.bind_endpoint, "ipc:///tmp/v"
+        )
+        self.assertEqual(
+            port_args.decoupled_spec_ipc_config.connect_endpoints, ("ipc:///tmp/d",)
+        )
+
+    @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
+    def test_init_new_no_decoupled_config_when_role_null(self, mock_temp_file):
+        mock_temp_file.return_value.name = "temp_file"
+
+        server_args = ServerArgs(model_path="dummy")
+        server_args.nccl_port = None
+        server_args.enable_dp_attention = False
+        # decoupled_spec_role defaults to "null"
+
+        port_args = PortArgs.init_new(server_args)
+
+        self.assertIsNone(port_args.decoupled_spec_ipc_config)
+
+    def test_init_new_decoupled_role_requires_endpoints(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.nccl_port = None
+        server_args.enable_dp_attention = False
+        server_args.decoupled_spec_role = "drafter"
+        # endpoints intentionally left as their None defaults
+
+        with self.assertRaises(ValueError):
+            PortArgs.init_new(server_args)
 
     def test_init_new_with_single_node_dp_attention(self):
 
@@ -875,6 +999,54 @@ class TestNgramExternalSamArgs(CustomTestCase):
         with self.assertRaises(ValueError) as context:
             handle_speculative_decoding(args)
         self.assertIn("external-corpus-max-tokens", str(context.exception))
+
+
+class TestDecoupledSpecArgs(CustomTestCase):
+    """Decoupled speculative-decoding CLI flags.
+
+    These flags are auto-derived from the ``A[...]`` field metadata on
+    ``ServerArgs``; a bare annotation is silently skipped by
+    ``add_cli_args_from_dataclass``. This guards against the regression where
+    the flags went missing (e.g. after rebasing onto the auto-gen
+    ``add_cli_args``), which the direct-attribute ``PortArgs`` tests cannot
+    catch because they never exercise the CLI.
+    """
+
+    def test_decoupled_spec_cli_flags_round_trip(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--decoupled-spec-role",
+                "verifier",
+                "--decoupled-spec-bind-endpoint",
+                "ipc:///tmp/v",
+                "--decoupled-spec-connect-endpoints",
+                '["ipc:///tmp/d"]',
+                "--decoupled-spec-rank",
+                "0",
+                "--spec-trace-dir",
+                "/tmp/tr",
+            ]
+        )
+        self.assertEqual(server_args.decoupled_spec_role, "verifier")
+        self.assertEqual(server_args.decoupled_spec_bind_endpoint, "ipc:///tmp/v")
+        self.assertEqual(server_args.decoupled_spec_connect_endpoints, ["ipc:///tmp/d"])
+        self.assertEqual(server_args.decoupled_spec_rank, 0)
+        self.assertEqual(server_args.spec_trace_dir, "/tmp/tr")
+
+    def test_decoupled_spec_role_defaults_to_null(self):
+        server_args = prepare_server_args(["--model-path", "dummy"])
+        self.assertEqual(server_args.decoupled_spec_role, "null")
+        self.assertIsNone(server_args.decoupled_spec_bind_endpoint)
+        self.assertIsNone(server_args.decoupled_spec_connect_endpoints)
+        self.assertIsNone(server_args.decoupled_spec_rank)
+
+    def test_decoupled_spec_role_rejects_invalid_choice(self):
+        with self.assertRaises(SystemExit):
+            prepare_server_args(
+                ["--model-path", "dummy", "--decoupled-spec-role", "bogus"]
+            )
 
 
 class TestAdaptiveSpecArgs(CustomTestCase):
