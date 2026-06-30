@@ -77,7 +77,7 @@ class TestCPPrefixLenFA3Parity(CustomTestCase):
 
         def _call_meta(rank: int):
             return prepare_context_parallel_metadata(
-                padded_extend, rank, cp_size, seqs_len, extend_lens=extend_lens
+                padded_extend, rank, cp_size, seqs_len, extend_seqs_len=extend_lens
             )
 
         # Exercise the non-DSA branch; the DSA branch uses a separate

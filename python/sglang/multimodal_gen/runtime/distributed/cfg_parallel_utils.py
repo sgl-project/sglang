@@ -36,7 +36,7 @@ _logged_dispatch_keys: set[tuple[int, int, int]] = set()
 
 
 def _run(
-    predict_fn: Callable[["CFGBranch"], "torch.Tensor | tuple[torch.Tensor, ...]"],
+    predict_fn: Callable[[CFGBranch], torch.Tensor | tuple[torch.Tensor, ...]],
     bid: int,
     branches,
 ) -> tuple[torch.Tensor, ...]:
@@ -54,9 +54,9 @@ def _run(
 
 
 def run_cfg_parallel(
-    policy: "CFGPolicy",
-    predict_fn: Callable[["CFGBranch"], "torch.Tensor | tuple[torch.Tensor, ...]"],
-) -> "list[torch.Tensor | tuple[torch.Tensor, ...]]":
+    policy: CFGPolicy,
+    predict_fn: Callable[[CFGBranch], torch.Tensor | tuple[torch.Tensor, ...]],
+) -> list[torch.Tensor | tuple[torch.Tensor, ...]]:
     """Dispatch CFG branches across ranks, all-gather results, return in branch order.
 
     ``predict_fn`` is a closure capturing all step-varying state
@@ -136,12 +136,12 @@ def run_cfg_parallel(
 
 
 def run_two_branch_cfg_parallel(
-    policy: "CFGPolicy",
-    predict_fn: Callable[["CFGBranch"], "torch.Tensor | tuple[torch.Tensor, ...]"],
+    policy: CFGPolicy,
+    predict_fn: Callable[[CFGBranch], torch.Tensor | tuple[torch.Tensor, ...]],
     cfg_scale: float,
     batch,
     pipeline_config,
-) -> "torch.Tensor | tuple[torch.Tensor, ...]":
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """Run standard two-pass CFG with the old all-reduce combine.
 
     This keeps the existing WAN baselines: it avoids gathering both branch

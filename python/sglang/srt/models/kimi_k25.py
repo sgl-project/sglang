@@ -674,6 +674,19 @@ class KimiK25ForConditionalGeneration(nn.Module):
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
+    @property
+    def model(self):
+        # Alias .model to .language_model so this class satisfies the piecewise
+        # CUDA graph gate, which checks `hasattr(model, "model")`.
+        return self.language_model
+
+    def __setattr__(self, name, value):
+        # Skip redundant self.model.model assignment in runner to avoid duplicate
+        # nn.Module registration.
+        if name == "model":
+            return
+        super().__setattr__(name, value)
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
@@ -790,6 +803,24 @@ class KimiK25ForConditionalGeneration(nn.Module):
             # encoder-only: drain the generator so inline vision-weight loading fires.
             for _ in stream_language_weights():
                 pass
+
+    def post_load_weights(self):
+        if self.language_model is not None:
+            self.language_model.post_load_weights()
+
+    @property
+    def stacked_params_mapping(self):
+        return getattr(self.language_model, "stacked_params_mapping", [])
+
+    @property
+    def expert_params_mapping(self):
+        return getattr(self.language_model, "expert_params_mapping", [])
+
+    def mutate_weight_preload(self, name):
+        return self.language_model.mutate_weight_preload(name)
+
+    def custom_scale_remap(self, name):
+        return self.language_model.custom_scale_remap(name)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config: KimiK25Config):

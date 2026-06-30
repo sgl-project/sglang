@@ -141,38 +141,9 @@ log "Waiting for fake-worker rollout..."
 kubectl --context "${CONTEXT}" -n "${NAMESPACE}" rollout status deployment/fake-worker --timeout=120s
 
 # ---------------------------------------------------------------------------
-# Step 6: Create sgl-router ConfigMap with k8s discovery pointing at the
-#         namespace where fake-worker pods live.
-# ---------------------------------------------------------------------------
-log "Creating sgl-router-config ConfigMap..."
-ROUTER_CONFIG="[server]
-host = \"0.0.0.0\"
-port = 8090
-
-[[models]]
-id = \"tiny\"
-tokenizer_path = \"/etc/tokenizer/tiny.json\"
-policy = \"round_robin\"
-# Aggressive breaker so a terminating pod's connection-refused
-# immediately excludes it from the next request's candidate set —
-# the reconciliation tests scale workers rapidly and depend on
-# fast worker eviction to absorb the churn.
-circuit_breaker = { threshold = 1, cool_down_secs = 5 }
-
-[discovery]
-backend = \"k8s\"
-
-[discovery.k8s]
-namespace = \"${NAMESPACE}\"
-label_selector = \"app=sglang\""
-
-kubectl --context "${CONTEXT}" -n "${NAMESPACE}" create configmap sgl-router-config \
-    --from-literal=router.toml="${ROUTER_CONFIG}" \
-    --dry-run=client -o yaml \
-    | kubectl --context "${CONTEXT}" apply -f -
-
-# ---------------------------------------------------------------------------
-# Step 7: Deploy sgl-router
+# Step 6: Deploy sgl-router. It is configured entirely via CLI flags in
+#         router.yaml — k8s EndpointSlice discovery watches `app=sglang`
+#         pods in the sgl-router-test namespace (where fake-worker lives).
 # ---------------------------------------------------------------------------
 log "Deploying sgl-router..."
 kubectl --context "${CONTEXT}" apply -f "${MANIFESTS_DIR}/router.yaml"

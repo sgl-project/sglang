@@ -31,7 +31,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from sglang.bench_serving import run_benchmark
+from sglang.benchmark.serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
@@ -66,6 +66,8 @@ DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
 
 # Hybrid Mamba models
 DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+# Small GDN-hybrid (gated delta net) model that fits a single GPU
+DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST = "Qwen/Qwen3.5-4B"
 # VL test models
 DEFAULT_MODEL_NAME_FOR_TEST_VL_PP = "Qwen/Qwen3-VL-2B-Thinking"
 DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP = "zai-org/GLM-4.1V-9B-Thinking"
@@ -755,6 +757,43 @@ def _create_clean_subprocess_env(env: dict) -> dict:
     return child_env
 
 
+def _subprocess_popen_with_outputs(
+    command: list,
+    env: Optional[dict],
+    return_stdout_stderr: Optional[tuple],
+) -> subprocess.Popen:
+    if not return_stdout_stderr:
+        return subprocess.Popen(command, stdout=None, stderr=None, env=env)
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+        bufsize=1,
+    )
+
+    def _dump(src, sinks):
+        for line in iter(src.readline, ""):
+            for sink in sinks:
+                sink.write(line)
+                sink.flush()
+        src.close()
+
+    threading.Thread(
+        target=_dump,
+        args=(process.stdout, [return_stdout_stderr[0], sys.stdout]),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=_dump,
+        args=(process.stderr, [return_stdout_stderr[1], sys.stderr]),
+        daemon=True,
+    ).start()
+    return process
+
+
 def _launch_server_process(
     command: List[str],
     env: dict,
@@ -777,37 +816,11 @@ def _launch_server_process(
     hf_hub_offline = child_env.get("HF_HUB_OFFLINE", "0")
     print(f"CI_OFFLINE: Launching server HF_HUB_OFFLINE={hf_hub_offline} model={model}")
 
-    if return_stdout_stderr:
-        proc = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=child_env,
-            text=True,
-            bufsize=1,
-        )
-
-        def _dump(src, sinks):
-            for line in iter(src.readline, ""):
-                for sink in sinks:
-                    sink.write(line)
-                    sink.flush()
-            src.close()
-
-        threading.Thread(
-            target=_dump,
-            args=(proc.stdout, [return_stdout_stderr[0], sys.stdout]),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=_dump,
-            args=(proc.stderr, [return_stdout_stderr[1], sys.stderr]),
-            daemon=True,
-        ).start()
-    else:
-        proc = subprocess.Popen(command, stdout=None, stderr=None, env=child_env)
-
-    return proc
+    return _subprocess_popen_with_outputs(
+        command=command,
+        env=child_env,
+        return_stdout_stderr=return_stdout_stderr,
+    )
 
 
 def _wait_for_server_health(
@@ -1024,6 +1037,7 @@ def popen_launch_pd_server(
     api_key: Optional[str] = None,
     other_args: list[str] = (),
     env: Optional[dict] = None,
+    return_stdout_stderr: Optional[tuple] = None,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -1059,9 +1073,11 @@ def popen_launch_pd_server(
     if env is not None:
         env = {**os.environ, **env}
 
-    process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
-
-    return process
+    return _subprocess_popen_with_outputs(
+        command=command,
+        env=env,
+        return_stdout_stderr=return_stdout_stderr,
+    )
 
 
 def get_similarities(vec1, vec2):
@@ -1550,7 +1566,7 @@ def run_bench_one_batch(model, other_args):
     command = [
         "python3",
         "-m",
-        "sglang.bench_one_batch",
+        "sglang.benchmark.one_batch",
         "--batch-size",
         "1",
         "--input",
@@ -1602,7 +1618,7 @@ def run_bench_offline_throughput(model, other_args):
     command = [
         "python3",
         "-m",
-        "sglang.bench_offline_throughput",
+        "sglang.benchmark.offline_throughput",
         "--num-prompts",
         "1",
         "--dataset-name",
