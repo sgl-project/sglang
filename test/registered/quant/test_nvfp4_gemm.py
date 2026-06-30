@@ -20,6 +20,10 @@ MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-NVFP4"
 class FP4GemmBase:
     backend = None
 
+    # Calibrated to true eager/BCG FP4 accuracy (~0.637); old 0.64 tracked the
+    # numerically higher tc_piecewise default.
+    gsm8k_threshold = 0.63
+
     @classmethod
     def setUpClass(cls):
         if cls.backend is None:
@@ -58,7 +62,7 @@ class FP4GemmBase:
         metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreater(metrics["score"], 0.64)
+        self.assertGreater(metrics["score"], self.gsm8k_threshold)
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
