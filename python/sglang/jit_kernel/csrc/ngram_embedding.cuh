@@ -26,7 +26,8 @@ __global__ void ComputeNGramIdsKernel(
     int max_context_len,                  // max_context_len
     long* row_indices,                    // [batch_size]
     int* column_starts,                   // [batch_size]
-    int* n_gram_ids                       // [ne_n-1,ne_k,token_num]
+    int* n_gram_ids,                      // [ne_n-1,ne_k,token_num]
+    int eos_token_id                      // tokens before an eos are excluded from the n-gram context
 ) {
   // Determine which n, k, and request this block handles.
   /**
@@ -69,12 +70,17 @@ __global__ void ComputeNGramIdsKernel(
         // Out of this request's range, stop computing n_gram_id
         break;
       }
-      if (ne_token_table[current_token_table_index - j] < 0) {
+      const int table_token = ne_token_table[current_token_table_index - j];
+      if (table_token < 0) {
         // Token was marked as ignored during write
         break;
       }
-      const uint64_t term =
-          (uint64_t)ne_token_table[current_token_table_index - j] * (uint64_t)ne_weights[ne_weight_base_idx + j];
+      if (table_token == eos_token_id && j > 0) {
+        // Don't let the n-gram context cross an eos boundary. j==0 (the
+        // current token) is allowed; only break when looking back.
+        break;
+      }
+      const uint64_t term = (uint64_t)table_token * (uint64_t)ne_weights[ne_weight_base_idx + j];
       n_gram_id += term % ne_mod;
     }
     n_gram_id %= ne_mod;
@@ -137,7 +143,8 @@ struct NgramEmbeddingKernel {
       const tvm::ffi::TensorView ne_token_table,
       const tvm::ffi::TensorView row_indices,
       const tvm::ffi::TensorView column_starts,
-      const tvm::ffi::TensorView n_gram_ids) {
+      const tvm::ffi::TensorView n_gram_ids,
+      const int64_t eos_token_id) {
     using namespace host;
 
     auto device_ = SymbolicDevice{};
@@ -210,7 +217,8 @@ struct NgramEmbeddingKernel {
         max_context_len,
         static_cast<long*>(row_indices.data_ptr()),
         static_cast<int*>(column_starts.data_ptr()),
-        static_cast<int*>(n_gram_ids.data_ptr()));
+        static_cast<int*>(n_gram_ids.data_ptr()),
+        static_cast<int>(eos_token_id));
   }
 
   static void update_token_table(

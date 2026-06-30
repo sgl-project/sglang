@@ -35,6 +35,7 @@ def compute_n_gram_ids(
     row_indices: torch.Tensor,
     column_starts: torch.Tensor,
     n_gram_ids: torch.Tensor,
+    eos_token_id: int,
 ) -> None:
     """
     Compute n-gram IDs for embedding.
@@ -51,6 +52,7 @@ def compute_n_gram_ids(
         row_indices: row indices for each request
         column_starts: column start positions for each request
         n_gram_ids: output tensor for n-gram ids
+        eos_token_id: tokens before an eos are excluded from the n-gram context
     """
     module = _jit_ngram_embedding_module()
     module.compute_n_gram_ids(
@@ -65,6 +67,7 @@ def compute_n_gram_ids(
         row_indices,
         column_starts,
         n_gram_ids,
+        eos_token_id,
     )
 
 

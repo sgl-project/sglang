@@ -520,6 +520,7 @@ class LongcatFlashModel(nn.Module):
                 over_embedding_m=config.ngram_embedding_m,
                 over_embedding_k=config.ngram_embedding_k,
                 over_embedding_n=config.ngram_embedding_n,
+                eos_token_id=config.eos_token_id,
             )
         else:
             self.use_ngram_embedding = False
