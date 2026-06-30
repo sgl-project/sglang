@@ -82,7 +82,10 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.distributed.parallel_state import (
+    _use_torchcomms_enabled,
+    monkey_patch_vllm_parallel_state,
+)
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     join_process_groups,
@@ -1597,8 +1600,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger,
         )
 
-        if self.server_args.elastic_ep_backend == "mooncake":
-            # Mooncake does not support `monitored_barrier`
+        if (
+            self.server_args.elastic_ep_backend == "mooncake"
+            or _use_torchcomms_enabled()
+        ):
+            # Mooncake and TorchComms (which wraps the gloo backend) do not
+            # support `monitored_barrier`; fall back to a plain barrier.
             dist.barrier(group=get_tp_group().cpu_group)
         else:
             # Handle the case where some ranks do not finish loading.

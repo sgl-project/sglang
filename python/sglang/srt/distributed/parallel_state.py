@@ -43,6 +43,16 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
+
+try:
+    # Predicate for whether torch.distributed is routed through TorchComms.
+    from torch.distributed.distributed_c10d import _use_torchcomms_enabled
+except (ImportError, AttributeError):
+
+    def _use_torchcomms_enabled() -> bool:
+        return False
+
+
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
@@ -318,11 +328,21 @@ class GroupCoordinator:
                     timeout=subgroup_timeout,
                 )
             else:
+                # Under torchcomms, the pp group requests a members-only,
+                # lazily-init group (use_local_synchronization=True, no device_id)
+                # so new_group builds a per-peer nccl-lazy ProcessGroup (per-peer
+                # comm + stream, like ProcessGroupNCCL) for the default PP
+                # send/recv loop; non-member ranks return without joining. Other
+                # groups and the torchcomms-off path are the original stock call
+                # (PyTorch translates pg_options to torchcomms hints under TC=1).
                 pg_options = get_torch_distributed_pg_options(group_name)
                 device_group = torch.distributed.new_group(
                     ranks,
                     backend=torch_distributed_backend,
                     pg_options=pg_options,
+                    use_local_synchronization=(
+                        _use_torchcomms_enabled() and group_name == "pp"
+                    ),
                     timeout=subgroup_timeout,
                 )
                 # a group with `gloo` backend, to allow direct coordination
@@ -1906,6 +1926,17 @@ def init_distributed_environment(
             ) from e
         mooncake_ep.set_host_ip(get_local_ip_auto())
 
+    # Resolve local_rank up front: it is not available on a torch ProcessGroup
+    # (see https://github.com/pytorch/pytorch/issues/122816) and is needed both
+    # for the world device binding below and for init_world_group.
+    if local_rank == -1:
+        # local rank not set, this usually happens in single-node setting,
+        # where we can use rank as local rank
+        if distributed_init_method == "env://":
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        else:
+            local_rank = rank
+
     if not torch.distributed.is_initialized():
         global _MODEL_PARALLEL_GROUP_TIMEOUT
         assert distributed_init_method is not None, (
@@ -1928,6 +1959,17 @@ def init_distributed_environment(
         else:
             pg_options = get_torch_distributed_pg_options()
 
+        # Under torchcomms, bind the world PG to its CUDA device so split_group /
+        # the lazy new_group path can read bound_device_id. PyTorch auto-qualifies
+        # "nccl" -> "cpu:gloo,cuda:nccl", and lazy PP subgroups reuse the c10d
+        # store (persistent_store), so no MASTER_PORT / TORCHCOMM_* seeding. With
+        # torchcomms off, device_id stays None and this is the original call.
+        device_id = (
+            torch.device(f"cuda:{local_rank}")
+            if _use_torchcomms_enabled() and is_cuda_alike() and backend != "gloo"
+            else None
+        )
+
         # this backend is used for WORLD
         torch.distributed.init_process_group(
             backend=backend,
@@ -1936,22 +1978,13 @@ def init_distributed_environment(
             rank=rank,
             timeout=timeout,
             pg_options=pg_options,
+            device_id=device_id,
         )
 
         # Create a global TCPStore for coordination (used by NIXL)
         if moe_a2a_backend == "nixl":
             _create_global_tcp_store(rank, world_size)
 
-    # set the local rank
-    # local_rank is not available in torch ProcessGroup,
-    # see https://github.com/pytorch/pytorch/issues/122816
-    if local_rank == -1:
-        # local rank not set, this usually happens in single-node
-        # setting, where we can use rank as local rank
-        if distributed_init_method == "env://":
-            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        else:
-            local_rank = rank
     global _WORLD
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
