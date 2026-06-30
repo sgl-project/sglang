@@ -20,7 +20,7 @@ import signal
 import threading
 import time
 from enum import Enum, auto
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import psutil
 import setproctitle
@@ -654,6 +654,113 @@ class DataParallelController:
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
+
+
+def launch_dp_attention_schedulers_standalone(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    run_scheduler_process_func: Callable = run_scheduler_process,
+) -> Tuple[List[mp.Process], List]:
+    """Launch the dp-attention scheduler processes WITHOUT a DataParallelController.
+
+    Used by the rust server (``SGLANG_RUST_SERVER`` + ``enable_dp_attention``): the
+    rust api-server does the request routing and control broadcast the DPC would,
+    so only the DPC's *launch* is needed, not its process or event loop. Spawns the
+    per-(pp, tp) schedulers for this node and returns ``(procs, pipe_readers)`` so
+    the caller (the engine) collects ``scheduler_info`` directly via its normal
+    ready-wait path — exactly like the ``dp_size == 1`` path. No worker ZMQ ports
+    are allocated/broadcast: the scheduler receives requests via the in-process
+    ring, so its input socket is unused (see ``PortArgs.init_new``).
+
+    NOTE: the per-rank math (gpu_id, dp_rank, attn_cp / moe ranks) mirrors the
+    ``enable_dp_attention`` branch of
+    ``DataParallelController.launch_tensor_parallel_group``; keep the two in sync.
+    """
+    memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=server_args.enable_memory_saver
+    )
+    # Protects the CUDA_VISIBLE_DEVICES env mutation in maybe_reindex_device_id.
+    env_lock = threading.Lock()
+    scheduler_procs: List[mp.Process] = []
+    scheduler_pipe_readers = []
+
+    pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+    nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
+    pp_rank_range = range(
+        pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
+        pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
+    )
+    nnodes_per_tp_group = nnodes_per_pp_rank
+    tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
+    tp_rank_range = range(
+        tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
+        tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+    )
+
+    for pp_rank in pp_rank_range:
+        for tp_rank in tp_rank_range:
+            _, _, dp_rank, _ = compute_dp_attention_world_info(
+                server_args.enable_dp_attention,
+                tp_rank,
+                server_args.tp_size,
+                server_args.dp_size,
+                server_args.attn_cp_size,
+            )
+            # worker_ports=None: the input ZMQ socket is unused in rust mode, so
+            # PortArgs derives a deterministic (never-bound) scheduler_input port.
+            rank_port_args = PortArgs.init_new(server_args, dp_rank, None)
+            # Data parallelism reuses the tensor parallelism group, so all dp ranks
+            # share the same nccl port / instance id.
+            rank_port_args.nccl_port = port_args.nccl_port
+            rank_port_args.instance_id = port_args.instance_id
+
+            reader, writer = mp.Pipe(duplex=False)
+            gpu_id = (
+                server_args.base_gpu_id
+                + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+            )
+            attn_dp_size = server_args.dp_size
+            attn_tp_size = (
+                server_args.tp_size // attn_dp_size // server_args.attn_cp_size
+            )
+            attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
+            moe_dp_rank = tp_rank // (server_args.tp_size // server_args.moe_dp_size)
+            moe_ep_rank = (
+                tp_rank
+                % (server_args.tp_size // server_args.moe_dp_size)
+                // (
+                    server_args.tp_size
+                    // server_args.moe_dp_size
+                    // server_args.ep_size
+                )
+            )
+
+            with env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
+                proc = mp.Process(
+                    target=run_scheduler_process_func,
+                    args=(
+                        server_args,
+                        rank_port_args,
+                        gpu_id,
+                        tp_rank,
+                        attn_cp_rank,
+                        moe_dp_rank,
+                        moe_ep_rank,
+                        pp_rank,
+                        dp_rank,
+                        writer,
+                    ),
+                )
+                with (
+                    memory_saver_adapter.configure_subprocess(),
+                    numa_utils.configure_subprocess(server_args, gpu_id),
+                ):
+                    proc.start()
+            scheduler_procs.append(proc)
+            scheduler_pipe_readers.append(reader)
+
+    return scheduler_procs, scheduler_pipe_readers
 
 
 def run_data_parallel_controller_process(

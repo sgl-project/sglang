@@ -8476,8 +8476,15 @@ class PortArgs:
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
+            elif worker_ports is None:
+                # Rust server path (SGLANG_RUST_SERVER + dp attention): there is no
+                # DataParallelController allocating worker ports, and the scheduler
+                # receives requests via the in-process ring — its input ZMQ socket
+                # is never bound or read. Derive a deterministic, per-dp-rank port
+                # (distinct, clear of the 5 derived ports above) so all nodes agree
+                # without a broadcast; it is never actually used.
+                scheduler_input_port = port_base + 6 + dp_rank
             else:
-                assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
 
             try:
@@ -8490,10 +8497,10 @@ class PortArgs:
                     wait_port_available(metrics_port, "metrics_port")
                     if server_args.nnodes > 1:
                         wait_port_available(load_collector_port, "load_collector_port")
-                # Check scheduler_input_port only for dp.
-                # Skip check when using worker_ports since the port is already bound by our ZMQ socket
-                if dp_rank is None or worker_ports is None:
                     wait_port_available(scheduler_input_port, "scheduler_input_port")
+                # For dp ranks the scheduler_input port is already bound by the DPC's
+                # ZMQ socket (worker_ports), or unused (rust, worker_ports is None) —
+                # either way, no availability check.
             except ValueError:
                 logger.exception(
                     f"Port is already in use. {dist_init_port=} {port_base=} {detokenizer_port=} {nccl_port=} {scheduler_input_port=}"

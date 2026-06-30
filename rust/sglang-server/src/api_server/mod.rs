@@ -39,16 +39,18 @@ use crate::message::{
 };
 use crate::runtime::ServerArgs;
 use crate::runtime::channels::{Senders, TmEvent};
-use crate::transport::NetClient;
+use crate::transport::NetReady;
 
 /// How the api-server reaches the pipeline. Embedded (`dp_size == 1`) uses the
 /// in-process `flume` channels; the standalone api-server process (`dp_size > 1`)
-/// reaches each headless DP rank over TCP via [`NetClient`]. `submit` is the only
-/// place that branches; every handler is transport-agnostic.
+/// reaches each headless DP rank over TCP. The [`NetReady`] pool is established
+/// lazily, once every rank has registered (`POST /internal/register`), so
+/// `submit` answers 503 until then. `submit` is the only place that branches;
+/// every handler is transport-agnostic.
 #[derive(Clone)]
 pub enum Transport {
     Local(Senders),
-    Net(Arc<NetClient>),
+    Net(Arc<NetReady>),
 }
 
 /// Built once at startup from the model's `tokenizer_config.json` (`None` when
@@ -100,6 +102,10 @@ pub async fn serve(
         .route("/server_info", get(server_info))
         // Static config endpoint (OpenAI-compatible): no scheduler round-trip.
         .route("/v1/models", get(openai::available_models))
+        // Internal: a headless DP rank reports its TCP endpoint so the standalone
+        // api-server can build its pool (Mode A registration). No-op (400) on the
+        // embedded transport.
+        .route("/internal/register", post(register))
         .with_state(state);
 
     match tokio::net::TcpListener::bind(bind).await {
@@ -110,6 +116,33 @@ pub async fn serve(
             }
         }
         Err(e) => tracing::error!(error = %e, %bind, "failed to bind api server"),
+    }
+}
+
+/// Body of `POST /internal/register`: one headless DP rank announcing the TCP
+/// address the api-server should dial it at.
+#[derive(serde::Deserialize)]
+struct RegisterBody {
+    dp_rank: usize,
+    endpoint: String,
+}
+
+/// `POST /internal/register` — a headless DP rank reports its TCP endpoint. The
+/// standalone api-server collects all `dp_size` of them, then connects its pool
+/// (handled inside [`NetReady::register`]); request handlers return 503 until
+/// it's up. Not applicable to the embedded (in-process) transport.
+async fn register(State(state): State<AppState>, Json(body): Json<RegisterBody>) -> Response {
+    match &state.transport {
+        Transport::Net(ready) => match body.endpoint.parse() {
+            Ok(addr) => {
+                ready.register(body.dp_rank, addr);
+                (StatusCode::OK, "registered").into_response()
+            }
+            Err(_) => (StatusCode::BAD_REQUEST, "bad endpoint").into_response(),
+        },
+        Transport::Local(_) => {
+            (StatusCode::BAD_REQUEST, "registration not applicable").into_response()
+        }
     }
 }
 
@@ -138,14 +171,20 @@ async fn submit(state: &AppState, kind: RequestKind) -> Result<mpsc::Receiver<Eg
                 }
             }
         }
-        // Standalone: serialize the request and route it over TCP. Generate
-        // requests load-balance to one rank; **control** requests (e.g.
-        // `/server_info`) are answered per-rank, so they're broadcast to all and
-        // the first response wins — round-robin could pick a rank whose answer
-        // never returns, hanging the caller.
-        Transport::Net(client) => match kind {
-            RequestKind::Control(_) => client.submit_broadcast(id, kind, state.egress_buf).await,
-            RequestKind::Generate(_) => client.submit(id, kind, state.egress_buf).await,
+        // Standalone: serialize the request and route it over TCP. The pool is
+        // up only after every rank has registered — until then `client()` is
+        // `None` and we fail (→ 503). Generate requests load-balance to one rank;
+        // **control** requests (e.g. `/server_info`) are answered per-rank, so
+        // they're broadcast to all and the first response wins — round-robin
+        // could pick a rank whose answer never returns, hanging the caller.
+        Transport::Net(ready) => match ready.client() {
+            Some(client) => match kind {
+                RequestKind::Control(_) => {
+                    client.submit_broadcast(id, kind, state.egress_buf).await
+                }
+                RequestKind::Generate(_) => client.submit(id, kind, state.egress_buf).await,
+            },
+            None => Err(()),
         },
     }
 }

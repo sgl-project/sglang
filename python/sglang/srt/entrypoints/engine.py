@@ -58,6 +58,7 @@ from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
+    launch_dp_attention_schedulers_standalone,
     run_data_parallel_controller_process,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
@@ -650,6 +651,17 @@ class Engine(EngineScoreMixin, EngineBase):
 
                     scheduler_procs.append(proc)
                     scheduler_pipe_readers.append(reader)
+        elif envs.SGLANG_RUST_SERVER.get() and server_args.enable_dp_attention:
+            # Rust server: skip the DataParallelController entirely. The rust
+            # api-server does the request routing and control broadcast the DPC
+            # would, so only its *launch* is needed. Spawn the dp-attention
+            # schedulers directly and collect their info via the normal ready-wait
+            # path below (same as the dp_size == 1 case) — no controller process,
+            # no event loop, no worker ZMQ ports.
+            procs, scheduler_pipe_readers = launch_dp_attention_schedulers_standalone(
+                server_args, port_args, run_scheduler_process_func
+            )
+            scheduler_procs.extend(procs)
         else:
             # Launch the data parallel controller
             reader, writer = mp.Pipe(duplex=False)

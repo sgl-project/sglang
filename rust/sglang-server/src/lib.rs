@@ -180,22 +180,22 @@ impl Server {
     }
 }
 
-/// Run the standalone api-server process (`dp_size > 1`): connect to every
-/// headless DP-rank endpoint over TCP and serve the OpenAI / `/generate` HTTP API
-/// on `bind`, routing requests across ranks. Blocks for the process lifetime;
-/// the GIL is released while the Rust HTTP server runs, so the host process can
-/// still handle signals. A connect failure surfaces as a `ValueError`.
+/// Run the standalone api-server process (`dp_size > 1`): serve the OpenAI /
+/// `/generate` HTTP API on `bind` and the internal `/internal/register` endpoint.
+/// The TCP pool to the DP ranks is **deferred** — each headless rank reports its
+/// endpoint via registration, and the pool connects once all `dp_size` have
+/// (handlers answer 503 until then). Blocks for the process lifetime; the GIL is
+/// released while the Rust HTTP server runs, so the host process can still handle
+/// signals.
 #[pyfunction]
 #[pyo3(signature = (
     bind,
-    endpoints,
     egress_buf = 8192,
     server_args_json = "{}",
 ))]
 fn run_api_server(
     py: Python<'_>,
     bind: String,
-    endpoints: Vec<String>,
     egress_buf: usize,
     server_args_json: &str,
 ) -> PyResult<()> {
@@ -207,20 +207,18 @@ fn run_api_server(
         .validate_mandatory()
         .map_err(|e| to_val(format!("server_args: {e}")))?;
     let bind: SocketAddr = bind.parse().map_err(|e| to_val(format!("bad bind: {e}")))?;
-    let endpoints: Vec<SocketAddr> = endpoints
-        .iter()
-        .map(|e| e.parse())
-        .collect::<Result<_, _>>()
-        .map_err(|e| to_val(format!("bad endpoint: {e}")))?;
-    if endpoints.is_empty() {
-        return Err(to_val("endpoints must be non-empty".into()));
-    }
     let standalone_api_worker_num = server_args.standalone_api_server_num();
+    // Readiness state: ranks register their endpoints, then the pool connects.
+    let ready = transport::NetReady::new(
+        server_args.dp_size(),
+        server_args.ingress_pool_size(),
+        server_args.egress_pool_size(),
+    );
     let server_args = std::sync::Arc::new(server_args);
     let id_gen = std::sync::Arc::new(crate::ids::RequestIdGen::default());
 
     // Release the GIL: pure-Rust HTTP server that runs until the process is
-    // signalled. The async connect happens inside `block_on`.
+    // signalled. The pool connect is driven by registrations inside `block_on`.
     py.detach(move || -> Result<(), String> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(standalone_api_worker_num)
@@ -228,16 +226,9 @@ fn run_api_server(
             .build()
             .map_err(|e| e.to_string())?;
         rt.block_on(async move {
-            let client = transport::NetClient::connect(
-                &endpoints,
-                server_args.ingress_pool_size(),
-                server_args.egress_pool_size(),
-            )
-            .await
-            .map_err(|e| format!("connect failed: {e}"))?;
             api_server::serve(
                 bind,
-                api_server::Transport::Net(client),
+                api_server::Transport::Net(ready),
                 id_gen,
                 egress_buf,
                 server_args,

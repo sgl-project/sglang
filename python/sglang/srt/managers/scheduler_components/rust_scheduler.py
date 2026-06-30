@@ -11,6 +11,7 @@ import dataclasses
 import json
 import logging
 import os
+import threading
 from array import array
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -106,6 +107,12 @@ class RustServer:
             "headless TCP" if headless_server_bind else "embedded HTTP",
             headless_server_bind or bind or f"{server_args.host}:{server_args.port}",
         )
+        # Mode B: the rank's headless listener is up (the `Server` above bound it),
+        # so report the address the api-server should dial. Registration drives the
+        # api-server's deferred pool connect (it has no deterministic endpoint
+        # list); done on a daemon thread so scheduler startup isn't blocked.
+        if headless_server_bind is not None:
+            _register_headless_rank(server_args, dp_rank)
         return cls(server)
 
     def drain(self, max_recv: int) -> List[Any]:
@@ -321,31 +328,110 @@ class RustServer:
 
 # --- Standalone api-server (Mode B): SGLANG_RUST_SERVER + ---------------------
 # SGLANG_RUST_STANDALONE_API_SERVER + dp_size>1. The DP ranks run headless (TCP)
-# and a single api-server process, spawned by the node-0 launcher, connects to
-# all of them and serves the HTTP API. The TCP port scheme is deterministic so
-# both the rank (bind) and the api-server (connect) compute it from server_args
-# with no handshake.
+# and a single api-server process, spawned by the node-0 launcher, serves the
+# HTTP API and connects to every rank. The api-server has no deterministic
+# endpoint list: each rank reports the address to dial via `POST
+# /internal/register`, so per-rank node IPs need no out-of-band discovery and the
+# api-server connects its pool only once all ranks have registered.
+
+
+def _rust_headless_port(server_args, dp_rank: int) -> int:
+    """Per-DP-rank headless TCP port, offset from the HTTP ``port`` so it never
+    collides with the api-server's ``port``."""
+    return server_args.port + 1 + dp_rank
 
 
 def rust_headless_tcp_bind(server_args, dp_rank: int) -> str:
-    """TCP address of DP rank ``dp_rank``'s headless listener — the single source
-    of truth used by both the rank (to bind) and the api-server (to connect, over
-    ``[rust_headless_tcp_bind(args, i) for i in range(dp_size)]``).
+    """Address DP rank ``dp_rank``'s headless listener **binds** to. Single-node:
+    loopback. Multi-node (``nnodes > 1``): all interfaces, so the api-server on
+    node 0 can reach ranks on other nodes — the concrete address it dials is the
+    one the rank advertises (:func:`rust_headless_advertise_addr`)."""
+    host = "0.0.0.0" if server_args.nnodes > 1 else "127.0.0.1"
+    return f"{host}:{_rust_headless_port(server_args, dp_rank)}"
 
-    Offset from the HTTP ``port`` so it never collides with the api-server's
-    ``port``. Single-node: loopback. Multi-node per-rank node-IP discovery (so the
-    api-server can reach ranks on other nodes) is a follow-up.
+
+def rust_headless_advertise_addr(server_args, dp_rank: int) -> str:
+    """Address the api-server should **dial** for DP rank ``dp_rank`` — the value
+    the rank reports via registration. Single-node: loopback. Multi-node: this
+    node's auto-detected reachable IP."""
+    if server_args.nnodes > 1:
+        from sglang.srt.utils.network import get_local_ip_auto
+
+        host = get_local_ip_auto(fallback=server_args.host)
+    else:
+        host = "127.0.0.1"
+    return f"{host}:{_rust_headless_port(server_args, dp_rank)}"
+
+
+def _api_server_register_url(server_args) -> str:
+    """URL of the node-0 standalone api-server's ``/internal/register`` endpoint.
+    Node 0 is the ``dist_init_addr`` host (loopback for a single node)."""
+    if server_args.dist_init_addr:
+        from sglang.srt.utils.network import NetworkAddress
+
+        host = NetworkAddress.parse(server_args.dist_init_addr).host
+    else:
+        host = "127.0.0.1"
+    return f"http://{host}:{server_args.port}/internal/register"
+
+
+def _register_headless_rank(server_args, dp_rank: int) -> None:
+    """Report this headless DP rank's TCP endpoint to the standalone api-server so
+    it can dial the rank and (once all ranks register) connect its pool.
+
+    Runs on a daemon thread with bounded retry: the api-server (node 0) may not be
+    listening yet, while this rank's own listener is already up — so the
+    api-server connects as soon as it receives the registration.
     """
-    return f"{server_args.host}:{server_args.port + 1 + dp_rank}"
+    url = _api_server_register_url(server_args)
+    endpoint = rust_headless_advertise_addr(server_args, dp_rank)
+
+    def _post() -> None:
+        import time
+        import urllib.error
+        import urllib.request
+
+        body = json.dumps({"dp_rank": dp_rank, "endpoint": endpoint}).encode()
+        deadline = time.monotonic() + 120.0
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                req = urllib.request.Request(
+                    url, data=body, headers={"Content-Type": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    resp.read()
+                logger.info(
+                    "Rust headless rank %s registered %s -> %s", dp_rank, endpoint, url
+                )
+                return
+            except (urllib.error.URLError, OSError) as e:
+                if time.monotonic() >= deadline:
+                    logger.error(
+                        "Rust headless rank %s failed to register to %s after %d attempts: %s",
+                        dp_rank,
+                        url,
+                        attempt,
+                        e,
+                    )
+                    return
+                time.sleep(0.2)
+
+    threading.Thread(
+        target=_post, daemon=True, name=f"rust-register-dp{dp_rank}"
+    ).start()
 
 
-def run_rust_api_server_process(server_args) -> None:
-    """Entry point for the standalone Rust api-server process (Mode B).
+def run_rust_api_server(server_args) -> None:
+    """Entry point for the standalone Rust api-server (Mode B), run on a daemon
+    thread of the node-0 launcher.
 
     Resolves its own ``ModelConfig`` (it has no scheduler), dumps server_args,
-    and hands off to the Rust ``run_api_server``, which connects to every DP
-    rank over TCP and serves the OpenAI / ``/generate`` HTTP API. Blocks for the
-    process lifetime.
+    and hands off to the Rust ``run_api_server``, which serves the OpenAI /
+    ``/generate`` HTTP API plus ``/internal/register`` and connects to the DP
+    ranks once they register. Blocks (with the GIL released) for the process
+    lifetime.
     """
     import sglang_server
 
@@ -355,13 +441,9 @@ def run_rust_api_server_process(server_args) -> None:
     server_args_json = RustServer._dump_server_args_json(server_args, model_config)
 
     bind = f"{server_args.host}:{server_args.port}"
-    endpoints = [
-        rust_headless_tcp_bind(server_args, i) for i in range(server_args.dp_size)
-    ]
     logger.info(
-        "Rust standalone api-server: HTTP %s -> %d DP ranks %s",
+        "Rust standalone api-server: HTTP %s, awaiting %d DP-rank registration(s)",
         bind,
-        len(endpoints),
-        endpoints,
+        server_args.dp_size,
     )
-    sglang_server.run_api_server(bind, endpoints, server_args_json=server_args_json)
+    sglang_server.run_api_server(bind, server_args_json=server_args_json)

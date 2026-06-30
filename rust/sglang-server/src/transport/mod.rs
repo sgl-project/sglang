@@ -23,7 +23,7 @@
 
 mod client;
 mod server;
-pub use client::NetClient;
+pub use client::NetReady;
 pub use server::serve_headless;
 
 use bytes::Bytes;

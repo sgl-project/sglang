@@ -19,11 +19,14 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::OnceCell;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
@@ -97,7 +100,7 @@ impl NetClient {
             let mut reg = Vec::with_capacity(egress_pool);
             for shard in 0..egress_pool {
                 let (reg_tx, reg_rx) = mpsc::unbounded_channel::<Register>();
-                let mut ec = TcpStream::connect(ep).await?;
+                let mut ec = connect_with_retry(ep).await?;
                 ec.set_nodelay(true)?;
                 ec.write_all(&handshake(ROLE_EGRESS, shard)).await?;
                 let (er, _w) = ec.into_split();
@@ -108,7 +111,7 @@ impl NetClient {
             let mut ingress = Vec::with_capacity(ingress_pool);
             for idx in 0..ingress_pool {
                 let (fr_tx, fr_rx) = mpsc::channel::<(Frame, Vec<u8>)>(INGRESS_QUEUE);
-                let mut ic = TcpStream::connect(ep).await?;
+                let mut ic = connect_with_retry(ep).await?;
                 ic.set_nodelay(true)?;
                 ic.write_all(&handshake(ROLE_INGRESS, idx)).await?;
                 let (_r, iw) = ic.into_split();
@@ -196,6 +199,119 @@ impl NetClient {
         // Ok as long as at least one rank received the request.
         if delivered { Ok(rx) } else { Err(()) }
     }
+}
+
+/// Readiness wrapper for the standalone api-server (Mode A registration).
+///
+/// The HTTP server binds and serves `/internal/register` immediately, but the
+/// TCP pool to the DP ranks is **deferred** until every rank has reported its
+/// headless endpoint (`POST /internal/register`). The api-server doesn't know
+/// the rank addresses up front — ranks self-report (so multi-node node IPs need
+/// no out-of-band discovery, and the api-server is relocatable as one unit).
+/// Until the pool is up, [`client`](Self::client) returns `None` and request
+/// handlers answer 503.
+pub struct NetReady {
+    dp_size: usize,
+    ingress_pool: usize,
+    egress_pool: usize,
+    /// `dp_rank → reported headless endpoint`, filled by `/internal/register`.
+    /// Std mutex: tiny, non-async critical sections (insert / snapshot).
+    pending: StdMutex<HashMap<usize, SocketAddr>>,
+    /// Guards the one-shot connect: set by the registration that completes the
+    /// set, reset on connect failure so a later (re)registration can retry.
+    connecting: AtomicBool,
+    /// The pool, established once all `dp_size` ranks register. Lock-free reads
+    /// on the request hot path once set.
+    client: OnceCell<Arc<NetClient>>,
+}
+
+impl NetReady {
+    /// New, empty readiness state. Pool sizes are the api-server's `ServerArgs`
+    /// values (`egress_pool` must match the ranks' `egress_pool_size`).
+    pub fn new(dp_size: usize, ingress_pool: usize, egress_pool: usize) -> Arc<Self> {
+        Arc::new(Self {
+            dp_size,
+            ingress_pool,
+            egress_pool,
+            pending: StdMutex::new(HashMap::new()),
+            connecting: AtomicBool::new(false),
+            client: OnceCell::new(),
+        })
+    }
+
+    /// The connected pool, or `None` until every DP rank has registered.
+    pub fn client(&self) -> Option<Arc<NetClient>> {
+        self.client.get().cloned()
+    }
+
+    /// Record one DP rank's headless endpoint. When the final rank registers,
+    /// spawn the (one-shot) pool connect in the background so the registering
+    /// request returns promptly. A duplicate `dp_rank` overwrites (a rank that
+    /// restarted/re-registered before the pool came up).
+    pub fn register(self: &Arc<Self>, dp_rank: usize, addr: SocketAddr) {
+        let complete = {
+            let mut p = self.pending.lock().unwrap();
+            p.insert(dp_rank, addr);
+            p.len() == self.dp_size
+        };
+        // Only the registration that completes the set, and only once, connects.
+        if complete && !self.connecting.swap(true, Ordering::SeqCst) {
+            let this = Arc::clone(self);
+            tokio::spawn(this.connect_all());
+        }
+    }
+
+    /// Establish the pool to all ranks (ordered by `dp_rank`) and publish it.
+    async fn connect_all(self: Arc<Self>) {
+        let endpoints: Vec<SocketAddr> = {
+            let p = self.pending.lock().unwrap();
+            (0..self.dp_size)
+                .filter_map(|i| p.get(&i).copied())
+                .collect()
+        };
+        // Every dp_rank in [0, dp_size) must be present (set just reached size).
+        if endpoints.len() != self.dp_size {
+            tracing::error!(
+                got = endpoints.len(),
+                want = self.dp_size,
+                "register: dp_rank gap; deferring connect"
+            );
+            self.connecting.store(false, Ordering::SeqCst);
+            return;
+        }
+        match NetClient::connect(&endpoints, self.ingress_pool, self.egress_pool).await {
+            Ok(c) => {
+                let _ = self.client.set(c);
+                tracing::info!(?endpoints, "standalone api-server: rank pool connected");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "standalone api-server: pool connect failed; retrying on next registration");
+                self.connecting.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+/// Connect to a rank endpoint, retrying briefly. A rank reports its endpoint
+/// right after constructing its `Server`, whose TCP listener may bind a hair
+/// later, and remote ranks can lag at startup — so a first refusal is expected.
+/// Bounded (~5s) so a genuinely dead endpoint still surfaces as an error.
+async fn connect_with_retry(ep: SocketAddr) -> std::io::Result<TcpStream> {
+    const ATTEMPTS: usize = 50;
+    const DELAY: Duration = Duration::from_millis(100);
+    let mut last: Option<std::io::Error> = None;
+    for _ in 0..ATTEMPTS {
+        match TcpStream::connect(ep).await {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                last = Some(e);
+                tokio::time::sleep(DELAY).await;
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "connect retries exhausted")
+    }))
 }
 
 /// Drive one ingress connection: drain its queue and write each frame. Exits on
