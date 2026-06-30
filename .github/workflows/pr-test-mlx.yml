@@ -13,27 +13,22 @@ permissions:
   contents: read
 
 jobs:
-  # ==================== Model-free MLX unit tests (Apple Silicon) ==================== #
   mlx-unit-test:
-    # Label-gated, mirroring the repo's run-ci label gate (see pr-test-rust.yml):
-    # on a pull_request the job runs only when the PR carries the 'mlx' label,
-    # and re-fires when that label is added. The leading non-pull_request clause
-    # keeps the job runnable for push / workflow_dispatch events if they are ever
-    # added (the model-requiring half of the MLX suite stays on the self-hosted
-    # Apple Silicon runner and is intentionally excluded here).
+    # Label-gated on 'mlx', reusing the repo's run-ci label-gate mechanism
+    # (pr-test-rust.yml). The gate keys on the PR's current label set, so any
+    # event on a labeled PR re-runs the tests and a later unrelated label can't
+    # mask a prior result. The non-pull_request clause covers push / dispatch.
     if: |
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'mlx')
-    runs-on: macos-14
+    runs-on: macos-26
     timeout-minutes: 60
     env:
       SGLANG_IS_IN_CI: true
-      # use_mlx() gates the MLX backend on this var AND mlx importing. Without it
-      # the profiler patch path takes the MPS branch, so the MLX capture-selection
-      # branch (profiler.py: if use_mlx()) is never exercised by this lane.
+      # use_mlx() needs this var (and mlx importable); without it the profiler
+      # takes the MPS branch and the MLX capture path goes untested.
       SGLANG_USE_MLX: 1
-      # Hosted runner has no model cache; the selected tests are model-free, so
-      # forbid any HF download to keep that guarantee enforced rather than assumed.
+      # Forbid HF downloads so the model-free guarantee is enforced, not assumed.
       HF_HUB_OFFLINE: 1
     steps:
       - name: Checkout code
@@ -56,10 +51,9 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           test -f python/pyproject_other.toml || { echo "alt pyproject_other.toml missing"; exit 1; }
-          # Swap in the Apple Silicon (MLX/MPS) project metadata for this
-          # ephemeral checkout, then install the minimal extra that satisfies the
-          # MLX unit-test imports (mlx, mlx-lm, runtime_common, torch). The heavier
-          # all_mps diffusion chain is not needed for these tests.
+          # Swap in the Apple Silicon project metadata, then install the srt_mps
+          # extra (mlx, mlx-lm, runtime_common, torch). The all_mps diffusion
+          # chain is not needed here.
           rm -f python/pyproject.toml
           mv python/pyproject_other.toml python/pyproject.toml
           python3 -m pip install -e "python[srt_mps]"
@@ -73,23 +67,21 @@ jobs:
       - name: Run model-free MLX unit tests
         timeout-minutes: 15
         run: |
-          # Model-free MLX unit tests, run directly via pytest (same convention as
-          # the MUSA unit-test jobs). These never load a model: signature-only
-          # contract checks, mocked Metal capture, dummy ServerArgs + patch logic,
-          # and pure quantization-config dict logic.
+          # Model-free MLX unit tests via pytest, like MUSA's unit-test jobs
+          # (its model and server suites use run_suite.py). None load a model:
+          # signature contracts, mocked Metal capture, dummy ServerArgs patch
+          # logic, and quantization-config dict logic.
           #
-          # Three cases are excluded by name (-k): stale against current upstream/main
-          # (they poke internal APIs refactored after the tests landed; only ever
-          # skipped on ubuntu base-a-test-cpu, so the drift went unnoticed). Model-free
-          # but red, tracked separately:
+          # Three cases are excluded (-k): model-free but stale against main, only
+          # ever skipped on ubuntu so the drift went unnoticed. Tracked separately:
           #   - test_decode_finalize_does_not_snapshot_auxiliary_state
           #       (MlxModelRunner._clear_steps now set in __init__, fake runner omits it)
           #   - test_mlx_scheduler_init_overlap_keeps_future_map_relay
           #       (decide_needs_cpu_seq_lens now reads server_args.speculative_algorithm)
           #   - test_finished_request_snapshots_before_release
           #       (_handle_finished_req renamed to _handle_finish_state_updated_req)
-          # -k matches on test-name keywords, so it is robust to the test/pytest.ini
-          # rootdir (which shifts nodeids and silently breaks path-based --deselect).
+          # -k matches test-name keywords, robust to the pytest.ini rootdir that
+          # shifts nodeids and breaks path-based --deselect.
           EXCLUDE="test_decode_finalize_does_not_snapshot_auxiliary_state \
             or test_mlx_scheduler_init_overlap_keeps_future_map_relay \
             or test_finished_request_snapshots_before_release"
@@ -100,7 +92,6 @@ jobs:
             "test/registered/unit/hardware_backend/mlx/test_quantization.py::TestMlxQuantizationOverride" \
             -k "not ($EXCLUDE)"
 
-  # ==================== Finish ==================== #
   pr-test-mlx-finish:
     needs: [mlx-unit-test]
     if: always()
