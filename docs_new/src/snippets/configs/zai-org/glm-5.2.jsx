@@ -6,6 +6,7 @@ export const config = {
 
   supportedHardware: [
     "h200", "b200", "gb300", "b300",
+    "mi355x", "mi325x", "mi300x",
   ],
 
   // Single released checkpoint — no size/mode split.
@@ -114,8 +115,8 @@ sgl-eval run aime25 \\
       knobs: [
         { id: "tp", label: "TP", values: [null, 4, 8] },
         { id: "cp", label: "CP (DSA prefill)", values: [null, 1, 2, 4, 8],
-          disable: { hw: ["b200", "gb300", "b300"] },
-          disableReason: "DSA prefill Context Parallel is verified on Hopper (H200); the Blackwell sm100 DSA-CP FP8 rope kernel is not yet adapted." },
+          disable: { hw: ["b200", "gb300", "b300", "mi355x", "mi325x", "mi300x"] },
+          disableReason: "DSA prefill Context Parallel is verified on Hopper (H200); the Blackwell sm100 DSA-CP FP8 rope kernel is not yet adapted, and the ROCm DSA-CP path is not yet validated on AMD (MI300X/MI325X/MI355X)." },
         { id: "dpAttn", label: "DP-Attention",
           values: [null, false, 4, 8],
           labels: { "auto": "Auto", "false": "Off" } },
@@ -150,10 +151,14 @@ sgl-eval run aime25 \\
         { id: "off",     label: "Off (greedy)" },
         { id: "mtp-516", label: "EAGLE / MTP 5-1-6 (low-latency)",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 5",
-                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 6"] },
+                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 6"],
+          disable: { hw: ["mi355x", "mi325x", "mi300x"] },
+          disableReason: "MTP/EAGLE speculative decoding is not yet validated on AMD ROCm (MI300X/MI325X/MI355X): the gfx950 spec-decode draft kernel is not yet validated and at --speculative-num-steps > 3 hits a separate build issue; the DSA nextn draft path is CUDA-only." },
         { id: "mtp-112", label: "EAGLE / MTP 1-1-2 (balanced)",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
-                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"] },
+                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
+          disable: { hw: ["mi355x", "mi325x", "mi300x"] },
+          disableReason: "MTP/EAGLE speculative decoding is not yet validated on AMD ROCm (MI300X/MI325X/MI355X): the gfx950 spec-decode draft kernel is not yet validated and at --speculative-num-steps > 3 hits a separate build issue; the DSA nextn draft path is CUDA-only." },
       ],
     },
 
