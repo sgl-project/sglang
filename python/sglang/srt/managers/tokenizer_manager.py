@@ -3133,7 +3133,7 @@ class SignalHandler:
         if self.tokenizer_manager._subprocess_watchdog is not None:
             self.tokenizer_manager._subprocess_watchdog.stop()
         self.tokenizer_manager.dump_requests_before_crash()
-        kill_process_tree(os.getpid())
+        kill_process_tree(os.getpid(), exit_code=1)
 
 
 # Note: request abort handling logic
