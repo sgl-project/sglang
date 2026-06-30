@@ -207,11 +207,6 @@ class SWAComponent(TreeComponent):
             # Branch 3: entire value_slice is outside SWA window — not consumed
             return prefix_len
 
-    def should_skip_leaf_creation(
-        self, total_prefix_len: int, key_len: int, params: InsertParams
-    ) -> bool:
-        return params.swa_evicted_seqlen >= total_prefix_len + key_len
-
     def recover_after_unevict(
         self,
         node: UnifiedTreeNode,
@@ -564,8 +559,9 @@ class SWAComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
-        if is_finished:
-            insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
+        # Unfinished requests can already have an SWA-evicted prefix; preserve
+        # that boundary so insertion creates a tombstone instead of live SWA KV.
+        insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
         return None
 
     def free_out_of_window_slots(
