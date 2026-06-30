@@ -5,24 +5,12 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
     LATENT_SCALE,
     LATENT_SHIFT,
 )
 from sglang.multimodal_gen.configs.sample.ideogram import IDEOGRAM4_PRESETS
-from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
-    CacheDitConfig,
-    enable_cache_on_dual_transformer,
-    get_scm_mask,
-    refresh_context_on_dual_transformer,
-)
-from sglang.multimodal_gen.runtime.distributed import (
-    get_local_torch_device,
-    get_sp_group,
-    get_tp_group,
-    get_world_size,
-)
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import build_varlen_mask_meta
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -37,6 +25,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
     DenoisingStage,
     DenoisingStepState,
+    DualTransformerExecutionMode,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
@@ -279,173 +268,31 @@ class Ideogram4DenoisingStage(DenoisingStage):
     def __init__(self, transformer, unconditional_transformer, pipeline=None) -> None:
         super().__init__(
             transformer=transformer,
+            transformer_2=unconditional_transformer,
             scheduler=Ideogram4Scheduler(),
             pipeline=pipeline,
         )
-        self.unconditional_transformer = unconditional_transformer
-        self._maybe_enable_torch_compile(self.unconditional_transformer)
+        self.unconditional_transformer = self.transformer_2
 
     def _component_name_for_stage_module(self, module, default_name: str) -> str:
         if module is self.unconditional_transformer:
             return "unconditional_transformer"
         return super()._component_name_for_stage_module(module, default_name)
 
-    def component_uses(
-        self, server_args: ServerArgs, stage_name: str | None = None
-    ) -> list[ComponentUse]:
-        stage_name = self._component_stage_name(stage_name)
-        return [
-            ComponentUse(
-                stage_name=stage_name,
-                component_name="transformer",
-                phase="transformer",
-                preferred_ready_after_request=True,
-                memory_intensive=True,
-            ),
-            ComponentUse(
-                stage_name=stage_name,
-                component_name="unconditional_transformer",
-                phase="unconditional_transformer",
-                memory_intensive=True,
-            ),
-        ]
+    def _cache_dit_dual_model_name(self) -> str:
+        return "ideogram4"
 
-    def _maybe_enable_cache_dit_and_torch_compile(
-        self, num_inference_steps: int | tuple[int, int], batch: Req
-    ) -> None:
-        self._maybe_enable_cache_dit(num_inference_steps, batch)
-        for transformer in filter(
-            None, [self.transformer, self.unconditional_transformer]
-        ):
-            self._maybe_enable_torch_compile(transformer)
+    def _dual_transformer_execution_mode(
+        self,
+    ) -> DualTransformerExecutionMode | None:
+        return DualTransformerExecutionMode.PAIRED_PER_STEP
 
-    @staticmethod
-    def _cache_dit_num_steps(num_inference_steps: int | tuple[int, int]) -> int:
-        if isinstance(num_inference_steps, tuple):
-            return int(num_inference_steps[0])
-        return int(num_inference_steps)
+    def _cache_dit_secondary_uses_primary_config(self) -> bool:
+        return True
 
-    @staticmethod
-    def _parse_cache_dit_scm_bins() -> tuple[list[int] | None, list[int] | None, str]:
-        scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
-        compute_bins_str = envs.SGLANG_CACHE_DIT_SCM_COMPUTE_BINS
-        cache_bins_str = envs.SGLANG_CACHE_DIT_SCM_CACHE_BINS
-        compute_bins = None
-        cache_bins = None
-        if compute_bins_str and cache_bins_str:
-            try:
-                compute_bins = [int(x.strip()) for x in compute_bins_str.split(",")]
-                cache_bins = [int(x.strip()) for x in cache_bins_str.split(",")]
-            except ValueError as exc:
-                logger.warning("Failed to parse SCM bins: %s. SCM disabled.", exc)
-                scm_preset = "none"
-        elif compute_bins_str or cache_bins_str:
-            logger.warning(
-                "SCM custom bins require both compute_bins and cache_bins. "
-                "Only one was provided (compute=%s, cache=%s). Falling back to preset '%s'.",
-                compute_bins_str,
-                cache_bins_str,
-                scm_preset,
-            )
-        return compute_bins, cache_bins, scm_preset
-
-    @staticmethod
-    def _cache_dit_parallel_groups():
-        if get_world_size() <= 1:
-            return None, None
-
-        sp_group_candidate = get_sp_group()
-        tp_group_candidate = get_tp_group()
-        sp_world_size = sp_group_candidate.world_size if sp_group_candidate else 1
-        tp_world_size = tp_group_candidate.world_size if tp_group_candidate else 1
-        sp_group = (
-            sp_group_candidate.device_group
-            if sp_group_candidate and sp_world_size > 1
-            else None
-        )
-        tp_group = (
-            tp_group_candidate.device_group
-            if tp_group_candidate and tp_world_size > 1
-            else None
-        )
-        logger.info(
-            "cache-dit enabled in distributed environment for Ideogram transformers "
-            "(world_size=%d, has_sp=%s, has_tp=%s)",
-            get_world_size(),
-            sp_group is not None,
-            tp_group is not None,
-        )
-        return sp_group, tp_group
-
-    def _build_ideogram_cache_dit_config(
-        self, num_inference_steps: int
-    ) -> CacheDitConfig:
-        scm_compute_bins, scm_cache_bins, scm_preset = self._parse_cache_dit_scm_bins()
-        steps_computation_mask = get_scm_mask(
-            preset=scm_preset,
-            num_inference_steps=num_inference_steps,
-            compute_bins=scm_compute_bins,
-            cache_bins=scm_cache_bins,
-        )
-        return CacheDitConfig(
-            enabled=True,
-            Fn_compute_blocks=envs.SGLANG_CACHE_DIT_FN,
-            Bn_compute_blocks=envs.SGLANG_CACHE_DIT_BN,
-            max_warmup_steps=envs.SGLANG_CACHE_DIT_WARMUP,
-            residual_diff_threshold=envs.SGLANG_CACHE_DIT_RDT,
-            max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_MC,
-            enable_taylorseer=envs.SGLANG_CACHE_DIT_TAYLORSEER,
-            taylorseer_order=envs.SGLANG_CACHE_DIT_TS_ORDER,
-            num_inference_steps=num_inference_steps,
-            steps_computation_mask=steps_computation_mask,
-            steps_computation_policy=envs.SGLANG_CACHE_DIT_SCM_POLICY,
-        )
-
-    def _maybe_enable_cache_dit(
-        self, num_inference_steps: int | tuple[int, int], batch: Req
-    ) -> None:
-        if not envs.SGLANG_CACHE_DIT_ENABLED:
-            return
-        if batch.is_warmup and not self.server_args.enable_torch_compile:
-            return
-
-        cache_dit_steps = self._cache_dit_num_steps(num_inference_steps)
-        config = self._build_ideogram_cache_dit_config(cache_dit_steps)
-        if self._cache_dit_enabled:
-            refresh_context_on_dual_transformer(
-                self.transformer,
-                self.unconditional_transformer,
-                cache_dit_steps,
-                cache_dit_steps,
-                steps_computation_mask=config.steps_computation_mask,
-                steps_computation_mask_2=config.steps_computation_mask,
-                steps_computation_policy=config.steps_computation_policy,
-            )
-            return
-
-        sp_group, tp_group = self._cache_dit_parallel_groups()
-        (
-            self.transformer,
-            self.unconditional_transformer,
-        ) = enable_cache_on_dual_transformer(
-            self.transformer,
-            self.unconditional_transformer,
-            config,
-            config,
-            model_name="ideogram4",
-            sp_group=sp_group,
-            tp_group=tp_group,
-        )
-        self._cache_dit_enabled = True
-        self._cached_num_steps = cache_dit_steps
-        logger.info(
-            "cache-dit enabled on Ideogram conditional/unconditional transformers "
-            "(steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
-            cache_dit_steps,
-            envs.SGLANG_CACHE_DIT_FN,
-            envs.SGLANG_CACHE_DIT_BN,
-            envs.SGLANG_CACHE_DIT_RDT,
-        )
+    def _maybe_enable_cache_dit(self, *args, **kwargs) -> None:
+        super()._maybe_enable_cache_dit(*args, **kwargs)
+        self.unconditional_transformer = self.transformer_2
 
     def _manage_unconditional_transformer_use_site(self, batch: Req) -> None:
         manager = self._component_residency_manager

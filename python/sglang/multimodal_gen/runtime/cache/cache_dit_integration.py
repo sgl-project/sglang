@@ -633,9 +633,7 @@ def refresh_context_on_dual_transformer(
             mask_policy=scm_preset, total_steps=num_low_noise_steps
         )
     policy = (
-        steps_computation_policy
-        if steps_computation_policy is not None
-        else scm_preset
+        steps_computation_policy if steps_computation_policy is not None else scm_preset
     )
     cache_dit.refresh_context(
         transformer,
