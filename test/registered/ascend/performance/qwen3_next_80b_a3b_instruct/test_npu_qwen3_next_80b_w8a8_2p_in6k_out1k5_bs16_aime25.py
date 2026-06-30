@@ -91,8 +91,6 @@ QWEN3_NEXT_80B_A3B_OTHER_ARGS = [
     "bfloat16",
     "--speculative-draft-model-path",
     QWEN3_NEXT_80B_A3B_MODEL_PATH,
-    "--reasoning-parser",
-    "qwen3",
     "--tool-call-parser",
     "qwen",
 ]
