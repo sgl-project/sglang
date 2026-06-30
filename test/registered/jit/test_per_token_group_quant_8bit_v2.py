@@ -160,8 +160,9 @@ def test_sglang_per_token_group_quant_fp8_row_major_ue8m0(dtype, num_tokens, hid
 # [num_experts, tokens_padded, hidden*2]; only tokens < masked_m[e] are processed
 # (padding left untouched → zeros in both). Compare JIT vs AOT bit-exact.
 MASKED_V2_CASES = get_ci_test_range(
-    list(itertools.product([2, 5], [2048, 4096, 7168], [128, 384])),
-    [(2, 2048, 128), (5, 4096, 384), (2, 7168, 128)],
+    # MaskedLayoutScheduler requires hidden / group_size to be divisible by 16.
+    list(itertools.product([2, 5], [2048, 4096, 8192], [128, 384])),
+    [(2, 2048, 128), (5, 4096, 384), (2, 8192, 128)],
 )
 
 
