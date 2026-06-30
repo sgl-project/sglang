@@ -150,6 +150,7 @@ class SchedulerOutputStreamer:
             default_stream_interval=self.server_args.stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,
+            rust_mode=self.rust_server is not None,
         )
         for req in reqs:
             if req is skip_req:
@@ -264,6 +265,10 @@ class _GenerationStreamAccumulator:
     default_stream_interval: int
     default_force_stream_interval: int
     get_cached_tokens_details: Callable[[Req], Optional[dict]]
+    # Rust server mode: the Rust detokenizer reconstructs text/ids from the raw
+    # output tokens itself and never consumes the scheduler's incremental-detok
+    # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
+    rust_mode: bool = False
 
     rids: list = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
@@ -368,15 +373,21 @@ class _GenerationStreamAccumulator:
             req.finished_reason.to_json() if req.finished_reason else None
         )
         self.decoded_texts.append(req.decoded_text)
-        decode_ids, read_offset = req.init_incremental_detokenize()
-
-        self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+        if self.rust_mode:
+            # Rust detok works from raw output tokens and ignores decode_ids /
+            # read_offset, so skip the per-step incremental-detok bookkeeping
+            # (surr_and_decode_ids) entirely. Placeholders keep the parallel
+            # lists aligned; the Rust egress (push_generation) never reads them.
+            self.decode_ids_list.append([])
+            self.read_offsets.append(0)
+        else:
+            decode_ids, read_offset = req.init_incremental_detokenize()
+            self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+            req.send_decode_id_offset = len(decode_ids)
+            self.read_offsets.append(read_offset)
 
         # Exclude the tokens after stop condition
         output_ids_ = req.output_ids_through_stop
-
-        req.send_decode_id_offset = len(decode_ids)
-        self.read_offsets.append(read_offset)
         self.output_ids.append(output_ids_[send_token_offset:])
         req.send_token_offset = len(output_ids_)
         self.skip_special_tokens.append(req.sampling_params.skip_special_tokens)
