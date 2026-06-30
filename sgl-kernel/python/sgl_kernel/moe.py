@@ -27,20 +27,6 @@ def moe_align_block_size(
     )
 
 
-def moe_permute_prepare(
-    topk_ids: torch.Tensor,
-    num_experts: int,
-    use_int64_offset: bool = False,
-    is_ep: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.ops.sgl_kernel.moe_permute_prepare.default(
-        topk_ids,
-        num_experts,
-        use_int64_offset,
-        is_ep,
-    )
-
-
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,

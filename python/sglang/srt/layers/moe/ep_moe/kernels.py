@@ -1607,7 +1607,7 @@ def moe_permute(
     is_ep: bool = False,
     outputs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from sgl_kernel import moe_permute_prepare
+    from sglang.jit_kernel.moe_permute_prepare import moe_permute_prepare
 
     expert_offsets, src2dst = moe_permute_prepare(
         topk_ids=topk_ids,

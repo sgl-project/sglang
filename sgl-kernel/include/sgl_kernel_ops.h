@@ -279,8 +279,6 @@ void moe_align_block_size(
     bool pad_sorted_token_ids,
     bool ignore_invalid_expert);
 
-std::vector<torch::Tensor> moe_permute_prepare(torch::Tensor topk_ids, int64_t num_experts, bool use_int64, bool is_ep);
-
 void topk_softmax(
     torch::Tensor& topk_weights,
     torch::Tensor& topk_indices,

@@ -158,9 +158,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "pad_sorted_token_ids, bool ignore_invalid_expert) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
-  m.def("moe_permute_prepare(Tensor topk_ids, int num_experts, bool use_int64, bool is_ep) -> Tensor[]");
-  m.impl("moe_permute_prepare", torch::kCUDA, &moe_permute_prepare);
-
   m.def(
       "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, float "
       "moe_softcapping, Tensor? correction_bias) -> ()");
