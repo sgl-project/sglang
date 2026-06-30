@@ -103,6 +103,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.basic_req = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
+            session_id="session-1",
             temperature=0.7,
             max_tokens=100,
             stream=False,
@@ -146,6 +147,7 @@ class ServingChatTestCase(unittest.TestCase):
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
+            self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
     def test_convert_to_internal_request_rejects_stream_return_prompt_token_ids(self):

@@ -21,8 +21,12 @@ import torch
 
 from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
+    get_minimax_sparse_attention_config,
+    get_minimax_sparse_disable_value_layer_ids,
+    get_minimax_sparse_layer_ids,
     is_deepseek_dsa,
     is_deepseek_v4,
+    is_minimax_sparse,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -200,6 +204,44 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
+        elif is_minimax_sparse(model_config.hf_config):
+            # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
+            # (sparse-only, single-head; kv layers store K+V, k-only layers store K).
+            sparse_cfg = get_minimax_sparse_attention_config(model_config.hf_config)
+            dense_layer_ids, sparse_layer_ids = get_minimax_sparse_layer_ids(sparse_cfg)
+            indexer_k_only_layer_ids = set(
+                get_minimax_sparse_disable_value_layer_ids(sparse_cfg)
+            )
+
+            local_dense_layer_ids = [
+                l for l in dense_layer_ids if mr.start_layer <= l < mr.end_layer
+            ]
+            local_sparse_layer_ids = [
+                l for l in sparse_layer_ids if mr.start_layer <= l < mr.end_layer
+            ]
+            num_dense = len(local_dense_layer_ids)
+            num_sparse = len(local_sparse_layer_ids)
+            num_indexer_k_only = sum(
+                1 for l in local_sparse_layer_ids if l in indexer_k_only_layer_ids
+            )
+            num_indexer_kv = num_sparse - num_indexer_k_only
+
+            kv_heads = model_config.get_num_kv_heads(get_attention_tp_size())
+            head_dim = model_config.head_dim
+            indexer_head_dim = sparse_cfg["sparse_index_dim"]
+            indexer_dtype_size = torch._utils._element_size(mr.dtype)
+
+            main_pool_bytes = (
+                (num_dense + num_sparse) * 2 * kv_heads * head_dim * kv_size
+            )
+            indexer_bytes = (
+                (num_indexer_kv * 2 + num_indexer_k_only)
+                * indexer_head_dim
+                * indexer_dtype_size
+            )
+            # FP4 scale buffer adjustment doesn't apply to MiniMax sparse:
+            # cell_size is already a sum over heterogeneous sub-pools.
+            return main_pool_bytes + indexer_bytes
         else:
             cell_size = (
                 model_config.get_num_kv_heads(tp_size)
@@ -268,6 +310,16 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             * kv_size
         )
 
+        # EAGLE/STANDALONE draft KV pool inherits max_total tokens with its
+        # full-attn layers; budget into the full term.
+        self._draft_full_layers_num = 0
+        if (
+            mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
+        ) and not mr.is_draft_worker:
+            draft_layers = getattr(mr, "eagle_draft_num_layers", None)
+            if draft_layers is not None and int(draft_layers) > 0:
+                self._draft_full_layers_num = int(draft_layers)
+
         # Bytes per token of max_total_num_tokens.
         #
         # Hybrid (full_layers > 0): max_total = full_tokens, so cell_size accounts
@@ -278,10 +330,14 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         # token beyond the sliding window can be evicted. So cell_size = S*ns,
         # with no ratio factor applied.
         if self._full_layers_num == 0:
-            self._cell_size = self._swa_per_token * self._swa_layers_num
+            self._cell_size = (
+                self._swa_per_token * self._swa_layers_num
+                + self._full_per_token * self._draft_full_layers_num
+            )
         else:
             self._cell_size = (
-                self._full_per_token * self._full_layers_num
+                self._full_per_token
+                * (self._full_layers_num + self._draft_full_layers_num)
                 + self._swa_full_tokens_ratio
                 * self._swa_per_token
                 * self._swa_layers_num
@@ -405,7 +461,9 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         # SWA pool sized tightly from the cap; the rest of the budget goes to full.
         swa_tokens = ceil_align(self._swa_cap, page_size)
         fixed_swa_bytes = swa_tokens * self._swa_per_token * self._swa_layers_num
-        full_cell_size = self._full_per_token * self._full_layers_num
+        full_cell_size = self._full_per_token * (
+            self._full_layers_num + self._draft_full_layers_num
+        )
         full_tokens = (
             int((available_bytes - fixed_swa_bytes) // full_cell_size) // page_size
         ) * page_size

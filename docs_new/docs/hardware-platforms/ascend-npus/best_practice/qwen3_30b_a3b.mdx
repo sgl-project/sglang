@@ -4,7 +4,9 @@ metatags:
   description: "Best Practice for Qwen3-30B-A3B on Ascend NPU"
 ---
 
-This guide describes the best practice data for Qwen3-30B-A3B on the Ascend NPU.
+<Note>
+This page focuses on optimal configuration and benchmark results for Qwen3-30B-A3B on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3-30B-A3B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_30b_a3b).
+</Note>
 
 ### Low Latency
 
@@ -71,7 +73,7 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 export ASCEND_LAUNCH_BLOCKING=0
 export DP_ROUND_ROBIN=1
 export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_ALGO=level0:NA;level1:ring
+export HCCL_ALGO="level0:NA;level1:ring"
 export HCCL_SOCKET_IFNAME=<network-interface>
 export INF_NAN_MODE_FORCE_DISABLE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:False
@@ -106,7 +108,9 @@ python3 -m sglang.launch_server \
     --dp-size 2 \
     --mem-fraction-static 0.85 \
     --cuda-graph-bs 1 2 4 8 16 20 24 28 32 36 40 44 48 52 56 60 64 68 72 76 80 84 \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
@@ -204,7 +208,9 @@ python3 -m sglang.launch_server \
     --tp-size 2 \
     --mem-fraction-static 0.87 \
     --cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162 \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
@@ -302,7 +308,9 @@ python3 -m sglang.launch_server \
     --tp-size 2 \
     --mem-fraction-static 0.87 \
     --cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162 \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
@@ -399,7 +407,9 @@ python3 -m sglang.launch_server \
     --tp-size 2 \
     --mem-fraction-static 0.6 \
     --cuda-graph-bs 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
