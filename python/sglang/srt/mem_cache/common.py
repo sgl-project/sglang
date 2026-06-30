@@ -410,16 +410,6 @@ def alloc_paged_token_slots_extend(
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
-class PlannerRefused(Exception):
-    """Raised by ``alloc_req_slots`` when the planner cannot honor a prefill
-    batch (the shared KV pool's byte-coordinated availability dropped below what
-    the reqs need). Caught once at the scheduler's batch-prep boundary, which
-    unwinds the admission state and re-queues the reqs to retry next iter —
-    instead of crashing mid-batch-prep on the per-req ``HybridReqToTokenPool.alloc``
-    assert. Propagates cleanly through ``alloc_for_extend`` / ``prepare_for_extend``
-    so neither needs Optional/bool refusal threading."""
-
-
 def alloc_req_slots(
     req_to_token_pool: ReqToTokenPool,
     reqs: list[Req],
@@ -427,77 +417,43 @@ def alloc_req_slots(
 ) -> list[int]:
     """Allocate request slots from the pool.
 
-    Raises ``PlannerRefused`` when the batch cannot be honored: under the shared
-    KV pool the byte-coordinated mamba availability can drop below the
-    slot-conservation view when the peer (full) sub-pool consumes bytes. The
-    shared pool implements "``schedulable_available_size() >= N`` ⇒ ``alloc(N)``
-    succeeds", so the planner refuses up front rather than letting the per-req
-    ``HybridReqToTokenPool.alloc`` loop assert-fail mid-loop.
+    Fail-loud: raises ``RuntimeError`` if the pool can't satisfy the batch. The
+    scheduler's admission (``PrefillAdder``) is responsible for collecting the
+    correct available size so it never over-admits; an alloc failure here means
+    the admission budget was wrong (see the FIXME in
+    ``schedule_policy.PrefillAdder``) and should surface rather than be masked.
     """
     num_reqs = len(reqs)
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
         # Byte-coordinated availability: the shared `SharedMambaSlotAllocator`'s
         # `schedulable_available_size` accounts for the peer (full) sub-pool's
         # byte usage; the non-shared `MambaSlotAllocator` returns its plain slot
-        # free count (the two views coincide there). The lazy-extra-buffer factor
-        # below is upstream's (kept intact).
+        # free count (the two views coincide there).
         mamba_available_size = (
             req_to_token_pool.mamba_allocator.schedulable_available_size()
         )
-        # The eviction-trigger factor: how much "headroom" to ask the tree
-        # cache to free. For radix this is 3× — or the upstream
-        # lazy-extra-buffer variant when enabled — to leave room for potential
-        # COW (mamba_radix_cache._match_post_processor may allocate 1-2
-        # additional slots per req for copy-on-write branching). For chunk this
-        # is 1× — exact required. The lazy factor (kept from the upstream
-        # lazy-extra-buffer integration) only changes the eviction HEADROOM,
-        # not the strict refusal minimum below.
+        # Best-effort eviction headroom asked of the tree cache: 3× (or the
+        # lazy-extra-buffer variant) for radix to leave room for COW, 1× for
+        # chunk.
         if tree_cache.supports_mamba():
-            evict_factor = (
+            factor = (
                 MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
                 if req_to_token_pool.enable_mamba_extra_buffer_lazy
                 else MAMBA_STATE_PER_REQ_PREFIX_CACHE
             )
         else:
-            evict_factor = MAMBA_STATE_PER_REQ_NO_CACHE
-        # The refusal-trigger threshold MUST use the strict minimum
-        # (1 mamba slot per req) — not the 3× safety margin. The
-        # ``HybridReqToTokenPool.alloc`` per-req loop only needs 1
-        # mamba slot per req for its baseline call; the extra slots
-        # for COW are taken on the radix path later AFTER alloc
-        # succeeds. Using the 3× factor as the refusal threshold
-        # would refuse admissions that ACTUALLY would succeed,
-        # turning into a livelock under steady-state pressure (with all
-        # reqs pinning mamba slots: planner keeps refusing, scheduler
-        # keeps restoring, decoding freezes).
-        min_required = num_reqs  # ≥ 1 slot per req
-        evict_target = num_reqs * evict_factor
-        if mamba_available_size < evict_target:
+            factor = MAMBA_STATE_PER_REQ_NO_CACHE
+        mamba_state_needed = num_reqs * factor
+        if mamba_available_size < mamba_state_needed:
             if tree_cache is not None and tree_cache.supports_mamba():
-                mamba_num = max(0, evict_target - mamba_available_size)
+                mamba_num = max(0, mamba_state_needed - mamba_available_size)
                 tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
-                # Re-read after eviction to see whether it freed enough for the
-                # strict minimum.
-                mamba_available_size = (
-                    req_to_token_pool.mamba_allocator.schedulable_available_size()
-                )
-            # Refuse ONLY when the strict minimum cannot be honored —
-            # i.e., the ``mamba_pool.alloc(1)`` per-req loop would
-            # genuinely fail. The 3× evict target was a "best effort"
-            # hint to the tree cache; missing that target is fine as
-            # long as the strict minimum is met.
-            if mamba_available_size < min_required:
-                raise PlannerRefused(
-                    f"shared mamba pool cannot honor {min_required} slot(s): "
-                    f"only {mamba_available_size} schedulable after eviction"
-                )
     req_pool_indices = req_to_token_pool.alloc(reqs)
     if req_pool_indices is None:
-        # alloc could not be honored — refuse so the caller backs off and
-        # retries next iter rather than crashing mid-batch-prep.
-        raise PlannerRefused(
-            f"req_to_token_pool.alloc failed for {num_reqs} req(s) "
-            f"(available_size={req_to_token_pool.available_size()})"
+        raise RuntimeError(
+            "alloc_req_slots runs out of memory. "
+            "Please set a smaller number for `--max-running-requests`. "
+            f"{req_to_token_pool.available_size()=}, {num_reqs=}, "
         )
     return req_pool_indices
 
@@ -520,10 +476,9 @@ def alloc_for_extend(
     """
     Allocate KV cache for extend batch and write to req_to_token_pool.
 
-    Raises ``PlannerRefused`` (from ``alloc_req_slots``) when the batch cannot be
-    honored — the scheduler catches it and re-queues. Otherwise returns
-    ``(out_cache_loc, req_pool_indices_device, req_pool_indices_cpu)`` (the last
-    is the host/CPU mirror of the request pool indices).
+    Returns ``(out_cache_loc, req_pool_indices_device, req_pool_indices_cpu)``
+    (the last is the host/CPU mirror). ``alloc_req_slots`` raises ``RuntimeError``
+    if the pool can't satisfy the batch (fail-loud — see its docstring).
     """
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
@@ -536,8 +491,7 @@ def alloc_for_extend(
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
-    # Allocate req slots (raises PlannerRefused if the batch can't be honored,
-    # before any KV/req-pool mutations are committed)
+    # Allocate req slots (raises RuntimeError if the pool is exhausted)
     req_pool_indices = alloc_req_slots(
         batch.req_to_token_pool, batch.reqs, batch.tree_cache
     )

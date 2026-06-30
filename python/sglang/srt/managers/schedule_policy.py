@@ -630,7 +630,17 @@ class PrefillAdder:
         has none yet (`mamba_pool_idx is None` — mirrors
         `HybridReqToTokenPool.alloc`, so a chunked-prefill continuation or a
         radix state-reuse that won't allocate is not charged). 0 otherwise,
-        which keeps the baseline / SWA / non-Mamba paths unchanged."""
+        which keeps the baseline / SWA / non-Mamba paths unchanged.
+
+        FIXME(shared-kv-pool): this budget estimate is NOT correct. It charges a
+        flat per-req mamba-slot byte cost to the full gap, but does not fully
+        account for the shared pool's byte coordination — e.g. eviction freeing
+        bytes that are actually pinned (locked) by running reqs, COW slot growth
+        on the radix path, and compaction timing. When the estimate is too
+        optimistic the admission over-admits and `alloc_req_slots` then fails
+        loud with a RuntimeError (the planner no longer silently re-queues).
+        Make this account for the true schedulable byte budget so admission never
+        over-commits, then the alloc can never fail."""
         if self._mamba_slot_cost and req.mamba_pool_idx is None:
             return self._mamba_slot_cost
         return 0

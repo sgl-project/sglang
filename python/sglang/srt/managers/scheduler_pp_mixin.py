@@ -668,9 +668,8 @@ class SchedulerPPMixin:
                 device_module.synchronize()
 
                 start = time.perf_counter()
-                # PP-mixin's benchmark scaffold has no retry plumbing; if the
-                # planner refuses, `prepare_for_extend` raises `PlannerRefused`
-                # and it propagates (crash), matching the pre-refactor behavior.
+                # `prepare_for_extend` raises `RuntimeError` (fail-loud) if the
+                # pool is exhausted; it propagates (crash) here.
                 batch.prepare_for_extend()
 
                 # Resolve deferred H2D: prepare_for_extend now leaves input_ids=None

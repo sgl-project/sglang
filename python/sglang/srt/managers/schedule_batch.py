@@ -2011,9 +2011,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_extend(self) -> None:
         """Build extend tensors and allocate KV / req slots.
 
-        Raises ``PlannerRefused`` (from ``alloc_for_extend``) when the planner
-        cannot admit the batch — no KV/req-pool mutations have been committed at
-        the failure point, so the scheduler catches it and re-queues the reqs.
+        ``alloc_for_extend`` raises ``RuntimeError`` (fail-loud) if the pool
+        can't satisfy the batch — the scheduler's admission must not over-admit.
         """
         self.forward_mode = ForwardMode.EXTEND
 
@@ -2058,9 +2057,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
 
-        # Allocate memory. ``alloc_for_extend`` raises ``PlannerRefused`` when
-        # the planner cannot honor the batch (shared-pool byte-coordinated
-        # availability shortfall); the scheduler catches it and re-queues.
+        # Allocate memory. ``alloc_for_extend`` raises ``RuntimeError`` if the
+        # pool is exhausted (fail-loud — the scheduler must not over-admit).
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self
         )
@@ -2395,8 +2393,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_split_prefill(self) -> None:
         """Build extend tensors then switch to SPLIT_PREFILL mode.
-        ``prepare_for_extend`` raises ``PlannerRefused`` if the planner cannot
-        admit the batch."""
+        ``prepare_for_extend`` raises ``RuntimeError`` if the pool is exhausted."""
         self.prepare_for_extend()
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
         self.forward_mode = ForwardMode.SPLIT_PREFILL
