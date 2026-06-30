@@ -10,7 +10,7 @@ from collections import deque
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-import sglang.srt.managers.scheduler_components.self_benchmark as self_benchmark_module
+import sglang.srt.managers.scheduler_components.self_benchmark_decode as self_benchmark_decode_module
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler_components.self_benchmark import (
     SELF_BENCHMARK_DUMMY_TOKEN_ID,
@@ -492,7 +492,7 @@ class TestSelfBenchmark(CustomTestCase):
             captured["context_length"] = context_length
             return fake_batch
 
-        benchmark._build_synthetic_decode_batch = fake_build_synthetic_decode_batch
+        benchmark._decode_batch_builder.build = fake_build_synthetic_decode_batch
 
         injected = benchmark._inject_synthetic_decode(context_length=8, batch_size=2)
 
@@ -524,7 +524,7 @@ class TestSelfBenchmark(CustomTestCase):
         def fail_build_synthetic_decode_batch(_reqs, _context_length):
             raise AssertionError("synthetic decode batch should not be built")
 
-        benchmark._build_synthetic_decode_batch = fail_build_synthetic_decode_batch
+        benchmark._decode_batch_builder.build = fail_build_synthetic_decode_batch
 
         injected = benchmark._inject_synthetic_decode(context_length=8, batch_size=2)
 
@@ -683,23 +683,15 @@ class TestSelfBenchmark(CustomTestCase):
 
         self.assertTrue(all(p.point_type == "decode" for p in benchmark._grid))
 
-    def test_build_synthetic_decode_batch_stashes_relay_payload(self):
-        # P0-1 regression guard: _build_synthetic_decode_batch must hand
-        # FutureMap.stash a RelayPayload, never a raw tensor. We exercise the
-        # REAL _build_synthetic_decode_batch (only the memory allocation and
-        # sampling-info construction are stubbed) so the stash call is covered.
+    def test_decode_batch_builder_uses_canonical_allocation_and_relay_payload(self):
         scheduler = _prepare_decode_scheduler(self._scheduler())
-
         captured = {}
 
         class _FakeFutureMap:
             def stash(self, future_indices, payload):
                 captured["future_indices"] = future_indices
                 captured["payload"] = payload
-                # Mirror FutureMap.stash's real access pattern: a raw tensor
-                # would raise AttributeError here.
                 assert type(payload).__name__ == "RelayPayload"
-                assert hasattr(payload, "bonus_tokens")
                 _ = payload.bonus_tokens.to
 
         scheduler.future_map = _FakeFutureMap()
@@ -708,40 +700,55 @@ class TestSelfBenchmark(CustomTestCase):
         scheduler.enable_overlap = False
         scheduler.dllm_config = None
         scheduler.enable_hisparse = False
+        root_node = object()
+        scheduler.tree_cache.root_node = root_node
 
         benchmark = SelfBenchmark(scheduler)
-
-        # Stub the GPU-memory allocation + sampling-info construction; keep the
-        # real stash path. _place_synthetic_context_cache normally fills
-        # req_pool_indices, so the stub sets it.
-        def fake_place(batch, context_length):
-            batch.req_pool_indices = list(range(len(batch.reqs)))
-
-        benchmark._place_synthetic_context_cache = fake_place
 
         class _FakeBatch:
             def __init__(self, **kwargs):
                 self.reqs = kwargs.get("reqs", [])
+                self.tree_cache = kwargs["tree_cache"]
                 self.device = "cpu"
-                self.req_pool_indices = None
-                self.sampling_info = None
                 self.input_ids = "sentinel"
 
-        # mock.patch.object correctly saves/restores the classmethod descriptors.
+        out_cache_loc = object()
+        req_pool_indices = [0]
+        req_pool_indices_cpu = [0]
+        alloc_for_extend = mock.Mock(
+            return_value=(out_cache_loc, req_pool_indices, req_pool_indices_cpu)
+        )
         with mock.patch.object(
-            self_benchmark_module.ScheduleBatch,
+            self_benchmark_decode_module.ScheduleBatch,
             "init_new",
             staticmethod(lambda **kwargs: _FakeBatch(**kwargs)),
         ), mock.patch.object(
-            self_benchmark_module.SamplingBatchInfo,
+            self_benchmark_decode_module.SamplingBatchInfo,
             "from_schedule_batch",
             staticmethod(lambda batch, vocab_size: object()),
+        ), mock.patch.object(
+            self_benchmark_decode_module, "alloc_for_extend", alloc_for_extend
         ):
             reqs = [benchmark._new_synthetic_req(prompt_len=8, max_tokens=2)]
             reqs[0].output_ids.append(SELF_BENCHMARK_DUMMY_TOKEN_ID)
-            batch = benchmark._build_synthetic_decode_batch(reqs, context_length=8)
+            batch = benchmark._decode_batch_builder.build(reqs, context_length=8)
 
-        self.assertIn("payload", captured)
+        alloc_for_extend.assert_called_once_with(batch)
+        self.assertIs(batch.out_cache_loc, out_cache_loc)
+        self.assertIs(batch.req_pool_indices, req_pool_indices)
+        self.assertIs(batch.req_pool_indices_cpu, req_pool_indices_cpu)
+        self.assertEqual(batch.prefix_lens, [0])
+        self.assertEqual(batch.extend_lens, [8])
+        self.assertEqual(batch.extend_num_tokens, 8)
+        self.assertEqual(batch.seq_lens_cpu.tolist(), [8])
+        self.assertEqual(batch.seq_lens.tolist(), [8])
+        self.assertEqual(batch.orig_seq_lens.tolist(), [8])
+        self.assertEqual(batch.seq_lens_sum, 8)
+        self.assertTrue(batch.forward_mode.is_extend())
+        self.assertTrue(reqs[0].synthetic_benchmark_kv_placed)
+        self.assertIs(reqs[0].last_node, root_node)
+        self.assertIs(reqs[0].last_host_node, root_node)
+        self.assertIs(reqs[0].best_match_node, root_node)
         self.assertEqual(type(captured["payload"]).__name__, "RelayPayload")
         self.assertEqual(captured["payload"].bonus_tokens.tolist(), [0])
         self.assertIsNone(batch.input_ids)
@@ -754,10 +761,10 @@ class TestSelfBenchmark(CustomTestCase):
                 benchmark = SelfBenchmark(scheduler)
                 build_error = AttributeError("synthetic build failed")
                 cleanup = mock.Mock(side_effect=cleanup_error)
-                benchmark._build_synthetic_decode_batch = mock.Mock(
+                benchmark._decode_batch_builder.build = mock.Mock(
                     side_effect=build_error
                 )
-                benchmark._free_synthetic_decode_reqs = cleanup
+                benchmark._decode_batch_builder.cleanup = cleanup
 
                 with self.assertRaises(AttributeError) as raised:
                     benchmark._inject_synthetic_decode(context_length=8, batch_size=2)
@@ -767,6 +774,24 @@ class TestSelfBenchmark(CustomTestCase):
                 self.assertEqual(len(cleanup.call_args.args[0]), 2)
                 self.assertIs(scheduler.running_batch, original_batch)
                 self.assertEqual(benchmark._active_reqs, [])
+
+    def test_decode_batch_builder_cleanup_handles_partial_allocation(self):
+        scheduler = self._scheduler()
+        scheduler.req_to_token_pool = types.SimpleNamespace(free=mock.Mock())
+        placed = types.SimpleNamespace(
+            synthetic_benchmark_kv_placed=True, req_pool_idx=1
+        )
+        slot_only = types.SimpleNamespace(req_pool_idx=2)
+        unallocated = types.SimpleNamespace(req_pool_idx=None)
+
+        with mock.patch.object(
+            self_benchmark_decode_module, "release_kv_cache"
+        ) as release:
+            benchmark = SelfBenchmark(scheduler)
+            benchmark._decode_batch_builder.cleanup([placed, slot_only, unallocated])
+
+        release.assert_called_once_with(placed, scheduler.tree_cache, is_insert=False)
+        scheduler.req_to_token_pool.free.assert_called_once_with(slot_only)
 
     def test_partial_sweep_records_skipped_point_and_is_invalid(self):
         benchmark = SelfBenchmark(self._scheduler())
@@ -878,6 +903,8 @@ def _make_rejection_scheduler():
         ps=types.SimpleNamespace(pp_size=1, tp_size=2, dp_size=2),
         enable_pdmux=False,
         enable_overlap_mlx=False,
+        dllm_config=None,
+        token_to_kv_pool_allocator=object(),
         is_generation=True,
         spec_algorithm=types.SimpleNamespace(is_none=lambda: True),
         model_config=types.SimpleNamespace(
@@ -920,6 +947,10 @@ class TestSelfBenchmarkFactory(CustomTestCase):
                 lambda scheduler: setattr(scheduler, "enable_overlap_mlx", True),
             ),
             (
+                "diffusion LLM",
+                lambda scheduler: setattr(scheduler, "dllm_config", object()),
+            ),
+            (
                 "only supported for generative",
                 lambda scheduler: setattr(scheduler, "is_generation", False),
             ),
@@ -955,6 +986,17 @@ class TestSelfBenchmarkFactory(CustomTestCase):
                 fake = _make_rejection_scheduler()
                 mutate(fake)
                 with self.assertRaisesRegex(ValueError, message):
+                    self._run(fake)
+
+    def test_rejects_deepseek_v4_npu_for_all_modes(self):
+        for mode in ("prefill", "decode", "agg"):
+            with self.subTest(mode=mode):
+                fake = _make_rejection_scheduler()
+                fake.server_args.benchmark_mode = mode
+                fake.token_to_kv_pool_allocator = types.SimpleNamespace(
+                    c4_attn_allocator=object()
+                )
+                with self.assertRaisesRegex(ValueError, "DeepSeek V4 on NPU"):
                     self._run(fake)
 
     def test_does_not_reject_multi_rank_tp(self):
