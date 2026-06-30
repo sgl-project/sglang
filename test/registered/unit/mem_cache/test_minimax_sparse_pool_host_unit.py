@@ -390,6 +390,13 @@ class TestMiniMaxSparseHiCacheTransfer(unittest.TestCase):
     def test_device_to_host_kernel_layer_first(self):
         self._run_device_to_host_copy(io_backend="kernel", layout="layer_first")
 
+    @unittest.skipIf(
+        is_hip(),
+        "ROCm sgl-kernel transfer_kv_all_layer_lf_pf requires a CUDA dst-indices "
+        "tensor for the kernel+page_first combo, while CUDA accepts the CPU "
+        "dst-indices this combo feeds. The production io_backend=kernel + "
+        "layer_first path is covered by test_device_to_host_kernel_layer_first.",
+    )
     def test_device_to_host_kernel_page_first(self):
         self._run_device_to_host_copy(io_backend="kernel", layout="page_first")
 
