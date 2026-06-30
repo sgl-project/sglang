@@ -1,5 +1,6 @@
 import json
 from abc import ABC, abstractmethod
+from array import array
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
@@ -165,7 +166,7 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
             if ngram_size <= 0 or window_size <= 0:
                 continue
 
-            sequence: List[int] = req.origin_input_ids + req.output_ids
+            sequence = req.origin_input_ids + req.output_ids
             if len(sequence) < ngram_size:
                 continue
 
@@ -175,14 +176,14 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
                 continue
 
             if ngram_size > 1:
-                current_prefix = tuple(sequence[-(ngram_size - 1) :])
+                current_prefix = sequence[-(ngram_size - 1) :]
             else:
-                current_prefix = tuple()
+                current_prefix = array("q")
 
             banned_tokens: Set[int] = set()
             for idx in range(search_start, search_end):
                 ngram = sequence[idx : idx + ngram_size]
-                if ngram_size == 1 or tuple(ngram[:-1]) == current_prefix:
+                if ngram_size == 1 or ngram[:-1] == current_prefix:
                     banned_tokens.add(ngram[-1])
 
             whitelist_ids = params.get("whitelist_token_ids") or []

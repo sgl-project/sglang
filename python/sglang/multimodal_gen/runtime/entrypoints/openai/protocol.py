@@ -151,6 +151,8 @@ class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     num_profiled_timesteps: Optional[int] = None
     profile_all_stages: Optional[bool] = False
     realtime_output_format: Optional[Literal["raw", "webp", "jpeg"]] = None
+    realtime_preview_max_width: Optional[int] = None
+    realtime_output_pacing: Optional[bool] = False
     realtime_causal_sink_size: Optional[int] = None
     realtime_causal_kv_cache_num_frames: Optional[int] = None
 

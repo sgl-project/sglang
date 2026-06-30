@@ -10,7 +10,6 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateDType,
 )
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers import dp_attention as _dp_attention
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -22,13 +21,20 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
 )
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_parallel
 
 from ..mock_server_args import make_mock_server_args
 
-_dp_attention.get_attention_tp_size = lambda: 1
+_parallel_override = get_parallel().override(attn_tp_size=1)
+_parallel_override.__enter__()
 
 DEFAULT_HEAD_K_DIM = 32
 DEFAULT_HEAD_V_DIM = 32
@@ -217,14 +223,24 @@ class MockKDAModelRunner(ModelRunner):
         speculative_num_draft_tokens = (
             case.input_lens[0]
             if case.forward_mode.is_target_verify()
-            or case.forward_mode.is_draft_extend(include_v2=True)
+            or case.forward_mode.is_draft_extend_v2()
             else 0
         )
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
+                ),
+                prefill=PhaseConfig(
+                    backend=(
+                        Backend.DISABLED
+                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+                        else Backend.TC_PIECEWISE
+                    ),
+                ),
+            ),
             dllm_algorithm=None,
             dllm_algorithm_config=None,
             enable_deterministic_inference=False,
@@ -294,6 +310,7 @@ class MockKDAModelRunner(ModelRunner):
         self.sliding_window_size = None
         self.use_mla_backend = False
         self.is_draft_worker = False
+        self._kernel_warmed_up = True
 
     @property
     def hybrid_gdn_config(self):

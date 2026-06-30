@@ -504,19 +504,32 @@ def test_lingbot_realtime_plastic_beach_params_are_lossless_gt_ready():
     assert params.realtime_perf_ignore_initial_chunks == 2
     assert params.realtime_perf_thresholds["p95_chunk_total_ms"] == 5000.0
     assert params.realtime_perf_thresholds["p95_scheduler_forward_ms"] == 4500.0
-    assert params.realtime_events[0]["kind"] == "camera_actions"
-    assert params.realtime_events[0]["payload"]["mode"] == "state"
+    assert params.realtime_events == []
+    assert params.extras["condition_inputs"]["camera_actions"] == [
+        ["w"],
+        ["w"],
+        ["w"],
+        ["w"],
+        ["w"],
+        ["w"],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+    ]
 
 
 def test_lingbot_realtime_case_is_registered_by_default():
-    from sglang.multimodal_gen.test.server.gpu_cases import (
-        ONE_GPU_CASES,
-        _make_lingbot_realtime_plastic_beach_case,
-    )
+    from sglang.multimodal_gen.test.server.gpu_cases import ONE_GPU_CASES
 
-    case = _make_lingbot_realtime_plastic_beach_case()
+    case = next(
+        item
+        for item in ONE_GPU_CASES
+        if item.id == "lingbot_world_realtime_plastic_beach"
+    )
     assert case.id == "lingbot_world_realtime_plastic_beach"
     assert case.run_consistency_check is True
     assert case.run_perf_check is True
     assert case.sampling_params.realtime_output_format is None
-    assert any(item.id == case.id for item in ONE_GPU_CASES)

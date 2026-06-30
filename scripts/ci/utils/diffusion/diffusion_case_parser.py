@@ -16,6 +16,7 @@ Usage:
 
 import ast
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -43,6 +44,17 @@ STARTUP_OVERHEAD_SECONDS = 120.0
 # Paths relative to repository root
 BASELINE_REL_PATH = "python/sglang/multimodal_gen/test/server/perf_baselines.json"
 RUN_SUITE_REL_PATH = "python/sglang/multimodal_gen/test/run_suite.py"
+
+USE_NPU_CONFIGS = os.getenv("USE_NPU_CONFIGS", "0").lower() in ("1", "true")
+
+if USE_NPU_CONFIGS:
+    BASELINE_REL_PATH = (
+        "python/sglang/multimodal_gen/test/server/perf_baselines_npu.json"
+    )
+    CASE_LIST_TO_SUITE = {
+        "ONE_NPU_CASES": "1-npu",
+        "TWO_NPU_CASES": "2-npu",
+    }
 
 
 @dataclass
@@ -90,10 +102,19 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
             if case_id:
                 self.factory_case_ids[stmt.name] = case_id
 
-        for stmt in node.body:
-            if isinstance(stmt, ast.Expr):
-                self._process_expr(stmt.value)
+        self.generic_visit(node)
 
+    def visit_Expr(self, node: ast.Expr):
+        """Handle ``LIST.append(...)`` mutations at any nesting level.
+
+        Previously only module-top-level ``ast.Expr`` statements were scanned for
+        ``.append()`` calls, so cases registered under a platform guard such as
+        ``if not current_platform.is_hip(): ONE_GPU_CASES.append(...)`` (used by
+        ``hunyuan3d_shape_gen`` and ``turbo_wan2_1_t2v_1.3b``) were invisible to
+        the partition planner and therefore never scheduled in CI. Visiting every
+        ``Expr`` lets ``generic_visit`` reach appends inside ``if``/``else`` blocks.
+        """
+        self._process_expr(node.value)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign):

@@ -75,13 +75,16 @@ class RocmPlatform(Platform):
     @classmethod
     def get_available_gpu_memory(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
         distributed: bool = False,
         empty_cache: bool = True,
         cpu_group: Any = None,
     ) -> float:
         if empty_cache:
             torch.cuda.empty_cache()
+
+        if device_id is None:
+            device_id = torch.cuda.current_device()
 
         free_gpu_memory, _ = torch.cuda.mem_get_info(device_id)
 

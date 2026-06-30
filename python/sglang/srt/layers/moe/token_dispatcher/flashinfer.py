@@ -20,9 +20,11 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_int_env_var
+from sglang.srt.utils.common import require_mlp_tp_gather
 
 try:
     from flashinfer import nvfp4_block_scale_interleave
@@ -96,7 +98,11 @@ class FlashinferDispatcher(BaseDispatcher):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
-
+        self.invalid_token_expert_id = (
+            -1
+            if get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            else self.num_experts
+        )
         # TODO: Can other moe runners use payload_in_workspace too?
         self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
 
@@ -162,19 +168,6 @@ class FlashinferDispatcher(BaseDispatcher):
             mnnvl_config=MnnvlConfig(comm_backend=TorchDistributedCommBackend(group)),
         )
 
-        self.dummy_topk_ids = torch.full(
-            (1, self.router_topk), self.num_experts, dtype=torch.int32, device="cuda"
-        )
-        self.dummy_topk_ids_current_rank = torch.full(
-            (1, self.router_topk),
-            self.ep_rank * self.num_local_experts,
-            dtype=torch.int32,
-            device="cuda",
-        )
-        self.dummy_topk_weights = torch.zeros(
-            (1, self.router_topk), dtype=torch.float32, device="cuda"
-        )
-
     @debug_kernel_api
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -185,15 +178,14 @@ class FlashinferDispatcher(BaseDispatcher):
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
 
-        self.has_dummy_token = x.shape[0] == 0
-        if self.has_dummy_token:
-            x = hidden_states.new_zeros((1, self.hidden_size))
-            topk_ids = self.dummy_topk_ids
-            topk_weights = self.dummy_topk_weights
-
         global_scale = self.quant_config.get("input_global_scale", None)
         if global_scale is not None:
-            x, x_sf = fp4_quantize(x, global_scale, is_sf_swizzled_layout=False)
+            if x.shape[0] > 0:
+                x, x_sf = fp4_quantize(x, global_scale, is_sf_swizzled_layout=False)
+            else:
+                x_col = x.shape[1]
+                x = torch.zeros(0, x_col // 2, dtype=torch.uint8, device=x.device)
+                x_sf = torch.zeros(0, x_col // 16, dtype=torch.uint8, device=x.device)
 
         payloads = []
         payloads.append(x)
@@ -205,18 +197,47 @@ class FlashinferDispatcher(BaseDispatcher):
         payloads.append(topk_ids)
         payloads.append(topk_weights)
 
+        # runtime_max_tokens_per_rank selection
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # MoeAlltoAll uses fixed-geometry buffers shaped
+        # [ep_size, runtime_max_tokens_per_rank, ...], so every EP rank
+        # must pass the same value.  Three cases:
+        #
+        # Case 1 — max(dp_global):
+        #   DP attention with require_mlp_tp_gather=True.  The scheduler
+        #   all-gathered per-DP-rank token counts into dp_global (a list
+        #   of length dp_size); max() is uniform across all ranks and
+        #   sizes the workspace for the fattest rank.
+        #
+        # Case 2 — self.max_num_tokens (static capacity):
+        #   EP>1 during live (non-capture) inference with
+        #   require_mlp_tp_gather=False.  The scheduler only stored the
+        #   local token count, so x.shape[0] can differ across EP ranks
+        #   that span different DP groups.  The static workspace capacity
+        #   is the same on every rank, so it is always safe.
+        #
+        # Case 3 — x.shape[0] (actual tensor size):
+        #   Everything else: EP=1, sequence-parallel (post-scatter), or
+        #   CUDA graph capture.  In these situations x.shape[0] is the
+        #   same on every EP rank.  During CUDA graph capture
+        #   (get_is_capture_mode()=True) the graph runner ensures all
+        #   ranks capture with the same batch size, so we skip Case 2
+        #   and land here — using x.shape[0] avoids baking the
+        #   (potentially much larger) static max into the captured graph.
         dp_global = get_dp_global_num_tokens()
         if dp_global is not None and len(dp_global) > 1:
-            # DP attention: multiple DP ranks with different token counts.
-            # Use the max across ranks so the A2A workspace fits the fattest.
+            # Case 1
             self.runtime_max_tokens_per_rank = max(dp_global)
+        elif (
+            self.ep_size > 1
+            and not get_is_capture_mode()
+            and not require_mlp_tp_gather(get_global_server_args())
+        ):
+            # Case 2
+            self.runtime_max_tokens_per_rank = self.max_num_tokens
         else:
-            # dp_size=1 or SP: use the actual input tensor size (post-scatter
-            # in SP mode, full batch otherwise).  Avoids the pre-scatter
-            # scheduler count which can exceed the workspace cap.
+            # Case 3
             self.runtime_max_tokens_per_rank = x.shape[0]
-        if self.has_dummy_token:
-            self.runtime_max_tokens_per_rank = max(self.runtime_max_tokens_per_rank, 1)
 
         # Passing topk_ids + invalid_token_expert_id triggers the sanitize step
         # inside moe_a2a. The recv buffer has shape
@@ -225,10 +246,10 @@ class FlashinferDispatcher(BaseDispatcher):
         # and waste downstream MoE compute. Sanitizing the padding to a
         # sentinel id is structural, not optional.
         recv_tensors = self.moe_a2a.dispatch(
-            self.dummy_topk_ids_current_rank if self.has_dummy_token else topk_ids,
+            topk_ids,
             payloads,
             self.runtime_max_tokens_per_rank,
-            invalid_token_expert_id=self.num_experts,
+            invalid_token_expert_id=self.invalid_token_expert_id,
             expert_id_payload_index=expert_id_payload_index,
         )
         if x_sf is not None:
@@ -268,9 +289,5 @@ class FlashinferDispatcher(BaseDispatcher):
             payload_in_workspace=self.payload_in_workspace,
         )
 
-        if self.has_dummy_token:
-            hidden_states = hidden_states[1:, :]
-
         del self.runtime_max_tokens_per_rank
-        del self.has_dummy_token
         return hidden_states

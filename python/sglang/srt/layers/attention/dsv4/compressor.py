@@ -23,12 +23,23 @@ from sglang.srt.layers.dp_attention import get_attention_cp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip
-from sglang.srt.utils import add_prefix
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_npu, set_weight_attrs
+
+_is_npu = is_npu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_tgemm = None
+if _use_aiter:
+    from aiter.tuned_gemm import tgemm
+
+    _tgemm = tgemm
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -97,6 +108,7 @@ class CompressorBackendMixin:
 
             from sglang.srt.layers.attention.dsv4.fused_compress_triton import (
                 hip_compress_forward,
+                hip_compress_fused_norm_rope_hadamard_inplace,
                 hip_compress_fused_norm_rope_inplace,
             )
 
@@ -113,14 +125,24 @@ class CompressorBackendMixin:
             norm_eps = (
                 norm.variance_epsilon if hasattr(norm, "variance_epsilon") else norm.eps
             )
-            hip_compress_fused_norm_rope_inplace(
-                kv_compressed,
-                norm.weight,
-                norm_eps,
-                freqs_cis_cache,
-                plan,
-            )
-            return rotate_activation(kv_compressed) if rotate else kv_compressed
+            if rotate:
+                hip_compress_fused_norm_rope_hadamard_inplace(
+                    kv_compressed,
+                    norm.weight,
+                    norm_eps,
+                    freqs_cis_cache,
+                    plan,
+                    head_dim,
+                )
+            else:
+                hip_compress_fused_norm_rope_inplace(
+                    kv_compressed,
+                    norm.weight,
+                    norm_eps,
+                    freqs_cis_cache,
+                    plan,
+                )
+            return kv_compressed
 
         kv_compressed = compress_forward(
             kv_score_buffer=kv_score_buffer,
@@ -161,6 +183,8 @@ class CompressorBackendMixin:
             if compressor.ratio == 4
             else core_metadata.c128_out_loc
         )
+        if out_loc.shape[0] > new_compressed_kv.shape[0]:
+            out_loc = out_loc[: new_compressed_kv.shape[0]]
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_extra_key_buffer_fused(
                 layer_id=layer_id,
@@ -184,16 +208,19 @@ class CompressorBackendMixin:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         new_compressed_kv = compressor(x, forward_batch, attn_backend=self)
+        out_loc = self.forward_metadata.core_metadata.c4_out_loc
+        if out_loc.shape[0] > new_compressed_kv.shape[0]:
+            out_loc = out_loc[: new_compressed_kv.shape[0]]
         if self.enable_deepseek_v4_fp4_indexer:
             token_to_kv_pool.set_index_k_fp4(
                 layer_id=layer_id,
-                loc=self.forward_metadata.core_metadata.c4_out_loc,
+                loc=out_loc,
                 cache_k=new_compressed_kv,
             )
         elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,
-                loc=self.forward_metadata.core_metadata.c4_out_loc,
+                loc=out_loc,
                 cache_k=new_compressed_kv,
             )
         else:
@@ -202,7 +229,7 @@ class CompressorBackendMixin:
             )
             token_to_kv_pool.set_index_k_scale_buffer(
                 layer_id=layer_id,
-                loc=self.forward_metadata.core_metadata.c4_out_loc,
+                loc=out_loc,
                 index_k=new_compressed_kv_fp8,
                 index_k_scale=new_compressed_kv_scale,
             )
@@ -318,7 +345,7 @@ def create_paged_compressor_data(
     return FusedCompressMetadata(write_loc=write_loc, extra_data=extra_data, plan=plan)
 
 
-class Compressor(nn.Module):
+class Compressor(MultiPlatformOp):
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -346,6 +373,7 @@ class Compressor(nn.Module):
         self.ape = nn.Parameter(
             torch.empty(self.ratio, coff * self.head_dim, dtype=torch.float32)
         )
+        set_weight_attrs(self.ape, {"weight_loader": self.load_ape_weight})
         wkv_gate_dtype = torch.bfloat16
         self.wkv_gate = ReplicatedLinear(
             self.dim,
@@ -363,14 +391,26 @@ class Compressor(nn.Module):
 
         self.ape_converted = False
 
-    def apply_ape_hotfix(self):
-        assert not self.ape_converted
+    def _apply_ape_hotfix(self):
         self.ape_converted = True
+
+        if _is_npu:
+            return
 
         if self.overlap:
             ape = torch.chunk(self.ape.data, 2, dim=-1)
             ape = torch.cat([ape[0], ape[1]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
+
+    def apply_ape_hotfix(self):
+        assert not self.ape_converted
+        self._apply_ape_hotfix()
+
+    def load_ape_weight(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        assert param is self.ape
+        assert loaded_weight.shape == param.shape
+        param.data.copy_(loaded_weight)
+        self._apply_ape_hotfix()
 
     def get_state_pool(self, attn_backend: AttentionBackend) -> CompressStatePool:
         token_to_kv_pool = attn_backend.token_to_kv_pool
@@ -383,23 +423,28 @@ class Compressor(nn.Module):
         return ret
 
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        if _tgemm is not None and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
+            # v1 compress goes through fused_compress_triton, which promotes
+            # bf16->fp32 internally, so skip the .float() cast.
+            kv_score = _tgemm.mm(x, self.wkv_gate.weight, otype=x.dtype)
+        else:
+            kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
             kv_score = cp_all_gather_rerange_output(
                 kv_score,
-                get_attention_cp_size(),
+                get_parallel().attn_cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
         return kv_score
 
-    def forward(
+    def forward_native(
         self,
         x: torch.Tensor,
         forward_batch: ForwardBatch,
-        attn_backend: AttentionBackend,
+        attn_backend: Optional[AttentionBackend] = None,
     ) -> torch.Tensor:
         if forward_batch.forward_mode.is_idle():
             assert x.shape[0] == 0
@@ -422,6 +467,26 @@ class Compressor(nn.Module):
             forward_batch=forward_batch,
             is_paged=True,
         )
+
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend: Optional[AttentionBackend] = None,
+    ) -> torch.Tensor:
+        if forward_batch.forward_mode.is_idle():
+            assert x.shape[0] == 0
+            return x.new_empty(0, self.head_dim)
+
+        if dsa_use_prefill_cp(forward_batch):
+            x = cp_all_gather_rerange_output(
+                x,
+                get_attention_cp_size(),
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+
+        return get_attn_backend().forward_compress(self, x, forward_batch)
 
 
 if _is_hip and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():

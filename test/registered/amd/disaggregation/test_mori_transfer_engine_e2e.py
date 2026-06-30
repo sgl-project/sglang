@@ -8,7 +8,6 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
-    DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
@@ -176,20 +175,6 @@ class TestMoriTransferEngineTPMismatchE2E(MoriTransferEngineBase):
     required_gpus = 6
 
     def test_generate_smoke_tp_mismatch(self):
-        self._assert_generate_smoke()
-
-
-class TestMoriTransferEngineHybridMambaE2E(MoriTransferEngineBase):
-
-    port_delta = 20
-    prefill_tp = 4
-    decode_tp = 4
-    decode_base_gpu_id = 4
-    required_gpus = 8
-    model_default = DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST
-    model_env_var = "SGLANG_MORI_HYBRID_E2E_TEST_MODEL"
-
-    def test_generate_smoke_hybrid_mamba(self):
         self._assert_generate_smoke()
 
 
