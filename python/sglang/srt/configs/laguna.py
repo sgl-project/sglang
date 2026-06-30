@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
@@ -21,6 +21,20 @@ logger = logging.get_logger(__name__)
 def _first_not_none(*candidates: Any) -> Any:
     """First non-None candidate. Unlike `a or b`, preserves falsy values."""
     return next((c for c in candidates if c is not None), None)
+
+
+def normalize_gating(value: Any) -> Literal["per-head", "per-element", "disabled"]:
+    if value in (True, "per-head"):
+        return "per-head"
+    if value == "per-element":
+        return "per-element"
+    if value in (False, None, "disabled"):
+        return "disabled"
+    raise ValueError(
+        "gating must be one of True, False, None, "
+        '"per-head", "per-element", or "disabled"; '
+        f"got {value!r}."
+    )
 
 
 def _to_sglang_rope_scaling(rope_params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -121,7 +135,7 @@ class LagunaConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-        self.gating = "per-head" if gating is True else gating
+        self.gating = normalize_gating(gating)
         self.sliding_window = sliding_window
 
         self.num_experts = num_experts
@@ -154,7 +168,7 @@ class LagunaConfig(PretrainedConfig):
         # Per-layer Q-head count is read directly from num_attention_heads_per_layer.
         # DFlash draft configs can be all-SWA. In that case there is no full
         # layer geometry to expose, so use layer 0 for the default attention
-        # fields and keep the SWA-specific fields below explicit.
+        # fields and keep per-layer Q-head geometry explicit.
         full_idx = (
             self.layer_types.index("full_attention")
             if "full_attention" in self.layer_types
@@ -167,8 +181,9 @@ class LagunaConfig(PretrainedConfig):
 
         # Released checkpoint nests rope_parameters under layer-type keys.
         rp = rope_parameters if isinstance(rope_parameters, dict) else {}
+        has_full_attention = "full_attention" in self.layer_types
         swa_rp = rp.get("sliding_attention") or {}
-        full_rp = rp.get("full_attention") or swa_rp or {}
+        full_rp = rp.get("full_attention") or (swa_rp if not has_full_attention else {})
 
         # transformers v5 aliases `rope_scaling` ↔ `rope_parameters` on
         # PretrainedConfig — writing one clobbers the other. Keep the nested

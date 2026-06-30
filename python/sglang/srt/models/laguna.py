@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.configs.laguna import LagunaConfig
+from sglang.srt.configs.laguna import LagunaConfig, normalize_gating
 from sglang.srt.distributed import (
     get_pp_group,
     tensor_model_parallel_all_reduce,
@@ -247,13 +247,9 @@ class LagunaAttention(nn.Module):
         self.hidden_size = hidden_size
         self.head_dim = head_dim
         self.layer_id = layer_id
-        if gating not in (True, False, None, "per-head", "per-element"):
-            raise ValueError(
-                f"Unsupported gating value {gating!r}; expected one of "
-                'True, False, None, "per-head", or "per-element".'
-            )
-        self.gating = bool(gating)
-        self.gate_per_head = gating is True or gating == "per-head"
+        gating = normalize_gating(gating)
+        self.gating = gating != "disabled"
+        self.gate_per_head = gating == "per-head"
 
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size

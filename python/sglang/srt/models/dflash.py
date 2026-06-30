@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -67,12 +68,28 @@ def _get_dflash_layer_attention_params(
     )
 
 
+def _get_dflash_total_num_heads(config, layer_id: int) -> int:
+    """Let per-layer DFlash Q-heads override scalar num_attention_heads."""
+    heads_per_layer = getattr(config, "num_attention_heads_per_layer", None)
+    if heads_per_layer is not None:
+        if layer_id >= len(heads_per_layer):
+            expected = getattr(config, "num_hidden_layers", layer_id + 1)
+            raise ValueError(
+                "DFLASH config.num_attention_heads_per_layer must have one "
+                "entry per draft layer: "
+                f"expected num_hidden_layers={expected}, "
+                f"got {len(heads_per_layer)}."
+            )
+        return int(heads_per_layer[layer_id])
+    return int(config.num_attention_heads)
+
+
 class DFlashAttention(nn.Module):
     def __init__(self, config, layer_id: int, quant_config=None) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         tp_size = int(get_parallel().tp_size)
-        total_num_heads = int(config.num_attention_heads)
+        total_num_heads = _get_dflash_total_num_heads(config, layer_id)
         total_num_kv_heads = int(
             getattr(config, "num_key_value_heads", total_num_heads)
         )
@@ -488,17 +505,8 @@ class DFlashLagunaAttention(DFlashAttention):
     def __init__(self, config, layer_id: int, quant_config=None) -> None:
         super().__init__(config=config, layer_id=layer_id, quant_config=quant_config)
         hidden_size = int(config.hidden_size)
-        total_num_heads = int(config.num_attention_heads)
-        gating = getattr(config, "gating", True)
-        if gating is True:
-            gating = "per-head"
-        elif gating in (False, None):
-            gating = "disabled"
-        if gating not in ("per-head", "per-element", "disabled"):
-            raise ValueError(
-                "Laguna DFLASH gating must be one of per-head, per-element, "
-                f"or disabled, got {gating!r}."
-            )
+        total_num_heads = self.total_num_heads
+        gating = normalize_gating(getattr(config, "gating", True))
         self.gating = gating
         self.gate_per_head = gating == "per-head"
         if self.gating == "disabled":
