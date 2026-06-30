@@ -1074,7 +1074,12 @@ def pre_permute_deepep_v2_to_deep_gemm(
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
 
-    input_tensor = torch.zeros(
+    # Match the legacy deepep_normal adapter (same ep_scatter + grouped GEMM): the
+    # scatter writes only real-token rows and the post-permute ep_gather reads them
+    # back via output_index, so the per-expert alignment padding rows are never
+    # consumed and the activation buffer needs no zero-init. The ue8m0 packed-scale
+    # layout keeps zeros (its in-int32 padding lanes must be zero).
+    input_tensor = torch.empty(
         (all_tokens, K), device=hidden_states.device, dtype=hidden_states.dtype
     )
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
@@ -1084,7 +1089,7 @@ def pre_permute_deepep_v2_to_deep_gemm(
             dtype=torch.int,
         ).transpose(0, 1)
     else:
-        input_tensor_scale = torch.zeros(
+        input_tensor_scale = torch.empty(
             (all_tokens, K // 128), device=hidden_states.device, dtype=torch.float32
         )
     m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
