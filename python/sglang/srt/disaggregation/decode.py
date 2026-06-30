@@ -57,8 +57,12 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import dsv4_state_payloads
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    dsv4_prealloc_kwargs,
+    dsv4_state_payloads,
+    dsv4_unwrap_prealloc,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
@@ -1391,24 +1395,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if prefix_len > 0
                 else torch.tensor([-1], dtype=torch.int64, device=device)
             )
-            # DSV4-on-NPU allocator: reserves c4/c128 + tail compress-state pools
-            # as transfer dst; None for non-DSV4 (plain path).
-            dsv4_alloc = (
-                self.token_to_kv_pool_allocator
-                if hasattr(self.token_to_kv_pool_allocator, "c4_attn_allocator")
-                else None
+            # dsv4_prealloc_kwargs and dsv4_unwrap_prealloc (below) are a pair:
+            # the kwargs make the DSV4 allocator return a bundle, unwrap reads it.
+            dsv4_kwargs = dsv4_prealloc_kwargs(
+                self.token_to_kv_pool_allocator,
+                req,
+                fill_len,
+                self.req_to_token_pool,
+                device=device,
             )
-            dsv4_kwargs = {}
-            if dsv4_alloc is not None:
-                dsv4_kwargs = dict(
-                    req_pool_indices=torch.tensor(
-                        [req.req_pool_idx], dtype=torch.int64, device=device
-                    ),
-                    dsv4_state_lens=dsv4_alloc.compute_dsv4_state_lens_extend(
-                        [req], [fill_len]
-                    ),
-                    req_to_token_pool=self.req_to_token_pool,
-                )
             if self._uses_swa_tail_prealloc() and prefix_len == 0:
                 # Tail-only SWA allocation: only valid when prefix_len == 0.
                 # When prefix_len > 0 (radix cache hit), we fall back to
@@ -1437,22 +1432,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extend_num_tokens=delta_len,
                     **dsv4_kwargs,
                 )
-            # Unwrap the DSV4OutCacheLoc bundle: full-pool loc for the base write,
-            # plus the five per-req tables (disagg bypasses the batch hook).
-            if dsv4_alloc is not None and kv_loc is not None:
-                from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-                    write_dsv4_prealloc_tables,
-                )
-
-                dsv4_bundle = kv_loc
-                kv_loc = dsv4_bundle.out_full_loc
-                write_dsv4_prealloc_tables(
-                    self.req_to_token_pool,
-                    req,
-                    total_prefix_len,
-                    fill_len,
-                    dsv4_bundle,
-                )
+            kv_loc = dsv4_unwrap_prealloc(
+                kv_loc, self.req_to_token_pool, req, total_prefix_len, fill_len
+            )
 
         assert kv_loc is not None, (
             f"KV cache is full! Bug in memory estimation. "

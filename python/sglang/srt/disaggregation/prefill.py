@@ -46,8 +46,8 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import dsv4_state_payloads
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import dsv4_state_payloads
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,

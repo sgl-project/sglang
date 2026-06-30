@@ -493,9 +493,32 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             last_loc,
             extend_num_tokens,
         )
+        return self._wrap_full_alloc(
+            out_full_loc,
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc.dtype,
+            req_pool_indices,
+            dsv4_state_lens,
+        )
+
+    def _wrap_full_alloc(
+        self,
+        out_full_loc,
+        prefix_lens,
+        prefix_lens_cpu,
+        seq_lens,
+        seq_lens_cpu,
+        loc_dtype,
+        req_pool_indices,
+        dsv4_state_lens,
+    ) -> Optional[DSV4OutCacheLoc]:
+        # Shared tail of alloc_extend / alloc_extend_swa_tail: translate the full
+        # loc to swa, then add the c4/c128(+state) pools into a DSV4OutCacheLoc.
         if out_full_loc is None:
             return None
-
         out_swa_loc = self.translate_loc_from_full_to_swa(out_full_loc)
         assert out_swa_loc is not None, (
             "translate_loc_from_full_to_swa returned None — "
@@ -508,7 +531,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             prefix_lens_cpu,
             seq_lens,
             seq_lens_cpu,
-            last_loc.dtype,
+            loc_dtype,
             req_pool_indices,
             dsv4_state_lens,
         )
@@ -571,17 +594,8 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             extend_num_tokens,
             swa_tail_len,
         )
-        if out_full_loc is None:
-            return None
-
-        out_swa_loc = self.translate_loc_from_full_to_swa(out_full_loc)
-        assert out_swa_loc is not None, (
-            "translate_loc_from_full_to_swa returned None — "
-            "full_to_swa_index_mapping not initialized?"
-        )
-        return self._alloc_c_and_state(
+        return self._wrap_full_alloc(
             out_full_loc,
-            out_swa_loc,
             prefix_lens,
             prefix_lens_cpu,
             seq_lens,

@@ -379,8 +379,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             kernel_page_size=self.page_size,
         )
 
-    # PD-disaggregation buffer descriptors. NPU buffers are 4D PA_ND
-    # (num_pages, page_size, 1, dim); buf.nbytes / buf[0].nbytes stay per-page-correct.
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         # No full-token contiguous space on NPU; everything ships per-pool via
         # get_dsv4_state_components(), so the contiguous path is empty.

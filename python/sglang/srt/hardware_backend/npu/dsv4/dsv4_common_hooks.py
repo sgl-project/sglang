@@ -13,13 +13,9 @@ these hooks then:
 Non-DSV4 paths leave ``batch.out_cache_loc_dsv4`` None, so this module is a
 no-op for them.
 
-TODO: the disagg DSV4 path bypasses these hooks — it calls
-``allocator.alloc_extend`` directly then ``req_to_token_pool.write`` without
-going through ``mem_cache/common.py`` (see ``disaggregation/decode.py``). The
-DSV4OutCacheLoc bundle is still produced but never written into the per-req
-tables, so disagg + DSV4 is unsupported here (c-pages leak). Fixing requires
-calling these hooks from disagg's per-req alloc loop, or moving the write
-into the allocator itself.
+The disagg per-req prealloc path does not build a ``ScheduleBatch`` and so
+bypasses the batch hook; it writes the same tables via
+``write_dsv4_prealloc_tables`` (driven by ``dsv4_unwrap_prealloc``).
 """
 
 from __future__ import annotations
@@ -161,6 +157,29 @@ def dsv4_state_payloads(req_to_token_pool, req_pool_idx, seq_len, page_size, win
             req_to_token_pool.req_to_token_c128_state
         ),
     }
+
+
+def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device):
+    """Extra ``alloc_extend(_swa_tail)`` kwargs for the DSV4 allocator; ``{}`` for
+    non-DSV4 so callers can splat it unconditionally."""
+    if not hasattr(allocator, "c4_attn_allocator"):
+        return {}
+    return dict(
+        req_pool_indices=torch.tensor(
+            [req.req_pool_idx], dtype=torch.int64, device=device
+        ),
+        dsv4_state_lens=allocator.compute_dsv4_state_lens_extend([req], [fill_len]),
+        req_to_token_pool=req_to_token_pool,
+    )
+
+
+def dsv4_unwrap_prealloc(kv_loc, req_to_token_pool, req, prefix_len, fill_len):
+    """Unwrap a DSV4OutCacheLoc bundle to its full-pool loc and write the five
+    per-req tables; a plain tensor (non-DSV4) passes through unchanged."""
+    if kv_loc is None or not hasattr(kv_loc, "out_full_loc"):
+        return kv_loc
+    write_dsv4_prealloc_tables(req_to_token_pool, req, prefix_len, fill_len, kv_loc)
+    return kv_loc.out_full_loc
 
 
 def write_dsv4_prealloc_tables(
