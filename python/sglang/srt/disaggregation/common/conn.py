@@ -135,6 +135,14 @@ class CommonKVManager(BaseKVManager):
         self.system_dp_rank = (
             self.kv_args.system_dp_rank if self.kv_args.system_dp_rank else 0
         )
+        # Effective DP rank along the DP dimension that bootstrap_room hashes
+        # over. Under plain DP (enable_dp_attention=False) attn_dp_rank is a
+        # constant 0 for every subprocess, so we fall back to system_dp_rank
+        # which is the real per-process DP rank. Mirrors the dispatch in
+        # KVBootstrapServer.register at the bottom of this file.
+        self.effective_dp_rank = (
+            self.attn_dp_rank if self.system_dp_size == 1 else self.system_dp_rank
+        )
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
@@ -781,7 +789,7 @@ class CommonKVSender(BaseKVSender):
             if self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room":
                 self._register_prefill_dp_rank()
             elif (
-                self.kv_mgr.attn_dp_rank
+                self.kv_mgr.effective_dp_rank
                 != self.bootstrap_room % self.kv_mgr.server_args.dp_size
             ):
                 # follow_bootstrap_room was overridden by external routed_dp_rank
@@ -791,7 +799,7 @@ class CommonKVSender(BaseKVSender):
                     self.kv_mgr.record_failure(
                         self.bootstrap_room,
                         f"follow_bootstrap_room conflict: dispatched to dp_rank "
-                        f"{self.kv_mgr.attn_dp_rank} but bootstrap_room "
+                        f"{self.kv_mgr.effective_dp_rank} but bootstrap_room "
                         f"{self.bootstrap_room} implies dp_rank "
                         f"{self.bootstrap_room % self.kv_mgr.server_args.dp_size}. "
                         f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
@@ -805,7 +813,7 @@ class CommonKVSender(BaseKVSender):
         url = f"http://{self.bootstrap_server_url}/register_dp_rank"
         payload = {
             "bootstrap_room": self.bootstrap_room,
-            "dp_rank": self.kv_mgr.attn_dp_rank,
+            "dp_rank": self.kv_mgr.effective_dp_rank,
         }
         try:
             response = requests.post(url, json=payload, timeout=5)
