@@ -25,53 +25,22 @@ from sglang.test.test_utils import CustomTestCase
 
 def _make_manager_mock(
     *,
-    attn_dp_rank: int,
-    system_dp_rank: int,
-    enable_dp_attention: bool,
+    effective_dp_rank: int,
     dp_size: int,
     load_balance_method: str = "follow_bootstrap_room",
 ):
-    """Build a CommonKVManager-spec mock with the rank fields driven directly.
+    """Build a CommonKVManager-spec mock with the fields CommonKVSender reads.
 
-    effective_dp_rank is computed exactly as CommonKVManager.__init__ does so
-    that calling the real CommonKVSender.__init__ exercises the source code.
+    `effective_dp_rank` is provided directly so the test fixture does not
+    re-derive what the source under test computes.
     """
     mgr = MagicMock(spec=CommonKVManager)
-    mgr.attn_dp_rank = attn_dp_rank
-    mgr.system_dp_rank = system_dp_rank
-    mgr.system_dp_size = 1 if enable_dp_attention else dp_size
-    mgr.effective_dp_rank = (
-        mgr.attn_dp_rank if mgr.system_dp_size == 1 else mgr.system_dp_rank
-    )
+    mgr.effective_dp_rank = effective_dp_rank
     mgr.is_dummy_cp_rank = False
     mgr.server_args = MagicMock()
     mgr.server_args.dp_size = dp_size
     mgr.server_args.load_balance_method = load_balance_method
     return mgr
-
-
-class TestEffectiveDpRankComputation(CustomTestCase):
-    """The effective_dp_rank assigned in CommonKVManager.__init__ must equal
-    system_dp_rank under plain DP (system_dp_size > 1) and attn_dp_rank under
-    DP attention (system_dp_size==1)."""
-
-    def test_plain_dp_uses_system_dp_rank(self):
-        mgr = _make_manager_mock(
-            attn_dp_rank=0, system_dp_rank=1, enable_dp_attention=False, dp_size=2
-        )
-        self.assertEqual(mgr.effective_dp_rank, 1)
-
-    def test_dp_attention_uses_attn_dp_rank(self):
-        mgr = _make_manager_mock(
-            attn_dp_rank=1, system_dp_rank=0, enable_dp_attention=True, dp_size=2
-        )
-        self.assertEqual(mgr.effective_dp_rank, 1)
-
-    def test_dp_size_one_collapses_to_zero(self):
-        mgr = _make_manager_mock(
-            attn_dp_rank=0, system_dp_rank=0, enable_dp_attention=False, dp_size=1
-        )
-        self.assertEqual(mgr.effective_dp_rank, 0)
 
 
 class TestFollowBootstrapRoomConflictCheck(CustomTestCase):
@@ -80,8 +49,7 @@ class TestFollowBootstrapRoomConflictCheck(CustomTestCase):
     not attn_dp_rank (which is constant 0 under plain DP).
 
     We construct a real CommonKVSender with a mocked manager so the actual
-    __init__ source is exercised. attn_dp_rank and effective_dp_rank are set
-    to *different* values so the choice between them is observable.
+    __init__ source is exercised.
     """
 
     def _build_sender(self, mgr, bootstrap_room):
@@ -98,12 +66,7 @@ class TestFollowBootstrapRoomConflictCheck(CustomTestCase):
         """A DP1 subprocess receives a request whose room%dp_size==1.  Under
         the fix, effective_dp_rank=1 matches and the request passes through.
         Before the fix, attn_dp_rank=0 != 1 and the request was rejected."""
-        mgr = _make_manager_mock(
-            attn_dp_rank=0,
-            system_dp_rank=1,
-            enable_dp_attention=False,
-            dp_size=2,
-        )
+        mgr = _make_manager_mock(effective_dp_rank=1, dp_size=2)
         self._build_sender(mgr, bootstrap_room=43)  # 43 % 2 == 1
         mgr.record_failure.assert_not_called()
         statuses = [c.args[1] for c in mgr.update_status.call_args_list]
@@ -113,12 +76,7 @@ class TestFollowBootstrapRoomConflictCheck(CustomTestCase):
         """A genuine routing conflict (room%2==1 dispatched to DP0) is still
         flagged after the fix.  The error message must report the actual
         dispatched DP rank (0 here), not always 0."""
-        mgr = _make_manager_mock(
-            attn_dp_rank=0,
-            system_dp_rank=0,
-            enable_dp_attention=False,
-            dp_size=2,
-        )
+        mgr = _make_manager_mock(effective_dp_rank=0, dp_size=2)
         self._build_sender(mgr, bootstrap_room=43)
         mgr.record_failure.assert_called_once()
         msg = mgr.record_failure.call_args[0][1]
@@ -130,12 +88,7 @@ class TestFollowBootstrapRoomConflictCheck(CustomTestCase):
     def test_dp_attention_rank_match(self):
         """With DP attention on, effective_dp_rank == attn_dp_rank.  A DP-rank-1
         worker getting a room%2==1 request must pass through without rejection."""
-        mgr = _make_manager_mock(
-            attn_dp_rank=1,
-            system_dp_rank=0,
-            enable_dp_attention=True,
-            dp_size=2,
-        )
+        mgr = _make_manager_mock(effective_dp_rank=1, dp_size=2)
         self._build_sender(mgr, bootstrap_room=99)  # 99 % 2 == 1
         mgr.record_failure.assert_not_called()
 
@@ -152,9 +105,7 @@ class TestRegisterPrefillDpRankPayload(CustomTestCase):
         mock_post.return_value = mock_response
 
         mgr = _make_manager_mock(
-            attn_dp_rank=0,
-            system_dp_rank=1,
-            enable_dp_attention=False,
+            effective_dp_rank=1,
             dp_size=2,
             # Non-default LB drives the sender into _register_prefill_dp_rank
             load_balance_method="round_robin",
