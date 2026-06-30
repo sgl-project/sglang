@@ -1219,7 +1219,7 @@ class Req(ReqDllmMixin):
 
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
-        max_prefix_len = input_len - 1
+        max_prefix_len = input_len - 1 - get_global_server_args().hicache_kvtc_sliding_window
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         return max(max_prefix_len, 0)
