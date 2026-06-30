@@ -35,9 +35,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        self.enable_unified_memory_pool = (
-            model_runner.server_args.enable_unified_memory_pool
-        )
+        self.enable_unified_memory = model_runner.server_args.enable_unified_memory
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
         # Static (max_bs,) track-dest buffer captured by pointer, refreshed in-place
@@ -695,7 +693,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 forward_batch.mamba_track_mask,
                 self.forward_metadata.mamba_track_indices,
                 forward_batch.batch_size,
-                check_freed_slots=self.enable_unified_memory_pool,
+                check_freed_slots=self.enable_unified_memory,
             )
 
     def _track_mamba_state_extend(
@@ -827,7 +825,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                     forward_batch.mamba_track_mask[-num_decodes:],
                     self.forward_metadata.mamba_track_indices[-num_decodes:],
                     num_decodes,
-                    check_freed_slots=self.enable_unified_memory_pool,
+                    check_freed_slots=self.enable_unified_memory,
                 )
 
         return mixer_out

@@ -508,7 +508,7 @@ class ModelRunnerKVCacheMixin:
         # from one byte buffer, then return. Gated to the target worker
         # (req_to_token_pool is None); supports hybrid Mamba and hybrid SWA (not DSV4).
         if (
-            self.server_args.enable_unified_memory_pool
+            self.server_args.enable_unified_memory
             and self.server_args.disaggregation_mode == "null"
             and self.req_to_token_pool is None
         ):
@@ -521,11 +521,11 @@ class ModelRunnerKVCacheMixin:
             # Fail loud, not silently fall through to the normal pools (which would
             # leave the flag a no-op). The feature replaces the HYBRID pools only.
             raise ValueError(
-                "--enable-unified-memory-pool only supports hybrid Mamba and "
+                "--enable-unified-memory only supports hybrid Mamba and "
                 "hybrid sliding-window-attention models (DeepSeek-V4 excluded); "
                 f"the current model ({self.model_config.hf_config.architectures}) "
                 "is neither, so the unified memory pool cannot be built. Drop "
-                "--enable-unified-memory-pool for this model."
+                "--enable-unified-memory for this model."
             )
 
         # Initialize req_to_token_pool

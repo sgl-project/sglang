@@ -1581,7 +1581,7 @@ class Scheduler(
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
-                if self.server_args.enable_unified_memory_pool:
+                if self.server_args.enable_unified_memory:
                     try:
                         self.token_to_kv_pool_allocator.flush_opportunistic()
                     except Exception:
@@ -3242,7 +3242,7 @@ class Scheduler(
                             self.batch_record_buf[self.batch_record_ct].extend(
                                 batch_result.extra_keep_alive_refs
                             )
-                        if self.server_args.enable_unified_memory_pool:
+                        if self.server_args.enable_unified_memory:
                             # Record a `forward_done` event after the forward (before
                             # copy_to_cpu); lazy-compaction `_flush` gates src reuse on
                             # it. Only the unified pool's allocator exposes these hooks.
@@ -3508,7 +3508,7 @@ class Scheduler(
         if not self.is_fully_idle():
             return
 
-        if self.server_args.enable_unified_memory_pool:
+        if self.server_args.enable_unified_memory:
             try:
                 self.token_to_kv_pool_allocator.flush_opportunistic()
             except Exception:

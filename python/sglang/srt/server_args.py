@@ -783,7 +783,7 @@ class ServerArgs:
         "(layer-major) layout. Requires the Triton attention / linear-attn / "
         "Mamba backends.",
     ] = False
-    enable_unified_memory_pool: A[
+    enable_unified_memory: A[
         bool,
         "Replace the statically-partitioned hybrid-model pools (full-attn KV + "
         "SWA/Mamba state) with one byte buffer split dynamically between "
@@ -6315,25 +6315,24 @@ class ServerArgs:
                     )
 
     def _handle_unified_memory_pool(self):
-        if not self.enable_unified_memory_pool:
+        if not self.enable_unified_memory:
             return
         assert self.disaggregation_mode == "null", (
-            "--enable-unified-memory-pool is not yet compatible with PD "
-            "disaggregation."
+            "--enable-unified-memory is not yet compatible with PD " "disaggregation."
         )
         assert self.speculative_algorithm is None, (
-            "--enable-unified-memory-pool is not yet compatible with speculative "
+            "--enable-unified-memory is not yet compatible with speculative "
             "decoding."
         )
         assert not (self.enable_hierarchical_cache or self.enable_lmcache), (
-            "--enable-unified-memory-pool is not yet compatible with hierarchical / "
+            "--enable-unified-memory is not yet compatible with hierarchical / "
             "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
             "the unified-memory-pool init wires up no host pools, and its device mamba / "
             "full-attention slots are VIRTUAL — the host-offload path does not "
             "translate them to physical."
         )
         assert self.dcp_size == 1, (
-            "--enable-unified-memory-pool is not yet compatible with decode context "
+            "--enable-unified-memory is not yet compatible with decode context "
             "parallelism (--dcp-size > 1): the pool has no DCP-aware masked write "
             "path (UnifiedMHATokenToKVPool.set_kv_buffer asserts dcp_kv_mask is None), "
             "so a DCP run would boot and then fail on the first KV write."
@@ -6343,7 +6342,7 @@ class ServerArgs:
         _cg_cfg = self.cuda_graph_config
         if _cg_cfg is not None and _cg_cfg.prefill.backend == Backend.TC_PIECEWISE:
             raise ValueError(
-                "--enable-unified-memory-pool supports monolithic (decode) "
+                "--enable-unified-memory supports monolithic (decode) "
                 "cuda-graph capture only; disable piecewise prefill capture "
                 "(e.g. --cuda-graph-backend-prefill=disabled)."
             )
@@ -6356,7 +6355,7 @@ class ServerArgs:
         # The unified pool stores state in the page-major envelope-strided layout, so
         # enabling it implies --enable-page-major-kv-layout — routing it through the
         # single page-major path + stride-aware Triton asserts (set before the guard).
-        if self.enable_unified_memory_pool:
+        if self.enable_unified_memory:
             self.enable_page_major_kv_layout = True
         if not self.enable_page_major_kv_layout:
             return

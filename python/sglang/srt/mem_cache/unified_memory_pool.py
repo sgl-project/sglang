@@ -430,7 +430,7 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         # Decode context parallel (dcp_kv_mask) unsupported; fail loud.
         assert dcp_kv_mask is None, (
             "UnifiedMHATokenToKVPool.set_kv_buffer: decode context parallel "
-            "(dcp_kv_mask) is not supported with --enable-unified-memory-pool."
+            "(dcp_kv_mask) is not supported with --enable-unified-memory."
         )
         # Bypass super().set_kv_buffer: the parent's `k_cache.view(-1, row_dim)` can't
         # merge our 4-D layer-major view (stride[0]=page_bytes) at page_size>1. Call
