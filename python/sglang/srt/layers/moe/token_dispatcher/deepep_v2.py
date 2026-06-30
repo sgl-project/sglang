@@ -276,16 +276,43 @@ class _DeepEPV2Impl:
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids.to(torch.int64)
         self._validate_common(hidden_states, topk_ids)
-        # DeepEP v2 native expanded layout is profitable for direct/decode-like
-        # DeepGEMM FP8 workloads, but regresses hybrid/prefill-like workloads.
-        # Keep hybrid on the native default non-expanded layout.
+        # DeepEP v2's native expanded layout is profitable for decode-like DeepGEMM
+        # FP8 workloads but regresses prefill-like ones, so layout is chosen by
+        # inference PHASE, independently of the comm mode (direct/hybrid is a topology
+        # knob fixed at server init): decode (non-extend) -> native expanded layout;
+        # prefill/extend -> non-expanded contiguous layout. This decouples the
+        # masked-GEMM + CUDA-graph decode fast path from the comm mode, so it is
+        # available under multi-node `hybrid` too.
         use_expand_layout = (
-            self.capability.use_expanded_layout and not _get_allow_hybrid_mode()
+            self.capability.use_expanded_layout and not get_is_extend_in_batch()
         )
-        # decode (non-extend) expanded path -> masked-GEMM bridge: async dispatch
-        # (cpu_sync=False) gives a static capturable recv shape; the masked GEMM
-        # bounds compute by masked_m, so the full (safe) cap costs no extra GEMM.
-        use_masked = use_expand_layout and not get_is_extend_in_batch()
+        # masked GEMM is built from the expanded layout (expand_to_masked_slab), so
+        # masked <=> expanded. async dispatch (cpu_sync=False) gives a static
+        # capturable recv shape; the masked GEMM bounds compute by masked_m, so the
+        # full (safe) cap costs no extra GEMM.
+        use_masked = use_expand_layout
+
+        # ElasticBuffer requires >=1 token per rank on the non-masked (contiguous /
+        # extend) path: DeepEP's own ElasticBuffer test pads every rank to
+        # `max(1, num_tokens)` (tests/elastic/test_ep.py). An idle DP rank with 0
+        # tokens never fires the dispatch notify / scale-up-reduction warps, so no
+        # rank's recv count becomes "ready" and the do_cpu_sync CPU readback times
+        # out ("Dispatch CPU wait", buffer.hpp:1032). Pad an empty local batch to a
+        # single dummy token (routed to local expert 0); the contiguous slice in
+        # dispatch_b yields 0 real rows and combine_b drops it back to an empty
+        # output. The masked decode path tolerates empty (do_cpu_sync=False), so it
+        # is left untouched.
+        self._pad_empty_combine = (not use_masked) and hidden_states.shape[0] == 0
+        if self._pad_empty_combine:
+            hidden_states = hidden_states.new_zeros((1, hidden_states.shape[-1]))
+            # A token's top-k experts must be DISTINCT valid ids: duplicates (e.g.
+            # all-zero -> expert 0 repeated) fault the dispatch kernel. Route the
+            # dummy to experts [0, 1, ..., topk-1] with zero weights so it
+            # contributes nothing even before combine_b slices it off.
+            topk_ids = torch.arange(
+                topk_ids.shape[-1], dtype=topk_ids.dtype, device=topk_ids.device
+            ).unsqueeze(0)
+            topk_weights = topk_weights.new_zeros((1, topk_weights.shape[-1]))
 
         if self._uses_fp8_dispatch_output():
             _ensure_fp8_quant_available()
@@ -493,8 +520,13 @@ class _DeepEPV2Impl:
         try:
             if event.event is not None:
                 event.current_stream_wait()
+            if getattr(self, "_pad_empty_combine", False):
+                # Drop the dummy token padded onto an empty local batch in
+                # dispatch_a so this idle rank's combined output is empty again.
+                combined_x = combined_x[:0]
             return combined_x
         finally:
+            self._pad_empty_combine = False
             self._destroy_handle()
 
     def combine(self, combine_input: DeepEPV2CombineInput) -> torch.Tensor:

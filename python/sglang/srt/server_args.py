@@ -5530,19 +5530,19 @@ class ServerArgs:
                 )
             self.ep_size = self.tp_size
             self.disable_shared_experts_fusion = True
-            # CUDA graph is only safe on the DeepEP v2 direct-mode decode masked-GEMM
-            # path: deep_gemm runner + fp8 dispatch gives static shapes and no host
-            # readback. Every other DeepEP v2 combination (hybrid, or direct + triton/
-            # bf16) falls back to a non-capturable path (host readback / cpu_sync ->
-            # cudaErrorStreamCaptureUnjoined), so disable cuda graph there.
+            # CUDA graph is safe on the DeepEP v2 decode masked-GEMM path under ANY
+            # comm mode (direct or hybrid): the masked layout is chosen per-batch by
+            # inference phase (decode), not by the comm mode, giving static shapes
+            # with no host readback. deep_gemm runner + fp8 dispatch are required;
+            # every other combination (triton/bf16, or the prefill/extend contiguous
+            # path) needs a host readback / cpu_sync and is not capturable, so the
+            # decode graph is disabled there (the prefill graph is always disabled).
             deepep_v2_fp8 = self.deepep_v2_dispatcher_output_dtype == "fp8" or (
                 self.deepep_v2_dispatcher_output_dtype == "auto"
                 and self.moe_runner_backend == "deep_gemm"
             )
             deepep_v2_graph_ok = (
-                self.deepep_v2_mode == "direct"
-                and self.moe_runner_backend == "deep_gemm"
-                and deepep_v2_fp8
+                self.moe_runner_backend == "deep_gemm" and deepep_v2_fp8
             )
             if not deepep_v2_graph_ok:
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
