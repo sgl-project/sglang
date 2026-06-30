@@ -91,7 +91,7 @@ class ModelSlimConfig(QuantizationConfig):
     Config class for ModelSlim Quantization, a NPU-specific quantization type.
     """
 
-    def __init__(self, quant_config, weight_prefix, group_size=0):
+    def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
         keys = [k for k in quant_config if isinstance(k, str)]
         is_dsv4 = any(k.startswith("hc_head_") for k in keys)
@@ -265,9 +265,6 @@ class ModelSlimConfig(QuantizationConfig):
             if cls is None:
                 logger.warning(f"Unsupported scheme '{name}' for layer {prefix}")
                 return None
-            # ModelSlimW8A8Mxfp8MoE expects an extra `group_size` argument
-            if cls is ModelSlimW8A8Mxfp8MoE:
-                return cls(self, weight_group, group_size=self.group_size)
             return cls(self, weight_group)
 
 
