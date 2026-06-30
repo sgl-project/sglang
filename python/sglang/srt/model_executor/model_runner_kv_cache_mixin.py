@@ -532,6 +532,17 @@ class ModelRunnerKVCacheMixin:
             if self.is_hybrid_swa and not is_deepseek_v4(self.model_config.hf_config):
                 self._init_unified_swa_pools(max_num_reqs)
                 return
+            # Fail loud instead of silently falling through to the normal pools
+            # (which would leave --enable-unified-memory-pool a no-op while only
+            # enable_page_major_kv_layout was forced). The feature replaces the
+            # statically-partitioned HYBRID pools only.
+            raise ValueError(
+                "--enable-unified-memory-pool only supports hybrid Mamba and "
+                "hybrid sliding-window-attention models (DeepSeek-V4 excluded); "
+                f"the current model ({self.model_config.hf_config.architectures}) "
+                "is neither, so the unified memory pool cannot be built. Drop "
+                "--enable-unified-memory-pool for this model."
+            )
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:

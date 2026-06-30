@@ -6332,6 +6332,12 @@ class ServerArgs:
             "full-attention slots are VIRTUAL — the host-offload path does not "
             "translate them to physical."
         )
+        assert self.dcp_size == 1, (
+            "--enable-unified-memory-pool is not yet compatible with decode context "
+            "parallelism (--dcp-size > 1): the pool has no DCP-aware masked write "
+            "path (UnifiedMHATokenToKVPool.set_kv_buffer asserts dcp_kv_mask is None), "
+            "so a DCP run would boot and then fail on the first KV write."
+        )
         # Only monolithic decode cuda-graph capture is wired; piecewise prefill
         # capture is not. Guard when the user opts into it.
         _cg_cfg = self.cuda_graph_config
