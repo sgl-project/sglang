@@ -60,8 +60,8 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.layers.attention.nsa.longcatpro_npu_indexer import (
-    LongcatProNPUIndexer,
+from sglang.srt.layers.attention.nsa.longcat2_npu_indexer import (
+    Longcat2NPUIndexer,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.attention.dsa.utils import (
@@ -1489,7 +1489,7 @@ class DeepseekV2AttentionMLA(
         if self.use_longcat_dsa:
             assert (
                 not self.dsa_enable_prefill_cp
-            ), "LongCatPro NPU baseline does not support DSA prefill CP"
+            ), "LongCat2 NPU baseline does not support DSA prefill CP"
 
         # cp reuses the attn_tp comm group but needs to duplicate the weights;
         # store cp_size whenever either CP flavor is active so rebuild_cp_kv_cache
@@ -1592,14 +1592,14 @@ class DeepseekV2AttentionMLA(
                     else:
                         self.next_skip_topk = False
 
-            # Longcat Pro's shared-topk layers reuse the previous attention's
+            # Longcat2's shared-topk layers reuse the previous attention's
             # indices and do not ship standalone indexer weights.
             if not self.skip_topk:
                 if self.use_longcat_dsa:
                     indexer_is_neox_style = not getattr(
                         config, "rope_interleave", True
                     )
-                    self.indexer = LongcatProNPUIndexer(
+                    self.indexer = Longcat2NPUIndexer(
                         hidden_size=hidden_size,
                         index_n_heads=get_dsa_index_n_heads(config),
                         index_head_dim=get_dsa_index_head_dim(config),

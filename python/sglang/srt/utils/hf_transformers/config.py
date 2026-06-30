@@ -106,7 +106,7 @@ class HfModelConfigParser(ModelConfigParserBase):
         if config.architectures == ["LongcatCausalLM"] and getattr(
             config, "index_topk", None
         ) is not None:
-            config.model_type = "longcat_flash_pro"
+            config.model_type = "longcat2"
         elif config.architectures in [
             ["LongcatCausalLM"],
             ["LongcatFlashForCausalLM"],
@@ -196,8 +196,8 @@ class HfModelConfigParser(ModelConfigParserBase):
 
         if config.model_type == "longcat_flash":
             _set_architectures(config, "LongcatFlashForCausalLM")
-        if config.model_type == "longcat_flash_pro":
-            _set_architectures(config, "LongcatFlashProForCausalLM")
+        if config.model_type == "longcat2":
+            _set_architectures(config, "Longcat2ForCausalLM")
 
         return config
 

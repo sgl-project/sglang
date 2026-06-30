@@ -31,7 +31,7 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.utils import add_prefix
 
 
-class LongcatProNPUIndexer(Indexer):
+class Longcat2NPUIndexer(Indexer):
     def __init__(
         self,
         hidden_size: int,
@@ -84,7 +84,7 @@ class LongcatProNPUIndexer(Indexer):
                 self.head_dim, eps=getattr(config, "rms_norm_eps", 1e-6)
             )
 
-        # LongcatPro's reference NPU path keeps indexer routing weights in fp32.
+        # Longcat2's reference NPU path keeps indexer routing weights in fp32.
         self.weights_proj = ReplicatedLinear(
             self.hidden_size,
             self.n_heads,
@@ -116,7 +116,7 @@ class LongcatProNPUIndexer(Indexer):
 
     def _get_full_candidate_count(self, actual_seq_lengths_kv: torch.Tensor) -> int:
         # Ascend lightning indexer requires sparse_count <= 2048.
-        # For LongCat Pro we keep the candidate pool aligned with the model's
+        # For LongCat2 we keep the candidate pool aligned with the model's
         # configured topk budget instead of expanding it with sequence length.
         return min(self.index_topk, 2048)
 
@@ -132,7 +132,7 @@ class LongcatProNPUIndexer(Indexer):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self._can_use_mlp_lightning_indexer():
             raise RuntimeError(
-                "LongcatProNPUIndexer requires torch.ops.npu.mlp_lightning_indexer. "
+                "Longcat2NPUIndexer requires torch.ops.npu.mlp_lightning_indexer. "
                 "Please ensure sgl_kernel_npu with mlp_lightning_indexer is "
                 "built and imported."
             )
@@ -174,7 +174,7 @@ class LongcatProNPUIndexer(Indexer):
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
         if torch_npu is None:
-            raise RuntimeError("LongcatProNPUIndexer requires torch_npu")
+            raise RuntimeError("Longcat2NPUIndexer requires torch_npu")
 
         is_prefill = (
             forward_batch.forward_mode.is_extend()

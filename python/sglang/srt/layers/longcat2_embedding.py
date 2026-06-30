@@ -11,7 +11,7 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, NgramEmbeddingInfo
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
-class LongcatFlashProEmbedding(nn.Module):
+class Longcat2Embedding(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.num_embeddings = config.vocab_size
@@ -85,12 +85,12 @@ class LongcatFlashProEmbedding(nn.Module):
                 or not self.word_embeder.use_attn_tp_group
             ):
                 raise AssertionError(
-                    "LongCatPro word embedding must use attention TP group "
+                    "LongCat2 word embedding must use attention TP group "
                     "under dp-attention."
                 )
             if not self.oe_embeder.enable_tp or not self.oe_embeder.use_attn_tp_group:
                 raise AssertionError(
-                    "LongCatPro OE embedding must use attention TP group "
+                    "LongCat2 OE embedding must use attention TP group "
                     "under dp-attention."
                 )
             if self.word_embeder.tp_size <= 1 or self.oe_embeder.tp_size <= 1:
@@ -101,7 +101,7 @@ class LongcatFlashProEmbedding(nn.Module):
     ) -> torch.Tensor:
         info = forward_batch.ngram_embedding_info
         if info is None:
-            raise ValueError("LongcatFlashProEmbedding requires ngram_embedding_info.")
+            raise ValueError("Longcat2Embedding requires ngram_embedding_info.")
 
         if get_is_capture_mode():
             batch_size = int(forward_batch.batch_size)
@@ -241,7 +241,7 @@ class LongcatFlashProEmbedding(nn.Module):
         if input_ids.device.type == "npu" and self._can_use_compute_n_gram_ids():
             return self._compute_fused_ngram_ids_npu(input_ids, forward_batch)
         raise RuntimeError(
-            "LongcatFlashProEmbedding requires NPU compute_n_gram_ids support, "
+            "Longcat2Embedding requires NPU compute_n_gram_ids support, "
         )
 
     def _load_oe_embedder_weight(self, index: int, loaded_weight: torch.Tensor):
@@ -316,7 +316,7 @@ class LongcatFlashProEmbedding(nn.Module):
                 )
             self.oe_projection[index].copy_(loaded_weight.data.t())
         else:
-            raise ValueError(f"Unknown LongcatFlashPro embedding weight: {weight_name}")
+            raise ValueError(f"Unknown Longcat2 embedding weight: {weight_name}")
 
     def forward(self, input_ids: torch.Tensor, forward_batch: ForwardBatch):
         hidden_states = self.word_embeder(input_ids).to(self.oe_projection.dtype)

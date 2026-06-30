@@ -6,8 +6,8 @@ logger = logging.get_logger(__name__)
 FLASH_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
 
-class LongcatFlashProConfig(PretrainedConfig):
-    model_type = "longcat_flash_pro"
+class Longcat2Config(PretrainedConfig):
+    model_type = "longcat2"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(

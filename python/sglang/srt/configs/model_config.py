@@ -116,7 +116,7 @@ def is_deepseek_dsa(config) -> bool:
 
 def is_longcat_dsa(config) -> bool:
     return (
-        _hf_arch(config) in ("LongcatFlashProForCausalLM", "LongcatCausalLM")
+        _hf_arch(config) in ("Longcat2ForCausalLM", "LongcatCausalLM")
         and _hf_attr(config, "index_topk") is not None
         and _hf_attr(config, "use_longcat_dsa") is not False
     )
@@ -629,7 +629,7 @@ class ModelConfig:
             or "Glm4MoeLiteForCausalLMNextN" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
-            or "LongcatFlashProForCausalLM" in self.hf_config.architectures
+            or "Longcat2ForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
             or "MistralLarge3ForCausalLM" in self.hf_config.architectures
@@ -800,7 +800,7 @@ class ModelConfig:
         self.num_attention_layers = self.num_hidden_layers
         if (
             "LongcatFlashForCausalLM" in self.hf_config.architectures
-            or "LongcatFlashProForCausalLM" in self.hf_config.architectures
+            or "Longcat2ForCausalLM" in self.hf_config.architectures
         ):
             self.num_attention_layers = self.num_hidden_layers * 2
         if "IQuestLoopCoderForCausalLM" in self.hf_config.architectures:

@@ -37,7 +37,7 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.srt.configs import LongcatFlashProConfig
+from sglang.srt.configs import Longcat2Config
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -69,7 +69,7 @@ from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
-from sglang.srt.layers.longcat_flash_pro_embedding import LongcatFlashProEmbedding
+from sglang.srt.layers.longcat2_embedding import Longcat2Embedding
 from sglang.srt.layers.n_gram_embedding import NgramEmbedding
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
@@ -210,7 +210,7 @@ class LongcatFlashMoE(nn.Module):
 
     def __init__(
         self,
-        config: LongcatFlashProConfig,
+        config: Longcat2Config,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -328,11 +328,11 @@ class LongcatFlashMoE(nn.Module):
         ]
 
 
-class LongcatFlashProDecoderLayer(nn.Module):
+class Longcat2DecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: LongcatFlashProConfig,
+        config: Longcat2Config,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -581,12 +581,12 @@ class LongcatFlashProDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class LongcatFlashProModel(nn.Module):
+class Longcat2Model(nn.Module):
     fall_back_to_pt_during_load = False
 
     def __init__(
         self,
-        config: LongcatFlashProConfig,
+        config: Longcat2Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -596,7 +596,7 @@ class LongcatFlashProModel(nn.Module):
         if config.use_oe_embedding:
             self.use_oe_embedding = True
             self.use_ngram_embedding = True
-            self.embed_tokens = LongcatFlashProEmbedding(config)
+            self.embed_tokens = Longcat2Embedding(config)
         elif config.use_ngram_embedding:
             self.use_oe_embedding = False
             self.use_ngram_embedding = True
@@ -627,7 +627,7 @@ class LongcatFlashProModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                LongcatFlashProDecoderLayer(
+                Longcat2DecoderLayer(
                     config,
                     layer_id,
                     quant_config=quant_config,
@@ -689,13 +689,13 @@ class LongcatFlashProModel(nn.Module):
         return hidden_states, aux_hidden_states
 
 
-class LongcatFlashProForCausalLM(nn.Module):
+class Longcat2ForCausalLM(nn.Module):
     # for quark model load
     packed_modules_mapping = {}
 
     def __init__(
         self,
-        config: LongcatFlashProConfig,
+        config: Longcat2Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -715,7 +715,7 @@ class LongcatFlashProForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-        self.model = LongcatFlashProModel(
+        self.model = Longcat2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.use_oe_embedding = config.use_oe_embedding
@@ -1174,7 +1174,7 @@ class LongcatFlashProForCausalLM(nn.Module):
 
         if self.use_oe_embedding:
             logger.info(
-                "Loaded LongcatFlashPro embedding weights: base=%d oe_tokens=%d oe_proj=%d",
+                "Loaded Longcat2 embedding weights: base=%d oe_tokens=%d oe_proj=%d",
                 oe_base_embed_count,
                 oe_embed_token_count,
                 oe_embed_proj_count,
@@ -1182,7 +1182,7 @@ class LongcatFlashProForCausalLM(nn.Module):
             expected_oe_branches = getattr(self.config, "oe_branch_num", 0)
             if oe_base_embed_count != 1:
                 logger.warning(
-                    "Expected exactly one LongcatFlashPro base embedding weight, got %d.",
+                    "Expected exactly one Longcat2 base embedding weight, got %d.",
                     oe_base_embed_count,
                 )
             if expected_oe_branches > 0 and (
@@ -1190,7 +1190,7 @@ class LongcatFlashProForCausalLM(nn.Module):
                 or oe_embed_proj_count != expected_oe_branches
             ):
                 logger.warning(
-                    "LongcatFlashPro embedding weights are incomplete: "
+                    "Longcat2 embedding weights are incomplete: "
                     "expected %d oe token/proj weights, got tokens=%d proj=%d.",
                     expected_oe_branches,
                     oe_embed_token_count,
@@ -1201,14 +1201,14 @@ class LongcatFlashProForCausalLM(nn.Module):
     def get_embed_and_head(self):
         if self.use_oe_embedding:
             raise NotImplementedError(
-                "LongcatFlashPro OE embedding does not support get_embed_and_head sharing."
+                "Longcat2 OE embedding does not support get_embed_and_head sharing."
             )
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
         if self.use_oe_embedding:
             raise NotImplementedError(
-                "LongcatFlashPro OE embedding does not support set_embed_and_head sharing."
+                "Longcat2 OE embedding does not support set_embed_and_head sharing."
             )
         del self.model.embed_tokens.weight
         del self.lm_head.weight
@@ -1234,4 +1234,4 @@ class LongcatFlashProForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
-EntryClass = [LongcatFlashProForCausalLM]
+EntryClass = [Longcat2ForCausalLM]
