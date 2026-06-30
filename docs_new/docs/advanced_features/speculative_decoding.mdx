@@ -16,6 +16,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
   - [EAGLE-3 Decoding](#eagle-3-decoding)
 - [Multi Token Prediction](#multi-token-prediction)
 - [DFlash Decoding](#dflash-decoding)
+- [DSpark Decoding (DeepSeek-V4)](#dspark-decoding-deepseek-v4)
 - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
 - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
 - [Ngram Speculative Decoding](#ngram-speculative-decoding)
@@ -31,6 +32,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - **Lower `lm_head` overhead for EAGLE-2**: Enable **FR-Spec** with `--speculative-token-map`.
 - **Model is MTP-enabled**: Use **MTP via speculative decoding** (often with small `speculative_num_steps/topk/num_draft_tokens`, see the example section).
 - **You have a DFlash draft checkpoint**: Use **DFLASH** with `--speculative-algorithm DFLASH` and `--speculative-draft-model-path ...`.
+- **Serving DeepSeek-V4 DSpark checkpoints**: Use **DSpark** with `--speculative-algorithm DSPARK` (block drafting, greedy, lossless).
 - **You have a smaller draft LLM**: Use **STANDALONE** (`--speculative-algorithm STANDALONE`).
 - **No extra model available**: Use **NGRAM** (`--speculative-algorithm NGRAM`, CUDA-only).
 
@@ -92,6 +94,13 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm DFLASH</code> + <code>--speculative-draft-model-path ...</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No <code>--enable-dp-attention</code>; <code>pp_size == 1</code>; disables overlap scheduler &amp; mixed chunked prefill</td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DSpark</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepSeek-V4 block drafter (3-stage MTP + Markov/confidence heads) in the checkpoint</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm DSPARK</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Greedy (lossless); DeepSeek-V4 DSpark checkpoints only; no <code>--enable-dp-attention</code>; <code>pp_size == 1</code></td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>STANDALONE</td>
@@ -498,6 +507,78 @@ print(response.choices[0].message.content)
 
 ---
 
+## DSpark Decoding (DeepSeek-V4)
+
+**DSpark** is a block drafter for DeepSeek-V4. The DSpark checkpoints (`deepseek-ai/DeepSeek-V4-Flash-DSpark`, `deepseek-ai/DeepSeek-V4-Pro-DSpark`) ship the speculative module inside the model under the `mtp.*` namespace, so there is no separate draft model to download. Each decode step DSpark proposes a block of `block_size` tokens (default 5) in one draft forward and the target verifies the whole block in one pass. The drafter is a three-stage MTP stack with a Markov head that refines the block autoregressively and a confidence head that scores each position; it runs off the target's fused hidden states rather than its own token KV. At `temperature 0`, verification is greedy and lossless: the accepted output matches the target's greedy decoding for any block size or confidence threshold. At `temperature > 0`, the block is verified with target-only speculative sampling, which preserves the target's sampling distribution without needing the draft's probabilities.
+
+`--speculative-algorithm DSPARK` is enough; the draft path defaults to the target checkpoint, and `--speculative-eagle-topk 1` / `--speculative-num-steps 1` are pinned automatically.
+
+Relevant parameters:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "30%"}} />
+    <col style={{width: "50%"}} />
+    <col style={{width: "20%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-dspark-block-size</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Draft block length (tokens proposed per step). Alias of <code>--speculative-num-draft-tokens</code> for DSpark.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>5</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-dspark-confidence-threshold</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Truncate the draft block at the first position whose confidence-head probability falls below this value; <code>0</code> verifies the full block. Range <code>[0, 1]</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0.0</code></td>
+    </tr>
+  </tbody>
+</table>
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path deepseek-ai/DeepSeek-V4-Flash-DSpark \
+    --trust-remote-code --tp 8 --ep-size 8 \
+    --moe-runner-backend flashinfer_mxfp4 \
+    --speculative-moe-runner-backend flashinfer_mxfp4 \
+    --speculative-algorithm DSPARK \
+    --mem-fraction-static 0.85 --cuda-graph-max-bs 32
+```
+
+**Send a request** (DSpark verifies greedily, so use `temperature=0`):
+
+```python Example
+import openai
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="None")
+
+response = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-V4-Flash-DSpark",
+    messages=[
+        {"role": "user", "content": "List 3 countries and their capitals."},
+    ],
+    temperature=0,
+    max_tokens=64,
+)
+
+print(response.choices[0].message.content)
+```
+
+**Notes**
+
+- DeepSeek-V4 DSpark checkpoints only. Requires `pp_size == 1` and does not support `--enable-dp-attention`; mixed chunked prefill is disabled automatically.
+- `temperature > 0` is verified with the same target-only speculative-sampling primitive as DFLASH, so sampled requests are not downgraded to greedy. Greedy (`temperature 0`) is the benchmark-validated path. If the sampling kernel is unavailable on a build, `temperature > 0` falls back to greedy with a one-time warning.
+- On `DeepSeek-V4-Flash-DSpark` (284B, 8x B200, tp8 ep8, greedy), acceptance length is roughly 3.2 to 3.6 tokens per target forward across math, code, and chat; single-stream throughput improves about 1.5x to 1.8x over no speculation; and GSM8K / MMLU match the no-speculation target within noise. See [sgl-project/sglang#29538](https://github.com/sgl-project/sglang/pull/29538) for full sweeps and raw logs.
+
+---
+
 ## Standalone Speculative Decoding (Small Draft Model)
 
 Besides EAGLE/MTP, SGLang also supports **token-level speculative decoding** using a smaller **draft model**. Enable it with `--speculative-algorithm STANDALONE` and provide a draft model via `--speculative-draft-model-path`.
@@ -746,7 +827,7 @@ Below is a comprehensive list of all speculative decoding parameters available i
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-algorithm</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>str</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Algorithm to use: <code>DFLASH</code>, <code>EAGLE</code>, <code>EAGLE3</code>, <code>STANDALONE</code>, <code>NGRAM</code>, <code>NEXTN</code> (alias of <code>EAGLE</code>)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Algorithm to use: <code>DFLASH</code>, <code>DSPARK</code>, <code>EAGLE</code>, <code>EAGLE3</code>, <code>STANDALONE</code>, <code>NGRAM</code>, <code>NEXTN</code> (alias of <code>EAGLE</code>)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-draft-model-path</code></td>
@@ -795,6 +876,18 @@ Below is a comprehensive list of all speculative decoding parameters available i
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>int</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DFlash-only draft KV sliding-window size</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-dspark-block-size</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>int</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DSpark-only alias of <code>--speculative-num-draft-tokens</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-dspark-confidence-threshold</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>float</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0.0</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DSpark-only confident-prefix truncation threshold in <code>[0, 1]</code>; <code>0</code> verifies the full block</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-accept-threshold-single</code></td>

@@ -67,6 +67,11 @@ _OWNER_SITES = {
         "DFlashDraftInputV2.prepare_for_decode",
         "kv_allocated_len",
     ): 1,
+    (
+        "speculative/dspark_info.py",
+        "DSparkDraftInputV2.prepare_for_decode",
+        "kv_allocated_len",
+    ): 1,
     # disaggregation decode prealloc
     (
         "disaggregation/decode.py",

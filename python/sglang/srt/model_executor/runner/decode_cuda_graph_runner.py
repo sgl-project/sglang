@@ -408,6 +408,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_dspark()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -920,6 +921,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_dspark()
                 else max_num_tokens
             )
             bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
@@ -998,10 +1000,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.load_batch(forward_batch, pp_proxy_tensors)
             # Publish a read-done event for the WAR barrier: a cuda-graph forward
             # finishes its shared req_to_token / SWA reads at this pre-replay
-            # snapshot, so plain DECODE and DFLASH TARGET_VERIFY both qualify.
+            # snapshot, so plain DECODE and DFLASH/DSPARK TARGET_VERIFY both qualify.
             if forward_batch.forward_mode.is_decode() or (
                 forward_batch.forward_mode.is_target_verify()
-                and self.model_runner.spec_algorithm.is_dflash()
+                and self.model_runner.spec_algorithm.supports_target_verify_for_draft()
             ):
                 read_done = self.device_module.Event()
                 read_done.record()
@@ -1101,6 +1103,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if self.model_runner.is_draft_worker
                     else CaptureHiddenMode.FULL
                 ),
+            )
+
+        elif self.model_runner.spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dspark_info import DSparkVerifyInput
+
+            spec_info = DSparkVerifyInput(
+                draft_token=None,
+                positions=None,
+                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                custom_mask=None,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
             )
 
         elif self.model_runner.spec_algorithm.is_ngram():
