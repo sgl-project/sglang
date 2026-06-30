@@ -151,7 +151,9 @@ def forward_mha_prepare_npu(
     v = kv[..., m.qk_nope_head_dim :]
 
     k = m._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
-    return q, k, v, forward_batch
+    return q, k, v, forward_batch, _get_fp8_kv_runtime_scale(
+        m, "fak_descale_float", q.device
+    )
 
 
 def forward_mha_core_npu(
@@ -160,8 +162,16 @@ def forward_mha_core_npu(
     k: torch.Tensor,
     v: torch.Tensor,
     forward_batch: "ForwardBatch",
+    fp8_kv_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    attn_output = m.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+    attn_output = m.attn_mha(
+        q,
+        k,
+        v,
+        forward_batch,
+        save_kv_cache=False,
+        fp8_kv_scale=fp8_kv_scale,
+    )
     attn_output = attn_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     output, _ = m.o_proj(attn_output)
     return output
