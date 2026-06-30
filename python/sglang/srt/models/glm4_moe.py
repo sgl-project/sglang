@@ -52,6 +52,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -78,6 +79,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import (
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
@@ -196,6 +201,14 @@ class Glm4MoeAttention(nn.Module):
         use_qk_norm: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        glm_sparse_indexer_enabled: bool = False,
+        glm_sparse_indexer_topk: int = 2048,
+        glm_sparse_indexer_smoke_gather: bool = True,
+        tsa_index_topk: Optional[int] = None,
+        glm_sparse_index_topk_freq: int = 1,
+        glm_sparse_index_topk_pattern: Optional[str] = None,
+        glm_sparse_force_left: int = 0,
+        glm_sparse_force_right: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -270,6 +283,316 @@ class Glm4MoeAttention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
+        self.glm_sparse_indexer_enabled = glm_sparse_indexer_enabled
+        self.glm_sparse_indexer_topk = tsa_index_topk or glm_sparse_indexer_topk
+        self.glm_sparse_indexer_smoke_gather = glm_sparse_indexer_smoke_gather
+        # Cross-layer TopK reuse: only recompute the indexer on a subset of
+        # layers and reuse the previous layer's topk_indices on the rest.
+        # ``skip_topk`` -> this layer reuses ``prev_topk_indices`` instead of
+        # running the score+topk; ``next_skip_topk`` -> the next layer will
+        # reuse, so this layer must output its topk_indices. ``freq == 1`` and
+        # ``pattern is None`` keep both False (every layer computes; no-op).
+        self.glm_sparse_index_topk_freq = max(int(glm_sparse_index_topk_freq), 1)
+        self.glm_sparse_index_topk_pattern = glm_sparse_index_topk_pattern
+        # Force-select boundaries: first ``force_left`` tokens (sink) and last
+        # ``force_right`` history tokens (local window) are forced into TopK.
+        # They consume the topk budget; require their sum <= topk.
+        self.glm_sparse_force_left = max(int(glm_sparse_force_left), 0)
+        self.glm_sparse_force_right = max(int(glm_sparse_force_right), 0)
+        assert (
+            self.glm_sparse_force_left + self.glm_sparse_force_right
+            <= self.glm_sparse_indexer_topk
+        ), (
+            "glm_sparse_force_left+glm_sparse_force_right="
+            f"{self.glm_sparse_force_left + self.glm_sparse_force_right} exceeds "
+            f"glm_sparse_indexer_topk={self.glm_sparse_indexer_topk}"
+        )
+        self.glm_sparse_skip_topk, self.glm_sparse_next_skip_topk = (
+            self._glm_sparse_compute_reuse_flags(layer_id, start_layer)
+        )
+
+    def _glm_sparse_compute_reuse_flags(self, layer_id: int, start_layer: int):
+        """Decide whether this layer reuses the previous layer's TopK indices.
+
+        Returns ``(skip_topk, next_skip_topk)``:
+          - ``skip_topk``: this layer reuses ``prev_topk_indices`` (no indexer).
+          - ``next_skip_topk``: the next layer will reuse, so this layer must
+            emit its topk_indices for the chain.
+
+        ``pattern`` (a per-layer string of 'S'=skip/reuse, anything else=compute)
+        takes priority over ``freq``. Both default to "every layer computes".
+        The first sparse layer (``layer_id == start_layer``) always computes,
+        since there is no previous layer to reuse from.
+        """
+        pattern = self.glm_sparse_index_topk_pattern
+        if pattern is not None:
+            skip = layer_id < len(pattern) and pattern[layer_id] == "S"
+            nxt = (layer_id + 1) < len(pattern) and pattern[layer_id + 1] == "S"
+        else:
+            freq = self.glm_sparse_index_topk_freq
+            rel = layer_id - start_layer
+            skip = (rel % freq) != 0
+            nxt = ((rel + 1) % freq) != 0
+        if layer_id == start_layer:
+            skip = False
+        return skip, nxt
+
+    def _glm_sparse_fail(self, message: str, exc: Optional[Exception] = None):
+        return None
+
+    def _glm_sparse_get_decoder_lens(
+        self,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        # During CUDA graph capture we must not perform device->host syncs or
+        # data-dependent Python control flow. ``torch.equal`` below is a sync,
+        # so skip the validation under capture and trust the decode invariant
+        # (seq_lens already includes the current token). Replay reuses the same
+        # clamp graph against the live seq_lens buffer.
+        if get_is_capture_mode():
+            return torch.clamp(seq_lens - 1, min=0).to(torch.int32)
+        expected_loc = req_to_token[
+            req_pool_indices.to(torch.long), torch.clamp(seq_lens - 1, min=0).to(torch.long)
+        ]
+        seq_lens_include_current = bool(torch.equal(expected_loc.to(out_cache_loc.dtype), out_cache_loc))
+        if not seq_lens_include_current:
+            return self._glm_sparse_fail(
+                "GLM sparse expected forward_batch.seq_lens to include current decode token"
+            )
+        return torch.clamp(seq_lens - 1, min=0).to(torch.int32)
+
+    def _compute_glm_sparse_training_free_flat_topk(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens_decoder: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if self.num_heads % self.num_kv_heads != 0:
+            return self._glm_sparse_fail(
+                "GLM sparse training-free path requires query heads to be divisible by KV heads"
+            )
+        if k_cache.dim() != 3:
+            return self._glm_sparse_fail("GLM sparse training-free path requires flat K cache")
+        if k_cache.shape[1] != self.num_kv_heads or k_cache.shape[2] != self.head_dim:
+            return self._glm_sparse_fail(
+                "GLM sparse training-free path got incompatible K cache shape "
+                f"{tuple(k_cache.shape)}"
+            )
+
+        batch_size = req_pool_indices.shape[0]
+        # Per-query-head q: the scoring kernel runs the GEMM for every query head
+        # and max-pools over the GQA group, so we pass q un-pooled as
+        # [batch, num_heads, head_dim] (NOT mean-pooled to kv-head granularity).
+        q_index = q.reshape(batch_size, self.num_heads, self.head_dim)
+        topk = self.glm_sparse_indexer_topk
+        topk_indices = torch.full(
+            (batch_size, self.num_kv_heads, topk),
+            -1,
+            dtype=torch.int32,
+            device=q.device,
+        )
+
+        ## compute scores
+        max_score_len = req_to_token.shape[1]
+        try:
+            from sglang.srt.layers.attention.glm_sparse.score_kernel import (
+                glm_sparse_compute_scores,
+            )
+
+            scores = glm_sparse_compute_scores(
+                q_index,
+                k_cache,
+                req_to_token,
+                req_pool_indices,
+                seq_lens_decoder,
+                max_score_len=max_score_len,
+                force_left=self.glm_sparse_force_left,
+                force_right=self.glm_sparse_force_right,
+            )
+        except (AssertionError, AttributeError, ImportError, RuntimeError) as exc:
+            return self._glm_sparse_fail(
+                "GLM sparse training-free score kernel failed", exc
+            )
+
+        seq_lens_i32 = seq_lens_decoder.to(torch.int32).contiguous()
+
+        # Prefer the sgl-kernel radix-sort topk when topk == 2048; otherwise use torch.topk.
+        used_fast_topk = False
+        if topk == 2048:
+            try:
+                from sgl_kernel import fast_topk_v2
+
+                fast_indices = fast_topk_v2(scores, seq_lens_i32, topk)
+                # fast_topk_v2 returns int32 column indices in [0, max_score_len).
+                # Reshape [batch*kv_heads, topk] -> [batch, kv_heads, topk].
+                fast_indices = fast_indices.view(batch_size, self.num_kv_heads, topk)
+                # The kernel pads short rows with arbitrary values; mask via seq_len.
+                col_arange = torch.arange(topk, device=q.device, dtype=torch.int32)
+                visible_lens = torch.clamp(seq_lens_i32, max=topk).to(torch.int32)
+                valid = col_arange[None, None, :] < visible_lens[:, None, None]
+                topk_indices = torch.where(
+                    valid, fast_indices.to(torch.int32), torch.full_like(fast_indices, -1, dtype=torch.int32)
+                )
+                used_fast_topk = True
+            except (AssertionError, AttributeError, ImportError, RuntimeError) as exc:
+                pass
+
+        if not used_fast_topk:
+            # Capture-safe vectorized fallback (no .item()/Python loop, static
+            # shapes). ``scores`` is [batch*kv_heads, max_score_len] fp32 with
+            # -inf padding beyond each row's seq_len, so torch.topk returns the
+            # valid entries first and the -inf padding last -> the valid mask is
+            # front-packed, matching the fast_topk_v2 convention. We judge padding
+            # by column position (top_idx < seq_len) rather than torch.isfinite
+            # so that force-selected +inf scores are kept, not dropped.
+            k = min(topk, max_score_len)
+            top_vals, top_idx = torch.topk(scores, k=k, dim=-1)
+            top_idx = top_idx.to(torch.int32).view(batch_size, self.num_kv_heads, k)
+            valid = top_idx < seq_lens_i32[:, None, None]
+            top_idx = torch.where(
+                valid,
+                top_idx,
+                torch.full_like(top_idx, -1),
+            )
+            topk_indices[:, :, :k] = top_idx
+
+        return topk_indices
+
+    def _run_glm_sparse_indexer_pre_attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        forward_batch: ForwardBatch,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ):
+        if not self.glm_sparse_indexer_enabled or not _is_cuda:
+            return None
+        if not forward_batch.forward_mode.is_decode():
+            return None
+        if q.shape[0] != forward_batch.req_pool_indices.shape[0]:
+            return None
+        try:
+            token_to_kv_pool = get_token_to_kv_pool()
+            req_to_token = get_req_to_token_pool().req_to_token
+            seq_lens_decoder = self._glm_sparse_get_decoder_lens(
+                req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.out_cache_loc,
+            )
+            if seq_lens_decoder is None:
+                return None
+
+            # Cross-layer reuse: this layer is configured to skip the indexer
+            # and reuse the previous layer's TopK. Only valid in the plain
+            # decode path, where prev_topk_indices is threaded layer-to-layer;
+            # the TBO path never passes it (stays None) so it always recomputes.
+            if self.glm_sparse_skip_topk and prev_topk_indices is not None:
+                return prev_topk_indices
+
+            k_cache = token_to_kv_pool.get_key_buffer(self.attn.layer_id)
+            topk_indices = self._compute_glm_sparse_training_free_flat_topk(
+                q,
+                k_cache,
+                req_to_token,
+                forward_batch.req_pool_indices,
+                seq_lens_decoder,
+            )
+            return topk_indices
+        except (AssertionError, AttributeError, ImportError, RuntimeError) as exc:
+            return self._glm_sparse_fail("GLM sparse indexer pre-attention failed", exc)
+
+    def _run_glm_sparse_gather_post_attn(self, topk_indices, forward_batch: ForwardBatch):
+        if topk_indices is None or not self.glm_sparse_indexer_smoke_gather:
+            return None
+        try:
+            from sglang.srt.layers.attention.glm_sparse.gather_kv import (
+                gather_kv_by_indices,
+            )
+
+            token_to_kv_pool = get_token_to_kv_pool()
+            req_to_token = get_req_to_token_pool().req_to_token
+            k_cache = token_to_kv_pool.get_key_buffer(self.attn.layer_id)
+            v_cache = token_to_kv_pool.get_value_buffer(self.attn.layer_id)
+            batch_size, topk_heads, topk = topk_indices.shape
+            if k_cache.dim() != 3 or v_cache.dim() != 3:
+                return None
+            if v_cache.shape[1] != k_cache.shape[1]:
+                return None
+            kv_heads = k_cache.shape[1]
+            # Width is topk + 1: the gather kernel fills the first ``topk`` slots
+            # (front-packed valid history, zero padding after). The trailing slot
+            # is scratch for FlashAttention's in-place current-token append in
+            # fa3_token_sparse_attention.
+            gather_width = topk + 1
+            gathered_k = torch.empty(
+                batch_size,
+                topk_heads,
+                gather_width,
+                k_cache.shape[2],
+                dtype=k_cache.dtype,
+                device=k_cache.device,
+            )
+            gathered_v = torch.empty(
+                batch_size,
+                topk_heads,
+                gather_width,
+                v_cache.shape[2],
+                dtype=v_cache.dtype,
+                device=v_cache.device,
+            )
+            if topk_heads != kv_heads and topk_heads % kv_heads != 0:
+                return self._glm_sparse_fail(
+                    "GLM sparse query-head TopK requires TopK heads to be divisible by KV heads"
+                )
+            # The token KV pool is flat ([pool_size, kv_heads, head_dim]), so we
+            # gather the TopK tokens directly via req_to_token logical->physical
+            # translation. This reads only batch*topk_heads*topk tokens and needs
+            # no block_tables or full-pool paged reconstruction.
+            gather_kv_by_indices(
+                k_cache,
+                v_cache,
+                topk_indices.to(torch.int32),
+                req_to_token,
+                forward_batch.req_pool_indices,
+                gathered_k,
+                gathered_v,
+            )
+            return gathered_k, gathered_v
+        except (AssertionError, AttributeError, ImportError, RuntimeError) as exc:
+            return self._glm_sparse_fail("GLM sparse gather failed", exc)
+
+    def _glm_sparse_write_kv_cache(
+        self, k: torch.Tensor, v: torch.Tensor, forward_batch: ForwardBatch
+    ) -> bool:
+        """Persist the current decode token's KV into the pool.
+
+        Normally ``self.attn`` writes the KV cache as a side effect. When the
+        sparse path runs we skip that dense attention, so we replicate the
+        write here (same path the attention backends use) to keep subsequent
+        decode steps correct. Returns True on success.
+        """
+        try:
+            token_to_kv_pool = get_token_to_kv_pool()
+            k_view = k.reshape(-1, self.num_kv_heads, self.head_dim)
+            v_view = v.reshape(-1, self.num_kv_heads, self.head_dim)
+            token_to_kv_pool.set_kv_buffer(
+                self.attn,
+                forward_batch.out_cache_loc,
+                k_view,
+                v_view,
+                self.attn.k_scale,
+                self.attn.v_scale,
+            )
+            return True
+        except (AttributeError, RuntimeError, TypeError) as exc:
+            self._glm_sparse_fail("GLM sparse manual KV writecache failed", exc)
+            return False
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
@@ -279,15 +602,17 @@ class Glm4MoeAttention(nn.Module):
         )
 
     def op_core(self, state):
-        state.hidden_states_after_attn = self.forward_core(
-            state.pop("attn_intermediate_state")
-        )
+        # TBO path: forward_core returns (output, emitted_topk); TBO never reuses
+        # TopK across layers (each sub-batch recomputes), so discard the topk.
+        output, _ = self.forward_core(state.pop("attn_intermediate_state"))
+        state.hidden_states_after_attn = output
 
     def forward_prepare(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        prev_topk_indices: Optional[torch.Tensor] = None,
     ):
         # hidden_states can be a (fp8_tensor, scale) tuple from fused RMSNorm+Quant
         hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
@@ -339,28 +664,104 @@ class Glm4MoeAttention(nn.Module):
                 k_bias=k_bias,
             )
 
-        inner_state = q, k, v, forward_batch
+        topk_indices = self._run_glm_sparse_indexer_pre_attn(
+            q, k, forward_batch, prev_topk_indices
+        )
+        inner_state = q, k, v, forward_batch, topk_indices
         return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
-            return hidden_states
-        attn_output = self.attn(*inner_state)
+            return hidden_states, None
+        q, k, v, forward_batch, topk_indices = inner_state
+        run_sparse = topk_indices is not None
+        # In production the sparse path replaces dense attention entirely, so
+        # dense is only run when sparse is not active.
+        need_dense = not run_sparse
+        wrote_kv = False
+        if need_dense:
+            attn_output = self.attn(q, k, v, forward_batch)
+        else:
+            # self.attn (skipped) normally writes the KV cache; do it ourselves
+            # so later decode steps still see this token.
+            attn_output = None
+            wrote_kv = self._glm_sparse_write_kv_cache(k, v, forward_batch)
+        if run_sparse:
+            # Indexer TopK is kv-head granular ([batch, kv_heads, topk]); we
+            # gather and run FA3 at kv-head granularity and let FA3 broadcast
+            # each kv-head over its GQA group (q keeps num_heads). This removes
+            # the group_size x redundant gather + single-head FA3 work of the
+            # old q-head fold. NOTE: an earlier kv-head native-GQA FA3 attempt
+            # was numerically equivalent in isolation but its bf16 accumulation
+            # order differed from the dense backend and drifted under temp=0
+            # greedy decode into a degeneration loop near seq_len ~1940. We are
+            # re-testing that path (test_glm_sparse_fa3_gqa_equiv.py + a
+            # >1940-token greedy e2e check); fall back to dense on any failure.
+            sparse_kv = self._run_glm_sparse_gather_post_attn(topk_indices, forward_batch)
+            if sparse_kv is not None:
+                try:
+                    from sglang.srt.layers.attention.glm_sparse.sparse_attention import (
+                        fa3_token_sparse_attention,
+                    )
+
+                    gathered_k, gathered_v = sparse_kv
+                    q_view = q.reshape(-1, self.num_heads, self.head_dim)
+                    batch = q_view.shape[0]
+                    # The indexer/gather only saw history [0, L-2]; the current
+                    # token's KV was not yet in the pool. Build the current
+                    # token at kv-head granularity (NO GQA expansion) and hand
+                    # it to FA3, which appends it in-place at cache_seqlens and
+                    # broadcasts each kv-head over its query-head group, so the
+                    # self-attention term is preserved, matching full attention.
+                    k_cur = k.reshape(batch, self.num_kv_heads, self.head_dim)
+                    v_cur = v.reshape(batch, self.num_kv_heads, self.head_dim)
+                    # topk_indices [batch, kv_heads, topk] is front-packed (valid
+                    # first, -1 padding after). The valid count is min(seq_len,
+                    # topk), identical across kv-heads of a batch row, so collapse
+                    # to [batch] via kv-head 0 (FA3 cache_seqlens is per-batch).
+                    cache_seqlens = (
+                        (topk_indices[:, 0, :] >= 0).sum(dim=-1).to(torch.int32)
+                    )
+                    sparse_attn_output = fa3_token_sparse_attention(
+                        q_view,
+                        gathered_k,
+                        gathered_v,
+                        k_cur,
+                        v_cur,
+                        cache_seqlens,
+                        self.scaling,
+                    ).reshape(q.shape[0], self.num_heads * self.head_dim)
+                    attn_output = sparse_attn_output
+                except (AssertionError, AttributeError, ImportError, RuntimeError) as exc:
+                    self._glm_sparse_fail("GLM sparse attention output failed", exc)
+            if attn_output is None:
+                # Sparse path failed and dense was skipped; fall back to dense.
+                # If we already wrote the KV cache manually, avoid a double write.
+                attn_output = self.attn(
+                    q, k, v, forward_batch, save_kv_cache=not wrote_kv
+                )
         output, _ = self.o_proj(attn_output)
-        return output
+        # Emit topk_indices for the next layer only when it is configured to
+        # reuse them; otherwise emit None so the chain does not pin memory.
+        emitted_topk = topk_indices if self.glm_sparse_next_skip_topk else None
+        return output, emitted_topk
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            prev_topk_indices=prev_topk_indices,
         )
+        # Returns (output, emitted_topk_indices); the decoder layer threads the
+        # topk to the next layer for cross-layer reuse.
         return self.forward_core(s)
 
 
@@ -827,6 +1228,22 @@ class Glm4MoeDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             use_qk_norm=use_qk_norm,
             alt_stream=alt_stream,
+            glm_sparse_indexer_enabled=getattr(
+                config, "glm_sparse_indexer_enabled", False
+            ),
+            glm_sparse_indexer_topk=getattr(config, "glm_sparse_indexer_topk", 2048),
+            glm_sparse_indexer_smoke_gather=getattr(
+                config, "glm_sparse_indexer_smoke_gather", True
+            ),
+            tsa_index_topk=getattr(config, "tsa_index_topk", None),
+            glm_sparse_index_topk_freq=getattr(
+                config, "glm_sparse_index_topk_freq", 1
+            ),
+            glm_sparse_index_topk_pattern=getattr(
+                config, "glm_sparse_index_topk_pattern", None
+            ),
+            glm_sparse_force_left=getattr(config, "glm_sparse_force_left", 0),
+            glm_sparse_force_right=getattr(config, "glm_sparse_force_right", 0),
         )
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
@@ -936,6 +1353,7 @@ class Glm4MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
@@ -949,7 +1367,14 @@ class Glm4MoeDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            prev_topk_indices=prev_topk_indices,
         )
+        # self_attn returns (output, emitted_topk_indices) to thread the
+        # cross-layer TopK reuse chain; tolerate a bare tensor defensively.
+        if isinstance(hidden_states, tuple):
+            hidden_states, topk_indices = hidden_states
+        else:
+            topk_indices = None
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -977,7 +1402,7 @@ class Glm4MoeDecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
-        return hidden_states, residual
+        return hidden_states, residual, topk_indices
 
     def op_comm_prepare_attn(
         self,
@@ -1121,16 +1546,18 @@ class Glm4MoeModel(nn.Module):
                 normal_end_layer = normal_start_layer = 0
 
         aux_hidden_states = []
+        topk_indices = None
         for i in range(normal_start_layer, normal_end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
-                hidden_states, residual = layer(
+                hidden_states, residual, topk_indices = layer(
                     positions,
                     hidden_states,
                     forward_batch,
                     residual,
+                    prev_topk_indices=topk_indices,
                 )
 
         if normal_end_layer != self.end_layer:
