@@ -174,7 +174,7 @@ Both Instruct repos ship as **FP4 MoE experts + FP8 attention / dense** (one mix
 
 **Concurrency & DeepEP dispatch buffer**
 
-Must hold: `max-running-requests × MTP_draft_tokens ≤ SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`. Violating it blows DeepEP's dispatch buffer at steady-state load (`deep_ep.cpp:1105`). When tuning, move `--cuda-graph-max-bs`, `--max-running-requests`, and the env together.
+Must hold: `max-running-requests × MTP_draft_tokens ≤ SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`. Violating it blows DeepEP's dispatch buffer at steady-state load (`deep_ep.cpp:1105`). When tuning, move `--cuda-graph-max-bs-decode`, `--max-running-requests`, and the env together.
 
 The generator currently picks values on the **conservative** side (mirroring an internal stress-test matrix). They run safely out of the box but likely leave throughput on the table — please tune them up toward your actual workload's peak concurrency and report findings back so the defaults can be revised.
 
