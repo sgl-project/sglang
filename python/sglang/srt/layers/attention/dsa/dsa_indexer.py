@@ -428,7 +428,6 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
-        # Optional CuTe DSL FP8 paged MQA logits kernel (Blackwell SM100 only).
         self.use_cute_dsl_paged_mqa_logits = (
             get_global_server_args().dsa_use_cute_dsl_paged_mqa_logits
             and is_sm100_supported()
@@ -827,15 +826,6 @@ class Indexer(MultiPlatformOp):
         # hidden states; q_offset is the real (unpadded) q length.
         q_offset = sum(metadata.get_dsa_extend_len_cpu())
 
-        # Path selection (mutually exclusive, decode falls through to DG-expanded):
-        #   - cute_dsl (flag opt-in, SM100 only): 1 atom per batch, kernel handles
-        #     full next_n natively. Schedule built from `[B, 1]` in dsa_backend.
-        #   - DG-native: q=[B,next_n,H,D] is faster than expanded q=[B*next_n,1,H,D]
-        #     for target_verify with next_n>=2 (bigger MMA tile, fewer atoms). The
-        #     precomputed ctx_lens_2d's shape is the single source of truth — if
-        #     dsa_backend chose the per-token layout (e.g. non-SM100), fall through
-        #     to the expanded path.
-        #   - DG-expanded: q=[B*next_n,1,H,D]. Schedule from `[N_total, 1]`.
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
         use_cute_dsl = (
@@ -900,8 +890,6 @@ class Indexer(MultiPlatformOp):
                 CuteDSLPagedMQALogitsRunner,
             )
 
-            # 1D context_lens [B], q reshaped to [B, next_n, H, D] for verify
-            # (or [B, 1, H, D] for decode), per-batch block_tables [B, max_blks].
             ctx_lens_1d = metadata.get_seqlens_int32()
             schedule_metadata_dsl = schedule_metadata
             factor = getattr(metadata, "dsl_expand_factor", 1)

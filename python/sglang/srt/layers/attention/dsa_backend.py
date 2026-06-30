@@ -633,35 +633,23 @@ class DeepseekSparseAttnBackend(
         batch_size: int,
         max_seq_len_k: int,
     ) -> Tuple[int, int]:
-        """Wave-aware atom-split picker for the CuTe DSL FP8 paged MQA logits
-        kernel. Returns ``(factor, atom)``; ``(1, 1)`` when atom-split is N/A
-        (mode != target_verify, next_n < 2, or DSL kernel not enabled).
-
-        Uses ``max_seq_len_k`` (CPU int — already computed for the metadata)
-        for the ``max_ctx`` input, so this is cuda-graph capture safe.
-        """
-        if not self.use_cute_dsl_paged_mqa_logits:
-            return 1, 1
-        if not forward_mode.is_target_verify():
-            return 1, 1
         next_n = self.speculative_num_draft_tokens
-        if next_n is None or next_n < 2:
+        if (
+            not self.use_cute_dsl_paged_mqa_logits
+            or not forward_mode.is_target_verify()
+            or next_n is None
+            or next_n < 2
+        ):
             return 1, 1
         from sglang.srt.layers.attention.dsa.cute_dsl_paged_mqa_logits import (
             _pick_dsl_expand,
         )
 
-        try:
-            import deep_gemm
-
-            num_sms = deep_gemm.get_num_sms()
-        except (ImportError, ModuleNotFoundError):
-            return 1, 1
         return _pick_dsl_expand(
             next_n,
             batch_size=batch_size,
             max_ctx=max_seq_len_k,
-            num_sms=num_sms,
+            num_sms=deep_gemm.get_num_sms(),
             kernel_atoms=(1, 2, 3, 4),
             num_heads=self.dsa_index_n_heads,
         )
