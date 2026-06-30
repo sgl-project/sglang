@@ -850,12 +850,16 @@ class USPAttention(nn.Module):
         k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
         v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
 
+        # Q and KV can have different head counts (GQA), so slice each replicated
+        # prefix by its own per-rank head shard to match the all-to-all'd suffix.
+        # For MHA (kv heads == q heads) this is identical to the q shard.
         h_local = q_shard.shape[2]
+        kv_h_local = k_shard.shape[2]
         h_start = sp_rank * h_local
-        h_end = h_start + h_local
-        q_rep = q_rep[:, :, h_start:h_end, :].contiguous()
-        k_rep = k_rep[:, :, h_start:h_end, :].contiguous()
-        v_rep = v_rep[:, :, h_start:h_end, :].contiguous()
+        kv_h_start = sp_rank * kv_h_local
+        q_rep = q_rep[:, :, h_start : h_start + h_local, :].contiguous()
+        k_rep = k_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
+        v_rep = v_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
 
         q = torch.cat([q_rep, q_shard], dim=1)
         k = torch.cat([k_rep, k_shard], dim=1)
