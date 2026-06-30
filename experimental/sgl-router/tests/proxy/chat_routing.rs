@@ -2336,6 +2336,20 @@ async fn success_logged_once_in_access_log() {
 /// later aborts by — distinct from the `x-request-id` HTTP header `
 /// make_chat_req` sets for access-log correlation).
 fn chat_req_with_body_rid(streaming: bool, body_rid: Option<&str>) -> Request<Body> {
+    chat_req_with_rids(streaming, body_rid, None)
+}
+
+/// Like [`chat_req_with_body_rid`], plus an optional `x-request-id` HEADER —
+/// the gateway/access-log correlation id, distinct from the body-level `rid`
+/// the engine adopts. Used to test that a missing body `rid` falls back to
+/// deriving the engine-facing rid from this header (not an unrelated random
+/// UUID), so router/gateway logs (keyed on `x-request-id`) and engine logs
+/// (keyed on `rid`) can be cross-referenced by the same token.
+fn chat_req_with_rids(
+    streaming: bool,
+    body_rid: Option<&str>,
+    x_request_id: Option<&str>,
+) -> Request<Body> {
     let mut body = serde_json::json!({
         "model": "tiny",
         "messages": [{"role": "user", "content": "hi"}],
@@ -2344,10 +2358,14 @@ fn chat_req_with_body_rid(streaming: bool, body_rid: Option<&str>) -> Request<Bo
     if let Some(rid) = body_rid {
         body["rid"] = Value::String(rid.to_string());
     }
-    Request::builder()
+    let mut builder = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+    if let Some(xrid) = x_request_id {
+        builder = builder.header("x-request-id", xrid);
+    }
+    builder
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap()
 }
@@ -2473,6 +2491,81 @@ async fn streaming_disconnect_reuses_client_supplied_rid() {
     assert_eq!(
         log[0]["rid"], "client-rid-123",
         "a client-supplied rid must be reused verbatim, not overridden"
+    );
+}
+
+/// With no client-supplied body `rid`, the minted engine-facing rid must be
+/// derived from the gateway's `x-request-id` header (already logged by the
+/// router's own access-log middleware, server/app.rs) — not an unrelated
+/// random UUID. This is what lets an operator take a `rid` out of an engine
+/// log line and find the matching router/gateway log line via the same
+/// `x-request-id` value, and vice versa.
+#[tokio::test]
+async fn streaming_disconnect_derives_rid_from_x_request_id_header() {
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        vec!["data: a\n\n", "data: b\n\n", "data: c\n\n"],
+        Duration::from_millis(50),
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let res = app
+        .oneshot(chat_req_with_rids(true, None, Some("gw-correlate-456")))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    use futures::StreamExt;
+    let mut data_stream = res.into_body().into_data_stream();
+    assert!(data_stream.next().await.is_some());
+    drop(data_stream);
+
+    wait_for_abort(&worker.abort_log, Duration::from_secs(2)).await;
+    let log = worker.abort_log.lock().unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(
+        log[0]["rid"], "router-gw-correlate-456",
+        "with no body rid, the minted rid must incorporate x-request-id verbatim, \
+         so it's findable from the access-log's own x-request-id field"
+    );
+}
+
+/// A client-supplied body `rid` still wins over `x-request-id` when both are
+/// present — the body-level `rid` is the more specific, explicit signal (an
+/// external abort-by-rid integration would set it deliberately), so it must
+/// not be silently overridden by the more general gateway-correlation header.
+#[tokio::test]
+async fn streaming_disconnect_prefers_client_body_rid_over_x_request_id_header() {
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        vec!["data: a\n\n", "data: b\n\n", "data: c\n\n"],
+        Duration::from_millis(50),
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let res = app
+        .oneshot(chat_req_with_rids(
+            true,
+            Some("client-rid-wins"),
+            Some("gw-should-be-ignored"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    use futures::StreamExt;
+    let mut data_stream = res.into_body().into_data_stream();
+    assert!(data_stream.next().await.is_some());
+    drop(data_stream);
+
+    wait_for_abort(&worker.abort_log, Duration::from_secs(2)).await;
+    let log = worker.abort_log.lock().unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(
+        log[0]["rid"], "client-rid-wins",
+        "a client-supplied body rid must take priority over x-request-id"
     );
 }
 

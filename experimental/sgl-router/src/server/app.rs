@@ -65,6 +65,53 @@ fn normalize_method(method: &axum::http::Method) -> &'static str {
     }
 }
 
+/// Guards `access_log_and_record`'s normal access-log line, which is only
+/// reached after `next.run(req).await` resolves. If the client disconnects
+/// while that await is still pending, axum drops that function's future
+/// there -- a dropped `Future` does not run its remaining code, so without
+/// this guard the request's `rid`/method/path would never appear anywhere in
+/// the router's own logs even though the request was genuinely received and
+/// dispatched (only `record_ingress`, below, would reflect it, as an
+/// unexplained gap against `responses_total`). Armed before the await,
+/// disarmed once the normal log line is about to fire -- but never for a
+/// request on an infra path (`/healthz`, `/readyz`, `/metrics`), which are
+/// polled constantly and would otherwise turn routine probe timeouts into
+/// WARN-level "client disconnected" noise indistinguishable from a real API
+/// client giving up; see the `is_infra_path` check in `access_log_and_record`.
+/// A cancelled non-infra request still gets exactly one log line via `Drop`.
+struct AccessLogFallbackGuard {
+    request_id: String,
+    method_label: &'static str,
+    path: String,
+    route: String,
+    start: std::time::Instant,
+    is_infra: bool,
+    armed: bool,
+}
+
+impl AccessLogFallbackGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AccessLogFallbackGuard {
+    fn drop(&mut self) {
+        if !self.armed || self.is_infra {
+            return;
+        }
+        tracing::warn!(
+            request_id = %self.request_id,
+            method = %self.method_label,
+            path = %self.path,
+            route = %self.route,
+            latency_ms = self.start.elapsed().as_millis() as u64,
+            outcome = "cancelled",
+            "http_request: client disconnected before a response was produced",
+        );
+    }
+}
+
 /// Outermost middleware: the single edge-counting + access-log site.
 ///
 /// Runs for EVERY request — all routes, plus responses produced before any
@@ -119,7 +166,20 @@ async fn access_log_and_record(
     // a never-answered request still shows up (intake - responses = the gap).
     metrics.record_ingress(&route, method_label);
 
+    let mut log_guard = AccessLogFallbackGuard {
+        request_id: request_id.clone(),
+        method_label,
+        path: path.clone(),
+        route: route.clone(),
+        start,
+        is_infra: is_infra_path(&path),
+        armed: true,
+    };
+
     let resp = next.run(req).await;
+    // Past this point the function is fully synchronous (no more `.await`),
+    // so it will run to completion — safe to disarm the fallback now.
+    log_guard.disarm();
 
     let status = resp.status();
     let latency_ms = start.elapsed().as_millis() as u64;
@@ -272,6 +332,28 @@ mod tests {
         );
     }
 
+    /// Ensure a real (non-no-op) global default `tracing` subscriber exists for
+    /// the whole test binary. `tracing`'s per-callsite interest is computed once,
+    /// process-wide, on first hit, and cached; a callsite whose first-ever hit
+    /// happens on a thread with no active subscriber (the no-op default) can get
+    /// cached as a hard "never interested" that no *later* per-thread
+    /// `tracing::subscriber::set_default` override can undo. Any test that can
+    /// reach `access_log_and_record`'s abandoned-request path -- which is any
+    /// test using the abandon-via-timeout pattern below, not just the ones that
+    /// assert on log content -- must call this first, or it can race a sibling
+    /// test for which thread hits `AccessLogFallbackGuard`'s `tracing::warn!`
+    /// callsite first and poison it for the rest of the process.
+    fn ensure_global_tracing_default() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(std::io::sink)
+                    .finish(),
+            );
+        });
+    }
+
     /// The point of counting intake at ENTRY: a request that never produces a
     /// response — client disconnect / cancellation drops the in-flight handler
     /// future at its `.await` — is still counted in `requests_total`, while
@@ -280,6 +362,7 @@ mod tests {
     /// handler that sleeps far past our abandon timeout models the dropped future.
     #[tokio::test]
     async fn intake_counted_at_entry_even_when_request_never_completes() {
+        ensure_global_tracing_default();
         let metrics = MetricsRegistry::new();
         let app = Router::new()
             .route(
@@ -315,6 +398,180 @@ mod tests {
         assert!(
             !m.contains(r#"sgl_router_responses_total{route="/v1/chat/completions""#),
             "a never-answered request must NOT appear in responses_total; got:\n{m}",
+        );
+    }
+
+    /// Companion to the metrics-side test above: a cancelled request must also
+    /// leave a log line, not just a metrics gap. Without `AccessLogFallbackGuard`,
+    /// the normal `tracing::info!` call is unreachable here because it sits after
+    /// the `.await` this test drops the future at -- this request's `rid` would
+    /// never appear anywhere in the router's own logs.
+    #[derive(Clone)]
+    struct VecWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for VecWriter {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for VecWriter {
+        type Writer = VecWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Installs a thread-local `tracing` subscriber (via `set_default`, not the
+    /// global default `ensure_global_tracing_default` installs) that captures
+    /// every log line into an in-memory buffer, so a test can assert on the
+    /// exact content the middleware emitted.
+    fn capture_logs() -> (
+        Arc<std::sync::Mutex<Vec<u8>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(VecWriter(buf.clone()))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (buf, guard)
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_still_emits_one_log_line() {
+        ensure_global_tracing_default();
+        let (buf, _guard) = capture_logs();
+
+        let metrics = MetricsRegistry::new();
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    StatusCode::OK
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&metrics),
+                access_log_and_record,
+            ));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("x-request-id", "test-cancelled-rid")
+            .body(Body::empty())
+            .unwrap();
+        let abandoned =
+            tokio::time::timeout(std::time::Duration::from_millis(50), app.oneshot(req)).await;
+        assert!(abandoned.is_err(), "request must not complete within 50ms");
+        // `timeout` returning Err only means the outer await gave up; the
+        // abandoned future's drop glue (and thus this guard's Drop) still has
+        // to actually run on the runtime, and exactly when that happens
+        // relative to this point is not guaranteed, so poll with a generous
+        // ceiling instead of asserting on one fixed wait.
+        let mut logs = String::new();
+        for _ in 0..20 {
+            logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+            if logs.contains("test-cancelled-rid") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            logs.contains("test-cancelled-rid"),
+            "a cancelled request's rid must still be logged; captured:\n{logs}"
+        );
+        assert!(
+            logs.contains(r#"outcome="cancelled""#) || logs.contains("outcome=cancelled"),
+            "the fallback log line must mark the outcome as cancelled; captured:\n{logs}"
+        );
+    }
+
+    /// A request that completes normally must disarm `AccessLogFallbackGuard`
+    /// before the guard's `Drop` can fire, so it gets exactly one log line (the
+    /// normal one), never a second "cancelled" line from the fallback.
+    #[tokio::test]
+    async fn normal_completion_does_not_also_log_cancelled() {
+        ensure_global_tracing_default();
+        let (buf, _guard) = capture_logs();
+
+        let metrics = MetricsRegistry::new();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&metrics),
+                access_log_and_record,
+            ));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("x-request-id", "test-normal-rid")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("test-normal-rid"),
+            "a completed request must still be logged; captured:\n{logs}"
+        );
+        assert!(
+            !logs.contains("outcome=\"cancelled\"") && !logs.contains("outcome=cancelled"),
+            "a request that completed normally must not ALSO get the fallback \
+             cancelled line; captured:\n{logs}"
+        );
+    }
+
+    /// The fallback guard must stay silent for a cancelled infra-path request
+    /// (`/healthz` and friends are polled continuously; a client — the probe —
+    /// giving up mid-poll is routine, not something worth a WARN-level "client
+    /// disconnected" line indistinguishable from a real API client giving up).
+    #[tokio::test]
+    async fn cancelled_infra_path_does_not_warn() {
+        ensure_global_tracing_default();
+        let (buf, _guard) = capture_logs();
+
+        let metrics = MetricsRegistry::new();
+        let app = Router::new()
+            .route(
+                "/healthz",
+                get(|| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    StatusCode::OK
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&metrics),
+                access_log_and_record,
+            ));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .header("x-request-id", "test-infra-cancelled-rid")
+            .body(Body::empty())
+            .unwrap();
+        let abandoned =
+            tokio::time::timeout(std::time::Duration::from_millis(50), app.oneshot(req)).await;
+        assert!(abandoned.is_err(), "request must not complete within 50ms");
+
+        // Give the dropped future's Drop glue a generous window to run, same
+        // as `cancelled_request_still_emits_one_log_line` — but here we expect
+        // it to run and produce NOTHING, so there is no log-content poll loop
+        // to break out of early; the sleep is the entire wait.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logs.contains("test-infra-cancelled-rid"),
+            "a cancelled infra-path request must not produce a WARN fallback \
+             line; captured:\n{logs}"
         );
     }
 

@@ -438,7 +438,22 @@ async fn chat_completions_inner(
     let request_id: Option<String> = if decode_peer.is_none() {
         Some(match &client_rid {
             Some(rid) => rid.clone(),
-            None => format!("router-{}", uuid::Uuid::new_v4().simple()),
+            // No client-supplied rid: derive the minted one from the
+            // gateway/access-log `x-request-id` (already read the same way by
+            // the global access-log middleware, server/app.rs) instead of an
+            // unrelated random UUID. Without this, the router/gateway logs
+            // (keyed on x-request-id) and the engine logs (keyed on this rid)
+            // use two disjoint identifiers for the same request, making it
+            // impossible to correlate a log line found in one against the
+            // other. Falls back to a UUID only when the header itself is
+            // absent (e.g. direct-to-router traffic bypassing the gateway).
+            None => {
+                let xrid = headers.get("x-request-id").and_then(|v| v.to_str().ok());
+                match xrid {
+                    Some(id) => format!("router-{id}"),
+                    None => format!("router-{}", uuid::Uuid::new_v4().simple()),
+                }
+            }
         })
     } else {
         None
