@@ -1540,13 +1540,18 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.model.capture_aux_hidden_states = True
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
-            self.model.layers_to_capture = [
+            layers_to_capture = [
                 2,
                 num_layers // 2,
                 num_layers - 3,
             ]  # Specific layers for EAGLE3 support
         else:
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            layers_to_capture = [val + 1 for val in layer_ids]
+
+        if hasattr(self.model, "set_eagle3_layers_to_capture"):
+            self.model.set_eagle3_layers_to_capture(layers_to_capture)
+        else:
+            self.model.layers_to_capture = layers_to_capture
 
 
 EntryClass = Qwen3VLForConditionalGeneration
