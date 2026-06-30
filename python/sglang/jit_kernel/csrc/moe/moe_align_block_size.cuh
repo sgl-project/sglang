@@ -169,11 +169,12 @@ void moe_align_block_size(
 
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA>();
+  auto topk_dtype = SymbolicDType{};
 
   if (topk_ids.ndim() == 1) {
-    TensorMatcher({-1}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
+    TensorMatcher({-1}).with_dtype<int32_t, int64_t>(topk_dtype).with_device(device).verify(topk_ids);
   } else if (topk_ids.ndim() == 2) {
-    TensorMatcher({-1, -1}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
+    TensorMatcher({-1, -1}).with_dtype<int32_t, int64_t>(topk_dtype).with_device(device).verify(topk_ids);
   } else {
     RuntimeCheck(false, "moe_align_block_size: topk_ids must be 1D or 2D, got ndim=", topk_ids.ndim());
   }
@@ -190,29 +191,52 @@ void moe_align_block_size(
 
   const size_t shared_mem_size = (num_experts + (num_experts + 1) + scan_size + kWarpSize) * sizeof(int32_t);
 
-  LaunchKernel(dim3(2), dim3(kThreads), dev, shared_mem_size)(
-      moe_align_block_size_kernel<int32_t>,
-      static_cast<const int32_t*>(topk_ids.data_ptr()),
-      static_cast<int32_t*>(sorted_token_ids.data_ptr()),
-      static_cast<int32_t*>(expert_ids.data_ptr()),
-      static_cast<int32_t*>(num_tokens_post_pad.data_ptr()),
-      static_cast<int32_t>(num_experts),
-      static_cast<int32_t>(block_size),
-      numel,
-      static_cast<int32_t*>(cumsum_buffer.data_ptr()),
-      pad_sorted_token_ids,
-      scan_size,
-      static_cast<int32_t>(max_num_tokens_padded));
-
   constexpr int kBlockThreads = 256;
   const int64_t num_blocks_sort = std::min((numel + kBlockThreads - 1) / kBlockThreads, (int64_t)65535);
 
-  LaunchKernel(dim3(static_cast<unsigned>(num_blocks_sort)), dim3(kBlockThreads), dev)(
-      count_and_sort_expert_tokens_kernel<int32_t>,
-      static_cast<const int32_t*>(topk_ids.data_ptr()),
-      static_cast<int32_t*>(sorted_token_ids.data_ptr()),
-      static_cast<int32_t*>(cumsum_buffer.data_ptr()),
-      numel);
+  if (topk_dtype.unwrap().bits == 32) {
+    LaunchKernel(dim3(2), dim3(kThreads), dev, shared_mem_size)(
+        moe_align_block_size_kernel<int32_t>,
+        static_cast<const int32_t*>(topk_ids.data_ptr()),
+        static_cast<int32_t*>(sorted_token_ids.data_ptr()),
+        static_cast<int32_t*>(expert_ids.data_ptr()),
+        static_cast<int32_t*>(num_tokens_post_pad.data_ptr()),
+        static_cast<int32_t>(num_experts),
+        static_cast<int32_t>(block_size),
+        numel,
+        static_cast<int32_t*>(cumsum_buffer.data_ptr()),
+        pad_sorted_token_ids,
+        scan_size,
+        static_cast<int32_t>(max_num_tokens_padded));
+
+    LaunchKernel(dim3(static_cast<unsigned>(num_blocks_sort)), dim3(kBlockThreads), dev)(
+        count_and_sort_expert_tokens_kernel<int32_t>,
+        static_cast<const int32_t*>(topk_ids.data_ptr()),
+        static_cast<int32_t*>(sorted_token_ids.data_ptr()),
+        static_cast<int32_t*>(cumsum_buffer.data_ptr()),
+        numel);
+  } else {
+    LaunchKernel(dim3(2), dim3(kThreads), dev, shared_mem_size)(
+        moe_align_block_size_kernel<int64_t>,
+        static_cast<const int64_t*>(topk_ids.data_ptr()),
+        static_cast<int32_t*>(sorted_token_ids.data_ptr()),
+        static_cast<int32_t*>(expert_ids.data_ptr()),
+        static_cast<int32_t*>(num_tokens_post_pad.data_ptr()),
+        static_cast<int32_t>(num_experts),
+        static_cast<int32_t>(block_size),
+        numel,
+        static_cast<int32_t*>(cumsum_buffer.data_ptr()),
+        pad_sorted_token_ids,
+        scan_size,
+        static_cast<int32_t>(max_num_tokens_padded));
+
+    LaunchKernel(dim3(static_cast<unsigned>(num_blocks_sort)), dim3(kBlockThreads), dev)(
+        count_and_sort_expert_tokens_kernel<int64_t>,
+        static_cast<const int64_t*>(topk_ids.data_ptr()),
+        static_cast<int32_t*>(sorted_token_ids.data_ptr()),
+        static_cast<int32_t*>(cumsum_buffer.data_ptr()),
+        numel);
+  }
 }
 
 }  // namespace

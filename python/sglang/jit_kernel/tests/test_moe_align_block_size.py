@@ -1,4 +1,5 @@
 import itertools
+import sys
 
 import pytest
 import torch
@@ -158,6 +159,49 @@ def test_moe_align_block_size(m, topk, num_experts, block_size):
         )
 
 
+def test_moe_align_block_size_int64_topk_ids():
+    device = "cuda"
+    block_size = 16
+    ne_param = 5
+    topk_ids = torch.tensor(
+        [[0, 1], [2, 0], [1, 3], [3, 2]], dtype=torch.int64, device=device
+    )
+    numel = topk_ids.numel()
+    max_num_tokens_padded = numel * block_size
+
+    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=device)
+    max_num_m_blocks = (max_num_tokens_padded + block_size - 1) // block_size
+    expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=device)
+    num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=device)
+    cumsum_buffer = torch.empty((ne_param + 1,), dtype=torch.int32, device=device)
+
+    moe_align_block_size(
+        topk_ids,
+        ne_param,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        cumsum_buffer,
+        True,
+    )
+    torch.cuda.synchronize()
+
+    ref_sorted, ref_expert_ids, ref_total, _ = moe_align_block_size_ref(
+        topk_ids,
+        ne_param,
+        block_size,
+        pad_sorted_token_ids=True,
+    )
+
+    total_jit = num_tokens_post_pad.item()
+    assert total_jit == ref_total
+    assert expert_ids[: ref_total // block_size].cpu().tolist() == ref_expert_ids
+    assert sorted(sorted_ids[:total_jit].cpu().tolist()) == sorted(
+        ref_sorted[:total_jit]
+    )
+
+
 @pytest.mark.parametrize("num_experts", [4, 8, 64])
 def test_filtered_experts(num_experts):
     device = "cuda"
@@ -204,4 +248,4 @@ def test_filtered_experts(num_experts):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "--tb=short"])
+    sys.exit(pytest.main([__file__, "-v", "--tb=short"]))

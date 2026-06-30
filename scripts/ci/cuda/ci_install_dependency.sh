@@ -36,6 +36,21 @@ configure_environment() {
 
     OPTIONAL_DEPS="${1:-}"
 
+    if [ -z "${UV_CACHE_DIR:-}" ]; then
+        export UV_CACHE_DIR="${RUNNER_TEMP:-/tmp}/uv-cache"
+    fi
+    mkdir -p "${UV_CACHE_DIR}"
+    echo "UV_CACHE_DIR=${UV_CACHE_DIR}"
+    if [ -z "${SGLANG_CACHE_DIR:-}" ]; then
+        export SGLANG_CACHE_DIR="${RUNNER_TEMP:-/tmp}/sglang-cache"
+    fi
+    mkdir -p "${SGLANG_CACHE_DIR}"
+    echo "SGLANG_CACHE_DIR=${SGLANG_CACHE_DIR}"
+    if [ -n "${GITHUB_ENV:-}" ]; then
+        echo "UV_CACHE_DIR=${UV_CACHE_DIR}" >> "${GITHUB_ENV}" || true
+        echo "SGLANG_CACHE_DIR=${SGLANG_CACHE_DIR}" >> "${GITHUB_ENV}" || true
+    fi
+
     # Whether to create a uv venv (set USE_VENV=1). Default: 0.
     USE_VENV="${USE_VENV:-0}"
     echo "USE_VENV=${USE_VENV}"
