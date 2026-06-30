@@ -41,6 +41,11 @@ class ScriptedTokenizerRecvProxy:
             "ScriptedTokenizerRecvProxy.recv_pyobj: blocking recv is not supported"
         )
 
+    def recv(self, flags: int = 0) -> bytes:
+        raise NotImplementedError(
+            "TODO: support ScriptedTokenizerRecvProxy.recv for msgpack IPC"
+        )
+
     def wait_until_arrived(
         self,
         predicate: Callable[[Any], bool],

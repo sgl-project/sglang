@@ -93,6 +93,7 @@ endif()
 # Keep them out of Arm64 bootstrap builds until native Arm paths land.
 set(SGLANG_CPU_X86_ONLY_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/gemm_int4.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/gemm_int8.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/moe.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/moe_fp8.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/moe_int4.cpp
