@@ -20,9 +20,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
 
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    set_graph_pool_id,
-)
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
@@ -54,7 +51,6 @@ class XPUCudaGraphBackend(BaseCudaGraphBackend):
     def capture_session(self, stream: torch.xpu.Stream):
         if self._pool is None:
             self._pool = self._device_module.graph_pool_handle()
-        set_graph_pool_id(self._pool)
         self._capture_stream = stream
         try:
             yield
