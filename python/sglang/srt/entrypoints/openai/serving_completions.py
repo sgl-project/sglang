@@ -17,7 +17,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
     SglExt,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_base import (
+    OpenAIServingBase,
+    StreamingAbortBeforeFirstChunk,
+)
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     cached_tokens_details_from_dict,
@@ -200,6 +203,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
             first_chunk = await generator.__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))
+        except StreamingAbortBeforeFirstChunk as e:
+            # Abort decided before HTTP 200 was committed (e.g. queue full):
+            # return a real HTTP error so the status code matches the body.
+            return self.create_error_response(e.message, e.err_type, e.status_code)
 
         async def prepend_first_chunk():
             yield first_chunk
@@ -329,8 +336,17 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     finish_reason.get("status_code"), HTTPStatus
                 ):
                     code = finish_reason["status_code"]
+                    message = finish_reason.get("message", "Generation aborted.")
+                    # Abort before any chunk streamed (e.g. "The request queue is
+                    # full.") -> HTTP 200 not committed yet: raise so the handler
+                    # returns a real HTTP error matching the body. After streaming
+                    # started, only an in-band SSE error chunk is possible.
+                    if not stream_started:
+                        raise StreamingAbortBeforeFirstChunk(
+                            message, code.name, code.value
+                        )
                     error = self.create_streaming_error_response(
-                        finish_reason.get("message", "Generation aborted."),
+                        message,
                         code.name,
                         code.value,
                     )
