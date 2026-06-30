@@ -2664,10 +2664,12 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         full-KV bytes and the planner sources this via `getattr(..., None)`.
 
         = mamba bytes/slot (mamba page_size==1 → `entry_bytes_per_page`)
-        ÷ full bytes/token (`entry_bytes`).
+        ÷ full bytes/token (`entry_bytes`), rounded UP so the planner's
+        reservation never under-charges the bytes a mamba slot actually removes
+        from the shared gap (conservative — see `PrefillAdder._mamba_gap_budget_for_req`).
         """
-        return (
-            self.mamba_allocator.entry_bytes_per_page
+        return -(
+            -self.mamba_allocator.entry_bytes_per_page
             // self.full_attn_allocator.entry_bytes
         )
 

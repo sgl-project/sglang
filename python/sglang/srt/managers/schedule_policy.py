@@ -632,15 +632,18 @@ class PrefillAdder:
         radix state-reuse that won't allocate is not charged). 0 otherwise,
         which keeps the baseline / SWA / non-Mamba paths unchanged.
 
-        FIXME(shared-kv-pool): this budget estimate is NOT correct. It charges a
-        flat per-req mamba-slot byte cost to the full gap, but does not fully
-        account for the shared pool's byte coordination — e.g. eviction freeing
-        bytes that are actually pinned (locked) by running reqs, COW slot growth
-        on the radix path, and compaction timing. When the estimate is too
-        optimistic the admission over-admits and `alloc_req_slots` then fails
-        loud with a RuntimeError (the planner no longer silently re-queues).
-        Make this account for the true schedulable byte budget so admission never
-        over-commits, then the alloc can never fail."""
+        NOTE(shared-kv-pool): this is a CONSERVATIVE (not exact) estimate, by
+        design. `_mamba_slot_cost` (`mamba_slot_full_token_cost`) rounds the
+        per-slot byte cost UP, so each new-mamba req over-reserves slightly rather
+        than under-reserve — keeping admission within the joint gap for the
+        baseline `alloc(1)` per req. It does NOT separately reserve the radix COW
+        headroom (1-2 extra slots for branching reqs) or model locked-but-
+        evictable bytes / compaction timing; that residual is backstopped by the
+        fail-loud RuntimeError in `alloc_req_slots`. FIXME: if over-admission
+        crashes are observed under pressure, make this MORE conservative (e.g.
+        multiply by the eviction factor `MAMBA_STATE_PER_REQ_PREFIX_CACHE`),
+        trading some concurrency for headroom — a conservative over-estimate is
+        sufficient; an exact estimate is not required."""
         if self._mamba_slot_cost and req.mamba_pool_idx is None:
             return self._mamba_slot_cost
         return 0
