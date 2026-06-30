@@ -7,6 +7,7 @@ K >> BLOCK_KN_SIZE (gridDim.z > 1) to surface a missing zero-init.
 """
 
 import sys
+
 import pytest
 import torch
 from sgl_kernel import gptq_gemm
