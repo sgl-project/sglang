@@ -126,15 +126,15 @@ def fp4_gemm(
 ) -> torch.Tensor:
     fp4_backend = get_fp4_gemm_runner_backend()
     if fp4_backend.is_cutlass() and cutlass_fp4_gemm is not None:
-        # flashinfer.fp4_quantize returns scale factors as uint8 (e4m3fn bits
-        # stored in uint8 memory). The JIT kernel requires float8_e4m3fn dtype.
-        if input_sf.dtype != torch.float8_e4m3fn:
-            input_sf = input_sf.view(torch.float8_e4m3fn)
-        if weight_sf.dtype != torch.float8_e4m3fn:
-            weight_sf = weight_sf.view(torch.float8_e4m3fn)
+        # SM120 (RTX 5090 / Blackwell) CUTLASS FP4 GEMM NaN fix:
+        # E4M3 scale factor with uint8 value 127 (max representable = 448.0)
+        # triggers NaN in the CUTLASS kernel on SM120. Clamp to 126 (= 416.0,
+        # <2% precision loss). Using unconditional clamp instead of conditional
+        # .max() check avoids GPU-to-CPU sync that breaks CUDA graph capture.
+        input_sf = input_sf.contiguous().view(torch.uint8).clamp(max=126).view(torch.float8_e4m3fn)
+        weight_sf = weight_sf.contiguous().view(torch.uint8).clamp(max=126).view(torch.float8_e4m3fn)
         return cutlass_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
     elif enable_flashinfer_fp4_gemm:
-        # Use the remapping logic to convert SGLang backend names to FlashInfer API names
         backend = fp4_backend.get_flashinfer_backend()
         return flashinfer_fp4_gemm(
             input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
