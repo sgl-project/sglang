@@ -1479,6 +1479,7 @@ def build_inner_fb_view(
         seq_lens_cpu=forward_batch.seq_lens_cpu,
         encoder_lens=encoder_lens,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
     )
 
