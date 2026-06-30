@@ -638,6 +638,31 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
 
         self.assertEqual(result["quant_method"], "modelopt_mixed")
 
+    def test_nvfp4_layer_metadata_uses_modelopt_mixed(self):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.hf_config = MagicMock()
+        model_config.hf_config.model_type = "qwen3_5_moe"
+        model_config.hf_config.architectures = ["Qwen3_5MoeForConditionalGeneration"]
+
+        result = model_config._parse_modelopt_quant_config(
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "model.language_model.layers.0.linear_attn.out_proj": {
+                            "quant_algo": "FP8"
+                        },
+                        "model.language_model.layers.0.mlp.experts": {
+                            "quant_algo": "NVFP4",
+                            "group_size": 16,
+                        },
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(result["quant_method"], "modelopt_mixed")
+
     def test_mixed_precision_override_does_not_hijack_w4afp8(self):
         self.assertIsNone(
             ModelOptMixedPrecisionConfig.override_quantization_method(
@@ -686,6 +711,81 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         self.assertEqual(
             quant_config._resolve_quant_algo("model.layers.2.mixer.qkv_proj"),
             "FP8",
+        )
+
+    def test_qwen35_nvfp4_v2_layer_resolution(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "kv_cache_scheme": {"type": "float", "num_bits": 8},
+                "quantized_layers": {
+                    "model.language_model.layers.0.linear_attn.in_proj_qkv": {
+                        "quant_algo": "FP8"
+                    },
+                    "model.language_model.layers.0.linear_attn.in_proj_z": {
+                        "quant_algo": "FP8"
+                    },
+                    "model.language_model.layers.0.mlp.experts": {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                    },
+                    "model.language_model.layers.0.mlp.shared_expert.gate_proj": {
+                        "quant_algo": "FP8"
+                    },
+                    "model.language_model.layers.0.mlp.shared_expert.up_proj": {
+                        "quant_algo": "FP8"
+                    },
+                    "model.language_model.layers.3.self_attn.q_proj": {
+                        "quant_algo": "FP8"
+                    },
+                    "model.language_model.layers.3.self_attn.k_proj": {
+                        "quant_algo": "FP8"
+                    },
+                    "model.language_model.layers.3.self_attn.v_proj": {
+                        "quant_algo": "FP8"
+                    },
+                },
+                "packed_modules_mapping": {
+                    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                    "gate_up_proj": ["gate_proj", "up_proj"],
+                    "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+                },
+            }
+        )
+
+        self.assertEqual(quant_config.kv_cache_quant_algo, "FP8")
+        self.assertEqual(
+            quant_config._resolve_quant_algo(
+                "model.language_model.layers.0.linear_attn.in_proj_qkvz"
+            ),
+            "FP8",
+        )
+        self.assertEqual(
+            quant_config._resolve_quant_algo(
+                "model.language_model.layers.0.mlp.experts"
+            ),
+            "NVFP4",
+        )
+        self.assertEqual(
+            quant_config._resolve_quant_algo(
+                "model.language_model.layers.0.mlp.shared_expert.gate_up_proj"
+            ),
+            "FP8",
+        )
+        self.assertEqual(
+            quant_config._resolve_quant_algo(
+                "model.language_model.layers.3.self_attn.qkv_proj"
+            ),
+            "FP8",
+        )
+        self.assertIsNone(
+            quant_config._resolve_quant_algo(
+                "model.language_model.layers.0.linear_attn.in_proj_ba"
+            )
+        )
+        self.assertIsNone(quant_config._resolve_quant_algo("lm_head"))
+        self.assertIsNone(
+            quant_config._resolve_quant_algo("mtp.layers.0.mlp.experts")
         )
 
 
