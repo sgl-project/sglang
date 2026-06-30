@@ -785,8 +785,12 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
         # Calculate first full attention layer ID based on config
-        if self.attn.layer_id == (self.config.full_attention_interval - 1):
-            self.rotary_emb.get_cos_sin_with_position(positions)
+        # Calculate once for each pp group
+        calculated_pp_groups = []
+        if (self.attn.layer_id + 1) % self.config.full_attention_interval == 0:
+            if self.pp_group.rank_in_group not in calculated_pp_groups:
+                self.rotary_emb.get_cos_sin_with_position(positions)
+                calculated_pp_groups.append(self.pp_group.rank_in_group)
 
         q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
             qkv,
