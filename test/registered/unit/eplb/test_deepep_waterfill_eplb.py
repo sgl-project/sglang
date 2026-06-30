@@ -14,6 +14,7 @@ from torch import nn
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.topk import TopKConfig
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -74,10 +75,7 @@ class TestDeepEPWaterfillEPLB(CustomTestCase):
             patch.object(topk_module, "_is_cuda", True),
             patch.object(topk_module, "_use_aiter", False),
             patch.object(topk_module, "is_deepep_class_backend", return_value=True),
-            patch.object(
-                topk_module, "get_moe_expert_parallel_world_size", return_value=8
-            ),
-            patch.object(topk_module, "get_moe_expert_parallel_rank", return_value=7),
+            get_parallel().override(moe_ep_size=8, moe_ep_rank=7),
             patch.object(
                 topk_module,
                 "_biased_grouped_topk_postprocess",

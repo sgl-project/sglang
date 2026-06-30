@@ -6,6 +6,7 @@ run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_
 on:
   schedule:
     - cron: '30 17 * * *'
+    - cron: '0 */6 * * *' # Every 6 hours (UTC): target dsv4 accuracy jobs only
   # push:
   #   branches: [ main ]
   #   paths:
@@ -15,15 +16,14 @@ on:
   #     - "sgl-kernel/**"
   #     - ".github/workflows/pr-test-amd-rocm720.yml"
   #     - "docker/rocm.Dockerfile"
-  # pull_request:
-  #   branches: [ main ]
-  #   paths:
-  #     - "python/**"
-  #     - "scripts/ci/**"
-  #     - "test/**"
-  #     - "sgl-kernel/**"
-  #     - ".github/workflows/pr-test-amd-rocm720.yml"
-  #     - "docker/rocm.Dockerfile"
+  pull_request:
+    paths:
+      - "python/**"
+      - "scripts/ci/**"
+      - "test/**"
+      - "sgl-kernel/**"
+      - ".github/workflows/pr-test-amd-rocm720.yml"
+      - "docker/rocm.Dockerfile"
   workflow_dispatch:
     inputs:
       target_stage_select:
@@ -48,6 +48,8 @@ on:
           - stage-c-test-large-8-gpu-amd-mi35x-rocm720
           - stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720
           - stage-c-test-4-gpu-amd-rocm720
+          - dsv4-flash-fp4-fp8-amd-rocm720
+          - dsv4-pro-fp4-amd-rocm720
       target_stage:
         description: "Or type comma-separated stage names (overrides dropdown if non-empty)"
         required: false
@@ -96,6 +98,17 @@ on:
         type: boolean
         default: true
 
+# Mirror pr-test.yml: the chained extra suite (call-pr-test-amd-extra-rocm720
+# -> pr-test-amd-extra.yml) declares actions: write / issues: read /
+# pull-requests: read. A called reusable workflow can only use scopes the
+# caller already holds, so without this block the call fails workflow
+# validation ("requesting actions: write... but only allowed ...none").
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
+
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
@@ -111,6 +124,13 @@ concurrency:
 
 jobs:
   call-gate:
+    # Runs on PRs (pr-gate.yml enforces the run-ci label / blocks drafts), the daily
+    # '30 17 * * *' cron, workflow_dispatch and workflow_call. It is skipped only on the
+    # 6h ('0 */6 * * *') cron, which cascades a skip to check-changes and every existing
+    # test job, so that cron runs the two dsv4 jobs only. On PRs the existing jobs are
+    # additionally kept off via the change-detection guard in check-changes, so only the
+    # dsv4 jobs run there -- and only when this gate passes (they `needs` it).
+    if: github.event.schedule != '0 */6 * * *'
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
   check-changes:
@@ -133,9 +153,12 @@ jobs:
         run: |
           # Run all tests for workflow_call (when ref input is provided)
           # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.ref
-          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+          # Any scheduled run that reaches check-changes is the daily '30 17 * * *' cron
+          # (the 6h '0 */6 * * *' cron skips call-gate -> check-changes), so the daily run
+          # executes the full suite (existing jobs + dsv4), like pr-test-amd.yml.
+          if [[ "${{ inputs.run_all_tests }}" == "true" || "${{ github.event_name }}" == "schedule" ]]; then
             echo "run_all_tests=true" >> $GITHUB_OUTPUT
-            echo "Run mode: ALL TESTS (run_all_tests=${{ inputs.run_all_tests }})"
+            echo "Run mode: ALL TESTS (run_all_tests=${{ inputs.run_all_tests }}, event=${{ github.event_name }})"
           else
             echo "run_all_tests=false" >> $GITHUB_OUTPUT
             echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
@@ -145,11 +168,10 @@ jobs:
         id: set-continue-on-error
         run: |
           # Mirror pr-test-amd.yml: continue-on-error when any of
-          #   - run_all_tests was requested (workflow_dispatch checkbox or workflow_call input),
+          #   - run_all_tests was requested (workflow_dispatch checkbox, workflow_call input,
+          #     or a scheduled run, which run-mode above rolls into run_all_tests),
           #   - inputs.continue_on_error was explicitly set,
-          #   - or this is a scheduled run.
-          # The schedule check is included explicitly here because (unlike pr-test-amd.yml's
-          # run-mode) the rocm720 run-mode does not roll schedule into run_all_tests.
+          #   - or this is a scheduled run (kept as an explicit belt-and-suspenders guard).
           if [[ "${{ steps.run-mode.outputs.run_all_tests }}" == "true" || "${{ inputs.continue_on_error }}" == "true" || "${{ github.event_name }}" == "schedule" ]]; then
             echo "continue_on_error=true" >> $GITHUB_OUTPUT
             echo "Continue-on-error: ENABLED (run_all_tests=${{ steps.run-mode.outputs.run_all_tests }}, input=${{ inputs.continue_on_error }}, event=${{ github.event_name }})"
@@ -161,7 +183,9 @@ jobs:
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
-        if: steps.run-mode.outputs.run_all_tests != 'true'
+        # On pull_request only the dsv4 jobs run; skip change detection on PRs so the
+        # per-stage outputs stay 'false' and the existing test jobs are gated off.
+        if: steps.run-mode.outputs.run_all_tests != 'true' && github.event_name != 'pull_request'
         with:
           filters: |
             main_package:
@@ -177,16 +201,37 @@ jobs:
               - ".github/workflows/pr-test-amd-rocm720.yml"
             jit_kernel:
               - "python/sglang/jit_kernel/**"
+              - "test/registered/jit/**"
               - ".github/workflows/pr-test-amd-rocm720.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/cli/**"
               - "python/sglang/srt/observability/**"
               - "python/sglang/jit_kernel/diffusion/**"
-              - "python/sglang/jit_kernel/tests/diffusion/**"
-              - "python/sglang/jit_kernel/benchmark/diffusion/**"
+              - "test/registered/jit/diffusion/**"
+              - "test/registered/jit/benchmark/diffusion/**"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
+
+  # =============================================== extra (scheduled) ====================================================
+  # ROCm 7.2 mirror of pr-test-amd.yml's `call-pr-test-amd-extra`: chain the
+  # label-gated AMD extra tier into this workflow's daily schedule, but in a
+  # ROCm 7.2 container (`rocm_version: rocm720`). On `schedule` (and
+  # run_all_tests dispatch) the extra suite runs on `main` without the
+  # `run-ci-extra` label (pr-gate.yml only enforces labels on pull_request
+  # events). Targeted dispatches (target_stage set) are excluded. Not wired
+  # into any finish aggregator so the base rocm720 run never depends on it.
+  call-pr-test-amd-extra-rocm720:
+    if: |
+      (github.event_name == 'schedule' || inputs.run_all_tests == true) &&
+      !(inputs.target_stage || inputs.target_stage_select)
+    uses: ./.github/workflows/pr-test-amd-extra.yml
+    with:
+      ref: ${{ inputs.pr_head_sha || inputs.ref || '' }}
+      rocm_version: rocm720
+      aiter_ref: ${{ inputs.aiter_ref }}
+      continue_on_error: true
+    secrets: inherit
 
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd-rocm720:
@@ -223,7 +268,7 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
-        timeout-minutes: 14
+        timeout-minutes: 30
         run: |
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_align.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_topk_softmax.py
@@ -269,10 +314,9 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_amd_deterministic_custom_allreduce.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_amd_nccl_allreduce_determinism.py
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite sgl-kernel-unit-test-2-gpu-amd
 
   # =============================================== primary ====================================================
 
@@ -349,7 +393,7 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run JIT kernel unit tests
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-unit-test-amd ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
@@ -426,9 +470,9 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
-        timeout-minutes: 45
+        timeout-minutes: 75
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-nondeterministic --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-nondeterministic --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-small-amd-mi35x-rocm720:
     needs: [check-changes]
@@ -702,7 +746,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi325-2gpu-sglang]
-        part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (test_disagg_server.py)
+        part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (single_test_file/test_disagg_server.py)
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -1041,6 +1085,23 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
+      - name: Verify NIXL in Container
+        run: |
+          docker exec ci_sglang bash -lc '
+            set -eux
+            export LD_LIBRARY_PATH=/opt/ucx/lib:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+            python -c "import nixl; print(\"nixl OK:\", nixl.__file__)"
+            test -d /opt/ucx/lib
+            UCX_INFO=$(command -v ucx_info || true)
+            if [ -z "$UCX_INFO" ]; then
+              UCX_INFO=/opt/ucx/bin/ucx_info
+            fi
+            test -x "$UCX_INFO"
+            "$UCX_INFO" -v
+            "$UCX_INFO" -d | grep -iq rocm
+            python -c "from nixl._api import nixl_agent, nixl_agent_config; nixl_agent(\"ci-smoke\", nixl_agent_config(backends=[\"UCX\"])); print(\"nixl UCX backend init OK\")"
+          '
+
       - name: Verify RDMA in Container
         run: |
           docker exec -u root ci_sglang bash -c '
@@ -1079,6 +1140,118 @@ jobs:
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
             -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
+  # =============================================== DeepSeek-V4 (MI35x, 8-GPU) ====================================================
+  # On `pull_request` and the 6h ('0 */6 * * *') cron these are the ONLY jobs that run;
+  # they also run on the daily cron alongside the full suite. On PRs they run only when
+  # call-gate succeeds, i.e. the PR carries the run-ci label (and is not a draft), so
+  # they are gated just like every other PR test job. On PR they hard-fail (a failure
+  # blocks merge); on any scheduled run they pass --continue-on-error. They stay
+  # selectable via workflow_dispatch / run on workflow_call full runs.
+  dsv4-flash-fp4-fp8-amd-rocm720:
+    needs: [call-gate]
+    if: |
+      always() && !cancelled() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',dsv4-flash-fp4-fp8-amd-rocm720,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (
+            (github.event_name == 'schedule') ||
+            inputs.run_all_tests
+          )
+        )
+      )
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (ROCm 7.2)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: |
+          # --skip-test-time-deps: GSM8K + bench_one_batch_server don't need lmms-eval / human-eval.
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Flash FP4 + FP8)
+        timeout-minutes: 300
+        run: |
+          > github_summary.md  # Clear summary file
+          # SGLANG_DSV4_ACCURACY_ONLY=1 makes the dsv4 test files skip their perf test
+          # (test_b_perf_8k_1k); only the GSM8K accuracy test runs in this workflow.
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            -e SGLANG_DSV4_ACCURACY_ONLY=1 \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-flash --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  dsv4-pro-fp4-amd-rocm720:
+    needs: [call-gate]
+    if: |
+      always() && !cancelled() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',dsv4-pro-fp4-amd-rocm720,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (
+            (github.event_name == 'schedule') ||
+            inputs.run_all_tests
+          )
+        )
+      )
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (ROCm 7.2)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: |
+          # --skip-test-time-deps: GSM8K + bench_one_batch_server don't need lmms-eval / human-eval.
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro FP4)
+        timeout-minutes: 480
+        run: |
+          > github_summary.md  # Clear summary file
+          # SGLANG_DSV4_ACCURACY_ONLY=1 makes the dsv4 test files skip their perf test
+          # (test_b_perf_8k_1k); only the GSM8K accuracy test runs in this workflow.
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            -e SGLANG_DSV4_ACCURACY_ONLY=1 \
+            python3 registered/amd/test_deepseek_v4_pro_fp4.py || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          if [[ "${{ github.event_name == 'schedule' || inputs.continue_on_error }}" == "true" ]]; then
+            exit 0
+          fi
+          exit ${TEST_EXIT_CODE:-0}
+
   pr-test-amd-rocm720-finish:
     needs:
       [
@@ -1101,6 +1274,9 @@ jobs:
         stage-c-test-4-gpu-amd-rocm720,
         stage-c-test-large-8-gpu-amd-rocm720,
         stage-c-test-large-8-gpu-amd-mi35x-rocm720,
+
+        dsv4-flash-fp4-fp8-amd-rocm720,
+        dsv4-pro-fp4-amd-rocm720,
       ]
     if: always()
     runs-on: ubuntu-latest

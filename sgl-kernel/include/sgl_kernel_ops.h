@@ -89,20 +89,6 @@ std::tuple<std::vector<int64_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta
 void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs);
 void register_graph_buffers(
     fptr_t _fa, const std::vector<std::vector<int64_t>>& handles, const std::vector<std::vector<int64_t>>& offsets);
-
-// mscclpp
-torch::Tensor mscclpp_generate_unique_id();
-fptr_t mscclpp_init_context(
-    const torch::Tensor& unique_id,
-    const int64_t rank,
-    const int64_t world_size,
-    torch::Tensor& scratch,
-    torch::Tensor& put_buffer,
-    const int64_t nranks_per_node,
-    const std::vector<int64_t>& rank_to_node,
-    const std::vector<int64_t>& rank_to_ib,
-    const int64_t context_selection);
-void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out, int64_t nthreads, int64_t nblocks);
 #endif
 
 /*
@@ -265,7 +251,6 @@ void bmm_fp8(
     at::Tensor B_scale,
     at::Tensor workspace_buffer,
     int64_t cublas_handle);
-void dsv3_router_gemm(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
 void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b);
 
 torch::Tensor gptq_gemm(

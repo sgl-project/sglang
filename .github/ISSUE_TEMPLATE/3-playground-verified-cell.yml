@@ -21,13 +21,12 @@ body:
       recipe, they'll convert this issue into a PR against the cookbook cell
       catalog and close this issue.
 
-- type: dropdown
+- type: input
   id: model
   attributes:
     label: Cookbook model
-    description: Which model's cookbook does this cell belong to?
-    options:
-      - deepseek-ai/deepseek-v4
+    description: Which model's cookbook does this cell belong to? Auto-filled by the playground — use the model id as it appears in the cookbook config.
+    placeholder: "deepseek-ai/deepseek-v4"
   validations:
     required: true
 

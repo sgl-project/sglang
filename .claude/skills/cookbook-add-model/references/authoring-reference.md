@@ -32,7 +32,7 @@ the full contract):
 | `hardware` | `{id,label,vram,vendor}[]` | Optional. GPUs the shared `HARDWARE_CATALOG` doesn't carry (workstation / desktop / future chips, e.g. RTX PRO 6000). The engine merges these into the catalog, so a model-specific GPU is config data — **no engine-catalog edit**. Also add the id to `supportedHardware`. |
 | `variants` | `{id, label, subtitle?}[]` | 2nd-dim option list. Use `default` / single-element if the model has no variant axis. |
 | `quantizations` | `{id, label}[]` | 3rd-dim option list. |
-| `strategies` | `{id, label}[]` | 4th-dim option list. Common ids: `low-latency`, `balanced`, `high-throughput`. |
+| `strategies` | `{id, label}[]` | 4th-dim option list. Canonical ids: `low-latency` / `balanced` / `high-throughput` (never model-specific ids like `mtp`). **The count follows the page's operating points**: one recipe → a single `balanced`; two → `low-latency` + `high-throughput`; three → the full trio (the ideal). Tiers apply per (hw × variant × quant) combination — a single-recipe combination parks under its semantically honest tier (clear slant → that tier, e.g. DSv4's RTX 6000 → `low-latency`; no slant → `balanced`, e.g. Qwen3.5's Xeon); the page's list is the union and the engine greys unused chips per selection. Never invent a recipe just to fill chips. When two recipes differ by MTP / speculative decoding, the assignment is deterministic: spec ON → `low-latency`, spec OFF → `high-throughput` (at saturation the draft+verify overhead outweighs the speedup — same reason DSv4's high-throughput recipes disable MTP). The recurring markers in the other direction: dp-attention ON (MLA-attention models) and EP / DP+EP ON (MoE models) → `high-throughput`. |
 | `nodesOptions` | `{id, label}[]` | 5th-dim option list. The `id` MUST be `single` or `multi-N` — the engine parses N from the id for `--nnodes`. |
 | `cells` | `{match, verified?, env, flags}[]` | One per supported (hw × variant × quant × strategy × nodes) combination. See §2.2. |
 | `modelNames` | `{[key]: string}` | HF slug lookup. Keys are either `hw\|variant\|quant` (most specific) or `variant\|quant` (fallback). |
@@ -44,11 +44,12 @@ the full contract):
 | Field | Type | Purpose |
 |---|---|---|
 | `multiNodeHints` | `{[hwId]: string[]}` | Lines prepended as `# ...` comments to multi-node commands (env-var hints). Per-hw, and only for hw whose **cluster fabric needs manual NIC config** (e.g. `gb200` NVL72/MNNVL → NVSHMEM/Gloo hints). NOT every multi-N hw needs an entry — standard-IB DeepEP (h200) auto-detects the HCA, and Marlin multi-node (h100) uses no DeepEP/NVSHMEM at all. |
-| `dockerImages` | `{[hwId]: string}` | Per-hw image name for `docker run` framing. **Ask the user which sglang build the recipes ran on; don't guess a supporting release.** Falls back to `lmsysorg/sglang:dev` if missing — also the sensible default when unsure. |
+| `dockerImages` | `{[key]: string}` | Image for `docker run` framing, keyed by `hw\|quant` (most specific) then `hw`. Use a `hw\|quant` key only when one quant on a shared GPU needs a different image (e.g. an NVFP4 dev build on b300/gb300 while FP8/BF16 stay on the release image); otherwise key by plain `hw`. **Ask the user which sglang build the recipes ran on; don't guess a supporting release.** Falls back to `lmsysorg/sglang:dev` if missing — also the sensible default when unsure. |
 | `playgroundFeatures` | `{[axisId]: {...}}` | Opts into the Playground widget. See §2.3. |
 | `benchmarkCommands` | `{speed: string, accuracy: {[accKey]: string \| {[variant]: string}}, numPromptsByConc?: {[c]: number}}` | Powers the benchmark card's **"⚡ Reproduce"** modal. `speed` is ONE `bench_serving` template; the engine fills `{{DATASET}}`/`{{ISL}}`/`{{OSL}}` from each cell's `speed[].workload`, the chip-picked `{{MAX_CONCURRENCY}}`, and `{{NUM_PROMPTS}}` (resolved `workload.num_prompts ?? numPromptsByConc[c] ?? max(c*2, 200)`). `accuracy` maps an accuracy field (e.g. `gsm8k_pct`) to a per-eval template — a string, OR a `{flash, pro, …}` object keyed by variant when the command differs per variant (e.g. GPQA/AIME `--max-tokens`). The modal renders a chip per eval (one command area, like Speed). Both also use `{{MODEL_NAME}}` + `{{CURL_HOST}}`/`{{CURL_PORT}}` like `curl`. Optional; the button only appears when this AND `benchmarks` are present. |
-| `defaultAccuracy` | `{[variant]: {[accKey]: number}}` | Model-level accuracy applied to **every** cell of a variant (e.g. GPQA Diamond / AIME25 — hardware-independent). Merged UNDER each cell's measured `accuracy` (a per-cell value wins), so you set a variant's score once instead of copying it onto every benchmark entry. Keys must match `ACCURACY_LABELS` + `benchmarkCommands.accuracy`. |
-| `github` | `{owner?, repo?, issueTemplate?, cookbookModel?}` | Overrides for the "Submit verified cell" CTA in the playground. Defaults: `sgl-project/sglang` + `3-playground-verified-cell.yml` + `"deepseek-ai/deepseek-v4"`. Set `cookbookModel` to the value that matches the `model` dropdown in your issue template so it's pre-selected when the issue opens. |
+| `defaultAccuracy` | `{[variant]: {[accKey]: number}}` | Model-level accuracy applied to **every** cell of a variant (e.g. GPQA Diamond / AIME25 — hardware-independent). Merged UNDER each cell's measured `accuracy` (a per-cell value wins), so you set a variant's score once instead of copying it onto every benchmark entry. Keys must match `accuracyLabels` (below) + `benchmarkCommands.accuracy`. |
+| `accuracyLabels` | `[key, label, unit][]` | The eval set rendered in the benchmark card and the "⚡ Reproduce" modal — **the engine ships no default**, every config declares its own (e.g. DSv4: GPQA/AIME25/GSM8K; Qwen3.5: GSM8K/MMMU). Required whenever the benchmarks carry accuracy data; without it the accuracy rows silently don't render. Every key used in `benchmarks[].accuracy`, `defaultAccuracy`, and `benchmarkCommands.accuracy` must appear here. |
+| `github` | `{owner?, repo?, issueTemplate?, cookbookModel?}` | Overrides for the "Submit verified cell" CTA in the playground. Defaults: `sgl-project/sglang` + `3-playground-verified-cell.yml` + `"deepseek-ai/deepseek-v4"`. Set `cookbookModel` to the model's HF id (`<hf-org>/<model-slug>`); it prefills the issue template's free-form `model` input when the issue opens. **Don't prune this block** — without it the engine falls back to `deepseek-ai/deepseek-v4` and submissions from your page get mislabeled. |
 
 ## 2.2 Author the 5-dim matrix (`cells[]`)
 
@@ -90,6 +91,16 @@ Each cell describes one verified (or auto-estimated) launch recipe.
   flags, then tuning knobs, with `--host` / `--port` last. The playground
   engine assumes this ordering when inserting overrides (its anchors target
   `--model-path` / `--tp` / etc., and inserts before the `--host` tail).
+- Accuracy-degrading flags don't belong in cells by default: a cell's
+  output quality should be exactly what its quantization chip declares.
+  Runtime quant below the checkpoint's precision (e.g. MegaMoE **W4A4** —
+  DSv4 gates it behind the Playground's `megamoeQuant` opt-in) and lossy
+  KV-cache dtypes (`--kv-cache-dtype fp8_e4m3` over a higher-precision-KV
+  checkpoint) default to Playground opt-ins or §2-tips material. If the
+  model's recipe genuinely needs one in a cell, **flag it to the user and
+  get explicit confirmation** — never ship it silently. (Migrations are the
+  sanctioned exception: a flag baked into the legacy recipe's default
+  command keeps verbatim — see the migrate skill.)
 
 **Cells are denormalized on purpose** — common flags repeat across cells.
 This makes each cell self-contained and easy to verify. When sweeping a
@@ -102,20 +113,25 @@ automatically.
 
 ## 2.3 Configure `playgroundFeatures` (optional)
 
-The Playground widget is opt-in per axis. Add only the axes that make sense
-for this model. Recognised axis keys and their schemas (full reference in
-the `_playground.jsx` header):
+The Playground is **opt-out, not opt-in**: every cookbook ships the general
+axes by default — `attention` (TP/CP/DP-Attn), `moe` (backend + EP, for MoE
+models), `parsers`, `speculative`, `pdDisagg`, `hicache` — then adds
+model-specific axes (e.g. MegaMoE for DeepSeek-V4) and deletes ONLY the axes
+this model genuinely cannot use (e.g. `hisparse` on non-DSA models, `moe` on a
+pure-dense model). Knobs that don't apply to a subset of variants/hw get
+`disable` + `disableReason`, not removal. Recognised axis keys and their
+schemas (full reference in the `_playground.jsx` header):
 
 | Axis key | Widget | Use when |
 |---|---|---|
 | `attention` | TP / CP / DP-Attention sub-knobs (DP-Attention is a combined knob: its value is the DP degree AND toggles `--enable-dp-attention`) | Model exposes parallelism knobs in its cells (§2.2) and you want users to override them. |
-| `moe` | Backend select + EP knob | Model is MoE and supports multiple `--moe-*-backend` choices. |
+| `moe` | Backend select (incl. MegaMoE) + EP knob; picking the MegaMoE backend reveals a Quantization sub-select (W4A8/W4A4) | Model is MoE and supports multiple `--moe-*-backend` choices. For Blackwell MoE kernel-fusion, give the `megamoe` backend option a `requiresHw` (and optional `excludesStrategy`) gate, then add a sibling `megamoeQuant` block (`{stripEnv, options}`): W4A8 = `NUM_MAX` only, W4A4 adds the FP4-activations env vars; both strip the DeepEP dispatch env. |
 | `parsers` | Multi-toggle | Model has reasoning / tool-call parsers. |
 | `speculative` | Single-select chip group | Model has spec-decoding presets you want to expose. |
 | `pdDisagg` | Mode + transfer backend (+ optional per-backend env via `envWhen` hw-gate) + IB device + optional `router{port, command}` | Model supports prefill/decode disaggregation. When a PD role is active and `router` is set, the playground shows the router (SGLang Model Gateway) launch command as a separate companion block and retargets the cURL modal to `router.port` (clients hit the router, not the role servers). |
 | `hicache` | Enable + storage + write policy | Model is large enough that hierarchical KV cache matters. |
 | `hisparse` | Enable + host-ratio select; whole card gated on the live PD-Disagg mode being `decode` | DSA-style model (DeepSeek-V3.2 / V4, GLM-5) that supports decode-side hierarchical sparse attention. |
-| `megamoe` | Single-select with hw/strategy gating | Blackwell-only kernel fusion variant. |
+| `flagSelects` | A config-declared **list** of single-selects, each `{ id, title, stripPrefixes, options }` (option = `{ id, label, flags?, hide?, disable?, disableReason? }`); a flagless option is the "none"/accuracy-safe choice | A titled single-select that picks one value of a flag family the other axes don't model — e.g. KV-cache dtype (`--kv-cache-dtype`), mamba scheduler strategy (`--mamba-scheduler-strategy`). Generic: no engine change to add another. |
 
 **Per-chip constraints**: any chip entry in any axis can be wrapped with
 `hide` / `disable` constraint objects:
@@ -187,6 +203,15 @@ The `benchmarks` prop is **optional**. It points at a sibling
 box; omit the import and the prop if the cookbook has no measured numbers
 yet. See the `_deployment.jsx` header and `deepseek-v4-benchmarks.jsx` for
 the full speed/accuracy schema.
+
+Each entry's `sglang_version` must be a **reproducible anchor** — a release
+tag/version (`v0.5.9`), a commit hash, or (for **Day-0 support**, before the
+enabling PR merges or a release is cut) a specific PR (`PR #27944`) or commit
+you can `gh pr checkout` / `git checkout`. Never a moving ref like `"main"` /
+`"main (2026-06-11)"` (not reproducible). A spec-decoding model whose cell
+carries `--speculative-algorithm` but no `--max-running-requests` auto-shows
+an amber Deploy + Playground callout (SGLang otherwise caps it at 48) — it is
+flag-driven, so no per-page prose is needed.
 
 To let users *reproduce* those numbers, add a `benchmarkCommands` block to
 the config (§2.1, next to `curl`). When present alongside `benchmarks`, the

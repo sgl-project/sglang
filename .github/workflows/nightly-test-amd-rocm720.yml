@@ -29,6 +29,7 @@ on:
           - 'all'
           # 1-GPU Unit Tests (MI30x + MI35x)
           - nightly-test-1-gpu-unit-rocm720
+          - nightly-test-1-gpu-kernel-rocm720
           - nightly-test-1-gpu-mi35x-rocm720
           # 2-GPU and 4-GPU Tests (MI30x + MI35x)
           - nightly-accuracy-2-gpu-rocm720
@@ -68,6 +69,7 @@ on:
           # 8-GPU DeepSeek-V4 (MI35x only)
           - nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720
           - nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720
+          - nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720
           # 8-GPU Kimi-K2.6 (MI30x + MI35x)
           - nightly-8-gpu-kimi-k26-rocm720
           - nightly-8-gpu-mi35x-kimi-k26-rocm720
@@ -164,6 +166,36 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-1-gpu --nightly --timeout-per-file 900 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-test-1-gpu-kernel-rocm720:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-test-1-gpu-kernel-rocm720,'))
+    runs-on: linux-mi325-1gpu-sglang
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (ROCm 7.2)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+      - name: Nightly Kernel Benchmark ROCm 7.2 (1-GPU)
+        timeout-minutes: 60
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-kernel-1-gpu --nightly --timeout-per-file 900 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -284,6 +316,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: |
@@ -722,6 +755,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
@@ -767,6 +801,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
@@ -810,6 +845,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
@@ -853,6 +889,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
@@ -889,6 +926,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: |
@@ -924,6 +962,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: |
@@ -959,6 +998,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: |
@@ -994,6 +1034,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: |
@@ -1033,6 +1074,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: |
@@ -1079,6 +1121,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: |
@@ -1113,6 +1156,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: |
@@ -1159,6 +1203,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: |
@@ -1243,6 +1288,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: |
@@ -1250,15 +1296,28 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Flash FP8 + FP4)
+      - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Flash FP8 + FP4, unified_kv_triton)
         timeout-minutes: 300
         run: |
           > github_summary.md  # Clear summary file
+          echo "## SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton" >> github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-flash --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-flash --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Flash FP8 + FP4, triton)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 300
+        run: |
+          > github_summary.md  # Clear summary file
+          echo "## SGLANG_HACK_FLASHMLA_BACKEND=triton" >> github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_HACK_FLASHMLA_BACKEND=triton \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-flash --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
   nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720,'))
@@ -1278,6 +1337,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: |
@@ -1285,15 +1345,77 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro FP8 + FP4)
+      - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro FP8 + FP4, unified_kv_triton)
         timeout-minutes: 480
         run: |
           > github_summary.md  # Clear summary file
+          echo "## SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton" >> github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro FP8 + FP4, triton)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 480
+        run: |
+          > github_summary.md  # Clear summary file
+          echo "## SGLANG_HACK_FLASHMLA_BACKEND=triton" >> github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_HACK_FLASHMLA_BACKEND=triton \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+
+  nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720,'))
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (ROCm 7.2)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: |
+          # --skip-test-time-deps: GSM8K + send_one don't need lmms-eval / human-eval.
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Accuracy + MTP Accept Length Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro FP8 MTP, unified_kv_triton)
+        timeout-minutes: 240
+        run: |
+          > github_summary.md  # Clear summary file
+          echo "## SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton" >> github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro-mtp --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+
+      - name: Accuracy + MTP Accept Length Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro FP8 MTP, triton)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 240
+        run: |
+          > github_summary.md  # Clear summary file
+          echo "## SGLANG_HACK_FLASHMLA_BACKEND=triton" >> github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_HACK_FLASHMLA_BACKEND=triton \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro-mtp --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
   # ==============================================================================
   # 8-GPU Kimi-K2.6 (MI30x + MI35x)
@@ -1317,6 +1439,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
@@ -1349,6 +1472,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: |
@@ -1388,6 +1512,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
@@ -1459,6 +1584,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: |
@@ -1701,6 +1827,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
@@ -1739,6 +1866,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
@@ -1853,6 +1981,7 @@ jobs:
       # 8-GPU DeepSeek-V4 (MI35x only)
       - nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720
       - nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720
+      - nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720
       # 8-GPU Kimi-K2.6 (MI30x + MI35x)
       - nightly-8-gpu-kimi-k26-rocm720
       - nightly-8-gpu-mi35x-kimi-k26-rocm720

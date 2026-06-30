@@ -29,7 +29,12 @@ HW_MAPPING = {
 # (label-gated; pr-test-extra.yml). Tests are tagged per-commit regardless;
 # pr-test-extra.yml's `run-ci-extra` PR label decides whether extra-* dispatches.
 PER_COMMIT_SUITES = {
-    HWBackend.CPU: ["base-a-test-cpu", "base-b-test-cpu"],
+    HWBackend.CPU: [
+        "base-a-test-cpu",
+        "base-b-test-cpu",
+        "base-c-test-cpu",
+        "base-b-test-cpu-arm64",
+    ],
     HWBackend.AMD: [
         "stage-a-test-1-gpu-small-amd",
         "stage-b-test-1-gpu-small-amd",
@@ -39,9 +44,24 @@ PER_COMMIT_SUITES = {
         "stage-b-test-1-gpu-large-amd",
         "stage-b-test-2-gpu-large-amd",
         "jit-kernel-unit-test-amd",
+        "sgl-kernel-unit-test-2-gpu-amd",
         "stage-c-test-4-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
+        # extra-a: label-gated PR opt-in suites in pr-test-amd-extra.yml
+        # (mirror of CUDA extra-a; tests stay tagged per-commit but only
+        # dispatch when the PR carries the `run-ci-extra` label). 1-gpu-small
+        # carries the mock-model / kv_canary unit + single-GPU canary e2e
+        # tests; 1-gpu-large carries the subset of model e2e tests validated
+        # to pass on mi325 (quant fp8kv-triton, sessions streaming-session
+        # EAGLE3, spec standalone triton-backend variant); 2-gpu-large carries
+        # the multi-GPU (TP/PP/PD) mock-model + kv_canary e2e tests. The rest
+        # of CUDA extra-a tests fail on ROCm (missing flash_attn.cute/flash_ops
+        # kernels, OOM, or accuracy regressions — e.g. gemma4-mtp-31b dips
+        # below the gsm8k floor on the topk=3 leg) and stay CUDA-only for now.
+        "extra-a-test-1-gpu-small-amd",
+        "extra-a-test-1-gpu-large-amd",
+        "extra-a-test-2-gpu-large-amd",
     ],
     HWBackend.MUSA: [],
     HWBackend.CUDA: [
@@ -50,10 +70,10 @@ PER_COMMIT_SUITES = {
         "base-b-test-1-gpu-large",
         "base-b-test-2-gpu-large",
         "base-b-test-4-gpu-b200",
-        "base-b-kernel-unit-1-gpu-large",
-        "base-b-kernel-unit-1-gpu-b200",
-        "base-b-kernel-unit-8-gpu-h200",
-        "base-b-kernel-benchmark-1-gpu-large",
+        "base-b-kernel-unit-test-1-gpu-large",
+        "base-b-kernel-unit-test-4-gpu-b200",
+        "base-b-kernel-unit-test-8-gpu-h200",
+        "base-b-kernel-benchmark-test-1-gpu-large",
         "base-c-test-4-gpu-h100",
         "base-c-test-4-gpu-b200",
         "base-c-test-4-gpu-gb300",
@@ -108,12 +128,21 @@ NIGHTLY_SUITES = {
         "nightly-eval-vlm-2-gpu",
         "nightly-perf-text-2-gpu",
         "nightly-perf-vlm-2-gpu",
-        # GB300 (4x B200 NVL4) nightly suite
+        # GB300 (4x GB300 NVL4) nightly suites
         "nightly-4-gpu-gb300",
+        "nightly-4-gpu-gb300-deepseek-v4-pro-fp4",
+        "nightly-4-gpu-gb300-glm5-nvfp4",
+        "nightly-4-gpu-gb300-kimi-k25",
+        "nightly-4-gpu-gb300-kimi-k25-nvfp4",
+        "nightly-4-gpu-gb300-qwen35-fp8",
+        "nightly-4-gpu-gb300-qwen35-nvfp4",
+        # Nightly precision regression (per-layer hidden state comparison)
+        "nightly-precision-8-gpu-h200",
     ],
     HWBackend.AMD: [
         "nightly-amd",
         "nightly-amd-1-gpu",
+        "nightly-amd-kernel-1-gpu",
         "nightly-amd-1-gpu-mi35x",
         "nightly-amd-1-gpu-zimage-turbo",
         "nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2",
@@ -297,15 +326,6 @@ def run_a_suite(args):
         and not f.endswith("/__init__.py")
         and not f.endswith("/cpu/utils.py")
     ]
-
-    # JIT kernel tests and benchmarks (live alongside kernel source)
-    jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
-    files += glob.glob(
-        os.path.join(jit_kernel_dir, "tests", "**", "test_*.py"), recursive=True
-    )
-    files += glob.glob(
-        os.path.join(jit_kernel_dir, "benchmark", "**", "bench_*.py"), recursive=True
-    )
 
     # Strict: all discovered files must have proper registration
     sanity_check = True

@@ -67,6 +67,7 @@ forced_attn_backend: AttentionBackendEnum | None = None
 class ComponentAttnBackendContext(NamedTuple):
     backend: AttentionBackendEnum | None
     component_name: str | None
+    selected_backends: dict[str, str | None]
 
 
 component_attn_backend_context: ContextVar[ComponentAttnBackendContext | None] = (
@@ -111,6 +112,40 @@ def get_component_attn_backend_name() -> str | None:
     return context.component_name if context is not None else None
 
 
+def _record_component_attn_backend(backend_name: str, reason: str | None) -> bool:
+    context = get_component_attn_backend_context()
+    if context is None or context.component_name is None:
+        return False
+
+    existing_reason = context.selected_backends.get(backend_name)
+    if backend_name not in context.selected_backends or existing_reason is None:
+        context.selected_backends[backend_name] = reason
+    return True
+
+
+def _log_component_attn_backend_summary(
+    context: ComponentAttnBackendContext | None,
+) -> None:
+    if (
+        context is None
+        or context.component_name is None
+        or not context.selected_backends
+    ):
+        return
+
+    backend_parts = []
+    for backend_name, reason in context.selected_backends.items():
+        if reason:
+            backend_parts.append(f"{backend_name} ({reason})")
+        else:
+            backend_parts.append(backend_name)
+
+    logger.info_once(
+        f"Attention backends for {context.component_name}: "
+        f"{', '.join(backend_parts)}"
+    )
+
+
 def get_attn_backend(
     head_size: int,
     dtype: torch.dtype,
@@ -141,23 +176,21 @@ def get_attn_backend(
                     f"Available options are: {[e.name.lower() for e in AttentionBackendEnum]}"
                 )
 
-    component_name = get_component_attn_backend_name()
-    backend_not_specified = selected_backend is None
+    constraint_backend = None
+    if selected_backend is None and len(be_tuple) == 1:
+        constraint_backend = be_tuple[0].name.lower()
+
     attention_backend_cls = _cached_get_attn_backend(
         head_size,
         dtype,
         be_tuple,
         selected_backend,
     )
-    if component_name:
-        backend_name = attention_backend_cls.get_enum().name.lower()
-        if backend_not_specified:
-            logger.info_once(
-                f"Attention backend not specified for {component_name}, "
-                f"using {backend_name} backend for {component_name}"
-            )
-        else:
-            logger.info_once(f"Using {backend_name} backend for {component_name}")
+
+    backend_name = attention_backend_cls.get_enum().name.lower()
+    reason = "component constraint" if backend_name == constraint_backend else None
+    if not _record_component_attn_backend(backend_name, reason):
+        logger.info_once(f"Using {backend_name} attention backend")
     return attention_backend_cls
 
 
@@ -178,9 +211,10 @@ def _cached_get_attn_backend(
         pass
     elif selected_backend is None and len(supported_attention_backends) == 1:
         selected_backend = next(iter(supported_attention_backends))
-    elif selected_backend is None:
-        logger.debug("Attention backend not specified")
-    elif selected_backend not in supported_attention_backends:
+    elif (
+        selected_backend is not None
+        and selected_backend not in supported_attention_backends
+    ):
         supported_attention_backends_str = [
             supported_attention_backend.__str__()
             for supported_attention_backend in supported_attention_backends
@@ -212,11 +246,13 @@ def component_attn_backend_context_manager(
         return
 
     token = component_attn_backend_context.set(
-        ComponentAttnBackendContext(attn_backend, component_name)
+        ComponentAttnBackendContext(attn_backend, component_name, {})
     )
     try:
         yield
     finally:
+        context = component_attn_backend_context.get()
+        _log_component_attn_backend_summary(context)
         component_attn_backend_context.reset(token)
 
 
