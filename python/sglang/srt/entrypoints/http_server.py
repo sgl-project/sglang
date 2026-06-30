@@ -318,6 +318,56 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager
     )
 
+    # ── Codec: load any pre-trained zstd dictionaries declared via env ─────
+    # Per spec/PROTOCOL.md "Pre-trained ZSTD dictionaries", a server MUST
+    # load a matching dict before the negotiator can pick zstd. Env vars
+    # let operators wire dict files into the boot sequence without a
+    # supervisor admin call:
+    #
+    #   CODEC_ZSTD_DICT_MSGPACK_PATH=/opt/codec/dicts/qwen2.5-msgpack-v1.dict
+    #   CODEC_ZSTD_DICT_PROTOBUF_PATH=/opt/codec/dicts/qwen2.5-protobuf-v1.dict
+    #
+    # Both are optional. Missing or unreadable files are logged and
+    # skipped; the server continues without that format's dict and
+    # the negotiator falls through to gzip/br for those requests.
+    try:
+        import logging as _logging
+        import os as _os
+
+        from sglang.srt.entrypoints import codec_compression as _codec_comp
+
+        _codec_log = _logging.getLogger("sglang.codec")
+        for _fmt, _env in (
+            ("msgpack", "CODEC_ZSTD_DICT_MSGPACK_PATH"),
+            ("protobuf", "CODEC_ZSTD_DICT_PROTOBUF_PATH"),
+        ):
+            _path = _os.environ.get(_env)
+            if not _path:
+                continue
+            try:
+                with open(_path, "rb") as _f:
+                    _bytes = _f.read()
+                _codec_comp.set_zstd_dict(_fmt, _bytes)
+                _hash = _codec_comp.get_zstd_dict_hash(_fmt) or "(unknown)"
+                _codec_log.info(
+                    "codec: loaded zstd dict for %s from %s (%s, %d bytes)",
+                    _fmt,
+                    _path,
+                    _hash,
+                    len(_bytes),
+                )
+            except OSError as _e:
+                _codec_log.warning(
+                    "codec: failed to load %s from %s: %s — falling back to gzip for %s",
+                    _env,
+                    _path,
+                    _e,
+                    _fmt,
+                )
+    except ImportError:
+        # codec_compression not available in this build; nothing to do.
+        pass
+
     # Initialize Ollama-compatible serving handler
     fast_api_app.state.ollama_serving = OllamaServing(_global_state.tokenizer_manager)
 
@@ -1588,9 +1638,140 @@ async def continue_generation(
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
+    # Codec version-negotiation gate. Default-off; only fires when the
+    # deployment has CODEC_*_REQUIRED set and the client speaks below
+    # the floor. See spec/versions/v0.4.md § Version Compatibility Signaling.
+    from sglang.srt.entrypoints.codec_version import (
+        make_426_response,
+        needs_upgrade,
+        parse_client_version,
+    )
+
+    client_version = parse_client_version(raw_request)
+    if needs_upgrade(client_version):
+        return make_426_response(client_version=client_version)
+
     return await raw_request.app.state.openai_serving_completion.handle_request(
         request, raw_request
     )
+
+
+@app.post("/v1/completions/codec")
+async def openai_v1_completions_codec(raw_request: Request):
+    """Codec bidirectional binary endpoint.
+
+    Accepts a binary-encoded CodecRequest (prompt_ids + sampling params) and
+    streams CodecFrame responses in the same binary format. No text ever
+    enters the transport — token IDs flow directly from one model to the next.
+
+    This is an alternative to POST /v1/completions with prompt: int[] +
+    stream_format: "msgpack". Both achieve "no text on the wire"; this
+    endpoint additionally accepts a binary request body, which is more
+    bandwidth-efficient for very large prompts (>50K tokens) where a JSON
+    [int, int, ...] array is 2-3x larger than the equivalent msgpack
+    packed varint encoding.
+
+    For typical prompts (<10K tokens) the JSON path is fine — pick whichever
+    fits your client better.
+
+    Content-Type / Accept:
+      application/x-msgpack   — MessagePack framing (default)
+      application/x-protobuf  — Protobuf framing (4-byte big-endian length prefix)
+    """
+    from fastapi.responses import ORJSONResponse
+
+    from sglang.srt.entrypoints.codec_frame import (
+        decode_msgpack,
+        decode_protobuf_request,
+    )
+    from sglang.srt.entrypoints.codec_version import (
+        make_426_response,
+        needs_upgrade,
+        parse_client_version,
+    )
+    from sglang.srt.entrypoints.openai.protocol import CompletionRequest
+
+    # Version negotiation gate. Per spec § Version Compatibility Signaling,
+    # if the deployment has any v0.4 capability set to ENFORCE and the
+    # client's advertised version is below the floor, refuse with 426
+    # before doing any work. Servers without enforce stages set never
+    # 426 for version reasons — opt-on default OFF.
+    client_version = parse_client_version(raw_request)
+    if needs_upgrade(client_version):
+        return make_426_response(client_version=client_version)
+
+    content_type = raw_request.headers.get("content-type", "application/x-msgpack")
+    body = await raw_request.body()
+
+    try:
+        if "protobuf" in content_type:
+            params = decode_protobuf_request(body)
+            stream_format = params.get("stream_format", "protobuf")
+        else:
+            params = decode_msgpack(body)
+            stream_format = params.get("stream_format", "msgpack")
+    except Exception as e:
+        return ORJSONResponse(
+            {"error": f"Codec: failed to decode request: {e}"}, status_code=400
+        )
+
+    prompt_ids = params.get("prompt_ids", [])
+    if not prompt_ids:
+        return ORJSONResponse(
+            {"error": "Codec: prompt_ids is required"}, status_code=400
+        )
+
+    request = CompletionRequest(
+        model=raw_request.app.state.openai_serving_completion.tokenizer_manager.server_args.served_model_name,
+        prompt=prompt_ids,
+        max_tokens=params.get("max_tokens", 256),
+        temperature=params.get("temperature", 1.0),
+        stop=params.get("stop"),
+        stream_format=stream_format,
+        stream=True,
+    )
+
+    return await raw_request.app.state.openai_serving_completion.handle_request(
+        request, raw_request
+    )
+
+
+@app.get("/codec/schema")
+async def codec_schema():
+    """Return the Codec .proto schema for client code generation.
+
+    Usage:
+        curl http://localhost:30000/codec/schema > codec.proto
+        protoc --python_out=. codec.proto
+    """
+    from fastapi.responses import PlainTextResponse
+
+    from sglang.srt.entrypoints.codec_frame import PROTO_SCHEMA
+
+    return PlainTextResponse(PROTO_SCHEMA, media_type="text/plain")
+
+
+@app.get("/.well-known/codec/version-policy.json")
+async def well_known_version_policy():
+    """Pre-flight discovery for the runtime 426 / VERSION_INCOMPATIBLE
+    contract. Per `spec/WELL_KNOWN_DISCOVERY.md § Version policy (v0.4+)`
+    a deployment that mandates v0.4+ features publishes its minimum-version
+    requirement here.
+
+    Returns 404 when no v0.4 capability is required — the spec says
+    deployments without mandatory features SHOULD NOT publish this
+    document because its presence advertises that older clients will
+    be rejected.
+    """
+    from fastapi.responses import JSONResponse
+    from fastapi.responses import Response as FastResponse
+
+    from sglang.srt.entrypoints.codec_version import version_policy_document
+
+    doc = version_policy_document()
+    if doc is None:
+        return FastResponse(status_code=404)
+    return JSONResponse(doc)
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(validate_json_request)])

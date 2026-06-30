@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
@@ -8,6 +9,20 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Uni
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.entrypoints.codec_agent import (
+    ToolWatcher,
+    detokenize_region,
+    make_call_id,
+    parse_tool_call,
+)
+from sglang.srt.entrypoints.codec_compression import wrap_streaming_response
+from sglang.srt.entrypoints.codec_dispatcher import (
+    CODEC_BOLT_ON_DISPATCH,
+    ToolRegistry,
+    dispatch_call_async,
+    reinject_ids_into_context,
+)
+from sglang.srt.entrypoints.codec_frame import encode_frame
 from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -50,6 +65,14 @@ class OpenAIServingCompletion(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
+        # v0.5 #87: lazy-cached ToolRegistry. The fetch (`ToolRegistry.from_env`)
+        # makes synchronous HTTP calls to manifest URLs; doing that per-request
+        # blocks the event loop and adds startup latency to every tool-watcher
+        # stream. We resolve it once per process on first use and reuse the
+        # registry thereafter. Sentinel = "not yet attempted"; None = attempted
+        # but env not configured (CODEC_BOLT_ON_DISPATCH=0 or no manifest URLs).
+        self._codec_dispatcher_registry: Optional[ToolRegistry] = None
+        self._codec_dispatcher_registry_loaded: bool = False
 
     def _request_id_prefix(self) -> str:
         return "cmpl-"
@@ -190,7 +213,25 @@ class OpenAIServingCompletion(OpenAIServingBase):
         request: CompletionRequest,
         raw_request: Request,
     ) -> Union[StreamingResponse, ErrorResponse]:
-        """Handle streaming completion request"""
+        """Handle streaming completion request.
+
+        Dispatches to the binary Codec generator when stream_format is
+        'msgpack' or 'protobuf'; otherwise uses the standard SSE path.
+        """
+        if request.stream_format != "json":
+            media_type = (
+                "application/x-protobuf"
+                if request.stream_format == "protobuf"
+                else "application/x-msgpack"
+            )
+            return wrap_streaming_response(
+                raw_request.headers.get("accept-encoding", ""),
+                self._generate_binary_stream(adapted_request, request, raw_request),
+                media_type=media_type,
+                background=self.tokenizer_manager.create_abort_task(adapted_request),
+                stream_format=request.stream_format,
+            )
+
         generator = self._generate_completion_stream(
             adapted_request, request, raw_request
         )
@@ -211,6 +252,182 @@ class OpenAIServingCompletion(OpenAIServingBase):
             media_type="text/event-stream",
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
+
+    async def _generate_binary_stream(
+        self,
+        adapted_request: GenerateReqInput,
+        request: CompletionRequest,
+        raw_request: Request,
+    ):
+        """
+        Yield raw Codec frames (bytes) for binary stream_format requests.
+
+        Token IDs come straight from `content["output_ids"]` — the
+        TokenizerManager surfaces them in the streamed dict regardless of
+        whether logprobs were requested. No detokenization, no logprob
+        machinery, no top-k overhead.
+
+        The shape of `output_ids` depends on the server's incremental mode:
+          incremental_streaming_output=True  → already a per-chunk delta
+          incremental_streaming_output=False → cumulative; slice by length
+
+        For agent-to-agent workloads the caller passes the yielded IDs
+        directly into the next model's prompt without ever materialising text.
+        """
+        n_prev_tokens: dict[int, int] = {}
+        incremental = self.tokenizer_manager.server_args.incremental_streaming_output
+
+        # Optional server-side ToolWatcher. When the request carries a
+        # `tool_watcher: {start_id, end_id}` field, we run a uint32-compare
+        # state machine over the output IDs and surface completed regions
+        # as parsed tool_calls on the frame whose `ids` come from after
+        # the region. Markers are consumed (not forwarded) so orchestrators
+        # don't see the model's begin/end tokens in the wire stream.
+        watcher: Optional[ToolWatcher] = None
+        tool_call_seq = 0
+        if request.tool_watcher is not None:
+            watcher = ToolWatcher(
+                start_id=int(request.tool_watcher["start_id"]),
+                end_id=int(request.tool_watcher["end_id"]),
+            )
+
+        # v0.5 #76 (T1.4 OpenAI-bypass): when CODEC_OPENAI_BYPASS=1 AND
+        # the tokenizer_manager surfaces output_ids as a numpy array
+        # (upstream work — until then sglang ships List[int]), pass the
+        # buffer through to the encoder without intermediate List[int]
+        # allocation. encoder accepts ndarray / array.array / bytes since
+        # the codec_frame.py change. Wire bytes are byte-identical to the
+        # default path; the win is upstream PyLong-list elimination.
+        bypass_buffers = os.environ.get("CODEC_OPENAI_BYPASS", "0") == "1"
+
+        # v0.5 #87 (bolt-on tool dispatcher): when CODEC_BOLT_ON_DISPATCH=1
+        # AND the ToolWatcher detects a completed tool-call region, look
+        # up the tool by parsed name in the registry. If registered in
+        # dispatch mode, POST a CodecToolCall to its endpoint and yield
+        # the response's response_ids as the next frame's tokens (the
+        # reinjection contract in codec_dispatcher.reinject_ids_into_context).
+        # If not registered or in text-fallback mode, surface the
+        # detected region to the client unchanged (existing behaviour).
+        dispatcher_registry: Optional[ToolRegistry] = None
+        if CODEC_BOLT_ON_DISPATCH and watcher is not None:
+            # Cached on the serving instance — ToolRegistry.from_env performs
+            # blocking HTTP fetches against manifest URLs, so it must NEVER
+            # run inside the async request loop. First request that arrives
+            # after process start pays the fetch cost (off the event loop
+            # via to_thread); every subsequent request reuses the registry.
+            if not self._codec_dispatcher_registry_loaded:
+                tokenizer_hash = getattr(
+                    self.tokenizer_manager, "tokenizer_map_hash", ""
+                )
+                import asyncio as _asyncio
+
+                self._codec_dispatcher_registry = await _asyncio.to_thread(
+                    ToolRegistry.from_env, tokenizer_hash
+                )
+                self._codec_dispatcher_registry_loaded = True
+            dispatcher_registry = self._codec_dispatcher_registry
+
+        try:
+            async for content in self.tokenizer_manager.generate_request(
+                adapted_request, raw_request
+            ):
+                index = content.get("index", 0)
+                output_ids = content.get("output_ids") or []
+
+                # Detect numpy / array.array / bytes path (upstream may surface
+                # these when the engine is configured for the bypass).
+                is_buffer = bypass_buffers and not isinstance(output_ids, list)
+
+                if incremental:
+                    new_ids = output_ids if is_buffer else list(output_ids)
+                else:
+                    n_prev = n_prev_tokens.get(index, 0)
+                    new_ids = (
+                        output_ids[n_prev:] if is_buffer else list(output_ids[n_prev:])
+                    )
+                    n_prev_tokens[index] = len(output_ids)
+
+                meta = content.get("meta_info", {}) or {}
+                finish_reason_obj = meta.get("finish_reason")
+                finish_reason = finish_reason_obj["type"] if finish_reason_obj else None
+                done = finish_reason is not None
+
+                tool_calls_payload: list[dict] = []
+                if watcher is not None:
+                    passthrough_ids, completed_regions = watcher.feed(new_ids)
+                    new_ids = passthrough_ids
+                    for body_ids in completed_regions:
+                        tool_call_seq += 1
+                        try:
+                            body_text = detokenize_region(
+                                self.tokenizer_manager.tokenizer, body_ids
+                            )
+                        except Exception:
+                            body_text = ""
+                        ev = parse_tool_call(
+                            body_text, call_id=make_call_id(tool_call_seq)
+                        )
+                        tool_calls_payload.append(ev.to_wire_dict())
+
+                        # v0.5 #87: try in-engine dispatch when registered.
+                        if dispatcher_registry is not None and ev.name:
+                            tool = dispatcher_registry.get(ev.name)
+                            if tool is not None and tool.mode == "dispatch":
+                                try:
+                                    # Use the async variant — `dispatch_call`
+                                    # itself does a blocking urllib POST,
+                                    # which would freeze the event loop if
+                                    # called directly from this `async def`.
+                                    # `dispatch_call_async` runs it via
+                                    # asyncio.to_thread so other concurrent
+                                    # requests on the worker keep flowing.
+                                    result = await dispatch_call_async(
+                                        tool,
+                                        arguments_json=ev.arguments_json,
+                                        call_id=ev.id or make_call_id(tool_call_seq),
+                                    )
+                                    if not result.is_error and result.response_ids:
+                                        # Append the tool's response IDs to the
+                                        # stream so the model "reads" them as
+                                        # its next input. The detailed
+                                        # KV-cache-aware reinjection is in
+                                        # tokenizer_manager (follow-up); this
+                                        # simple append matches the contract
+                                        # in reinject_ids_into_context.
+                                        new_ids = reinject_ids_into_context(
+                                            new_ids,
+                                            result.response_ids,
+                                        )
+                                except Exception as e:
+                                    # Dispatch failure surfaces to the client
+                                    # as an unhandled tool call — same as if
+                                    # the tool wasn't registered. The error
+                                    # is logged but doesn't tear down the
+                                    # stream.
+                                    import logging as _log
+
+                                    _log.getLogger(__name__).warning(
+                                        "codec_dispatcher: dispatch_call(%s) failed: %s",
+                                        ev.name,
+                                        e,
+                                    )
+
+                yield encode_frame(
+                    request.stream_format,
+                    new_ids,
+                    done=done,
+                    finish_reason=finish_reason,
+                    tool_calls=tool_calls_payload or None,
+                )
+                if done:
+                    return
+
+        except Exception:
+            # Emit a terminal error frame so binary clients can distinguish
+            # a server error from a cleanly truncated stream.
+            yield encode_frame(
+                request.stream_format, [], done=True, finish_reason="error"
+            )
 
     async def _generate_completion_stream(
         self,
