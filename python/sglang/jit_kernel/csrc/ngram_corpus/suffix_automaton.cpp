@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unordered_set>
 
 namespace ngram {
 
@@ -278,6 +279,100 @@ Result SuffixAutomaton::buildFrequency(
     }
   }
   return fillResult(last_token, draft_token_num + 1, tree, root);
+}
+
+std::vector<int32_t> SuffixAutomaton::getRootCandidatesRecency(
+    const int32_t* context, size_t len, size_t max_candidates, const Param& param) const {
+  std::vector<int32_t> candidates;
+  if (max_candidates == 0) {
+    return candidates;
+  }
+
+  auto anchors = match(context, len, param.max_trie_depth);
+  candidates.reserve(max_candidates);
+  std::unordered_set<int32_t> seen_tokens;
+  std::queue<int> fallback_queue;
+
+  auto add_candidate = [&candidates, &seen_tokens, max_candidates](int32_t token) -> bool {
+    if (seen_tokens.insert(token).second) {
+      candidates.emplace_back(token);
+    }
+    return candidates.size() >= max_candidates;
+  };
+
+  for (const auto& anchor : anchors) {
+    const auto& children = states_[anchor.state].children_by_recency;
+    for (const auto& [token, child_state] : children) {
+      if (add_candidate(token)) {
+        return candidates;
+      }
+      fallback_queue.emplace(child_state);
+    }
+  }
+
+  while (!fallback_queue.empty() && candidates.size() < max_candidates) {
+    const auto state = fallback_queue.front();
+    fallback_queue.pop();
+
+    const auto& children = states_[state].children_by_recency;
+    size_t scanned = 0;
+    for (const auto& [token, child_state] : children) {
+      if (scanned++ >= param.max_bfs_breadth || candidates.size() >= max_candidates) {
+        break;
+      }
+      add_candidate(token);
+      fallback_queue.emplace(child_state);
+    }
+  }
+
+  return candidates;
+}
+
+std::vector<int32_t> SuffixAutomaton::getRootCandidatesFrequency(
+    const int32_t* context, size_t len, size_t max_candidates, const Param& param) const {
+  std::vector<int32_t> candidates;
+  if (max_candidates == 0) {
+    return candidates;
+  }
+
+  auto anchors = match(context, len, param.max_trie_depth);
+  candidates.reserve(max_candidates);
+  std::unordered_set<int32_t> seen_tokens;
+  std::queue<int> fallback_queue;
+
+  auto add_candidate = [&candidates, &seen_tokens, max_candidates](int32_t token) -> bool {
+    if (seen_tokens.insert(token).second) {
+      candidates.emplace_back(token);
+    }
+    return candidates.size() >= max_candidates;
+  };
+
+  for (const auto& anchor : anchors) {
+    const auto& children = states_[anchor.state].children_by_freq;
+    for (const auto& [token, child_state] : children) {
+      if (add_candidate(token)) {
+        return candidates;
+      }
+      fallback_queue.emplace(child_state);
+    }
+  }
+
+  while (!fallback_queue.empty() && candidates.size() < max_candidates) {
+    const auto state = fallback_queue.front();
+    fallback_queue.pop();
+
+    const auto& children = states_[state].children_by_freq;
+    size_t scanned = 0;
+    for (const auto& [token, child_state] : children) {
+      if (scanned++ >= param.max_bfs_breadth || candidates.size() >= max_candidates) {
+        break;
+      }
+      add_candidate(token);
+      fallback_queue.emplace(child_state);
+    }
+  }
+
+  return candidates;
 }
 
 }  // namespace ngram

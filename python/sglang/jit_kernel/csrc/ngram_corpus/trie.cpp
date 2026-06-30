@@ -5,6 +5,7 @@
 #include <list>
 #include <queue>
 #include <tuple>
+#include <unordered_set>
 #include <vector>
 
 namespace ngram {
@@ -326,6 +327,99 @@ Result Trie::buildFrequency(
   }
 
   return fillResult(last_token, draft_token_num + 1, tree, root);
+}
+
+std::vector<int32_t> Trie::getRootCandidatesRecency(
+    const int32_t* context, size_t len, size_t max_candidates, const Param& param, MatchState& state, size_t total_len)
+    const {
+  std::vector<int32_t> candidates;
+  if (max_candidates == 0) {
+    return candidates;
+  }
+
+  auto anchors = match(context, len, state, total_len);
+  candidates.reserve(max_candidates);
+  std::unordered_set<int32_t> seen_tokens;
+  std::queue<const TrieNode*> fallback_queue;
+
+  auto add_candidate = [&candidates, &seen_tokens, max_candidates](int32_t token) -> bool {
+    if (seen_tokens.insert(token).second) {
+      candidates.emplace_back(token);
+    }
+    return candidates.size() >= max_candidates;
+  };
+
+  for (auto [node, _] : anchors) {
+    for (auto iter = node->lru.begin(); iter != node->lru.end(); ++iter) {
+      const auto child = *iter;
+      if (add_candidate(child->token)) {
+        return candidates;
+      }
+      fallback_queue.emplace(child);
+    }
+  }
+
+  while (!fallback_queue.empty() && candidates.size() < max_candidates) {
+    const auto node = fallback_queue.front();
+    fallback_queue.pop();
+
+    size_t scanned = 0;
+    for (auto iter = node->lru.begin();
+         iter != node->lru.end() && scanned < param.max_bfs_breadth && candidates.size() < max_candidates;
+         ++iter, ++scanned) {
+      const auto child = *iter;
+      add_candidate(child->token);
+      fallback_queue.emplace(child);
+    }
+  }
+
+  return candidates;
+}
+
+std::vector<int32_t> Trie::getRootCandidatesFrequency(
+    const int32_t* context, size_t len, size_t max_candidates, const Param& param, MatchState& state, size_t total_len)
+    const {
+  std::vector<int32_t> candidates;
+  if (max_candidates == 0) {
+    return candidates;
+  }
+
+  auto anchors = match(context, len, state, total_len);
+  candidates.reserve(max_candidates);
+  std::unordered_set<int32_t> seen_tokens;
+  std::queue<const TrieNode*> fallback_queue;
+
+  auto add_candidate = [&candidates, &seen_tokens, max_candidates](int32_t token) -> bool {
+    if (seen_tokens.insert(token).second) {
+      candidates.emplace_back(token);
+    }
+    return candidates.size() >= max_candidates;
+  };
+
+  for (auto [node, _] : anchors) {
+    for (auto* child : node->sorted_children) {
+      if (add_candidate(child->token)) {
+        return candidates;
+      }
+      fallback_queue.emplace(child);
+    }
+  }
+
+  while (!fallback_queue.empty() && candidates.size() < max_candidates) {
+    const auto node = fallback_queue.front();
+    fallback_queue.pop();
+
+    size_t scanned = 0;
+    for (auto* child : node->sorted_children) {
+      if (scanned++ >= param.max_bfs_breadth || candidates.size() >= max_candidates) {
+        break;
+      }
+      add_candidate(child->token);
+      fallback_queue.emplace(child);
+    }
+  }
+
+  return candidates;
 }
 
 }  // namespace ngram
