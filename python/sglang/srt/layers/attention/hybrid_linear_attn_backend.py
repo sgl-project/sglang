@@ -924,8 +924,6 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        # One-time guard for the causal-conv kernel-choice log line.
-        self._logged_conv_kernel_choice = False
         config = model_runner.mamba2_config
         assert config is not None
         self.mamba_chunk_size = config.mamba_chunk_size
@@ -976,38 +974,6 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             forward_batch,
         )
 
-    def _select_causal_conv_backend(self, use_triton_causal_conv: bool) -> bool:
-        """Decide the causal-conv kernel: it FOLLOWS ``--linear-attn-backend``.
-
-        ``--linear-attn-backend triton`` (the default) ⇒ the stride-aware Triton
-        causal-conv kernels; any other linear-attn backend ⇒ the model's own
-        choice (CUDA sgl-kernel by default). This keeps the conv kernel
-        consistent with the declared linear-attn backend instead of being a
-        per-model hardcode.
-
-        Why it matters for the shared pool: it stores Mamba conv/temporal state
-        in envelope-STRIDED views (slot stride == ``entry_bytes``, not the inner
-        size); only the stride-aware Triton conv reads them correctly — the CUDA
-        ``causal_conv1d`` path GARBLES them. The shared pool's
-        gate (``ServerArgs._handle_shared_kv_pool``) already asserts
-        ``--linear-attn-backend triton``, so the shared pool always lands on
-        Triton conv here — no per-pool special-casing, no env knob.
-
-        A model that explicitly requested Triton conv (e.g. spec decoding's
-        intermediate-state path in Nemotron-H / Granite) is always honored.
-        Logged ONCE per backend instance.
-        """
-        la_backend = get_global_server_args().linear_attn_backend
-        resolved = use_triton_causal_conv or (la_backend == "triton")
-        if not self._logged_conv_kernel_choice:
-            self._logged_conv_kernel_choice = True
-            logger.info(
-                "[mamba] causal-conv kernel = %s (linear_attn_backend=%s)",
-                "TRITON (stride-aware)" if resolved else "CUDA (sgl-kernel)",
-                la_backend,
-            )
-        return resolved
-
     def forward(
         self,
         mixer: MambaMixer2,
@@ -1019,8 +985,14 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         use_triton_causal_conv: bool = False,
     ):
         assert isinstance(self.forward_metadata, Mamba2Metadata)
-        use_triton_causal_conv = self._select_causal_conv_backend(
+        # The page-major envelope stores conv/SSM state in strided views; only the
+        # stride-aware Triton causal-conv reads them correctly (CUDA causal_conv1d
+        # garbles them). enable_page_major_kv_layout IS the signal that strides the
+        # state, so the conv kernel follows it. A model may also force Triton
+        # per-call (spec decoding's intermediate-state path in Nemotron-H / Granite).
+        use_triton_causal_conv = (
             use_triton_causal_conv
+            or get_global_server_args().enable_page_major_kv_layout
         )
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         mixer_out, intermediate_states = mixer.forward(

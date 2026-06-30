@@ -6340,37 +6340,21 @@ class ServerArgs:
                 "cuda-graph capture only; disable piecewise prefill capture "
                 "(e.g. --cuda-graph-backend-prefill=disabled)."
             )
-        # Only the Triton attention backend's read path translates virtual ->
-        # physical slot ids. Require it for the full-attention layers.
-        backends = {
-            self.attention_backend,
-            self.prefill_attention_backend,
-            self.decode_attention_backend,
-        }
-        backends.discard(None)
-        assert backends <= {"triton"}, (
-            "--enable-shared-kv-pool currently requires the Triton attention "
-            f"backend for the full-attention layers; got {sorted(backends)}. "
-            "Pass --attention-backend triton."
-        )
-        # The Mamba conv/SSM state is stored in envelope-strided views; only the
-        # stride-aware Triton linear-attn / causal-conv kernels read them correctly.
-        linear_backends = {
-            self.linear_attn_backend,
-            self.linear_attn_decode_backend,
-            self.linear_attn_prefill_backend,
-            self.mamba_backend,
-        }
-        linear_backends.discard(None)
-        assert linear_backends <= {"triton"}, (
-            "--enable-shared-kv-pool currently requires the Triton linear-"
-            f"attention / Mamba kernels; got {sorted(linear_backends)}. Pass "
-            "--linear-attn-backend triton and --mamba-backend triton."
-        )
-        # The model-family gate (hybrid Mamba / hybrid SWA) is enforced at
+        # The Triton-backend requirement for the strided full-attention K/V and
+        # the Mamba conv/SSM envelope is enforced via --enable-page-major-kv-layout
+        # (implied by the shared pool in _handle_page_major_kv_layout, which runs
+        # first). The model-family gate (hybrid Mamba / hybrid SWA) is enforced at
         # pool-construction time in model_runner_kv_cache_mixin._init_pools.
 
     def _handle_page_major_kv_layout(self):
+        # The shared KV pool stores its full-attention K/V and Mamba conv/SSM
+        # state in the page-major envelope-strided layout, so enabling it implies
+        # --enable-page-major-kv-layout. Setting it here (before the guard below)
+        # routes the shared pool through the single page-major code path and the
+        # stride-aware Triton-kernel asserts, instead of duplicating that
+        # enforcement in _handle_shared_kv_pool.
+        if self.enable_shared_kv_pool:
+            self.enable_page_major_kv_layout = True
         if not self.enable_page_major_kv_layout:
             return
         # Only the Triton attention kernels read the strided 4-D envelope K/V
