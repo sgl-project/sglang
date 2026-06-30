@@ -5,7 +5,6 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
-import torch_npu
 import numpy as np
 
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
@@ -130,6 +129,10 @@ class ModelSlimConfig(QuantizationConfig):
                     [npu_wrapper_rmsnorm_forward],
                 )
 
+        self.kv_cache_scheme = None
+        if quant_config.get("kv_quant_type", "") == "C8":
+            self.kv_cache_scheme = "int8"
+
     def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
         self.packed_modules_mapping.update(mapping)
 
@@ -190,7 +193,7 @@ class ModelSlimConfig(QuantizationConfig):
         elif isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer, prefix)
             return ModelSlimFusedMoEMethod(self)
-        elif isinstance(layer, RadixAttention):
+        elif (self.kv_cache_scheme is not None) and isinstance(layer, RadixAttention):
             return ModelSlimKVCacheMethod(self)
         return None
 
@@ -412,20 +415,21 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
 class ModelSlimKVCacheMethod(BaseKVCacheMethod):
     def __init__(self, config):
         super().__init__(config)
+        self.is_dynamic = False
 
     def create_weights(
         self,
         layer: nn.Module,
-        head_size: int,
-        num_kv_heads: int,
-        tp_rank: int,
+        #head_size: int,
+        #num_kv_heads: int,
+        #tp_rank: int,
         **extra_weight_attrs,
     ):
         # Deleting scales created in base Attention class to register new ones.
         del layer.k_scale
         del layer.v_scale
-        self.kv_size = num_kv_heads * head_size
-        self.tp_rank = tp_rank
+        self.kv_size = extra_weight_attrs['num_kv_heads'] * extra_weight_attrs['head_size']
+        self.tp_rank = extra_weight_attrs['tp_rank']
 
         k_scale = ChannelQuantScaleParameter(
             data=torch.full([self.kv_size], fill_value=-1, dtype=torch.float32),
@@ -472,12 +476,12 @@ class ModelSlimKVCacheMethod(BaseKVCacheMethod):
         old_shape = k_cache.shape
         k_cache = k_cache.view(-1, self.kv_size)
         v_cache = v_cache.view(-1, self.kv_size)
-        k_cache = torch_npu.npu_anti_quant(
+        k_cache = torch.ops.npu.npu_anti_quant(
             x=k_cache,
             scale=layer.k_scale,
             dst_dtype=torch.bfloat16
         )
-        v_cache = torch_npu.npu_anti_quant(
+        v_cache = torch.ops.npu.npu_anti_quant(
             x=v_cache,
             scale=layer.v_scale,
             dst_dtype=torch.bfloat16
@@ -492,7 +496,7 @@ class ModelSlimKVCacheMethod(BaseKVCacheMethod):
         k_cache = k_cache.view(-1, self.kv_size)
         v_cache = v_cache.view(-1, self.kv_size)
 
-        key_int8 = torch_npu.npu_quantize(
+        key_int8 = torch.ops.npu.npu_quantize(
                     k_cache,
                     layer.k_quant_scale.squeeze(),
                     layer.k_quant_offset.squeeze() if hasattr(layer,"k_quant_offset") else None,
@@ -500,7 +504,7 @@ class ModelSlimKVCacheMethod(BaseKVCacheMethod):
                     -1,
                     False)
 
-        value_int8 = torch_npu.npu_quantize(
+        value_int8 = torch.ops.npu.npu_quantize(
                     v_cache,
                     layer.v_quant_scale.squeeze(),
                     layer.v_quant_offset.squeeze() if hasattr(layer,"v_quant_offset") else None,

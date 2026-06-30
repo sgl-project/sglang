@@ -598,7 +598,7 @@ class ServerArgs:
                 '"fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only '
                 "mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+"
             ),
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1", "int8"],
         ),
     ] = "auto"
     enable_fp32_lm_head: A[
