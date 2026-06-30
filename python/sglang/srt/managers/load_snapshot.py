@@ -87,7 +87,10 @@ def should_use_zmq(server_args) -> bool:
     ) or envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.get()
 
 
-_LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens"})
+# Methods for which the DataParallelController reads load snapshots on every
+# dispatch (and thus owns the zmq PULL socket in multi-node mode).
+# cache_aware also consumes the per-rank cache digest carried in the snapshot.
+_LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens", "cache_aware"})
 
 
 def _tokenizer_load_snapshot_owner_caller(server_args) -> str:
@@ -214,6 +217,21 @@ SECTION_FIELDS = (
 )
 
 
+class CacheDigestSnapshot(msgspec.Struct, omit_defaults=True):
+    """Serializable mirror of ``io_struct.CacheDigest`` for the SHM/zmq
+    transport.  Carries the chunk-aligned prefix hash digest a decode rank
+    publishes so the DP controller can do cache-aware routing.  ``bytes`` keys
+    round-trip cleanly through msgpack.
+    """
+
+    dp_rank: int = 0
+    prefix_entries: dict[bytes, int] = {}
+    total_cached_tokens: int = 0
+    evictable_tokens: int = 0
+    protected_tokens: int = 0
+    timestamp: float = 0.0
+
+
 class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     timestamp: float = 0.0
     dp_rank: int = 0
@@ -260,6 +278,11 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     queue_paused: int = 0
     queue_retracted: int = 0
 
+    # Cache-aware DP routing digest (decode ranks with radix cache only).
+    # None for prefill / non-cache-aware ranks; omit_defaults keeps the
+    # encoded payload tiny in that case.
+    cache_digest: Optional[CacheDigestSnapshot] = None
+
     @classmethod
     def from_get_loads_output(cls, output: GetLoadsReqOutput) -> LoadSnapshot:
         snapshot: dict = {}
@@ -282,6 +305,17 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
                 else:
                     value = _native(value)
                 snapshot[snapshot_attr] = value
+
+        digest = getattr(output, "cache_digest", None)
+        if digest is not None:
+            snapshot["cache_digest"] = CacheDigestSnapshot(
+                dp_rank=int(digest.dp_rank),
+                prefix_entries=digest.prefix_entries,
+                total_cached_tokens=int(digest.total_cached_tokens),
+                evictable_tokens=int(digest.evictable_tokens),
+                protected_tokens=int(digest.protected_tokens),
+                timestamp=_native(digest.timestamp),
+            )
 
         return cls(**snapshot)
 
@@ -343,10 +377,15 @@ snapshot_decoder = msgspec.msgpack.Decoder(LoadSnapshot)
 # ---------------------------------------------------------------------------
 
 MAGIC = b"SLNS"
-VERSION = 2
+VERSION = 3
 HEADER_STRUCT = struct.Struct("<4sHHI")
 SLOT_LEN_STRUCT = struct.Struct("<I")
-SLOT_SIZE = 16 * 1024
+# 128 KiB per slot: must hold a full cache-aware routing digest.  A digest of
+# the default max_entries=2048 chunk hashes (32-byte key + int) encodes to
+# ~76 KiB via msgpack; 16 KiB (the metrics-only size) overflows and the write
+# raises.  Readers negotiate the actual slot size from the SHM header, so
+# bumping this is backward-safe (VERSION bump invalidates stale files).
+SLOT_SIZE = 128 * 1024
 
 
 @contextmanager

@@ -201,6 +201,11 @@ class DataParallelController:
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            # cache_aware reads each rank's load AND cache digest from the
+            # snapshot on every dispatch; without refreshing here the budget
+            # (and cache_digests) stay empty and routing degrades to a static
+            # fallback.
+            LoadBalanceMethod.CACHE_AWARE,
         )
 
         # Load balance budget

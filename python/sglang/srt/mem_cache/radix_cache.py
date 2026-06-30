@@ -670,7 +670,10 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 if self._skip_node_in_digest(child):
                     continue
 
-                path_tokens = parent_tokens + child.key.token_ids
+                # child.key.token_ids may be an array.array; normalize to list
+                # so the concat works and repr(chunk) matches the list-based
+                # hashing in the DP controller's _fast_chain_hash.
+                path_tokens = parent_tokens + list(child.key.token_ids)
                 if len(path_tokens) > max_prefix_tokens:
                     path_tokens = path_tokens[:max_prefix_tokens]
 
