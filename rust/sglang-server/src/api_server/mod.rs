@@ -310,6 +310,59 @@ fn msgpack_to_json(bytes: &[u8]) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&val).map_err(|e| e.to_string())
 }
 
+/// Folds the per-chunk [`GenerationOutput`] deltas the detok emits into a
+/// cumulative view. Used by the drain loops that need cumulative output — every
+/// unary response and the cumulative SGLang `/generate` stream. OpenAI streaming
+/// forwards deltas directly and doesn't use this. Shared with the [`openai`]
+/// submodule (`super::OutputAccumulator`).
+#[derive(Default)]
+struct OutputAccumulator {
+    text: String,
+    output_ids: Vec<i32>,
+    prompt_tokens: u32,
+    completion_tokens: u64,
+    finish_reason: Option<String>,
+}
+
+impl OutputAccumulator {
+    /// Fold one delta frame in.
+    fn fold(&mut self, d: &GenerationOutput) {
+        self.text.push_str(&d.text);
+        self.output_ids.extend_from_slice(&d.output_ids);
+        self.completion_tokens += d.completion_tokens;
+        self.prompt_tokens = d.prompt_tokens; // constant across the request
+        if d.finish_reason.is_some() {
+            self.finish_reason = d.finish_reason.clone();
+        }
+    }
+
+    /// Cumulative snapshot for an intermediate streaming frame (clones — a
+    /// cumulative protocol like SGLang `/generate` needs the full text per frame).
+    fn snapshot(&self, rid: &str) -> GenerationOutput {
+        GenerationOutput {
+            rid: rid.to_string(),
+            text: self.text.clone(),
+            output_ids: self.output_ids.clone(),
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            finish_reason: self.finish_reason.clone(),
+        }
+    }
+
+    /// Consume into the final cumulative output (moves; for a unary response or a
+    /// stream's final frame).
+    fn into_output(self, rid: String) -> GenerationOutput {
+        GenerationOutput {
+            rid,
+            text: self.text,
+            output_ids: self.output_ids,
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            finish_reason: self.finish_reason,
+        }
+    }
+}
+
 async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePayload>) -> Response {
     let stream = payload.stream;
     let kind = RequestKind::Generate(GenerateRequest {
@@ -325,16 +378,20 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
     };
 
     if stream {
-        // SSE: relay frames until Done/Error, then `data: [DONE]`.
+        // SSE: the SGLang `/generate` protocol carries **cumulative** text per
+        // frame, so fold the detok deltas back up before formatting each frame.
         let s = async_stream::stream! {
+            let mut acc = OutputAccumulator::default();
             while let Some(item) = rx.recv().await {
                 match item {
                     EgressItem::Frame(out) => {
-                        let f = sglang_frame(&out);
+                        acc.fold(&out);
+                        let f = sglang_frame(&acc.snapshot(&out.rid));
                         yield Ok::<_, Infallible>(Event::default().data(String::from_utf8_lossy(&f)));
                     }
                     EgressItem::Done(out) => {
-                        let f = sglang_frame(&out);
+                        acc.fold(&out);
+                        let f = sglang_frame(&acc.into_output(out.rid));
                         yield Ok(Event::default().data(String::from_utf8_lossy(&f)));
                         break;
                     }
@@ -353,15 +410,17 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
         };
         Sse::new(s).into_response()
     } else {
-        // Unary: drain until the terminal frame.
+        // Unary: fold every delta, respond once from the cumulative result.
+        let mut acc = OutputAccumulator::default();
         while let Some(item) = rx.recv().await {
             match item {
-                EgressItem::Frame(_) => continue, // ignore intermediate for unary
+                EgressItem::Frame(out) => acc.fold(&out),
                 EgressItem::Done(out) => {
+                    acc.fold(&out);
                     return (
                         StatusCode::OK,
                         [("content-type", "application/json")],
-                        sglang_frame(&out),
+                        sglang_frame(&acc.into_output(out.rid)),
                     )
                         .into_response();
                 }

@@ -43,19 +43,25 @@ impl EgressSink {
 #[allow(dead_code)] // the receiver half is created inline in api_server::submit.
 pub type EgressSource = mpsc::Receiver<EgressItem>;
 
-/// Protocol-neutral output for one generation step (cumulative values). The
-/// detok shard produces these; each API handler formats them into its own wire
-/// shape — SGLang `/generate`, OpenAI `/v1/completions`, `/v1/chat/completions`.
+/// Protocol-neutral output for one generation step — a **per-chunk delta**. The
+/// detok shard emits one per decode step (it keeps no cumulative buffer); a
+/// consumer that needs the cumulative view folds them with `OutputAccumulator`
+/// (every unary response and the cumulative SGLang `/generate` stream). OpenAI
+/// streaming forwards the deltas directly. Each API handler formats the result
+/// into its own wire shape — SGLang `/generate`, OpenAI `/v1/completions`,
+/// `/v1/chat/completions`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GenerationOutput {
     pub rid: String,
-    /// Cumulative decoded text (empty in `skip_tokenizer_init` mode).
+    /// Decoded text **delta** for this chunk (empty in `skip_tokenizer_init`
+    /// mode, or when the step only produced a partial multi-byte sequence).
     pub text: String,
-    /// Cumulative output token ids (`skip_tokenizer_init` mode; empty otherwise).
+    /// Output token ids for this chunk (`skip_tokenizer_init` mode; empty
+    /// otherwise).
     pub output_ids: Vec<i32>,
     /// Prompt token count (from the scheduler; constant across the request).
     pub prompt_tokens: u32,
-    /// Cumulative output token count.
+    /// Output token count for this chunk (the accumulator sums them).
     pub completion_tokens: u64,
     /// `Some(reason)` on the final step, `None` while streaming.
     pub finish_reason: Option<String>,
@@ -89,17 +95,6 @@ pub enum RequestKind {
     /// A control endpoint (e.g. `/server_info`, `/health`): no tokenization, and
     /// the egress is a single non-streamed JSON result.
     Control(ControlRequest),
-}
-
-impl RequestKind {
-    /// Whether the client asked for SSE streaming. Always false for control
-    /// requests (their response is a single result, never streamed).
-    pub fn is_stream(&self) -> bool {
-        match self {
-            RequestKind::Generate(g) => g.stream,
-            RequestKind::Control(_) => false,
-        }
-    }
 }
 
 /// Body of a `/generate` request.

@@ -83,7 +83,6 @@ impl Ingress {
             .send(DetokMsg::Register {
                 id: req.id,
                 sink: req.sink.clone(),
-                stream: req.kind.is_stream(),
             })
             .is_err()
         {

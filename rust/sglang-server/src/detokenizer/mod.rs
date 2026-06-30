@@ -62,8 +62,8 @@ impl StreamDecoder for DynamoDecoder {
 #[derive(Clone)]
 pub enum DetokenizerBackend {
     Dynamo(dynamo_tokenizers::Tokenizer),
-    /// No decoding at all — the shard accumulates the raw output token ids and
-    /// emits them as `output_ids` (no `DecodeStream`). Used for
+    /// No decoding at all — the shard emits each chunk's raw output token ids as
+    /// `output_ids` (no `DecodeStream`, no accumulation). Used for
     /// `skip_tokenizer_init` and when no tokenizer is configured.
     Skip,
 }
@@ -87,16 +87,12 @@ impl DetokenizerBackend {
 
 struct DetokState {
     sink: EgressSink,
-    stream: bool,
-    /// Cumulative decoded text (SGLang stream frames carry cumulative text).
-    text: String,
-    /// Cumulative output token ids, emitted as `output_ids` in
-    /// `skip_tokenizer_init` mode; stays empty when a decoder is present.
-    output_ids: Vec<i32>,
-    /// Cumulative output token count, reported as `meta_info.completion_tokens`
-    /// (clients like bench_serving diff successive frames to get per-step tokens).
-    completion_tokens: u64,
     /// Per-request incremental decoder; `None` in `skip_tokenizer_init` mode.
+    /// This is the *only* per-request accumulation the shard keeps: the decoder's
+    /// internal byte/UTF-8 buffer. Decoded **text deltas** are emitted per chunk
+    /// (no cumulative buffer here) — the api-server's drain loop reassembles the
+    /// cumulative view where a consumer needs it (every unary response and the
+    /// cumulative SGLang `/generate` stream); OpenAI streaming forwards deltas.
     decoder: Option<Box<dyn StreamDecoder>>,
     /// Egress half of the lifecycle FSM. Lives here because the ingress
     /// `Request` (and its FSM) was handed to the scheduler when queued; the
@@ -126,15 +122,11 @@ impl Runnable for DetokenizerWorker {
 
         while let Ok(msg) = self.rx.recv() {
             match msg {
-                DetokMsg::Register { id, sink, stream } => {
+                DetokMsg::Register { id, sink } => {
                     table.insert(
                         id,
                         DetokState {
                             sink,
-                            stream,
-                            text: String::new(),
-                            output_ids: Vec::new(),
-                            completion_tokens: 0,
                             decoder: self.backend.new_decoder(),
                             // Registered == handed to the scheduler == Queued.
                             fsm: RequestState::Queued,
@@ -159,7 +151,7 @@ fn handle_result(table: &mut HashMap<RequestId, DetokState>, id: RequestId, payl
     }
 }
 
-fn handle_chunk(table: &mut HashMap<RequestId, DetokState>, ev: ChunkEvent) {
+fn handle_chunk(table: &mut HashMap<RequestId, DetokState>, mut ev: ChunkEvent) {
     let id = match ev.rid.parse::<u64>() {
         Ok(v) => RequestId(v),
         Err(_) => {
@@ -178,11 +170,13 @@ fn handle_chunk(table: &mut HashMap<RequestId, DetokState>, ev: ChunkEvent) {
         let _ = st.fsm.apply(Event::SchedulerPicked);
     }
 
-    st.completion_tokens += ev.token_ids.len() as u64;
-    match &mut st.decoder {
-        // Normal path: incrementally decode to cumulative text.
+    // Fully incremental: decode just this chunk's delta (or, in skip mode, take
+    // its raw ids). Nothing cumulative is kept here — the api-server's drain loop
+    // reassembles it where needed.
+    let n_tok = ev.token_ids.len() as u64;
+    let (delta_text, delta_ids) = match &mut st.decoder {
         Some(decoder) => match decoder.step(&ev.token_ids) {
-            Ok(delta) => st.text.push_str(&delta),
+            Ok(delta) => (delta, Vec::new()),
             Err(e) => {
                 let _ = st.fsm.apply(Event::Error(e.clone()));
                 let _ = st.sink.try_send(EgressItem::Error(e));
@@ -190,23 +184,23 @@ fn handle_chunk(table: &mut HashMap<RequestId, DetokState>, ev: ChunkEvent) {
                 return;
             }
         },
-        // skip_tokenizer_init: pass token ids through, no decode.
-        None => st.output_ids.extend_from_slice(&ev.token_ids),
-    }
+        // skip_tokenizer_init: pass the chunk's token ids through, no decode.
+        None => (String::new(), std::mem::take(&mut ev.token_ids)),
+    };
 
     let finished = ev.finish_reason.is_some();
     // Streaming → Streaming (finish:false) or Streaming → Finalizing (finish:true).
     let _ = st.fsm.apply(Event::Chunk { finish: finished });
 
-    // Protocol-neutral cumulative snapshot; the API handler formats it. `text`
-    // and `output_ids` are cumulative so we clone (the entry persists across
-    // streamed frames); `rid`/`finish_reason` are moved (this `ev` is done).
+    // Protocol-neutral **delta** snapshot for this chunk; the API handler formats
+    // it (and accumulates when a cumulative view is required). `text`/`output_ids`
+    // are this chunk's delta; `completion_tokens` is this chunk's token count.
     let output = GenerationOutput {
         rid: ev.rid,
-        text: st.text.clone(),
-        output_ids: st.output_ids.clone(),
+        text: delta_text,
+        output_ids: delta_ids,
         prompt_tokens: ev.prompt_tokens,
-        completion_tokens: st.completion_tokens,
+        completion_tokens: n_tok,
         finish_reason: ev.finish_reason,
     };
 
@@ -219,9 +213,10 @@ fn handle_chunk(table: &mut HashMap<RequestId, DetokState>, ev: ChunkEvent) {
             Event::Disconnect
         });
         table.remove(&id);
-    } else if st.stream {
-        // Only emit intermediate frames for streaming requests; unary requests
-        // just accumulate until the final Done. A failed send == client gone.
+    } else {
+        // Every intermediate chunk emits its delta frame (fully-delta egress; the
+        // egress shards exist to carry exactly this per-token fan-out at high
+        // concurrency). A failed send == client gone.
         if st.sink.try_send(EgressItem::Frame(output)).is_err() {
             let _ = st.fsm.apply(Event::Disconnect);
             table.remove(&id);

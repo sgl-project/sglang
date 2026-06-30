@@ -29,7 +29,7 @@ use dynamo_protocols::types::{
 };
 use dynamo_renderer::{ChatTemplate, ContextMixins, PromptContextMixin, PromptFormatter};
 
-use super::{AppState, submit};
+use super::{AppState, OutputAccumulator, submit};
 use crate::message::{EgressItem, GeneratePayload, GenerateRequest, RequestKind};
 use crate::runtime::ServerArgs;
 
@@ -131,22 +131,19 @@ pub(super) async fn openai_completions(
                 return (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response();
             }
         };
-        // SSE: each chunk carries the text *delta*; final chunk carries the
-        // finish_reason; then `data: [DONE]`.
+        // SSE: the detok already emits per-chunk text deltas, so each frame's
+        // `text` is forwarded straight as the OpenAI delta; the final chunk
+        // carries the finish_reason; then `data: [DONE]`.
         let s = async_stream::stream! {
-            let mut prev = 0usize; // byte offset already emitted
             while let Some(item) = rx.recv().await {
                 match item {
                     EgressItem::Frame(out) => {
-                        let delta = out.text[prev..].to_string();
-                        prev = out.text.len();
-                        let chunk = completion_response(&id, created, &model, delta, None, None);
+                        let chunk = completion_response(&id, created, &model, out.text, None, None);
                         yield Ok::<_, Infallible>(Event::default().data(json_string(&chunk)));
                     }
                     EgressItem::Done(out) => {
-                        let delta = out.text[prev..].to_string();
                         let chunk = completion_response(
-                            &id, created, &model, delta,
+                            &id, created, &model, out.text,
                             finish_reason(out.finish_reason.as_deref()), None,
                         );
                         yield Ok(Event::default().data(json_string(&chunk)));
@@ -197,10 +194,13 @@ pub(super) async fn openai_completions(
         let mut prompt_tokens = 0u32;
         let mut completion_tokens = 0u32;
         for (i, mut rx) in rxs.into_iter().enumerate() {
+            let mut acc = OutputAccumulator::default();
             loop {
                 match rx.recv().await {
-                    Some(EgressItem::Frame(_)) => continue,
+                    Some(EgressItem::Frame(out)) => acc.fold(&out),
                     Some(EgressItem::Done(out)) => {
+                        acc.fold(&out);
+                        let out = acc.into_output(out.rid);
                         prompt_tokens += out.prompt_tokens;
                         completion_tokens += out.completion_tokens as u32;
                         choices.push(Choice {
@@ -460,15 +460,13 @@ pub(super) async fn openai_chat_completions(
         // final chunk. Reasoning still streams live.
         let tools_on = tool_parser.is_some();
         let s = async_stream::stream! {
-            let mut prev = 0usize;
             let mut first = true;
             let mut content_buf = String::new();
             while let Some(item) = rx.recv().await {
                 match item {
                     EgressItem::Frame(out) => {
-                        let text = out.text[prev..].to_string();
-                        prev = out.text.len();
-                        let (content, reason) = split_reasoning(reasoner.as_mut(), &text, false);
+                        // The detok already emits per-chunk deltas — split directly.
+                        let (content, reason) = split_reasoning(reasoner.as_mut(), &out.text, false);
                         if tools_on {
                             if let Some(c) = content {
                                 content_buf.push_str(&c);
@@ -485,8 +483,7 @@ pub(super) async fn openai_chat_completions(
                         }
                     }
                     EgressItem::Done(out) => {
-                        let text = out.text[prev..].to_string();
-                        let (content, reason) = split_reasoning(reasoner.as_mut(), &text, true);
+                        let (content, reason) = split_reasoning(reasoner.as_mut(), &out.text, true);
                         if tools_on {
                             if let Some(c) = content {
                                 content_buf.push_str(&c);
@@ -529,11 +526,14 @@ pub(super) async fn openai_chat_completions(
         };
         Sse::new(s).into_response()
     } else {
+        let mut acc = OutputAccumulator::default();
         while let Some(item) = rx.recv().await {
             match item {
-                EgressItem::Frame(_) => continue,
+                EgressItem::Frame(out) => acc.fold(&out),
                 EgressItem::Done(out) => {
-                    // Non-streaming: split the full text in one pass.
+                    acc.fold(&out);
+                    // Non-streaming: split the full (reassembled) text in one pass.
+                    let out = acc.into_output(out.rid);
                     let (content, reason) = match &reasoning {
                         Some(n) => {
                             let mut p = ReasoningParserType::get_reasoning_parser_from_name(n);

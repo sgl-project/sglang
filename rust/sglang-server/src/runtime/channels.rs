@@ -26,7 +26,6 @@ pub enum DetokMsg {
     Register {
         id: RequestId,
         sink: EgressSink,
-        stream: bool,
     },
     Chunk(ChunkEvent),
     /// Control-request result: a single already-serialized JSON payload to
