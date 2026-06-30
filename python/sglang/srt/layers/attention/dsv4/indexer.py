@@ -19,8 +19,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_hip
+from sglang.srt.utils import add_prefix
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
@@ -33,12 +34,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-if is_hip():
-    FP8_DTYPE = torch.float8_e4m3fnuz
-    FP8_MAX = torch.finfo(FP8_DTYPE).max
-else:
-    FP8_DTYPE = torch.float8_e4m3fn
-    FP8_MAX = torch.finfo(FP8_DTYPE).max
+FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+
 
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
