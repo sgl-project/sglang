@@ -82,6 +82,7 @@ class BatchedDecodeContext:
         req_to_token_pool: Any | None,
         attention_layer_indices: list[int] | None = None,
         attention_pool_index_by_layer: dict[int, int] | None = None,
+        paged_attention_supported: bool = True,
     ) -> BatchedDecodeContext:
         batch_size = len(req_ids)
         if attention_layer_indices is None:
@@ -94,7 +95,11 @@ class BatchedDecodeContext:
             for layer_idx in attention_layer_indices
         ]
         paged_metadata = None
-        if kv_pool is not None and req_to_token_pool is not None:
+        if (
+            paged_attention_supported
+            and kv_pool is not None
+            and req_to_token_pool is not None
+        ):
             try:
                 paged_metadata = build_decode_paged_metadata(
                     req_ids=req_ids,

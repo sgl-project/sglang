@@ -1153,6 +1153,7 @@ class MlxModelRunner:
             attention_pool_index_by_layer=(
                 self._cache_layout.attention_pool_index_by_layer
             ),
+            paged_attention_supported=not self._cache_layout.has_auxiliary_state,
         )
 
     def decode_batch_start(self, req_ids: list[str]) -> MlxPendingDecode:

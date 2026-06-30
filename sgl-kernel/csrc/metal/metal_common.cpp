@@ -49,7 +49,7 @@ MTL::Size pick_tg(uint32_t gx, uint32_t gy, uint32_t gz) {
 }
 
 metal::CommandEncoder& command_encoder(Stream stream) {
-  return metal::device(stream.device).get_command_encoder(stream.index);
+  return metal::get_command_encoder(stream);
 }
 
 nb::object wrap_array(array&& value) {
