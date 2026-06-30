@@ -181,8 +181,7 @@ struct Compress128SharedBuffer {
 /// \brief Sentinel score for padded positions in a 128-segment.
 constexpr float kPadScore = -FLT_MAX;
 
-[[maybe_unused]]
-SGL_DEVICE void c128_prefill_segment_softmax(
+[[maybe_unused]] SGL_DEVICE void c128_prefill_segment_softmax(
     const PrefillStorage (&kv)[kElementsPerWarp],
     const PrefillStorage (&score)[kElementsPerWarp],
     float* seg_kv,
@@ -446,11 +445,9 @@ __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
 
 template <int64_t kHeadDim, typename BufferFloat, bool kUsePDL>
 struct FlashCompress128OnlineKernel {
-  static constexpr auto decode_kernel =
-      flash_c128_online_decode_v2<kHeadDim, BufferFloat, kUsePDL>;
+  static constexpr auto decode_kernel = flash_c128_online_decode_v2<kHeadDim, BufferFloat, kUsePDL>;
   template <bool kWrite>
-  static constexpr auto prefill_kernel =
-      flash_c128_online_prefill_v2<kHeadDim, BufferFloat, kWrite, kUsePDL>;
+  static constexpr auto prefill_kernel = flash_c128_online_prefill_v2<kHeadDim, BufferFloat, kWrite, kUsePDL>;
   static constexpr int64_t kTileDim = kTileElements * device::kWarpThreads;  // 64
   static constexpr uint32_t kNumSplit = kHeadDim / kTileDim;
   static constexpr uint32_t kDecodeBlockSize = kHeadDim / 4;
@@ -958,9 +955,7 @@ inline OnlinePrefillPlan plan_online_prefill(
 
 namespace {
 
-[[maybe_unused]]
-constexpr auto& plan_compress_128_online_decode = host::compress::plan_online_decode;
-[[maybe_unused]]
-constexpr auto& plan_compress_128_online_prefill = host::compress::plan_online_prefill;
+[[maybe_unused]] constexpr auto& plan_compress_128_online_decode = host::compress::plan_online_decode;
+[[maybe_unused]] constexpr auto& plan_compress_128_online_prefill = host::compress::plan_online_prefill;
 
 }  // namespace

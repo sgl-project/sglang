@@ -80,8 +80,8 @@ __global__ void online_c128_mtp_mark_pending_kernel(const OnlineC128MTPMarkPendi
 }
 
 template <int64_t kHeadDim, typename TSeq, typename TReq, typename BufferFloat>
-__global__ void online_c128_mtp_commit_pending_kernel(
-    const OnlineC128MTPCommitPendingParams<TSeq, TReq, BufferFloat> params) {
+__global__ void
+online_c128_mtp_commit_pending_kernel(const OnlineC128MTPCommitPendingParams<TSeq, TReq, BufferFloat> params) {
   const int64_t bid = static_cast<int64_t>(blockIdx.x);
   if (bid >= params.cur_bs) return;
 
@@ -101,8 +101,7 @@ __global__ void online_c128_mtp_commit_pending_kernel(
   const int64_t full_loc = static_cast<int64_t>(params.req_to_token[req * params.req_to_token_stride_b + chunk_start]);
   const int64_t swa_loc = params.full_to_swa[full_loc];
   const int64_t slot = swa_loc / params.swa_page_size;
-  const BufferFloat* const src =
-      params.state + (slot + accept * params.state_slot_stride) * params.state_stride_b;
+  const BufferFloat* const src = params.state + (slot + accept * params.state_slot_stride) * params.state_stride_b;
   BufferFloat* const dst = params.state + slot * params.state_stride_b;
 
   for (int64_t d = static_cast<int64_t>(threadIdx.x); d < kHeadDim * 3; d += blockDim.x) {
@@ -111,8 +110,8 @@ __global__ void online_c128_mtp_commit_pending_kernel(
 }
 
 template <int64_t kHeadDim, typename TSeq, typename TReq, typename BufferFloat>
-__global__ void online_c128_mtp_write_prefix_kernel(
-    const OnlineC128MTPWritePrefixParams<TSeq, TReq, BufferFloat> params) {
+__global__ void
+online_c128_mtp_write_prefix_kernel(const OnlineC128MTPWritePrefixParams<TSeq, TReq, BufferFloat> params) {
   const int64_t bid = static_cast<int64_t>(blockIdx.x);
   if (bid >= params.layer_bs) return;
 
@@ -250,8 +249,7 @@ struct OnlineC128MTPWritePrefixKernel {
     static_assert(kHeadDim == 512, "online c128 MTP write-prefix only supports head_dim=512");
     constexpr uint32_t kThreads = static_cast<uint32_t>(kHeadDim);
     LaunchKernel(static_cast<uint32_t>(layer_bs), kThreads, device)(
-        online_c128_mtp_write_prefix_kernel<kHeadDim, TSeq, TReq, BufferFloat>,
-        params);
+        online_c128_mtp_write_prefix_kernel<kHeadDim, TSeq, TReq, BufferFloat>, params);
   }
 
   static void
@@ -454,8 +452,7 @@ struct OnlineC128MTPCommitPendingKernel {
 
     constexpr uint32_t kThreads = 256;
     LaunchKernel(static_cast<uint32_t>(cur_bs), kThreads, device)(
-        online_c128_mtp_commit_pending_kernel<kHeadDim, TSeq, TReq, BufferFloat>,
-        params);
+        online_c128_mtp_commit_pending_kernel<kHeadDim, TSeq, TReq, BufferFloat>, params);
   }
 
   static void
