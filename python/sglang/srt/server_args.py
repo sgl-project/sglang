@@ -6984,6 +6984,12 @@ class ServerArgs:
             and self.decode_attention_backend is None
         )
 
+    def is_decoupled_verifier(self) -> bool:
+        return self.decoupled_spec_role == "verifier"
+
+    def is_decoupled_drafter(self) -> bool:
+        return self.decoupled_spec_role == "drafter"
+
     def enable_mamba_extra_buffer(self) -> bool:
         return (
             self.disable_radix_cache is False
