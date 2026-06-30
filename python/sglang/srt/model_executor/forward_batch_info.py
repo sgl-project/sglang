@@ -334,7 +334,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     req_pool_indices: torch.Tensor
     # The sequence length
     seq_lens: torch.Tensor
-    # The indices of output tokens in the token_to_kv_pool.
+    # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
     # The sum of all sequence lengths
     seq_lens_sum: int
@@ -854,69 +854,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
             else:
                 ret._compute_mrope_positions(model_runner, batch)
-
-        # Diagnostic: env-gated invariant check. The clamps inside
-        # `translate_kv_loc` / `translate_loc_from_full_to_swa` and inside
-        # `UnifiedMHATokenToKVPool.set_kv_buffer`'s elif route tombstoned
-        # `v2p[live_virtual]` reads/writes to the reserved padding sink so
-        # the captured graph cannot crash on `k_buffer[-1]`. The clamps mask
-        # any underlying invariant violation (live virtuals should never
-        # have v2p == -1). Enable this check (export
-        # `SGLANG_DEBUG_CHECK_V2P_TOMBSTONES=1`) to surface such violations
-        # eagerly with a Python traceback that names the offending virtuals.
-        # Cost: one gather + one any() per batch — only enabled for
-        # debugging. In practice the clamps fire on padded / zero-cleared
-        # entries only; if any future regression brings a live tombstone,
-        # this check catches it before the clamp hides it.
-        if (
-            envs.SGLANG_DEBUG_CHECK_V2P_TOMBSTONES.get()
-            and model_runner.enable_unified_memory_pool
-            and ret.out_cache_loc is not None
-        ):
-            alloc = model_runner.token_to_kv_pool_allocator
-            full = getattr(alloc, "full_attn_allocator", None)
-            if full is not None:
-                ps = full.page_size
-                v_pages = ret.out_cache_loc // ps if ps > 1 else ret.out_cache_loc
-                raw_v2p = full.virtual_to_physical[v_pages]
-                bad_mask = raw_v2p < 0
-                if bool(bad_mask.any().item()):
-                    bad_idx = bad_mask.nonzero(as_tuple=False).flatten()
-                    sample = bad_idx[: min(8, bad_idx.numel())]
-                    raise AssertionError(
-                        "SGLANG_DEBUG_CHECK_V2P_TOMBSTONES: v2p_full has "
-                        "tombstoned (-1) entries for live virtual ids in "
-                        f"out_cache_loc. count={int(bad_mask.sum().item())}, "
-                        f"sample_positions={sample.tolist()}, "
-                        f"sample_virtuals={ret.out_cache_loc[sample].tolist()}, "
-                        "indicates an invariant violation — a live virtual "
-                        "should always map to a non-negative physical. The "
-                        "tombstone-safety clamp in translate_kv_loc would "
-                        "otherwise mask this by routing the read/write to "
-                        "physical slot 0 (the padding sink)."
-                    )
-            swa = getattr(alloc, "swa_attn_allocator", None)
-            if swa is not None:
-                ps = swa.page_size
-                v_pages = ret.out_cache_loc // ps if ps > 1 else ret.out_cache_loc
-                raw_v2p_swa = swa.virtual_to_physical[v_pages]
-                # Tombstone on swa side: -1 = freed/never-bound. Don't fail
-                # on 0 (sentinel page) because under SWARadixCache the swa
-                # side can legitimately have padding-page bindings.
-                bad_mask = raw_v2p_swa < 0
-                if bool(bad_mask.any().item()):
-                    bad_idx = bad_mask.nonzero(as_tuple=False).flatten()
-                    sample = bad_idx[: min(8, bad_idx.numel())]
-                    raise AssertionError(
-                        "SGLANG_DEBUG_CHECK_V2P_TOMBSTONES: v2p_swa has "
-                        "tombstoned (-1) entries for live virtual ids in "
-                        f"out_cache_loc. count={int(bad_mask.sum().item())}, "
-                        f"sample_positions={sample.tolist()}, "
-                        f"sample_virtuals={ret.out_cache_loc[sample].tolist()}, "
-                        "indicates an invariant violation. The clamp in "
-                        "translate_loc_from_full_to_swa would otherwise "
-                        "mask this by routing to swa-physical slot 0."
-                    )
 
         # Init lora information
         if model_runner.server_args.enable_lora:
