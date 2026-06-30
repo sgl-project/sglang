@@ -36,6 +36,16 @@ from sglang.srt.function_call.core_types import (
 logger = logging.getLogger(__name__)
 
 
+_PYTHONIC_NAME_LITERALS = {
+    "True": True,
+    "False": False,
+    "None": None,
+    "true": True,
+    "false": False,
+    "null": None,
+}
+
+
 class Lfm2Detector(BaseFormatDetector):
     """
     Detector for LFM2 (Liquid Foundation Model 2) function call format.
@@ -86,15 +96,12 @@ class Lfm2Detector(BaseFormatDetector):
         elif isinstance(val, ast.Tuple):
             return tuple(self._get_parameter_value(v) for v in val.elts)
         elif isinstance(val, ast.Name):
-            # Handle True, False, None as names in older Python
-            if val.id == "True":
-                return True
-            elif val.id == "False":
-                return False
-            elif val.id == "None":
-                return None
-            else:
-                raise ValueError(f"Unsupported name reference: {val.id}")
+            # Python True/False/None are ast.Constant on modern Python, but
+            # accept their legacy node shape plus LFM2's JSON-literal spellings.
+            try:
+                return _PYTHONIC_NAME_LITERALS[val.id]
+            except KeyError:
+                raise ValueError(f"Unsupported name reference: {val.id}") from None
         elif isinstance(val, ast.UnaryOp) and isinstance(val.op, ast.USub):
             # Handle negative numbers like -5
             inner = self._get_parameter_value(val.operand)
@@ -105,6 +112,19 @@ class Lfm2Detector(BaseFormatDetector):
             raise ValueError(
                 f"Tool call arguments must be literals, got: {type(val).__name__}"
             )
+
+    def _get_function_name(self, func: ast.AST) -> Optional[str]:
+        """Extract a flat or dotted function name from a Pythonic call node."""
+        parts: List[str] = []
+        while isinstance(func, ast.Attribute):
+            parts.append(func.attr)
+            func = func.value
+
+        if not isinstance(func, ast.Name):
+            return None
+
+        parts.append(func.id)
+        return ".".join(reversed(parts))
 
     def _parse_pythonic_call(
         self, call: ast.Call, call_index: int, tool_indices: Dict[str, int]
@@ -120,13 +140,12 @@ class Lfm2Detector(BaseFormatDetector):
         Returns:
             ToolCallItem if successful, None if the call should be skipped
         """
-        if not isinstance(call.func, ast.Name):
+        function_name = self._get_function_name(call.func)
+        if function_name is None:
             logger.warning(
-                f"Tool call function must be a simple name, got: {type(call.func).__name__}"
+                f"Tool call function must be a name or dotted name, got: {type(call.func).__name__}"
             )
             return None
-
-        function_name = call.func.id
 
         # Validate that the function exists in the tools
         if function_name not in tool_indices:
