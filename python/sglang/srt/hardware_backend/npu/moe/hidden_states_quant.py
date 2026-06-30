@@ -52,7 +52,6 @@ class HiddenStatesStaticQuant(BaseHiddenStatesQuant):
         hidden_states: torch.Tensor,
         layer: torch.nn.Module,
     ) -> Tuple[torch.Tensor, None]:
-        # Optional defensive check (as suggested in the review)
         if not hasattr(layer, "aclnn_input_scale_reciprocal") or not hasattr(
             layer, "aclnn_input_offset"
         ):
@@ -70,3 +69,26 @@ class HiddenStatesStaticQuant(BaseHiddenStatesQuant):
             False,
         )
         return quantized, None
+
+
+class HiddenStatesMXFP8DynamicQuant(BaseHiddenStatesQuant):
+    """
+    Dynamic MXFP8 per‑token quantisation for NPU MoE hidden states.
+
+    Uses the NPU dynamic MX quantisation API to produce
+    ``float8_e4m3fn`` quantized activations and
+    ``float8_e8m0fnu`` per‑token scales.
+    """
+
+    def __init__(self) -> None:
+        # quant_dtype is not needed here because npu_dynamic_mx_quant
+        # will always output float8_e4m3fn
+        super().__init__(torch.float8_e4m3fn)
+
+    def __call__(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        quantized, scale = torch.ops.npu.npu_dynamic_mx_quant(
+            hidden_states, dst_type=torch.float8_e4m3fn
+        )
+        return quantized, scale
