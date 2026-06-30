@@ -218,9 +218,8 @@ class FusedMoE(torch.nn.Module):
         self._num_local_routed = self._num_global_routed // self.moe_ep_size
         self.num_local_experts = self._num_local_routed + num_fused_shared_experts
         self._has_fused_shared = num_fused_shared_experts > 0
-        self._fp8_shared_to_fp4_pending: dict[
-            tuple[int, str], dict[str, torch.Tensor]
-        ] = {}
+        self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
+        self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
 
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
@@ -620,15 +619,18 @@ class FusedMoE(torch.nn.Module):
             return False
 
         key = (expert_id, shard_id)
-        entry = self._fp8_shared_to_fp4_pending.setdefault(key, {})
-        entry["weight" if is_weight else "scale"] = loaded_weight
-        if "weight" not in entry or "scale" not in entry:
-            return True
-
-        fp8_weight = entry.pop("weight")
-        fp8_scale = entry.pop("scale")
-        if not entry:
-            self._fp8_shared_to_fp4_pending.pop(key, None)
+        if is_weight:
+            fp8_weight = loaded_weight
+            fp8_scale = self._pending_fp8_shared_scales.pop(key, None)
+            if fp8_scale is None:
+                self._pending_fp8_shared_weights[key] = loaded_weight
+                return True
+        else:
+            fp8_weight = self._pending_fp8_shared_weights.pop(key, None)
+            fp8_scale = loaded_weight
+            if fp8_weight is None:
+                self._pending_fp8_shared_scales[key] = loaded_weight
+                return True
 
         logging.getLogger(__name__).warning_once(
             "Loading FP8 shared expert weights into FP4 fused MoE weights. "
