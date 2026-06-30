@@ -578,15 +578,9 @@ class HiRadixCache(RadixCache):
                 drained += 1
                 yield item
 
-        def _revoke_prefetch(req_id, info):
-            last_host_node, prefetch_key, _ = info
-            self._abandon_prefetch(req_id, last_host_node, prefetch_key)
-
         def _drain_revoke():
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                info = self.ongoing_prefetch.get(req_id)
-                if info is not None:
-                    _revoke_prefetch(req_id, info)
+                self._revoke_pending_prefetch(req_id)
 
         def _drain_storage_hit():
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
@@ -597,7 +591,7 @@ class HiRadixCache(RadixCache):
                     continue
                 if operation.is_terminated():
                     # request was aborted while the storage query was in flight
-                    _revoke_prefetch(req_id, info)
+                    self._revoke_pending_prefetch(req_id)
                     continue
 
                 # The L3 hit count is now known, so reserve exactly that much host
@@ -607,7 +601,7 @@ class HiRadixCache(RadixCache):
                     self.evict_host(operation.storage_hit_count)
                     host_indices = cc.mem_pool_host.alloc(operation.storage_hit_count)
                 if host_indices is None:
-                    _revoke_prefetch(req_id, info)
+                    self._revoke_pending_prefetch(req_id)
                     logger.debug(
                         f"Revoking prefetch for request {req_id} due to host memory allocation failure."
                     )
@@ -1468,14 +1462,12 @@ class HiRadixCache(RadixCache):
         can_terminate = can_terminate or operation_terminated
         return can_terminate
 
-    def _abandon_prefetch(self, req_id: str, last_host_node, prefetch_key):
-        """Forget an in-flight prefetch: drop the host-node protection, remove it
-        from ongoing_prefetch, and decrement the in-flight prefetch token counter.
-        No host_indices is freed here -- under lazy allocation an abandoned prefetch
-        holds none until _drain_storage_hit() runs (and the host_indices-allocated
-        case is cleaned up by the normal completion path instead)."""
+    def _revoke_pending_prefetch(self, req_id: str):
+        info = self.ongoing_prefetch.pop(req_id, None)
+        if info is None:
+            return
+        last_host_node, prefetch_key, _ = info
         last_host_node.release_host()
-        self.ongoing_prefetch.pop(req_id, None)
         cc = self.cache_controller
         cc.prefetch_tokens_occupied = max(
             0, cc.prefetch_tokens_occupied - len(prefetch_key)
@@ -1492,9 +1484,10 @@ class HiRadixCache(RadixCache):
             return False
 
         if operation.host_indices is None:
-            # Stopping before allocation happened
+            # Stopping before host memory was committed (best_effort, timeout, or
+            # still mid-query): signal the worker to stop, then release the request.
             self.cache_controller.terminate_prefetch(operation)
-            self._abandon_prefetch(req_id, last_host_node, prefetch_key)
+            self._revoke_pending_prefetch(req_id)
             return True
 
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
