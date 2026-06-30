@@ -338,9 +338,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         if self.is_fp8_kvcache:
-            assert (
-                self.dcp_world_size == 1
-            ), "FlashMLA does not support DCP for FP8 kv cache"
             if layer.k_scale is not None:
                 q_scale = layer.k_scale
                 descale_q = layer.k_scale.reshape(1)
@@ -358,7 +355,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             reshape_q_2d = reshape_q.reshape(-1, q_shape[-1])
             reshape_q_fp8_2d, _ = scaled_fp8_quant(reshape_q_2d, q_scale)
             reshape_q_fp8 = reshape_q_fp8_2d.reshape(q_shape)
-            o, _ = flash_mla_with_kvcache(
+            o, lse = flash_mla_with_kvcache(
                 q=reshape_q_fp8,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                 block_table=self.forward_metadata.block_kv_indices[:bs],
@@ -372,7 +369,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 descale_k=descale_k,
             )
 
-            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            if dcp_enabled():
+                return o, lse
+            return o
         else:
             # todo: need check all causal True or False?
             o, lse = flash_mla_with_kvcache(
@@ -440,7 +440,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 reshape_q_2d = reshape_q.reshape(-1, q_shape[-1])
                 reshape_q_fp8_2d, _ = scaled_fp8_quant(reshape_q_2d, q_scale)
                 reshape_q_fp8 = reshape_q_fp8_2d.reshape(q_shape)
-                o, _ = flash_mla_with_kvcache(
+                o, lse = flash_mla_with_kvcache(
                     q=reshape_q_fp8,
                     k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                     block_table=self.forward_metadata.block_kv_indices[:bs],
@@ -455,7 +455,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     descale_k=descale_k,
                 )
             else:
-                o, _ = flash_mla_with_kvcache(
+                o, lse = flash_mla_with_kvcache(
                     q=reshape_q,
                     k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                     block_table=self.forward_metadata.block_kv_indices[:bs],
@@ -467,7 +467,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     softmax_scale=layer.scaling,
                     causal=True,
                 )
-            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            if dcp_enabled():
+                return o, lse
+            return o
 
 
 class FlashMLAMultiStepDraftBackend:
