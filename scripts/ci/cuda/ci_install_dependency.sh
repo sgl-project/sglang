@@ -46,9 +46,15 @@ configure_environment() {
     fi
     mkdir -p "${SGLANG_CACHE_DIR}"
     echo "SGLANG_CACHE_DIR=${SGLANG_CACHE_DIR}"
+    if [ -z "${OUTLINES_CACHE_DIR:-}" ]; then
+        export OUTLINES_CACHE_DIR="${RUNNER_TEMP:-/tmp}/outlines-cache"
+    fi
+    mkdir -p "${OUTLINES_CACHE_DIR}"
+    echo "OUTLINES_CACHE_DIR=${OUTLINES_CACHE_DIR}"
     if [ -n "${GITHUB_ENV:-}" ]; then
         echo "UV_CACHE_DIR=${UV_CACHE_DIR}" >> "${GITHUB_ENV}" || true
         echo "SGLANG_CACHE_DIR=${SGLANG_CACHE_DIR}" >> "${GITHUB_ENV}" || true
+        echo "OUTLINES_CACHE_DIR=${OUTLINES_CACHE_DIR}" >> "${GITHUB_ENV}" || true
     fi
 
     # Whether to create a uv venv (set USE_VENV=1). Default: 0.
