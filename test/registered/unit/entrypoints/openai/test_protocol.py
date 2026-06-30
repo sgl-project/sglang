@@ -140,6 +140,12 @@ class TestChatCompletionRequest(unittest.TestCase):
             ).parallel_tool_calls
         )
 
+    def test_parallel_tool_calls_absent_is_not_injected_by_validator(self):
+        values = ChatCompletionRequest.set_tool_choice_default(
+            {"model": "x", "messages": [{"role": "user", "content": "Hello"}]}
+        )
+        self.assertNotIn("parallel_tool_calls", values)
+
     def test_sampling_param_build(self):
         req = ChatCompletionRequest(
             model="x",

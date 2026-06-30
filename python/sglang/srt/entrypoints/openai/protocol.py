@@ -892,8 +892,8 @@ class ChatCompletionRequest(BaseModel):
             else:
                 values["tool_choice"] = "auto"
         # An explicit null parallel_tool_calls means "use the field default",
-        # not False, so downstream consumers never see None.
-        if values.get("parallel_tool_calls") is None:
+        # not False; omitted values should leave default ownership to Pydantic.
+        if "parallel_tool_calls" in values and values["parallel_tool_calls"] is None:
             values["parallel_tool_calls"] = cls.model_fields[
                 "parallel_tool_calls"
             ].default
