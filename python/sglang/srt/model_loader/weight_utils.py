@@ -296,6 +296,8 @@ def get_quant_config(
     if not possible_config_filenames:
         if model_config.quantization == "mxfp8":
             return Fp8Config(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
+        if model_config.quantization == "blockwise_fp8":
+            return Fp8Config(blockwise_fp8=True, is_checkpoint_fp8_serialized=False)
         if model_config.quantization == "quark_mxfp4":
             return quant_cls(
                 online_scheme=model_config.quantization,
