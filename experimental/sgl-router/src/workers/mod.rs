@@ -9,6 +9,7 @@ pub mod worker;
 pub use introspect::{ServerInfo, WorkerIntrospector};
 pub use registry::WorkerRegistry;
 pub use worker::LoadGuard;
+pub use worker::WireProtocol;
 pub use worker::Worker;
 
 use std::sync::Arc;

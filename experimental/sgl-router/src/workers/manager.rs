@@ -7,7 +7,7 @@ use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::kv_events::KvEventIndex;
 use crate::workers::introspect::{DisaggregationRole, WorkerIntrospector};
-use crate::workers::WorkerRegistry;
+use crate::workers::{WireProtocol, WorkerRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,6 +42,28 @@ fn cb_config_for_spec(spec: &WorkerSpec, cfg: &Config) -> Option<CircuitBreakerC
     None
 }
 
+/// Resolve the wire protocol for a worker from its `/server_info`
+/// (`enable_http2`) and the scheme of the URL the router will dial.
+///
+/// Upgrades to [`WireProtocol::H2c`] only when the engine self-reports
+/// `--enable-http2` **and** the worker URL is cleartext `http://`. The h2c
+/// client speaks cleartext HTTP/2 with prior knowledge, which is what
+/// Granian's `HTTPModes.auto` serves on a plaintext port. An `https://`
+/// engine with `--enable-http2` instead serves HTTP/2 over TLS (ALPN); the
+/// router dials cleartext and cannot speak that, so it stays on HTTP/1.1 —
+/// which the default reqwest client negotiates fine over TLS. Everything
+/// else (`Some(false)`, `None` from older SGLang, an unparsable URL) also
+/// stays on the always-safe HTTP/1.1 default.
+fn resolve_protocol(enable_http2: Option<bool>, worker_url: &str) -> WireProtocol {
+    let dials_cleartext = url::Url::parse(worker_url)
+        .map(|u| u.scheme() == "http")
+        .unwrap_or(false);
+    match (enable_http2, dials_cleartext) {
+        (Some(true), true) => WireProtocol::H2c,
+        _ => WireProtocol::Http1,
+    }
+}
+
 pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistry>) {
     run_with_config(rx, registry, None, None, None).await;
 }
@@ -50,6 +72,11 @@ pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistr
 /// configuration from `cfg`, an optional KV-event index that is notified
 /// on every worker add / remove, and an optional active-load registry
 /// that is asked to forget per-worker counters on `Removed`.
+///
+/// The forwarding wire protocol (HTTP/1.1 vs cleartext h2c) is resolved per
+/// worker from its `/server_info` and stamped onto the registered
+/// [`crate::workers::Worker`] (see `register_one`), so the manager does not
+/// need a handle to the proxy.
 ///
 /// When `kv_index` is `None` the cache-aware-zmq path is disabled
 /// (selection falls through to the non-cache-aware policies); when
@@ -125,6 +152,12 @@ pub async fn run_with_introspector(
 ///   [`reconcile_unresolved_workers`]). Runs on the same loop and shares
 ///   `pending` with the discovery events so re-registrations stay
 ///   serialized per id against concurrent `Added` / `Removed`.
+// Each argument is a distinct collaborator threaded into the loop (event
+// source, registry, plus the optional cfg / kv-index / active-load
+// injections and the introspector + reconcile cadence). Bundling them into a
+// struct purely to satisfy the arg-count heuristic would add indirection
+// without clarity.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_with_introspector_and_reconcile(
     mut rx: mpsc::Receiver<DiscoveryEvent>,
     registry: Arc<WorkerRegistry>,
@@ -203,6 +236,10 @@ pub async fn run_with_introspector_and_reconcile(
 /// `tokio::select!`. See the concurrency-model doc on
 /// [`run_with_introspector_and_reconcile`] for the per-id ordering
 /// contract `pending` enforces.
+// Mirrors `run_with_introspector_and_reconcile`'s collaborator set (minus the
+// reconcile cadence, plus `pending`); see the note there on why these stay as
+// positional arguments rather than a bundle.
+#[allow(clippy::too_many_arguments)]
 async fn handle_discovery_event(
     event: DiscoveryEvent,
     registry: &Arc<WorkerRegistry>,
@@ -428,7 +465,26 @@ async fn register_one(
             spec.bootstrap_port = new_port;
         }
     }
+    // Pick cleartext h2c vs HTTP/1.1 from the engine's self-report and the
+    // dialed scheme (see `resolve_protocol`). HTTP/1.1 is the always-safe
+    // default: Granian's `auto` mode accepts it, and it negotiates fine over
+    // TLS — so the only mismatch that would fail (cleartext h2c to a non-h2c
+    // endpoint) is exactly what the cleartext-scheme gate prevents.
+    let protocol = resolve_protocol(info.enable_http2, &worker_url);
+    match protocol {
+        WireProtocol::H2c => tracing::info!(
+            worker_url = %worker_url,
+            "/server_info reports --enable-http2 on a cleartext worker; forwarding over h2c",
+        ),
+        WireProtocol::Http1 if info.enable_http2 == Some(true) => tracing::warn!(
+            worker_url = %worker_url,
+            "/server_info reports --enable-http2 but the worker URL is not cleartext http://; \
+             the router only speaks cleartext h2c, staying on HTTP/1.1",
+        ),
+        WireProtocol::Http1 => {}
+    }
     let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
+    let worker_id = spec.id.clone();
     if let Err(e) = registry.add_with_cb(spec, cb) {
         // Mixed PD + plain on the same model is rejected at registration
         // time. Log loudly so the operator notices the conflicting
@@ -442,6 +498,16 @@ async fn register_one(
             "worker manager: refused to register worker due to mixed PD/plain configuration",
         );
         return;
+    }
+    // Stamp the resolved protocol onto the freshly-registered worker. Per
+    // worker (not a fleet-wide client): a worker that transiently failed
+    // introspection stays HTTP/1.1 without forcing the rest of the fleet off
+    // h2c, and a reconcile re-introspection upgrades the worker in place once
+    // the engine is ready. `add_with_cb` is an upsert that builds a new
+    // `Worker` (resetting its protocol to the Http1 default), so we set the
+    // protocol on the post-insert entry.
+    if let Some(w) = registry.get(&worker_id) {
+        w.set_protocol(protocol);
     }
     if let Some(idx) = kv_index {
         // Pass the pre-resolved EventConfig so the KvEventIndex does
@@ -504,6 +570,49 @@ mod tests {
         let cb = cb_config_for_spec(&spec, &cfg).expect("model has cb config");
         assert_eq!(cb.threshold.get(), 5);
         assert_eq!(cb.cool_down, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn resolve_protocol_upgrades_to_h2c_only_for_cleartext_http2_engine() {
+        // The one case that gets h2c: engine self-reports --enable-http2 and
+        // we dial cleartext http://.
+        assert_eq!(
+            resolve_protocol(Some(true), "http://10.0.0.1:30000"),
+            WireProtocol::H2c,
+        );
+    }
+
+    #[test]
+    fn resolve_protocol_stays_http1_for_https_even_with_http2() {
+        // A TLS engine with --enable-http2 serves h2-over-TLS, not cleartext
+        // h2c; the router dials cleartext, so it must stay on HTTP/1.1
+        // (which negotiates fine over TLS) rather than break every request.
+        assert_eq!(
+            resolve_protocol(Some(true), "https://10.0.0.1:30000"),
+            WireProtocol::Http1,
+        );
+    }
+
+    #[test]
+    fn resolve_protocol_stays_http1_when_http2_disabled_or_unknown() {
+        // Explicit false (HTTP/1.1-only Uvicorn) and absent field (older
+        // SGLang) both keep the safe default.
+        assert_eq!(
+            resolve_protocol(Some(false), "http://10.0.0.1:30000"),
+            WireProtocol::Http1,
+        );
+        assert_eq!(
+            resolve_protocol(None, "http://10.0.0.1:30000"),
+            WireProtocol::Http1,
+        );
+    }
+
+    #[test]
+    fn resolve_protocol_stays_http1_for_unparsable_url() {
+        assert_eq!(
+            resolve_protocol(Some(true), "not a url"),
+            WireProtocol::Http1,
+        );
     }
 
     /// Helper: spawn a tiny fake worker that returns the supplied JSON body
@@ -1057,6 +1166,93 @@ mod tests {
             registry.get(&id).unwrap().model_ids,
             vec![ModelId("m".into())],
             "recovered worker must carry the resolved model id",
+        );
+
+        drop(tx);
+        let _ = manager_handle.await;
+    }
+
+    /// A worker that failed its initial `/server_info` (so registered with the
+    /// HTTP/1.1 default) must be UPGRADED to h2c by the reconcile loop once the
+    /// engine is ready and reports `enable_http2: true`. This is the second
+    /// half of the production fix: per-worker protocol resolution that is
+    /// re-resolvable, so a transient startup failure does not strand an
+    /// h2c-capable engine on HTTP/1.1 forever.
+    #[tokio::test]
+    async fn reconcile_upgrades_worker_to_h2c_after_transient_failure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::timeout;
+
+        // While not-ready the worker answers 503 (introspection fails → Http1,
+        // empty model_ids); once ready it reports a model AND enable_http2.
+        let ready = Arc::new(AtomicBool::new(false));
+        let (worker_url, _shutdown) = spawn_switchable_server_info_worker(
+            json!({"served_model_name": "m", "enable_http2": true}),
+            ready.clone(),
+        )
+        .await;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+            Duration::from_millis(150),
+        ));
+
+        let id = WorkerId("w-warming".into());
+        tx.send(DiscoveryEvent::Added(WorkerSpec {
+            id: id.clone(),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            bootstrap_port: None,
+        }))
+        .await
+        .unwrap();
+
+        // Phase 1: the warming worker is registered on the safe HTTP/1.1
+        // default (introspection failed → empty model_ids, no h2c).
+        let stuck = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(w) = registry.get(&id) {
+                    if w.model_ids.is_empty() && w.protocol() == WireProtocol::Http1 {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            stuck.is_ok(),
+            "a worker that failed initial /server_info must register on the HTTP/1.1 default",
+        );
+
+        // The engine finishes coming up.
+        ready.store(true, Ordering::SeqCst);
+
+        // Phase 2: reconcile re-introspects and upgrades the worker to h2c.
+        let upgraded = timeout(Duration::from_secs(3), async {
+            loop {
+                if registry
+                    .get(&id)
+                    .is_some_and(|w| w.protocol() == WireProtocol::H2c)
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            upgraded.is_ok(),
+            "reconcile must upgrade the worker to h2c once /server_info reports enable_http2; got {:?}",
+            registry.get(&id).map(|w| w.protocol()),
         );
 
         drop(tx);

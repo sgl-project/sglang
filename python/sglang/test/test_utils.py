@@ -31,7 +31,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from sglang.bench_serving import run_benchmark
+from sglang.benchmark.serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
@@ -1616,7 +1616,7 @@ def run_bench_offline_throughput(model, other_args):
     command = [
         "python3",
         "-m",
-        "sglang.bench_offline_throughput",
+        "sglang.benchmark.offline_throughput",
         "--num-prompts",
         "1",
         "--dataset-name",

@@ -142,7 +142,17 @@ async fn main() -> Result<()> {
     let janitor_handle =
         sgl_router::policies::active_load::spawn_janitor(Arc::clone(&active_load), sweep_interval);
 
-    // Spawn discovery + manager tasks.
+    let proxy = Arc::new(
+        sgl_router::proxy::Proxy::new(std::time::Duration::from_secs(
+            cfg.proxy.request_timeout_secs,
+        ))
+        .context("construct proxy")?,
+    );
+
+    // Spawn discovery + manager tasks. The manager resolves each worker's wire
+    // protocol from its `/server_info` and stamps it onto the registered
+    // worker; the proxy holds a client per protocol and selects by the worker's
+    // protocol per request, so the manager needs no proxy handle.
     let (event_rx, discovery_handle) = sgl_router::discovery::spawn_discovery(&cfg)
         .await
         .context("spawn discovery")?;
@@ -160,17 +170,11 @@ async fn main() -> Result<()> {
     // held past the TTL (a leaked guard whose request hung and never dropped).
     // Complements the SSE idle timeout so the cap can never stay pinned and
     // false-shed forever. Sweep every 60 s; a slot held > 10 min is leaked.
+    // (`proxy` is already constructed above, before the manager spawn.)
     let _worker_load_janitor = sgl_router::workers::spawn_load_janitor(
         registry.clone(),
         std::time::Duration::from_secs(600),
         std::time::Duration::from_secs(60),
-    );
-
-    let proxy = Arc::new(
-        sgl_router::proxy::Proxy::new(std::time::Duration::from_secs(
-            cfg.proxy.request_timeout_secs,
-        ))
-        .context("build proxy client")?,
     );
 
     let ctx = Arc::new(
