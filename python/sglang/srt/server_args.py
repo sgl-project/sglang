@@ -7230,6 +7230,12 @@ class ServerArgs:
                                                   # prompts at this size
                 "dp_size": <dp_size>,             # number of SUB sockets
                                                   # to open
+                "load_endpoint_port_base": 5557 + <dp_size>,
+                                                  # base TCP port of the
+                                                  # dedicated load-snapshot
+                                                  # range (load rank r =
+                                                  # base + r); omitted if it
+                                                  # would overflow u16
             }
 
         Returns None (i.e. "no publisher to describe") when any of:
@@ -7249,8 +7255,8 @@ class ServerArgs:
         new module-level helper.
         """
         # Lazy import so loading server_args doesn't pull in
-        # disaggregation / msgspec / zmq at module top level.
-        from sglang.srt.disaggregation.kv_events import KVEventsConfig
+        # msgspec / zmq at module top level.
+        from sglang.srt.utils.event_publisher import KVEventsConfig
 
         raw = self.kv_events_config
         page_size = self.page_size
@@ -7278,7 +7284,7 @@ class ServerArgs:
             return None
         if not host or not (0 < port < 65536):
             return None
-        return {
+        descriptor = {
             "publisher": cfg.publisher,
             "endpoint_host": host,
             "endpoint_port_base": port,
@@ -7286,6 +7292,17 @@ class ServerArgs:
             "block_size": page_size,
             "dp_size": self.dp_size,
         }
+        # Dedicated port range for runtime load snapshots, packed immediately
+        # after the KV-event range (load rank r binds load_endpoint_port_base +
+        # r). Load-aware routers connect there to read the engine's true queue
+        # depth / KV occupancy. Absent => the worker predates load publishing,
+        # or the range would overflow u16; the router then falls back to its
+        # own in-flight counter. Must agree with SchedulerLoadPublisher, which
+        # binds the load publisher at kv_base + dp_size.
+        load_port_base = port + self.dp_size
+        if self.dp_size >= 1 and load_port_base + self.dp_size - 1 < 65536:
+            descriptor["load_endpoint_port_base"] = load_port_base
+        return descriptor
 
 
 # NOTE: This is a global variable to hold the server args for scheduler.
