@@ -1156,6 +1156,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 logprob_start_len=obj.logprob_start_len,
                 top_logprobs_num=obj.top_logprobs_num,
                 token_ids_logprob=obj.token_ids_logprob,
+                return_text_in_logprobs=obj.return_text_in_logprobs,
+                return_token_ids_in_logprobs=obj.return_token_ids_in_logprobs,
                 stream=obj.stream,
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
@@ -1907,6 +1909,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state.obj.token_ids_logprob,
                     state.obj.return_text_in_logprobs
                     and not self.server_args.skip_tokenizer_init,
+                    state.obj.return_token_ids_in_logprobs,
                     recv_obj,
                     i,
                 )
@@ -2143,6 +2146,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         top_logprobs_num: int,
         token_ids_logprob: List[int],
         return_text_in_logprobs: bool,
+        return_token_ids_in_logprobs: bool = True,
     ):
         # 1. Handle regular logprobs
         if len(state.input_token_logprobs_val) > len(state.input_token_logprobs):
@@ -2203,6 +2207,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             len(state.input_token_ids_logprobs) :
                         ],
                         return_text_in_logprobs,
+                        return_token_ids_in_logprobs,
                     )
                 )
             if len(state.output_token_ids_logprobs_val) > len(
@@ -2217,6 +2222,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             len(state.output_token_ids_logprobs) :
                         ],
                         return_text_in_logprobs,
+                        return_token_ids_in_logprobs,
                     )
                 )
 
@@ -2232,6 +2238,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return_text_in_logprobs: bool,
         recv_obj: BatchStrOutput,
         recv_obj_index: int,
+        return_token_ids_in_logprobs: bool = True,
     ):
         if recv_obj.input_token_logprobs_val is None:
             return
@@ -2289,6 +2296,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             state.obj.top_logprobs_num,
             state.obj.token_ids_logprob,
             return_text_in_logprobs,
+            return_token_ids_in_logprobs,
         )
 
     def detokenize_logprob_tokens(
@@ -2296,8 +2304,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         token_logprobs_val: List[float],
         token_logprobs_idx: List[int],
         decode_to_text: bool,
+        return_token_ids: bool = True,
     ):
         if not decode_to_text:
+            if not return_token_ids:
+                return list(token_logprobs_val)
             return [
                 (logprob, token_id, None)
                 for logprob, token_id in zip(token_logprobs_val, token_logprobs_idx)
@@ -2309,6 +2320,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             token_texts = self.tokenizer.batch_decode(
                 [[idx] for idx in token_logprobs_idx]
             )
+            if not return_token_ids:
+                return list(zip(token_logprobs_val, token_texts))
             return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
 
     def detokenize_top_logprobs_tokens(
@@ -2316,6 +2329,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         token_logprobs_val: List[float],
         token_logprobs_idx: List[int],
         decode_to_text: bool,
+        return_token_ids: bool = True,
     ):
         # TODO: The current implementation only batches the detokenization for top-k tokens per single position.
         # We should batch all top-k tokens in all positions.
@@ -2324,7 +2338,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if token_logprobs_val[i]:
                 ret.append(
                     self.detokenize_logprob_tokens(
-                        token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
+                        token_logprobs_val[i],
+                        token_logprobs_idx[i] if token_logprobs_idx else None,
+                        decode_to_text,
+                        return_token_ids,
                     )
                 )
             else:

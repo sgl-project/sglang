@@ -203,6 +203,8 @@ class GenerateReqInput:
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
+    # Whether to include token ids in the returned logprobs.
+    return_token_ids_in_logprobs: bool = True
     # Whether to stream output.
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
@@ -713,6 +715,7 @@ class GenerateReqInput:
             top_logprobs_num=self.top_logprobs_num[i],
             token_ids_logprob=self.token_ids_logprob[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
+            return_token_ids_in_logprobs=self.return_token_ids_in_logprobs,
             stream=self.stream,
             log_metrics=self.log_metrics,
             return_hidden_states=(
@@ -793,6 +796,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     top_logprobs_num: int
     # If return logprobs, the token id to return logprob for
     token_ids_logprob: Optional[List[int]]
+    # Whether to detokenize tokens in text in the returned logprobs.
+    return_text_in_logprobs: bool = False
+    # Whether to include token ids in the returned logprobs.
+    return_token_ids_in_logprobs: bool = True
     # Whether to stream output
     stream: bool
 

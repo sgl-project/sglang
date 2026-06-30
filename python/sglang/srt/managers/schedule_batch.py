@@ -676,6 +676,8 @@ class Req(ReqDllmMixin):
         top_logprobs_num: int = 0,
         dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
+        return_token_ids_in_logprobs: bool = True,
+        return_text_in_logprobs: bool = False,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[array[int]] = None,
         lora_id: Optional[str] = None,
@@ -889,6 +891,8 @@ class Req(ReqDllmMixin):
 
         # Logprobs (arguments)
         self.return_logprob = return_logprob
+        self.return_token_ids_in_logprobs = return_token_ids_in_logprobs
+        self.return_text_in_logprobs = return_text_in_logprobs
         # Start index to compute logprob from.
         self.logprob_start_len = 0
         self.logprob = ReqLogprob(
