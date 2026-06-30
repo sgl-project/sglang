@@ -1244,6 +1244,92 @@ def fused_append_shared_experts(
 
 
 @triton.jit
+def _fused_append_remap_shared_experts_deepep_kernel(
+    topk_ids_ptr,
+    topk_weights_ptr,
+    out_ids_ptr,
+    out_weights_ptr,
+    shared_id_base,  # runtime scalar: ep_rank * num_local_experts + num_local_routed
+    num_local_routed,  # runtime scalar: routed experts per rank (for gap-insertion)
+    scale_factor,  # runtime scalar: shared-expert weight
+    K: tl.constexpr,
+    S: tl.constexpr,
+):
+    """Append shared experts AND apply the DeepEP interleaved remap in one pass.
+
+    Equivalent to fused_append_shared_experts() immediately followed by
+    topk._remap_topk_for_deepep(), but the remap math runs on the rows already
+    loaded into registers, so it costs a few ALU ops instead of ~6 extra eager
+    kernel launches (div_floor / add / arange / fill / copy) per MoE layer.
+
+    Routed IDs:   e -> e + e // num_local_routed   (insert gaps for shared slots)
+    Shared IDs:   shared_id_base + arange(S)        (one id per shared slot)
+    Shared wgt:   scale_factor                     (1.0 on aiter; 1/rsf otherwise)
+    """
+    pid = tl.program_id(0)
+
+    ids_row_ptr = pid * K
+    out_ids_row_ptr = pid * (K + S)
+
+    offs_k = tl.arange(0, K)
+    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k)
+    ws = tl.load(topk_weights_ptr + ids_row_ptr + offs_k)
+
+    # DeepEP interleaved layout: shift each routed id past the shared slots that
+    # precede it. Matches `routed + routed // num_local_routed` exactly.
+    ids = ids + ids // num_local_routed
+
+    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids)
+    tl.store(out_weights_ptr + out_ids_row_ptr + offs_k, ws)
+
+    offs_s = tl.arange(0, S)
+    shared_ids = tl.cast(shared_id_base + offs_s, ids.dtype)
+    shared_ws = tl.full([S], scale_factor, dtype=ws.dtype)
+
+    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids)
+    tl.store(out_weights_ptr + out_ids_row_ptr + K + offs_s, shared_ws)
+
+
+def fused_append_remap_shared_experts_deepep(
+    topk_ids,
+    topk_weights,
+    num_fused_shared_experts,
+    scale_factor,
+    shared_id_base,
+    num_local_routed,
+):
+    """Fused append + DeepEP remap (see kernel docstring).
+
+    Replaces the fused_append_shared_experts() + _remap_topk_for_deepep() pair on
+    the aiter/DeepEP-class path. Host computes the scalar remap params so the
+    kernel stays branch-free.
+    """
+    m, k = topk_ids.shape
+    s = int(num_fused_shared_experts)
+    if s <= 0:
+        return topk_ids, topk_weights
+
+    out_ids = torch.empty((m, k + s), dtype=topk_ids.dtype, device=topk_ids.device)
+    out_weights = torch.empty(
+        (m, k + s), dtype=topk_weights.dtype, device=topk_weights.device
+    )
+
+    _fused_append_remap_shared_experts_deepep_kernel[(m,)](
+        topk_ids,
+        topk_weights,
+        out_ids,
+        out_weights,
+        shared_id_base,
+        num_local_routed,
+        scale_factor,
+        K=k,
+        S=s,
+        num_warps=1,
+    )
+    return out_ids, out_weights
+
+
+@triton.jit
 def _fused_append_shared_experts_with_weights_kernel(
     topk_ids_ptr,
     topk_weights_ptr,

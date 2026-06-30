@@ -39,7 +39,7 @@ dependencies = [
   "IPython",
   "kernels>=0.14.1,<0.15",
   "llguidance>=0.7.11,<0.8.0",
-  "mistral_common>=1.11.0",
+  "mistral_common>=1.11.5",
   "modelscope",
   "msgspec",
   "ninja",
@@ -81,7 +81,7 @@ dependencies = [
   "torchcodec==0.11.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec 0.11.1 for torch 2.11.x (0.10 is ABI-incompatible: references the pre-2.11 c10::MessageLogger ctor signature). Not available on Linux ARM.
   "torchvision",
   "tqdm",
-  "transformers==5.8.1",
+  "transformers==5.12.1",
   "uvicorn",
   "uvloop",
   "watchfiles",
@@ -140,6 +140,7 @@ fastokens = [
 test = [
   "accelerate",
   "addict",
+  "auto-round>=0.13.1",
   "bitsandbytes",
   "diff-cover",
   "expecttest",
