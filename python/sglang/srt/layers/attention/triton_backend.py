@@ -2028,9 +2028,11 @@ def update_sliding_window_buffer(
 
     ``skip_full_to_swa_translation=True`` leaves ``window_kv_indices`` as VIRTUAL
     full-token ids (no eager full->swa translate). The shared-pool cuda-graph
-    builder passes this so the window translate is CAPTURED into the decode
-    graph (``TritonAttnBackend.init_forward_metadata_in_graph``) and rewritten to
-    swa-physical in place at replay; baseline SWA leaves it False (eager).
+    builder passes this so the window translate is deferred to
+    ``TritonAttnBackend._translate_cuda_graph_shared_pool_locs`` (run in
+    ``init_forward_metadata_out_graph``, BEFORE ``graph.replay()``), which reads
+    the live v2p and rewrites the static window buffer to swa-physical in place;
+    baseline SWA leaves it False (eager).
     """
     window_kv_lens = torch.minimum(
         seq_lens,

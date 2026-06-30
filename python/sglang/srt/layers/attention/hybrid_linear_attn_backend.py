@@ -1102,26 +1102,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         if init is not None:
             init(forward_batch, disable_flashinfer_ragged)
 
-    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        """Forward the upstream #27091 in-graph metadata hook to the
-        sub-backend(s). For the shared pool this propagates the full-attn
-        (Triton) read-path v2p translate into the captured decode graph (the
-        Triton sub-backend overrides the hook); the Mamba sub-backend inherits
-        the base no-op (no kv_indices read path).
-
-        WHY THIS EXISTS: `cuda_graph_runner.run_once` calls
-        `attn_backend.init_forward_metadata_in_graph(forward_batch)`. For a
-        hybrid model the top-level `attn_backend` is THIS wrapper; without this
-        forward it would use the base no-op, the translate would be SILENTLY
-        SKIPPED, and the captured graph would read VIRTUAL kv_indices -> the
-        full-attention reads the WRONG KV slots under cg_on. The resulting
-        symptom looks like Mamba-state garble but is actually a full-attention
-        READ bug; the Mamba state divergence is downstream (layer 0's wrong
-        attention output flows through the residual).
-        """
-        for attn_backend in self.attn_backend_list:
-            attn_backend.init_forward_metadata_in_graph(forward_batch)
-
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
