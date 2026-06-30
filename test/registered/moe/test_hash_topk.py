@@ -9,8 +9,6 @@ from sglang.srt.layers.moe import hash_topk as hash_topk_module
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
-    TopKConfig,
-    remap_topk_for_per_rank_shared_slots,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.srt.runtime_context import get_parallel
@@ -102,27 +100,6 @@ def test_hash_topk_empty_output_keeps_per_rank_shared_slot(monkeypatch):
     assert output.topk_ids.shape == (0, 7)
     assert output.topk_weights.shape == (0, 7)
     assert output.router_logits.shape == (0, 6)
-
-
-def test_topk_remaps_per_rank_fused_shared_slots():
-    topk_ids = torch.tensor([[0, 65, 256], [63, 127, 256]], dtype=torch.int32)
-    topk_weights = torch.tensor([[0.8, 0.7, 1.0], [0.6, 0.5, 1.0]])
-
-    with get_parallel().override(moe_ep_size=4, moe_ep_rank=2):
-        topk_ids, topk_weights = remap_topk_for_per_rank_shared_slots(
-            topk_ids,
-            topk_weights,
-            num_fused_shared_experts=1,
-            num_physical_routed_experts=256,
-            topk_config=TopKConfig(
-                top_k=3,
-                num_fused_shared_experts=1,
-                routed_scaling_factor=2.5,
-            ),
-        )
-
-    assert topk_ids.tolist() == [[0, 66, 194], [63, 128, 194]]
-    assert torch.allclose(topk_weights[:, -1], torch.full((2,), 0.4))
 
 
 def test_deepep_empty_forward_does_not_append_shared_slot_twice():

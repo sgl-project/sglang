@@ -1,9 +1,9 @@
-"""Unit tests for the fused append + DeepEP-remap shared-experts Triton kernel.
+"""Unit tests for fused append + per-rank shared-slot remap.
 
 Covers ``fused_append_remap_shared_experts_deepep``, which collapses
 ``fused_append_shared_experts()`` followed by
 ``remap_topk_for_per_rank_shared_slots()`` into a
-single Triton launch on the aiter/DeepEP-class path. The kernel is GPU-only
+single Triton launch on the per-rank shared-slot path. The kernel is GPU-only
 (Triton), so these tests are skipped when no accelerator is present.
 """
 
@@ -55,7 +55,7 @@ def _reference_append_remap(
 @unittest.skipUnless(
     torch.cuda.is_available(), "fused append+remap kernel requires a GPU"
 )
-class TestFusedAppendRemapDeepEP(CustomTestCase):
+class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
     # (m, k, num_physical_routed, ep_size, ep_rank, num_fused_shared_experts).
     # k and num_fused_shared_experts are kept powers of two (tl.arange constraint).
     CASES = [
