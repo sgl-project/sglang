@@ -1426,7 +1426,14 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
             # Native mxfp4 experts (is_fp4_experts): checkpoint ships uint8
             # e2m1 nibbles + uint8 e8m0 block scales per expert, while the
             # fp4-expert params are int8 nibbles + float32 *_weight_scale_inv.
-            if ".mlp.experts." in name and loaded_weight.dtype == torch.uint8:
+            # Only remap when native fp4 is active; otherwise the default
+            # mxfp4->fp8-dequant path keeps the original (*.weight_scale) param
+            # names, so this rename would KeyError on w*_weight_scale_inv.
+            if (
+                ".mlp.experts." in name
+                and loaded_weight.dtype == torch.uint8
+                and getattr(self.quant_config, "is_fp4_experts", False)
+            ):
                 if name.endswith(".weight_scale"):
                     name = name + "_inv"
                     loaded_weight = torch.exp2(loaded_weight.to(torch.float32) - 127.0)
