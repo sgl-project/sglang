@@ -2526,10 +2526,34 @@ def launch_server(
     )
 
     if envs.SGLANG_RUST_SERVER.get():
-        # The embedded Rust frontend (in the rank-0 scheduler process) serves
-        # HTTP, tokenization, and detokenization. The main process has no
-        # Python HTTP server / tokenizer manager to run — just keep it alive
-        # until the scheduler process exits.
+        # The Rust frontend serves HTTP, tokenization, and detokenization, so the
+        # main process has no Python HTTP server / tokenizer manager to run. In
+        # Mode B (standalone api-server + dp_size>1) the DP ranks run headless, so
+        # node 0 also spawns the single api-server process that connects to all of
+        # them over TCP and serves HTTP; otherwise the embedded frontend(s) in the
+        # scheduler process(es) handle HTTP directly.
+        if (
+            envs.SGLANG_RUST_STANDALONE_API_SERVER.get()
+            and server_args.dp_size > 1
+            and server_args.node_rank == 0
+        ):
+            import multiprocessing as mp
+
+            from sglang.srt.managers.scheduler_components.rust_scheduler import (
+                run_rust_api_server_process,
+            )
+
+            # daemon=True so it dies with the launcher when the schedulers exit.
+            api_proc = mp.Process(
+                target=run_rust_api_server_process,
+                args=(server_args,),
+                daemon=True,
+            )
+            api_proc.start()
+            logger.info(
+                "Rust standalone api-server process started (pid=%s)", api_proc.pid
+            )
+        # Keep the main process alive until the scheduler process exits.
         scheduler_init_result.wait_for_completion()
         return
 

@@ -72,33 +72,39 @@ class RustServer:
         # pinning / NUMA isolation. setdefault so an explicit choice still wins.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-        # Per-DP-rank HTTP port (Mode A). `maybe_create` runs once per DP group
-        # (gated on the group's first TP rank), so with dp_size>1 the embedded
-        # frontends would otherwise all bind the same `host:port`. Offset by the
-        # attention DP rank so an external router / client load-balancer can
-        # target `port + dp_rank`. dp_size==1 keeps `bind=None`, letting the Rust
-        # side resolve `host:port` from server_args. The standalone-api-server
-        # mode (dp ranks headless behind one api-server) is handled separately.
+        # `maybe_create` runs once per DP group (gated on the group's first TP
+        # rank). With dp_size>1 the frontends would otherwise all bind the same
+        # `host:port`, so the address is per-DP-rank:
+        #   * Mode B (standalone api-server): the rank runs **headless** on a TCP
+        #     listener (`headless_server_bind`); a separate api-server process connects in.
+        #   * Mode A (embedded): the rank serves HTTP on `port + dp_rank`; an
+        #     external router / client LB fans out.
+        #   * dp_size==1: embedded HTTP on the base port (`bind=None` → the Rust
+        #     side resolves `host:port` from server_args).
         dp_rank = scheduler.ps.attn_dp_rank
         bind = None
-        if server_args.dp_size > 1 and not envs.SGLANG_RUST_STANDALONE_API_SERVER.get():
+        headless_server_bind = None
+        if server_args.dp_size > 1 and envs.SGLANG_RUST_STANDALONE_API_SERVER.get():
+            headless_server_bind = rust_headless_tcp_bind(server_args, dp_rank)
+        elif server_args.dp_size > 1:
             bind = f"{server_args.host}:{server_args.port + dp_rank}"
 
-        # The bind address (host:port), tokenizer source/revision, and
-        # tokenizer/detok worker counts all live in the dumped `server_args`
-        # blob, so the Rust side resolves them itself (tokenizer_path falls back
-        # to model_path there). Only the Python-computed core partition and the
-        # per-DP-rank `bind` override (neither part of server_args) pass here.
+        # The bind address, tokenizer source/revision, and tokenizer/detok worker
+        # counts live in the dumped `server_args` blob, so the Rust side resolves
+        # them itself. Only the Python-computed core partition and the per-DP-rank
+        # `bind` / `tcp_bind` override (none part of server_args) pass here.
         server = Server(
             pin_cores=cores is not None,
             cores=cores,
             bind=bind,
+            headless_server_bind=headless_server_bind,
             server_args_json=cls._build_server_args(scheduler),
         )
         logger.info(
-            "SGLANG_RUST_SERVER enabled: embedded Rust server (dp_rank=%s) listening on %s",
+            "SGLANG_RUST_SERVER enabled: Rust server (dp_rank=%s, %s) on %s",
             dp_rank,
-            bind or f"{server_args.host}:{server_args.port}",
+            "headless TCP" if headless_server_bind else "embedded HTTP",
+            headless_server_bind or bind or f"{server_args.host}:{server_args.port}",
         )
         return cls(server)
 
@@ -200,6 +206,14 @@ class RustServer:
 
     @staticmethod
     def _build_server_args(scheduler: Scheduler) -> str:
+        """JSON blob of the scheduler's ``server_args`` for its embedded Rust
+        server (carries the already-resolved ``model_config``)."""
+        return RustServer._dump_server_args_json(
+            scheduler.server_args, scheduler.model_config
+        )
+
+    @staticmethod
+    def _dump_server_args_json(server_args, model_config) -> str:
         """JSON blob of ``server_args`` handed to the Rust server.
 
         Recursively dumps the JSON-safe fields of ``server_args``, drilling into
@@ -208,12 +222,14 @@ class RustServer:
         are dropped; cycles are guarded by an identity set. Read-only static
         config; live state goes through the request pipeline.
 
-        The resolved ``model_config`` is attached to ``server_args`` first so the
-        dump carries model-derived values (e.g. ``model_config.context_len``).
+        ``model_config`` is attached to ``server_args`` first so the dump carries
+        model-derived values (e.g. ``model_config.context_len``). Shared by the
+        embedded scheduler path and the standalone api-server process, which
+        resolves its own ``ModelConfig`` (it has no scheduler).
         """
         # Make the resolved model_config part of server_args so the recursive
         # dump includes it (context_len, architecture config, …).
-        scheduler.server_args.model_config = scheduler.model_config
+        server_args.model_config = model_config
 
         drop = object()
 
@@ -252,7 +268,7 @@ class RustServer:
             seen.discard(oid)
             return out
 
-        return json.dumps(to_json_safe(scheduler.server_args, set()))
+        return json.dumps(to_json_safe(server_args, set()))
 
     @staticmethod
     def _partition_cores() -> Optional[List[int]]:
@@ -301,3 +317,51 @@ class RustServer:
             launch_cores,
         )
         return server_cores
+
+
+# --- Standalone api-server (Mode B): SGLANG_RUST_SERVER + ---------------------
+# SGLANG_RUST_STANDALONE_API_SERVER + dp_size>1. The DP ranks run headless (TCP)
+# and a single api-server process, spawned by the node-0 launcher, connects to
+# all of them and serves the HTTP API. The TCP port scheme is deterministic so
+# both the rank (bind) and the api-server (connect) compute it from server_args
+# with no handshake.
+
+
+def rust_headless_tcp_bind(server_args, dp_rank: int) -> str:
+    """TCP address of DP rank ``dp_rank``'s headless listener — the single source
+    of truth used by both the rank (to bind) and the api-server (to connect, over
+    ``[rust_headless_tcp_bind(args, i) for i in range(dp_size)]``).
+
+    Offset from the HTTP ``port`` so it never collides with the api-server's
+    ``port``. Single-node: loopback. Multi-node per-rank node-IP discovery (so the
+    api-server can reach ranks on other nodes) is a follow-up.
+    """
+    return f"{server_args.host}:{server_args.port + 1 + dp_rank}"
+
+
+def run_rust_api_server_process(server_args) -> None:
+    """Entry point for the standalone Rust api-server process (Mode B).
+
+    Resolves its own ``ModelConfig`` (it has no scheduler), dumps server_args,
+    and hands off to the Rust ``run_api_server``, which connects to every DP
+    rank over TCP and serves the OpenAI / ``/generate`` HTTP API. Blocks for the
+    process lifetime.
+    """
+    import sglang_server
+
+    from sglang.srt.configs.model_config import ModelConfig
+
+    model_config = ModelConfig.from_server_args(server_args)
+    server_args_json = RustServer._dump_server_args_json(server_args, model_config)
+
+    bind = f"{server_args.host}:{server_args.port}"
+    endpoints = [
+        rust_headless_tcp_bind(server_args, i) for i in range(server_args.dp_size)
+    ]
+    logger.info(
+        "Rust standalone api-server: HTTP %s -> %d DP ranks %s",
+        bind,
+        len(endpoints),
+        endpoints,
+    )
+    sglang_server.run_api_server(bind, endpoints, server_args_json=server_args_json)

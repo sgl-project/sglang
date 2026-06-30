@@ -11,17 +11,42 @@ use crate::error::Error;
 use crate::fsm::RequestState;
 use crate::ids::RequestId;
 
-/// Sink the API-server connection handler reads from to emit SSE frames.
-/// One per request, bounded for backpressure. The FSM owner holds the sender;
-/// dropping it (disconnect) is observed by the handler as stream end.
-pub type EgressSink = mpsc::Sender<EgressItem>;
+/// Where the egress side (detok shard) writes a request's generation/control
+/// frames. The detok calls [`EgressSink::try_send`] without caring which kind it
+/// is:
+///   * `Local` — the in-process per-request channel the API handler drains for
+///     SSE. One per request, bounded for backpressure; dropping the receiver
+///     (client disconnect) is observed as stream end.
+///   * `Net` — headless mode: each item is tagged with its `rid` and funneled to
+///     the shared TCP egress writer that multiplexes one connection per DP rank.
+#[derive(Clone, Debug)]
+pub enum EgressSink {
+    Local(mpsc::Sender<EgressItem>),
+    #[allow(dead_code)] // wired by the headless TCP transport (next step).
+    Net {
+        rid: RequestId,
+        tx: mpsc::Sender<(RequestId, EgressItem)>,
+    },
+}
+
+impl EgressSink {
+    /// Non-blocking send. `Err(())` means the consumer is gone (client
+    /// disconnected / writer closed); callers treat that as an abort signal.
+    pub fn try_send(&self, item: EgressItem) -> Result<(), ()> {
+        match self {
+            EgressSink::Local(tx) => tx.try_send(item).map_err(|_| ()),
+            EgressSink::Net { rid, tx } => tx.try_send((*rid, item)).map_err(|_| ()),
+        }
+    }
+}
+
 #[allow(dead_code)] // the receiver half is created inline in api_server::submit.
 pub type EgressSource = mpsc::Receiver<EgressItem>;
 
 /// Protocol-neutral output for one generation step (cumulative values). The
 /// detok shard produces these; each API handler formats them into its own wire
 /// shape — SGLang `/generate`, OpenAI `/v1/completions`, `/v1/chat/completions`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GenerationOutput {
     pub rid: String,
     /// Cumulative decoded text (empty in `skip_tokenizer_init` mode).

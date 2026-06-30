@@ -34,11 +34,22 @@ use crate::ids::RequestIdGen;
 use dynamo_renderer::PromptFormatter;
 
 use crate::message::{
-    ControlRequest, EgressItem, GeneratePayload, GenerateRequest, GenerationOutput, Request,
-    RequestKind,
+    ControlRequest, EgressItem, EgressSink, GeneratePayload, GenerateRequest, GenerationOutput,
+    Request, RequestKind,
 };
 use crate::runtime::ServerArgs;
 use crate::runtime::channels::{Senders, TmEvent};
+use crate::transport::NetClient;
+
+/// How the api-server reaches the pipeline. Embedded (`dp_size == 1`) uses the
+/// in-process `flume` channels; the standalone api-server process (`dp_size > 1`)
+/// reaches each headless DP rank over TCP via [`NetClient`]. `submit` is the only
+/// place that branches; every handler is transport-agnostic.
+#[derive(Clone)]
+pub enum Transport {
+    Local(Senders),
+    Net(Arc<NetClient>),
+}
 
 /// Built once at startup from the model's `tokenizer_config.json` (`None` when
 /// the model has no chat template, or under `skip_tokenizer_init`). `Clone` is a
@@ -52,7 +63,7 @@ struct ChatFormatter(PromptFormatter);
 /// bump.
 #[derive(Clone)]
 struct AppState {
-    senders: Senders,
+    transport: Transport,
     id_gen: Arc<RequestIdGen>,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
@@ -62,14 +73,14 @@ struct AppState {
 
 pub async fn serve(
     bind: SocketAddr,
-    senders: Senders,
+    transport: Transport,
     id_gen: Arc<RequestIdGen>,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
 ) {
     let chat = openai::load_chat_formatter(&server_args).map(ChatFormatter);
     let state = AppState {
-        senders,
+        transport,
         id_gen,
         egress_buf,
         server_args,
@@ -106,23 +117,36 @@ pub async fn serve(
 /// receiver to read the result(s) from. The `kind` carries the variant body
 /// (generate payload / control tag), so this stays generic over both.
 async fn submit(state: &AppState, kind: RequestKind) -> Result<mpsc::Receiver<EgressItem>, ()> {
-    let (tx, rx) = mpsc::channel::<EgressItem>(state.egress_buf);
     let id = state.id_gen.next();
-    let req = Request {
-        id,
-        state: RequestState::Received,
-        sink: tx,
-        kind,
-    };
-    // Async-aware send from this tokio task: under a full TM inbox it yields
-    // (backpressure) instead of parking a worker thread, which flume's sync
-    // `send` would do. Err only when the inbox is closed (runtime shutdown).
-    match state.senders.tm.send_async(TmEvent::Ingress(req)).await {
-        Ok(()) => Ok(rx),
-        Err(_) => {
-            tracing::error!("tm inbox closed; request dropped");
-            Err(())
+    match &state.transport {
+        // Embedded: move the request into the in-process pipeline. Async-aware
+        // send so a full TM inbox yields (backpressure) instead of parking a
+        // worker thread; Err only when the inbox is closed (runtime shutdown).
+        Transport::Local(senders) => {
+            let (tx, rx) = mpsc::channel::<EgressItem>(state.egress_buf);
+            let req = Request {
+                id,
+                state: RequestState::Received,
+                sink: EgressSink::Local(tx),
+                kind,
+            };
+            match senders.tm.send_async(TmEvent::Ingress(req)).await {
+                Ok(()) => Ok(rx),
+                Err(_) => {
+                    tracing::error!("tm inbox closed; request dropped");
+                    Err(())
+                }
+            }
         }
+        // Standalone: serialize the request and route it over TCP. Generate
+        // requests load-balance to one rank; **control** requests (e.g.
+        // `/server_info`) are answered per-rank, so they're broadcast to all and
+        // the first response wins — round-robin could pick a rank whose answer
+        // never returns, hanging the caller.
+        Transport::Net(client) => match kind {
+            RequestKind::Control(_) => client.submit_broadcast(id, kind, state.egress_buf).await,
+            RequestKind::Generate(_) => client.submit(id, kind, state.egress_buf).await,
+        },
     }
 }
 

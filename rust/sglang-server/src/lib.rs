@@ -18,12 +18,12 @@ mod message;
 mod runtime;
 mod tokenizer;
 mod tokenizer_manager;
+mod transport;
 
 use std::net::SocketAddr;
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use std::cmp::max;
 
 use crate::runtime::{Runtime, RuntimeConfig};
 
@@ -45,16 +45,13 @@ impl Server {
     #[new]
     #[pyo3(signature = (
         bind = None,
-        api_worker_num = None,
-        tokenizer_worker_num = None,
-        detokenizer_worker_num = None,
+        headless_server_bind = None,
         ingress_ring_cap = 8192,
         egress_ring_cap = 8192,
         channel_cap = 8192,
         pin_cores = true,
         cores = None,
-        tokenizer_path = None,
-        revision = None,
+
         server_args_json = "{}",
     ))]
     // pyo3 `#[new]` constructor: the wide arg list is the Python-facing boot
@@ -62,16 +59,12 @@ impl Server {
     #[allow(clippy::too_many_arguments)]
     fn start(
         bind: Option<String>,
-        api_worker_num: Option<usize>,
-        tokenizer_worker_num: Option<usize>,
-        detokenizer_worker_num: Option<usize>,
+        headless_server_bind: Option<String>,
         ingress_ring_cap: usize,
         egress_ring_cap: usize,
         channel_cap: usize,
         pin_cores: bool,
         cores: Option<Vec<usize>>,
-        tokenizer_path: Option<String>,
-        revision: Option<String>,
         server_args_json: &str,
     ) -> PyResult<Self> {
         // Static server metadata (server_args + model_config) dumped by the
@@ -92,22 +85,29 @@ impl Server {
         // standalone callers (tests) that construct a `Server` without a full
         // `server_args`.
         let bind: SocketAddr = bind
-            .or_else(|| server_args.bind())
-            .unwrap_or_else(|| "127.0.0.1:30000".to_string())
+            .unwrap_or_else(|| server_args.bind())
             .parse()
             .map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("bad bind: {e}"))
             })?;
 
-        let tokenizer_worker_num =
-            tokenizer_worker_num.unwrap_or_else(|| server_args.tokenizer_worker_num());
-        let detokenizer_worker_num =
-            detokenizer_worker_num.unwrap_or_else(|| server_args.detokenizer_worker_num());
-        let api_worker_num = api_worker_num
-            .unwrap_or_else(|| max(4, max(tokenizer_worker_num / 2, detokenizer_worker_num / 2)));
+        let tokenizer_worker_num = server_args.tokenizer_worker_num();
+        let detokenizer_worker_num = server_args.detokenizer_worker_num();
+        let api_worker_num = server_args.api_worker_num();
 
-        let tokenizer_path = tokenizer_path.or_else(|| server_args.tokenizer_path());
-        let revision = revision.or_else(|| server_args.revision());
+        let tokenizer_path = server_args.tokenizer_path();
+        let revision = server_args.revision();
+        // Headless TCP transport (`dp_size > 1`): when set, replaces the embedded
+        // HTTP api-server with a TCP listener a standalone api-server drives.
+        let headless: Option<SocketAddr> = match headless_server_bind {
+            Some(addr) => Some(addr.parse().map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "bad headless_server_bind: {e}"
+                ))
+            })?),
+            None => None,
+        };
+
         let server_args = std::sync::Arc::new(server_args);
 
         let cfg = RuntimeConfig {
@@ -122,6 +122,7 @@ impl Server {
             cores,
             tokenizer_path,
             revision,
+            headless,
             server_args,
         };
         let rt = runtime::start(cfg).map_err(|e| {
@@ -179,6 +180,75 @@ impl Server {
     }
 }
 
+/// Run the standalone api-server process (`dp_size > 1`): connect to every
+/// headless DP-rank endpoint over TCP and serve the OpenAI / `/generate` HTTP API
+/// on `bind`, routing requests across ranks. Blocks for the process lifetime;
+/// the GIL is released while the Rust HTTP server runs, so the host process can
+/// still handle signals. A connect failure surfaces as a `ValueError`.
+#[pyfunction]
+#[pyo3(signature = (
+    bind,
+    endpoints,
+    egress_buf = 8192,
+    server_args_json = "{}",
+))]
+fn run_api_server(
+    py: Python<'_>,
+    bind: String,
+    endpoints: Vec<String>,
+    egress_buf: usize,
+    server_args_json: &str,
+) -> PyResult<()> {
+    let to_val = |e: String| PyErr::new::<pyo3::exceptions::PyValueError, _>(e);
+
+    let server_args = runtime::ServerArgs::from_json(server_args_json)
+        .map_err(|e| to_val(format!("bad server_args_json: {e}")))?;
+    server_args
+        .validate_mandatory()
+        .map_err(|e| to_val(format!("server_args: {e}")))?;
+    let bind: SocketAddr = bind.parse().map_err(|e| to_val(format!("bad bind: {e}")))?;
+    let endpoints: Vec<SocketAddr> = endpoints
+        .iter()
+        .map(|e| e.parse())
+        .collect::<Result<_, _>>()
+        .map_err(|e| to_val(format!("bad endpoint: {e}")))?;
+    if endpoints.is_empty() {
+        return Err(to_val("endpoints must be non-empty".into()));
+    }
+    let standalone_api_worker_num = server_args.standalone_api_server_num();
+    let server_args = std::sync::Arc::new(server_args);
+    let id_gen = std::sync::Arc::new(crate::ids::RequestIdGen::default());
+
+    // Release the GIL: pure-Rust HTTP server that runs until the process is
+    // signalled. The async connect happens inside `block_on`.
+    py.detach(move || -> Result<(), String> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(standalone_api_worker_num)
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        rt.block_on(async move {
+            let client = transport::NetClient::connect(
+                &endpoints,
+                server_args.ingress_pool_size(),
+                server_args.egress_pool_size(),
+            )
+            .await
+            .map_err(|e| format!("connect failed: {e}"))?;
+            api_server::serve(
+                bind,
+                api_server::Transport::Net(client),
+                id_gen,
+                egress_buf,
+                server_args,
+            )
+            .await;
+            Ok(())
+        })
+    })
+    .map_err(to_val)
+}
+
 /// The Python module: `import sglang_server`.
 #[pymodule]
 fn sglang_server(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -190,5 +260,6 @@ fn sglang_server(m: &Bound<'_, PyModule>) -> PyResult<()> {
         )
         .try_init();
     m.add_class::<Server>()?;
+    m.add_function(wrap_pyfunction!(run_api_server, m)?)?;
     Ok(())
 }
