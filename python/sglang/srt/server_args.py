@@ -520,6 +520,7 @@ class ServerArgs:
     sampling_defaults: str = "model"
     asr_max_buffer_seconds: int = 60
     asr_max_concurrent_sessions: int = 32
+    asr_disable_input_slicing: bool = False
 
     # Data parallelism
     dp_size: int = 1
@@ -5308,10 +5309,12 @@ class ServerArgs:
             "--asr-max-buffer-seconds",
             type=int,
             default=ServerArgs.asr_max_buffer_seconds,
-            help="Maximum seconds of PCM audio the streaming ASR WebSocket handler "
-            "will accumulate before closing the session with a buffer_overflow "
-            "error. Guards against OOM when a client streams audio faster than "
-            "inference can consume it. Default 60s.",
+            help="Maximum seconds of PCM audio a single streaming ASR item may "
+            "receive before the session is closed with a buffer_overflow error. "
+            "Measured on total audio received per item (not the compacted "
+            "resident buffer, which input slicing bounds separately), so it caps "
+            "per-item duration and guards against unbounded per-item state growth "
+            "when a client streams faster than inference can consume. Default 60s.",
         )
         parser.add_argument(
             "--asr-max-concurrent-sessions",
@@ -5322,7 +5325,15 @@ class ServerArgs:
             "accepted, sent an error{code:too_many_sessions} frame, and closed. "
             "Default 32.",
         )
-
+        parser.add_argument(
+            "--asr-disable-input-slicing",
+            action="store_true",
+            help="Force the realtime ASR WebSocket path to use cumulative "
+            "inference (re-send the whole accumulated buffer every chunk) even "
+            "for adapters that opt into input slicing. Default off (slicing "
+            "enabled per adapter). Primarily for local A/B checks of the "
+            "sliced vs cumulative path.",
+        )
         # Data parallelism
         parser.add_argument(
             "--data-parallel-size",

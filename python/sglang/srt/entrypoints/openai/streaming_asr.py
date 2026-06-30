@@ -32,10 +32,8 @@ class StreamingASRState:
     Parameters are model-specific and should be provided via the
     adapter's ``chunked_streaming_config``.
 
-    Known limitation: rollback uses str.split() which is ineffective
-    for CJK languages (no whitespace between words).
-    TODO: implement token-level rollback to handle all languages
-    correctly.
+    CJK-style no-whitespace text uses character rollback as a conservative
+    fallback; token-level rollback is still needed for full alignment.
     """
 
     chunk_size_sec: float
@@ -51,6 +49,11 @@ class StreamingASRState:
     def get_prefix_text(self) -> str:
         if self.chunk_index < self.unfixed_chunk_num or not self.emitted_text:
             return ""
+        # Word-level overlap dedupe is still the slicing guardrail; keep CJK
+        # char-rollback streams on the cumulative path until stronger alignment
+        # is available.
+        if _is_cjk_no_whitespace(self.emitted_text):
+            return ""
         return self.emitted_text
 
     def _record_emit(self, delta: str) -> str:
@@ -64,7 +67,10 @@ class StreamingASRState:
                 self.emitted_text = delta
         return delta
 
-    def update(self, new_transcript: str) -> str:
+    def update(self, new_transcript: str, *, cumulative: bool = True) -> str:
+        if _is_cjk_no_whitespace(new_transcript):
+            return self._update_chars(new_transcript, cumulative=cumulative)
+
         old_confirmed = self.confirmed_text
         words = new_transcript.split()
         if len(words) > self.unfixed_token_num:
@@ -83,9 +89,36 @@ class StreamingASRState:
             if ow != nw:
                 break
             common_count += 1
+        if common_count == 0 and cumulative and old_words and new_words:
+            return self._record_emit(" ".join(new_words[len(old_words) :]))
         return self._record_emit(" ".join(new_words[common_count:]))
 
-    def finalize(self) -> str:
+    def _update_chars(self, new_transcript: str, *, cumulative: bool) -> str:
+        old_confirmed = self.confirmed_text
+        holdback = max(0, self.unfixed_token_num)
+        if holdback == 0:
+            self.confirmed_text = new_transcript
+        elif len(new_transcript) > holdback:
+            self.confirmed_text = new_transcript[:-holdback]
+        else:
+            self.confirmed_text = ""
+        self.full_transcript = new_transcript
+        self.chunk_index += 1
+
+        common_count = _common_prefix_len(old_confirmed, self.confirmed_text)
+        if common_count == 0 and cumulative and old_confirmed and self.confirmed_text:
+            return self._record_emit(self.confirmed_text[len(old_confirmed) :])
+        return self._record_emit(self.confirmed_text[common_count:])
+
+    def finalize(self, *, cumulative: bool = True) -> str:
+        if _is_cjk_no_whitespace(self.full_transcript):
+            old_confirmed = self.confirmed_text
+            self.confirmed_text = self.full_transcript
+            common_count = _common_prefix_len(old_confirmed, self.full_transcript)
+            if common_count == 0 and cumulative and old_confirmed and self.full_transcript:
+                return self._record_emit(self.full_transcript[len(old_confirmed) :])
+            return self._record_emit(self.full_transcript[common_count:])
+
         confirmed_words = self.confirmed_text.split()
         all_words = self.full_transcript.split()
         # Use word level common prefix to handle punctuation differences
@@ -96,8 +129,8 @@ class StreamingASRState:
                 break
             common_count += 1
         self.confirmed_text = self.full_transcript
-        if common_count == 0 and confirmed_words and all_words:
-            return self._record_emit(self.full_transcript)
+        if common_count == 0 and cumulative and confirmed_words and all_words:
+            return self._record_emit(" ".join(all_words[len(confirmed_words) :]))
         return self._record_emit(" ".join(all_words[common_count:]))
 
 
@@ -147,6 +180,23 @@ def _is_cjk(c: str) -> bool:
         or 0x4E00 <= cp <= 0x9FFF  # CJK Unified Ideographs
         or 0xFF00 <= cp <= 0xFFEF  # Halfwidth & Fullwidth Forms
     )
+
+
+def _is_cjk_no_whitespace(text: str) -> bool:
+    return (
+        bool(text)
+        and not any(c.isspace() for c in text)
+        and any(_is_cjk(c) for c in text)
+    )
+
+
+def _common_prefix_len(left: str, right: str) -> int:
+    count = 0
+    for lc, rc in zip(left, right):
+        if lc != rc:
+            break
+        count += 1
+    return count
 
 
 def needs_space(prev: str, cur: str) -> bool:
@@ -212,8 +262,7 @@ def dedupe_overlap(committed_text: str, candidate_out: str) -> str:
     ``committed_text``'s tail (word-level, case- and punctuation-insensitive).
 
     CJK has no inter-word spaces, so the word-level matcher does not help there;
-    a character-level CJK dedupe is deferred to M3, where slicing also engages
-    for CJK (today it stays on the cumulative path)."""
+    slicing stays on the cumulative path for CJK until stronger alignment exists."""
     if not committed_text or not candidate_out:
         return candidate_out
     return _dedupe_by_word(committed_text, candidate_out)
@@ -272,5 +321,5 @@ async def process_asr_chunk(
 
     if is_last:
         state.full_transcript = text
-        return state.finalize()
-    return state.update(text)
+        return state.finalize(cumulative=dedupe_against is None)
+    return state.update(text, cumulative=dedupe_against is None)
