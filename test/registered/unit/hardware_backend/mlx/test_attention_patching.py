@@ -384,6 +384,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
     def test_mlx_scheduler_init_overlap_keeps_future_map_relay(self):
         from sglang.srt.managers import scheduler as scheduler_module
+        from sglang.srt.managers.overlap_utils import RelayPayload
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -417,7 +418,9 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         self.assertIsNotNone(scheduler.future_map)
         indices = torch.tensor([1], dtype=torch.int64)
-        scheduler.future_map.stash(indices, torch.tensor([7], dtype=torch.int64))
+        scheduler.future_map.stash(
+            indices, RelayPayload(bonus_tokens=torch.tensor([7], dtype=torch.int64))
+        )
         self.assertEqual(int(scheduler.future_map.output_tokens_buf[1].item()), 7)
 
     def test_decode_finalize_does_not_snapshot_auxiliary_state(self):
@@ -1207,8 +1210,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             "_maybe_collect_customized_info": lambda *a, **k: None,
         }
         saved = {
-            name: getattr(SchedulerBatchResultProcessor, name)
-            for name in noop_stubs
+            name: getattr(SchedulerBatchResultProcessor, name) for name in noop_stubs
         }
         for name, value in noop_stubs.items():
             setattr(SchedulerBatchResultProcessor, name, value)
@@ -1229,9 +1231,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         logits_output = SimpleNamespace(customized_info=None)
         original_release = batch_result_processor_module.release_kv_cache
         original_get_indexer = batch_result_processor_module.get_global_indexer_capturer
-        original_get_server_args = (
-            batch_result_processor_module.get_global_server_args
-        )
+        original_get_server_args = batch_result_processor_module.get_global_server_args
 
         def fake_release_kv_cache(release_req, tree_cache, is_insert=False):
             events.append(("release", release_req.rid))

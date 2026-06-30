@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
 )
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cpu_ci(est_time=12, suite="base-b-test-cpu")
+register_cpu_ci(est_time=12, suite="base-c-test-cpu")
 
 # Mock get_device() so all tests run on CPU-only CI runners
 _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
@@ -69,6 +69,42 @@ class TestPrepareServerArgs(CustomTestCase):
             self.assertEqual(parsed.mm_process_config, {"image": {"resize": 128}})
         finally:
             os.unlink(config_file)
+
+
+class TestMambaCacheStochasticRounding(unittest.TestCase):
+    def test_rejects_fp32_ssm_cache(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="float32",
+            enable_mamba_cache_stochastic_rounding=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "--mamba-ssm-dtype float16"):
+            server_args._handle_mamba_backend()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_rejects_non_cuda(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="float16",
+            enable_mamba_cache_stochastic_rounding=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "NVIDIA CUDA"):
+            server_args._handle_mamba_backend()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    def test_rejects_triton_without_sm100(self, _mock_sm100, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="float16",
+            mamba_backend="triton",
+            enable_mamba_cache_stochastic_rounding=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires SM100"):
+            server_args._handle_mamba_backend()
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
