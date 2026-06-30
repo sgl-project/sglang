@@ -131,7 +131,7 @@ def build_tree_kernel_efficient(
     top_scores_index: torch.Tensor,
     draft_tokens: torch.Tensor,
     seq_lens: torch.Tensor,
-    seq_lens_sum: int,
+    seq_lens_sum: Optional[int],
     topk: int,
     spec_steps: int,
     num_verify_tokens: int,
@@ -147,6 +147,12 @@ def build_tree_kernel_efficient(
     # e.g. for bs=1, tree_mask: num_draft_token, seq_lens_sum + num_draft_token (flattened)
     # where each row indicates the attending pattern of each draft token
     # if use_partial_packed_tree_mask is True, tree_mask: num_draft_token (flattened, packed)
+    #
+    # Protocol: when tree_mask_buf is provided (preallocated), seq_lens_sum is
+    # never read — callers may pass None. When tree_mask_buf is None, the
+    # FULL_MASK path sizes the allocation from seq_lens_sum, so it must be a
+    # concrete int. Assert here so every caller gets the same error instead of
+    # each guarding independently.
     if tree_mask_buf is not None:
         tree_mask = tree_mask_buf
         if tree_mask_mode == TreeMaskMode.QLEN_ONLY:
@@ -173,6 +179,11 @@ def build_tree_kernel_efficient(
             device=device,
         )
     elif tree_mask_mode == TreeMaskMode.FULL_MASK:
+        assert seq_lens_sum is not None, (
+            "FULL_MASK requires seq_lens_sum to size the tree mask when "
+            "tree_mask_buf is None; provide a preallocated tree_mask_buf "
+            "or a concrete seq_lens_sum"
+        )
         tree_mask = torch.full(
             (
                 seq_lens_sum * num_verify_tokens
