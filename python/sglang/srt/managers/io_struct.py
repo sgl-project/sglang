@@ -1734,6 +1734,13 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
 class CheckWeightsReqInput(BaseReq):
     action: str = "checksum"
     allow_quant_error: bool = False
+    # Which runners to check; "all" is target plus any draft workers.
+    # Same convention as UpdateWeightsFrom*ReqInput.
+    selector: Literal["target", "draft", "all"] = "all"
+    # Substring matches against tensor names, skipped on every checked runner.
+    # Use when a job leaves some weights unupdated, e.g. an LLM-only RL job never
+    # touches the vision tower: ["visual.", "vision_tower."].
+    skip_tensor_list: Optional[List[str]] = None
 
 
 @dataclass
