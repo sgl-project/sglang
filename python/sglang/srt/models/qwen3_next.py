@@ -270,7 +270,28 @@ class Qwen3GatedDeltaNet(nn.Module):
         (packed-format) checkpoint weights (shard_id=None), and delegates
         to the standard MergedColumnParallelLinear loader for split checkpoint
         weights (shard_id=int/tuple)."""
-        original_loader = module.weight.weight_loader
+        # Quantized checkpoints (NVFP4 / compressed-tensors, AWQ, GPTQ, ...)
+        # either omit ``.weight`` entirely or expose it as a plain Tensor
+        # without ``weight_loader``; the canonical Parameter that carries
+        # ``weight_loader`` lives on ``.weight_packed`` (compressed-tensors)
+        # or ``.qweight`` (AWQ / GPTQ). Find it via an explicit loop -- we
+        # cannot use ``a or b`` here because ``a`` may already be a
+        # multi-element Tensor, which would itself raise ``RuntimeError:
+        # Boolean value of Tensor with more than one value is ambiguous``.
+        # See https://github.com/sgl-project/sglang/issues/13639.
+        weight_param = None
+        for _attr in ("weight", "weight_packed", "qweight"):
+            candidate = getattr(module, _attr, None)
+            if candidate is not None and hasattr(candidate, "weight_loader"):
+                weight_param = candidate
+                break
+        if weight_param is None:
+            raise AttributeError(
+                f"_make_packed_weight_loader: {type(module).__name__} "
+                "exposes neither .weight nor .weight_packed nor .qweight "
+                "carrying a weight_loader"
+            )
+        original_loader = weight_param.weight_loader
 
         def weight_loader(param, loaded_weight, loaded_shard_id=None):
             if loaded_shard_id is None:
