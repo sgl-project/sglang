@@ -45,9 +45,18 @@ def _jit_fused_store_module(
 def get_paged_mqa_logits_metadata(seq_lens: torch.Tensor, page_size: int, num_sm: int):
     assert page_size == 64
     seq_lens = seq_lens.view(-1).to(torch.int32)
+    bs = int(seq_lens.shape[0])
     metadata = seq_lens.new_empty(num_sm + 1, 2)
+    # Workspace for the multi-block path; kMBTileSize must match the .cuh.
+    if bs > 2048:
+        kMBTileSize = 4096
+        workspace = seq_lens.new_empty(
+            bs + (bs + kMBTileSize - 1) // kMBTileSize, dtype=torch.int32
+        )
+    else:
+        workspace = seq_lens.new_empty(0, dtype=torch.int32)
     module = _jit_metadata_module()
-    module.run(seq_lens, metadata)
+    module.run(seq_lens, metadata, workspace)
     return metadata
 
 
