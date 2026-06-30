@@ -1136,7 +1136,17 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     assert (
                         swa_evicted_seqlen % self.page_size == 0
                     ), f"swa_evicted_seqlen must be page aligned, {swa_evicted_seqlen=}, {self.page_size=}"
-                    if swa_evicted_seqlen <= total_prefix_length:
+                    if (
+                        swa_evicted_seqlen <= total_prefix_length
+                        and node.full_lock_ref > 0
+                    ):
+                        # Full KV is still locked by a running request. Keep it
+                        # and adopt the incoming SWA instead of freeing in-flight
+                        # Full slots.
+                        self._recover_tombstone_keeping_locked_full(
+                            node, value[:prefix_len]
+                        )
+                    elif swa_evicted_seqlen <= total_prefix_length:
                         # Branch 1: all swa tokens of value[:prefix_len] are not evicted, so we can insert it to the tree directly.
                         # Free full tokens in the original tree node.
                         self.token_to_kv_pool_allocator.free(node.value[:prefix_len])
@@ -1145,6 +1155,18 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                         node.swa_tombstone = False
                         self.swa_lru_list.insert_mru(node)
                         self.swa_evictable_size_ += len(node.value)
+                    elif (
+                        swa_evicted_seqlen < total_prefix_length + prefix_len
+                        and node.full_lock_ref > 0
+                    ):
+                        # Split first so the recovered suffix keeps the locked
+                        # Full slots, then adopt the incoming SWA for that suffix.
+                        start_update_idx = swa_evicted_seqlen - total_prefix_length
+                        self._split_node(node.key, node, start_update_idx)
+                        self._recover_tombstone_keeping_locked_full(
+                            node, value[start_update_idx:prefix_len]
+                        )
+                        self.token_to_kv_pool_allocator.free(value[:start_update_idx])
                     elif swa_evicted_seqlen < total_prefix_length + prefix_len:
                         # Branch 2: part of swa tokens of value[:prefix_len] are evicted, so we need to split the node and insert the value to new node.
                         start_update_idx = swa_evicted_seqlen - total_prefix_length
@@ -1216,6 +1238,30 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._maybe_split_leaf_for_swa_lock(new_leaf)
 
         return total_prefix_length
+
+    def _recover_tombstone_keeping_locked_full(
+        self, node: TreeNode, incoming_full: torch.Tensor
+    ) -> None:
+        """Recover a tombstoned node whose Full KV is locked by a running request.
+
+        Keep node.value, the locked Full slots, and re-point its full->SWA
+        mapping at the incoming request's fresh SWA. Free only the incoming
+        redundant Full slots, not their SWA slots.
+        """
+        assert len(node.value) == len(incoming_full), (
+            f"locked-full recover size mismatch: {len(node.value)=}, "
+            f"{len(incoming_full)=}"
+        )
+
+        allocator = self.token_to_kv_pool_allocator
+        swa_value = allocator.translate_loc_from_full_to_swa(incoming_full)
+        allocator.set_full_to_swa_mapping(node.value, swa_value)
+        allocator.full_to_swa_index_mapping[incoming_full.to(torch.int64)] = 0
+        allocator.full_attn_allocator.free(incoming_full)
+
+        node.swa_tombstone = False
+        self.swa_lru_list.insert_mru(node)
+        self.swa_evictable_size_ += len(node.value)
 
     def _add_new_node(
         self,
