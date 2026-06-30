@@ -617,6 +617,19 @@ async def health_generate(request: Request) -> Response:
         async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
             break
 
+    if _global_state.tokenizer_manager.server_args.enable_mis:
+        # MIS-only server: /generate is rejected at the tokenizer manager, so
+        # probe via the score path. Overrides gen() to exercise the same
+        # kernel chain production scoring traffic uses.
+        async def gen():
+            await _global_state.tokenizer_manager.score_request(
+                query=[0],
+                items=[[0]],
+                label_token_ids=(
+                    [0] if _global_state.tokenizer_manager.is_generation else None
+                ),
+            )
+
     task = asyncio.create_task(gen())
 
     # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
@@ -2057,6 +2070,18 @@ def _execute_server_warmup(server_args: ServerArgs):
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["text"] = json_data["text"][0]
+
+    if server_args.enable_mis:
+        # MIS-only server: /generate is rejected at the tokenizer manager, so
+        # warm up via /v1/score with a minimal MIS-structured payload. Overrides
+        # the request constructed above to exercise the same kernels production
+        # scoring traffic uses.
+        request_name = "/v1/score"
+        json_data = {
+            "query": [0],
+            "items": [[0]],
+            "label_token_ids": [0] if model_info["is_generation"] else None,
+        }
 
     # Config debug dumping
     if server_args.debug_tensor_dump_input_file:

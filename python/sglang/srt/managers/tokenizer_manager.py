@@ -593,6 +593,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         self.auto_create_handle_loop()
 
+        # Under --enable-mis the scheduler / attention / logits paths assume
+        # every batch member is MIS-structured. Non-MIS GenerateReqInputs
+        # (e.g. a stray /generate, an unredirected /health_generate, or a
+        # direct Engine.generate() call) would crash the scheduler in
+        # prepare_for_extend (sgl-project/sglang#25414), so reject them here
+        # before they ever reach the queue. The /v1/score path constructs a
+        # GenerateReqInput with multi_item_delimiter_indices populated and
+        # passes through cleanly.
+        if (
+            self.server_args.enable_mis
+            and isinstance(obj, GenerateReqInput)
+            and obj.multi_item_delimiter_indices is None
+        ):
+            raise ValueError(
+                "Non-MIS generation is disabled when --enable-mis is set. "
+                "Use /v1/score, or deploy a separate generator server."
+            )
+
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
