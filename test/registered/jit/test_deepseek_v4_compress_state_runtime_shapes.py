@@ -53,7 +53,7 @@
 #     --chunked-prefill-size 4096 \
 #     --max-prefill-tokens 16384 \
 #     --max-running-requests 32 \
-#     --cuda-graph-max-bs 16 \
+#     --cuda-graph-max-bs-decode 16 \
 #     --enable-metrics \
 #     --disable-radix-cache
 #
@@ -101,7 +101,7 @@ from sglang.jit_kernel.tests.deepseek_v4.common import (
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.utils import is_in_ci
 
-register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=25, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 Mode = Literal["decode", "prefill"]
