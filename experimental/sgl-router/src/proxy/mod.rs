@@ -474,12 +474,45 @@ impl Proxy {
         // Diagnostic: count time blocked in upstream send (connect + write body +
         // await response headers). Scoped so it decrements the instant send
         // resolves, whether it returns headers or errors.
+        //
+        // Bounded by `request_timeout`, but via an EXTERNAL `tokio::time::timeout`
+        // wrapping only this `.send()` future — not `req.timeout(self.request_timeout)`
+        // (the builder method `forward_json_to` uses). Verified empirically: reqwest's
+        // own per-request `.timeout()` covers the request's *entire* lifecycle,
+        // including a manual `bytes_stream()` poll loop made well after `.send()`
+        // already resolved — it is not a "wait for headers" timeout, it's "wait for
+        // the whole exchange, however you choose to read the body." Setting it here
+        // would silently re-impose `request_timeout` as a body-streaming cap, exactly
+        // the regression `STREAM_IDLE_TIMEOUT` (below) and the "long generations are
+        // valid" design this function documents elsewhere exist to avoid. An external
+        // `tokio::time::timeout` has no such reach: once the wrapped future resolves,
+        // the deadline is gone — the subsequent `bytes_stream()` consumption is
+        // governed only by `STREAM_IDLE_TIMEOUT`, never by this.
+        //
+        // Without this, an engine that accepts the connection but never produces
+        // headers (a wedged scheduler, not a connection failure) hangs the dispatch
+        // forever — no breaker signal (it only fires on a completed response or
+        // error), no client-visible failure, until some caller above the router
+        // times out on its own and gives up with no explanation in this router's logs.
         let resp = {
             let _send_phase = crate::diag::PhaseGuard::in_send();
-            req.send().await.map_err(|e| {
-                breaker.record_failure();
-                Self::classify_reqwest_error_for(worker_url.clone(), e, path)
-            })?
+            match tokio::time::timeout(self.request_timeout, req.send()).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(e)) => {
+                    breaker.record_failure();
+                    return Err(Self::classify_reqwest_error_for(
+                        worker_url.clone(),
+                        e,
+                        path,
+                    ));
+                }
+                Err(_elapsed) => {
+                    breaker.record_failure();
+                    return Err(ApiError::UpstreamTimeout {
+                        worker: worker_url.clone(),
+                    });
+                }
+            }
         };
         let status = resp.status();
         let upstream_ct = resp
@@ -1323,6 +1356,157 @@ mod tests {
             abort_log.lock().unwrap().is_empty(),
             "a non-2xx response must never trigger an abort, even on client disconnect"
         );
+    }
+
+    /// A worker that accepts the connection but never produces a response at
+    /// all (a wedged scheduler, not a connection failure) must time out
+    /// within `request_timeout`, return `UpstreamTimeout`, and trip the
+    /// breaker — not hang the dispatch forever. This is the headers-await gap:
+    /// before this guard existed, nothing router-side bounded this wait.
+    #[tokio::test]
+    async fn forward_streaming_to_times_out_when_headers_never_arrive() {
+        // Worker "responds" after 10s; the test's Proxy has a 150ms timeout,
+        // so the dispatch must fail long before the worker would ever answer.
+        let (url, _abort_log, _shutdown) =
+            spawn_hanging_worker_with_abort_capture(Duration::from_secs(10)).await;
+        let proxy = Proxy::new(Duration::from_millis(150)).unwrap();
+        // threshold=1: a single headers-await timeout must be enough to trip
+        // it, same as any other dispatch failure.
+        let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+            threshold: NonZeroU32::new(1).unwrap(),
+            cool_down: Duration::from_secs(30),
+        }));
+
+        let start = std::time::Instant::now();
+        let result = proxy
+            .forward_streaming_to(
+                &url,
+                WireProtocol::Http1,
+                &breaker,
+                "/v1/chat/completions",
+                &HeaderMap::new(),
+                Bytes::from_static(b"{}"),
+                None,
+                None,
+                Some("headers-timeout-rid"),
+            )
+            .await;
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "a wedged engine must time out promptly (≈150ms), not hang — took {:?}",
+            start.elapsed()
+        );
+        match result {
+            Err(ApiError::UpstreamTimeout { .. }) => {}
+            other => panic!("expected UpstreamTimeout, got {other:?}"),
+        }
+        assert_eq!(
+            breaker.snapshot().state_code,
+            1,
+            "a headers-await timeout must count as a breaker failure, same as any other dispatch failure"
+        );
+    }
+
+    /// `forward_json_to`'s pre-existing timeout mechanism (`req.timeout(self.request_timeout)`,
+    /// the builder method — appropriate there since non-streaming has no
+    /// later body-stream phase for it to over-reach into) had no test of its
+    /// own anywhere in this file before this commit, despite this same
+    /// commit explaining in detail why that mechanism would be wrong for
+    /// `forward_streaming_to`. Mirrors
+    /// `forward_streaming_to_times_out_when_headers_never_arrive` for the
+    /// unary path, closing that gap: a never-responding worker must still
+    /// fail fast with `UpstreamTimeout` and trip the breaker.
+    #[tokio::test]
+    async fn forward_json_to_times_out_when_response_never_arrives() {
+        let (url, _abort_log, _shutdown) =
+            spawn_hanging_worker_with_abort_capture(Duration::from_secs(10)).await;
+        let proxy = Proxy::new(Duration::from_millis(150)).unwrap();
+        let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+            threshold: NonZeroU32::new(1).unwrap(),
+            cool_down: Duration::from_secs(30),
+        }));
+
+        let start = std::time::Instant::now();
+        let result = proxy
+            .forward_json_to(
+                &url,
+                WireProtocol::Http1,
+                &breaker,
+                "/v1/chat/completions",
+                &HeaderMap::new(),
+                Bytes::from_static(b"{}"),
+            )
+            .await;
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "a wedged engine must time out promptly (≈150ms), not hang — took {:?}",
+            start.elapsed()
+        );
+        match result {
+            Err(ApiError::UpstreamTimeout { .. }) => {}
+            other => panic!("expected UpstreamTimeout, got {other:?}"),
+        }
+        assert_eq!(
+            breaker.snapshot().state_code,
+            1,
+            "a response timeout must count as a breaker failure, same as the streaming arm"
+        );
+    }
+
+    /// The headers-await timeout must NOT cap the body-streaming phase that
+    /// follows. Verified empirically (outside this crate) that reqwest's own
+    /// per-request `.timeout()` covers the WHOLE exchange — including a
+    /// manual `bytes_stream()` poll loop made well after `.send()` already
+    /// resolved — which is exactly why the fix uses an external
+    /// `tokio::time::timeout` around only `.send()` instead. This test pins
+    /// that a stream running longer than `request_timeout`, entirely via
+    /// legitimate slow-but-progressing chunks (never idle long enough to
+    /// trip `STREAM_IDLE_TIMEOUT` either), completes intact.
+    #[tokio::test]
+    async fn forward_streaming_to_body_duration_is_not_capped_by_headers_timeout() {
+        let (url, _abort_log, _shutdown) = spawn_streaming_worker_with_abort_capture(
+            vec!["data: a\n\n", "data: b\n\n", "data: c\n\n", "data: d\n\n"],
+            Duration::from_millis(150),
+        )
+        .await;
+        // 4 chunks * 150ms = 600ms total body time, well past this 200ms
+        // headers-timeout — but headers arrive immediately, so only the
+        // (unbounded-by-this-guard) body phase is what runs long.
+        let proxy = Proxy::new(Duration::from_millis(200)).unwrap();
+        let breaker = Arc::new(CircuitBreaker::new());
+
+        let resp = proxy
+            .forward_streaming_to(
+                &url,
+                WireProtocol::Http1,
+                &breaker,
+                "/v1/chat/completions",
+                &HeaderMap::new(),
+                Bytes::from_static(b"{}"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("headers arrive well within the timeout");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        use http_body_util::BodyExt;
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("the full slow stream must complete, not be cut off at ~200ms")
+            .to_bytes();
+        let body_str = String::from_utf8_lossy(&body);
+        for chunk in ["data: a", "data: b", "data: c", "data: d"] {
+            assert!(
+                body_str.contains(chunk),
+                "expected all 4 slow chunks (600ms total) past the 200ms headers-timeout; got: {body_str}"
+            );
+        }
     }
 
     /// `send_abort` must never affect the worker's circuit breaker — an

@@ -24,9 +24,16 @@ pub struct Config {
 /// trip the circuit breaker within the test's wall-time.
 #[derive(Debug, Clone, Copy)]
 pub struct ProxyConfig {
-    /// Maximum time to wait for a single upstream HTTP request to
-    /// return headers + body. Default 300 s. The circuit breaker
-    /// records a failure when this fires.
+    /// Maximum time to wait for a single upstream HTTP request. Default
+    /// 300 s. The circuit breaker records a failure when this fires.
+    ///
+    /// For non-streaming forwards (`forward_json_to`), this bounds the
+    /// whole exchange — headers AND body. For streaming forwards
+    /// (`forward_streaming_to`), it bounds only the wait for response
+    /// headers; once those arrive, body-streaming duration is governed
+    /// solely by `STREAM_IDLE_TIMEOUT` (no idle-time cap is acceptable
+    /// for long generations, so this budget deliberately does not apply
+    /// there — see `forward_streaming_to`'s `send()` timeout comment).
     pub request_timeout_secs: u64,
 }
 
