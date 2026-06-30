@@ -21,7 +21,7 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 _HAS_CUDA = torch.cuda.is_available()
 # The set_kv_buffer integration test needs SharedMHATokenToKVPool, which only
@@ -31,6 +31,7 @@ _HAS_SHARED_POOL = (
 )
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
 def _legacy_advanced_indexing_write(
