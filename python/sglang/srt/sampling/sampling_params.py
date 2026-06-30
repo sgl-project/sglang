@@ -18,7 +18,6 @@ import math
 from typing import Dict, List, Optional, Set, Union
 
 import msgspec
-
 import regex
 
 # sre_parse is deprecated in Python 3.11+, use re._parser instead

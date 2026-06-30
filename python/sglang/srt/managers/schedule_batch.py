@@ -39,7 +39,6 @@ ScheduleBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
-import re
 from array import array
 from concurrent.futures import Future
 from enum import Enum, auto
@@ -1340,7 +1339,10 @@ class Req(ReqDllmMixin):
         def matched(text: str) -> bool:
             if stop_str is not None:
                 return stop_str in text
-            return re.search(stop_regex, text) is not None
+            try:
+                return match_stop_regex(stop_regex, text)
+            except TimeoutError:
+                return False
 
         tail_len = self._stop_match_tail_len(new_accepted_len)
         start = len(self.output_ids) - tail_len
