@@ -660,14 +660,15 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         value = []
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            child.last_access_time = access_time
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
+                new_node.last_access_time = access_time
                 value.append(new_node.value)
                 node = new_node
                 break
             else:
+                child.last_access_time = access_time
                 value.append(child.value)
                 node = child
                 key = key[prefix_len:]
@@ -730,7 +731,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
-            node.last_access_time = access_time
             prefix_len = node.key.match(key, page_size=self.page_size)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -738,10 +738,12 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
+                new_node.last_access_time = access_time
                 new_node.priority = max(new_node.priority, priority)
                 self._inc_hit_count(new_node, chunked)
                 node = new_node
             else:
+                node.last_access_time = access_time
                 node.priority = max(node.priority, priority)
                 self._inc_hit_count(node, chunked)
             if len(key):
