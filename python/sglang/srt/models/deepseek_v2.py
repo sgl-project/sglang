@@ -706,7 +706,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_ascend_fuseep()
                 or get_moe_a2a_backend().is_flashinfer()
                 or get_moe_a2a_backend().is_megamoe()
-                or get_moe_a2a_backend().is_epv2()
+                or get_moe_a2a_backend().is_deepep_v2()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
@@ -787,7 +787,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_nixl()
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
-            or get_moe_a2a_backend().is_epv2()
+            or get_moe_a2a_backend().is_deepep_v2()
         ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
@@ -811,7 +811,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
-            or get_moe_a2a_backend().is_epv2()
+            or get_moe_a2a_backend().is_deepep_v2()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
@@ -2434,10 +2434,10 @@ class DeepseekV2Model(nn.Module):
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
                     # tp_size = get_parallel().tp_size
-                    # Keep the original deepep-class scope here and only add EPv2,
+                    # Keep the original deepep-class scope here and only add DeepEP v2,
                     # so unrelated backends' allocator sizing is unchanged.
                     is_a2a_moe = (
-                        is_deepep_class_backend() or get_moe_a2a_backend().is_epv2()
+                        is_deepep_class_backend() or get_moe_a2a_backend().is_deepep_v2()
                     )
                     tp_size = 1 if is_a2a_moe else get_parallel().tp_size
                     intermediate_size = (
@@ -2461,7 +2461,7 @@ class DeepseekV2Model(nn.Module):
         self.enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_epv2()
+            or get_moe_a2a_backend().is_deepep_v2()
         )
 
         # llama_4_scaling: for supporting Mistral-Large-3 model

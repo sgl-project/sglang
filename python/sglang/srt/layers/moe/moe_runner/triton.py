@@ -19,7 +19,7 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.token_dispatcher.epv2 import EpV2DispatchOutput
+    from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPV2DispatchOutput
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
@@ -159,7 +159,7 @@ class TritonRunnerCore(MoeRunnerCore):
             inplace=self.config.inplace,
             apply_router_weight_on_input=self.config.apply_router_weight_on_input,
             routed_scaling_factor=running_state.get(
-                "epv2_routed_scaling_factor", self.config.routed_scaling_factor
+                "deepep_v2_routed_scaling_factor", self.config.routed_scaling_factor
             ),
             gemm1_alpha=self.config.gemm1_alpha,
             gemm1_limit=self.config.gemm1_clamp_limit,
@@ -365,9 +365,9 @@ def _prepare_triton_runner_input(
     )
 
 
-@register_pre_permute("epv2", "triton")
-def pre_permute_epv2_to_triton(
-    dispatch_output: EpV2DispatchOutput,
+@register_pre_permute("deepep_v2", "triton")
+def pre_permute_deepep_v2_to_triton(
+    dispatch_output: DeepEPV2DispatchOutput,
     quant_info: TritonMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
@@ -376,16 +376,16 @@ def pre_permute_epv2_to_triton(
     if hidden_states_scale is not None or hidden_states.dtype != torch.bfloat16:
         raise RuntimeError(
             "DeepEP v2 -> Triton expects BF16 dispatch output without activation scales. "
-            "Use --epv2-dispatcher-output-dtype bf16."
+            "Use --deepep-v2-dispatcher-output-dtype bf16."
         )
     # A2A EP combine inputs are kept unscaled. The model-level MoE forward
     # applies the routed scaling factor once after combine.
-    running_state["epv2_routed_scaling_factor"] = None
+    running_state["deepep_v2_routed_scaling_factor"] = None
     valid_rows = (topk_ids >= 0).any(dim=1)
-    running_state["epv2_output_shape"] = hidden_states.shape
-    running_state["epv2_valid_rows"] = valid_rows
-    running_state["epv2_topk_ids"] = topk_ids
-    running_state["epv2_topk_weights"] = topk_weights
+    running_state["deepep_v2_output_shape"] = hidden_states.shape
+    running_state["deepep_v2_valid_rows"] = valid_rows
+    running_state["deepep_v2_topk_ids"] = topk_ids
+    running_state["deepep_v2_topk_weights"] = topk_weights
     hidden_states = hidden_states[valid_rows].contiguous()
     topk_ids = topk_ids[valid_rows].contiguous()
     topk_weights = topk_weights[valid_rows].contiguous()
@@ -394,24 +394,24 @@ def pre_permute_epv2_to_triton(
     )
 
 
-@register_post_permute("triton", "epv2")
-def post_permute_triton_to_epv2(
+@register_post_permute("triton", "deepep_v2")
+def post_permute_triton_to_deepep_v2(
     runner_output: TritonRunnerOutput,
     quant_info: TritonMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ):
-    from sglang.srt.layers.moe.token_dispatcher.epv2 import EpV2CombineInput
+    from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPV2CombineInput
 
-    valid_rows = running_state["epv2_valid_rows"]
+    valid_rows = running_state["deepep_v2_valid_rows"]
     output = torch.zeros(
-        running_state["epv2_output_shape"],
+        running_state["deepep_v2_output_shape"],
         device=runner_output.hidden_states.device,
         dtype=runner_output.hidden_states.dtype,
     )
     output[valid_rows] = runner_output.hidden_states
-    return EpV2CombineInput(
+    return DeepEPV2CombineInput(
         hidden_states=output,
-        topk_ids=running_state["epv2_topk_ids"],
-        topk_weights=running_state["epv2_topk_weights"],
+        topk_ids=running_state["deepep_v2_topk_ids"],
+        topk_weights=running_state["deepep_v2_topk_weights"],
     )

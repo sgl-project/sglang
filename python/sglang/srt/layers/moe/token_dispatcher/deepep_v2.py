@@ -18,27 +18,27 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
-    EpV2OutputDtype,
-    EpV2RunnerCapability,
-    get_epv2_runner_capability,
+    DeepEPV2OutputDtype,
+    DeepEPV2RunnerCapability,
+    get_deepep_v2_runner_capability,
 )
 
 logger = logging.getLogger(__name__)
 
 _SCALE_BLOCK_SIZE = 128
-_epv2_import_error: Optional[BaseException] = None
+_deepep_v2_import_error: Optional[BaseException] = None
 _fp8_quant_import_error: Optional[BaseException] = None
 sglang_per_token_group_quant_fp8 = None
 
 try:
     from deep_ep import ElasticBuffer
 
-    use_epv2 = True
+    use_deepep_v2 = True
 except (ImportError, OSError) as exc:
-    use_epv2 = False
-    _epv2_import_error = exc
+    use_deepep_v2 = False
+    _deepep_v2_import_error = exc
 
-if use_epv2:
+if use_deepep_v2:
     try:
         from sglang.srt.layers.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
@@ -47,7 +47,7 @@ if use_epv2:
         _fp8_quant_import_error = exc
 
 
-class EpV2DispatchOutput(NamedTuple):
+class DeepEPV2DispatchOutput(NamedTuple):
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
     topk_ids: Optional[torch.Tensor]
@@ -64,27 +64,27 @@ class EpV2DispatchOutput(NamedTuple):
 
     @property
     def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.EPV2
+        return DispatchOutputFormat.DEEPEP_V2
 
 
-class EpV2CombineInput(NamedTuple):
+class DeepEPV2CombineInput(NamedTuple):
     hidden_states: torch.Tensor
     topk_ids: Optional[torch.Tensor]
     topk_weights: Optional[torch.Tensor]
 
     @property
     def format(self) -> CombineInputFormat:
-        return CombineInputFormat.EPV2
+        return CombineInputFormat.DEEPEP_V2
 
 
-assert isinstance(EpV2DispatchOutput, DispatchOutput)
-assert isinstance(EpV2CombineInput, CombineInput)
+assert isinstance(DeepEPV2DispatchOutput, DispatchOutput)
+assert isinstance(DeepEPV2CombineInput, CombineInput)
 
 
-def _raise_epv2_import_error() -> None:
+def _raise_deepep_v2_import_error() -> None:
     detail = (
-        f" Original import error: {_epv2_import_error}"
-        if _epv2_import_error is not None
+        f" Original import error: {_deepep_v2_import_error}"
+        if _deepep_v2_import_error is not None
         else ""
     )
     raise ImportError(
@@ -93,13 +93,13 @@ def _raise_epv2_import_error() -> None:
     )
 
 
-def _ensure_epv2_available() -> None:
-    if not use_epv2:
-        _raise_epv2_import_error()
+def _ensure_deepep_v2_available() -> None:
+    if not use_deepep_v2:
+        _raise_deepep_v2_import_error()
 
 
 def _ensure_fp8_quant_available() -> None:
-    _ensure_epv2_available()
+    _ensure_deepep_v2_available()
     if sglang_per_token_group_quant_fp8 is None:
         detail = (
             f" Original import error: {_fp8_quant_import_error}"
@@ -119,16 +119,16 @@ def _get_allow_hybrid_mode() -> bool:
         server_args = get_global_server_args()
     except ValueError:
         # Synthetic/unit tests can instantiate the dispatcher without ServerArgs.
-        return envs.SGLANG_EPV2_ALLOW_HYBRID_MODE.get()
+        return envs.SGLANG_DEEPEP_V2_ALLOW_HYBRID_MODE.get()
 
-    epv2_mode = getattr(server_args, "epv2_mode", None)
-    if epv2_mode is None:
-        return envs.SGLANG_EPV2_ALLOW_HYBRID_MODE.get()
-    return epv2_mode == "hybrid"
+    deepep_v2_mode = getattr(server_args, "deepep_v2_mode", None)
+    if deepep_v2_mode is None:
+        return envs.SGLANG_DEEPEP_V2_ALLOW_HYBRID_MODE.get()
+    return deepep_v2_mode == "hybrid"
 
 
-def _quantize_for_epv2_dispatch(
-    hidden_states: torch.Tensor, capability: EpV2RunnerCapability
+def _quantize_for_deepep_v2_dispatch(
+    hidden_states: torch.Tensor, capability: DeepEPV2RunnerCapability
 ):
     _ensure_fp8_quant_available()
     return sglang_per_token_group_quant_fp8(
@@ -140,7 +140,7 @@ def _quantize_for_epv2_dispatch(
     )
 
 
-class EpV2Buffer:
+class DeepEPV2Buffer:
     _buffer: Optional[ElasticBuffer] = None
     _buffer_key: Optional[Tuple] = None
 
@@ -153,7 +153,7 @@ class EpV2Buffer:
         num_max_dispatch_tokens_per_rank: int,
         use_fp8_dispatch: bool,
     ) -> ElasticBuffer:
-        _ensure_epv2_available()
+        _ensure_deepep_v2_available()
 
         allow_hybrid_mode = _get_allow_hybrid_mode()
         key = (
@@ -200,7 +200,7 @@ class EpV2Buffer:
         cls._buffer_key = None
 
 
-class _EpV2Impl:
+class _DeepEPV2Impl:
     def __init__(
         self,
         group: dist.ProcessGroup,
@@ -208,7 +208,7 @@ class _EpV2Impl:
         num_experts: int,
         num_local_experts: int,
         hidden_size: int,
-        capability: EpV2RunnerCapability,
+        capability: DeepEPV2RunnerCapability,
         num_max_dispatch_tokens_per_rank: int,
     ):
         self.group = group
@@ -221,19 +221,19 @@ class _EpV2Impl:
         self.rank = dist.get_rank(group)
         self._handle = None
 
-    def set_runner_capability(self, capability: EpV2RunnerCapability) -> None:
+    def set_runner_capability(self, capability: DeepEPV2RunnerCapability) -> None:
         if self.capability != capability:
             self._destroy_handle()
             self.capability = capability
 
     def _uses_fp8_dispatch_output(self) -> bool:
-        return self.capability.output_dtype == EpV2OutputDtype.FP8
+        return self.capability.output_dtype == DeepEPV2OutputDtype.FP8
 
     def _destroy_handle(self) -> None:
         self._handle = None
 
     def _get_buffer(self) -> ElasticBuffer:
-        return EpV2Buffer.get_buffer(
+        return DeepEPV2Buffer.get_buffer(
             self.group,
             self.hidden_size,
             self.router_topk,
@@ -248,7 +248,7 @@ class _EpV2Impl:
             raise ValueError(
                 f"DeepEP v2 dispatch input exceeds the per-rank buffer capacity "
                 f"{self.num_max_dispatch_tokens_per_rank}, got {hidden_states.shape[0]}. "
-                "Increase SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK."
+                "Increase SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK."
             )
         if hidden_states.shape[1] != self.hidden_size:
             raise ValueError(
@@ -270,11 +270,11 @@ class _EpV2Impl:
             )
 
     def dispatch_a(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        _ensure_epv2_available()
+        _ensure_deepep_v2_available()
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids.to(torch.int64)
         self._validate_common(hidden_states, topk_ids)
-        # EPv2 native expanded layout is profitable for direct/decode-like
+        # DeepEP v2 native expanded layout is profitable for direct/decode-like
         # DeepGEMM FP8 workloads, but regresses hybrid/prefill-like workloads.
         # Keep hybrid on the native default non-expanded layout.
         use_expand_layout = (
@@ -300,7 +300,7 @@ class _EpV2Impl:
                 )
                 use_tma_aligned_col_major_sf = False
             else:
-                dispatch_x = _quantize_for_epv2_dispatch(hidden_states, self.capability)
+                dispatch_x = _quantize_for_deepep_v2_dispatch(hidden_states, self.capability)
                 use_tma_aligned_col_major_sf = self.capability.fp8_scale_tma_aligned
         else:
             dispatch_x = hidden_states
@@ -329,7 +329,7 @@ class _EpV2Impl:
             num_experts=self.num_experts,
             num_max_tokens_per_rank=num_max_tokens,
             expert_alignment=self.capability.expert_alignment,
-            num_sms=envs.SGLANG_EPV2_NUM_SMS.get(),
+            num_sms=envs.SGLANG_DEEPEP_V2_NUM_SMS.get(),
             use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
             do_cpu_sync=do_cpu_sync_val,
             do_expand=use_expand_layout,
@@ -426,7 +426,7 @@ class _EpV2Impl:
             masked_max_m = self.num_max_dispatch_tokens_per_rank * ep_group_size
             total_expanded = recv_hidden_states.shape[0]
 
-        return EpV2DispatchOutput(
+        return DeepEPV2DispatchOutput(
             recv_hidden_states,
             recv_hidden_states_scale,
             local_topk_ids,
@@ -447,7 +447,7 @@ class _EpV2Impl:
         # pre-split path; non-TBO callers use this).
         return self.dispatch_b(*self.dispatch_a(hidden_states, topk_output))
 
-    def combine_a(self, combine_input: EpV2CombineInput):
+    def combine_a(self, combine_input: DeepEPV2CombineInput):
         if self._handle is None:
             raise RuntimeError(
                 "DeepEP v2 combine called without a valid dispatch handle"
@@ -470,7 +470,7 @@ class _EpV2Impl:
         finally:
             self._destroy_handle()
 
-    def combine(self, combine_input: EpV2CombineInput) -> torch.Tensor:
+    def combine(self, combine_input: DeepEPV2CombineInput) -> torch.Tensor:
         return self.combine_b(*self.combine_a(combine_input))
 
 
@@ -479,7 +479,7 @@ class _Stage(Enum):
     AFTER_DISPATCH = auto()
 
 
-class EpV2Dispatcher(BaseDispatcher):
+class DeepEPV2Dispatcher(BaseDispatcher):
     def __init__(
         self,
         group: dist.ProcessGroup,
@@ -496,12 +496,12 @@ class EpV2Dispatcher(BaseDispatcher):
                 f"got {params_dtype}"
             )
         self.quant_config = {}
-        capability = get_epv2_runner_capability(self)
+        capability = get_deepep_v2_runner_capability(self)
         self.output_dtype = capability.output_dtype
         self.num_max_dispatch_tokens_per_rank = (
-            envs.SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+            envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
-        self._impl = _EpV2Impl(
+        self._impl = _DeepEPV2Impl(
             group=group,
             router_topk=router_topk,
             num_experts=num_experts,
@@ -516,7 +516,7 @@ class EpV2Dispatcher(BaseDispatcher):
 
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
-        capability = get_epv2_runner_capability(self)
+        capability = get_deepep_v2_runner_capability(self)
         self.output_dtype = capability.output_dtype
         self._impl.set_runner_capability(capability)
 
@@ -551,7 +551,7 @@ class EpV2Dispatcher(BaseDispatcher):
             raise RuntimeError(
                 f"DeepEP v2 combine called in invalid stage: {self._stage}"
             )
-        if combine_input.format != CombineInputFormat.EPV2:
+        if combine_input.format != CombineInputFormat.DEEPEP_V2:
             raise TypeError(
                 f"Expected DeepEP v2 combine input, got {combine_input.format}"
             )

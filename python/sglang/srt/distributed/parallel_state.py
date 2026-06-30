@@ -1940,7 +1940,7 @@ def init_distributed_environment(
         )
         if (
             backend == "nccl"
-            and moe_a2a_backend == "epv2"
+            and moe_a2a_backend == "deepep_v2"
             and "device_id"
             in inspect.signature(torch.distributed.init_process_group).parameters
         ):

@@ -1369,7 +1369,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ):
                     if not isinstance(layer, DeepEPMoE):
                         # UE8M0 in-place weight requant is only wired for the
-                        # DeepEPMoE layer (legacy deepep backend). The EPv2
+                        # DeepEPMoE layer (legacy deepep backend). The DeepEP v2
                         # backend uses FusedMoE, so fail fast with a clear
                         # message instead of asserting; use a pre-requantized
                         # FP8 checkpoint or --moe-a2a-backend deepep for
@@ -1377,7 +1377,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         raise NotImplementedError(
                             "DeepGEMM UE8M0 weight requant requires the "
                             f"DeepEPMoE layer, got {type(layer).__name__}. The "
-                            "EPv2 backend does not support FP8 checkpoints that "
+                            "DeepEP v2 backend does not support FP8 checkpoints that "
                             "need load-time UE8M0 requant yet; use a "
                             "pre-requantized checkpoint or --moe-a2a-backend "
                             "deepep."

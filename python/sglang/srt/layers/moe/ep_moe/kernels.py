@@ -1735,7 +1735,7 @@ def fp8_per_token_to_per_tensor_quant_triton(
 
 
 # ---------------------------------------------------------------------------
-# EPv2 decode masked-GEMM bridge: repack the expanded expert-packed
+# DeepEP v2 decode masked-GEMM bridge: repack the expanded expert-packed
 # dispatch buffer into a regular [E_local, max_m, hidden] slab so DeepGEMM's
 # *masked* grouped GEMM can bound compute by per-expert real counts (masked_m)
 # instead of the dispatch capacity. All-GPU, static shapes -> cuda-graph safe.
@@ -1886,9 +1886,9 @@ def expand_to_masked_slab(
     # graph replay would NOT fail-fast on overflow — re-validate before relying on it.
     if not torch.cuda.is_current_stream_capturing() and int(overflow.item()) != 0:
         raise RuntimeError(
-            f"EPv2 masked slab overflow: an expert received more than max_m="
+            f"DeepEP v2 masked slab overflow: an expert received more than max_m="
             f"{max_m} tokens; increase "
-            f"SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK."
+            f"SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK."
         )
     slab = slab.view(num_local_experts, max_m, hidden)
     if is_fp8:

@@ -16,10 +16,10 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPNormalCombineInput,
     DeepEPNormalDispatchOutput,
 )
-from sglang.srt.layers.moe.token_dispatcher.epv2 import (
-    EpV2CombineInput,
-    EpV2Dispatcher,
-    EpV2DispatchOutput,
+from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import (
+    DeepEPV2CombineInput,
+    DeepEPV2Dispatcher,
+    DeepEPV2DispatchOutput,
 )
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
     FlashinferDispatcher,
@@ -67,9 +67,9 @@ __all__ = [
     "MoriEPLLDispatchOutput",
     "MoriEPLLCombineInput",
     "MoriEPDispatcher",
-    "EpV2Dispatcher",
-    "EpV2DispatchOutput",
-    "EpV2CombineInput",
+    "DeepEPV2Dispatcher",
+    "DeepEPV2DispatchOutput",
+    "DeepEPV2CombineInput",
     "NixlEPCombineInput",
     "NixlEPDispatchOutput",
     "NixlEPDispatcher",

@@ -1,4 +1,4 @@
-"""Unit tests for the EPv2 masked-slab repack Triton kernels.
+"""Unit tests for the DeepEP v2 masked-slab repack Triton kernels.
 
 Covers the corner cases flagged in review: empty expert, single hot expert,
 per-expert count near / over max_m (overflow -> fail-fast, not silent truncation),
@@ -25,7 +25,7 @@ DEVICE = "cuda"
 def _build_layout(counts, align, hidden, dtype, with_scale=False, scale_hidden=4):
     """Build (recv_x, recv_x_scale, psum, starts, total) for given per-expert counts.
 
-    Mirrors the EPv2 expanded layout: expert e occupies rows
+    Mirrors the DeepEP v2 expanded layout: expert e occupies rows
     [align(psum[e-1]), psum[e]) with psum[-1] == 0.
     """
     starts, psum = [], []

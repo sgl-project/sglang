@@ -37,9 +37,9 @@ if TYPE_CHECKING:
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
     )
-    from sglang.srt.layers.moe.token_dispatcher.epv2 import (
-        EpV2CombineInput,
-        EpV2DispatchOutput,
+    from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import (
+        DeepEPV2CombineInput,
+        DeepEPV2DispatchOutput,
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
@@ -233,7 +233,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
             use_contig_swizzle = self.use_swizzle and not running_state.get(
-                "epv2_disable_contig_swizzle", False
+                "deepep_v2_disable_contig_swizzle", False
             )
 
             down_input_fp8 = torch.empty(
@@ -957,9 +957,9 @@ def _apply_swiglu_limit(
     return out
 
 
-@register_pre_permute("epv2", "deep_gemm")
-def pre_permute_epv2_to_deep_gemm(
-    dispatch_output: EpV2DispatchOutput,
+@register_pre_permute("deepep_v2", "deep_gemm")
+def pre_permute_deepep_v2_to_deep_gemm(
+    dispatch_output: DeepEPV2DispatchOutput,
     quant_info: DeepGemmMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
@@ -979,29 +979,29 @@ def pre_permute_epv2_to_deep_gemm(
         psum_num_recv_tokens_per_expert,
         is_expanded,
         hidden_states_scale_tma_aligned,
-        epv2_use_masked,
-        epv2_expected_m,
-        epv2_masked_max_m,
-        epv2_total_expanded,
-        epv2_expert_alignment,
+        deepep_v2_use_masked,
+        deepep_v2_expected_m,
+        deepep_v2_masked_max_m,
+        deepep_v2_total_expanded,
+        deepep_v2_expert_alignment,
     ) = dispatch_output
     if hidden_states_scale is None:
         raise RuntimeError(
             "DeepEP v2 -> DeepGEMM requires FP8 dispatch output with activation scales. "
-            "Use --epv2-dispatcher-output-dtype fp8 or select a BF16 runner such as triton."
+            "Use --deepep-v2-dispatcher-output-dtype fp8 or select a BF16 runner such as triton."
         )
     if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
         # The MegaMoE memory optimization enables a swizzled activation kernel
-        # for its gran=8 interleaved gate/up layout. EPv2's contiguous adapter
+        # for its gran=8 interleaved gate/up layout. DeepEP v2's contiguous adapter
         # is validated with the non-swizzled activation layout; using the
         # swizzled reader here mixes gate/up pairs and breaks generation.
-        running_state["epv2_disable_contig_swizzle"] = True
+        running_state["deepep_v2_disable_contig_swizzle"] = True
     assert runner_config.activation == "silu"
 
     if is_expanded:
         if psum_num_recv_tokens_per_expert is None:
             raise RuntimeError(
-                "EPv2 expanded layout requires native expert prefix sums."
+                "DeepEP v2 expanded layout requires native expert prefix sums."
             )
         all_tokens = hidden_states.shape[0]
         running_state["all_tokens"] = all_tokens
@@ -1010,9 +1010,9 @@ def pre_permute_epv2_to_deep_gemm(
         running_state["hidden_states_dtype"] = hidden_states.dtype
         running_state["topk_ids"] = None
         running_state["topk_weights"] = topk_weights
-        running_state["epv2_expanded"] = True
+        running_state["deepep_v2_expanded"] = True
 
-        if epv2_use_masked:
+        if deepep_v2_use_masked:
             # Masked-GEMM bridge: repack the expanded expert-packed buffer into a
             # regular [E_local, max_m, hidden] slab so DeepGEMM's masked grouped
             # GEMM bounds compute by per-expert real counts (masked_m), decoupled
@@ -1025,19 +1025,19 @@ def pre_permute_epv2_to_deep_gemm(
                 hidden_states_scale,
                 psum_num_recv_tokens_per_expert,
                 num_local_experts,
-                epv2_masked_max_m,
-                epv2_expert_alignment,
+                deepep_v2_masked_max_m,
+                deepep_v2_expert_alignment,
             )
-            running_state["epv2_masked"] = True
-            running_state["epv2_psum"] = psum_num_recv_tokens_per_expert
-            running_state["epv2_total_expanded"] = epv2_total_expanded
-            running_state["epv2_expert_alignment"] = epv2_expert_alignment
+            running_state["deepep_v2_masked"] = True
+            running_state["deepep_v2_psum"] = psum_num_recv_tokens_per_expert
+            running_state["deepep_v2_total_expanded"] = deepep_v2_total_expanded
+            running_state["deepep_v2_expert_alignment"] = deepep_v2_expert_alignment
             return DeepGemmRunnerInput(
                 hidden_states=slab,
                 hidden_states_scale=slab_scale,
                 use_masked_gemm=True,
                 masked_m=masked_m,
-                expected_m=epv2_expected_m,
+                expected_m=deepep_v2_expected_m,
                 hidden_states_scale_tma_aligned=hidden_states_scale_tma_aligned,
             )
 
@@ -1129,32 +1129,32 @@ def pre_permute_epv2_to_deep_gemm(
     )
 
 
-@register_post_permute("deep_gemm", "epv2")
-def post_permute_deep_gemm_to_epv2(
+@register_post_permute("deep_gemm", "deepep_v2")
+def post_permute_deep_gemm_to_deepep_v2(
     runner_output: DeepGemmRunnerOutput,
     quant_info: DeepGemmMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
-) -> EpV2CombineInput:
+) -> DeepEPV2CombineInput:
     from sglang.srt.layers.moe.ep_moe.kernels import ep_gather
-    from sglang.srt.layers.moe.token_dispatcher.epv2 import EpV2CombineInput
+    from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPV2CombineInput
 
-    if running_state.get("epv2_expanded", False):
+    if running_state.get("deepep_v2_expanded", False):
         hidden_states = runner_output.hidden_states
         topk_weights = running_state["topk_weights"]
-        if running_state.get("epv2_masked", False):
+        if running_state.get("deepep_v2_masked", False):
             # Masked path: GEMM output is the [E_local, max_m, hidden] slab. Repack
             # it back to expanded row order (padding rows zeroed) before combine.
             from sglang.srt.layers.moe.ep_moe.kernels import masked_slab_to_expand
 
             hidden_states = masked_slab_to_expand(
                 hidden_states,
-                running_state["epv2_psum"],
-                running_state["epv2_total_expanded"],
-                running_state["epv2_expert_alignment"],
+                running_state["deepep_v2_psum"],
+                running_state["deepep_v2_total_expanded"],
+                running_state["deepep_v2_expert_alignment"],
                 topk_weights=topk_weights,
             )
-            return EpV2CombineInput(hidden_states, None, None)
+            return DeepEPV2CombineInput(hidden_states, None, None)
         if topk_weights is not None:
             # Expanded combine does not consume top-k weights, so apply them to
             # each expert slot before combine. Keep this out-of-place until the
@@ -1162,7 +1162,7 @@ def post_permute_deep_gemm_to_epv2(
             hidden_states = hidden_states * topk_weights.to(
                 hidden_states.dtype
             ).unsqueeze(-1)
-        return EpV2CombineInput(hidden_states, None, None)
+        return DeepEPV2CombineInput(hidden_states, None, None)
 
     hidden_states = runner_output.hidden_states
     topk_ids = running_state["topk_ids"]
@@ -1174,7 +1174,7 @@ def post_permute_deep_gemm_to_epv2(
         dtype=torch.bfloat16,
     )
     ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out)
-    return EpV2CombineInput(
+    return DeepEPV2CombineInput(
         hidden_states=gather_out,
         topk_ids=topk_ids,
         topk_weights=topk_weights,
