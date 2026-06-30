@@ -1167,6 +1167,10 @@ class ServerArgs:
         int,
         "Maximum number of concurrent realtime ASR WebSocket sessions served by /v1/realtime. New connections beyond this cap are accepted, sent an error{code:too_many_sessions} frame, and closed. Default 32.",
     ] = 32
+    asr_disable_input_slicing: A[
+        bool,
+        "Force realtime ASR to use cumulative inference even when the adapter enables input slicing.",
+    ] = False
     preferred_sampling_params: A[
         Optional[str],
         Arg(
