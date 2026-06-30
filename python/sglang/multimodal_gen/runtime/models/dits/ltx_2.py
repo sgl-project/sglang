@@ -10,13 +10,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.jit_kernel.diffusion.residual_gate_add import (
-    can_use_residual_gate_add_cuda,
-    residual_gate_add_cuda,
-)
 from sglang.jit_kernel.diffusion.ltx2_qknorm_split_rope import (
     can_use_ltx2_qknorm_split_rope_cuda,
     ltx2_qknorm_split_rope_cuda,
+)
+from sglang.jit_kernel.diffusion.residual_gate_add import (
+    can_use_residual_gate_add_cuda,
+    residual_gate_add_cuda,
 )
 from sglang.multimodal_gen.configs.models.dits.ltx_2 import LTX2ArchConfig, LTX2Config
 from sglang.multimodal_gen.runtime.distributed import (
@@ -102,10 +102,6 @@ def _ltx2_try_fused_qknorm_split_rope(
         or get_tp_world_size() != 1
         or not isinstance(q_norm, nn.RMSNorm)
         or not isinstance(k_norm, nn.RMSNorm)
-        or q_norm.weight is None
-        or k_norm.weight is None
-        or q_norm.eps is None
-        or k_norm.eps is None
         or float(q_norm.eps) != float(eps)
         or float(k_norm.eps) != float(eps)
         or not can_use_ltx2_qknorm_split_rope_cuda(

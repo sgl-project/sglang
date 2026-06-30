@@ -33,7 +33,7 @@ inline char* mutable_data_ptr(const ffi::TensorView& t) {
 
 __device__ inline float compute_rstd(
     const __nv_bfloat16* __restrict__ xrow,
-    int hidden_size,
+    int64_t hidden_size,
     float eps,
     int tid,
     int lane,
@@ -41,9 +41,9 @@ __device__ inline float compute_rstd(
     float* warp_sum,
     float* s_rstd) {
   float local = 0.f;
-  const int n_vec = hidden_size >> 2;
-  for (int i = tid; i < n_vec; i += kThreads) {
-    const int base = i << 2;
+  const int64_t n_vec = hidden_size >> 2;
+  for (int64_t i = tid; i < n_vec; i += kThreads) {
+    const int64_t base = i << 2;
     const float v0 = __bfloat162float(xrow[base + 0]);
     const float v1 = __bfloat162float(xrow[base + 1]);
     const float v2 = __bfloat162float(xrow[base + 2]);
@@ -89,22 +89,22 @@ __global__ void ltx2_qknorm_split_rope_kernel(
     const __nv_bfloat16* __restrict__ weight,
     __nv_bfloat16* __restrict__ out,
     float eps,
-    int seq_len,
-    int num_heads,
-    int head_dim,
+    int64_t seq_len,
+    int64_t num_heads,
+    int64_t head_dim,
     int64_t stride_cos_b,
     int64_t stride_cos_h,
     int64_t stride_cos_t,
     int64_t stride_sin_b,
     int64_t stride_sin_h,
     int64_t stride_sin_t) {
-  const int row = blockIdx.x;
-  const int batch = row / seq_len;
-  const int token = row - batch * seq_len;
-  const int hidden_size = num_heads * head_dim;
-  const int half_dim = head_dim >> 1;
-  const auto* __restrict__ xrow = x + static_cast<int64_t>(row) * hidden_size;
-  auto* __restrict__ outrow = out + static_cast<int64_t>(row) * hidden_size;
+  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  const int64_t batch = row / seq_len;
+  const int64_t token = row - batch * seq_len;
+  const int64_t hidden_size = num_heads * head_dim;
+  const int64_t half_dim = head_dim >> 1;
+  const auto* __restrict__ xrow = x + row * hidden_size;
+  auto* __restrict__ outrow = out + row * hidden_size;
   const int tid = threadIdx.x + threadIdx.y * 32;
   const int lane = threadIdx.x;
   const int warp_id = threadIdx.y;
@@ -113,12 +113,12 @@ __global__ void ltx2_qknorm_split_rope_kernel(
   __shared__ float s_rstd;
   const float rstd = compute_rstd(xrow, hidden_size, eps, tid, lane, warp_id, warp_sum, &s_rstd);
 
-  const int num_pairs = num_heads * half_dim;
-  for (int pair = tid; pair < num_pairs; pair += kThreads) {
-    const int head = pair / half_dim;
-    const int offset = pair - head * half_dim;
-    const int idx0 = head * head_dim + offset;
-    const int idx1 = idx0 + half_dim;
+  const int64_t num_pairs = num_heads * half_dim;
+  for (int64_t pair = tid; pair < num_pairs; pair += kThreads) {
+    const int64_t head = pair / half_dim;
+    const int64_t offset = pair - head * half_dim;
+    const int64_t idx0 = head * head_dim + offset;
+    const int64_t idx1 = idx0 + half_dim;
     const float n0 = norm_value(__bfloat162float(xrow[idx0]), __bfloat162float(weight[idx0]), rstd);
     const float n1 = norm_value(__bfloat162float(xrow[idx1]), __bfloat162float(weight[idx1]), rstd);
     const int64_t cos_offset = static_cast<int64_t>(batch) * stride_cos_b + static_cast<int64_t>(head) * stride_cos_h +
@@ -159,9 +159,9 @@ inline void launch_one(
       reinterpret_cast<const __nv_bfloat16*>(data_ptr(weight)),
       reinterpret_cast<__nv_bfloat16*>(mutable_data_ptr(out)),
       eps,
-      static_cast<int>(seq_len),
-      static_cast<int>(num_heads),
-      static_cast<int>(head_dim),
+      seq_len,
+      num_heads,
+      head_dim,
       stride_cos_b,
       stride_cos_h,
       stride_cos_t,

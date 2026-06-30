@@ -9,7 +9,7 @@ from sglang.jit_kernel.diffusion.ltx2_qknorm_split_rope import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=45, suite="base-b-kernel-unit-1-gpu-b200")
+register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def _require_cuda_b200() -> None:
@@ -55,10 +55,8 @@ def _apply_split_rotary_ref(
     sin_u = sin.unsqueeze(-2)
 
     out = split_x * cos_u
-    first_out = out[..., :1, :]
-    second_out = out[..., 1:, :]
-    first_out.addcmul_(-sin_u, second_x)
-    second_out.addcmul_(sin_u, first_x)
+    out[..., :1, :].addcmul_(-sin_u, second_x)
+    out[..., 1:, :].addcmul_(sin_u, first_x)
     out = out.reshape(*out.shape[:-2], last)
     return out.swapaxes(1, 2).reshape(batch, seq_len, -1).to(dtype=x_dtype)
 
