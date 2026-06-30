@@ -56,10 +56,11 @@ const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 /// PAYLOAD_TOO_LARGE before this handler runs.
 pub const MAX_CHAT_BODY_BYTES: usize = 5 << 20;
 
-/// Minimal probe over the request body — we only need the `stream` field
-/// and the `model` field to decide between buffered vs SSE forwarding and
-/// to select a worker. Deserializing into this struct (vs `serde_json::Value`)
-/// does two things:
+/// Minimal probe over the request body — we only need the `stream` field,
+/// the `model` field, and a client-supplied `rid` to decide between buffered
+/// vs SSE forwarding, select a worker, and know whether to reuse the
+/// client's abort-by-rid identifier. Deserializing into this struct (vs
+/// `serde_json::Value`) does two things:
 ///
 /// 1. Avoids the per-field heap allocation of `Value` for a multi-MiB body.
 /// 2. Pins the contract: the body MUST be a JSON object. Degenerate
@@ -68,12 +69,21 @@ pub const MAX_CHAT_BODY_BYTES: usize = 5 << 20;
 ///
 /// All other fields are ignored — the worker is authoritative for the
 /// full request schema.
+///
+/// `rid` is probed here — not via `request_value` — because `request_value`
+/// is only populated when `want_tokens` is true (a tokenization-offload
+/// decision unrelated to whether the client passed a `rid`). Gating the
+/// client-rid reuse on `want_tokens` would silently drop it for any
+/// model/policy that doesn't need ingress tokenization, undermining the
+/// "reuse, don't override" contract on the common path.
 #[derive(Debug, Deserialize)]
 struct RequestProbe {
     #[serde(default)]
     stream: Option<bool>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    rid: Option<String>,
 }
 
 /// RAII guard that records `sgl_router_request_duration_seconds` when
@@ -419,22 +429,23 @@ async fn chat_completions_inner(
     // into the forwarded body so the engine adopts it. SGLang keeps a provided
     // `rid` and only generates one when it is absent, and it aborts every rid
     // that *starts with* the one we send — covering `n>1` expansions.
-    let client_rid = request_value
-        .as_ref()
-        .and_then(|v| v.get("rid"))
-        .and_then(|r| r.as_str());
+    //
+    // Sourced from `probe.rid`, NOT `request_value` — `request_value` is only
+    // parsed when `want_tokens` is true, which has nothing to do with whether
+    // the client passed a `rid`. Gating on it silently dropped client rids for
+    // any model/policy that doesn't need ingress tokenization.
+    let client_rid: Option<String> = probe.rid;
     let request_id: Option<String> = if decode_peer.is_none() {
-        Some(
-            client_rid
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("router-{}", uuid::Uuid::new_v4().simple())),
-        )
+        Some(match &client_rid {
+            Some(rid) => rid.clone(),
+            None => format!("router-{}", uuid::Uuid::new_v4().simple()),
+        })
     } else {
         None
     };
     // Inject only a router-minted rid; a client-supplied one is already in the
     // body, and PD mode (`request_id == None`) is never injected.
-    let rid_to_inject: Option<&str> = match (request_id.as_deref(), client_rid) {
+    let rid_to_inject: Option<&str> = match (request_id.as_deref(), client_rid.as_deref()) {
         (Some(rid), None) => Some(rid),
         _ => None,
     };
@@ -578,6 +589,20 @@ async fn chat_completions_inner(
         // non-streaming arm.
         let stream_guards: Box<dyn Send + 'static> =
             Box::new((guard, active_guard, make_duration_guard()));
+        // Pre-headers abort guard: `forward_streaming_to` only constructs its
+        // own (reached_end-tracking) guard AFTER a response is received, so
+        // it can't protect the window before that — if the stale-request
+        // janitor fires while `fetch` is still awaiting headers, `fetch` (and
+        // the not-yet-existing internal guard) is dropped with no abort sent,
+        // even though the engine may already be working on the request. This
+        // guard covers exactly that window: armed until `fetch` resolves to
+        // any received response (disarmed below), at which point the
+        // internal guard (for a 2xx) or nothing (non-2xx, same as today)
+        // takes over — same disarm-on-`Ok` pattern as the non-streaming arm.
+        let mut pre_headers_abort_guard = request_id.as_deref().and_then(|rid| {
+            ctx.proxy
+                .abort_guard_for(&worker.url, worker.protocol(), rid)
+        });
         let fetch = ctx.proxy.forward_streaming_to(
             &worker.url,
             worker.protocol(),
@@ -598,11 +623,22 @@ async fn chat_completions_inner(
         // headers is a correctness regression). The cancellation
         // branch only matters when fetch is still pending — at that
         // point biasing the order is a wash.
-        tokio::select! {
+        let r = tokio::select! {
             biased;
             r = fetch => r,
             _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
+        };
+        // A received response (any status) means responsibility has passed
+        // to `forward_streaming_to`'s own guard (or nothing, for non-2xx) —
+        // disarm so this one doesn't also fire. Left armed only when `fetch`
+        // never resolved (stale-timeout) or a transport-level dispatch error
+        // occurred before any response.
+        if r.is_ok() {
+            if let Some(g) = pre_headers_abort_guard.as_mut() {
+                g.disarm();
+            }
         }
+        r
     } else {
         // Plain mode, non-streaming. The handler awaits the full
         // buffered response, so both guards live correctly in this
@@ -617,9 +653,10 @@ async fn chat_completions_inner(
         // tells the engine to stop. A stale-request timeout (the cancel arm
         // below) also leaves it armed — we've given up, so the engine should
         // too. `None` only in PD mode / on a worker-URL parse failure.
-        let mut abort_guard = request_id
-            .as_deref()
-            .and_then(|rid| ctx.proxy.abort_guard_for(&worker.url, worker.protocol(), rid));
+        let mut abort_guard = request_id.as_deref().and_then(|rid| {
+            ctx.proxy
+                .abort_guard_for(&worker.url, worker.protocol(), rid)
+        });
         let fetch = ctx.proxy.forward_json_to(
             &worker.url,
             worker.protocol(),
@@ -643,7 +680,6 @@ async fn chat_completions_inner(
             }
         }
         r
-        }
     };
 
     // Diagnostic: phase breakdown up to response headers, for ADMITTED requests
@@ -1069,7 +1105,8 @@ mod tests {
             port: None,
             room: 42,
         };
-        let injected = build_outgoing_body(&body, Some(value), None, Some(&bootstrap), None).unwrap();
+        let injected =
+            build_outgoing_body(&body, Some(value), None, Some(&bootstrap), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&injected).unwrap();
         assert_eq!(parsed.get("bootstrap_port"), Some(&serde_json::Value::Null));
         assert_eq!(
@@ -1119,7 +1156,8 @@ mod tests {
     fn build_outgoing_body_injects_rid() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let out = build_outgoing_body(&body, Some(value), None, None, Some("router-abc123")).unwrap();
+        let out =
+            build_outgoing_body(&body, Some(value), None, None, Some("router-abc123")).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             parsed.get("rid").and_then(|r| r.as_str()),
@@ -1145,7 +1183,8 @@ mod tests {
             port: Some(9),
             room: 5,
         };
-        let out = build_outgoing_body(&body, Some(value), Some(&ids), Some(&bootstrap), None).unwrap();
+        let out =
+            build_outgoing_body(&body, Some(value), Some(&ids), Some(&bootstrap), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([7, 8])));
         assert_eq!(

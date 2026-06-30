@@ -582,10 +582,14 @@ impl Proxy {
 mod tests {
     use super::*;
     use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+    use axum::extract::State;
     use axum::routing::post;
+    use axum::Json;
     use axum::Router;
     use reqwest::StatusCode;
+    use serde_json::Value;
     use std::num::NonZeroU32;
+    use std::sync::Mutex;
     use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -643,6 +647,34 @@ mod tests {
                 .await;
         });
         (format!("http://127.0.0.1:{port}"), tx)
+    }
+
+    /// `spawn_status_worker`, plus an `/abort_request` route that records
+    /// every POSTed body — so a test can assert a non-2xx response never
+    /// triggers an abort, rather than just hoping a stray POST went nowhere.
+    async fn spawn_status_worker_with_abort_capture(
+        status: u16,
+    ) -> (String, AbortLog, oneshot::Sender<()>) {
+        let log: AbortLog = Arc::new(Mutex::new(Vec::new()));
+        let code = StatusCode::from_u16(status).unwrap();
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move || async move { (code, "{\"error\":\"x\"}") }),
+            )
+            .route("/abort_request", post(abort_request_handler))
+            .with_state(log.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        (format!("http://127.0.0.1:{port}"), log, tx)
     }
 
     /// The bug this fixes: a saturated engine returning its own queue-full 503s
@@ -855,5 +887,526 @@ mod tests {
             p.client_for(WireProtocol::Http1),
             p.admin_client()
         ));
+    }
+
+    // ---- AbortOnDrop / send_abort -----------------------------------------
+
+    /// Every `/abort_request` POST appends its parsed JSON body here, so tests
+    /// can assert on `rid` / `abort_all` without racing a single "last body"
+    /// slot.
+    type AbortLog = Arc<Mutex<Vec<Value>>>;
+
+    async fn abort_request_handler(
+        State(log): State<AbortLog>,
+        Json(body): Json<Value>,
+    ) -> StatusCode {
+        log.lock().unwrap().push(body);
+        StatusCode::OK
+    }
+
+    /// A fake upstream whose `/v1/chat/completions` sleeps `delay` before
+    /// answering 200 (simulating an engine still generating a unary
+    /// response), and whose `/abort_request` records every POSTed body.
+    async fn spawn_hanging_worker_with_abort_capture(
+        delay: Duration,
+    ) -> (String, AbortLog, oneshot::Sender<()>) {
+        let log: AbortLog = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move || async move {
+                    tokio::time::sleep(delay).await;
+                    (StatusCode::OK, "{}")
+                }),
+            )
+            .route("/abort_request", post(abort_request_handler))
+            .with_state(log.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        (format!("http://127.0.0.1:{port}"), log, tx)
+    }
+
+    /// A fake upstream whose `/v1/chat/completions` streams `chunks` with
+    /// `delay` between each (an SSE body, like the real engine), and whose
+    /// `/abort_request` records every POSTed body. Mirrors
+    /// `tests/proxy/common/mock_worker.rs::start_slow_stream`, duplicated here
+    /// because that helper lives in the separate `tests/` integration-test
+    /// crate and isn't visible to this lib-internal `#[cfg(test)]` module.
+    async fn spawn_streaming_worker_with_abort_capture(
+        chunks: Vec<&'static str>,
+        delay: Duration,
+    ) -> (String, AbortLog, oneshot::Sender<()>) {
+        let log: AbortLog = Arc::new(Mutex::new(Vec::new()));
+
+        async fn stream_chat(chunks: Vec<&'static str>, delay: Duration) -> Response<Body> {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+            tokio::spawn(async move {
+                for c in chunks {
+                    tokio::time::sleep(delay).await;
+                    if tx.send(Ok(Bytes::from(c))).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+            let mut r = Response::new(body);
+            *r.status_mut() = StatusCode::OK;
+            r.headers_mut().insert(
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static("text/event-stream"),
+            );
+            r
+        }
+
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move || stream_chat(chunks.clone(), delay)),
+            )
+            .route("/abort_request", post(abort_request_handler))
+            .with_state(log.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        (format!("http://127.0.0.1:{port}"), log, tx)
+    }
+
+    /// Same shape as [`spawn_streaming_worker_with_abort_capture`], except
+    /// `/abort_request` always answers `500` (while still recording the
+    /// POSTed body). Used to prove a failing abort never reaches the circuit
+    /// breaker — `send_abort` has no breaker access by construction, so this
+    /// pins that invariant against a future refactor that might add one.
+    async fn spawn_streaming_worker_with_failing_abort(
+        chunks: Vec<&'static str>,
+        delay: Duration,
+    ) -> (String, AbortLog, oneshot::Sender<()>) {
+        let log: AbortLog = Arc::new(Mutex::new(Vec::new()));
+
+        async fn stream_chat(chunks: Vec<&'static str>, delay: Duration) -> Response<Body> {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+            tokio::spawn(async move {
+                for c in chunks {
+                    tokio::time::sleep(delay).await;
+                    if tx.send(Ok(Bytes::from(c))).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+            let mut r = Response::new(body);
+            *r.status_mut() = StatusCode::OK;
+            r.headers_mut().insert(
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static("text/event-stream"),
+            );
+            r
+        }
+
+        async fn failing_abort_handler(
+            State(log): State<AbortLog>,
+            Json(body): Json<Value>,
+        ) -> StatusCode {
+            log.lock().unwrap().push(body);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move || stream_chat(chunks.clone(), delay)),
+            )
+            .route("/abort_request", post(failing_abort_handler))
+            .with_state(log.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        (format!("http://127.0.0.1:{port}"), log, tx)
+    }
+
+    /// Poll `log` until it has at least one entry or `timeout` elapses.
+    async fn wait_for_abort(log: &AbortLog, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while log.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Unary guard: dropped while still armed (no `disarm()` call) must POST
+    /// exactly one abort — the handler-cancelled-by-client-disconnect case.
+    #[tokio::test]
+    async fn abort_on_drop_unary_fires_when_dropped_armed() {
+        let (url, abort_log, _shutdown) =
+            spawn_hanging_worker_with_abort_capture(Duration::from_secs(10)).await;
+        let client = Client::new();
+        {
+            let _guard =
+                AbortOnDrop::for_unary(client, format!("{url}/abort_request"), "test-rid-1".into());
+        }
+        wait_for_abort(&abort_log, Duration::from_secs(2)).await;
+        let log = abort_log.lock().unwrap();
+        assert_eq!(
+            log.len(),
+            1,
+            "an armed guard dropped without disarm must POST exactly one abort"
+        );
+        assert_eq!(log[0]["rid"], "test-rid-1");
+        assert_eq!(log[0]["abort_all"], false);
+    }
+
+    /// Unary guard: `disarm()` before drop (a complete response was received)
+    /// must suppress the abort entirely.
+    #[tokio::test]
+    async fn abort_on_drop_unary_does_not_fire_when_disarmed() {
+        let (url, abort_log, _shutdown) =
+            spawn_hanging_worker_with_abort_capture(Duration::from_secs(10)).await;
+        let client = Client::new();
+        {
+            let mut guard =
+                AbortOnDrop::for_unary(client, format!("{url}/abort_request"), "test-rid-2".into());
+            guard.disarm();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            abort_log.lock().unwrap().is_empty(),
+            "a disarmed guard must never abort"
+        );
+    }
+
+    /// Streaming guard: dropped with `reached_end` still false (the SSE pump
+    /// was torn down before the engine's terminal item) must abort.
+    #[tokio::test]
+    async fn abort_on_drop_stream_fires_when_reached_end_false() {
+        let (url, abort_log, _shutdown) =
+            spawn_hanging_worker_with_abort_capture(Duration::from_secs(10)).await;
+        let client = Client::new();
+        let reached_end = Arc::new(AtomicBool::new(false));
+        {
+            let _guard = AbortOnDrop::for_stream(
+                client,
+                format!("{url}/abort_request"),
+                "test-rid-3".into(),
+                Arc::clone(&reached_end),
+            );
+        }
+        wait_for_abort(&abort_log, Duration::from_secs(2)).await;
+        assert_eq!(
+            abort_log.lock().unwrap().len(),
+            1,
+            "reached_end=false at drop (client gone before engine finished) must abort"
+        );
+    }
+
+    /// Streaming guard: dropped with `reached_end` already true (the engine
+    /// reached its clean terminal item, or a terminal error) must NOT abort —
+    /// this is the normal-completion path and must never pollute engine abort
+    /// metrics.
+    #[tokio::test]
+    async fn abort_on_drop_stream_does_not_fire_when_reached_end_true() {
+        let (url, abort_log, _shutdown) =
+            spawn_hanging_worker_with_abort_capture(Duration::from_secs(10)).await;
+        let client = Client::new();
+        let reached_end = Arc::new(AtomicBool::new(true));
+        {
+            let _guard = AbortOnDrop::for_stream(
+                client,
+                format!("{url}/abort_request"),
+                "test-rid-4".into(),
+                Arc::clone(&reached_end),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            abort_log.lock().unwrap().is_empty(),
+            "reached_end=true at drop (normal completion) must NOT abort"
+        );
+    }
+
+    /// `send_abort` posts `{rid, abort_all:false}` to the given URL.
+    #[tokio::test]
+    async fn send_abort_posts_rid_and_abort_all_false() {
+        let (url, abort_log, _shutdown) =
+            spawn_hanging_worker_with_abort_capture(Duration::from_secs(10)).await;
+        let client = Client::new();
+        send_abort(&client, &format!("{url}/abort_request"), "direct-rid").await;
+        let log = abort_log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0]["rid"], "direct-rid");
+        assert_eq!(log[0]["abort_all"], false);
+    }
+
+    /// `send_abort` is best-effort: an unreachable abort URL (connection
+    /// refused) must be swallowed — logged, not panicked or propagated.
+    #[tokio::test]
+    async fn send_abort_swallows_unreachable_url_without_panicking() {
+        let client = Client::new();
+        // Port 1 is privileged / never listened on in CI sandboxes — refused
+        // promptly. No assertion beyond "this does not panic or hang".
+        send_abort(&client, "http://127.0.0.1:1/abort_request", "rid-x").await;
+    }
+
+    /// `abort_guard_for` returns `None` for a worker URL that can't be parsed
+    /// — matching the moot forward failure (the dispatch itself would fail the
+    /// same way, so there is nothing to abort).
+    #[tokio::test]
+    async fn abort_guard_for_returns_none_for_unparsable_url() {
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        let guard = proxy.abort_guard_for("not a valid url", WireProtocol::Http1, "rid");
+        assert!(
+            guard.is_none(),
+            "an unparsable worker URL must yield no guard"
+        );
+    }
+
+    /// `abort_guard_for` joins `worker_url` + `/abort_request` correctly: a
+    /// guard built through it (not constructed directly) must still reach the
+    /// right endpoint when dropped armed.
+    #[tokio::test]
+    async fn abort_guard_for_builds_a_working_guard() {
+        let (url, abort_log, _shutdown) =
+            spawn_hanging_worker_with_abort_capture(Duration::from_secs(10)).await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        {
+            let _guard = proxy
+                .abort_guard_for(&url, WireProtocol::Http1, "rid-via-proxy")
+                .expect("a well-formed worker URL must yield a guard");
+        }
+        wait_for_abort(&abort_log, Duration::from_secs(2)).await;
+        let log = abort_log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0]["rid"], "rid-via-proxy");
+    }
+
+    // ---- forward_streaming_to abort wiring --------------------------------
+
+    /// End-to-end through `forward_streaming_to`: a client that disconnects
+    /// before the upstream stream reaches its terminal item must trigger an
+    /// abort POST carrying the `abort_rid` the caller supplied.
+    #[tokio::test]
+    async fn forward_streaming_to_aborts_on_client_disconnect() {
+        let (url, abort_log, _shutdown) = spawn_streaming_worker_with_abort_capture(
+            vec!["data: a\n\n", "data: b\n\n", "data: c\n\n"],
+            Duration::from_millis(50),
+        )
+        .await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        let breaker = Arc::new(CircuitBreaker::new());
+        let resp = proxy
+            .forward_streaming_to(
+                &url,
+                WireProtocol::Http1,
+                &breaker,
+                "/v1/chat/completions",
+                &HeaderMap::new(),
+                Bytes::from_static(b"{}"),
+                None,
+                None,
+                Some("stream-rid-1"),
+            )
+            .await
+            .expect("streaming dispatch should reach the worker");
+
+        // Read exactly one chunk, then drop the body — simulating the client
+        // going away before the engine finishes streaming.
+        let mut data_stream = resp.into_body().into_data_stream();
+        use futures::StreamExt;
+        let first = data_stream.next().await;
+        assert!(first.is_some(), "expected at least one chunk before drop");
+        drop(data_stream);
+
+        wait_for_abort(&abort_log, Duration::from_secs(2)).await;
+        let log = abort_log.lock().unwrap();
+        assert_eq!(
+            log.len(),
+            1,
+            "client disconnect mid-stream must trigger exactly one abort"
+        );
+        assert_eq!(log[0]["rid"], "stream-rid-1");
+        assert_eq!(log[0]["abort_all"], false);
+    }
+
+    /// Contrast: a stream drained to its normal completion must NEVER abort —
+    /// the engine finished on its own, so telling it to stop would be a
+    /// spurious abort that pollutes engine abort metrics.
+    #[tokio::test]
+    async fn forward_streaming_to_does_not_abort_on_normal_completion() {
+        use http_body_util::BodyExt;
+
+        let (url, abort_log, _shutdown) = spawn_streaming_worker_with_abort_capture(
+            vec!["data: a\n\n", "data: b\n\n"],
+            Duration::from_millis(10),
+        )
+        .await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        let breaker = Arc::new(CircuitBreaker::new());
+        let resp = proxy
+            .forward_streaming_to(
+                &url,
+                WireProtocol::Http1,
+                &breaker,
+                "/v1/chat/completions",
+                &HeaderMap::new(),
+                Bytes::from_static(b"{}"),
+                None,
+                None,
+                Some("stream-rid-2"),
+            )
+            .await
+            .expect("streaming dispatch should reach the worker");
+
+        // Drain to completion — the normal-completion path.
+        let _ = resp.into_body().collect().await;
+        // Give the pump's mark_terminal + guard-drop a moment to run.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            abort_log.lock().unwrap().is_empty(),
+            "a stream drained to completion must never trigger an abort"
+        );
+    }
+
+    /// A non-2xx upstream response is the engine's own error body (it isn't
+    /// generating), so it must never be abortable even if the client
+    /// disconnects while reading it.
+    #[tokio::test]
+    async fn forward_streaming_to_does_not_abort_non_2xx_response() {
+        let (url, abort_log, _shutdown) = spawn_status_worker_with_abort_capture(503).await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        let breaker = Arc::new(CircuitBreaker::new());
+        let resp = proxy
+            .forward_streaming_to(
+                &url,
+                WireProtocol::Http1,
+                &breaker,
+                "/v1/chat/completions",
+                &HeaderMap::new(),
+                Bytes::from_static(b"{}"),
+                None,
+                None,
+                Some("stream-rid-3"),
+            )
+            .await
+            .expect("streaming dispatch should reach the worker");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Drop the body without draining it — the same "client disconnect"
+        // shape as the positive abort test — to prove the `status.is_success()`
+        // gate (not just an absent client disconnect) is what suppresses the
+        // abort here.
+        use futures::StreamExt;
+        let mut data_stream = resp.into_body().into_data_stream();
+        let _ = data_stream.next().await;
+        drop(data_stream);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            abort_log.lock().unwrap().is_empty(),
+            "a non-2xx response must never trigger an abort, even on client disconnect"
+        );
+    }
+
+    /// `send_abort` must never affect the worker's circuit breaker — an
+    /// abort is a courtesy to the engine, never counted against a worker (see
+    /// `send_abort`'s doc comment). `send_abort` has no breaker parameter at
+    /// all today, so this can't currently fail; this is a regression guard
+    /// against a future refactor that routes the abort POST through a
+    /// breaker-gated path (a change that would itself require adding a
+    /// breaker parameter to `send_abort`'s signature — the more durable
+    /// protection here is that shape change being visible at review time).
+    ///
+    /// Threshold is 1 so a leaked `record_failure()` would open the breaker
+    /// off a single failure. Note this is NOT a fully race-proof guard: each
+    /// iteration's own chat request succeeds and disconnects from a healthy
+    /// stream, which records a breaker SUCCESS synchronously, inline in the
+    /// SSE pump's completion hook (`bytes_stream_to_body`'s `on_complete`) —
+    /// the moment `AbortOnDrop` drops and spawns `send_abort` onto the
+    /// runtime. A hypothetical regressed `send_abort` recording a failure
+    /// only does so later, after a real async network round-trip, so the
+    /// synchronous success is very likely to win that race and mask a
+    /// transient open before either `would_allow()` below or the next
+    /// iteration's `breaker.allow()` check observes it. Treat this test as a
+    /// best-effort behavioral pin, not a deterministic regression detector —
+    /// the API-shape argument above is what actually carries the guarantee.
+    #[tokio::test]
+    async fn send_abort_failure_does_not_trip_circuit_breaker() {
+        let (url, abort_log, _shutdown) = spawn_streaming_worker_with_failing_abort(
+            vec!["data: a\n\n", "data: b\n\n", "data: c\n\n"],
+            Duration::from_millis(50),
+        )
+        .await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+            threshold: NonZeroU32::new(1).unwrap(),
+            cool_down: Duration::from_secs(30),
+        }));
+
+        for i in 0..3 {
+            let resp = proxy
+                .forward_streaming_to(
+                    &url,
+                    WireProtocol::Http1,
+                    &breaker,
+                    "/v1/chat/completions",
+                    &HeaderMap::new(),
+                    Bytes::from_static(b"{}"),
+                    None,
+                    None,
+                    Some(&format!("breaker-test-rid-{i}")),
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "iter {i}: dispatch must reach the worker (breaker must stay closed): {e}"
+                    )
+                });
+            assert_eq!(resp.status(), StatusCode::OK, "iter {i}");
+
+            use futures::StreamExt;
+            let mut data_stream = resp.into_body().into_data_stream();
+            assert!(
+                data_stream.next().await.is_some(),
+                "iter {i}: expected at least one chunk before drop"
+            );
+            drop(data_stream);
+        }
+
+        wait_for_abort_count(&abort_log, 3, Duration::from_secs(2)).await;
+        assert_eq!(
+            abort_log.lock().unwrap().len(),
+            3,
+            "all 3 disconnects must have attempted an abort, even though each one 500s"
+        );
+        assert!(
+            breaker.would_allow(),
+            "3 failed (500) /abort_request POSTs must NOT trip the breaker"
+        );
+    }
+
+    /// Poll `log` until it has at least `count` entries or `timeout` elapses.
+    async fn wait_for_abort_count(log: &AbortLog, count: usize, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while log.lock().unwrap().len() < count && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }

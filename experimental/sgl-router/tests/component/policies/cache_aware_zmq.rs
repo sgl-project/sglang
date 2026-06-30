@@ -26,6 +26,7 @@ use sgl_router::config::{ActiveLoadConfig, ProxyConfig};
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::cache_aware_zmq::CacheAwareZmqPolicy;
+use sgl_router::policies::engine_load::EngineLoadTable;
 use sgl_router::policies::kv_events::{compute_block_hashes, discovery::EventConfig, KvEventIndex};
 use sgl_router::policies::{Policy, SelectionContext};
 use sgl_router::tokenizer::TokenizerRegistry;
@@ -114,6 +115,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
         kv_index.tree(),
         Arc::clone(&tokenizers),
         block_size_oracle,
+        EngineLoadTable::new(),
     );
 
     // 5. Register two workers. They share `127.0.0.1` so both
@@ -128,6 +130,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
         block_size,
         dp_size: 1,
         is_bigram: false,
+        load_port_base: None,
     };
     kv_index.add_worker(url_a, Some(preresolved.clone())).await;
     kv_index.add_worker(url_b, Some(preresolved)).await;

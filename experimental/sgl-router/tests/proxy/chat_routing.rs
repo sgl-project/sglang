@@ -17,6 +17,7 @@ use sgl_router::workers::{WireProtocol, Worker, WorkerRegistry};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -87,7 +88,7 @@ async fn non_streaming_returns_200() {
     let res = app.oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["choices"][0]["message"]["content"], "ok");
 }
 
@@ -424,7 +425,7 @@ async fn non_streaming_upstream_429_preserved() {
         "router envelope header must NOT be set on upstream-passthrough responses",
     );
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let got: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let got: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(got, upstream_body, "body bytes must round-trip unchanged");
 }
 
@@ -463,7 +464,7 @@ async fn non_streaming_upstream_500_preserved() {
         "router envelope must NOT wrap upstream 5xx — passthrough",
     );
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let got: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let got: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(got, upstream_body);
 }
 
@@ -555,7 +556,7 @@ async fn non_streaming_upstream_4xx_body_passthrough() {
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     // Byte-exact passthrough — compare via Value to be insensitive to
     // whitespace, which is the only legal axis of variation for JSON.
-    let got: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let got: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(got, upstream_body);
 }
 
@@ -1531,6 +1532,97 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
         )),
         "stale 504 must be counted in worker_requests_total as outcome=cancelled: {m}",
     );
+
+    // The stale-timeout cancel arm leaves the unary abort guard armed (the
+    // engine is still generating a response no one will read) — distinct
+    // from the client-disconnect trigger covered elsewhere, this is the
+    // janitor-driven arm of the same `AbortOnDrop`.
+    wait_for_abort(&worker.abort_log, Duration::from_secs(2)).await;
+    let log = worker.abort_log.lock().unwrap();
+    assert_eq!(
+        log.len(),
+        1,
+        "a stale-request-janitor timeout must trigger exactly one abort"
+    );
+    let rid = log[0]["rid"].as_str().expect("rid must be a string");
+    assert!(rid.starts_with("router-"));
+}
+
+/// Streaming counterpart of `janitor_expiry_returns_504_stale_request_expired`.
+/// The streaming arm's `AbortOnDrop` guard is constructed INSIDE
+/// `forward_streaming_to`, only after a response is received — so a
+/// stale-timeout that fires while still waiting on headers (the engine
+/// hasn't responded at all yet) drops `fetch` before that guard ever exists.
+/// Without an eager pre-headers guard, that would leak the in-flight engine
+/// request with no abort sent — exactly the gap the non-streaming arm avoids
+/// by constructing its guard before dispatch. This pins the fix.
+#[tokio::test]
+async fn janitor_expiry_on_streaming_request_before_headers_still_aborts() {
+    use sgl_router::policies::active_load::{spawn_janitor, ActiveLoadRegistry};
+    // Upstream that takes 2s to even send headers — longer than our 50ms
+    // stale_request_timeout, so the janitor fires while `fetch` is still
+    // awaiting the response (no headers, no internal guard yet).
+    let worker =
+        crate::common::mock_worker::MockWorker::start_hanging(Duration::from_secs(2)).await;
+
+    let cfg = config_for(&worker.url);
+    let registry = Arc::new(WorkerRegistry::default());
+    let _ = registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    let active_load = ActiveLoadRegistry::new(
+        Arc::new(sgl_router::policies::active_load::SystemTimeClock),
+        Duration::from_millis(50),
+    );
+    let _janitor = spawn_janitor(Arc::clone(&active_load), Duration::from_millis(20));
+    let ctx = Arc::new(AppContext::with_active_load(
+        cfg,
+        tokenizers,
+        proxy,
+        registry,
+        policies,
+        active_load,
+    ));
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::GATEWAY_TIMEOUT,
+        "stale-request expiry must surface as 504 for streaming too",
+    );
+
+    wait_for_abort(&worker.abort_log, Duration::from_secs(2)).await;
+    let log = worker.abort_log.lock().unwrap();
+    assert_eq!(
+        log.len(),
+        1,
+        "a stale-timeout firing BEFORE headers arrive on a streaming request \
+         must still trigger an abort — the engine may already be working on \
+         a request no client will ever see"
+    );
+    let rid = log[0]["rid"].as_str().expect("rid must be a string");
+    assert!(rid.starts_with("router-"));
 }
 
 /// Task A: a non-streaming request that errors out (upstream
@@ -2092,6 +2184,26 @@ async fn admission_slots_not_leaked_under_concurrent_streaming_disconnects() {
         0,
         "active-load registry must drain too"
     );
+
+    // Every one of the 24 concurrent disconnects must independently trigger
+    // its own abort — exercising the shared `AbortOnDrop` machinery (the
+    // `reached_end` AtomicBool, the fire-and-forget spawn) under contention,
+    // not just a single request at a time.
+    wait_for_abort_count(&worker.abort_log, 24, Duration::from_secs(5)).await;
+    let log = worker.abort_log.lock().unwrap();
+    assert_eq!(
+        log.len(),
+        24,
+        "all 24 concurrent disconnects must each trigger exactly one abort"
+    );
+    let rids: std::collections::HashSet<&str> =
+        log.iter().filter_map(|v| v["rid"].as_str()).collect();
+    assert_eq!(
+        rids.len(),
+        24,
+        "all 24 aborted rids must be unique — a collision would mean two requests \
+         shared (or one overwrote) the other's router-minted rid"
+    );
 }
 
 /// Test-only `tracing` writer appending to a shared buffer.
@@ -2207,5 +2319,212 @@ async fn success_logged_once_in_access_log() {
     assert_eq!(
         n, 1,
         "a success must be logged exactly once; got {n}:\n{logs}"
+    );
+}
+
+// ---- Abort-on-disconnect (full handler, via build_router) -----------------
+//
+// Plain-mode (non-PD) coverage for the `/abort_request` wiring added in
+// `chat_completions_inner`: a client-supplied body `rid` is reused verbatim,
+// an absent one is minted as `router-<uuid>`, and only an early
+// disconnect — never a normal completion — sends an abort. PD-mode exclusion
+// is covered separately in `pd_bootstrap_injection.rs`, which already owns
+// the PD worker-registry setup.
+
+/// Build a chat-completion request body, optionally carrying a client
+/// `"rid"` field (the body-level identifier the engine adopts and the router
+/// later aborts by — distinct from the `x-request-id` HTTP header `
+/// make_chat_req` sets for access-log correlation).
+fn chat_req_with_body_rid(streaming: bool, body_rid: Option<&str>) -> Request<Body> {
+    let mut body = serde_json::json!({
+        "model": "tiny",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": streaming,
+    });
+    if let Some(rid) = body_rid {
+        body["rid"] = Value::String(rid.to_string());
+    }
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+/// Poll `log` until it has at least one entry or `timeout` elapses.
+async fn wait_for_abort(log: &Arc<std::sync::Mutex<Vec<Value>>>, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while log.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Poll `log` until it has at least `count` entries or `timeout` elapses —
+/// the multi-request counterpart of [`wait_for_abort`], for tests asserting
+/// on N independent aborts landing rather than just "at least one."
+async fn wait_for_abort_count(
+    log: &Arc<std::sync::Mutex<Vec<Value>>>,
+    count: usize,
+    timeout: Duration,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    while log.lock().unwrap().len() < count && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A client that disconnects mid-SSE-stream (drops the response body before
+/// it's drained) must trigger exactly one `/abort_request` to the engine,
+/// carrying a `router-`-minted rid (no client `rid` was supplied).
+#[tokio::test]
+async fn streaming_disconnect_triggers_engine_abort() {
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        vec!["data: a\n\n", "data: b\n\n", "data: c\n\n"],
+        Duration::from_millis(50),
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let res = app
+        .oneshot(chat_req_with_body_rid(true, None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Read exactly one chunk, then drop the body — simulating the client
+    // going away before the engine finishes streaming.
+    use futures::StreamExt;
+    let mut data_stream = res.into_body().into_data_stream();
+    assert!(
+        data_stream.next().await.is_some(),
+        "expected at least one chunk before drop"
+    );
+    drop(data_stream);
+
+    wait_for_abort(&worker.abort_log, Duration::from_secs(2)).await;
+    let log = worker.abort_log.lock().unwrap();
+    assert_eq!(
+        log.len(),
+        1,
+        "client disconnect mid-stream must trigger exactly one abort"
+    );
+    let rid = log[0]["rid"].as_str().expect("rid must be a string");
+    assert!(
+        rid.starts_with("router-"),
+        "no client rid was supplied — must mint a `router-`-prefixed rid, got {rid}"
+    );
+    assert_eq!(log[0]["abort_all"], false);
+}
+
+/// A stream drained to its normal completion must never trigger an abort.
+#[tokio::test]
+async fn streaming_normal_completion_does_not_abort() {
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        vec!["data: a\n\n", "data: b\n\n"],
+        Duration::from_millis(10),
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let res = app
+        .oneshot(chat_req_with_body_rid(true, None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = res.into_body().collect().await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        worker.abort_log.lock().unwrap().is_empty(),
+        "a stream drained to completion must never trigger an abort"
+    );
+}
+
+/// A client-supplied body `rid` must be reused verbatim for the abort — not
+/// overridden by a router-minted one — so an external abort-by-rid keeps
+/// working.
+#[tokio::test]
+async fn streaming_disconnect_reuses_client_supplied_rid() {
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        vec!["data: a\n\n", "data: b\n\n", "data: c\n\n"],
+        Duration::from_millis(50),
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let res = app
+        .oneshot(chat_req_with_body_rid(true, Some("client-rid-123")))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    use futures::StreamExt;
+    let mut data_stream = res.into_body().into_data_stream();
+    assert!(data_stream.next().await.is_some());
+    drop(data_stream);
+
+    wait_for_abort(&worker.abort_log, Duration::from_secs(2)).await;
+    let log = worker.abort_log.lock().unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(
+        log[0]["rid"], "client-rid-123",
+        "a client-supplied rid must be reused verbatim, not overridden"
+    );
+}
+
+/// Non-streaming: the handler future being dropped before the engine
+/// responds (the real shape of a client disconnect under axum — the runtime
+/// drops the handler future) must trigger exactly one abort.
+#[tokio::test]
+async fn non_streaming_handler_drop_triggers_engine_abort() {
+    let worker =
+        crate::common::mock_worker::MockWorker::start_hanging(Duration::from_secs(10)).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+    let req = chat_req_with_body_rid(false, None);
+
+    // Spawn the handler call so it can be cancelled mid-flight, exactly as
+    // the axum runtime cancels a handler future on a real client disconnect.
+    let handle = tokio::spawn(async move { app.oneshot(req).await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    handle.abort();
+    let _ = handle.await;
+
+    wait_for_abort(&worker.abort_log, Duration::from_secs(2)).await;
+    let log = worker.abort_log.lock().unwrap();
+    assert_eq!(
+        log.len(),
+        1,
+        "a dropped handler future (client disconnect) must trigger exactly one abort"
+    );
+    let rid = log[0]["rid"].as_str().expect("rid must be a string");
+    assert!(rid.starts_with("router-"));
+    assert_eq!(log[0]["abort_all"], false);
+}
+
+/// Non-streaming: a normal completion (the client waits for the full
+/// response) must never trigger an abort — the guard must be disarmed before
+/// drop.
+#[tokio::test]
+async fn non_streaming_normal_completion_does_not_abort() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let res = app
+        .oneshot(chat_req_with_body_rid(false, None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = res.into_body().collect().await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        worker.abort_log.lock().unwrap().is_empty(),
+        "a normal completion must never trigger an abort"
     );
 }

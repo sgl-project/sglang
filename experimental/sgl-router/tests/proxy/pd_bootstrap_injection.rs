@@ -332,3 +332,87 @@ async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
     let pv = parse_body(&prefill_body);
     assert_eq!(bootstrap_port(&pv), Some(8997));
 }
+
+fn streaming_chat_request() -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+/// PD-disagg mode deliberately excludes the abort-on-disconnect feature (see
+/// `chat_completions_inner`'s `request_id` comment): prefill is detached to
+/// outlive the client for KV-transfer correctness, and aborting only the
+/// decode half mid-transfer is out of scope. A client disconnect mid-decode-
+/// stream must NOT send `/abort_request` to either worker, and neither
+/// forwarded body should carry an injected `rid`.
+#[tokio::test]
+async fn pd_mode_disconnect_does_not_abort_either_worker() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start_slow_stream(
+        vec!["data: a\n\n", "data: b\n\n", "data: c\n\n"],
+        Duration::from_millis(50),
+    )
+    .await;
+    let ctx = build_ctx(vec![
+        WorkerSpec {
+            id: WorkerId("p1".into()),
+            url: prefill.url.clone(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: Some(8997),
+        },
+        WorkerSpec {
+            id: WorkerId("d1".into()),
+            url: decode.url.clone(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        },
+    ]);
+    let app = build_router(ctx);
+
+    let res = app.oneshot(streaming_chat_request()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Disconnect mid-decode-stream — the same shape as the plain-mode abort
+    // test, but here it must be a no-op.
+    use futures::StreamExt;
+    let mut data_stream = res.into_body().into_data_stream();
+    assert!(data_stream.next().await.is_some());
+    drop(data_stream);
+
+    // No fixed event to poll for ("nothing happens"), so wait out a window
+    // comfortably longer than the plain-mode abort tests' detection latency.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        decode.abort_log.lock().unwrap().is_empty(),
+        "PD mode must never send /abort_request to the decode worker"
+    );
+    assert!(
+        prefill.abort_log.lock().unwrap().is_empty(),
+        "PD mode must never send /abort_request to the prefill worker"
+    );
+
+    // Neither forwarded body carries an injected `rid` — `rid_to_inject` is
+    // `None` whenever `decode_peer.is_some()`.
+    let decode_body = await_captured_body(&decode, Duration::from_secs(2), "decode").await;
+    let prefill_body = await_captured_body(&prefill, Duration::from_secs(2), "prefill").await;
+    assert!(
+        parse_body(&decode_body).get("rid").is_none(),
+        "PD mode must not inject a rid into the decode body"
+    );
+    assert!(
+        parse_body(&prefill_body).get("rid").is_none(),
+        "PD mode must not inject a rid into the prefill body"
+    );
+}

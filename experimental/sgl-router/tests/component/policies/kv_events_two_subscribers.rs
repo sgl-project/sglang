@@ -42,6 +42,7 @@ async fn two_independent_subscribers_converge_to_same_tree_state() {
         block_size,
         dp_size: 1,
         is_bigram: false,
+        load_port_base: None,
     };
 
     // 2. Two independent router-process surrogates, each with its own
@@ -175,6 +176,7 @@ async fn two_subscribers_merge_events_from_two_publishers() {
         block_size,
         dp_size: 1,
         is_bigram: false,
+        load_port_base: None,
     };
     let cfg_y = EventConfig {
         host: "127.0.0.1".into(),
@@ -183,6 +185,7 @@ async fn two_subscribers_merge_events_from_two_publishers() {
         block_size,
         dp_size: 1,
         is_bigram: false,
+        load_port_base: None,
     };
 
     // Both routers subscribe to BOTH workers — the production fan-out.

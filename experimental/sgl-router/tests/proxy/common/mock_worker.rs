@@ -39,7 +39,28 @@ pub struct MockWorker {
     // Used in header_forwarding_test; not every test file reads captured headers.
     #[allow(dead_code)]
     pub captured: Arc<Mutex<CapturedHeaders>>,
+    /// Every `/abort_request` POST this worker received, in arrival order.
+    /// Populated by every axum-based `start_*` variant; not every test file
+    /// reads it. `start_returning_partial_body` (raw TCP, no path routing)
+    /// never populates it.
+    #[allow(dead_code)]
+    pub abort_log: Arc<Mutex<Vec<Value>>>,
     _shutdown: oneshot::Sender<()>,
+}
+
+/// `/abort_request` route shared by every axum-based `MockWorker::start_*`
+/// variant: appends the POSTed JSON body to `log` and answers 200 OK. Generic
+/// over `S` (the per-variant axum state type) because the handler closure
+/// extracts no `State<S>` — the same shape as `serve_tiny_server_info` below.
+#[allow(dead_code)] // shared across all axum variants
+fn abort_request_route<S>(log: Arc<Mutex<Vec<Value>>>) -> axum::routing::MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    post(move |Json(body): Json<Value>| async move {
+        log.lock().unwrap().push(body);
+        StatusCode::OK
+    })
 }
 
 impl MockWorker {
@@ -50,6 +71,7 @@ impl MockWorker {
     #[allow(dead_code)] // Only used by some test files.
     pub async fn start(stream_chunks: Vec<&'static str>) -> Self {
         let captured = Arc::new(Mutex::new(CapturedHeaders::default()));
+        let abort_log: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let state = MockWorkerState {
             captured: captured.clone(),
             stream_chunks: Arc::new(stream_chunks),
@@ -60,6 +82,7 @@ impl MockWorker {
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(chat))
             .route("/server_info", get(serve_tiny_server_info))
+            .route("/abort_request", abort_request_route(abort_log.clone()))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -77,6 +100,7 @@ impl MockWorker {
         Self {
             url,
             captured,
+            abort_log,
             _shutdown: tx,
         }
     }
@@ -88,6 +112,7 @@ impl MockWorker {
     #[allow(dead_code)]
     pub async fn start_hanging(delay: Duration) -> Self {
         let captured = Arc::new(Mutex::new(CapturedHeaders::default()));
+        let abort_log: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
 
         #[derive(Clone)]
         struct HangState {
@@ -127,6 +152,7 @@ impl MockWorker {
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(hang_handler))
             .route("/server_info", get(serve_tiny_server_info))
+            .route("/abort_request", abort_request_route(abort_log.clone()))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -144,6 +170,7 @@ impl MockWorker {
         Self {
             url,
             captured,
+            abort_log,
             _shutdown: tx,
         }
     }
@@ -154,6 +181,7 @@ impl MockWorker {
     #[allow(dead_code)]
     pub async fn start_slow_stream(chunks: Vec<&'static str>, delay: Duration) -> Self {
         let captured = Arc::new(Mutex::new(CapturedHeaders::default()));
+        let abort_log: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
 
         #[derive(Clone)]
         struct SlowState {
@@ -207,6 +235,7 @@ impl MockWorker {
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(slow_chat))
             .route("/server_info", get(serve_tiny_server_info))
+            .route("/abort_request", abort_request_route(abort_log.clone()))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -224,6 +253,7 @@ impl MockWorker {
         Self {
             url,
             captured,
+            abort_log,
             _shutdown: tx,
         }
     }
@@ -309,6 +339,7 @@ impl MockWorker {
         Self {
             url,
             captured,
+            abort_log: Arc::new(Mutex::new(Vec::new())),
             _shutdown: tx,
         }
     }
@@ -319,6 +350,7 @@ impl MockWorker {
     #[allow(dead_code)]
     pub async fn start_returning_error(status: StatusCode, body: Value) -> Self {
         let captured = Arc::new(Mutex::new(CapturedHeaders::default()));
+        let abort_log: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let body_arc = Arc::new(body.to_string());
 
         #[derive(Clone)]
@@ -360,6 +392,7 @@ impl MockWorker {
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(error_handler))
             .route("/server_info", get(serve_tiny_server_info))
+            .route("/abort_request", abort_request_route(abort_log.clone()))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -377,6 +410,7 @@ impl MockWorker {
         Self {
             url,
             captured,
+            abort_log,
             _shutdown: tx,
         }
     }
