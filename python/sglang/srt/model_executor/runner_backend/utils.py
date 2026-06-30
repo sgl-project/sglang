@@ -81,9 +81,7 @@ def resolve_decode_backend(
             FullXPUGraphBackend,
         )
 
-        return FullXPUGraphBackend(
-            cuda_graph_runner, enable_memory_saver=enable_memory_saver
-        )
+        return FullXPUGraphBackend(cuda_graph_runner)
 
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(

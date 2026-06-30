@@ -124,14 +124,13 @@ class XPUGraphRunner(DecodeCudaGraphRunner):
         torch._dynamo.config.suppress_errors = True
 
     def __init__(self, model_runner: ModelRunner):
+        assert (
+            not model_runner.server_args.enable_memory_saver
+        ), "XPUGraphRunner does not support Torch Memory Saver yet."
         register_fake_ops()
         self._apply_xpu_compile_config()
         register_xpu_device_properties_for_dynamo()
         super().__init__(model_runner)
-
-        assert (
-            not self.model_runner.server_args.enable_memory_saver
-        ), "XPUGraphRunner does not support Torch Memory Saver yet."
 
         assert (
             not self.enable_two_batch_overlap
