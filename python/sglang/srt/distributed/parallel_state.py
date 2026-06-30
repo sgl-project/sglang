@@ -43,6 +43,16 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
+
+try:
+    # Predicate for whether torch.distributed is routed through TorchComms.
+    from torch.distributed.distributed_c10d import _use_torchcomms_enabled
+except (ImportError, AttributeError):
+
+    def _use_torchcomms_enabled() -> bool:
+        return False
+
+
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
@@ -297,11 +307,40 @@ class GroupCoordinator:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
 
+        # Build the eager device subgroup with split_group: it splits the default
+        # (parent) communicator instead of bootstrapping a fresh one, reusing the
+        # parent's rendezvous. split_group is standard PyTorch (not
+        # torchcomms-specific); its only requirement is a device-bound default PG,
+        # so gate on bound_device_id rather than torchcomms. It is collective over
+        # the whole parent, so it is called ONCE with the full partition
+        # (group_ranks) and returns this rank's subgroup. The pp group is the
+        # exception -- it needs a torchcomms-only per-peer "nccl-lazy"
+        # ProcessGroup (a dedicated comm + stream per send/recv peer, like
+        # ProcessGroupNCCL) for P2P overlap, which split can't produce, so it is
+        # built members-only via new_group. The gloo cpu group can't be split
+        # from the NCCL-only parent, so it stays new_group too.
+        is_mooncake = "mooncake" in torch_distributed_backend
+        pp_lazy = _use_torchcomms_enabled() and group_name == "pp"
+        eager_split = (
+            not is_mooncake
+            and not pp_lazy
+            and torch.distributed.distributed_c10d._get_default_group().bound_device_id
+            is not None
+            and "nccl" in str(torch_distributed_backend).lower()
+        )
+        my_device_split_group = None
+        if eager_split:
+            my_device_split_group = torch.distributed.split_group(
+                split_ranks=[list(r) for r in group_ranks],
+                pg_options=get_torch_distributed_pg_options(group_name),
+                group_desc=group_name,
+                timeout=_MODEL_PARALLEL_GROUP_TIMEOUT,
+            )
         for ranks in group_ranks:
             active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
             active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
             subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
-            if "mooncake" in torch_distributed_backend:
+            if is_mooncake:
                 from mooncake.ep import MooncakeBackendOptions
 
                 device_group = torch.distributed.new_group(
@@ -316,12 +355,19 @@ class GroupCoordinator:
                     pg_options=MooncakeBackendOptions(active_ranks_cpu, recovered_rank),
                     timeout=subgroup_timeout,
                 )
+            elif eager_split:
+                # split_group already created this rank's subgroup above.
+                device_group = my_device_split_group if self.rank in ranks else None
+                cpu_group = torch.distributed.new_group(
+                    ranks, backend="gloo", timeout=gloo_timeout
+                )
             else:
                 pg_options = get_torch_distributed_pg_options(group_name)
                 device_group = torch.distributed.new_group(
                     ranks,
-                    backend=torch_distributed_backend,
+                    backend="nccl-lazy" if pp_lazy else torch_distributed_backend,
                     pg_options=pg_options,
+                    use_local_synchronization=pp_lazy,
                     timeout=subgroup_timeout,
                 )
                 # a group with `gloo` backend, to allow direct coordination
@@ -1792,6 +1838,17 @@ def init_distributed_environment(
             ) from e
         mooncake_ep.set_host_ip(get_local_ip_auto())
 
+    # Resolve local_rank up front: it is not available on a torch ProcessGroup
+    # (see https://github.com/pytorch/pytorch/issues/122816) and is needed both
+    # for the world device binding below and for init_world_group.
+    if local_rank == -1:
+        # local rank not set, this usually happens in single-node setting,
+        # where we can use rank as local rank
+        if distributed_init_method == "env://":
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        else:
+            local_rank = rank
+
     if not torch.distributed.is_initialized():
         global _MODEL_PARALLEL_GROUP_TIMEOUT
         assert distributed_init_method is not None, (
@@ -1814,6 +1871,17 @@ def init_distributed_environment(
         else:
             pg_options = get_torch_distributed_pg_options()
 
+        # Under torchcomms, bind the world PG to its CUDA device so split_group /
+        # the lazy new_group path can read bound_device_id. PyTorch auto-qualifies
+        # "nccl" -> "cpu:gloo,cuda:nccl", and lazy PP subgroups reuse the c10d
+        # store (persistent_store), so no MASTER_PORT / TORCHCOMM_* seeding. With
+        # torchcomms off, device_id stays None and this is the original call.
+        device_id = (
+            torch.device(f"cuda:{local_rank}")
+            if _use_torchcomms_enabled() and is_cuda_alike() and backend != "gloo"
+            else None
+        )
+
         # this backend is used for WORLD
         torch.distributed.init_process_group(
             backend=backend,
@@ -1822,22 +1890,13 @@ def init_distributed_environment(
             rank=rank,
             timeout=timeout,
             pg_options=pg_options,
+            device_id=device_id,
         )
 
         # Create a global TCPStore for coordination (used by NIXL)
         if moe_a2a_backend == "nixl":
             _create_global_tcp_store(rank, world_size)
 
-    # set the local rank
-    # local_rank is not available in torch ProcessGroup,
-    # see https://github.com/pytorch/pytorch/issues/122816
-    if local_rank == -1:
-        # local rank not set, this usually happens in single-node
-        # setting, where we can use rank as local rank
-        if distributed_init_method == "env://":
-            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        else:
-            local_rank = rank
     global _WORLD
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
