@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.utils import (
     _is_fake_transfer,
     get_kv_class,
     is_mla_backend,
+    merge_main_and_draft_kv_layout,
     poll_and_all_reduce,
     poll_and_all_reduce_with_staging,
     prepare_abort,
@@ -425,9 +426,42 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
+            # Draft-layout validation reorders the draft KV layout and ships
+            # the decode-side main count to prefill. Gated separately from LP
+            # (forced on under LP); with both off the wire protocol matches
+            # the pre-LP build (naive concat, no num_main_kv_layers).
+            draft_layout_validation = getattr(
+                self.scheduler.server_args,
+                "enable_disagg_draft_layout_validation",
+                False,
+            )
+            if draft_layout_validation:
+                # Capture decode-side main count BEFORE merging so the
+                # registration layer can ship it to prefill as
+                # ``dst_num_main_kv_layers``; the KV helpers slice main vs
+                # draft regions of dst independently.
+                kv_args.num_main_kv_layers = len(kv_data_ptrs) // (
+                    1 if self.is_mla_backend else 2
+                )
+                # Reorder MHA so the //2 split in `get_mha_kv_ptrs_with_pp`
+                # keeps K and V halves contiguous; MLA falls through to simple
+                # concat.
+                kv_data_ptrs, kv_data_lens, kv_item_lens = (
+                    merge_main_and_draft_kv_layout(
+                        kv_data_ptrs,
+                        kv_data_lens,
+                        kv_item_lens,
+                        draft_kv_data_ptrs,
+                        draft_kv_data_lens,
+                        draft_kv_item_lens,
+                        is_mla_backend=self.is_mla_backend,
+                    )
+                )
+            else:
+                # Pre-LP behavior: naive concat (no main/draft reorder).
+                kv_data_ptrs += draft_kv_data_ptrs
+                kv_data_lens += draft_kv_data_lens
+                kv_item_lens += draft_kv_item_lens
             kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
 
         kv_args.kv_data_ptrs = kv_data_ptrs
