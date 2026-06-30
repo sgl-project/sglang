@@ -875,6 +875,31 @@ class LoRAMemoryPool:
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
 
+    def free_lora(self, uid: Optional[str]) -> None:
+        """Release a resident adapter's buffer slot + bookkeeping (called from unload_lora_adapter).
+
+        Per-step LoRA weight refresh in colocate RL pushes a FRESH uid every step (unload + load).
+        Without freeing the slot here, unload leaves ``uid_to_buffer_id`` pointing at the unloaded
+        adapter, so the next load's in-place buffer copy in ``prepare_lora_batch`` is skipped (the
+        eviction self-heal of a dangling entry is fragile) and the SERVED (cuda-graph) buffer keeps
+        stale weights. Freeing the slot makes the next load re-copy the new weights into the SAME
+        fixed-address buffer slot the captured graph reads -> cuda-graph-replay-safe. Works for both
+        ``max_loras_per_batch == 1`` and ``> 1``: each adapter frees/reloads its own slot, and
+        ``weight_indices`` (attention) / ``token_lora_mapping`` (MoE) are updated in place per step,
+        so the kernels follow whatever slot the reload assigned. Mirrors the eviction path above.
+        """
+        if uid is None:
+            return
+        buffer_id = self.uid_to_buffer_id.pop(uid, None)
+        if buffer_id is None:
+            return
+        try:
+            self.eviction_policy.remove(uid)
+        except Exception:
+            pass
+        if 0 <= buffer_id < len(self.buffer_id_to_uid) and self.buffer_id_to_uid[buffer_id] == uid:
+            self.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
+
     def load_lora_weight_to_buffer(
         self,
         uid: str,
