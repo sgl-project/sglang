@@ -1165,13 +1165,15 @@ class KVWriteLoc:
     full_loc: Optional[torch.Tensor] = None
 
     def __post_init__(self):
-        # swa_out_cache_loc is computed once at metadata-init time from the
-        # full (possibly padded) out_cache_loc. Piecewise CUDA graphs later
-        # narrow out_cache_loc to real_num_tokens per layer, so swa_loc can
-        # be longer than loc. Slice to match since both are in the same
-        # per-token order.
+        # swa_loc / full_loc are computed once at metadata-init time from the
+        # full (possibly padded) out_cache_loc. Piecewise CUDA graphs / DP-padded
+        # paths later narrow out_cache_loc to real_num_tokens per layer, so these
+        # pre-resolved locs can be longer than loc. Slice both to match since all
+        # three are in the same per-token order.
         if self.swa_loc is not None and self.swa_loc.shape[0] != self.loc.shape[0]:
             self.swa_loc = self.swa_loc[: self.loc.shape[0]]
+        if self.full_loc is not None and self.full_loc.shape[0] != self.loc.shape[0]:
+            self.full_loc = self.full_loc[: self.loc.shape[0]]
 
 
 def unwrap_write_loc(loc_info):

@@ -732,6 +732,12 @@ class TritonAttnBackend(AttentionBackend):
         # out_cache_loc is always present and bs <= max_bs, so no guard needed).
         out_cache_loc = forward_batch.out_cache_loc
         n = out_cache_loc.shape[0]
+        # Zero the padded tail before refilling the head (mirrors
+        # _fill_cuda_graph_swa_out_cache_loc): a replay batch smaller than the
+        # captured bucket leaves [n:] holding stale physical ids, and the captured
+        # full-layer KV store writes those padded rows — send them to slot 0 (the
+        # reserved sink) instead of a stale live slot.
+        self.cuda_graph_out_cache_loc_full_physical[n:].zero_()
         self.cuda_graph_out_cache_loc_full_physical[:n].copy_(
             self._translate_kv_loc(out_cache_loc)
         )
