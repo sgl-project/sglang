@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW4A8Int8MoE,
     ModelSlimW8A8Int8,
     ModelSlimW8A8Int8MoE,
+    ModelSlimW8A8Mxfp8MoE,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import apply_module_patch
@@ -90,7 +91,7 @@ class ModelSlimConfig(QuantizationConfig):
     Config class for ModelSlim Quantization, a NPU-specific quantization type.
     """
 
-    def __init__(self, quant_config: Dict[str, Any] = {}):
+    def __init__(self, quant_config, weight_prefix, group_size=0):
         super().__init__()
         keys = [k for k in quant_config if isinstance(k, str)]
         is_dsv4 = any(k.startswith("hc_head_") for k in keys)
@@ -110,6 +111,8 @@ class ModelSlimConfig(QuantizationConfig):
         self.packed_modules_mapping = (
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
+        if group_size == 0:
+            group_size = quant_config.quant_description.get("group_size", 32)
 
         for name in self.quant_description.keys():
             if "norm.bias" in name:
@@ -230,6 +233,7 @@ class ModelSlimConfig(QuantizationConfig):
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE),
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
+            ("W8A8_MXFP8",   ModelSlimW8A8Mxfp8MoE),
         ]
         # Suffixes for the two weight groups
         w13_suffixes = [".0.gate_proj.weight", ".0.up_proj.weight"]
@@ -261,7 +265,11 @@ class ModelSlimConfig(QuantizationConfig):
             if cls is None:
                 logger.warning(f"Unsupported scheme '{name}' for layer {prefix}")
                 return None
+            # ModelSlimW8A8Mxfp8MoE expects an extra `group_size` argument
+            if cls is ModelSlimW8A8Mxfp8MoE:
+                return cls(self, weight_group, group_size=self.group_size)
             return cls(self, weight_group)
+
 
         w13_scheme = instantiate(w13_scheme_name, weight_group="w13")
         logger.info_once(
@@ -430,7 +438,8 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
             w2_weight=layer.w2_weight,
             w13_weight_scale=layer.w13_weight_scale,
             w2_weight_scale=layer.w2_weight_scale,
-            w13_weight_offset=layer.w13_weight_offset,
-            w2_weight_offset=layer.w2_weight_offset,
+            # offsets exist only for int4/int8 schemes; MXFP8 has none
+            w13_weight_offset=getattr(layer, "w13_weight_offset", None),
+            w2_weight_offset=getattr(layer, "w2_weight_offset", None),
         )
         return self.runner.run(dispatch_output, quant_info)
