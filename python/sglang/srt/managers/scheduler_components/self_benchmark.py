@@ -34,6 +34,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.observability.forward_pass_metrics import ForwardPassMetrics
+    from sglang.srt.server_args import ServerArgs
 
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,12 @@ class BenchmarkPointResult:
     fpms: list = field(default_factory=list)
 
 
+@dataclass
+class SkippedBenchmarkPoint:
+    point: BenchmarkPoint
+    reason: str
+
+
 class BenchmarkPhase(Enum):
     WARMUP = "warmup"
     SWEEP = "sweep"
@@ -90,6 +97,100 @@ class SelfBenchmark:
     only on homogeneous state.
     """
 
+    MAX_AXIS_GRANULARITY = 1024
+    MAX_GRID_POINTS = 4096
+
+    @classmethod
+    def create_if_enabled(cls, scheduler: Scheduler) -> Optional[SelfBenchmark]:
+        """Validate runtime compatibility and create an enabled benchmark."""
+        if scheduler.server_args.benchmark_mode is None:
+            return None
+
+        if scheduler.ps.pp_size > 1:
+            raise ValueError(
+                "--benchmark-mode is not supported with pipeline parallelism"
+            )
+        if scheduler.enable_pdmux:
+            raise ValueError("--benchmark-mode is not supported with PD multiplexing")
+        if scheduler.enable_overlap_mlx:
+            raise ValueError("--benchmark-mode is not supported with MLX overlap")
+        if not scheduler.is_generation:
+            # Non-generation (embedding/reward) models would leak synthetic
+            # prefill outputs to the tokenizer (suppress_output is only honored
+            # on the generation streaming path).
+            raise ValueError("--benchmark-mode is only supported for generative models")
+        if not scheduler.spec_algorithm.is_none():
+            # The synthetic decode path is incompatible with speculative
+            # decoding, and the synthetic prefill path is not guarded for it.
+            raise ValueError(
+                "--benchmark-mode is not supported with speculative decoding"
+            )
+        if scheduler.model_config.is_encoder_decoder:
+            raise ValueError(
+                "--benchmark-mode is not supported with encoder-decoder models"
+            )
+        if scheduler.model_config.is_multimodal:
+            # Synthetic requests carry no multimodal inputs.
+            raise ValueError("--benchmark-mode is not supported with multimodal models")
+        if scheduler.enable_lora:
+            raise ValueError("--benchmark-mode is not supported with LoRA")
+        if scheduler.server_args.load_format == "dummy":
+            # Dummy weights produce meaningless benchmark results.
+            raise ValueError(
+                "--benchmark-mode is not supported with dummy weights "
+                "(--load-format dummy)"
+            )
+
+        return cls(scheduler)
+
+    @classmethod
+    def validate_args(cls, server_args: ServerArgs) -> None:
+        """Validate self-benchmark-specific server arguments."""
+        if server_args.benchmark_mode is None:
+            return
+
+        # Non-positive values collapse an axis to one point, while very large
+        # values can exhaust host memory before the event loop starts.
+        for name in (
+            "benchmark_prefill_granularity",
+            "benchmark_prefill_kv_read_granularity",
+            "benchmark_decode_length_granularity",
+            "benchmark_decode_batch_granularity",
+        ):
+            value = getattr(server_args, name)
+            flag = f"--{name.replace('_', '-')}"
+            if value < 1:
+                raise ValueError(f"{flag} must be >= 1 when --benchmark-mode is set.")
+            if value > cls.MAX_AXIS_GRANULARITY:
+                raise ValueError(
+                    f"{flag} must be <= {cls.MAX_AXIS_GRANULARITY} "
+                    "when --benchmark-mode is set."
+                )
+
+        grid_points = {
+            "prefill": server_args.benchmark_prefill_granularity
+            * server_args.benchmark_prefill_kv_read_granularity,
+            "decode": server_args.benchmark_decode_length_granularity
+            * server_args.benchmark_decode_batch_granularity,
+        }
+        requested_grid_points = (
+            sum(grid_points.values())
+            if server_args.benchmark_mode == "agg"
+            else grid_points[server_args.benchmark_mode]
+        )
+        if requested_grid_points > cls.MAX_GRID_POINTS:
+            raise ValueError(
+                f"--benchmark-mode {server_args.benchmark_mode} requests "
+                f"{requested_grid_points} grid points; the maximum is "
+                f"{cls.MAX_GRID_POINTS}."
+            )
+
+        if server_args.benchmark_warmup_iterations < 0:
+            raise ValueError(
+                "--benchmark-warmup-iterations must be >= 0 when "
+                "--benchmark-mode is set."
+            )
+
     def __init__(self, scheduler: Scheduler):
         self.scheduler = scheduler
         self.config = SelfBenchmarkConfig(
@@ -110,6 +211,7 @@ class SelfBenchmark:
         self.phase = BenchmarkPhase.WARMUP
         self._grid: list[BenchmarkPoint] = []
         self._results: list[BenchmarkPointResult] = []
+        self._skipped_points: list[SkippedBenchmarkPoint] = []
         self._current: Optional[BenchmarkPointResult] = None
         self._active_reqs: list[Req] = []
         self._seq = 0
@@ -186,7 +288,7 @@ class SelfBenchmark:
             if injected > 0:
                 return
             logger.warning("Skipping benchmark point with no valid seed: %s", point)
-            self._advance_grid_point()
+            self._skip_grid_point(point, "seed_injection_failed")
             return
 
         self._current = BenchmarkPointResult(point=point)
@@ -200,7 +302,7 @@ class SelfBenchmark:
 
         if injected == 0:
             logger.warning("Skipping benchmark point with no valid requests: %s", point)
-            self._advance_grid_point()
+            self._skip_grid_point(point, "request_injection_failed")
 
     def observe_forward_pass(
         self, batch: ScheduleBatch, fpm: Optional[ForwardPassMetrics]
@@ -246,7 +348,16 @@ class SelfBenchmark:
     def _save_current_point(self) -> None:
         if self._current is None:
             return
+        if not self._current.fpms:
+            point = self._current.point
+            logger.warning("Skipping benchmark point with no metrics: %s", point)
+            self._skip_grid_point(point, "no_forward_pass_metrics")
+            return
         self._results.append(self._current)
+        self._advance_grid_point()
+
+    def _skip_grid_point(self, point: BenchmarkPoint, reason: str) -> None:
+        self._skipped_points.append(SkippedBenchmarkPoint(point=point, reason=reason))
         self._advance_grid_point()
 
     def _advance_grid_point(self) -> None:
@@ -388,7 +499,23 @@ class SelfBenchmark:
         paged_context = ((context_length + page_size - 1) // page_size) * page_size
         tokens_per_req = paged_context + page_size
         token_capped = max(1, max_tokens // max(1, tokens_per_req))
-        return min(max_running, token_capped)
+        return min(max_running, token_capped, self._max_decode_forward_batch_size())
+
+    def _max_decode_forward_batch_size(self) -> int:
+        """Return the configured decode-forward batch ceiling.
+
+        KV capacity and request slots do not account for transient full-vocabulary
+        logits. The decode graph limit is SGLang's existing memory-tuned forward
+        ceiling; keeping startup diagnostics within it avoids eager-only batches
+        whose logits can exceed the remaining device headroom.
+        """
+        max_bs = self.scheduler.server_args.cuda_graph_config.decode.max_bs
+        if max_bs is None:
+            raise RuntimeError(
+                "Decode CUDA graph max batch size must be resolved before "
+                "self-benchmark initialization"
+            )
+        return max(1, int(max_bs))
 
     def _inject_warmup(self) -> int:
         if self._supports_decode_points() and self._should_use_decode_warmup():
@@ -458,7 +585,7 @@ class SelfBenchmark:
                 point.kv_read_tokens,
                 actual_kv_read_tokens,
             )
-            self._advance_grid_point()
+            self._skip_grid_point(point, "seed_cache_validation_failed")
             return
 
         self._current = BenchmarkPointResult(point=point)
@@ -466,7 +593,7 @@ class SelfBenchmark:
         injected = self._inject_prefill(point=point, extra_key=extra_key)
         if injected == 0:
             logger.warning("Skipping benchmark point with no valid requests: %s", point)
-            self._advance_grid_point()
+            self._skip_grid_point(point, "request_injection_failed")
 
     def _inject_synthetic_decode(self, context_length: int, batch_size: int) -> int:
         if not self._synthetic_decode_supported():
@@ -517,17 +644,15 @@ class SelfBenchmark:
 
         try:
             batch = self._build_synthetic_decode_batch(reqs, context_length)
-        except Exception as exc:
-            # Any failure between KV/req-slot allocation and publish (KV OOM, a
-            # stash/payload error, etc.) must free the pre-allocated context KV +
-            # req slots and skip the point, never crash the scheduler.
-            logger.warning(
-                "Skipping decode benchmark point due to synthetic batch build "
-                "failure: %s",
-                exc,
-            )
-            self._free_synthetic_decode_reqs(reqs)
-            return 0
+        except Exception:
+            # A rank-local skip would let successful peers publish running_batch
+            # and enter model collectives alone. Clean up what we can, then let the
+            # scheduler wrapper fail startup and tear down every rank.
+            try:
+                self._free_synthetic_decode_reqs(reqs)
+            except Exception:
+                logger.exception("Failed to clean up a synthetic decode batch")
+            raise
 
         self.scheduler.running_batch = batch
         self._active_reqs = reqs
@@ -829,11 +954,14 @@ class SelfBenchmark:
             self.scheduler.enable_fpm = self._restore_enable_fpm
 
     def _write_output(self) -> None:
+        expected_points = len(self._grid)
+        completed_points = len(self._results)
+        skipped_count = len(self._skipped_points)
         output = {
             "schema_version": 1,
             "scope": "local_diagnostics",
             "status": "complete",
-            "valid": True,
+            "valid": completed_points == expected_points and skipped_count == 0,
             "run_id": self._run_id,
             "completed_at_unix": time.time(),
             "identity": self._identity,
@@ -849,17 +977,30 @@ class SelfBenchmark:
                 "max_model_len": getattr(self.scheduler, "max_req_len", None),
                 "block_size": getattr(self.scheduler, "page_size", None),
                 "num_gpu_blocks": getattr(self.scheduler, "max_total_num_tokens", None),
+                "max_decode_forward_batch_size": (
+                    self._max_decode_forward_batch_size()
+                ),
+            },
+            "coverage": {
+                "expected_points": expected_points,
+                "completed_points": completed_points,
+                "skipped_points": skipped_count,
             },
             "results": [
                 {"point": asdict(result.point), "fpms": result.fpms}
                 for result in self._results
             ],
+            "skipped_points": [
+                asdict(skipped_point) for skipped_point in self._skipped_points
+            ],
         }
         self._atomic_write_json(self._output_path, output)
         logger.info(
-            "Self-benchmark results written to %s (%d point(s))",
+            "Self-benchmark results written to %s (%d/%d point(s), %d skipped)",
             self._output_path,
-            len(self._results),
+            completed_points,
+            expected_points,
+            skipped_count,
         )
 
     def _invalidate_output(self) -> None:

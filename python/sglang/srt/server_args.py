@@ -2605,24 +2605,11 @@ class ServerArgs:
                 "ForwardPassMetrics publication is enabled explicitly."
             )
         if self.benchmark_mode is not None:
-            # Guard the sweep granularity args: 0/negative would silently
-            # collapse the grid to a single point instead of failing fast.
-            for name in (
-                "benchmark_prefill_granularity",
-                "benchmark_prefill_kv_read_granularity",
-                "benchmark_decode_length_granularity",
-                "benchmark_decode_batch_granularity",
-            ):
-                if getattr(self, name) < 1:
-                    raise ValueError(
-                        f"--{name.replace('_', '-')} must be >= 1 when "
-                        "--benchmark-mode is set."
-                    )
-            if self.benchmark_warmup_iterations < 0:
-                raise ValueError(
-                    "--benchmark-warmup-iterations must be >= 0 when "
-                    "--benchmark-mode is set."
-                )
+            from sglang.srt.managers.scheduler_components.self_benchmark import (
+                SelfBenchmark,
+            )
+
+            SelfBenchmark.validate_args(self)
         if self.benchmark_mode is not None and self.use_ray:
             # Ray reports scheduler readiness by calling SchedulerActor.get_info()
             # before the scheduler event loop starts. Self-benchmarking currently

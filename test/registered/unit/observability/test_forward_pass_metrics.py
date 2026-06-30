@@ -39,6 +39,17 @@ def _make_ps(**overrides) -> ParallelState:
     return ParallelState(**defaults)
 
 
+def _make_server_args(**overrides):
+    defaults = dict(
+        benchmark_mode=None,
+        enable_forward_pass_metrics=False,
+        forward_pass_metrics_worker_id="",
+        forward_pass_metrics_ipc_name=None,
+    )
+    defaults.update(overrides)
+    return types.SimpleNamespace(**defaults)
+
+
 class _FakeReq:
     def __init__(
         self,
@@ -87,13 +98,7 @@ class _DummyPublisherThread:
 
 def _make_reporter(scheduler) -> SchedulerMetricsReporter:
     if not hasattr(scheduler, "server_args"):
-        scheduler.server_args = types.SimpleNamespace(
-            enable_metrics=False,
-            enable_metrics_for_all_schedulers=False,
-            kv_events_config=None,
-            enable_mfu_metrics=False,
-            enable_forward_pass_metrics=False,
-        )
+        scheduler.server_args = _make_server_args()
     if not hasattr(scheduler, "ps"):
         scheduler.ps = types.SimpleNamespace(attn_tp_rank=0, attn_cp_rank=0)
     if not hasattr(scheduler, "kv_events_publisher"):
@@ -276,14 +281,9 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_init_metrics_uses_server_worker_id(self):
         scheduler = types.SimpleNamespace()
-        scheduler.server_args = types.SimpleNamespace(
-            enable_metrics=False,
-            enable_metrics_for_all_schedulers=False,
-            extra_metric_labels=None,
+        scheduler.server_args = _make_server_args(
             enable_forward_pass_metrics=True,
             forward_pass_metrics_worker_id="endpoint-42",
-            forward_pass_metrics_ipc_name=None,
-            kv_events_config=None,
         )
         scheduler.ps = _make_ps(attn_tp_rank=0, dp_rank=2, pp_rank=0, pp_size=1)
         scheduler.enable_kv_cache_events = False
@@ -292,7 +292,7 @@ class TestForwardPassMetrics(unittest.TestCase):
             "sglang.srt.observability.forward_pass_metrics._FpmPublisherThread",
             _DummyPublisherThread,
         ):
-            reporter = _make_reporter(scheduler)
+            _make_reporter(scheduler)
 
         self.assertTrue(scheduler.enable_fpm)
         self.assertEqual(scheduler._fpm_worker_id, "endpoint-42")
@@ -304,14 +304,9 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_init_fpm_disabled_on_non_last_pp_rank(self):
         scheduler = types.SimpleNamespace()
-        scheduler.server_args = types.SimpleNamespace(
-            enable_metrics=False,
-            enable_metrics_for_all_schedulers=False,
-            extra_metric_labels=None,
+        scheduler.server_args = _make_server_args(
             enable_forward_pass_metrics=True,
             forward_pass_metrics_worker_id="endpoint-42",
-            forward_pass_metrics_ipc_name=None,
-            kv_events_config=None,
         )
         scheduler.ps = _make_ps(attn_tp_rank=0, dp_rank=0, pp_rank=0, pp_size=2)
         scheduler.enable_kv_cache_events = False
@@ -320,9 +315,27 @@ class TestForwardPassMetrics(unittest.TestCase):
             "sglang.srt.observability.forward_pass_metrics._FpmPublisherThread",
             _DummyPublisherThread,
         ):
-            reporter = _make_reporter(scheduler)
+            _make_reporter(scheduler)
 
         self.assertFalse(scheduler.enable_fpm)
+
+    def test_init_fpm_forced_on_for_benchmark_rank(self):
+        scheduler = types.SimpleNamespace()
+        scheduler.server_args = _make_server_args(benchmark_mode="agg")
+        scheduler.ps = _make_ps(attn_tp_rank=1, attn_tp_size=2)
+        scheduler.enable_kv_cache_events = False
+
+        with patch(
+            "sglang.srt.observability.forward_pass_metrics._FpmPublisherThread",
+            _DummyPublisherThread,
+        ):
+            reporter = _make_reporter(scheduler)
+
+        self.assertTrue(scheduler.enable_fpm)
+        self.assertFalse(scheduler._fpm_is_real_rank)
+        self.assertTrue(scheduler._fpm_benchmark_forced)
+        reporter.shutdown_benchmark_forced_fpm()
+        self.assertFalse(scheduler._fpm_benchmark_forced)
 
 
 if __name__ == "__main__":
