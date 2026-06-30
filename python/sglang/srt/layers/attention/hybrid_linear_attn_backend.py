@@ -41,6 +41,17 @@ class MambaAttnBackendBase(AttentionBackend):
         self.enable_shared_kv_pool = model_runner.enable_shared_kv_pool
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
+        # Radix-prefix-cache mamba track DESTINATION slots. A SINGLE backend-owned
+        # static buffer mirroring the runner's DecodeInputBuffers.mamba_track_indices
+        # slot (shape (max_bs,), captured into the graph by pointer and refreshed
+        # in-place each replay with the virtual->physical translate). Exposed as
+        # ForwardMetadata.mamba_track_indices so the captured decode track-save
+        # reads THIS buffer instead of mutating the InputBuffer registry slot.
+        # Sized like the slot (NOT per-bs): the fb_view hands us the full slot
+        # un-sliced and the consumers index it relative to its full length
+        # ([:batch_size] for GDN, [-num_decodes:] for Mamba2), so a (max_bs,)
+        # buffer keeps that indexing byte-identical to the old in-place path.
+        self.mamba_track_indices_buf = None
         # GDN ReplaySSM (slice 1b): per-bs STATIC per-row write-cursor buffers
         # for cuda-graph. Allocated lazily in init_cuda_graph_state only when
         # --enable-linear-replayssm is set; stays None otherwise.
@@ -283,6 +294,10 @@ class MambaAttnBackendBase(AttentionBackend):
         return ForwardMetadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,
+            # Physical track destinations for the decode track-save (translated in
+            # place above; None when tracking is off). cuda-graph supplies this via
+            # the static backend buffer instead — see _replay_metadata.
+            mamba_track_indices=forward_batch.mamba_track_indices,
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             retrieve_parent_token=retrieve_parent_token,
@@ -517,6 +532,12 @@ class MambaAttnBackendBase(AttentionBackend):
         # by pointer and refreshed in-place per replay just like the write-pos
         # buffers. None when the flag is off.
         self.replayssm_force_flush_list = [] if self._replayssm_enabled() else None
+        # Single (max_bs,) track-destination buffer mirroring the runner's slot.
+        # int64 to match DecodeInputBuffers.mamba_track_indices + the track-save
+        # kernel's int64 index load. Refreshed in-place by _replay_metadata.
+        self.mamba_track_indices_buf = torch.zeros(
+            (max_bs,), dtype=torch.int64, device=self.device
+        )
         for i in range(max_bs):
             self.state_indices_list.append(
                 torch.full(
@@ -670,19 +691,19 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_indices = self._translate_mamba_indices(mamba_indices)
         mamba_indices[bs - num_padding :] = -1
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
-        # Shared pool, cg_on replay-prep: rewrite the captured radix-prefix-cache
-        # track destination (`mamba_track_indices`) virtual->physical IN PLACE
-        # against the live v2p, so the captured decode track-save
-        # (`conv_states[mamba_track_indices] = …`) writes the right physical slot.
-        # Only the shared pool needs this (its translate returns a fresh physical
-        # tensor; the static pool's track indices are already physical), and only
-        # at replay (capture runs on dummy slots).
-        if (
-            not in_capture
-            and self.enable_shared_kv_pool
-            and mamba_track_indices is not None
-        ):
-            mamba_track_indices.copy_(
+        # Radix-prefix-cache mamba track DESTINATION (`mamba_track_indices`):
+        # refresh the captured backend-owned static buffer (the
+        # state_indices_list sibling) in-place with the virtual->physical
+        # translate, then expose it as ForwardMetadata.mamba_track_indices below.
+        # The captured decode track-save reads THAT field, so the InputBuffer
+        # registry slot we were handed stays read-only (never mutated). Runs at
+        # capture too (records the static pointer + writes valid in-bounds dummy
+        # slots) and at replay (live v2p -> physical). The translate is identity
+        # for the non-shared pool, so this is a plain copy there.
+        track_buf = None
+        if mamba_track_indices is not None:
+            track_buf = self.mamba_track_indices_buf
+            track_buf[: len(mamba_track_indices)].copy_(
                 self._translate_mamba_indices(mamba_track_indices)
             )
         # GDN ReplaySSM (slice 1b): refresh the STATIC per-row write cursor the
@@ -806,6 +827,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_track_indices=track_buf,
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
@@ -816,6 +838,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_track_indices=track_buf,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
@@ -845,6 +868,11 @@ class MambaAttnBackendBase(AttentionBackend):
             conv_states[mamba_track_indices[i]] = conv_states[cache_indices[i]]
             ssm_states[mamba_track_indices[i]] = ssm_states[cache_indices[i]]
         for all requests where mamba_track_mask[i] is True.
+
+        The PHYSICAL track destinations come from the attention metadata
+        (`self.forward_metadata.mamba_track_indices`), not forward_batch: under
+        cuda-graph that is the backend-owned static buffer refreshed each replay,
+        so the InputBuffer registry slot is never mutated.
         """
         if forward_batch.mamba_track_mask is not None:
             track_mamba_states_if_needed(
@@ -852,7 +880,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 ssm_states,
                 cache_indices,
                 forward_batch.mamba_track_mask,
-                forward_batch.mamba_track_indices,
+                self.forward_metadata.mamba_track_indices,
                 forward_batch.batch_size,
                 check_freed_slots=self.enable_shared_kv_pool,
             )
@@ -1025,7 +1053,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                     layer_cache.temporal,
                     self.forward_metadata.mamba_cache_indices[-num_decodes:],
                     forward_batch.mamba_track_mask[-num_decodes:],
-                    forward_batch.mamba_track_indices[-num_decodes:],
+                    self.forward_metadata.mamba_track_indices[-num_decodes:],
                     num_decodes,
                     check_freed_slots=self.enable_shared_kv_pool,
                 )
