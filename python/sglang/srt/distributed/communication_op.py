@@ -92,6 +92,8 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token(
     return get_tp_group().fused_allreduce_rmsnorm_quant_per_token(
         input_, residual_inp_, weight_, eps
     )
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:

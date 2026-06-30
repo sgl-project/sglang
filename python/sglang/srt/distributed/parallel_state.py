@@ -83,7 +83,8 @@ _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 
 
 def _should_use_1stage_mxfp4_ar(input_: torch.Tensor) -> bool:
-    tokens, hidden_size = input_.shape
+    hidden_size = input_.shape[-1]
+    tokens = input_.numel() // hidden_size
     if hidden_size == 7168:
         # CUDA-graph microbench: direct MXFP4 epilogue is faster through 56
         # tokens, while fallback wins from 64 tokens onward.
@@ -755,6 +756,9 @@ class GroupCoordinator:
         emit_bf16: bool = False,
     ):
         """Attempt fused all-reduce + RMSNorm + MXFP4 quant via AITER custom AR."""
+        if not (is_hip() and is_gfx95_supported()):
+            return None
+
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
@@ -849,7 +853,6 @@ class GroupCoordinator:
         except Exception:
             return None
 
-
     def fused_allreduce_rmsnorm_quant_per_token(
         self,
         input_: torch.Tensor,
@@ -905,6 +908,7 @@ class GroupCoordinator:
             )
         except Exception:
             return None
+
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
     ) -> torch.Tensor:

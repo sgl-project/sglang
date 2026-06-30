@@ -730,7 +730,7 @@ class LayerCommunicator:
                     # Requires a *positive* per-group FP8 signal (quant_format
                     # == "fp8"): an empty quant_format means the consumer is
                     # unquantized (bf16) and must receive a plain tensor, not a
-                    # (fp8, scale) tuple — otherwise the downstream GEMM crashes
+                    # (fp8, scale) tuple - otherwise the downstream GEMM crashes
                     # with 'tuple has no attribute dtype'. "fp8_per_token" and
                     # "mxfp4" have their own fused paths above.
                     if (

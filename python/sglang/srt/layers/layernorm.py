@@ -164,8 +164,10 @@ if _is_npu:
 def _maybe_transpose_aiter_bpreshuffle_scale(scale: torch.Tensor) -> torch.Tensor:
     if not _use_aiter_bpreshuffle_gfx95:
         return scale
-    # Match aiter's transpose_scale=True layout: same logical shape, transposed
-    # physical storage for CK bpreshuffle consumers on ROCm >= 7.2.
+    # per-1x128 scale is contractually 2D [M, K/128]. Reproduce aiter's
+    # transpose_scale=True layout (same logical shape, column-major storage):
+    # aiter defines it as scale.transpose(0, 1).contiguous().view(*scale.shape).
+    assert scale.dim() == 2, f"expected 2D per-group scale, got {tuple(scale.shape)}"
     return scale.transpose(0, 1).contiguous().view_as(scale)
 
 
@@ -348,9 +350,9 @@ def _forward_with_allreduce_fusion_quant_per_token(
 
     This is the per-token counterpart of
     ``_forward_with_allreduce_fusion_quant_per_group``. It targets FP8 GEMM
-    consumers that expect per-token (1xK) activation scales — e.g. attention
+    consumers that expect per-token (1xK) activation scales - e.g. attention
     ``qkv_proj`` / GDN ``in_proj_qkvz`` prepared with
-    ``SGLANG_USE_AITER_FP8_PER_TOKEN`` — for which the per-1x128 group scales
+    ``SGLANG_USE_AITER_FP8_PER_TOKEN`` - for which the per-1x128 group scales
     produced by the per-group path would be the wrong layout.
 
     Returns one of:
