@@ -111,14 +111,6 @@ class MambaComponent(TreeComponent):
                 req.mamba_pool_idx = dst_index[0]
             req.mamba_cow_src_index = mamba_value
             req.mamba_needs_clear = False
-        elif cow_mamba and req is not None and req.mamba_cow_src_index is not None:
-            # A queued request can keep a COW source from an earlier match. If
-            # this re-match has no donor, that source may point at an evicted
-            # slot; clear it so admission zero-clears instead of copying freed state.
-            req.mamba_cow_src_index = None
-            if req.mamba_pool_idx is not None:
-                req.mamba_needs_clear = True
-
         # HiCache: if mamba was evicted from device but has host backup,
         # ensure mamba_host_hit_length >= 1 so load_back is triggered.
         cd = last_node.component_data[self.component_type]
