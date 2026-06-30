@@ -1619,12 +1619,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                     ]
                 tokenized_obj.rid = tmp_obj.regenerate_rid()
-                tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
-                tokenized_obj.sampling_params.max_new_tokens = 0
-                tokenized_obj.stream = False
-                self._init_req_state(tmp_obj)
-                self._send_one_request(tokenized_obj)
-                await self._wait_one_response(tmp_obj, request).__anext__()
+                prefix_lora_id = None
+                sent_to_scheduler = False
+                try:
+                    if self.server_args.enable_lora and tmp_obj.lora_path:
+                        prefix_lora_id = await self.lora_registry.acquire(
+                            tmp_obj.lora_path
+                        )
+                        tmp_obj.lora_id = prefix_lora_id
+                        tokenized_obj.lora_id = prefix_lora_id
+                    tokenized_obj.sampling_params = copy.copy(
+                        tokenized_obj.sampling_params
+                    )
+                    tokenized_obj.sampling_params.max_new_tokens = 0
+                    tokenized_obj.stream = False
+                    self._init_req_state(tmp_obj)
+                    self._send_one_request(tokenized_obj)
+                    sent_to_scheduler = True
+                    await self._wait_one_response(tmp_obj, request).__anext__()
+                except Exception:
+                    if prefix_lora_id is not None and not sent_to_scheduler:
+                        self.rid_to_state.pop(tmp_obj.rid, None)
+                        await self.lora_registry.release(prefix_lora_id)
+                    raise
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
