@@ -3248,29 +3248,25 @@ class Scheduler(
                             self.batch_record_buf[self.batch_record_ct].extend(
                                 batch_result.extra_keep_alive_refs
                             )
-                        allocator = self.token_to_kv_pool_allocator
-                        need_forward_done = hasattr(
-                            allocator, "set_latest_forward_done_event"
-                        ) or hasattr(allocator, "set_inflight_forward")
-                        if need_forward_done:
+                        if self.server_args.enable_unified_memory_pool:
                             # Record a dedicated `forward_done` event right
                             # after the forward (BEFORE copy_to_cpu). This is
                             # what lazy-compaction `_flush` uses to gate src
                             # reuse: when this fires, the in-flight forward's KV
-                            # reads have settled. Keep it gated so static
-                            # allocators pay no extra event-record overhead.
+                            # reads have settled. Only the unified memory pool's
+                            # allocator exposes these hooks; static allocators
+                            # pay no extra event-record overhead.
+                            allocator = self.token_to_kv_pool_allocator
                             forward_done = self.device_module.Event()
                             forward_done.record(stream=self.forward_stream)
-                            if hasattr(allocator, "set_latest_forward_done_event"):
-                                allocator.set_latest_forward_done_event(forward_done)
+                            allocator.set_latest_forward_done_event(forward_done)
                             # Write-set classification. Hand the allocator the
                             # virtual `out_cache_loc` of this forward as a
                             # TENSOR REFERENCE (no GPU work here).
-                            if hasattr(allocator, "set_inflight_forward"):
-                                allocator.set_inflight_forward(
-                                    forward_done,
-                                    batch.out_cache_loc,
-                                )
+                            allocator.set_inflight_forward(
+                                forward_done,
+                                batch.out_cache_loc,
+                            )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
