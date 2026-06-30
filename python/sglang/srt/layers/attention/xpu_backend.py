@@ -587,6 +587,11 @@ class XPUAttentionBackend(AttentionBackend):
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,
+                # Piecewise XPU graph for prefill requires a pre-allocated
+                # output buffer at a stable device address so the graph can
+                # record writes to the same storage on every replay.
+                # _attn_output is that fixed buffer; None falls back to a
+                # freshly allocated tensor (eager / cascade-attn path).
                 out=(
                     forward_batch._attn_output.view(
                         -1, layer.tp_q_head_num, layer.v_head_dim
