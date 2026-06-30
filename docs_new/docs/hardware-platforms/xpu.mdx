@@ -220,7 +220,6 @@ To specify explicit token-length buckets:
 ```bash
 python -m sglang.launch_server \
     --model-path <MODEL> --device xpu \
-    python -m sglang.launch_server --model-path <MODEL> --device xpu \
     --cuda-graph-backend-prefill tc_piecewise \
     --cuda-graph-bs-prefill 64 128 256 512
 ```
@@ -255,9 +254,9 @@ via `--cuda-graph-backend-prefill` or `--cuda-graph-config`.
 
 | Feature | Status |
 |---|---|
-| Memory saver (`--enable-memory-saver`) | Not supported (requires `torch.cuda.MemPool`) |
-| Two-batch overlap (`--enable-two-batch-overlap`) | Not supported (requires DeepEP on XPU) |
-| Breakable CUDA graph | Not supported (XPU only supports `full` decode backend) |
+| Memory saver (`--enable-memory-saver`) | Not yet supported |
+| Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported |
+| Breakable CUDA graph | Not yet supported |
 | Speculative decoding | Not yet implemented |
 
 ## Prefill-Decode (P/D) Disaggregation on Intel XPU [Experimental]
