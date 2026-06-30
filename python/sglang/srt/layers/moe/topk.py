@@ -349,14 +349,21 @@ def _make_round_robin_expert_ids(
     dtype: torch.dtype,
     layer_id: Optional[int] = None,
 ) -> torch.Tensor:
+    # Deterministic, perfectly balanced expert assignment: each token's top-k is
+    # spread by num_experts//topk. Returns global expert ids of shape
+    # [num_tokens, topk].
     if topk == 0:
         return torch.empty((num_tokens, 0), device=device, dtype=dtype)
 
     step = max(num_experts // topk, 1)
     layer_offset = 0 if layer_id is None else layer_id
-    offsets = torch.arange(num_tokens, device=device, dtype=dtype).unsqueeze(1)
-    steps = torch.arange(topk, device=device, dtype=dtype).unsqueeze(0) * step
-    return (offsets + layer_offset + steps) % num_experts
+    offsets = torch.arange(num_tokens, device=device, dtype=dtype).unsqueeze(
+        1
+    )  # [num_tokens, 1]
+    steps = (
+        torch.arange(topk, device=device, dtype=dtype).unsqueeze(0) * step
+    )  # [1, topk]
+    return (offsets + layer_offset + steps) % num_experts  # [num_tokens, topk]
 
 
 @triton.jit
@@ -380,6 +387,12 @@ def _simulate_balanced_routing_kernel(
     assignment and uniform ``1/k`` weights, in a single launch — so the
     benchmark override barely perturbs routing/MoE timing vs. the non-simulated
     path (instead of the ~5-7 small elementwise ops it replaces).
+
+    Shapes:
+    - ``topk_ids_ptr``: ``[num_tokens, K]`` (row-major; strides passed in),
+      overwritten in place
+    - ``topk_weights_ptr``: ``[num_tokens, K]`` (row-major; strides passed in),
+      overwritten in place
 
     ``RANDOM=False`` is the deterministic round-robin base ``token + layer_offset``
     (matches ``_make_round_robin_expert_ids``); ``RANDOM=True`` is a random
@@ -419,7 +432,12 @@ def _simulate_balanced_routing(
     """Benchmark-only fused override (in place): replace ``topk_ids`` with a
     balanced expert assignment and ``topk_weights`` with ``1/k`` using a single
     Triton kernel. ``random=False`` is round-robin (matches
-    ``_make_round_robin_expert_ids``); ``random=True`` is uniform."""
+    ``_make_round_robin_expert_ids``); ``random=True`` is uniform.
+
+    Shapes:
+    - ``topk_ids``: ``[num_tokens, k]``, overwritten in place
+    - ``topk_weights``: ``[num_tokens, k]``, overwritten in place
+    """
     global _simulate_uniform_seed
     num_tokens, k = topk_ids.shape
     if num_tokens == 0 or k == 0:
