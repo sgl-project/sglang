@@ -161,16 +161,6 @@ jobs:
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
           fi
 
-  nightly-xpu-8-gpu:
-    # Placeholder: Llama-3.3-70B is registered to nightly-xpu-8-gpu but has not
-    # yet been validated end-to-end on intel-bmg-nightly. Flip `if` once a
-    # passing run is recorded and the test class is un-skipped.
-    if: false
-    runs-on: intel-bmg-nightly
-    steps:
-      - name: Placeholder
-        run: echo "nightly-xpu-8-gpu has no validated models; skipping."
-
   check-all-jobs:
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch')
     needs:
