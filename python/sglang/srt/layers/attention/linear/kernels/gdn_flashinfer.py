@@ -103,14 +103,20 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         if self._decode_fn is None:
             raise RuntimeError("FlashInfer GDN decode kernel is unavailable.")
 
-        sm_major = torch.cuda.get_device_capability()[0]
-        self.use_state_pool = sm_major >= 10
-        self.supports_target_verify = sm_major in (9, 10)
+        is_sm90 = torch.cuda.get_device_capability()[0] == 9
+        self.use_state_pool = not is_sm90
+        self.supports_extend = is_sm90
+        self.supports_target_verify = is_sm90
 
-        if sm_major == 9 and self._prefill_fn is None:
-            raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
-        if self._mtp_fn is None:
-            raise RuntimeError("FlashInfer GDN MTP (verify) kernel is unavailable.")
+        if is_sm90:
+            if self._prefill_fn is None:
+                raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
+            if self._mtp_fn is None:
+                raise RuntimeError("FlashInfer GDN MTP (verify) kernel is unavailable.")
+
+        # Slot 0 is reserved as a dummy for padded requests (SGLang uses -1
+        # as a padding sentinel in cache_indices during CUDA graph replay).
+        self.pad_state_slot = 0
 
         if self.use_state_pool and mtp_bf16_fn is not None:
             # Adapt bf16 kernel to fp32 kernel interface so target_verify needs no branching.
@@ -178,6 +184,15 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         b_fi = b.view(batch_size, 1, num_v_heads)
 
         if self.use_state_pool:
+            # Remap negative padding sentinels (-1) to the reserved dummy
+            # slot 0.  Use torch.clamp (graph-safe) instead of data-dependent
+            # branching which would break CUDA graph capture.
+            safe_indices = cache_indices.clamp(min=self.pad_state_slot)
+            # Build a mask for padded lanes so we can zero their output.
+            # All ops here are element-wise and CUDA-graph-capturable.
+            # output_fi is [B, 1, HV, V] so pad_mask needs 3 trailing dims
+            pad_mask = (cache_indices < 0).view(-1, 1, 1, 1)
+
             output_fi, _ = self._decode_fn(
                 q=query_fi,
                 k=key_fi,
@@ -189,8 +204,11 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 b=b_fi,
                 use_qk_l2norm=True,
                 initial_state=ssm_states,
-                initial_state_indices=cache_indices,
+                initial_state_indices=safe_indices,
             )
+            # Zero out outputs from padded lanes to avoid polluting results.
+            # masked_fill_ is graph-safe (no data-dependent control flow).
+            output_fi.masked_fill_(pad_mask, 0)
         else:
             # TODO: Once FlashInfer PR#2521 is merged for SM90, gather/scatter
             # will no longer be needed here.
