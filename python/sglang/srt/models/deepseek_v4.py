@@ -136,6 +136,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
+    get_device,
     is_gfx95_supported,
     is_gfx942_supported,
     log_info_on_rank0,
@@ -2529,6 +2530,21 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         torch.float32,
     ), f"expected fp8_e8m0fnu or float32, got {scale.dtype}"
 
+    # The dequant itself is a trivially parallel elementwise multiply that runs
+    # orders of magnitude faster on the accelerator. Checkpoint tensors are
+    # loaded on the host, so running this on the CPU makes weight loading
+    # CPU-bound and very slow for large models (e.g. DeepSeek-V4). Offload host
+    # tensors to the current accelerator and move the result back to the input
+    # device so downstream weight-loading behavior is unchanged.
+    # get_device() is device-agnostic (CUDA/HIP/NPU/XPU/...) and resolves to the
+    # current rank's device under tensor parallelism; on a CPU-only host it
+    # returns "cpu", making the move a no-op.
+    src_device = weight.device
+    if src_device.type == "cpu":
+        compute_device = get_device()
+        weight = weight.to(compute_device)
+        scale = scale.to(compute_device)
+
     weight_f32 = rearrange(
         weight.float(), "(sn bn) (sk bk) -> sn bn sk bk", bn=128, bk=128
     )
@@ -2536,7 +2552,7 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         weight_f32 * scale.float()[:, None, :, None], "sn bn sk bk -> (sn bn) (sk bk)"
     )
 
-    return result.to(torch.bfloat16)
+    return result.to(device=src_device, dtype=torch.bfloat16)
 
 
 def _dequant_fp8_wo_a(
