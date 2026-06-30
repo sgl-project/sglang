@@ -7,6 +7,7 @@ import einops
 import torch
 
 from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -59,6 +60,22 @@ else:
 
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
+
+
+def _batch_invariant_expected_m(expected_m: int, actual_m: int) -> int:
+    if not is_batch_invariant_mode_enabled():
+        return expected_m
+
+    # Masked DeepGEMM kernels are stable on block-aligned M. Keep the padded
+    # shape within the dispatcher-provided buffer so A2A dispatchers stay valid.
+    if actual_m % 256 == 0:
+        block_m = 256
+    elif actual_m % 128 == 0:
+        block_m = 128
+    else:
+        block_m = actual_m
+    aligned_m = max(block_m, ceil_div(expected_m, block_m) * block_m)
+    return min(aligned_m, actual_m)
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -399,6 +416,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
 
         num_groups, m, k = hidden_states.shape
+        expected_m = _batch_invariant_expected_m(expected_m, m)
         n = w13_weight.size(1)
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
@@ -515,6 +533,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         # GroupGemm-0
         num_groups, m, k = hidden_states.shape
+        expected_m = _batch_invariant_expected_m(expected_m, m)
         n = w13_weight.size(1)
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
