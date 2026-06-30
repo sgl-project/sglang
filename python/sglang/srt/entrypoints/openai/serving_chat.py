@@ -342,8 +342,9 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> Optional[PromptTokensDetails]:
         if not self.tokenizer_manager.server_args.enable_cache_report:
             return None
-        cached = content["meta_info"].get("cached_tokens", 0)
-        return PromptTokensDetails(cached_tokens=cached) if cached else None
+        return UsageProcessor._details_if_cached(
+            content["meta_info"].get("cached_tokens", 0)
+        )
 
     async def _generate_stream_content(
         self,
