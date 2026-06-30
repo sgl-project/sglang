@@ -179,7 +179,7 @@ if _is_cuda:
         fused_topk_deepseek = None
 
     try:
-        from sgl_kernel import kimi_k2_moe_fused_gate
+        from sglang.jit_kernel.kimi_k2_moe_fused_gate import kimi_k2_moe_fused_gate
     except ImportError as e:
         pass
 
