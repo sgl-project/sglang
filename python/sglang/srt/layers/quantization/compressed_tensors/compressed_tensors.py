@@ -695,7 +695,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                         )
                         return CompressedTensorsWNA16TritonMoE(self)
                     logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
-                    return CompressedTensorsWNA16MoE(self)
+                    return CompressedTensorsWNA16MoE(self, weight_quant=weight_quant)
             else:
                 if (
                     self._is_dynamic_token_w4(weight_quant, input_quant)

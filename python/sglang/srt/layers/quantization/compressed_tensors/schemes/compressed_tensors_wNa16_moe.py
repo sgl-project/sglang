@@ -62,9 +62,17 @@ class GPTQMarlinState(Enum):
 
 class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
-    def __init__(self, quant_config: CompressedTensorsConfig, num_gpu_experts=-1):
+    def __init__(
+        self, quant_config: CompressedTensorsConfig, num_gpu_experts=-1, weight_quant=None
+    ):
         self.quant_config = quant_config
-        config = self.quant_config.target_scheme_map["Linear"].get("weights")
+        # get_moe_scheme already resolved this layer's scheme by matching it
+        # against config_groups targets; reuse it. Fall back to a "Linear" group
+        # only for uniform checkpoints — mixed-precision / regex-target MoE
+        # checkpoints have no group literally named "Linear".
+        config = weight_quant
+        if config is None:
+            config = self.quant_config.target_scheme_map["Linear"].get("weights")
         self.num_bits = config.num_bits
         self.packed_factor = 32 // config.num_bits
         self.strategy = config.strategy
