@@ -701,6 +701,22 @@ class TritonAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
 
+        # Shared KV pool: materialize the full-attention WRITE location
+        # (virtual `out_cache_loc` -> physical) into the attention metadata —
+        # the write-path companion to the read-path `_translate_kv_loc` below.
+        # `set_kv_buffer` reads it from `KVWriteLoc.full_loc`; the pool never
+        # translates. No-op for non-shared pools (`_translate_kv_loc is None`).
+        # The decode cuda-graph path does this translate in-graph at capture and
+        # never reaches here.
+        if (
+            self._translate_kv_loc is not None
+            and forward_batch.out_cache_loc is not None
+            and forward_batch.out_cache_loc_full_physical is None
+        ):
+            forward_batch.out_cache_loc_full_physical = self._translate_kv_loc(
+                forward_batch.out_cache_loc
+            )
+
         bs = forward_batch.batch_size
         window_kv_indptr = self.window_kv_indptr
         window_kv_indices = None

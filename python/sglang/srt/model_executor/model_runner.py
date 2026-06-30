@@ -3096,13 +3096,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 can_run_graph = True
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
-                # Shared-pool eager write-path v2p translate: materialize the
-                # full-physical write loc into the attention metadata
-                # (`ForwardBatch.out_cache_loc_full_physical`) so `set_kv_buffer`
-                # reads it from `KVWriteLoc.full_loc`. The decode cuda-graph path
-                # captures this in-graph and returns earlier; this is the
-                # eager/non-graph path only.
-                self._shared_pool_eager_precompute(forward_batch)
                 ret = self.eager_runner.execute(
                     forward_batch, pp_proxy_tensors=pp_proxy_tensors
                 )
@@ -3113,34 +3106,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ):
                 forward_batch.post_forward_mlp_sync_batch(ret)
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
-
-    def _shared_pool_eager_precompute(self, forward_batch: ForwardBatch):
-        """Shared-pool full-attention write-path v2p translate for the EAGER /
-        non-graph forward (extend / prefill / idle, and any decode that can't use
-        the decode cuda-graph). Materializes the full->physical write loc ONCE off
-        the LIVE v2p into the attention metadata
-        (`ForwardBatch.out_cache_loc_full_physical`), so `set_kv_buffer` reads it
-        from `KVWriteLoc.full_loc` instead of translating per layer. No-op for
-        non-shared pools.
-
-        The decode cuda-graph path captures this translate IN-graph and returns
-        earlier, so it never reaches here. The SWA write loc is NOT handled here:
-        it rides the backend `swa_out_cache_loc` rail, consumed directly in
-        `SharedSWAKVPool.set_kv_buffer`."""
-        if self.enable_shared_kv_pool:
-            alloc = self.token_to_kv_pool_allocator
-            if (
-                forward_batch.out_cache_loc is not None
-                and forward_batch.out_cache_loc_full_physical is None
-                and hasattr(alloc, "translate_kv_loc")
-            ):
-                # All write-location info stays in the attention metadata: the
-                # full-attention write path reads it from
-                # `KVWriteLoc.full_loc` (sourced here), NOT from any pool-side
-                # pin.
-                forward_batch.out_cache_loc_full_physical = alloc.translate_kv_loc(
-                    forward_batch.out_cache_loc
-                )
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
