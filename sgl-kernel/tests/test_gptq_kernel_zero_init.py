@@ -82,7 +82,7 @@ def _dequantize_4bit(b_q_weight, b_gptq_qzeros, b_gptq_scales, K, N, group_size)
 
 
 @pytest.mark.parametrize("M", [1, 8])
-@pytest.mark.parametrize("N", [2048, 4096])
+@pytest.mark.parametrize("N", [2048, 4096, 11008])  # 11008 is not a multiple of 512
 @pytest.mark.parametrize("K", [2048, 4096])
 def test_gptq_gemm_output_zero_init(M, N, K):
     if not torch.cuda.is_available():

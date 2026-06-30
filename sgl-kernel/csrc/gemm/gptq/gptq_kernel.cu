@@ -246,11 +246,12 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel(
     }
   }
 
+  // Sync before the early return
+  __syncthreads();
+
   // Output is zeroed on the host (see gptq_gemm); zeroing here would race the
   // cross-block atomicAdd accumulation
   if (n >= size_n) return;
-
-  __syncthreads();
 
   // Find initial group
   int groupsize = size_k / groups;
@@ -373,11 +374,12 @@ __global__ void gemm_half_q_half_gptq_2bit_kernel(
     }
   }
 
+  // Sync before the early return
+  __syncthreads();
+
   // Output is zeroed on the host (see gptq_gemm); zeroing here would race the
   // cross-block atomicAdd accumulation
   if (n >= size_n) return;
-
-  __syncthreads();
 
   // Find initial group
   int groupsize = size_k / groups;
@@ -489,11 +491,12 @@ __global__ void gemm_half_q_half_gptq_3bit_kernel(
     }
   }
 
+  // Sync before the early return
+  __syncthreads();
+
   // Output is zeroed on the host (see gptq_gemm); zeroing here would race the
   // cross-block atomicAdd accumulation
   if (n >= size_n) return;
-
-  __syncthreads();
 
   // Find initial group
   int groupsize = size_k / groups;
@@ -608,11 +611,12 @@ __global__ void gemm_half_q_half_gptq_8bit_kernel(
     }
   }
 
+  // Sync before the early return
+  __syncthreads();
+
   // Output is zeroed on the host (see gptq_gemm); zeroing here would race the
   // cross-block atomicAdd accumulation
   if (n >= size_n) return;
-
-  __syncthreads();
 
   // Find initial group
   int groupsize = size_k / groups;
