@@ -252,7 +252,7 @@ def _seed_for_parallel_sample(
     if sampling_params.sampling_seed is None:
         return sampling_params
     offset = copy.copy(sampling_params)
-    offset.sampling_seed += sample_index
+    offset.sampling_seed = (offset.sampling_seed + sample_index) & 0xFFFFFFFFFFFFFFFF
     return offset
 
 
