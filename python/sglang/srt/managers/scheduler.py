@@ -253,6 +253,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
     is_cuda,
+    is_hip,
     is_mps,
     kill_itself_when_parent_died,
     require_mlp_sync,
@@ -291,6 +292,7 @@ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
+_is_hip = is_hip()
 
 
 class Scheduler(
@@ -850,9 +852,6 @@ class Scheduler(
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
-        if self.spec_algorithm.is_frozen_kv_mtp():
-            # Frozen-KV MTP draft construction needs the target KV pool.
-            self.init_target_memory_pool()
         self.maybe_init_draft_worker()
 
         # Allocate KV cache pools for all workers.
@@ -3242,15 +3241,23 @@ class Scheduler(
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(future_indices, batch_result)
-                            # Result D2H on copy_stream overlaps the next forward
-                            # instead of serializing on forward_stream; it's a leaf
-                            # gated by copy_done, so nothing on forward_stream waits.
-                            self.copy_stream.wait_stream(self.forward_stream)
-                            with self.copy_stream_ctx:
+                            if _is_hip:
+                                # Cross-stream sync costs more than the tiny D2H it
+                                # overlaps.
                                 batch_result.copy_to_cpu(
                                     return_logprob=batch.return_logprob,
                                     return_hidden_states=batch.return_hidden_states,
                                 )
+                            else:
+                                # Result D2H on copy_stream overlaps the next forward
+                                # instead of serializing on forward_stream; it's a leaf
+                                # gated by copy_done, so nothing on forward_stream waits.
+                                self.copy_stream.wait_stream(self.forward_stream)
+                                with self.copy_stream_ctx:
+                                    batch_result.copy_to_cpu(
+                                        return_logprob=batch.return_logprob,
+                                        return_hidden_states=batch.return_hidden_states,
+                                    )
                         else:
                             batch_result.future_indices = future_indices
 
