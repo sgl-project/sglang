@@ -623,6 +623,18 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
         req = GenerateReqInput(
             text=["Hello", "World"],
+            sampling_params={"n": 3},
+            rid=["id1", "id2"],
+            session_params=[{"id": "s1"}, {"id": "s2"}],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].session_params, {"id": "s1"})
+        self.assertEqual(req[1].session_params, {"id": "s2"})
+        self.assertEqual(req[2].session_params, {"id": "s1"})
+        self.assertEqual(req[5].session_params, {"id": "s2"})
+
+        req = GenerateReqInput(
+            text=["Hello", "World"],
             sampling_params=[{}, {}],
             rid=["id1", "id2"],
             session_params={"id": "shared"},
