@@ -67,6 +67,12 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    # If insert skips creating a leaf, the remaining FULL KV is not owned by the tree.
+    # Finished requests should free it; unfinished requests keep it in ReqToTokenPool.
+    free_skipped_leaf_value: bool = True
+    # FULL overlap is not enough for SWA prefix reuse: the SWA side may be tombstoned.
+    # For unfinished requests, defer freeing until match_prefix confirms replacement.
+    free_insert_overlap_value: bool = True
 
 
 @dataclasses.dataclass
