@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 import time
 import traceback
@@ -45,35 +44,27 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.utils import MultiprocessingSerializer
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.utils.weight_checker import overall_checksum
 
 logger = logging.getLogger(__name__)
 
 
-def _get_draft_model_runner(draft_worker):
-    # DFlash / FrozenKVMTP workers expose draft_model_runner directly
-    runner = getattr(draft_worker, "draft_model_runner", None)
-    if runner is not None:
-        return runner
-    # EAGLEWorkerV2: _draft_worker.draft_runner
-    inner = getattr(draft_worker, "_draft_worker", None)
-    if inner is not None:
-        runner = getattr(inner, "draft_runner", None)
-        if runner is not None:
-            return runner
-    return None
-
-
-def _merge_checksum_payloads(target: Dict, draft: Dict) -> Dict:
-    merged_checksums = dict(target["checksums"])
-    for name, chk in draft["checksums"].items():
-        merged_checksums[f"draft.{name}"] = chk
-    h = hashlib.sha256()
-    for name in sorted(merged_checksums):
-        h.update(name.encode())
-        h.update(merged_checksums[name].encode())
-    target["checksums"] = merged_checksums
-    target["per_gpu_checksum"] = h.hexdigest()
-    return target
+def _merge_checksum_payloads(role_payloads: List[Tuple[str, Dict]]) -> Dict:
+    merged: Dict[str, str] = {}
+    parallelism_infos = []
+    for role, p in role_payloads:
+        for name, chk in p["checksums"].items():
+            # Add prefix for non-target roles
+            key = name if role == "" else f"{role}.{name}"
+            if key in merged:
+                raise ValueError(f"checksum key collision: {key}")
+            merged[key] = chk
+        parallelism_infos.append({"role": role or "target", **p["parallelism_info"]})
+    return {
+        "checksums": merged,
+        "per_gpu_checksum": overall_checksum(merged),
+        "parallelism_info": parallelism_infos,
+    }
 
 
 def _parse_runner_selector(selector: str) -> Set[str]:
@@ -368,27 +359,35 @@ class SchedulerWeightUpdaterManager:
 
     def check_weights(self, recv_req: CheckWeightsReqInput):
         try:
-            payload = self.tp_worker.model_runner.check_weights(
-                action=recv_req.action, allow_quant_error=recv_req.allow_quant_error
-            )
+            runners = self.get_model_runners(recv_req.selector)
 
-            if self.draft_worker is not None:
-                draft_runner = _get_draft_model_runner(self.draft_worker)
-                if draft_runner is not None:
-                    draft_payload = draft_runner.check_weights(
+            def _check(role, runner):
+                try:
+                    return runner.check_weights(
                         action=recv_req.action,
                         allow_quant_error=recv_req.allow_quant_error,
+                        skip_tensor_list=recv_req.skip_tensor_list,
                     )
-                    if payload is not None and draft_payload is not None:
-                        payload = _merge_checksum_payloads(payload, draft_payload)
+                except Exception as e:
+                    raise RuntimeError(f"[{role or 'target'}] {e}") from e
 
-            tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
-            if tp_size > 1 and payload is not None:
-                all_payloads = [None] * tp_size
-                torch.distributed.all_gather_object(
-                    all_payloads, payload, group=self.tp_cpu_group
+            if recv_req.action == "checksum":
+                payload = _merge_checksum_payloads(
+                    [(role, _check(role, runner)) for role, runner in runners]
                 )
-                payload = all_payloads
+            else:
+                for role, runner in runners:
+                    _check(role, runner)
+                payload = None
+
+            if payload is not None and torch.distributed.is_initialized():
+                tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
+                if tp_size > 1:
+                    all_payloads = [None] * tp_size
+                    torch.distributed.all_gather_object(
+                        all_payloads, payload, group=self.tp_cpu_group
+                    )
+                    payload = all_payloads
             return CheckWeightsReqOutput(
                 success=True, message="Success.", payload=payload
             )
