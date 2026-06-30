@@ -560,55 +560,13 @@ class Scheduler(
 
         self.init_startup_readiness_sender()
 
-        self.maybe_init_self_benchmark()
+        self.self_benchmark = SelfBenchmark.create_if_enabled(self)
 
         self.is_initializing = False
 
     def init_startup_readiness_sender(self) -> None:
         self._init_info_pipe_writer = None
         self._init_info_sent = False
-
-    def maybe_init_self_benchmark(self) -> None:
-        self.self_benchmark = None
-        if self.server_args.benchmark_mode is None:
-            return
-
-        if self.ps.pp_size > 1:
-            raise ValueError(
-                "--benchmark-mode is not supported with pipeline parallelism"
-            )
-        if self.enable_pdmux:
-            raise ValueError("--benchmark-mode is not supported with PD multiplexing")
-        if self.enable_overlap_mlx:
-            raise ValueError("--benchmark-mode is not supported with MLX overlap")
-        if not self.is_generation:
-            # Non-generation (embedding/reward) models would leak synthetic
-            # prefill outputs to the tokenizer (suppress_output is only honored
-            # on the generation streaming path).
-            raise ValueError("--benchmark-mode is only supported for generative models")
-        if not self.spec_algorithm.is_none():
-            # The synthetic decode path is incompatible with speculative
-            # decoding, and the synthetic prefill path is not guarded for it.
-            raise ValueError(
-                "--benchmark-mode is not supported with speculative decoding"
-            )
-        if self.model_config.is_encoder_decoder:
-            raise ValueError(
-                "--benchmark-mode is not supported with encoder-decoder models"
-            )
-        if self.model_config.is_multimodal:
-            # Synthetic requests carry no multimodal inputs.
-            raise ValueError("--benchmark-mode is not supported with multimodal models")
-        if self.enable_lora:
-            raise ValueError("--benchmark-mode is not supported with LoRA")
-        if self.server_args.load_format == "dummy":
-            # Dummy weights produce meaningless benchmark results.
-            raise ValueError(
-                "--benchmark-mode is not supported with dummy weights "
-                "(--load-format dummy)"
-            )
-
-        self.self_benchmark = SelfBenchmark(self)
 
     def init_zbal_on_npu(self):
         if _is_npu:
