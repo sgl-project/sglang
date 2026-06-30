@@ -1124,7 +1124,23 @@ class ReasoningParser:
             and request.messages[-1].role == "assistant"
         ):
             kwargs["continue_final_message"] = True
-            kwargs["previous_content"] = request.messages[-1].content
+            last_message = request.messages[-1]
+            previous_content = last_message.content
+            # Avoid len(None)/`in` TypeError when the prefill carries
+            # only reasoning_content or tool_calls (content=None).
+            if previous_content is None:
+                previous_content = ""
+            # The DSV4 encoder positions </think> ahead of visible content
+            # on the wo_eos path; prepend it to previous_content so
+            # _in_reasoning starts past that boundary. wo_eos=False routes
+            # to legacy strip-and-append where no </think> is emitted.
+            if (
+                model_type.lower() == "deepseek-v4"
+                and getattr(last_message, "wo_eos", None) is not False
+                and isinstance(previous_content, str)
+            ):
+                previous_content = "</think>" + previous_content
+            kwargs["previous_content"] = previous_content
 
         chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
         if chat_template_kwargs.get("force_nonempty_content") is True:

@@ -1373,6 +1373,104 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.assertIn("<｜Assistant｜>", out)
 
+    # ------------- dsv4 continue_final_message prefill -------------
+    def _setup_dsv4_prompt_capture(self):
+        """Configure self.chat as a DSV4 server whose tokenizer echoes each char.
+
+        After setUp, the generic mock points at Llama. Switch architectures to
+        DeepseekV4ForCausalLM, then stub tokenizer.encode so prompt_ids becomes
+        a list-of-chars round-trippable via ''.join(). bos_token_id is a
+        sentinel that never appears in DSV4 output, so the BOS-strip path in
+        _append_assistant_prefix_to_prompt_ids is a no-op when exercised.
+        """
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        self.tm.tokenizer.encode.side_effect = lambda text, *args, **kwargs: list(text)
+        self.tm.tokenizer.bos_token_id = "\0"
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.assertEqual(self.chat.chat_encoding_spec, "dsv4")
+        self.tm.tokenizer.encode.reset_mock()
+
+    @staticmethod
+    def _dsv4_continue_request(assistant):
+        """Build a DSV4 continue_final_message request with the given assistant message."""
+        return ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Return JSON."}, assistant],
+            continue_final_message=True,
+            chat_template_kwargs={"thinking": True},
+        )
+
+    def test_dsv4_continue_final_message_prefill_closes_think_before_content(self):
+        """Thinking-mode prefill must close <think> before the visible content."""
+        self._setup_dsv4_prompt_capture()
+        req = self._dsv4_continue_request(
+            {"role": "assistant", "content": '{"answer":'}
+        )
+
+        result = self.chat._process_messages(req, is_multimodal=False)
+        prompt = "".join(result.prompt_ids)
+
+        self.assertIn('<｜Assistant｜><think></think>{"answer":', prompt)
+        self.assertNotIn('<｜Assistant｜><think>{"answer":', prompt)
+
+    def test_dsv4_continue_final_message_prefill_preserves_reasoning_content(self):
+        """Final assistant reasoning_content stays inside <think>...</think>."""
+        self._setup_dsv4_prompt_capture()
+        req = self._dsv4_continue_request(
+            {
+                "role": "assistant",
+                "reasoning_content": "Need answer as JSON.",
+                "content": '{"answer":',
+            }
+        )
+
+        result = self.chat._process_messages(req, is_multimodal=False)
+        prompt = "".join(result.prompt_ids)
+
+        self.assertIn(
+            '<｜Assistant｜><think>Need answer as JSON.</think>{"answer":',
+            prompt,
+        )
+
+    def test_dsv4_continue_final_message_prefill_uses_single_encoder_pass(self):
+        """DSV4 prefill renders in one pass — no second tokenizer.encode for the prefix."""
+        self._setup_dsv4_prompt_capture()
+        req = self._dsv4_continue_request(
+            {"role": "assistant", "content": '{"answer":'}
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        self.assertEqual(self.tm.tokenizer.encode.call_count, 1)
+
+    def test_dsv4_continue_final_message_honors_explicit_wo_eos_true(self):
+        """Client-supplied wo_eos=True on the assistant turn flows through to the encoder."""
+        self._setup_dsv4_prompt_capture()
+        req = self._dsv4_continue_request(
+            {"role": "assistant", "content": '{"answer":', "wo_eos": True}
+        )
+
+        result = self.chat._process_messages(req, is_multimodal=False)
+        prompt = "".join(result.prompt_ids)
+        self.assertIn('<｜Assistant｜><think></think>{"answer":', prompt)
+
+    def test_dsv4_continue_final_message_explicit_wo_eos_false_falls_back_to_strip(
+        self,
+    ):
+        """wo_eos=False opts out of the wo_eos render and falls back to the
+        legacy strip-and-append path (two encode calls)."""
+        self._setup_dsv4_prompt_capture()
+        req = self._dsv4_continue_request(
+            {"role": "assistant", "content": '{"answer":', "wo_eos": False}
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        # Legacy path: encoder pass + a second encode for the raw prefix.
+        self.assertEqual(self.tm.tokenizer.encode.call_count, 2)
+
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
         err_msg = "Aborted by scheduler"

@@ -584,6 +584,10 @@ class ChatCompletionMessageGenericParam(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    # DSV4 only: render this turn without the trailing EOS token so
+    # generation can continue from it. Defaults to True on DSV4 +
+    # continue_final_message; non-DSV4 encoders ignore the field.
+    wo_eos: Optional[bool] = None
 
     @field_validator("role", mode="before")
     @classmethod

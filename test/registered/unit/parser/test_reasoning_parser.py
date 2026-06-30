@@ -1376,6 +1376,70 @@ class TestReasoningParserAdvanced(CustomTestCase):
         parser = ReasoningParser("qwen3", request=request)
         self.assertTrue(parser.detector.continue_final_message)
 
+    @staticmethod
+    def _make_continue_request(**assistant_kwargs):
+        """Build a ChatCompletionRequest with a user turn + one assistant turn
+        carrying the given kwargs, with continue_final_message=True."""
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionMessageGenericParam,
+            ChatCompletionMessageUserParam,
+            ChatCompletionRequest,
+        )
+
+        return ChatCompletionRequest(
+            model="test",
+            messages=[
+                ChatCompletionMessageUserParam(role="user", content="Hi"),
+                ChatCompletionMessageGenericParam(role="assistant", **assistant_kwargs),
+            ],
+            continue_final_message=True,
+        )
+
+    def test_continue_final_message_deepseek_v4_prepends_think_end(self):
+        """DSV4 prepends </think> so detector starts past the reasoning boundary."""
+        request = self._make_continue_request(content='{"answer":')
+        parser = ReasoningParser("deepseek-v4", request=request)
+        self.assertTrue(parser.detector.continue_final_message)
+        self.assertEqual(parser.detector.previous_content, '</think>{"answer":')
+        self.assertFalse(parser.detector._in_reasoning)
+
+        reasoning, normal = parser.parse_non_stream(" 5}")
+        self.assertEqual(normal, " 5}")
+        self.assertFalse(reasoning)
+
+    def test_continue_final_message_none_content_does_not_crash(self):
+        """content=None (reasoning/tool-only prefill) must not blow up len()/`in` checks."""
+        request = self._make_continue_request(reasoning_content="thinking...")
+
+        # qwen3: no DSV4 prepend, previous_content normalized to ""
+        parser = ReasoningParser("qwen3", request=request)
+        self.assertEqual(parser.detector.previous_content, "")
+        self.assertEqual(parser.detector.previous_count, 0)
+
+        # deepseek-v4: previous_content normalized then </think> prepended
+        parser = ReasoningParser("deepseek-v4", request=request)
+        self.assertEqual(parser.detector.previous_content, "</think>")
+        self.assertFalse(parser.detector._in_reasoning)
+
+    def test_continue_final_message_deepseek_v4_explicit_wo_eos_false_skips_prepend(
+        self,
+    ):
+        """Explicit wo_eos=False routes to legacy strip-and-append, so parser must not prepend."""
+        request = self._make_continue_request(content='{"answer":', wo_eos=False)
+        parser = ReasoningParser("deepseek-v4", request=request)
+        self.assertEqual(parser.detector.previous_content, '{"answer":')
+        # No </think> in previous_content, so _in_reasoning must reflect
+        # the detector default (False for the DSV4/Qwen3 chain). Locks
+        # against future drift that drops the prepend but flips the
+        # default — both halves matter.
+        self.assertFalse(parser.detector._in_reasoning)
+
+    def test_continue_final_message_other_models_keep_previous_content_verbatim(self):
+        """Only deepseek-v4 gets the </think> prepend — other parsers unaffected."""
+        request = self._make_continue_request(content='{"answer":')
+        parser = ReasoningParser("qwen3", request=request)
+        self.assertEqual(parser.detector.previous_content, '{"answer":')
+
     def test_force_nonempty_content_via_chat_template_kwargs(self):
         """Test that force_nonempty_content is passed via chat_template_kwargs."""
         from sglang.srt.entrypoints.openai.protocol import (
