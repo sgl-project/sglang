@@ -1,11 +1,24 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
+    alloc_paged_token_slots_extend_npu,
+)
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    maybe_build_dsv4_verify_bundle,
+)
+from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+    get_alloc_reserve_per_decode,
+    get_last_loc,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
@@ -26,6 +39,14 @@ if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
+
+
+ALLOC_EXTEND_FUNCS = defaultdict(
+    lambda: alloc_paged_token_slots_extend,
+    {
+        "npu": alloc_paged_token_slots_extend_npu,
+    },
+)
 
 
 def per_step_draft_out_cache_loc(
@@ -261,21 +282,55 @@ def verify_tree_greedy_func(
     return predicts, accept_index, accept_token_num
 
 
-def get_draft_hidden_dim(model_runner: ModelRunner) -> int:
-    """Derive the hidden dimension of target hidden states fed to the draft model."""
-    hf_config = model_runner.model_config.hf_config
-    eagle_config = getattr(hf_config, "eagle_config", {})
-    use_aux = eagle_config.get("use_aux_hidden_state", False)
+def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
+    """Width of the target hidden states fed into the draft model.
+
+    This is the single source of truth and is derived entirely from config: for
+    EAGLE3 aux mode the draft consumes `num_aux` concatenated target layers
+    (each `target_hidden_size` wide); every other arch consumes the per-layer
+    `spec_hidden_size`.
+
+    Do NOT read this off a draft projection's `in_features` (e.g. an `fc`
+    layer): that width is arch-specific.
+
+    Note: read entirely from the *draft* `model_runner`'s config. The non-aux
+    branch assumes the draft's `spec_hidden_size` equals the target hidden width
+    fed to the draft (true for standard EAGLE, where the draft mirrors the
+    target hidden size); aux mode reads the explicit `target_hidden_size`.
+    """
+    model_config = model_runner.model_config
+    hf_config = model_config.hf_config
+    eagle_config = getattr(hf_config, "eagle_config", None) or {}
+    get_eagle_config = (
+        eagle_config.get
+        if isinstance(eagle_config, dict)
+        else lambda key, default=None: getattr(eagle_config, key, default)
+    )
+    use_aux = get_eagle_config("use_aux_hidden_state", True)
     spec_algorithm = model_runner.spec_algorithm
 
-    if spec_algorithm is not None and spec_algorithm.is_eagle3() and use_aux:
-        base = getattr(hf_config, "target_hidden_size", None)
-        if base is None:
-            base = model_runner.model_config.hidden_size
-        layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids", [])
-        num_aux = max(len(layer_ids), 1)
-        return base * num_aux
-    return model_runner.model_config.spec_hidden_size
+    if not (spec_algorithm is not None and spec_algorithm.is_eagle3() and use_aux):
+        return model_config.spec_hidden_size
+
+    target_hidden = getattr(hf_config, "target_hidden_size", None)
+    if target_hidden is None:
+        target_hidden = model_config.hidden_size
+    num_aux = getattr(hf_config, "num_aux_hidden_states", None)
+    if num_aux is None:
+        layer_ids = get_eagle_config("eagle_aux_hidden_state_layer_ids", None)
+        if layer_ids is None:
+            layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+        num_aux = len(layer_ids) if layer_ids else 3
+    return target_hidden * num_aux
+
+
+def get_draft_recurrent_hidden_state_spec(
+    model_runner: ModelRunner,
+) -> tuple[Optional[int], Optional[torch.dtype]]:
+    """Return hidden_states width/dtype carried between draft decode steps."""
+    if model_runner.spec_algorithm.is_standalone():
+        return None, None
+    return model_runner.model_config.spec_hidden_size, model_runner.model_config.dtype
 
 
 def eagle_prepare_for_verify(
@@ -313,6 +368,10 @@ def eagle_prepare_for_verify(
             batch_size=bs,
             draft_token_num=verify_input.draft_token_num,
             device=device,
+        )
+
+        batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
+            batch, verify_input.draft_token_num
         )
 
         prepare_mamba_track_for_verify(batch)
@@ -455,6 +514,14 @@ def eagle_sample(
             tree_speculative_sampling_target_only,
         )
 
+        from sglang.srt.speculative.reject_sampling import (
+            chain_speculative_sampling_triton,
+        )
+
+        use_rejection_sampling = (
+            get_global_server_args().speculative_use_rejection_sampling
+        )
+
         # Apply temperature and get target probs
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
@@ -479,14 +546,34 @@ def eagle_sample(
         )
         maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
-        draft_probs = torch.zeros_like(target_probs)
+        draft_probs = (
+            verify_input.draft_probs
+            if use_rejection_sampling
+            else torch.zeros_like(target_probs)
+        )
+        # Defense-in-depth behind the spec_hook startup allowlist: validate the
+        # actual kernel inputs (catches draft_probs plumbing regressions or a
+        # startup guard bypassed by a worker subclass) before the Triton kernel.
+        if use_rejection_sampling and (
+            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
+        ):
+            raise ValueError(
+                "Rejection sampling requires a target-vocab draft proposal "
+                "distribution; the current speculative algorithm/draft worker "
+                "does not produce one (draft_probs missing or vocab-mismatched)."
+            )
 
         # coins for rejection sampling
         coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
         # coins for final sampling
         coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
 
-        tree_speculative_sampling_target_only(
+        sampling_fn = (
+            chain_speculative_sampling_triton
+            if use_rejection_sampling
+            else tree_speculative_sampling_target_only
+        )
+        sampling_fn(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
             accept_token_num=num_correct_drafts,  # mutable
@@ -533,3 +620,85 @@ def eagle_sample(
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
     return predict, num_correct_drafts + 1, accept_index
+
+
+def eagle_prepare_for_decode(batch: ScheduleBatch):
+    batch.maybe_evict_swa()
+
+    from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+    bs = batch.batch_size()
+
+    # Accumulate penalty
+    # This is a relaxed version of penalties for speculative decoding.
+    if batch.sampling_info.penalizer_orchestrator.is_required:
+        batch.cumulate_penalty_output_tokens()
+
+    page_size = batch.token_to_kv_pool_allocator.page_size
+    double_alloc = get_alloc_reserve_per_decode()
+
+    cur_kv_lens = [0] * bs
+    nxt_kv_lens = [0] * bs
+    num_needed_tokens = 0
+    for i, r in enumerate(batch.reqs):
+        cur = r.kv_allocated_len
+        # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
+        # kv_committed_len is honest (bonus committed in resolve, not here),
+        # so it lags batch.seq_lens by ~1 verify in overlap; 2*alloc absorbs.
+        nxt = max(cur, r.kv_committed_len + double_alloc)
+        cur_kv_lens[i] = cur
+        nxt_kv_lens[i] = nxt
+        num_needed_tokens += nxt - cur
+        r.kv_allocated_len = nxt
+        r.decode_batch_idx += 1
+
+    cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
+    nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
+
+    # Fail fast if the page>1 + topk>1 draft over-allocation
+    # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below
+    # would OOB and free would leak KV. The row is widened to hold it in _init_pools
+    # (PR #26972); fail here with a clear error, not on a later cryptic CUDA assert.
+    from sglang.srt.server_args import get_global_server_args
+
+    if page_size > 1 and (get_global_server_args().speculative_eagle_topk or 1) > 1:
+        max_alloc_len = int(nxt_kv_lens_cpu.max())
+        row_width = batch.req_to_token_pool.req_to_token.shape[1]
+        assert max_alloc_len <= row_width, (
+            f"spec v2 page>1 topk>1 draft over-allocation ({max_alloc_len}) exceeds "
+            f"req_to_token row width ({row_width}); page_size={page_size}. Widen the "
+            f"row to hold committed + get_alloc_reserve_per_decode (PR #26972)."
+        )
+
+    # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
+    # barrier has chained to the prev forward -> host stalls a full forward.
+    cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+    nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+    if page_size == 1:
+        out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
+    else:
+        last_loc = get_last_loc(
+            batch.req_to_token_pool.req_to_token,
+            batch.req_pool_indices,
+            cur_kv_lens_device,
+        )
+        device_type = getattr(batch.device, "type", str(batch.device).split(":", 1)[0])
+        out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
+            batch.tree_cache,
+            cur_kv_lens_device,
+            cur_kv_lens_cpu,
+            nxt_kv_lens_device,
+            nxt_kv_lens_cpu,
+            last_loc,
+            num_needed_tokens,
+            req_pool_indices=batch.req_pool_indices,
+            batch=batch,
+        )
+    assign_req_to_token_pool_func(
+        batch.req_pool_indices,
+        batch.req_to_token_pool.req_to_token,
+        cur_kv_lens_device,
+        nxt_kv_lens_device,
+        out_cache_loc,
+        bs,
+    )

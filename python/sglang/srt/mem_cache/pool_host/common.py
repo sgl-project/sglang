@@ -57,6 +57,19 @@ def _cuda_host_register(buffer: torch.Tensor) -> None:
         )
 
 
+def _cuda_host_unregister(buffer: torch.Tensor) -> None:
+    cudart = torch.cuda.cudart()
+    rc = cudart.cudaHostUnregister(buffer.data_ptr())
+    if int(rc) != 0:
+        # Best-effort on shutdown: warn, don't raise -- a leak is reclaimed at exit.
+        logger.warning(
+            "cudaHostUnregister failed (rc=%d, %s) for ptr=%#x",
+            int(rc),
+            cudart.cudaGetErrorString(rc),
+            buffer.data_ptr(),
+        )
+
+
 def alloc_with_host_register(
     dims: tuple,
     dtype: torch.dtype,

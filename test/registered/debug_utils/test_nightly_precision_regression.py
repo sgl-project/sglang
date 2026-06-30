@@ -2,7 +2,7 @@
 compare day-over-day against a rolling baseline.
 
 Env knobs:
-  SGLANG_PRECISION_MODELS         comma-separated model ids (default GLM-5.1-FP8)
+  SGLANG_PRECISION_MODELS         comma-separated model ids (default GLM-5.2-FP8)
   SGLANG_PRECISION_BASELINE_DIR   local baseline dir
   SGLANG_PRECISION_DIFF_THRESHOLD per-tensor rel_diff cutoff (default 1e-3)
   SGLANG_PRECISION_FORCE_UPDATE=1 skip comparison, refresh baseline
@@ -49,7 +49,7 @@ except Exception:  # pragma: no cover
 
 register_cuda_ci(est_time=3600, suite="nightly-precision-8-gpu-h200", nightly=True)
 
-DEFAULT_MODELS_FOR_NIGHTLY_PRECISION = "zai-org/GLM-5.1-FP8"
+DEFAULT_MODELS_FOR_NIGHTLY_PRECISION = "zai-org/GLM-5.2-FP8"
 DEFAULT_DIFF_THRESHOLD = 1e-3
 # Fallback when the layer count can't be resolved: never silently shrink coverage.
 DUMPER_FILTER_ALL_LAYERS = (

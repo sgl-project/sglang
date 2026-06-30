@@ -35,6 +35,57 @@ logger = logging.getLogger(__name__)
 _MIN_BLOCK_KV = 32
 
 
+def _extract_kv_strides(buf, page_size: int):
+    """Extract (slot_stride, head_stride, page_stride, tok_stride) for a
+    KV buffer that may be:
+      - 3-D ``[max_slots, head_num, head_dim]`` (legacy / non-shared) — the
+        contiguous layout most callers use. page/tok strides are synthesized
+        so the kernel's PAGE_SIZE>1 math collapses to ``kv_loc * stride(0)``.
+      - 4-D ``[num_pages, page_size, head_num, head_dim]`` (shared
+        pool). page/tok strides come from stride(0)/stride(1) directly;
+        legacy ``stride_bs`` is set to 0 (unused at PAGE_SIZE>1).
+
+    Returns a 4-tuple of ints suitable for passing as ``stride_buf_*bs``,
+    ``stride_buf_*h``, ``stride_buf_*page``, ``stride_buf_*tok``.
+    """
+    if buf.ndim == 4:
+        # 4-D view ``[num_pages, page_size, head_num, head_dim]``.
+        #   stride(0) = per-PAGE stride (page_bytes/itemsize)
+        #   stride(1) = within-page per-TOKEN stride (k_row/v_row bytes/itemsize)
+        # The PAGE_SIZE>1 kernel branch uses page_stride/tok_stride and does
+        # NOT read slot_stride. slot_stride is consumed ONLY by the
+        # PAGE_SIZE==1 branch (``offs = kv_loc * stride_buf_*bs``), where one
+        # page holds exactly one slot, so the per-slot stride is the per-page
+        # stride — NOT the within-page token stride. Concretely the per-slot
+        # stride is ``page_stride // page_size`` (= entry_bytes/itemsize),
+        # which at ps=1 equals page_stride. Using ``tok_stride`` here (one
+        # layer's k_row) would make the ps=1 read address ``kv_loc * k_row``
+        # instead of ``kv_loc * entry_bytes`` and read the wrong slot.
+        page_stride = buf.stride(0)
+        tok_stride = buf.stride(1)
+        head_stride = buf.stride(2)
+        slot_stride = (
+            page_stride // page_size
+        )  # per-slot stride; == page_stride at ps=1
+        assert buf.shape[1] == page_size, (
+            f"4-D KV buffer's dim-1 must equal page_size; got "
+            f"shape[1]={buf.shape[1]}, page_size={page_size}"
+        )
+    elif buf.ndim == 3:
+        # Legacy 3-D ``[N, head, dim]``. Synthesize page/tok strides such
+        # that ``(kv_loc // ps) * page_stride + (kv_loc % ps) * tok_stride
+        # == kv_loc * slot_stride`` for the page-aware branch — this lets
+        # the same kernel handle non-shared paged-allocator buffers without
+        # any caller adjustment.
+        slot_stride = buf.stride(0)
+        head_stride = buf.stride(1)
+        page_stride = slot_stride * page_size
+        tok_stride = slot_stride
+    else:  # pragma: no cover
+        raise ValueError(f"unexpected KV buffer ndim={buf.ndim}, shape={buf.shape}")
+    return slot_stride, head_stride, page_stride, tok_stride
+
+
 @triton.jit
 def tanh(x):
     # Tanh is just a scaled sigmoid
@@ -58,6 +109,13 @@ def _fwd_kernel_stage1(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
+    # Page-aware strides (used when PAGE_SIZE > 1). For
+    # PAGE_SIZE == 1 the address math degenerates and these are unused
+    # (Triton specializes the dead branch away at compile time).
+    stride_buf_kpage,
+    stride_buf_ktok,
+    stride_buf_vpage,
+    stride_buf_vtok,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -70,6 +128,7 @@ def _fwd_kernel_stage1(
     Lk: tl.constexpr,
     Lv: tl.constexpr,
     xai_temperature_len: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
 ):
     # int64 to avoid overflow of flat offsets into Mid_O when
     # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
@@ -115,11 +174,24 @@ def _fwd_kernel_stage1(
                 mask=offs_n < split_kv_end,
                 other=0,
             )
-            offs_buf_k = (
-                kv_loc[:, None] * stride_buf_kbs
-                + cur_kv_head * stride_buf_kh
-                + offs_d[None, :]
-            )
+            # Page-aware KV address math. At PAGE_SIZE==1 (legacy
+            # / non-shared / shared-at-ps=1), Triton specializes the
+            # else-branch away and the SASS is byte-identical to today.
+            if PAGE_SIZE == 1:
+                offs_buf_k = (
+                    kv_loc[:, None] * stride_buf_kbs
+                    + cur_kv_head * stride_buf_kh
+                    + offs_d[None, :]
+                )
+            else:
+                page_id = kv_loc // PAGE_SIZE
+                tok_in_p = kv_loc % PAGE_SIZE
+                offs_buf_k = (
+                    page_id[:, None] * stride_buf_kpage
+                    + tok_in_p[:, None] * stride_buf_ktok
+                    + cur_kv_head * stride_buf_kh
+                    + offs_d[None, :]
+                )
             k = tl.load(
                 K_Buffer + offs_buf_k,
                 mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
@@ -136,11 +208,19 @@ def _fwd_kernel_stage1(
 
             qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
 
-            offs_buf_v = (
-                kv_loc[:, None] * stride_buf_vbs
-                + cur_kv_head * stride_buf_vh
-                + offs_dv[None, :]
-            )
+            if PAGE_SIZE == 1:
+                offs_buf_v = (
+                    kv_loc[:, None] * stride_buf_vbs
+                    + cur_kv_head * stride_buf_vh
+                    + offs_dv[None, :]
+                )
+            else:
+                offs_buf_v = (
+                    page_id[:, None] * stride_buf_vpage
+                    + tok_in_p[:, None] * stride_buf_vtok
+                    + cur_kv_head * stride_buf_vh
+                    + offs_dv[None, :]
+                )
             v = tl.load(
                 V_Buffer + offs_buf_v,
                 mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
@@ -194,6 +274,7 @@ def _decode_att_m_fwd(
     sm_scale_withk,
     logit_cap,
     xai_temperature_len=-1,
+    page_size: int = 1,
 ):
     BLOCK = 64
     # [TODO] work around SGPR limit on MI3xx
@@ -203,10 +284,15 @@ def _decode_att_m_fwd(
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 
+    # head_num lives in the dim immediately before the head_dim. For 3-D
+    # ``[N, head_num, head_dim]`` that's dim 1; for 4-D
+    # ``[num_pages, page_size, head_num, head_dim]`` that's dim 2.
+    kv_head_num = k_buffer.shape[-2]
+
     batch, head_num = q.shape[0], q.shape[1]
 
     grid = (batch, head_num, MAX_KV_SPLITS)
-    kv_group_num = q.shape[1] // k_buffer.shape[1]
+    kv_group_num = q.shape[1] // kv_head_num
 
     if kv_group_num == 1:
         num_warps = 4
@@ -217,6 +303,13 @@ def _decode_att_m_fwd(
 
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
+
+    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
+        k_buffer, page_size
+    )
+    v_slot_stride, v_head_stride, v_page_stride, v_tok_stride = _extract_kv_strides(
+        v_buffer, page_size
+    )
 
     _fwd_kernel_stage1[grid](
         q,
@@ -230,10 +323,14 @@ def _decode_att_m_fwd(
         num_kv_splits,
         q.stride(0),
         q.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
+        k_slot_stride,
+        k_head_stride,
+        v_slot_stride,
+        v_head_stride,
+        k_page_stride,
+        k_tok_stride,
+        v_page_stride,
+        v_tok_stride,
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
@@ -248,6 +345,7 @@ def _decode_att_m_fwd(
         num_stages=2,
         Lk=Lk,
         Lv=Lv,
+        PAGE_SIZE=page_size,
     )
 
 
@@ -268,6 +366,11 @@ def _fwd_grouped_kernel_stage1(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
+    # Page-aware strides (used when PAGE_SIZE > 1).
+    stride_buf_kpage,
+    stride_buf_ktok,
+    stride_buf_vpage,
+    stride_buf_vtok,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -285,6 +388,7 @@ def _fwd_grouped_kernel_stage1(
     Lv: tl.constexpr,
     HAS_MLA: tl.constexpr = False,
     USE_PDL: tl.constexpr = False,
+    PAGE_SIZE: tl.constexpr = 1,
 ):
     # int64 to avoid overflow of flat offsets into Mid_O when
     # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
@@ -356,7 +460,17 @@ def _fwd_grouped_kernel_stage1(
                 mask=offs_n < split_kv_end,
                 other=0,
             )
-            offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
+            # Page-aware KV address math (see _fwd_kernel_stage1).
+            if PAGE_SIZE == 1:
+                offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
+            else:
+                page_id = kv_loc // PAGE_SIZE
+                tok_in_p = kv_loc % PAGE_SIZE
+                offs_buf_k = (
+                    page_id[None, :] * stride_buf_kpage
+                    + tok_in_p[None, :] * stride_buf_ktok
+                    + base_offs_k
+                )
             k = tl.load(
                 K_Buffer + offs_buf_k,
                 mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
@@ -364,7 +478,14 @@ def _fwd_grouped_kernel_stage1(
             )
             qk = tl.dot(q_k, k)
             if BLOCK_DPE > 0:
-                offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
+                if PAGE_SIZE == 1:
+                    offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
+                else:
+                    offs_buf_kpe = (
+                        page_id[None, :] * stride_buf_kpage
+                        + tok_in_p[None, :] * stride_buf_ktok
+                        + base_offs_kpe
+                    )
                 kpe = tl.load(
                     K_Buffer + offs_buf_kpe,
                     mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
@@ -385,7 +506,14 @@ def _fwd_grouped_kernel_stage1(
             if HAS_MLA:
                 v = tl.trans(k)
             else:
-                offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
+                if PAGE_SIZE == 1:
+                    offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
+                else:
+                    offs_buf_v = (
+                        page_id[:, None] * stride_buf_vpage
+                        + tok_in_p[:, None] * stride_buf_vtok
+                        + base_offs_v
+                    )
                 v = tl.load(
                     V_Buffer + offs_buf_v,
                     mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
@@ -445,6 +573,7 @@ def _decode_grouped_att_m_fwd(
     xai_temperature_len=-1,
     has_mla=False,
     use_pdl=False,
+    page_size: int = 1,
 ):
     BLOCK = 32
     Lk = k_buffer.shape[-1]
@@ -465,8 +594,11 @@ def _decode_grouped_att_m_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
+    # 4-D view exposes head_num at dim 2; legacy 3-D exposes
+    # it at dim 1.
+    kv_head_num = k_buffer.shape[-2]
     batch, head_num = q.shape[0], q.shape[1]
-    kv_group_num = q.shape[1] // k_buffer.shape[1]
+    kv_group_num = q.shape[1] // kv_head_num
 
     BLOCK_H = 16
     MAX_KV_SPLITS = max_kv_splits
@@ -484,6 +616,13 @@ def _decode_grouped_att_m_fwd(
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
         num_stages = 1
 
+    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
+        k_buffer, page_size
+    )
+    v_slot_stride, v_head_stride, v_page_stride, v_tok_stride = _extract_kv_strides(
+        v_buffer, page_size
+    )
+
     _fwd_grouped_kernel_stage1[grid](
         q,
         k_buffer,
@@ -496,10 +635,14 @@ def _decode_grouped_att_m_fwd(
         num_kv_splits,
         q.stride(0),
         q.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
+        k_slot_stride,
+        k_head_stride,
+        v_slot_stride,
+        v_head_stride,
+        k_page_stride,
+        k_tok_stride,
+        v_page_stride,
+        v_tok_stride,
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
@@ -519,6 +662,7 @@ def _decode_grouped_att_m_fwd(
         Lv=Lv,
         HAS_MLA=has_mla,
         USE_PDL=use_pdl,
+        PAGE_SIZE=page_size,
         **extra_kargs,
     )
 
@@ -669,6 +813,7 @@ def decode_attention_fwd_normal(
     logit_cap=0.0,
     sinks=None,
     xai_temperature_len=-1,
+    page_size: int = 1,
 ):
     _decode_att_m_fwd(
         q,
@@ -683,6 +828,7 @@ def decode_attention_fwd_normal(
         sm_scale_withk,
         logit_cap,
         xai_temperature_len,
+        page_size=page_size,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -716,6 +862,7 @@ def decode_attention_fwd_grouped(
     xai_temperature_len=-1,
     has_mla=False,
     use_pdl=False,
+    page_size: int = 1,
 ):
     _decode_grouped_att_m_fwd(
         q,
@@ -732,6 +879,7 @@ def decode_attention_fwd_grouped(
         xai_temperature_len,
         has_mla=has_mla,
         use_pdl=use_pdl,
+        page_size=page_size,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -767,12 +915,15 @@ def decode_attention_fwd(
     xai_temperature_len=-1,
     has_mla=False,
     use_pdl=False,
+    page_size: int = 1,
 ):
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
     assert q.shape[0] <= attn_logits.shape[0]
 
-    kv_group_num = q.shape[1] // v_buffer.shape[1]
+    # head_num lives at dim 1 (3-D) or dim 2 (4-D shared view).
+    kv_head_num = v_buffer.shape[-2]
+    kv_group_num = q.shape[1] // kv_head_num
 
     if kv_group_num == 1:
         # MHA
@@ -792,6 +943,7 @@ def decode_attention_fwd(
             logit_cap=logit_cap,
             sinks=sinks,
             xai_temperature_len=xai_temperature_len,
+            page_size=page_size,
         )
     else:
         # GQA/MQA/MLA
@@ -813,4 +965,5 @@ def decode_attention_fwd(
             xai_temperature_len=xai_temperature_len,
             has_mla=has_mla,
             use_pdl=use_pdl,
+            page_size=page_size,
         )

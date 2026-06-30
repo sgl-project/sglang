@@ -14,7 +14,7 @@ import traceback
 import uuid
 from collections import defaultdict
 from http import HTTPStatus
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Annotated, Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
 import numpy as np
@@ -23,7 +23,7 @@ import torch
 import uvicorn
 import zmq
 import zmq.asyncio
-from fastapi import FastAPI
+from fastapi import Body, FastAPI
 from fastapi.responses import ORJSONResponse, Response
 from transformers import AutoProcessor
 
@@ -44,7 +44,14 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
-from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileReqType
+from sglang.srt.managers.io_struct import (
+    ProfileReq,
+    ProfileReqType,
+    async_sock_recv,
+    async_sock_send,
+    sock_send,
+    wrap_as_pickle,
+)
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_loader import get_model
@@ -2390,13 +2397,16 @@ class EncoderScheduler:
         requests = [p.request for p in group]
         start = time.time()
         for sock in self.send_sockets:
-            sock.send_pyobj(
-                {
-                    "type": "batch_encode",
-                    "modality": modality.name,
-                    "requests": requests,
-                    "enter_time": start,
-                }
+            sock_send(
+                sock,
+                wrap_as_pickle(
+                    {
+                        "type": "batch_encode",
+                        "modality": modality.name,
+                        "requests": requests,
+                        "enter_time": start,
+                    }
+                ),
             )
 
         logger.info(f"Dispatching batch of {len(group)} {modality.name} requests")
@@ -2442,7 +2452,7 @@ class EncoderScheduler:
             req = p.request
             try:
                 for sock in self.send_sockets:
-                    sock.send_pyobj(req)
+                    sock_send(sock, wrap_as_pickle(req))
                 result = await self.encoder.encode_request(req, modality)
                 if not p.future.done():
                     p.future.set_result(result)
@@ -2731,7 +2741,7 @@ class DPDispatcher:
         )
 
         try:
-            await self.dispatch_sockets[rank].send_pyobj(request)
+            await async_sock_send(self.dispatch_sockets[rank], wrap_as_pickle(request))
             # An alive-but-stuck worker (NCCL deadlock etc.) wouldn't trip
             # the watchdog, so bound the wait explicitly.
             return await asyncio.wait_for(future, timeout=ENCODER_REQ_TIMEOUT)
@@ -2780,7 +2790,7 @@ class DPDispatcher:
             f"dp_rank={rank}, pending={self.pending_counts}"
         )
         try:
-            await self.dispatch_sockets[rank].send_pyobj(request)
+            await async_sock_send(self.dispatch_sockets[rank], wrap_as_pickle(request))
             return await asyncio.wait_for(future, timeout=ENCODER_REQ_TIMEOUT)
         except asyncio.TimeoutError:
             self.pending_futures[rank].pop(key, None)
@@ -2821,7 +2831,9 @@ class DPDispatcher:
                 self.req_id_to_rank[req_id] = rank
                 rank_keys.append((rank, req_id))
                 request_copy = {**request, "req_id": req_id}
-                await self.dispatch_sockets[rank].send_pyobj(request_copy)
+                await async_sock_send(
+                    self.dispatch_sockets[rank], wrap_as_pickle(request_copy)
+                )
                 futures.append(future)
             # Concurrent wait → total bounded by eff_timeout, not
             # dp_size × eff_timeout.
@@ -2901,7 +2913,7 @@ class DPDispatcher:
         consecutive_errors = 0
         while True:
             try:
-                msg = await self.result_socket.recv_pyobj()
+                msg = await async_sock_recv(self.result_socket)
                 consecutive_errors = 0
             except asyncio.CancelledError:
                 raise
@@ -2973,13 +2985,8 @@ async def _dp_worker_handle_profile(
 ) -> dict:
     prefix = f"dp_rank={dp_rank}: "
     if dp_type == "start_profile":
-        obj = request.get("profile_req")
-        # `is None` (not `if not obj`) so empty dict still raises.
-        req = (
-            ProfileReq(**obj)
-            if obj is not None
-            else ProfileReq(ProfileReqType.START_PROFILE)
-        )
+        req = request.get("profile_req") or ProfileReq()
+        req.req_type = ProfileReqType.START_PROFILE
         if enc.profiler is None:
             enc.profiler = EncoderProfiler(dp_rank)
         ok, msg = enc.profiler.start(req)
@@ -3051,10 +3058,10 @@ async def _dp_worker_handle_request(
             "_error_code": err_code,
         }
 
-    # pyzmq async send_pyobj isn't safe for concurrent senders.
+    # pyzmq async send isn't safe for concurrent senders.
     try:
         async with send_lock:
-            await send_sock.send_pyobj(envelope)
+            await async_sock_send(send_sock, wrap_as_pickle(envelope))
     except Exception:
         logger.error(
             f"DP worker {dp_rank} failed to send envelope for "
@@ -3113,7 +3120,7 @@ async def run_dp_worker(
             spawned = False
             try:
                 try:
-                    request = await recv_sock.recv_pyobj()
+                    request = await async_sock_recv(recv_sock)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -3197,9 +3204,9 @@ async def run_encoder(
 ):
     encoder = MMEncoder(server_args, schedule_path, dist_init_method, rank)
     while True:
-        request = await encoder.schedule_socket.recv_pyobj()
+        request = await async_sock_recv(encoder.schedule_socket)
         if isinstance(request, ProfileReq):
-            if request.type == ProfileReqType.START_PROFILE:
+            if request.req_type == ProfileReqType.START_PROFILE:
                 if encoder.profiler is None:
                     encoder.profiler = EncoderProfiler(encoder.rank)
                 encoder.profiler.start(request)
@@ -3601,7 +3608,7 @@ async def handle_encode_request(request: dict):
                     )
             else:
                 for socket in send_sockets:
-                    socket.send_pyobj(request)
+                    sock_send(socket, wrap_as_pickle(request))
                 nbytes, embedding_len, embedding_dim, error_msg, error_code = (
                     await encoder.encode_request(request, modality)
                 )
@@ -3822,7 +3829,7 @@ async def health_generate():
 
         # Broadcast to other TP ranks so distributed ops stay in sync
         for socket in send_sockets:
-            socket.send_pyobj(dummy_request)
+            sock_send(socket, wrap_as_pickle(dummy_request))
 
         # Run encode on rank 0 with timeout
         _, _, _, error_msg, _ = await asyncio.wait_for(
@@ -3854,53 +3861,23 @@ async def health_generate():
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
-async def start_profile_async(obj: Optional[ProfileReqInput] = None):
+async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = None):
     if dp_dispatcher is not None:
-        profile_req = None
         if obj is not None:
-            profile_req = {
-                "type": ProfileReqType.START_PROFILE,
-                "output_dir": obj.output_dir,
-                "start_step": obj.start_step,
-                "num_steps": obj.num_steps,
-                "activities": obj.activities,
-                "with_stack": obj.with_stack,
-                "record_shapes": obj.record_shapes,
-                "profile_by_stage": obj.profile_by_stage,
-                "profile_id": str(time.time()),
-                "merge_profiles": obj.merge_profiles,
-                "profile_prefix": obj.profile_prefix,
-                "profile_stages": obj.profile_stages,
-            }
+            obj.req_type = ProfileReqType.START_PROFILE
         try:
             results = await dp_dispatcher.broadcast(
-                {"_dp_type": "start_profile", "profile_req": profile_req}
+                {"_dp_type": "start_profile", "profile_req": obj}
             )
         except MMError as e:
             return Response(content=f"{e}\n", status_code=int(e.code))
         return _summarise_dp_broadcast(results)
     if encoder is None:
         return Response(content="encoder not ready\n", status_code=503)
-    req = None
-    if obj is None:
-        req = ProfileReq(ProfileReqType.START_PROFILE)
-    else:
-        req = ProfileReq(
-            type=ProfileReqType.START_PROFILE,
-            output_dir=obj.output_dir,
-            start_step=obj.start_step,
-            num_steps=obj.num_steps,
-            activities=obj.activities,
-            with_stack=obj.with_stack,
-            record_shapes=obj.record_shapes,
-            profile_by_stage=obj.profile_by_stage,
-            profile_id=str(time.time()),
-            merge_profiles=obj.merge_profiles,
-            profile_prefix=obj.profile_prefix,
-            profile_stages=obj.profile_stages,
-        )
+    req = obj or ProfileReq()
+    req.req_type = ProfileReqType.START_PROFILE
     for socket in send_sockets:
-        socket.send_pyobj(req)
+        sock_send(socket, req)
     if encoder.profiler is None:
         encoder.profiler = EncoderProfiler(encoder.rank)
     ok, msg = encoder.profiler.start(req)
@@ -3929,9 +3906,9 @@ async def stop_profile_async():
         return Response(
             content="profiling not initialized\n", status_code=HTTPStatus.BAD_REQUEST
         )
-    req = ProfileReq(ProfileReqType.STOP_PROFILE)
+    req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
     for socket in send_sockets:
-        socket.send_pyobj(req)
+        sock_send(socket, req)
     ok, msg = encoder.profiler.stop()
     if ok:
         return Response(content="Stop profiling.\n", status_code=200)
