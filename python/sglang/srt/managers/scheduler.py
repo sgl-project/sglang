@@ -1578,14 +1578,9 @@ class Scheduler(
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
                 pop_and_process()
-                # Opportunistic flush at the
-                # `disable_overlap_for_batch` sync boundary. After
-                # pop_and_process, the previous iter's forward is fully
-                # drained (sampling's CPU sync) and the next iter's
-                # forward has NOT yet been launched — `forward_stream` is
-                # truly idle, so the conservative non-urgent guard inside
-                # `_flush` finds `event.query()` True and compacts freely.
-                # Sync-free; best-effort.
+                # Opportunistic flush at the disable_overlap sync boundary:
+                # forward_stream is idle (prev forward drained, next not launched),
+                # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
                 if self.server_args.enable_unified_memory_pool:
                     try:
                         self.token_to_kv_pool_allocator.flush_opportunistic()
@@ -3248,20 +3243,15 @@ class Scheduler(
                                 batch_result.extra_keep_alive_refs
                             )
                         if self.server_args.enable_unified_memory_pool:
-                            # Record a dedicated `forward_done` event right
-                            # after the forward (BEFORE copy_to_cpu). This is
-                            # what lazy-compaction `_flush` uses to gate src
-                            # reuse: when this fires, the in-flight forward's KV
-                            # reads have settled. Only the unified memory pool's
-                            # allocator exposes these hooks; static allocators
-                            # pay no extra event-record overhead.
+                            # Record a `forward_done` event after the forward (before
+                            # copy_to_cpu); lazy-compaction `_flush` gates src reuse on
+                            # it. Only the unified pool's allocator exposes these hooks.
                             allocator = self.token_to_kv_pool_allocator
                             forward_done = self.device_module.Event()
                             forward_done.record(stream=self.forward_stream)
                             allocator.set_latest_forward_done_event(forward_done)
-                            # Write-set classification. Hand the allocator the
-                            # virtual `out_cache_loc` of this forward as a
-                            # TENSOR REFERENCE (no GPU work here).
+                            # Write-set classification: hand the allocator this
+                            # forward's virtual out_cache_loc as a tensor ref (no GPU work).
                             allocator.set_inflight_forward(
                                 forward_done,
                                 batch.out_cache_loc,

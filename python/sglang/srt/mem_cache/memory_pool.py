@@ -1165,11 +1165,9 @@ class KVWriteLoc:
     full_loc: Optional[torch.Tensor] = None
 
     def __post_init__(self):
-        # swa_loc / full_loc are computed once at metadata-init time from the
-        # full (possibly padded) out_cache_loc. Piecewise CUDA graphs / DP-padded
-        # paths later narrow out_cache_loc to real_num_tokens per layer, so these
-        # pre-resolved locs can be longer than loc. Slice both to match since all
-        # three are in the same per-token order.
+        # swa_loc / full_loc are resolved once at metadata-init from the full
+        # (padded) out_cache_loc; piecewise/DP-padded paths later narrow loc per
+        # layer, so slice these pre-resolved locs to match (same per-token order).
         if self.swa_loc is not None and self.swa_loc.shape[0] != self.loc.shape[0]:
             self.swa_loc = self.swa_loc[: self.loc.shape[0]]
         if self.full_loc is not None and self.full_loc.shape[0] != self.loc.shape[0]:
@@ -2384,10 +2382,8 @@ class HybridLinearKVPool(KVCache):
         self.head_num = head_num
         self.head_dim = head_dim
         self.mamba_pool = mamba_pool
-        # virtual->physical mamba-slot translate for the HiCache offload path
-        # (get_cpu_copy/load_cpu_copy). Identity for a static pool (slots are
-        # physical); set to the UnifiedMambaSlotAllocator's `translate` for the
-        # unified memory pool, where mamba_indices arrive virtual.
+        # virtual->physical mamba-slot translate for the HiCache offload path;
+        # identity for a static pool, the allocator's `translate` for the unified pool.
         self._mamba_translate = lambda ids: ids
         self.use_mla = use_mla
         if full_kv_pool is not None:
@@ -2528,10 +2524,9 @@ class HybridLinearKVPool(KVCache):
         v_scale: float = 1.0,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
-        # All write-location info lives in the metadata (`KVWriteLoc`); the pool
-        # holds none. `full_loc` is the unified memory pool's pre-translated full-PHYSICAL
-        # loc; for a static pool it's None and `loc` is already physical. Either
-        # way the write loc is PHYSICAL — the pool writes it directly.
+        # Write-location info lives in the metadata (`KVWriteLoc`). `full_loc` is the
+        # unified pool's pre-translated PHYSICAL loc (None for a static pool, where
+        # `loc` is already physical) — either way the pool writes a PHYSICAL loc.
         loc, _, full_loc = unwrap_write_loc(loc)
         layer_id = self._transfer_full_attention_id(layer.layer_id)
         if not self.use_mla:
@@ -2560,8 +2555,7 @@ class HybridLinearKVPool(KVCache):
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
-        # mamba_pool is a pure store on PHYSICAL ids; translate the (virtual,
-        # for the unified memory pool) mamba_indices first.
+        # mamba_pool stores PHYSICAL ids; translate the (unified-pool virtual) ids first.
         mamba_cpu = (
             self.mamba_pool.get_cpu_copy(self._mamba_translate(mamba_indices))
             if mamba_indices is not None

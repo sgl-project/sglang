@@ -52,10 +52,8 @@ def track_mamba_state_if_needed_kernel(
     src_idx = tl.load(cache_indices_ptr + batch_idx).to(tl.int64)
     dst_idx = tl.load(mamba_track_indices_ptr + batch_idx).to(tl.int64)
 
-    # Skip freed/unallocated slots: a freed slot maps to -1, and
-    # `state_ptr + (-1) * stride` would fault before the buffer. Only the
-    # shared/unified KV pool emits -1 (freed-slot tombstones from the
-    # virtual->physical translate); for the static pool this is compiled out.
+    # Skip freed slots (-1): `state_ptr + (-1)*stride` would fault. Only the unified
+    # pool emits -1 tombstones (from the v2p translate); compiled out for static.
     if check_freed_slots:
         if src_idx < 0 or dst_idx < 0:
             return

@@ -91,11 +91,9 @@ class SchedulerInvariantChecker:
         elif self.is_hybrid_ssm:
             # Branch on cache type for the protected accessor (MambaRadixCache
             # splits full/mamba; ChunkCache only has the single protected_size).
-            # Use the allocator's `.size` for `total` — for non-unified memory pools it
-            # equals `max_total_num_tokens` (static); for the unified memory pool it is
-            # the dynamic byte-coordinated cap that matches what `available_size`
-            # measures (so the invariant holds when idle even though the shared
-            # full-attn slot space is larger than `max_total_num_tokens`).
+            # Use the allocator's `.size` for `total`: static max_total_num_tokens for
+            # non-unified pools, the dynamic byte-coordinated cap (matching
+            # `available_size`) for the unified pool.
             if self.tree_cache.supports_mamba():
                 protected = self.tree_cache.full_protected_size()
             else:

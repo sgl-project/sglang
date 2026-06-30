@@ -6347,19 +6347,15 @@ class ServerArgs:
                 "cuda-graph capture only; disable piecewise prefill capture "
                 "(e.g. --cuda-graph-backend-prefill=disabled)."
             )
-        # The Triton-backend requirement for the strided full-attention K/V and
-        # the Mamba conv/SSM envelope is enforced via --enable-page-major-kv-layout
-        # (implied by the unified memory pool in _handle_page_major_kv_layout, which runs
-        # first). The model-family gate (hybrid Mamba / hybrid SWA) is enforced at
-        # pool-construction time in model_runner_kv_cache_mixin._init_pools.
+        # The strided-layout Triton requirement is enforced via
+        # --enable-page-major-kv-layout (implied by the unified pool in
+        # _handle_page_major_kv_layout); the model-family gate is enforced at pool
+        # construction in model_runner_kv_cache_mixin._init_pools.
 
     def _handle_page_major_kv_layout(self):
-        # The unified memory pool stores its full-attention K/V and Mamba conv/SSM
-        # state in the page-major envelope-strided layout, so enabling it implies
-        # --enable-page-major-kv-layout. Setting it here (before the guard below)
-        # routes the unified memory pool through the single page-major code path and the
-        # stride-aware Triton-kernel asserts, instead of duplicating that
-        # enforcement in _handle_unified_memory_pool.
+        # The unified pool stores state in the page-major envelope-strided layout, so
+        # enabling it implies --enable-page-major-kv-layout — routing it through the
+        # single page-major path + stride-aware Triton asserts (set before the guard).
         if self.enable_unified_memory_pool:
             self.enable_page_major_kv_layout = True
         if not self.enable_page_major_kv_layout:

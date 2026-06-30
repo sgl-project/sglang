@@ -30,13 +30,10 @@ class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
-    # Radix-prefix-cache mamba track DESTINATION slots (PHYSICAL slot ids,
-    # length == batch). Mirrors mamba_cache_indices: on the cuda-graph path it
-    # is a backend-owned STATIC buffer (state_indices_list's sibling), refreshed
-    # in-place with the virtual->physical translate each replay; eager sets it to
-    # the translated decode tensor. The decode track-save reads THIS field, never
-    # forward_batch.mamba_track_indices, so the cuda-graph InputBuffer registry
-    # slot stays read-only.
+    # Mamba track DESTINATION slots (PHYSICAL, length == batch). Like
+    # mamba_cache_indices: a backend-owned static buffer under cuda-graph (translated
+    # in-place each replay), eager sets the translated decode tensor. The decode
+    # track-save reads THIS, never forward_batch.mamba_track_indices.
     mamba_track_indices: Optional[torch.Tensor] = None
     # GDN ReplaySSM (slice 1a): per-decode-row snapshot of the ring write
     # cursor for THIS decode step (gathered from the persistent per-slot
