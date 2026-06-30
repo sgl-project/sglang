@@ -152,7 +152,7 @@ SGLang enables XPU graph capture to reduce per-step kernel-launch overhead.
 
 ### Enable Prefill Graph
 
-Prefill graph capture is **opt-in** on XPU because it requires `torch.compile`
+Prefill graph capture is **opt-in** on XPU and requires `torch.compile`
 and must be enabled explicitly:
 
 ```bash
@@ -173,8 +173,7 @@ You can also configure both phases together with a single `--cuda-graph-config` 
 
 ```bash
 python -m sglang.launch_server --model-path <MODEL> --device xpu \
-    --cuda-graph-config '{"decode":{"backend":"full"},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}' \
-    --cuda-graph-bs-prefill 64 128 256 512
+    --cuda-graph-config '{"decode":{"backend":"full"},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}'
 ```
 
 ### Enable torch.compile for Decode
@@ -186,8 +185,7 @@ but increases startup time.
 
 ```bash
 python -m sglang.launch_server --model-path <MODEL> --device xpu \
-    --enable-torch-compile \
-    --torch-compile-max-bs 4
+    --enable-torch-compile
 ```
 
 > **Note:** `--enable-torch-compile` is mutually exclusive with the prefill
@@ -214,7 +212,7 @@ python -m sglang.launch_server --model-path <MODEL> --device xpu \
     --cuda-graph-backend-prefill=disabled
 ```
 
-### Customize Prefill Capture Buckets
+### Customize Capture Buckets
 
 By default, prefill capture sizes are derived from `--chunked-prefill-size`.
 To specify explicit token-length buckets:
@@ -222,7 +220,17 @@ To specify explicit token-length buckets:
 ```bash
 python -m sglang.launch_server \
     --model-path <MODEL> --device xpu \
+    python -m sglang.launch_server --model-path <MODEL> --device xpu \
+    --cuda-graph-backend-prefill tc_piecewise \
     --cuda-graph-bs-prefill 64 128 256 512
+```
+
+To specify explicit decode graph batch sizes:
+
+```bash
+python -m sglang.launch_server \
+    --model-path <MODEL> --device xpu \
+    --cuda-graph-bs-decode 1 2 4 8
 ```
 
 ### Server Args
