@@ -49,7 +49,11 @@ from sglang.srt.layers.attention.utils import (
     mla_quantize_and_rope_for_fp8,
     seqlens_expand_triton,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    compute_position_torch,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -98,6 +102,32 @@ else:
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
     )
+
+
+def _get_cp_gathered_k_pos_ids(
+    forward_batch: ForwardBatch, q_len: int, k_len: int
+) -> Optional[torch.Tensor]:
+    if q_len == k_len:
+        return None
+    positions = getattr(forward_batch, "positions", None)
+    if positions is not None and positions.numel() == k_len:
+        return positions
+    if (
+        forward_batch.extend_prefix_lens is None
+        or forward_batch.extend_seq_lens is None
+    ):
+        return None
+
+    k_pos_ids, _ = compute_position_torch(
+        forward_batch.extend_prefix_lens,
+        forward_batch.extend_seq_lens,
+    )
+    if k_pos_ids.shape[0] != k_len:
+        raise ValueError(
+            "Unable to build gathered K RoPE positions for FP8 MLA: expected "
+            f"{k_len} positions, got {k_pos_ids.shape[0]}"
+        )
+    return k_pos_ids
 
 
 def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -1678,6 +1708,7 @@ class DeepseekSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        q_pos_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
@@ -1708,6 +1739,7 @@ class DeepseekSparseAttnBackend(
                 cos_sin_cache,
                 is_neox,
                 llama_4_scaling,
+                q_pos_ids,
                 is_prefill=True,
             )
 
@@ -1913,6 +1945,7 @@ class DeepseekSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        q_pos_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
@@ -1934,6 +1967,7 @@ class DeepseekSparseAttnBackend(
                 cos_sin_cache,
                 is_neox,
                 llama_4_scaling,
+                q_pos_ids,
             )
 
         if k is not None:
@@ -2471,6 +2505,7 @@ class DeepseekSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        q_pos_ids: Optional[torch.Tensor] = None,
         is_prefill: bool = False,
     ) -> torch.Tensor:
         """Forward using TRT-LLM sparse MLA kernel."""
@@ -2488,16 +2523,24 @@ class DeepseekSparseAttnBackend(
                 cos_sin_cache is not None
             ), "For FP8 path cos_sin_cache should not be None."
 
+            k = k.squeeze(1)
+            k_rope = k_rope.squeeze(1)
+            k_pos_ids = _get_cp_gathered_k_pos_ids(
+                forward_batch, q_rope.shape[0], k_rope.shape[0]
+            )
+            if q_pos_ids is None:
+                q_pos_ids = forward_batch.positions
             q, k, k_rope = mla_quantize_and_rope_for_fp8(
                 q,
                 q_rope,
-                k.squeeze(1),
-                k_rope.squeeze(1),
-                forward_batch.positions,
+                k,
+                k_rope,
+                q_pos_ids,
                 cos_sin_cache,
                 is_neox,
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
+                k_pos_ids=k_pos_ids,
             )
             merge_query = False
 

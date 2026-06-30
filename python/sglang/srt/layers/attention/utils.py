@@ -43,6 +43,7 @@ from sglang.srt.layers.attention.triton_ops.pad import (
 from sglang.srt.layers.attention.triton_ops.rope_cache import (
     fused_qk_rope_reshape_and_cache as fused_qk_rope_reshape_and_cache,
 )
+from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -96,40 +97,66 @@ def mla_quantize_and_rope_for_fp8(
     is_neox: bool,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    k_pos_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    import flashinfer.rope
-
     """Quantize and apply RoPE for FP8 attention path.
 
-        This function handles the FP8 quantization and RoPE application for MLA attention.
-        It takes separate query/key nope and rope components, applies RoPE to the rope parts,
-        quantizes all components to FP8, and merges the query components into a single tensor.
+    This function handles the FP8 quantization and RoPE application for MLA attention.
+    It takes separate query/key nope and rope components, applies RoPE to the rope parts,
+    quantizes all components to FP8, and merges the query components into a single tensor.
 
-        Args:
-            q_nope: Query no-position-encoding component [seq_len, num_heads, kv_lora_rank]
-                - expected dtype: torch.bfloat16
-            q_rope: Query RoPE component [seq_len, num_heads, qk_rope_head_dim]
-                - expected dtype: torch.bfloat16
-            k_nope: Key no-position-encoding component [seq_len, num_heads, kv_lora_rank]
-                - expected dtype: torch.bfloat16
-            k_rope: Key RoPE component [seq_len, num_heads, qk_rope_head_dim]
-                - expected dtype: torch.bfloat16
-            pos_ids: Position indices for each token
-                - expected dtype: torch.int64 or torch.int32
-            cos_sin_cache: Precomputed cosine/sine cache for RoPE
-                - expected dtype: matches q_/k_ input dtype (torch.bfloat16)
-            is_neox: Whether to use NeoX-style RoPE (interleaved) or GPT-style (half rotation)
-            kv_lora_rank: Dimension of the no-position-encoding component
-            qk_rope_head_dim: Dimension of the RoPE component
+    Args:
+        q_nope: Query no-position-encoding component [seq_len, num_heads, kv_lora_rank]
+            - expected dtype: torch.bfloat16
+        q_rope: Query RoPE component [seq_len, num_heads, qk_rope_head_dim]
+            - expected dtype: torch.bfloat16
+        k_nope: Key no-position-encoding component [seq_len, num_heads, kv_lora_rank]
+            - expected dtype: torch.bfloat16
+        k_rope: Key RoPE component [seq_len, num_heads, qk_rope_head_dim]
+            - expected dtype: torch.bfloat16
+        pos_ids: Position indices for each token
+            - expected dtype: torch.int64 or torch.int32
+        cos_sin_cache: Precomputed cosine/sine cache for RoPE
+            - expected dtype: matches q_/k_ input dtype (torch.bfloat16)
+        is_neox: Whether to use NeoX-style RoPE (interleaved) or GPT-style (half rotation)
+        kv_lora_rank: Dimension of the no-position-encoding component
+        qk_rope_head_dim: Dimension of the RoPE component
+        k_pos_ids: Optional separate key positions. This is needed by
+            prefill CP paths where q_rope is rank-local but k_rope has
+            been all-gathered and reranged back to the full token order.
 
-        Returns:
-            tuple: (merged_q_out, k_nope_out, k_rope_out) quantized to FP8
-                - merged_q_out: [seq_len, num_heads, kv_lora_rank + qk_rope_head_dim], dtype=torch.float8_e4m3fn
-                - k_nope_out:   [seq_len, num_heads, kv_lora_rank], dtype=torch.float8_e4m3fn
-                - k_rope_out:   [seq_len, num_heads, qk_rope_head_dim], dtype=torch.float8_e4m3fn
-        """
+    Returns:
+        tuple: (merged_q_out, k_nope_out, k_rope_out) quantized to FP8
+            - merged_q_out: [seq_len, num_heads, kv_lora_rank + qk_rope_head_dim], dtype=torch.float8_e4m3fn
+            - k_nope_out:   [seq_len, num_heads, kv_lora_rank], dtype=torch.float8_e4m3fn
+            - k_rope_out:   [seq_len, num_heads, qk_rope_head_dim], dtype=torch.float8_e4m3fn
+    """
     attn_dtype = torch.float8_e4m3fn
     q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
+
+    if k_pos_ids is not None:
+        return _mla_quantize_and_rope_for_fp8_torch(
+            q_nope,
+            q_rope,
+            k_nope,
+            k_rope,
+            pos_ids,
+            k_pos_ids,
+            cos_sin_cache,
+            is_neox,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            attn_dtype,
+        )
+
+    if q_rope.shape[0] != k_rope.shape[0]:
+        raise ValueError(
+            "mla_quantize_and_rope_for_fp8 requires k_pos_ids when q_rope and "
+            f"k_rope have different token counts: {q_rope.shape[0]} vs "
+            f"{k_rope.shape[0]}"
+        )
+
+    import flashinfer.rope
 
     # Allocate output tensors with FP8 dtype
     # Query output will contain merged nope + rope components
@@ -170,6 +197,59 @@ def mla_quantize_and_rope_for_fp8(
     )
 
     return q_out, k_nope_out, k_rope_out
+
+
+def _mla_quantize_and_rope_for_fp8_torch(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q_pos_ids: torch.Tensor,
+    k_pos_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    attn_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
+    q_out = q_rope.new_empty(
+        q_len,
+        num_heads,
+        kv_lora_rank + qk_rope_head_dim,
+        dtype=attn_dtype,
+    )
+
+    q_out[..., :kv_lora_rank] = q_nope.to(attn_dtype)
+    q_out[..., kv_lora_rank:] = _apply_rope_for_fp8_quantize(
+        q_rope, q_pos_ids, cos_sin_cache, is_neox
+    ).to(attn_dtype)
+    k_nope_out = k_nope.to(attn_dtype)
+    k_rope_out = _apply_rope_for_fp8_quantize(
+        k_rope, k_pos_ids, cos_sin_cache, is_neox
+    ).to(attn_dtype)
+    return q_out, k_nope_out, k_rope_out
+
+
+def _apply_rope_for_fp8_quantize(
+    rope: torch.Tensor,
+    pos_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+) -> torch.Tensor:
+    pos_ids = pos_ids.flatten()
+    if pos_ids.shape[0] != rope.shape[0]:
+        raise ValueError(
+            "RoPE position count must match token count, got "
+            f"{pos_ids.shape[0]} positions for {rope.shape[0]} tokens"
+        )
+    if pos_ids.device != cos_sin_cache.device or pos_ids.dtype != torch.int64:
+        pos_ids = pos_ids.to(device=cos_sin_cache.device, dtype=torch.int64)
+    cos_sin = cos_sin_cache.index_select(0, pos_ids)
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    if rope.dim() == 2:
+        return apply_rotary_emb(rope.unsqueeze(1), cos, sin, is_neox).squeeze(1)
+    return apply_rotary_emb(rope, cos, sin, is_neox)
 
 
 def concat_mla_absorb_q_general(q_nope, q_rope):

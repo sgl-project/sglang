@@ -671,6 +671,8 @@ class DeepseekMLAForwardMixin:
                         "is_neox": self.rotary_emb.is_neox_style,
                         "llama_4_scaling": llama_4_scaling,
                     }
+                    if self.current_attention_backend in ("dsa", "nsa"):
+                        extra_args["q_pos_ids"] = positions
                 if fusion_plan is not None:
                     bmm_attention_fn = (
                         bcg_mla_bmm_then_unified_attention
