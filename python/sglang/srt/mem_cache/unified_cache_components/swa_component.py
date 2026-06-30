@@ -628,10 +628,8 @@ class SWAComponent(TreeComponent):
                     nodes.append(cur)
                     n_swa += len(cd.host_value)
                 else:
-                    # FULL-only tombstone: decode SWA tail prealloc restores this
-                    # prefix only before the live SWA window, so there is no SWA
-                    # chunk to load for this range.
-                    n_swa += len(cur.key)
+                    # FULL-only tombstones mark the SWA eviction boundary.
+                    break
                 cur = cur.parent
 
             if not backed_up:

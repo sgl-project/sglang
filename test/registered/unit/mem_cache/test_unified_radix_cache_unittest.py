@@ -3861,9 +3861,14 @@ class UnifiedRadixCacheSuite:
         return tree, chain, n, y, x, tokens
 
     def test_hicache_swa_load_back_anchored_on_best_match_node(self):
-        tree, _, _, y, x, _ = self._swa_anchor_setup()
+        tree, _, n, y, x, _ = self._swa_anchor_setup()
         ps = self.cfg.page_size
         swa_comp = tree.components[ComponentType.SWA]
+
+        # A host-only ancestor before N must not load across the tombstone.
+        older_cd = n.parent.component_data[ComponentType.SWA]
+        self.assertIsNotNone(older_cd.host_value)
+        older_cd.value = None
 
         transfers = swa_comp.build_hicache_transfers(x, CacheTransferPhase.LOAD_BACK)
         self.assertEqual(len(transfers), 1)
