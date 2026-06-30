@@ -6318,8 +6318,7 @@ class ServerArgs:
         if not self.enable_shared_kv_pool:
             return
         assert self.disaggregation_mode == "null", (
-            "--enable-shared-kv-pool is not yet compatible with PD "
-            "disaggregation."
+            "--enable-shared-kv-pool is not yet compatible with PD " "disaggregation."
         )
         assert self.speculative_algorithm is None, (
             "--enable-shared-kv-pool is not yet compatible with speculative "

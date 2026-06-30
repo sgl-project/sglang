@@ -15,7 +15,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 # ---------------------------------------------------------------------------
 # translate_kv_indices_inplace — fused, GPU-bounded, in-place virtual->physical
 # translate of a shared-KV-pool attention index buffer. Used to CAPTURE
@@ -151,9 +150,9 @@ def translate_kv_indices_inplace(
         f"translate_kv_indices_inplace: kv_indices/src must be 1-D, got "
         f"{tuple(kv_indices.shape)}/{tuple(src.shape)}"
     )
-    assert v2p.dtype == torch.int64, (
-        f"translate_kv_indices_inplace: v2p must be int64, got {v2p.dtype}"
-    )
+    assert (
+        v2p.dtype == torch.int64
+    ), f"translate_kv_indices_inplace: v2p must be int64, got {v2p.dtype}"
     if kv_indices.numel() == 0:
         return
     grid = (num_programs,)
@@ -197,14 +196,14 @@ def translate_kv_indices_inplace(
 
 @triton.jit
 def alloc_bind_inplace_kernel(
-    v_pages_ptr,             # in: [N] int64 — virtual page ids
-    v2p_ptr,                 # in/out: int64 — virtual_to_physical table
-    p2v_ptr,                 # in/out: int64 — physical_to_virtual table
-    out_phys_ptr,            # out: [N] int64 — physical page ids
-    N,                       # runtime: number of pages to allocate
-    start_phys,              # runtime: lowest physical page id in the
-                             # newly-allocated range (caller computes
-                             # based on grow direction)
+    v_pages_ptr,  # in: [N] int64 — virtual page ids
+    v2p_ptr,  # in/out: int64 — virtual_to_physical table
+    p2v_ptr,  # in/out: int64 — physical_to_virtual table
+    out_phys_ptr,  # out: [N] int64 — physical page ids
+    N,  # runtime: number of pages to allocate
+    start_phys,  # runtime: lowest physical page id in the
+    # newly-allocated range (caller computes
+    # based on grow direction)
     BLOCK: tl.constexpr,
 ):
     """Token-parallel fused write: ascending arange + v2p scatter + p2v scatter.

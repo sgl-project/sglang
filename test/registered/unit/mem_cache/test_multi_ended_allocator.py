@@ -16,6 +16,7 @@ import unittest
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.multi_ended_allocator import (
     MultiEndedAllocator,
     SharedSWATokenToKVPoolAllocator,
@@ -25,7 +26,6 @@ from sglang.srt.mem_cache.shared_kv_pool import (
     MHASubPoolSpec,
     SharedKVPool,
 )
-from sglang.srt.environ import envs
 
 _DEV = "cpu"
 
@@ -2369,7 +2369,7 @@ class TestLazyCompaction(unittest.TestCase):
         # set must also be updated.
         # (Simulates a prior compaction whose event hasn't fired.)
         p = int(fa.virtual_to_physical[int(a[2].item())].item())
-        # Clear v2p/p2v so post-drain re-use is safe.
+        # Clear v2p/p2v so post-drain reuse is safe.
         fa.virtual_to_physical[int(a[2].item())] = -1
         fa.physical_to_virtual[p] = -1
         ev = _FakeEvent()

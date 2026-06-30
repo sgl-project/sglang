@@ -358,9 +358,9 @@ class ModelRunnerKVCacheMixin:
 
         config = self.mambaish_config
         assert config is not None
-        assert not self.use_mla_backend, (
-            "shared KV pool does not support MLA-hybrid-Mamba yet"
-        )
+        assert (
+            not self.use_mla_backend
+        ), "shared KV pool does not support MLA-hybrid-Mamba yet"
         # The full sub-pool is page-aware (via `MultiEndedAllocator(page_size=...)`);
         # the mamba sub-pool stays page=1.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
@@ -429,17 +429,15 @@ class ModelRunnerKVCacheMixin:
         the allocator."""
         from sglang.srt.mem_cache.shared_kv_pool import init_shared_swa_pools
 
-        assert self.is_hybrid_swa, (
-            "_init_shared_swa_pools called on a non-SWA model"
-        )
+        assert self.is_hybrid_swa, "_init_shared_swa_pools called on a non-SWA model"
         # Both sub-pools are page-aware; the SWA composite runs
         # `alloc_extend_kernel` once in virtual space and binds the new
         # virtual pages on both sub-allocators (see
         # SharedSWATokenToKVPoolAllocator.alloc_extend).
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
-        assert not self.use_mla_backend, (
-            "shared KV pool does not support MLA-SWA hybrid yet"
-        )
+        assert (
+            not self.use_mla_backend
+        ), "shared KV pool does not support MLA-SWA hybrid yet"
         # Mirror the non-shared path's extra_max_context_len computation.
         extra_max_context_len = 4
         if self.server_args.speculative_num_draft_tokens is not None:

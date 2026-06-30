@@ -679,7 +679,9 @@ class PrefillAdder:
         self.rem_total_token_offset += (
             extend_input_len + max_new_tokens + page_overhead + mamba_gap_reserve
         )
-        self.cur_rem_token_offset += extend_input_len + page_overhead + mamba_gap_reserve
+        self.cur_rem_token_offset += (
+            extend_input_len + page_overhead + mamba_gap_reserve
+        )
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:
@@ -936,12 +938,12 @@ class PrefillAdder:
             self.can_run_list.append(req)
             self.new_chunked_req = req
             self._update_prefill_budget(
-            0,
-            trunc_len,
-            0,
-            req.retracted_stain,
-            mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-        )
+                0,
+                trunc_len,
+                0,
+                req.retracted_stain,
+                mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            )
 
         return self.budget_state()
 
