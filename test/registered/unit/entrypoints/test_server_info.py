@@ -321,5 +321,59 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
         json.dumps(info)
 
 
+class TestServerInfoRedactsSecrets(CustomTestCase):
+    """`/server_info` must never disclose configured secrets.
+
+    The handler spreads `server_args.to_dict_redacted()` into the response,
+    so the configured `api_key`, `admin_api_key`, and `ssl_keyfile_password`
+    are masked. The keys stay present (existing consumers and
+    `test_every_server_args_field_appears_in_response` rely on that), but the
+    secret value is replaced with a placeholder.
+    """
+
+    SECRET_FIELDS = ("api_key", "admin_api_key", "ssl_keyfile_password")
+
+    def test_configured_secrets_are_masked(self):
+        args = ServerArgs(
+            model_path="dummy",
+            api_key="sk-normal-secret",
+            admin_api_key="sk-admin-secret",
+            ssl_keyfile_password="tls-password",
+        )
+
+        info = _call_server_info_with(args)
+
+        for field in self.SECRET_FIELDS:
+            self.assertIn(field, info)  # key preserved
+            self.assertEqual(
+                info[field],
+                "[REDACTED]",
+                f"secret field '{field}' must be masked in /server_info",
+            )
+        # The raw secret value must not appear anywhere in the response.
+        serialized = json.dumps(info)
+        for secret in ("sk-normal-secret", "sk-admin-secret", "tls-password"):
+            self.assertNotIn(secret, serialized)
+
+    def test_unset_secrets_stay_none(self):
+        # Masking only fires for configured secrets, so consumers can still
+        # tell "no key configured" (None) apart from "configured but hidden".
+        args = ServerArgs(model_path="dummy")
+
+        info = _call_server_info_with(args)
+
+        for field in self.SECRET_FIELDS:
+            self.assertIn(field, info)
+            self.assertIsNone(info[field])
+
+    def test_non_secret_fields_are_untouched(self):
+        args = ServerArgs(model_path="dummy", api_key="sk-secret", port=31234)
+
+        info = _call_server_info_with(args)
+
+        self.assertEqual(info["model_path"], "dummy")
+        self.assertEqual(info["port"], 31234)
+
+
 if __name__ == "__main__":
     unittest.main()

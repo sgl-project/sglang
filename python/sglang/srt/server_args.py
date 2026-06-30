@@ -7399,6 +7399,22 @@ class ServerArgs:
         else:
             return False
 
+    def to_dict_redacted(self) -> dict:
+        """Return ``dataclasses.asdict(self)`` with secret fields masked.
+
+        The server-info surfaces (HTTP ``/server_info``, the gRPC bridge, and
+        the Engine API) serialize ``ServerArgs`` straight back to callers, which
+        would otherwise disclose the configured API/admin keys and the SSL key
+        password. Mask those before serialization. Masking (rather than
+        dropping) keeps the ``None`` vs configured distinction visible without
+        leaking the secret value itself.
+        """
+        redacted = dataclasses.asdict(self)
+        for field in ("api_key", "admin_api_key", "ssl_keyfile_password"):
+            if redacted.get(field) is not None:
+                redacted[field] = "[REDACTED]"
+        return redacted
+
     def describe_kv_events_publisher(self) -> Optional[dict]:
         """Return a structured description of this server's KV-event
         publisher, or `None` if publishing is disabled / misconfigured.

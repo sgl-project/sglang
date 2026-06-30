@@ -1001,7 +1001,7 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         return msgspec_to_builtins(
             {
-                **dataclasses.asdict(self.tokenizer_manager.server_args),
+                **self.tokenizer_manager.server_args.to_dict_redacted(),
                 **self._scheduler_init_result.scheduler_infos[0],
                 "internal_states": internal_states,
                 "version": __version__,
