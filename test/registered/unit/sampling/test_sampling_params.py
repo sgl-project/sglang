@@ -305,8 +305,28 @@ class TestSamplingParamsVerify(CustomTestCase):
         with self.assertRaises(ValueError):
             self._make(stop=["ok", ""]).verify(self.VOCAB_SIZE)
 
+    def test_invalid_stop_type_raises(self):
+        with self.assertRaises(ValueError):
+            self._make(stop=["ok", 1]).verify(self.VOCAB_SIZE)
+
     def test_non_empty_stop_is_valid(self):
         self._make(stop=["</s>"]).verify(self.VOCAB_SIZE)
+
+    # --- stop_regex ---
+    def test_empty_stop_regex_string_raises(self):
+        with self.assertRaises(ValueError):
+            self._make(stop_regex="").verify(self.VOCAB_SIZE)
+
+    def test_empty_stop_regex_in_list_raises(self):
+        with self.assertRaises(ValueError):
+            self._make(stop_regex=["ok", ""]).verify(self.VOCAB_SIZE)
+
+    def test_invalid_stop_regex_type_raises(self):
+        with self.assertRaises(ValueError):
+            self._make(stop_regex=[r"\d+", 1]).verify(self.VOCAB_SIZE)
+
+    def test_non_empty_stop_regex_is_valid(self):
+        self._make(stop_regex=[r"\d+"]).verify(self.VOCAB_SIZE)
 
 
 class TestSamplingParamsNormalize(CustomTestCase):

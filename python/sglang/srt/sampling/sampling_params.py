@@ -224,12 +224,19 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
                     )
-        if self.stop_strs is not None:
-            stop_strs = (
-                [self.stop_strs] if isinstance(self.stop_strs, str) else self.stop_strs
-            )
-            if any(s == "" for s in stop_strs):
-                raise ValueError("stop cannot contain an empty string.")
+        for name, values in (
+            ("stop", self.stop_strs),
+            ("stop_regex", self.stop_regex_strs),
+        ):
+            if values is None:
+                continue
+            values = [values] if isinstance(values, str) else values
+            if not isinstance(values, list):
+                raise ValueError(f"{name} must be a string or a list of strings.")
+            if not all(isinstance(s, str) for s in values):
+                raise ValueError(f"{name} must be a string or a list of strings.")
+            if any(s == "" for s in values):
+                raise ValueError(f"{name} cannot contain an empty string.")
 
         grammars = [
             self.json_schema,
