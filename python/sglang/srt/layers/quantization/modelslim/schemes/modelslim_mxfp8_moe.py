@@ -7,6 +7,9 @@ import torch
 
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimMoEScheme
 from sglang.srt.utils import set_weight_attrs
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUW8A8Mxfp8MoEMethod,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +33,10 @@ class ModelSlimW8A8Mxfp8MoE(ModelSlimMoEScheme):
         weight_prefix: str,  # "w13" or "w2"
         group_size: int = 0,
     ) -> None:
+        if group_size == 0:
+            group_size = quant_config.quant_description.get("group_size", 32)
         self.quant_config = quant_config
-        # Kernel that will process the weights (transpose, reshape scales)
-        from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
-            NPUW8A8Mxfp8MoEMethod,
-        )
-        self.kernel = NPUW8A8Mxfp8MoEMethod()
+        self.kernel = NPUW8A8Mxfp8MoEMethod(group_size=group_size)
         self.weight_prefix = weight_prefix
         self.group_size = group_size
 
