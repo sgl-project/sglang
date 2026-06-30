@@ -847,18 +847,13 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
 
-                try:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                    else:
-                        continue
-
-                except KeyError:
-                    print(params_dict.keys())
-                    raise
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name in params_dict.keys():
+                    param = params_dict[name]
+                else:
+                    continue
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
