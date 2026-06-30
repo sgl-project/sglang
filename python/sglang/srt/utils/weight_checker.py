@@ -64,8 +64,6 @@ class WeightChecker:
             return self._compare()
         elif action == "checksum":
             return self._compute_checksum()
-        elif action == "lora_checksum":
-            return self._compute_lora_checksum()
         else:
             raise Exception(f"Unsupported {action=}")
 
@@ -141,41 +139,6 @@ class WeightChecker:
         )
         return info.model_dump()
 
-    def _compute_lora_checksum(self) -> Dict:
-        """LoRA-only checksum: hash just the adapter weights (lora_cpu::/lora_gpu::),
-        skipping the base model.
-
-        Same pipeline as `checksum` (_postprocess_tensors + _hash_tensor, i.e. the GPU
-        triton gpu_tensor_hash), but independent of the base-model hash. Use when the
-        base hash is unavailable or IMAs (gpu_tensor_hash currently hits an
-        illegal-memory-access on some GLM base tensors), or when only the LoRA
-        train<->rollout sync needs verifying. Hashing the LoRA buffers themselves on
-        GPU is fine (verified on GLM MoE/MLA), so this stays on the real serving path.
-        """
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        raw = self._lora_named_tensors()
-        checksums = {
-            name: _hash_resilient(tensor.data)
-            for name, should_compare, tensor in _postprocess_tensors(raw, set())
-            if should_compare
-        }
-        h = hashlib.sha256()
-        for name in sorted(checksums):
-            h.update(name.encode())
-            h.update(checksums[name].encode())
-        overall = h.hexdigest()
-        torch.cuda.synchronize()
-        logger.info(
-            f"[WeightChecker] lora_checksum: {len(checksums)} LoRA tensors "
-            f"in {time.perf_counter() - start:.3f}s"
-        )
-        return ChecksumInfo(
-            checksums=checksums,
-            per_gpu_checksum=overall,
-            parallelism_info=self._parallelism_info(),
-        ).model_dump()
-
     def _parallelism_info(self) -> ParallelismInfo:
         mr = self._model_runner
         return ParallelismInfo(
@@ -193,109 +156,9 @@ class WeightChecker:
         yield from self._model_runner.model.named_parameters()
         yield from self._model_runner.model.named_buffers()
 
-    def _lora_named_tensors(self) -> Dict[str, torch.Tensor]:
-        """LoRA adapter tensors held by THIS rollout engine, folded into `checksum`.
-
-        LoRA weights are not in model.named_parameters(); they live in
-        ``model_runner.lora_manager``. Returns two views, keyed by the STABLE
-        ``lora_name`` (not the per-load uuid) so checksums line up across steps and
-        ranks:
-          ``lora_cpu::{name}::...`` — the delivered CPU adapter (lora_manager.loras)
-          ``lora_gpu::{name}::...`` — the served GPU buffer slice the forward reads
-                                      (memory_pool; only the resident adapter has one)
-
-        Covers every module family — per-layer attn / MLP / MoE / MLA / DSA-indexer
-        AND the separate embedding / lm_head / added-token stores. Fully defensive:
-        returns ``{}`` if LoRA is disabled or internals are missing/renamed, and
-        never raises (a serving engine must not crash on a checksum request).
-
-        Note: GPU buffers are fused / zero-padded to max_lora_rank, so a
-        ``lora_gpu::`` hash does not byte-equal the matching ``lora_cpu::`` one; the
-        views are for cross-step (stale-buffer) and cross-rank (consistency) checks.
-        """
-        out: Dict[str, torch.Tensor] = {}
-        lm = getattr(self._model_runner, "lora_manager", None)
-        if lm is None:
-            return out
-        try:
-            loras = getattr(lm, "loras", {}) or {}
-            lora_refs = getattr(lm, "lora_refs", {}) or {}
-            pool = getattr(lm, "memory_pool", None)
-            for uid, adapter in loras.items():
-                ref = lora_refs.get(uid)
-                name = getattr(ref, "lora_name", None) or str(uid)[:8]
-
-                # (1) delivered CPU adapter --------------------------------------
-                for li, layer in enumerate(getattr(adapter, "layers", []) or []):
-                    for wname, t in (getattr(layer, "weights", {}) or {}).items():
-                        if isinstance(t, torch.Tensor):
-                            out[f"lora_cpu::{name}::L{li}::{wname}"] = t
-                for store, tag in (
-                    (getattr(adapter, "embedding_layers", {}), "embed"),
-                    (getattr(adapter, "added_tokens_embeddings", {}), "added_tokens"),
-                ):
-                    for wname, t in (store or {}).items():
-                        if isinstance(t, torch.Tensor):
-                            out[f"lora_cpu::{name}::{tag}::{wname}"] = t
-
-                # (2) served GPU buffer slice (resident adapter only) ------------
-                if pool is None:
-                    continue
-                bid = getattr(pool, "uid_to_buffer_id", {}).get(uid)
-                if bid is None:
-                    continue
-                # per-layer A/B buffers: Dict[module -> List[per-layer tensor]]
-                for ab, buf_dict in (
-                    ("A", getattr(pool, "A_buffer", {})),
-                    ("B", getattr(pool, "B_buffer", {})),
-                ):
-                    for module, per_layer in (buf_dict or {}).items():
-                        for li, buf in enumerate(per_layer):
-                            try:
-                                out[f"lora_gpu::{name}::{module}::{ab}::L{li}"] = buf[bid]
-                            except Exception:
-                                pass
-                # single-tensor embedding / lm_head / added-token buffers
-                for buf_attr, tag in (
-                    ("embedding_A_buffer", "embedA"),
-                    ("embedding_B_buffer", "embedB"),
-                    ("lm_head_A_buffer", "lmheadA"),
-                    ("lm_head_B_buffer", "lmheadB"),
-                    ("new_embeddings_buffer", "newemb"),
-                ):
-                    for module, buf in (getattr(pool, buf_attr, {}) or {}).items():
-                        try:
-                            out[f"lora_gpu::{name}::{module}::{tag}"] = buf[bid]
-                        except Exception:
-                            pass
-        except Exception as e:
-            logger.warning(f"[WeightChecker] _lora_named_tensors skipped: {e}")
-        return out
-
 
 def _hash_tensor(t: torch.Tensor) -> str:
     return f"{tensor_hash(t):016x}"
-
-
-def _hash_resilient(t: torch.Tensor) -> str:
-    """Hash on the GPU triton path (tensor_hash -> gpu_tensor_hash for cuda tensors),
-    i.e. the SAME path real serving uses; fall back to a CPU hashlib hash only if the
-    GPU hash raises a RECOVERABLE exception.
-
-    Caveat: a CUDA illegal-memory-access (IMA) is NOT recoverable — it corrupts the
-    context, so the CPU fallback (and everything else) fails too; this wrapper cannot
-    save an IMA, only clean exceptions. LoRA-buffer GPU hashing is verified not to IMA
-    on GLM MoE/MLA, so for the LoRA checksum the GPU path always succeeds and the
-    fallback never triggers — it is belt-and-suspenders for other models / edge cases.
-    """
-    try:
-        return _hash_tensor(t)
-    except Exception as e:
-        logger.warning(
-            "[WeightChecker] GPU hash failed (%s: %s); falling back to CPU hashlib",
-            type(e).__name__, e,
-        )
-        return _hash_tensor(t.detach().to("cpu").contiguous())
 
 
 def _check_tensors(
