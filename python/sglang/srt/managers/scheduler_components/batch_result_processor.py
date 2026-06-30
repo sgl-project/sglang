@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -14,6 +15,10 @@ from typing import (
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_pipeline_model_parallel_rank,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import AbortReq
@@ -810,6 +815,26 @@ class SchedulerBatchResultProcessor:
                 req.multimodal_inputs.release_features()
             self._maybe_collect_routed_experts(req)
             self._maybe_collect_indexer_topk(req)
+
+            if self.server_args.dump_kv_path:
+                req.offload_kv_cache(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
+                )
+
+                pp_rank =  get_pipeline_model_parallel_rank()
+                tp_rank =  get_tensor_model_parallel_rank()
+                req_path = Path(f"{self.server_args.dump_kv_path}/tp_{tp_rank}_pp_{pp_rank}")
+                req_path.mkdir(parents=True, exist_ok=True)
+                for (lid, token_chunk) in enumerate(req.kv_cache_cpu):
+                    for (tid, (k_chunk, v_chunk)) in enumerate(token_chunk):
+                        torch.save(
+                            k_chunk,
+                            req_path / f"{req.rid}-K-chunk_{tid}-layer_{lid}.bin"
+                        )
+                        torch.save(
+                            v_chunk,
+                            req_path / f"{req.rid}-V-chunk_{tid}-layer_{lid}.bin"
+                        )
 
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
