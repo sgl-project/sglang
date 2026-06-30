@@ -2377,6 +2377,29 @@ class ServerArgs:
         int,
         "Number of optimistic prefill retries that will skip the bootstrap wait. ",
     ] = 0
+    enable_disagg_layer_pipeline: A[
+        bool,
+        "Enable layer-group KV cache transfer for PD disaggregation.",
+    ] = False
+    disagg_layer_group_size: A[
+        int,
+        "Number of layers per disaggregated KV transfer group. 0 disables grouping.",
+    ] = 4
+    disagg_layer_pipeline_min_prefill_len: A[
+        int,
+        "Minimum prefill request total length in tokens required to use layer-group disaggregated KV transfer.",
+    ] = 2048
+    enable_disagg_draft_layout_validation: A[
+        bool,
+        "Validate and reorder draft KV layout across prefill/decode. Forced on when layer pipeline is enabled.",
+    ] = False
+    disaggregation_cp_transfer_shard_mode: A[
+        str,
+        Arg(
+            help="Per-CP-rank shard mode for KV transfer. 'layer' is only valid with NSA CP and SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1.",
+            choices=["page", "layer"],
+        ),
+    ] = "page"
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation
