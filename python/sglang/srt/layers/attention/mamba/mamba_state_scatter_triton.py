@@ -43,9 +43,13 @@ def track_mamba_state_if_needed_kernel(
     if not track_mask:
         return
 
-    # Load source and destination indices
-    src_idx = tl.load(cache_indices_ptr + batch_idx)
-    dst_idx = tl.load(mamba_track_indices_ptr + batch_idx)
+    # Cast indices to int64 before they multiply the row stride. The
+    # page-granularity envelope layout makes the conv/ssm row stride large
+    # (stride_0 = entry_bytes / itemsize), so an int32 `idx * stride_0` can
+    # overflow for moderately large idx and wrap to an illegal address. int64 is
+    # harmless for the small-stride (per-layer) case.
+    src_idx = tl.load(cache_indices_ptr + batch_idx).to(tl.int64)
+    dst_idx = tl.load(mamba_track_indices_ptr + batch_idx).to(tl.int64)
 
     # Copy conv_states
     # Each thread handles BLOCK_SIZE elements
