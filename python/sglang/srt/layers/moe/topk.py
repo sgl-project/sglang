@@ -24,6 +24,7 @@ from typing import (
     NamedTuple,
     Optional,
     Protocol,
+    Tuple,
     TypeGuard,
     runtime_checkable,
 )
@@ -177,11 +178,6 @@ if _is_cuda:
 
     except ImportError:
         fused_topk_deepseek = None
-
-    try:
-        from sgl_kernel import kimi_k2_moe_fused_gate
-    except ImportError as e:
-        pass
 
 if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel import topk_softmax
@@ -1054,7 +1050,7 @@ def biased_topk_jit_kernel_impl(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     if _use_aiter and scoring_func == "sqrtsoftplus" and num_fused_shared_experts == 0:
@@ -1382,8 +1378,7 @@ def biased_grouped_topk_gpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
-):
-
+) -> Tuple[torch.Tensor, torch.Tensor]:
     num_tokens = gating_output.shape[0]
     num_experts = gating_output.shape[1]
     experts_per_group = (
@@ -1500,8 +1495,8 @@ def biased_grouped_topk_gpu(
             True,
             apply_routed_scaling_factor_on_output,
         )
+        return topk_weights, topk_ids
     else:
-        # Use optimized path for Kimi K2 (384 experts with num_expert_group=1)
         num_experts = gating_output.shape[1]
         if _is_cuda and num_experts == 384 and num_expert_group == 1:
             # ===== TO BE REFACTORED ====
@@ -1528,12 +1523,18 @@ def biased_grouped_topk_gpu(
                     apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 )
             # ===== END TO BE REFACTORED ====
-            return kimi_k2_moe_fused_gate(
+            from sglang.jit_kernel.moe_fused_gate import moe_fused_gate as jit_gate
+
+            return jit_gate(
                 gating_output.to(dtype=torch.float32),
                 correction_bias,
                 topk=topk,
+                scoring_func="sigmoid",
+                num_fused_shared_experts=num_fused_shared_experts,
                 renormalize=renormalize,
-                routed_scaling_factor=routed_scaling_factor,
+                routed_scaling_factor=(
+                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
+                ),
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
         elif (
