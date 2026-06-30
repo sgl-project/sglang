@@ -248,6 +248,17 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertFalse(request.chat_template_kwargs.get("thinking"))
         self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
 
+    def test_chat_completion_reasoning_effort_none_overrides_enabled(self):
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning={"enabled": True, "effort": "none"},
+        )
+        self.assertEqual(request.reasoning_effort, "none")
+        self.assertFalse(request.chat_template_kwargs.get("thinking"))
+        self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
+
     def test_chat_completion_reasoning_effort_max(self):
         """`max` is an sglang extension on chat completion's top-level
         `reasoning_effort` only; the Responses-API-style nested
