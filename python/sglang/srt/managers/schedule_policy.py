@@ -520,6 +520,24 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.mamba_slot_full_token_cost()
             )
 
+        # The `mamba_gap_reserve` above is charged to `rem_total_tokens`, which
+        # INCLUDES `full_evictable_size()` — so admission could let full-attn
+        # evictable bytes "cover" a new mamba slot. But `alloc_req_slots` can only
+        # recover MAMBA-side bytes for a mamba slot: the shared gap + peer-
+        # compaction holes (`mamba_allocator.schedulable_available_size()`) plus
+        # mamba-evictable radix entries (`tree_cache.mamba_evictable_size()`) — NOT
+        # full evictable bytes (its eviction asks only for `mamba_num`). So gate
+        # new mamba slots on this mamba-recoverable budget too; otherwise an
+        # over-admit hits the fail-loud `RuntimeError` in `alloc_req_slots`. `None`
+        # (no extra gate) outside the unified Mamba pool.
+        self.rem_mamba_slots = None
+        if self._mamba_slot_cost:
+            self.rem_mamba_slots = (
+                self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
+            )
+            if self.is_hybrid_ssm_cache:
+                self.rem_mamba_slots += self.tree_cache.mamba_evictable_size()
+
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
         )
@@ -659,6 +677,12 @@ class PrefillAdder:
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
         if not no_token and self.is_hybrid_swa:
             no_token = self.rem_swa_tokens <= 0
+        # A new mamba slot needs mamba-recoverable bytes (shared gap + peer holes +
+        # mamba-evictable), which EXCLUDE full_evictable — gate it separately so
+        # rem_total_tokens' full_evictable can't admit a mamba slot the alloc
+        # can't realize (see __init__).
+        if not no_token and self.rem_mamba_slots is not None:
+            no_token = self.rem_mamba_slots <= 0
         if no_token:
             return AddReqResult.NO_TOKEN
 
@@ -699,6 +723,11 @@ class PrefillAdder:
         self.cur_rem_token_offset += (
             extend_input_len + page_overhead + mamba_gap_reserve
         )
+        # A new mamba slot (`mamba_gap_reserve > 0`) consumes one mamba-recoverable
+        # slot — gated separately from rem_total_tokens so full_evictable can't
+        # cover it (see __init__).
+        if mamba_gap_reserve and self.rem_mamba_slots is not None:
+            self.rem_mamba_slots -= 1
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:
