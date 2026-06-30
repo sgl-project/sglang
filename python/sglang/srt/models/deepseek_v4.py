@@ -1885,17 +1885,19 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         comm = get_dp_tbo_comm_stream()
         compute = torch.cuda.current_stream()
-        local.record_stream(comm)
-        global_hidden.record_stream(comm)
         with torch.cuda.stream(comm):
             comm.wait_stream(compute)
             dp_gather_partial(global_hidden, local, fb)
             state.gather_event = _tbo_event(("gather", sub))
             state.gather_event.record(comm)
+        state.gather_keepalive = local
         state.global_hidden = global_hidden
 
     def op_gather_b(self, state):
         torch.cuda.current_stream().wait_event(state.pop("gather_event"))
+        # Compute now ordered after the gather -> the gather input is safe to
+        # release (freed on the compute stream, no record_stream deferral).
+        state.pop("gather_keepalive")
 
     def op_moe(self, state):
         # MoE (gate/topk/experts) on the GLOBAL gathered buffer. use_reduce_scatter
@@ -1930,9 +1932,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             event_key=("combine", state.tbo_subbatch_index),
         )
         state.local_out = local_out
+        # Keep the (variable-size) MoE output alive until op_combine_b waits on
+        # the combine event (replaces record_stream; avoids reserved churn).
+        state.combine_keepalive = global_out
 
     def op_combine_b(self, state):
         torch.cuda.current_stream().wait_event(state.pop("combine_event"))
+        state.pop("combine_keepalive")
         hidden = state.pop("local_out")
         shared_local = state.pop("shared_local")
         state.pop("do_shared_local")

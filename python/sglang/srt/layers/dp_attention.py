@@ -789,8 +789,6 @@ def dp_reduce_scatterv_async(
     Matches the gatherv (SUM_LEN) path."""
     comm = get_dp_tbo_comm_stream()
     compute = torch.cuda.current_stream()
-    global_tokens.record_stream(comm)
-    output_local.record_stream(comm)
     ev = _tbo_event(event_key)
     with torch.cuda.stream(comm):
         comm.wait_stream(compute)
