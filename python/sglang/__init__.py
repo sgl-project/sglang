@@ -114,3 +114,34 @@ __all__ = [
     "global_config",
     "__version__",
 ]
+
+# Mixture-of-LoRA route-decode patch.
+# Enabled by default on this branch. Set SGLANG_DISABLE_MOL_PATCH=1 to import
+# plain SGLang without installing the runtime route/KV-reuse hooks.
+try:
+    import os as _mol_os
+
+    if _mol_os.environ.get("SGLANG_DISABLE_MOL_PATCH", "") not in (
+        "1",
+        "true",
+        "True",
+    ):
+        import apply_mol_patch as _apply_mol_patch
+
+        _apply_mol_patch.apply()
+except Exception as _mol_patch_error:
+    import logging as _mol_logging
+
+    _mol_logging.getLogger("mol-patch").warning(
+        "mol-patch: apply failed: %s", _mol_patch_error
+    )
+finally:
+    for _mol_name in (
+        "_mol_os",
+        "_apply_mol_patch",
+        "_mol_patch_error",
+        "_mol_logging",
+        "_mol_name",
+    ):
+        globals().pop(_mol_name, None)
+
