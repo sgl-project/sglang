@@ -194,6 +194,10 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         self.background_tasks: dict[str, asyncio.Task] = {}
 
+    @staticmethod
+    def _has_response_tool(request: ResponsesRequest, *tool_types: str) -> bool:
+        return any(tool.type in tool_types for tool in (request.tools or []))
+
     # error helpers dedicated for v1/responses
     def create_error_response(
         self,
@@ -260,6 +264,17 @@ class OpenAIServingResponses(OpenAIServingChat):
         if request.stream and request.is_include_output_logprobs():
             return self.create_error_response(
                 "logprobs are not supported in streaming mode", param="logprobs"
+            )
+        if (
+            self.use_harmony
+            and self._has_response_tool(request, "web_search", "web_search_preview")
+            and not self.supports_browsing
+        ):
+            return self.create_error_response(
+                "web_search requires a browser backend. Set EXA_API_KEY on the "
+                "SGLang server to enable native Exa-backed web search, or "
+                "configure a browser MCP tool server. Create an Exa API key at "
+                "https://dashboard.exa.ai/api-keys."
             )
 
         # Handle the previous response ID
@@ -432,6 +447,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         sampling_params=sampling_params,
                         stream=request.stream,
                         rid=request.request_id,
+                        session_id=request.session_id,
                         extra_key=self._compute_extra_key(request),
                         # background+stream streams on this connection, so don't detach.
                         background=request.background and not request.stream,
@@ -2487,6 +2503,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 sampling_params=sampling_params,
                 stream=adapted_request.stream,
                 rid=request_id,
+                session_id=adapted_request.session_id,
                 extra_key=adapted_request.extra_key,
                 return_logprob=adapted_request.return_logprob,
                 logprob_start_len=adapted_request.logprob_start_len,

@@ -4,6 +4,8 @@ from fastapi import APIRouter, Request
 
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromTensorCheckerReqInput,
     UpdateWeightFromTensorReqInput,
@@ -36,6 +38,15 @@ async def update_weights_from_disk(request: Request):
     except Exception as e:
         return orjson_response(
             {"success": False, "message": str(e)},
+            status_code=500,
+        )
+
+    if response.output is None:
+        return orjson_response(
+            {
+                "success": False,
+                "message": response.error or "Unknown status",
+            },
             status_code=500,
         )
 
@@ -138,3 +149,51 @@ async def get_weights_checksum(request: Request):
         return orjson_response({"error": str(e)}, status_code=500)
 
     return orjson_response(response.output, status_code=200)
+
+
+@router.post("/release_memory_occupation")
+async def release_memory_occupation():
+    """Release GPU memory occupation (sleep the engine)."""
+    try:
+        response = await async_scheduler_client.forward(
+            ReleaseMemoryOccupationReqInput()
+        )
+    except Exception as e:
+        return orjson_response({"success": False, "message": str(e)}, status_code=500)
+
+    if response.output is None:
+        return orjson_response(
+            {
+                "success": False,
+                "message": response.error or "Unknown status",
+            },
+            status_code=500,
+        )
+
+    payload = response.output
+    success = bool(payload["success"])
+    return orjson_response(payload, status_code=200 if success else 400)
+
+
+@router.post("/resume_memory_occupation")
+async def resume_memory_occupation():
+    """Resume GPU memory occupation (wake the engine)."""
+    try:
+        response = await async_scheduler_client.forward(
+            ResumeMemoryOccupationReqInput()
+        )
+    except Exception as e:
+        return orjson_response({"success": False, "message": str(e)}, status_code=500)
+
+    if response.output is None:
+        return orjson_response(
+            {
+                "success": False,
+                "message": response.error or "Unknown status",
+            },
+            status_code=500,
+        )
+
+    payload = response.output
+    success = bool(payload["success"])
+    return orjson_response(payload, status_code=200 if success else 400)
