@@ -731,11 +731,12 @@ class DeepseekSparseAttnBackend(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
             )
         elif forward_batch.forward_mode.is_draft_extend_v2():
+            # Only assert the fields this branch uses; extend_prefix_lens_cpu is
+            # read in the is_extend() branch and is None on the gpu_only path.
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens is not None
-                and forward_batch.extend_prefix_lens_cpu is not None
-            ), "All of them must not be None"
+            ), "extend_seq_lens(_cpu) must not be None for draft_extend_v2"
 
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             assert forward_batch.extend_seq_lens is not None
