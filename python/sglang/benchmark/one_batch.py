@@ -421,6 +421,13 @@ def prepare_synthetic_inputs_for_latency_test(
 
     reqs = []
     for i in range(len(input_ids)):
+        if custom_inputs:
+            if len(input_ids[i]) > input_len:
+                input_ids[i] = input_ids[i][:input_len]
+            else:
+                ratio = (len(input_ids[i]) + input_len - 1) // len(input_ids[i])
+                input_ids[i] = (input_ids[i] * ratio)[:input_len]
+
         req = Req(
             rid=i,
             origin_input_text="",
