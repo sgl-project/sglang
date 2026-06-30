@@ -220,6 +220,51 @@ class TestNormalizeBaseUrl(CustomTestCase):
             url = normalize_base_url("http://myhost", 9000)
         self.assertEqual(url, "http://myhost:9000")
 
+    def test_deprecated_scheme_preserves_existing_port(self):
+        """normalize_base_url should not append a second port to URLs."""
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            url = normalize_base_url("http://myhost:1234", 9000)
+        self.assertEqual(url, "http://myhost:1234")
+
+    def test_deprecated_scheme_inserts_port_before_path(self):
+        """normalize_base_url should add the port to netloc, not the path."""
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            url = normalize_base_url("https://myhost/v1", 9000)
+        self.assertEqual(url, "https://myhost:9000/v1")
+
+    def test_deprecated_scheme_replaces_empty_port_separator(self):
+        """normalize_base_url should not leave an empty port separator."""
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            url = normalize_base_url("http://myhost:/v1", 9000)
+        self.assertEqual(url, "http://myhost:9000/v1")
+
+    def test_deprecated_scheme_preserves_invalid_port(self):
+        """normalize_base_url should keep invalid URL ports on deprecated input."""
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            url = normalize_base_url("http://myhost:abc/v1", 9000)
+        self.assertEqual(url, "http://myhost:abc/v1")
+
+    def test_deprecated_scheme_preserves_unparseable_url(self):
+        """normalize_base_url should keep malformed deprecated URLs."""
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            url = normalize_base_url("http://[", 9000)
+        self.assertEqual(url, "http://[")
+
 
 if __name__ == "__main__":
     unittest.main()

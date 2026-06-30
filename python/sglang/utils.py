@@ -175,6 +175,8 @@ def dump_state_text(filename: str, states: list, mode: str = "w"):
 
 
 def normalize_base_url(host: str, port: int) -> str:
+    from urllib.parse import urlsplit, urlunsplit
+
     from sglang.srt.utils.network import NetworkAddress
 
     if host.startswith("http://") or host.startswith("https://"):
@@ -184,7 +186,15 @@ def normalize_base_url(host: str, port: int) -> str:
             DeprecationWarning,
             stacklevel=2,
         )
-        return f"{host}:{port}"
+        try:
+            parsed = urlsplit(host)
+            has_port = parsed.port is not None
+        except ValueError:
+            return host
+        if has_port:
+            return host
+        netloc = parsed.netloc.removesuffix(":")
+        return urlunsplit(parsed._replace(netloc=f"{netloc}:{port}"))
     return NetworkAddress(host, port).to_url()
 
 
