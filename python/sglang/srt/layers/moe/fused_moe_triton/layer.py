@@ -5,7 +5,6 @@
 import logging
 from enum import Enum
 from functools import cached_property
-from threading import Lock
 from typing import List, Optional, Tuple
 
 import torch
@@ -205,9 +204,10 @@ class FusedMoE(torch.nn.Module):
         self.moe_tp_size = get_parallel().moe_tp_size
         self.moe_tp_rank = get_parallel().moe_tp_rank
 
-        # DeepEP/MegaMOE use one physical shared slot per rank. Other backends
-        # keep the shared expert as a global slot.
-        # AMD/Standard: shared experts are global, slots = num_fused_shared_experts.
+        # For fused shared experts, DeepEP-class and MegaMOE backends use
+        # per-rank physical shared slots, while other backends keep fused
+        # shared experts as global shared slots. When fusion is disabled,
+        # num_fused_shared_experts is 0 and no shared slots are added here.
         if has_per_rank_fused_shared_slots(num_fused_shared_experts):
             num_shared_slots = num_fused_shared_experts * self.moe_ep_size
         else:
@@ -218,8 +218,7 @@ class FusedMoE(torch.nn.Module):
         self._num_local_routed = self._num_global_routed // self.moe_ep_size
         self.num_local_experts = self._num_local_routed + num_fused_shared_experts
         self._has_fused_shared = num_fused_shared_experts > 0
-        self._fp8_shared_to_fp4_lock = Lock()
-        self._fp8_shared_to_fp4_cache: dict[
+        self._fp8_shared_to_fp4_pending: dict[
             tuple[int, str], dict[str, torch.Tensor]
         ] = {}
 
@@ -621,51 +620,50 @@ class FusedMoE(torch.nn.Module):
             return False
 
         key = (expert_id, shard_id)
-        with self._fp8_shared_to_fp4_lock:
-            entry = self._fp8_shared_to_fp4_cache.setdefault(key, {})
-            entry["weight" if is_weight else "scale"] = loaded_weight
-            if "weight" not in entry or "scale" not in entry:
-                return True
-
-            fp8_weight = entry.pop("weight")
-            fp8_scale = entry.pop("scale")
-            if not entry:
-                self._fp8_shared_to_fp4_cache.pop(key, None)
-
-            logging.getLogger(__name__).warning_once(
-                "Loading FP8 shared expert weights into FP4 fused MoE weights. "
-                "The shared expert is quantized at load time and may differ "
-                "slightly from a checkpoint that stores shared experts directly "
-                "in FP4."
-            )
-
-            weight_block_size = getattr(self.quant_config, "weight_block_size", None)
-            if weight_block_size is None:
-                raise ValueError(
-                    "Loading FP8 shared expert weights into FP4 fused MoE weights "
-                    "requires block-FP8 weight_block_size."
-                )
-            fp4_weight, fp4_scale = quantize_block_fp8_weight_to_mxfp4(
-                fp8_weight, fp8_scale, weight_block_size
-            )
-
-            weight_data = weight_param.data[expert_id]
-            scale_data = scale_param.data[expert_id]
-            self._load_model_weight_or_group_weight_scale(
-                shard_dim=shard_dim,
-                expert_data=weight_data,
-                shard_id=shard_id,
-                loaded_weight=fp4_weight,
-                tp_rank=tp_rank,
-            )
-            self._load_model_weight_or_group_weight_scale(
-                shard_dim=shard_dim,
-                expert_data=scale_data,
-                shard_id=shard_id,
-                loaded_weight=fp4_scale,
-                tp_rank=tp_rank,
-            )
+        entry = self._fp8_shared_to_fp4_pending.setdefault(key, {})
+        entry["weight" if is_weight else "scale"] = loaded_weight
+        if "weight" not in entry or "scale" not in entry:
             return True
+
+        fp8_weight = entry.pop("weight")
+        fp8_scale = entry.pop("scale")
+        if not entry:
+            self._fp8_shared_to_fp4_pending.pop(key, None)
+
+        logging.getLogger(__name__).warning_once(
+            "Loading FP8 shared expert weights into FP4 fused MoE weights. "
+            "The shared expert is quantized at load time and may differ "
+            "slightly from a checkpoint that stores shared experts directly "
+            "in FP4."
+        )
+
+        weight_block_size = getattr(self.quant_config, "weight_block_size", None)
+        if weight_block_size is None:
+            raise ValueError(
+                "Loading FP8 shared expert weights into FP4 fused MoE weights "
+                "requires block-FP8 weight_block_size."
+            )
+        fp4_weight, fp4_scale = quantize_block_fp8_weight_to_mxfp4(
+            fp8_weight, fp8_scale, weight_block_size
+        )
+
+        weight_data = weight_param.data[expert_id]
+        scale_data = scale_param.data[expert_id]
+        self._load_model_weight_or_group_weight_scale(
+            shard_dim=shard_dim,
+            expert_data=weight_data,
+            shard_id=shard_id,
+            loaded_weight=fp4_weight,
+            tp_rank=tp_rank,
+        )
+        self._load_model_weight_or_group_weight_scale(
+            shard_dim=shard_dim,
+            expert_data=scale_data,
+            shard_id=shard_id,
+            loaded_weight=fp4_scale,
+            tp_rank=tp_rank,
+        )
+        return True
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
