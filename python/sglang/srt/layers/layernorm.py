@@ -794,7 +794,7 @@ class GemmaRMSNorm(MultiPlatformOp):
             )
             return norm_out, residual
 
-        x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
+        x, _ = add_gemma_rms_norm(x, self.weight, None, self.variance_epsilon)
         return x
 
     def forward_xpu(
