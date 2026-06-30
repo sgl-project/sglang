@@ -2721,9 +2721,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             return
 
         disable_reason = None
-        if get_moe_a2a_backend().is_megamoe():
-            disable_reason = "Config does not support fused shared expert(s)."
-        elif server_args.enforce_shared_experts_fusion:
+        if server_args.enforce_shared_experts_fusion:
             pass
         elif is_sbo_enabled() or is_tbo_enabled():
             disable_reason = "SBO/TBO enabled: incompatible with fusing shared expert into MoE kernel."
