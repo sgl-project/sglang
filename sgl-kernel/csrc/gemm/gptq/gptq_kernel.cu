@@ -246,13 +246,9 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel(
     }
   }
 
-  // Zero output
+  // Output is zeroed on the host (see gptq_gemm); zeroing here would race the
+  // cross-block atomicAdd accumulation
   if (n >= size_n) return;
-
-  if (blockIdx.z == 0) {
-    for (int m = 0; m < m_count; m++)
-      *((uint64_t*)c_.item_ptr(offset_m + m, n)) = 0;
-  }
 
   __syncthreads();
 
@@ -377,13 +373,9 @@ __global__ void gemm_half_q_half_gptq_2bit_kernel(
     }
   }
 
-  // Zero output
+  // Output is zeroed on the host (see gptq_gemm); zeroing here would race the
+  // cross-block atomicAdd accumulation
   if (n >= size_n) return;
-
-  if (blockIdx.z == 0) {
-    for (int m = 0; m < m_count; m++)
-      *((uint64_t*)c_.item_ptr(offset_m + m, n)) = 0;
-  }
 
   __syncthreads();
 
@@ -497,13 +489,9 @@ __global__ void gemm_half_q_half_gptq_3bit_kernel(
     }
   }
 
-  // Zero output
+  // Output is zeroed on the host (see gptq_gemm); zeroing here would race the
+  // cross-block atomicAdd accumulation
   if (n >= size_n) return;
-
-  if (blockIdx.z == 0) {
-    for (int m = 0; m < m_count; m++)
-      *((uint64_t*)c_.item_ptr(offset_m + m, n)) = 0;
-  }
 
   __syncthreads();
 
@@ -620,13 +608,9 @@ __global__ void gemm_half_q_half_gptq_8bit_kernel(
     }
   }
 
-  // Zero output
+  // Output is zeroed on the host (see gptq_gemm); zeroing here would race the
+  // cross-block atomicAdd accumulation
   if (n >= size_n) return;
-
-  if (blockIdx.z == 0) {
-    for (int m = 0; m < m_count; m++)
-      *((uint64_t*)c_.item_ptr(offset_m + m, n)) = 0;
-  }
 
   __syncthreads();
 
@@ -1275,10 +1259,8 @@ __global__ void gemm_half_q_half_alt_4bit_kernel(
     deq2[val][off] = __halves2half2(__int2half_rn(val & 0xF), __int2half_rn(val >> 4));
   }
 
-  if (blockIdx.z == 0) {
-    for (int m = 0; m < b_end; m++)
-      mul[(b + m) * width + w] = __int2half_rn(0);
-  }
+  // Output is zeroed on the host (see gptq_gemm); zeroing here would race the
+  // cross-block atomicAdd accumulation
   __syncthreads();
 
   int i = width * h + w;
@@ -1357,10 +1339,8 @@ __global__ void gemm_half_q_half_alt_8bit_kernel(
     }
   }
 
-  if (blockIdx.z == 0) {
-    for (int m = 0; m < b_end; m++)
-      mul[(b + m) * width + w] = __int2half_rn(0);
-  }
+  // Output is zeroed on the host (see gptq_gemm); zeroing here would race the
+  // cross-block atomicAdd accumulation
   __syncthreads();
 
   int i = width * h + w;
@@ -1918,7 +1898,9 @@ torch::Tensor gptq_gemm(
     int64_t bit) {
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   auto options = torch::TensorOptions().dtype(a.dtype()).device(a.device());
-  at::Tensor c = torch::empty({a.size(0), b_q_weight.size(1)}, options);
+  // Must be zeros, not empty: z-blocks atomicAdd K-slice partials into the same
+  // output element with no cross-block sync, so it must be pre-zeroed
+  at::Tensor c = torch::zeros({a.size(0), b_q_weight.size(1)}, options);
   at::Tensor temp_dq = torch::empty({b_q_weight.size(0) * 32 / bit, b_q_weight.size(1)}, options);
 
   sglang::gptq::gemm_half_q_half_cuda(
