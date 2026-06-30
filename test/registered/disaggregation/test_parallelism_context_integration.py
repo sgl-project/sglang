@@ -90,8 +90,7 @@ def verify_model_params_match_for_rank(
     original_global_server_args = server_args_module._global_server_args
 
     try:
-        # In a Mock ParallelismContext, instantiate the model for this rank.
-        # Use a separate GPU (test_gpu_id) to avoid memory conflicts with the running server.
+        # Dummy load is small enough to colocate with the server on GPU 0.
         server_args_module._global_server_args = server_args
         with ParallelismContext(parallelism_config):
             from sglang.srt.configs.device_config import DeviceConfig
@@ -232,13 +231,11 @@ class TestParallelismContextIntegration:
         model_name, tp_size, extra_args, min_gpus = config
         url = DEFAULT_URL_FOR_TEST
 
-        # Need min_gpus for server + 1 extra GPU for test model instantiation
-        required_gpus = min_gpus + 1
-        if torch.cuda.device_count() < required_gpus:
+        if torch.cuda.device_count() < min_gpus:
             pytest.skip(
-                f"Need at least {required_gpus} GPUs (server={min_gpus} + test=1), have {torch.cuda.device_count()}"
+                f"Need at least {min_gpus} GPUs, have {torch.cuda.device_count()}"
             )
-        test_gpu_id = min_gpus  # e.g., if server uses 0-1, test uses 2
+        test_gpu_id = 0
 
         # Build server args
         other_args = [
