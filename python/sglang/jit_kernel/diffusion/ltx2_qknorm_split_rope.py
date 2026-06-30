@@ -138,6 +138,15 @@ def _supported_side(
     )
 
 
+def _is_sm100_or_newer(x: torch.Tensor) -> bool:
+    if not x.is_cuda:
+        return False
+    try:
+        return torch.cuda.get_device_capability(x.device)[0] >= 10
+    except RuntimeError:
+        return False
+
+
 def can_use_ltx2_qknorm_split_rope_cuda(
     q: torch.Tensor,
     q_cos: torch.Tensor,
@@ -151,20 +160,24 @@ def can_use_ltx2_qknorm_split_rope_cuda(
     num_heads: int,
     head_dim: int,
 ) -> bool:
-    return _supported_side(
-        q,
-        q_cos,
-        q_sin,
-        q_weight,
-        num_heads=num_heads,
-        head_dim=head_dim,
-    ) and _supported_side(
-        k,
-        k_cos,
-        k_sin,
-        k_weight,
-        num_heads=num_heads,
-        head_dim=head_dim,
+    return (
+        _is_sm100_or_newer(q)
+        and _supported_side(
+            q,
+            q_cos,
+            q_sin,
+            q_weight,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+        and _supported_side(
+            k,
+            k_cos,
+            k_sin,
+            k_weight,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
     )
 
 
