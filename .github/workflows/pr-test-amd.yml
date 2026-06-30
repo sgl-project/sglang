@@ -1134,6 +1134,23 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
+      - name: Verify NIXL in Container
+        run: |
+          docker exec ci_sglang bash -lc '
+            set -eux
+            export LD_LIBRARY_PATH=/opt/ucx/lib:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+            python -c "import nixl; print(\"nixl OK:\", nixl.__file__)"
+            test -d /opt/ucx/lib
+            UCX_INFO=$(command -v ucx_info || true)
+            if [ -z "$UCX_INFO" ]; then
+              UCX_INFO=/opt/ucx/bin/ucx_info
+            fi
+            test -x "$UCX_INFO"
+            "$UCX_INFO" -v
+            "$UCX_INFO" -d | grep -iq rocm
+            python -c "from nixl._api import nixl_agent, nixl_agent_config; nixl_agent(\"ci-smoke\", nixl_agent_config(backends=[\"UCX\"])); print(\"nixl UCX backend init OK\")"
+          '
+
       - name: Verify RDMA in Container
         run: |
           docker exec -u root ci_sglang bash -c '
