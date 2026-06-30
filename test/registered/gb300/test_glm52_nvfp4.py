@@ -6,60 +6,62 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-# Runs on both H200 and B200 via nightly-8-gpu-common suite
-register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=7200, suite="nightly-4-gpu-gb300-glm5-nvfp4", nightly=True)
 
-GLM_51_FP8_MODEL_PATH = "zai-org/GLM-5.1-FP8"
+MODEL_PATH = "nvidia/GLM-5.2-NVFP4"
 
 COMMON_ARGS = [
     "--trust-remote-code",
     "--reasoning-parser=glm45",
     "--tool-call-parser=glm47",
-    "--mem-fraction-static=0.85",
+    "--quantization=modelopt_fp4",
+    "--moe-runner-backend=flashinfer_trtllm",
+    "--mem-fraction-static=0.9",
     "--enable-metrics",
 ]
 
-MTP_ARGS = [
+TP_MTP_ARGS = [
     "--speculative-algorithm=EAGLE",
     "--speculative-num-steps=3",
     "--speculative-eagle-topk=1",
     "--speculative-num-draft-tokens=4",
 ]
 
+DP_MTP_ARGS = [
+    "--speculative-algorithm=EAGLE",
+    "--speculative-num-steps=1",
+    "--speculative-eagle-topk=1",
+    "--speculative-num-draft-tokens=2",
+]
 
-class TestGlm51Fp8(unittest.TestCase):
-    """GLM-5.1 FP8 on H200/B200 (8-GPU, tp=8)."""
 
-    def test_glm51_fp8(self):
-        dp_args = ["--dp=8", "--enable-dp-attention"]
+class TestGlm52Nvfp4(unittest.TestCase):
+    """GLM-5.2 NVFP4 on GB300 (4x GB300 NVL4, tp=4)."""
 
+    def test_glm52_nvfp4(self):
         variants = [
             ModelLaunchSettings(
-                GLM_51_FP8_MODEL_PATH,
-                tp_size=8,
-                extra_args=COMMON_ARGS,
-                variant="TP8",
+                MODEL_PATH,
+                tp_size=4,
+                extra_args=COMMON_ARGS + TP_MTP_ARGS,
+                variant="TP4+MTP",
             ),
             ModelLaunchSettings(
-                GLM_51_FP8_MODEL_PATH,
-                tp_size=8,
-                extra_args=COMMON_ARGS + dp_args,
-                variant="TP8+DP8",
-            ),
-            ModelLaunchSettings(
-                GLM_51_FP8_MODEL_PATH,
-                tp_size=8,
-                extra_args=COMMON_ARGS + dp_args + MTP_ARGS,
-                variant="TP8+DP8+MTP",
+                MODEL_PATH,
+                tp_size=4,
+                extra_args=COMMON_ARGS
+                + ["--dp-size=4", "--enable-dp-attention"]
+                + DP_MTP_ARGS,
+                variant="TP4+DP4+DPA+MTP",
             ),
         ]
 
         run_combined_tests(
             models=variants,
-            test_name="GLM-5.1-FP8",
+            test_name="GLM-5.2-NVFP4",
             accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.92),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_glm_51_fp8",
+                profile_dir="performance_profiles_gb300",
             ),
         )
 
