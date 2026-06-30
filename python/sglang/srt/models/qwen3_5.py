@@ -727,6 +727,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.attn_tp_size = get_parallel().attn_tp_size
         self.pp_group = get_pp_group()
+        self.calculated_pp_groups = []
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % self.attn_tp_size == 0
         self.num_heads = self.total_num_heads // self.attn_tp_size
@@ -975,11 +976,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         # Calculate first full attention layer ID based on config
         # Calculate once for each pp group
-        calculated_pp_groups = []
         if (self.attn.layer_id + 1) % self.config.full_attention_interval == 0:
             if self.pp_group.rank_in_group not in calculated_pp_groups:
                 self.rotary_emb.get_cos_sin_with_position(positions)
-                calculated_pp_groups.append(self.pp_group.rank_in_group)
+                self.calculated_pp_groups.append(self.pp_group.rank_in_group)
 
         q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
             qkv,
