@@ -29,7 +29,6 @@ class SWAKVPool(BaseSWAKVPool):
         head_dim: int,
         swa_attention_layer_ids: List[int],
         full_attention_layer_ids: List[int],
-        enable_kvcache_transpose: bool,
         device: str,
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
         **kwargs,
@@ -52,8 +51,6 @@ class SWAKVPool(BaseSWAKVPool):
         kwargs["head_num"] = head_num
         kwargs["head_dim"] = head_dim
         kwargs["device"] = device
-        # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
-        assert not enable_kvcache_transpose
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (

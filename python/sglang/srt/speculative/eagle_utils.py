@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
+    alloc_paged_token_slots_extend_npu,
+)
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    maybe_build_dsv4_verify_bundle,
+)
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -32,6 +39,14 @@ if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
+
+
+ALLOC_EXTEND_FUNCS = defaultdict(
+    lambda: alloc_paged_token_slots_extend,
+    {
+        "npu": alloc_paged_token_slots_extend_npu,
+    },
+)
 
 
 def per_step_draft_out_cache_loc(
@@ -267,21 +282,55 @@ def verify_tree_greedy_func(
     return predicts, accept_index, accept_token_num
 
 
-def get_draft_hidden_dim(model_runner: ModelRunner) -> int:
-    """Derive the hidden dimension of target hidden states fed to the draft model."""
-    hf_config = model_runner.model_config.hf_config
-    eagle_config = getattr(hf_config, "eagle_config", {})
-    use_aux = eagle_config.get("use_aux_hidden_state", False)
+def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
+    """Width of the target hidden states fed into the draft model.
+
+    This is the single source of truth and is derived entirely from config: for
+    EAGLE3 aux mode the draft consumes `num_aux` concatenated target layers
+    (each `target_hidden_size` wide); every other arch consumes the per-layer
+    `spec_hidden_size`.
+
+    Do NOT read this off a draft projection's `in_features` (e.g. an `fc`
+    layer): that width is arch-specific.
+
+    Note: read entirely from the *draft* `model_runner`'s config. The non-aux
+    branch assumes the draft's `spec_hidden_size` equals the target hidden width
+    fed to the draft (true for standard EAGLE, where the draft mirrors the
+    target hidden size); aux mode reads the explicit `target_hidden_size`.
+    """
+    model_config = model_runner.model_config
+    hf_config = model_config.hf_config
+    eagle_config = getattr(hf_config, "eagle_config", None) or {}
+    get_eagle_config = (
+        eagle_config.get
+        if isinstance(eagle_config, dict)
+        else lambda key, default=None: getattr(eagle_config, key, default)
+    )
+    use_aux = get_eagle_config("use_aux_hidden_state", True)
     spec_algorithm = model_runner.spec_algorithm
 
-    if spec_algorithm is not None and spec_algorithm.is_eagle3() and use_aux:
-        base = getattr(hf_config, "target_hidden_size", None)
-        if base is None:
-            base = model_runner.model_config.hidden_size
-        layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids", [])
-        num_aux = max(len(layer_ids), 1)
-        return base * num_aux
-    return model_runner.model_config.spec_hidden_size
+    if not (spec_algorithm is not None and spec_algorithm.is_eagle3() and use_aux):
+        return model_config.spec_hidden_size
+
+    target_hidden = getattr(hf_config, "target_hidden_size", None)
+    if target_hidden is None:
+        target_hidden = model_config.hidden_size
+    num_aux = getattr(hf_config, "num_aux_hidden_states", None)
+    if num_aux is None:
+        layer_ids = get_eagle_config("eagle_aux_hidden_state_layer_ids", None)
+        if layer_ids is None:
+            layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+        num_aux = len(layer_ids) if layer_ids else 3
+    return target_hidden * num_aux
+
+
+def get_draft_recurrent_hidden_state_spec(
+    model_runner: ModelRunner,
+) -> tuple[Optional[int], Optional[torch.dtype]]:
+    """Return hidden_states width/dtype carried between draft decode steps."""
+    if model_runner.spec_algorithm.is_standalone():
+        return None, None
+    return model_runner.model_config.spec_hidden_size, model_runner.model_config.dtype
 
 
 def eagle_prepare_for_verify(
@@ -319,6 +368,10 @@ def eagle_prepare_for_verify(
             batch_size=bs,
             draft_token_num=verify_input.draft_token_num,
             device=device,
+        )
+
+        batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
+            batch, verify_input.draft_token_num
         )
 
         prepare_mamba_track_for_verify(batch)
@@ -629,7 +682,8 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             batch.req_pool_indices,
             cur_kv_lens_device,
         )
-        out_cache_loc = alloc_paged_token_slots_extend(
+        device_type = getattr(batch.device, "type", str(batch.device).split(":", 1)[0])
+        out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
             batch.tree_cache,
             cur_kv_lens_device,
             cur_kv_lens_cpu,
@@ -637,8 +691,9 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             nxt_kv_lens_cpu,
             last_loc,
             num_needed_tokens,
+            req_pool_indices=batch.req_pool_indices,
+            batch=batch,
         )
-
     assign_req_to_token_pool_func(
         batch.req_pool_indices,
         batch.req_to_token_pool.req_to_token,
