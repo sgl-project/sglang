@@ -324,6 +324,7 @@ DEFAULT_LORA_EVICTION_POLICY = "lru"
 
 DSA_CHOICES = [
     "flashmla_sparse",
+    "flashmla_sparse_q8",
     "flashmla_kv",
     "flashmla_auto",
     "fa3",
