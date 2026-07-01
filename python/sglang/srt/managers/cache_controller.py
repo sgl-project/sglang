@@ -851,9 +851,17 @@ class HiCacheController:
                     "supported on the mooncake v2 path."
                 )
                 return
-            self.storage_backend.register_mem_host_pool_v2(
-                self.mem_pool_host_draft, PoolName.DRAFT
-            )
+            try:
+                self.storage_backend.register_mem_host_pool_v2(
+                    self.mem_pool_host_draft, PoolName.DRAFT
+                )
+            except Exception as e:
+                logger.warning(
+                    "HiCache draft L3 disabled: failed to register draft buffer "
+                    "to Mooncake Store. Draft KV cache will use L2 (host DRAM) only. "
+                    "Error: %s", e
+                )
+                return
             self.draft_page_get_func = self._draft_page_get_v2
             self.draft_page_set_func = self._draft_page_set_v2
             return
