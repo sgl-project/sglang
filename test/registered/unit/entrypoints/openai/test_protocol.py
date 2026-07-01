@@ -22,8 +22,15 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
+    ChatCompletionResponseStreamChoice,
+    ChatCompletionStreamResponse,
     ChatMessage,
     CompletionRequest,
+    CompletionResponse,
+    CompletionResponseChoice,
+    CompletionResponseStreamChoice,
+    CompletionStreamResponse,
+    DeltaMessage,
     Function,
     ModelCard,
     ModelList,
@@ -524,6 +531,72 @@ class TestParsedResponseFieldsProtocol(unittest.TestCase):
             reasoning_content = None
 
         self.assertIsInstance(MockFields(), ParsedResponseFields)
+
+
+class TestSystemFingerprint(unittest.TestCase):
+    """Test that system_fingerprint serializes only when set."""
+
+    def _chat_response(self, system_fingerprint):
+        return ChatCompletionResponse(
+            id="test-id",
+            model="test-model",
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(role="assistant", content="Hello"),
+                    finish_reason="stop",
+                )
+            ],
+            usage=UsageInfo(prompt_tokens=5, completion_tokens=1, total_tokens=6),
+            system_fingerprint=system_fingerprint,
+        )
+
+    def _completion_response(self, system_fingerprint):
+        return CompletionResponse(
+            id="test-id",
+            model="test-model",
+            choices=[
+                CompletionResponseChoice(index=0, text="Hello", finish_reason="stop")
+            ],
+            usage=UsageInfo(prompt_tokens=5, completion_tokens=1, total_tokens=6),
+            system_fingerprint=system_fingerprint,
+        )
+
+    def test_excluded_when_none(self):
+        self.assertNotIn("system_fingerprint", self._chat_response(None).model_dump())
+        self.assertNotIn(
+            "system_fingerprint", self._completion_response(None).model_dump()
+        )
+
+    def test_included_when_set(self):
+        data = self._chat_response("default").model_dump()
+        self.assertEqual(data["system_fingerprint"], "default")
+        data = self._completion_response("v2").model_dump()
+        self.assertEqual(data["system_fingerprint"], "v2")
+
+    def test_stream_responses(self):
+        chat_chunk = ChatCompletionStreamResponse(
+            id="test-id",
+            model="test-model",
+            choices=[
+                ChatCompletionResponseStreamChoice(
+                    index=0, delta=DeltaMessage(content="Hi"), finish_reason=None
+                )
+            ],
+        )
+        self.assertNotIn("system_fingerprint", chat_chunk.model_dump())
+        chat_chunk.system_fingerprint = "default"
+        self.assertEqual(chat_chunk.model_dump()["system_fingerprint"], "default")
+
+        completion_chunk = CompletionStreamResponse(
+            id="test-id",
+            model="test-model",
+            choices=[
+                CompletionResponseStreamChoice(index=0, text="Hi", finish_reason=None)
+            ],
+            system_fingerprint="default",
+        )
+        self.assertEqual(completion_chunk.model_dump()["system_fingerprint"], "default")
 
 
 if __name__ == "__main__":
