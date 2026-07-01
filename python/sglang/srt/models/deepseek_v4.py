@@ -70,7 +70,11 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.layers.quantization.fp8_kernel import (
+    fp8_dtype,
+    fp8_max,
+    fp8_min,
+)
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -135,6 +139,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    ceil_align,
     get_bool_env_var,
     is_gfx95_supported,
     is_gfx942_supported,
@@ -153,6 +158,53 @@ logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
+
+
+def _fp8_wo_a_group_major_quant_ue8m0_for_deep_gemm(
+    o_group_major: torch.Tensor,
+    group_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize DeepSeek-V4 wo_a input for DeepGEMM FP8 einsum.
+
+    The input is logical [G, T, D]. The returned scale tensor is logical
+    [G, T, ceil(D / group_size, 4) / 4] with four UE8M0 scales packed per int32,
+    backed by the TMA-aligned layout expected by DeepGEMM on SM100. Do not make
+    the scale tensor contiguous.
+    """
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sgl_per_token_group_quant_8bit,
+    )
+
+    G, T, D = o_group_major.shape
+    scale_inner = ceil_align(D // group_size, 4) // 4
+    aligned_t = ceil_align(T, 4)
+    o_fp8 = torch.empty(
+        o_group_major.shape, device=o_group_major.device, dtype=fp8_dtype
+    )
+    o_s = torch.empty(
+        (G, scale_inner, aligned_t),
+        device=o_group_major.device,
+        dtype=torch.int,
+    ).transpose(-1, -2)[:, :T, :]
+
+    # The generic wrapper cannot express this preallocated group-major scale
+    # buffer. Write each group's [T, D] rows into the DeepGEMM TMA layout.
+    for g in range(G):
+        sgl_per_token_group_quant_8bit(
+            o_group_major[g],
+            o_fp8[g],
+            o_s[g],
+            group_size,
+            1e-10,
+            fp8_min,
+            fp8_max,
+            True,
+            False,
+            None,
+            enable_v2=True,
+        )
+
+    return o_fp8, o_s
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
@@ -1084,15 +1136,14 @@ class MQALayer(nn.Module):
 
             T, G, D = o.shape
             R = self.o_lora_rank
-            o_fp8, o_s = sglang_per_token_group_quant_fp8(
-                o.reshape(T * G, D).contiguous(),
+            o_fp8, o_s = _fp8_wo_a_group_major_quant_ue8m0_for_deep_gemm(
+                o.transpose(0, 1).contiguous(),
                 group_size=128,
-                scale_ue8m0=True,
             )
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
-                (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
+                (o_fp8.transpose(0, 1), o_s.transpose(0, 1)),
                 (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
                 output,
                 recipe=(1, 1, 128),
