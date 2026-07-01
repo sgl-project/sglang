@@ -1154,12 +1154,15 @@ class ModelConfig:
             # MXFP8. Route a MIXED_PRECISION checkpoint to modelopt_mixed only when it
             # actually contains a microscaling / NVFP4 layer (which w4afp8 cannot
             # consume); otherwise keep the previous w4afp8 route so existing W4A8 MoE
-            # checkpoints are unaffected.
+            # checkpoints are unaffected. MXFP4 is deliberately absent: this loader has
+            # no ModelOpt MXFP4 linear method, so routing it here would silently create
+            # unquantized linears instead of executing the checkpoint representation.
+            # MXFP4 support can, and probably shoud, be added in a separate PR.
             layer_algos = {
                 str(info.get("quant_algo", "")).upper()
                 for info in json_quant_configs.get("quantized_layers", {}).values()
             }
-            if is_nemotron_h or (layer_algos & {"MXFP8", "NVFP4", "MXFP4"}):
+            if is_nemotron_h or (layer_algos & {"MXFP8", "NVFP4"}):
                 return {"quant_method": "modelopt_mixed", "quant_algo": quant_algo}
             return {"quant_method": "w4afp8", "quant_algo": quant_algo}
         elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):

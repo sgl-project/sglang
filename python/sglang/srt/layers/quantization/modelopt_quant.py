@@ -2466,9 +2466,8 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
     The GEMM runs on the FlashInfer CUTLASS MXFP8 kernel (``flashinfer.mm_mxfp8``,
     ``backend="cutlass"``): the fp8 weight is consumed directly, the UE8M0 block
     scale is interleaved into the kernel's swizzled layout at load, and activations
-    are dynamically MXFP8-quantized per call. Small linears that don't meet the
-    kernel's 128-tile alignment (e.g. Qwen3.5's fused in_proj_ba gate, N=16 per
-    TP=4 shard) fall back to bf16.
+    are dynamically MXFP8-quantized per call. Local shards are zero-padded to the
+    kernel's 128-tile boundary when needed and trimmed back after the GEMM.
     """
 
     BLOCK = 32
@@ -2529,81 +2528,104 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
             ),
         )
 
-    # The CUTLASS mm_mxfp8 kernel tiles the GEMM and requires per-shard N and K to
-    # be multiples of 128. Small linears that don't meet this -- notably Qwen3.5's
-    # fused in_proj_ba (b+a gates, N=64 -> 16 per TP=4 shard) -- are dequantized to
-    # bf16 and run through a plain GEMM. These are tiny (e.g. 2048x16), so the cost
-    # is negligible and bf16 is numerically safer for the decay/gate projections.
+    # CUTLASS mm_mxfp8 requires per-shard N >= 128 and K >= 128 (K also a multiple of
+    # BLOCK). Shards with N < 128 -- only the tiny fused in_proj_ba (N=16/shard) here --
+    # are zero-padded in N up to the 128 tile; it stays a true MXFP8 W8A8 GEMM (~1x
+    # memory) and the padded output rows are sliced off in apply(). K is never padded:
+    # it cannot be zero-extended without a matching activation extension, so a K < 128 /
+    # K % BLOCK != 0 shard fails loudly rather than silently falling back (a bf16 dequant
+    # would ~2x a large shard's memory and risk OOM).
     ALIGN = 128
 
-    def _kernel_aligned(self, layer) -> bool:
+    @staticmethod
+    def _swizzle_weight_scale(sf: torch.Tensor, n: int, k: int) -> torch.Tensor:
+        # Row-major UE8M0 scales [N, K//BLOCK] -> FlashInfer F8_128x4 swizzled layout
+        # (flat 1D), padding N up to a 128 tile and K up to a 4-scale tile internally.
+        # Mirrors vLLM's swizzle_mxfp8_scale. We use this explicit swizzle rather than
+        # flashinfer.block_scale_interleave because the latter mishandles the N-padded
+        # small-shard case (in_proj_ba), which silently corrupted the real output rows.
+        factor = ModelOptMxfp8LinearMethod.BLOCK * 4  # 128
+        num_m_tiles = (n + 127) // 128
+        num_k_tiles = (k + factor - 1) // factor
+        scale_cols = k // ModelOptMxfp8LinearMethod.BLOCK
+        sf_padded = sf.new_zeros((num_m_tiles * 128, num_k_tiles * 4))
+        sf_padded[:n, :scale_cols] = sf
         return (
-            layer.input_size_per_partition % self.ALIGN == 0
-            and layer.output_size_per_partition % self.ALIGN == 0
+            sf_padded.view(num_m_tiles, 4, 32, num_k_tiles, 4)
+            .transpose(1, 3)
+            .contiguous()
+            .view(-1)
         )
 
     def process_weights_after_loading(self, layer) -> None:
-        if self._kernel_aligned(layer):
-            # CUTLASS mm_mxfp8 consumes the fp8 weight as-is and needs the UE8M0
-            # block scale interleaved into its swizzled layout.
-            from flashinfer import block_scale_interleave
-
-            layer.use_fused_mxfp8 = True
-            layer.weight = Parameter(
-                layer.weight.data.contiguous(), requires_grad=False
-            )
-            layer.weight_scale = Parameter(
-                block_scale_interleave(
-                    layer.weight_scale.data.contiguous().view(torch.uint8)
-                ).contiguous(),
-                requires_grad=False,
-            )
-            return
-
-        # Fallback: reconstruct the bf16 weight from the stored MX block scales
-        # (w_bf16 = fp8_weight * 2^(E8M0-127), per BLOCK along K) and drop the scale.
-        # E8M0 (bias 127) reinterpreted as float8_e8m0fnu casts to the 2^k multiplier;
-        # repeat_interleave expands each block scale across its BLOCK input columns.
-        layer.use_fused_mxfp8 = False
-        w = layer.weight.data.float()  # float8_e4m3fn -> f32 [out, in]
-        scale = layer.weight_scale.data.view(torch.float8_e8m0fnu).float()
-        w_bf16 = (w * scale.repeat_interleave(self.BLOCK, dim=1)).to(torch.bfloat16)
-        layer.weight = Parameter(w_bf16, requires_grad=False)
-        del layer.weight_scale
-
-    def apply(self, layer, x, bias=None):
-        if not getattr(layer, "use_fused_mxfp8", True):
-            # bf16 fallback for kernel-unaligned small linears (e.g. in_proj_ba).
-            return torch.nn.functional.linear(x, layer.weight.to(x.dtype), bias)
-
-        # FlashInfer CUTLASS MXFP8 W8A8 GEMM. Activations are dynamically MXFP8-
-        # quantized (swizzled SF layout); the weight scale was interleaved at load.
+        # Resolve the hardware-guarded flashinfer GEMM/quantize ops once here (load time,
+        # on the serving GPU) rather than per-call in apply() -- mirrors how Fp8LinearMethod
+        # binds its kernel callable before the hot path. They live behind an
+        # is_sm100/flashinfer guard in fp8_utils, so they cannot be imported at module top.
         from sglang.srt.layers.quantization.fp8_utils import (
             flashinfer_mm_mxfp8,
             flashinfer_mxfp8_quantize,
         )
 
+        self._mxfp8_quantize = flashinfer_mxfp8_quantize
+        self._mm_mxfp8 = flashinfer_mm_mxfp8
+
+        n, k = layer.weight.shape
+        if k < self.ALIGN or k % self.BLOCK != 0:
+            raise ValueError(
+                f"MXFP8 CUTLASS requires in_features >= {self.ALIGN} and a multiple of "
+                f"{self.BLOCK}, got {k} (K cannot be padded)."
+            )
+
+        scale_cols = k // self.BLOCK
+        weight = layer.weight.data.contiguous()
+        scale_u8 = (
+            layer.weight_scale.data.contiguous()
+            .view(torch.uint8)
+            .reshape(n, scale_cols)
+        )
+
+        # CUTLASS rejects N < 128: zero-pad the (necessarily small) shard up to the tile;
+        # padded rows produce zero output, sliced back to mxfp8_orig_n in apply().
+        layer.mxfp8_orig_n = n
+        if n < self.ALIGN:
+            pad_n = self.ALIGN - n
+            weight = torch.nn.functional.pad(weight, (0, 0, 0, pad_n))
+            scale_u8 = torch.nn.functional.pad(scale_u8, (0, 0, 0, pad_n))
+            n = self.ALIGN
+
+        layer.weight = Parameter(weight.contiguous(), requires_grad=False)
+        layer.weight_scale = Parameter(
+            self._swizzle_weight_scale(scale_u8, n, k), requires_grad=False
+        )
+
+    def apply(self, layer, x, bias=None):
+        # FlashInfer CUTLASS MXFP8 W8A8 GEMM. Activations are dynamically MXFP8-quantized
+        # (swizzled SF layout); the weight scale was swizzled to the F8_128x4 layout at
+        # load. Kernel callables bound in process_weights_after_loading (not per call).
         out_dtype = (
             x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
         )
         x_2d = x.view(-1, x.shape[-1]).contiguous()
-        q_x, x_scale = flashinfer_mxfp8_quantize(
-            x_2d, is_sf_swizzled_layout=True, alignment=self.BLOCK
-        )
-        weight_scale = (
-            layer.weight_scale.contiguous().t()
-            if layer.weight_scale.ndim == 2
-            else layer.weight_scale.contiguous()
-        )
-        out = flashinfer_mm_mxfp8(
+        q_x, x_scale = self._mxfp8_quantize(x_2d, is_sf_swizzled_layout=True)
+        out = self._mm_mxfp8(
             q_x,
-            layer.weight.contiguous().t(),
+            layer.weight.t(),
             x_scale,
-            weight_scale,
+            layer.weight_scale,
             out_dtype=out_dtype,
             use_8x4_sf_layout=False,
             backend="cutlass",
         )
+        # Slice the (possibly zero-padded) output dim back to the real N before the bias
+        # add so the layer's real [orig_n] bias lines up. The GDN fused projection
+        # kernel consumes this result with contiguous row-major pointer arithmetic;
+        # a narrow view of the padded [M, 128] result has stride 128 rather than
+        # orig_n and would make it read the wrong gate values on subsequent rows.
+        orig_n = getattr(layer, "mxfp8_orig_n", out.shape[-1])
+        if out.shape[-1] != orig_n:
+            out = out[:, :orig_n].contiguous()
         if bias is not None:
             out = out + bias
-        return out.view(*x.shape[:-1], layer.weight.shape[0])
+        # reshape (not view): x may carry >1 leading dim.
+        return out.reshape(*x.shape[:-1], orig_n)

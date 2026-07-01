@@ -540,6 +540,7 @@ If a model is already quantized (e.g., from Hugging Face), you can load it direc
         --model-path /path/to/modelopt-mixed-checkpoint \
         --port 30000
     ```
+    The MXFP8 integration serves block-32 E4M3 weights with E8M0 block scales through FlashInfer CUTLASS on Blackwell. It supports the MXFP8/NVFP4 ModelOpt layout used by mixed Qwen3.5 checkpoints; ModelOpt MXFP4 layers are intentionally not routed to `modelopt_mixed`, because that representation needs a distinct MXFP4 linear method.
 
 ##### Creating Your Own Quantized Checkpoints
 

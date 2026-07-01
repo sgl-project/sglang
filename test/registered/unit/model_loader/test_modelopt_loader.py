@@ -635,7 +635,7 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         model_config.hf_config.model_type = "qwen3"
         model_config.hf_config.architectures = ["Qwen3MoeForCausalLM"]
 
-        for quant_algo in ("MXFP8", "NVFP4", "MXFP4"):
+        for quant_algo in ("MXFP8", "NVFP4"):
             with self.subTest(quant_algo=quant_algo):
                 result = model_config._parse_modelopt_quant_config(
                     {
@@ -651,6 +651,25 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
                 )
 
                 self.assertEqual(result["quant_method"], "modelopt_mixed")
+
+    def test_mixed_precision_mxfp4_does_not_select_modelopt_mixed(self):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.hf_config = MagicMock()
+        model_config.hf_config.model_type = "qwen3"
+        model_config.hf_config.architectures = ["Qwen3MoeForCausalLM"]
+
+        result = model_config._parse_modelopt_quant_config(
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "model.layers.0.mlp.down_proj": {"quant_algo": "MXFP4"},
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(result["quant_method"], "w4afp8")
 
     def test_mixed_precision_fp8_only_keeps_w4afp8_route(self):
         model_config = ModelConfig.__new__(ModelConfig)
