@@ -139,6 +139,13 @@ def build_replay_fb_view(
     Subsumes the _replay_forward_batch side channel that DSV4 used to
     read out-of-band before the init_forward_metadata 3-method ABC.
     """
+    extend_num_tokens = getattr(forward_batch, "extend_num_tokens", None)
+    extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
+    extend_prefix_lens = getattr(forward_batch, "extend_prefix_lens", None)
+    extend_start_loc = getattr(forward_batch, "extend_start_loc", None)
+    extend_prefix_lens_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+    extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+
     return SimpleNamespace(
         batch_size=bs,
         forward_mode=capture_forward_mode,
@@ -155,8 +162,14 @@ def build_replay_fb_view(
         seq_lens_cpu=buffers.seq_lens_cpu[:bs],
         num_padding=bs - raw_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
-        out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        out_cache_loc=buffers.out_cache_loc[:num_tokens],
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+        extend_num_tokens=extend_num_tokens,
+        extend_seq_lens=extend_seq_lens,
+        extend_prefix_lens=extend_prefix_lens,
+        extend_start_loc=extend_start_loc,
+        extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
         spec_info=forward_batch.spec_info,
     )
 
@@ -612,6 +625,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             assert self.enable_pdmux
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
+        extend_num_tokens = None
+        extend_seq_lens = None
+        extend_prefix_lens = None
+        extend_start_loc = None
+        extend_prefix_lens_cpu = None
+        extend_seq_lens_cpu = None
+
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -629,6 +649,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             encoder_lens=encoder_lens,
             return_logprob=False,
             positions=positions,
+            extend_num_tokens=extend_num_tokens,
+            extend_seq_lens=extend_seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_start_loc=extend_start_loc,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),

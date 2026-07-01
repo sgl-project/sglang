@@ -553,13 +553,19 @@ class BaseRunner(ABC):
 
         buffers.num_token_non_padded[...] = num_tokens
 
-        # For extend mode
-        if capture_forward_mode == ForwardMode.EXTEND:
+        # EXTEND-like graph captures need prefix/length metadata. DLLM_EXTEND
+        # runs one diffusion block per request, so it uses the same shape fields.
+        if capture_forward_mode in (ForwardMode.EXTEND, ForwardMode.DLLM_EXTEND):
+            query_len_fill_value = (
+                num_tokens_per_bs
+                if capture_forward_mode == ForwardMode.DLLM_EXTEND
+                else seq_len_fill_value
+            )
             extend_prefix_lens_cpu = [0] * batch_size
-            extend_seq_lens_cpu = [seq_len_fill_value] * batch_size
+            extend_seq_lens_cpu = [query_len_fill_value] * batch_size
             extend_num_tokens = num_tokens
             extend_seq_lens = torch.full(
-                (batch_size,), seq_len_fill_value, dtype=torch.int32, device=mr.device
+                (batch_size,), query_len_fill_value, dtype=torch.int32, device=mr.device
             )
             extend_prefix_lens = torch.zeros(
                 (batch_size,), dtype=torch.int32, device=mr.device

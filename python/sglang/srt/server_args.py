@@ -3660,7 +3660,6 @@ class ServerArgs:
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "GFusionForDiffusionLM",
-            "GFusionModelLM",
             "KimiK25ForConditionalGeneration",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
@@ -3851,7 +3850,6 @@ class ServerArgs:
                     if quant_method is None and model_arch in [
                         "DeepseekV3ForCausalLM",
                         "GFusionForDiffusionLM",
-                        "GFusionModelLM",
                     ]:
                         if has_fp8_weights_in_checkpoint(self.model_path):
                             self.quantization = "fp8"
@@ -4458,7 +4456,6 @@ class ServerArgs:
                 "DeepseekV3ForCausalLM",
                 "DeepseekV32ForCausalLM",
                 "GFusionForDiffusionLM",
-                "GFusionModelLM",
                 "GptOssForCausalLM",
                 "GlmMoeDsaForCausalLM",
                 "Glm4MoeForCausalLM",
@@ -6358,7 +6355,7 @@ class ServerArgs:
             model_arch = self.get_model_config().hf_config.architectures[0]
         except Exception:
             model_arch = None
-        is_gfusion = model_arch in {"GFusionForDiffusionLM", "GFusionModelLM"}
+        is_gfusion = model_arch == "GFusionForDiffusionLM"
 
         if is_gfusion:
             allowed_backends = {"fa3", "triton"}
@@ -6382,14 +6379,9 @@ class ServerArgs:
                     "GFusion DLLM inference only supports FA3 or Triton attention "
                     f"backends, got {sorted(unsupported)}."
                 )
-            if "fa3" in configured_backends and self.page_size != 1:
-                logger.warning(
-                    "FlashAttention3 only supports page_size=1 for GFusion DLLM "
-                    f"inference currently. Changing page_size from {self.page_size} to 1."
-                )
-                self.page_size = 1
-        # On AMD/HIP, disable cuda graph for generic DLLM and use triton backend.
-        elif is_hip():
+
+        # On AMD/HIP, disable cuda graph for DLLM and use triton backend.
+        if is_hip():
             if (
                 self.cuda_graph_config.decode.backend != Backend.DISABLED
                 or self.cuda_graph_config.prefill.backend != Backend.DISABLED
@@ -6410,7 +6402,10 @@ class ServerArgs:
                     "Attention backend is overridden to 'ascend' when running on NPU for diffusion LLM inference."
                 )
                 self.attention_backend = "ascend"
-        elif self.cuda_graph_config.decode.backend != Backend.DISABLED:
+        elif (
+            not is_gfusion
+            and self.cuda_graph_config.decode.backend != Backend.DISABLED
+        ):
             if self.attention_backend != "flashinfer":
                 logger.warning(
                     "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
@@ -6423,31 +6418,18 @@ class ServerArgs:
             )
             self.disable_overlap_schedule = True
 
-        if is_gfusion:
-            if not self.disable_radix_cache:
-                logger.warning(
-                    "Radix cache is disabled because of using GFusion DLLM inference"
-                )
-                self.disable_radix_cache = True
-            if self.enable_hierarchical_cache:
-                logger.warning(
-                    "Hierarchical cache is disabled because of using GFusion DLLM inference"
-                )
-                self.enable_hierarchical_cache = False
-            if self.enable_lmcache:
-                logger.warning(
-                    "LMCache is disabled because of using GFusion DLLM inference"
-                )
-                self.enable_lmcache = False
-        elif not self.disable_radix_cache:
-            from sglang.srt.dllm.config import DllmConfig
+        from sglang.srt.dllm.config import DllmConfig
 
-            config = DllmConfig.from_server_args(self)
-            if self.page_size % config.block_size != 0:
-                logger.warning(
-                    f"Setting page size to {config.block_size} for diffusion LLM inference"
-                )
-                self.page_size = config.block_size
+        config = DllmConfig.from_server_args(self)
+        if self.page_size > config.block_size:
+            logger.warning(
+                f"Setting page size to {config.block_size} for diffusion LLM "
+                f"inference because page_size must not exceed the dLLM "
+                f"block size (previous page_size={self.page_size})."
+            )
+            self.page_size = config.block_size
+
+        if not self.disable_radix_cache:
             if self.enable_hierarchical_cache:
                 logger.warning(
                     "Hierarchical cache is disabled because of using diffusion LLM inference"

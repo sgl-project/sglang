@@ -96,15 +96,40 @@ def match_prefix_for_req(
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 
+    key_limit = None
+    if req.is_dllm():
+        block_size = req.dllm_config.block_size
+        key_limit = (len(token_ids) // block_size) * block_size
+
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
-            key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
+            key=RadixKey(
+                token_ids=token_ids, extra_key=req.extra_key, limit=key_limit
+            ),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
         match_result = zero_match_result(tree_cache, match_result)
+    if req.is_dllm():
+        block_size = req.dllm_config.block_size
+        aligned_len = (len(match_result.device_indices) // block_size) * block_size
+        if aligned_len != len(match_result.device_indices):
+            if aligned_len == 0:
+                match_result = zero_match_result(tree_cache, match_result)
+            else:
+                match_result = tree_cache.match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(
+                            token_ids=token_ids,
+                            extra_key=req.extra_key,
+                            limit=aligned_len,
+                        ),
+                        cow_mamba=cow_mamba,
+                        req=req if include_req else None,
+                    )
+                )
     (
         req.prefix_indices,
         req.last_node,
@@ -270,9 +295,17 @@ class SchedulePolicy:
             # threshold means we cannot use in-batch prefix caching for short prefixes.
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
+                in_batch_key_limit = None
+                if r.is_dllm():
+                    block_size = r.dllm_config.block_size
+                    in_batch_key_limit = (len(prefix_ids) // block_size) * block_size
                 match_result = self.waiting_queue_radix_tree.match_prefix(
                     MatchPrefixParams(
-                        key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
+                        key=RadixKey(
+                            token_ids=prefix_ids,
+                            extra_key=extra_key,
+                            limit=in_batch_key_limit,
+                        )
                     )
                 )
                 if envs.SGLANG_RADIX_FORCE_MISS.get():

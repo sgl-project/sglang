@@ -38,7 +38,7 @@ class DllmConfig:
         }
 
         arch = model_config.hf_config.architectures[0]
-        if arch in {"GFusionForDiffusionLM", "GFusionModelLM"}:
+        if arch == "GFusionForDiffusionLM":
             block_size = getattr(model_config.hf_config, "diffusion_block_size", 32)
             mask_id = getattr(model_config.hf_config, "mask_token_id", 128170)
         elif arch in DLLM_PARAMS:

@@ -13,7 +13,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 class EBSampling(DllmAlgorithm):
     def __init__(self, config: DllmConfig):
         super().__init__(config)
-        self.gamma = config.algorithm_config.get("gamma", 0.0)
+        self.gamma = config.algorithm_config.get("gamma", 0.15)
         if self.gamma < 0:
             raise ValueError("EBSampling requires a non-negative gamma threshold.")
 

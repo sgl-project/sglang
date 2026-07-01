@@ -18,7 +18,7 @@ from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
 
-class GFusionModelLM(DeepseekV2ForCausalLM):
+class GFusionForDiffusionLM(DeepseekV2ForCausalLM):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -38,18 +38,9 @@ class GFusionModelLM(DeepseekV2ForCausalLM):
             self_attn.attn_mha.attn_type = AttentionType.ENCODER_ONLY
 
     def determine_num_fused_shared_experts(
-        self, architecture: str = "GFusionModelLM"
+        self, architecture: str = "GFusionForDiffusionLM"
     ):
-        # GFusion checkpoints are DeepSeek-shaped but use their own architecture
-        # names. Treat either runtime name as the expected architecture.
-        archs = getattr(self.config, "architectures", None) or []
-        if archs and archs[0] == "GFusionForDiffusionLM":
-            architecture = "GFusionForDiffusionLM"
         return super().determine_num_fused_shared_experts(architecture=architecture)
 
 
-class GFusionForDiffusionLM(GFusionModelLM):
-    pass
-
-
-EntryClass = [GFusionModelLM, GFusionForDiffusionLM]
+EntryClass = [GFusionForDiffusionLM]
