@@ -33,6 +33,7 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    DSPARK = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     FROZEN_KV_MTP = auto()
@@ -109,6 +110,9 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
+    def is_dspark(self) -> bool:
+        return self == SpeculativeAlgorithm.DSPARK
+
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
@@ -116,7 +120,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_target_verify_for_draft(self) -> bool:
-        return self.is_dflash()
+        return self.is_dflash() or self.is_dspark()
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
@@ -126,8 +130,8 @@ class SpeculativeAlgorithm(Enum):
 
     def carries_draft_hidden_states(self) -> bool:
         """Whether the disagg prefill->decode transfer carries draft hidden
-        states (EAGLE-family only; STANDALONE's vanilla draft ignores them)."""
-        return self.is_eagle()
+        states (EAGLE-family and DSpark; STANDALONE's vanilla draft ignores them)."""
+        return self.is_eagle() or self.is_dspark()
 
     def create_future_map(
         self,
@@ -154,6 +158,14 @@ class SpeculativeAlgorithm(Enum):
             return build_eagle_disagg_draft_input(
                 batch, server_args, last_tokens_tensor, future_map
             )
+        if self.is_dspark():
+            from sglang.srt.speculative.dspark_disaggregation import (
+                build_dspark_disagg_draft_input,
+            )
+
+            return build_dspark_disagg_draft_input(
+                batch, server_args, last_tokens_tensor, future_map
+            )
         return None
 
     def need_topk(self) -> bool:
@@ -166,6 +178,7 @@ class SpeculativeAlgorithm(Enum):
         """
         from sglang.srt.arg_groups.speculative_hook import (
             _handle_dflash,
+            _handle_dspark,
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
             _handle_ngram,
@@ -173,6 +186,8 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dflash():
             _handle_dflash(server_args)
+        elif self.is_dspark():
+            _handle_dspark(server_args)
         elif self.is_frozen_kv_mtp():
             _handle_frozen_kv_mtp(server_args)
         elif self.is_eagle() or self.is_standalone():
@@ -203,6 +218,13 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
             return DFlashWorkerV2
+
+        if self.is_dspark():
+            # V2 worker; scheduler runs it synchronously when overlap is
+            # disabled, same as DFLASH.
+            from sglang.srt.speculative.dspark_worker_v2 import DSparkWorkerV2
+
+            return DSparkWorkerV2
 
         if self.is_frozen_kv_mtp():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
@@ -251,6 +273,9 @@ class SpecInputType(IntEnum):
     DFLASH_DRAFT = auto()
     DFLASH_VERIFY = auto()
     NGRAM_VERIFY = auto()
+    DSPARK_DRAFT = auto()
+    DSPARK_DRAFT_BLOCK = auto()
+    DSPARK_VERIFY = auto()
 
 
 class SpecInput(ABC):
@@ -267,6 +292,7 @@ class SpecInput(ABC):
             SpecInputType.EAGLE_DRAFT_EXTEND,
             SpecInputType.FROZEN_KV_MTP_DRAFT,
             SpecInputType.DFLASH_DRAFT,
+            SpecInputType.DSPARK_DRAFT,
         }
 
     def is_verify_input(self) -> bool:
@@ -275,6 +301,7 @@ class SpecInput(ABC):
             SpecInputType.FROZEN_KV_MTP_VERIFY,
             SpecInputType.DFLASH_VERIFY,
             SpecInputType.NGRAM_VERIFY,
+            SpecInputType.DSPARK_VERIFY,
         }
 
     @abstractmethod
@@ -329,6 +356,25 @@ def create_dummy_verify_input(
 
         # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
         spec_info = DFlashVerifyInput(
+            draft_token=None,
+            positions=None,
+            draft_token_num=server_args.speculative_num_draft_tokens,
+            custom_mask=None,
+            capture_hidden_mode=(
+                CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL
+            ),
+        )
+
+    elif spec_algorithm.is_dspark():
+        from sglang.srt.speculative.dspark_info import (
+            DSparkDraftBlockInput,
+            DSparkVerifyInput,
+        )
+
+        dspark_spec_input_cls = (
+            DSparkDraftBlockInput if is_draft_worker else DSparkVerifyInput
+        )
+        spec_info = dspark_spec_input_cls(
             draft_token=None,
             positions=None,
             draft_token_num=server_args.speculative_num_draft_tokens,

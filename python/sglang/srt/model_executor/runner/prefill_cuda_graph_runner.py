@@ -147,6 +147,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if (
             model_runner.server_args.enable_return_hidden_states
             or model_runner.spec_algorithm.is_dflash()
+            or model_runner.spec_algorithm.is_dspark()
         ):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
         # EAGLE captures FULL hidden states for the target and LAST for the

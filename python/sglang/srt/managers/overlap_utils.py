@@ -224,6 +224,10 @@ class FutureMap:
         if draft_input is None:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
             return
+        if (self.spec_algo.is_dflash() or self.spec_algo.is_dspark()) and getattr(
+            draft_input, "direct_carry_valid", False
+        ):
+            return
         indices = draft_input.future_indices
         if indices.shape[0] == 0:
             return
@@ -266,6 +270,11 @@ class FutureMap:
         # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
         draft_input = batch.spec_info
         if draft_input is None:
+            return
+        if (self.spec_algo.is_dflash() or self.spec_algo.is_dspark()) and getattr(
+            draft_input, "direct_carry_valid", False
+        ):
+            batch.seq_lens = draft_input.new_seq_lens
             return
 
         fi = draft_input.future_indices

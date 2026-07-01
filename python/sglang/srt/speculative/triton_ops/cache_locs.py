@@ -343,6 +343,10 @@ def assign_extend_cache_locs_func(
     draft_token_num: int,
     device,
 ) -> torch.Tensor:
+    if batch_size == 0:
+        dtype = torch.int32 if _is_npu else torch.int64
+        return torch.empty((0,), dtype=dtype, device=device)
+
     if _is_cuda or _is_hip or _is_musa:
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),

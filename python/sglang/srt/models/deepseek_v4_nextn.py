@@ -277,7 +277,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)
 
-    def post_load_weights(self, is_nextn=False, weight_names=None):
+    def post_load_weights(self, is_nextn=False, is_dspark=False, weight_names=None):
         super().post_load_weights(is_nextn=True, weight_names=weight_names)
 
 
