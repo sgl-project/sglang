@@ -14,7 +14,7 @@
 """Inference-only HunYuan model compatible with HuggingFace weights."""
 
 import re
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -515,6 +515,9 @@ class HunYuanModel(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # For EAGLE3 support
+        self.layers_to_capture = []
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -524,7 +527,7 @@ class HunYuanModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         if input_embeds is not None:
             hidden_states = input_embeds
         else:
@@ -532,7 +535,12 @@ class HunYuanModel(nn.Module):
         residual = None
 
         prev_kv_states = None
+        aux_hidden_states = []
         for i in range(len(self.layers)):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
             layer = self.layers[i]
             hidden_states, residual, kv_states = layer(
                 positions,
@@ -548,7 +556,10 @@ class HunYuanModel(nn.Module):
                 prev_kv_states = None
 
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
 
 class HunYuanMoEV1ForCausalLM(nn.Module):
@@ -606,6 +617,9 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config, logit_scale=logit_scale)
         self.sampler = create_sampler()
 
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -614,8 +628,13 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
 
     def _split_qkv_weight(self, qkv: torch.Tensor):
@@ -778,6 +797,17 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
     # make sure to leave KV cache scale factors in a known good (dummy) state
@@ -806,6 +836,18 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
                 raise RuntimeError(
                     "Self attention has no KV cache scaling " "factor attribute!"
                 )
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]  # Specific layers for EAGLE3 support
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 class HunYuanDenseV1ForCausalLM(HunYuanMoEV1ForCausalLM):
