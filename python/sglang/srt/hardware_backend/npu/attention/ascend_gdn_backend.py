@@ -202,17 +202,23 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             has_initial_states = forward_batch.extend_prefix_lens > 0
         if is_target_verify:
             num_token_padding = mixed_qkv.shape[0]
+            batch_size = cache_indices.shape[0]
+            draft_token_num = forward_batch.spec_info.draft_token_num
             if (
                 not self.graph_mode
                 and forward_batch.num_token_non_padded_cpu != num_token_padding
             ):
+                batch_size = (
+                    forward_batch.num_token_non_padded_cpu // draft_token_num
+                )
                 mixed_qkv = mixed_qkv[: forward_batch.num_token_non_padded_cpu]
                 a = a[: forward_batch.num_token_non_padded_cpu]
                 b = b[: forward_batch.num_token_non_padded_cpu]
+                cache_indices = cache_indices[:batch_size]
+                self.ssm_state_indices = self.ssm_state_indices[
+                    : forward_batch.num_token_non_padded_cpu
+                ]
                 seq_len = forward_batch.num_token_non_padded_cpu
-
-            batch_size = cache_indices.shape[0]
-            draft_token_num = forward_batch.spec_info.draft_token_num
             num_accepted_tokens = torch.full(
                 (batch_size,),
                 draft_token_num,
