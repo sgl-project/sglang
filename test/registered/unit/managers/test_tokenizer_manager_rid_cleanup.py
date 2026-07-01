@@ -23,9 +23,16 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import AbortReq, BatchStrOutput, GenerateReqInput
-from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
-from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
+from sglang.srt.managers.io_struct import (  # noqa: E402
+    AbortReq,
+    BatchStrOutput,
+    GenerateReqInput,
+)
+from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
+    ReqState,
+    TokenizerManager,
+)
+from sglang.srt.observability.req_time_stats import APIServerReqTimeStats  # noqa: E402
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -113,6 +120,8 @@ def _make_tokenizer_manager() -> TokenizerManager:
     tm.dump_requests_folder = ""
     tm.crash_dump_folder = ""
     tm.send_to_scheduler = MagicMock()
+    tm.model_config = MagicMock()
+    tm.model_config.vocab_size = 32000
     return tm
 
 
@@ -189,6 +198,34 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
             kwargs[f.name] = [[]]
 
     return BatchStrOutput(**kwargs)
+
+
+class TestTokenizerManagerLogprobValidation(CustomTestCase):
+    """Test request-level logprob parameter validation."""
+
+    def test_rejects_top_logprobs_num_above_vocab_size(self):
+        tm = _make_tokenizer_manager()
+        obj = GenerateReqInput(
+            text="Hello", return_logprob=True, top_logprobs_num=32001
+        )
+
+        with self.assertRaisesRegex(ValueError, "top_logprobs_num"):
+            tm._validate_top_logprobs_num(obj)
+
+    def test_rejects_negative_top_logprobs_num(self):
+        tm = _make_tokenizer_manager()
+        obj = GenerateReqInput(text="Hello", return_logprob=True, top_logprobs_num=-1)
+
+        with self.assertRaisesRegex(ValueError, "top_logprobs_num"):
+            tm._validate_top_logprobs_num(obj)
+
+    def test_accepts_top_logprobs_num_at_vocab_size(self):
+        tm = _make_tokenizer_manager()
+        obj = GenerateReqInput(
+            text="Hello", return_logprob=True, top_logprobs_num=32000
+        )
+
+        tm._validate_top_logprobs_num(obj)
 
 
 class TestRidToStateCleanupOnAbort(CustomTestCase):
