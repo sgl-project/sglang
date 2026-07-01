@@ -443,12 +443,25 @@ class MambaPool:
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
-        need_size = len(indices)
-        for i in range(len(self.mamba_cache.conv)):
-            t = self.mamba_cache.conv[i]
+        if not _is_npu:
+            need_size = len(indices)
+            for i in range(len(self.mamba_cache.conv)):
+                t = self.mamba_cache.conv[i]
+                z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
+                    t.shape[0], need_size, *t.shape[2:]
+                )
+                t[:, indices] = z
+            t = self.mamba_cache.temporal
+            z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
+                t.shape[0], need_size, *t.shape[2:]
+            )
+            t[:, indices] = z
+        else:
+            for i in range(len(self.mamba_cache.conv)):
+                t = self.mamba_cache.conv[i]
+                t[:, indices] = 0
+            t = self.mamba_cache.temporal
             t[:, indices] = 0
-        t = self.mamba_cache.temporal
-        t[:, indices] = 0
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         for i in range(len(self.mamba_cache.conv)):
