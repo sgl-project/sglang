@@ -3,6 +3,7 @@ from .attn import (
     get_paged_mqa_logits_metadata,
     triton_create_paged_compress_data,
 )
+from .c128_cleanup import clear_unaccepted_c128_draft_states
 from .compress import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
@@ -35,6 +36,7 @@ __all__ = [
     "CompressorPrefillPlan",
     "compress_forward",
     "compress_norm_rope_store",
+    "clear_unaccepted_c128_draft_states",
     "fused_norm_rope_inplace",
     "fused_store_cache",
     "fused_rope_inplace",

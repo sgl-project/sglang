@@ -169,7 +169,11 @@ NIGHTLY_SUITES = {
         "full-8-npu-a3",
         "full-16-npu-a3",
     ],
-    HWBackend.XPU: [],
+    HWBackend.XPU: [
+        "nightly-xpu-1-gpu",
+        "nightly-xpu-2-gpu",
+        "nightly-xpu-4-gpu",
+    ],
 }
 
 
