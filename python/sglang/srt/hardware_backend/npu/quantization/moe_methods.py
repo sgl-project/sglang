@@ -439,7 +439,7 @@ class NPUW8A8Mxfp8MoEMethod(_NPUMoEMethodBase):
             "scale": [weight_scale],
             "per_token_scale": [pertoken_scale],
             "scale_dtype": torch.float8_e8m0fnu,
-            "pertoken_scale_dtype": torch.float8_e8m0fnu,
+            "per_token_scale_dtype": torch.float8_e8m0fnu,
         }
     
         return self.matmul.forward(
