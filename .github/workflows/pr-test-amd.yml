@@ -1182,12 +1182,107 @@ jobs:
             ci_sglang \
             python /sgl-workspace/aiter/op_tests/test_rmsnorm2d.py
 
+      # ---------------------------------------------------------------------
+      # DEBUG (bingxche): per-NIC RDMA health isolation. The disaggregation
+      # suite has failed on 3 consecutive scheduled runs with
+      # `transport retry counter exceeded` (ionic cqe error 12 /
+      # IBV_WC_RETRY_EXC_ERR); the failing local NIC is consistently rdma5
+      # while the peer node varies (10.42.20.122/.151/.195). These two steps
+      # capture per-NIC error-counter deltas across the test + kernel ionic
+      # errors so IT can confirm/repair the faulty NIC. Remove before merge.
+      - name: DEBUG RDMA NIC counters (pre-test baseline)
+        if: ${{ always() }}
+        run: |
+          set +e
+          IB=/sys/class/infiniband
+          mkdir -p /tmp/rdma_pre
+          echo "Runner host: $(hostname)"
+          [ -d "$IB" ] || { echo "No $IB on host"; exit 0; }
+          # ionic/RoCE NICs do NOT populate ports/1/counters; the real stats
+          # live in ports/1/hw_counters and in `ethtool -S <netdev>`.
+          for d in "$IB"/*; do
+            dev=$(basename "$d")
+            if [ -d "$d/ports/1/hw_counters" ]; then
+              for f in "$d/ports/1/hw_counters"/*; do
+                [ -f "$f" ] && printf "%s %s\n" "$(basename "$f")" "$(cat "$f" 2>/dev/null)"
+              done | sort > "/tmp/rdma_pre/${dev}.hw"
+            fi
+            nd=$(ls "$d/device/net" 2>/dev/null | head -1)
+            echo "$nd" > "/tmp/rdma_pre/${dev}.netdev"
+            if [ -n "$nd" ] && command -v ethtool >/dev/null 2>&1; then
+              ethtool -S "$nd" 2>/dev/null | sed 's/^ *//' > "/tmp/rdma_pre/${dev}.eth"
+            fi
+          done
+          echo "Baseline captured for: $(ls $IB | paste -sd, -)"
+          echo "Sample hw_counters keys (rdma5): $(cut -d' ' -f1 /tmp/rdma_pre/rdma5.hw 2>/dev/null | paste -sd, - | cut -c1-300)"
+
       - name: Run test_disaggregation
         timeout-minutes: 60
         run: |
+          set -o pipefail
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
-            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }} 2>&1 | tee /tmp/disagg.out
+
+      - name: DEBUG RDMA NIC diagnostic (post-test, isolate faulty NIC)
+        if: ${{ always() }}
+        run: |
+          set +e
+          IB=/sys/class/infiniband
+          echo "===================================================================="
+          echo "Runner host: $(hostname)   (failure peer IPs were 10.42.20.x)"
+          echo "===================================================================="
+          [ -d "$IB" ] || { echo "No $IB on host"; exit 0; }
+
+          echo ""
+          echo "### 1. PRIMARY EVIDENCE: failed RDMA transfers bucketed by local NIC ###"
+          echo "    (from the ionic provider's own errors in the test output)"
+          if [ -f /tmp/disagg.out ]; then
+            echo "-- 'transport retry counter exceeded' failures per local_nic --"
+            grep -oE "local_nic: rdma[0-9]+" /tmp/disagg.out | sort | uniq -c | sort -rn \
+              || echo "   (none found)"
+            echo ""
+            echo "-- peer nodes seen in those failures --"
+            grep -oE "peer_nic: [0-9.]+" /tmp/disagg.out | sort | uniq -c | sort -rn | head
+            echo ""
+            echo "-- KV-transfer timeouts / cqe errors (counts) --"
+            printf "   cqe with error            : %s\n" "$(grep -c 'cqe with error' /tmp/disagg.out)"
+            printf "   transport retry exceeded  : %s\n" "$(grep -c 'transport retry counter exceeded' /tmp/disagg.out)"
+            printf "   KVPoll WaitingForInput TO : %s\n" "$(grep -c 'timed out after .* in KVPoll.WaitingForInput' /tmp/disagg.out)"
+            echo ""
+            echo "-- sample raw error lines --"
+            grep -E "cqe with error|transport retry counter exceeded" /tmp/disagg.out | head -4 | sed 's/^/   /'
+          else
+            echo "/tmp/disagg.out not found (test step did not produce output)"
+          fi
+
+          echo ""
+          echo "### 2. rdma statistic (netlink; bypasses pod sysfs mount limits) ###"
+          if docker ps --format '{{.Names}}' | grep -q '^ci_sglang$'; then
+            docker exec -u root ci_sglang bash -c 'rdma statistic show link 2>&1 || rdma statistic 2>&1 || echo "rdma statistic unavailable"' | head -80
+          else
+            echo "container ci_sglang not running"
+          fi
+
+          echo ""
+          echo "### 3. ibv_devinfo per device (note: all show PORT_ACTIVE => ###"
+          echo "###    fault is transient transport, NOT a hard link-down)     ###"
+          if docker ps --format '{{.Names}}' | grep -q '^ci_sglang$'; then
+            docker exec -u root ci_sglang bash -c '
+              for dev in $(ibv_devinfo -list 2>/dev/null | grep -oE "rdma[0-9]+" | sort); do
+                echo "==== $dev ===="
+                ibv_devinfo -d "$dev" 2>&1 | grep -E "state|phys_state|rate|link_layer|fw_ver|active_width|active_speed"
+              done'
+          else
+            echo "container ci_sglang not running; skipping ibv_devinfo"
+          fi
+
+          echo ""
+          echo "NOTE: /sys/class/infiniband/*/ports/1/{counters,hw_counters} and"
+          echo "device/net are NOT populated inside the k8s runner pod (only the"
+          echo "infiniband class dir is bind-mounted), so sysfs/ethtool counter"
+          echo "deltas are unavailable here. Section 1 (provider errors) is the"
+          echo "authoritative per-NIC signal."
 
   pr-test-amd-finish:
     needs:
