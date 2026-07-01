@@ -396,6 +396,7 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.Tensor,
         tp_rank: int,
         is_bias: bool = False,
+        load_full_w2: bool = False,
     ):
         # Load grouped weight scales for group quantization
         # or model weights
@@ -407,6 +408,7 @@ class FusedMoE(torch.nn.Module):
                 expert_data=expert_data,
                 tp_rank=tp_rank,
                 is_bias=is_bias,
+                load_full=load_full_w2,
             )
         elif shard_id in ("w1", "w3", "w13"):
             self._load_w13(
@@ -510,6 +512,7 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.Tensor,
         tp_rank: int,
         is_bias: bool = False,
+        load_full: bool = False,
     ):
         """Load w2 weights for down projection.
 
@@ -536,6 +539,14 @@ class FusedMoE(torch.nn.Module):
 
         if shard_id != "w2":
             raise ValueError(f"shard_id must be 'w2', got {shard_id}")
+
+        # Some grouped/actorder schemes (e.g. compressed-tensors wNa16 on ROCm)
+        # keep the full, unsharded w2 scale on every TP rank (load_full_w2=True).
+        # In that case the loaded scale already matches expert_data, so copy it
+        # whole instead of narrowing, which would index out of range.
+        if load_full:
+            expert_data.copy_(loaded_weight)
+            return
 
         # Index the loaded weight for tp sharding.
         # down_proj: "RowParallel" so tp sharding on input_dim
@@ -945,6 +956,7 @@ class FusedMoE(torch.nn.Module):
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
                     tp_rank=tp_rank,
+                    load_full_w2=getattr(param, "load_full_w2", False),
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust FP8 per-tensor scaling number for e4m3fnuz (AMD)
