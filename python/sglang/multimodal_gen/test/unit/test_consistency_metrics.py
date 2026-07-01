@@ -55,6 +55,7 @@ def test_remote_video_gt_candidates_survive_inconclusive_probe(monkeypatch):
 
 
 def test_remote_image_gt_prefers_official_when_present(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
     official_prefix = test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE + "/"
     expected_filename = f"unit_image_1gpu.{test_utils.output_format_to_ext(None)}"
     monkeypatch.setattr(
@@ -81,6 +82,7 @@ def test_remote_image_gt_prefers_official_when_present(monkeypatch):
 
 
 def test_remote_image_gt_falls_back_to_sglang_when_official_missing(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
     sglang_prefix = test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE + "/"
     expected_filename = f"unit_image_1gpu.{test_utils.output_format_to_ext(None)}"
     monkeypatch.setattr(
@@ -107,6 +109,7 @@ def test_remote_image_gt_falls_back_to_sglang_when_official_missing(monkeypatch)
 
 
 def test_remote_npu_image_gt_prefers_official_ascend_when_present(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
     official_ascend_prefix = (
         test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE_ASCEND + "/"
     )
@@ -132,6 +135,53 @@ def test_remote_npu_image_gt_prefers_official_ascend_when_present(monkeypatch):
             ),
         )
     ]
+
+
+def test_platform_gt_candidates_prefer_platform_then_default(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "5090")
+
+    assert test_utils.get_consistency_gt_candidates(
+        "unit_image",
+        1,
+        is_video=False,
+        output_format="png",
+    ) == [
+        "5090/unit_image_1gpu.png",
+        "5090/unit_image_1gpu.jpg",
+        "5090/unit_image_1gpu.webp",
+        "unit_image_1gpu.png",
+        "unit_image_1gpu.jpg",
+        "unit_image_1gpu.webp",
+    ]
+
+
+def test_threshold_metadata_merges_platform_override():
+    metadata = test_utils._merge_threshold_metadata(
+        {
+            "cases": {
+                "case_a": {
+                    "clip_threshold": 0.9,
+                    "ssim_threshold": 0.9,
+                    "psnr_threshold": 20.0,
+                    "mean_abs_diff_threshold": 10.0,
+                }
+            },
+            "default_clip_threshold_image": 0.92,
+        },
+        {
+            "cases": {
+                "case_a": {
+                    "clip_threshold": 0.8,
+                    "ssim_threshold": 0.7,
+                    "psnr_threshold": 12.0,
+                    "mean_abs_diff_threshold": 20.0,
+                }
+            }
+        },
+    )
+
+    assert metadata["default_clip_threshold_image"] == 0.92
+    assert metadata["cases"]["case_a"]["psnr_threshold"] == 12.0
 
 
 def test_pixel_metrics_identical_image():
