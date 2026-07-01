@@ -1131,6 +1131,7 @@ jobs:
         timeout-minutes: 60
         run: |
           docker exec ci_sglang rocm-smi --showtopotype || true
+          docker exec ci_sglang bash -c 'strings $(python3 -c "import mooncake,os;print(os.path.dirname(mooncake.__file__))")/engine*.so | grep -iE "rdma,hip|Unsupported multi-protocol"' || true
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
             -e MC_LOG_LEVEL=TRACE \
