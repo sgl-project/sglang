@@ -196,16 +196,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mi355x-${{ matrix.config.name }}-${{ github.run_id }}
-          path: ${{ github.workspace }}/*.json
-          retention-days: 30
-          if-no-files-found: warn
-
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-mi355x-${{ matrix.config.name }}-${{ github.run_id }}
-          path: ${{ github.workspace }}/*_logs.tar.gz
+          path: |
+            ${{ github.workspace }}/*.json
+            ${{ github.workspace }}/*_logs.tar.gz
           retention-days: 30
           if-no-files-found: warn
 
