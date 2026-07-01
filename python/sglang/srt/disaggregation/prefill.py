@@ -471,9 +471,10 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         while True:
-            # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            if not self._maybe_run_self_benchmark_step():
+                # Receive requests
+                recv_reqs = self.request_receiver.recv_requests()
+                self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
@@ -503,9 +504,10 @@ class SchedulerDisaggregationPrefillMixin:
         self.result_queue = deque()
 
         while True:
-            # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            if not self._maybe_run_self_benchmark_step():
+                # Receive requests
+                recv_reqs = self.request_receiver.recv_requests()
+                self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )

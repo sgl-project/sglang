@@ -1786,9 +1786,10 @@ class SchedulerDisaggregationDecodeMixin:
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
         while True:
-            # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            if not self._maybe_run_self_benchmark_step():
+                # Receive requests
+                recv_reqs = self.request_receiver.recv_requests()
+                self.process_input_requests(recv_reqs)
             self.process_decode_queue()
             if self._engine_paused:
                 continue
@@ -1818,9 +1819,10 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
-            # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            if not self._maybe_run_self_benchmark_step():
+                # Receive requests
+                recv_reqs = self.request_receiver.recv_requests()
+                self.process_input_requests(recv_reqs)
             self.process_decode_queue()
             if self._engine_paused:
                 continue
