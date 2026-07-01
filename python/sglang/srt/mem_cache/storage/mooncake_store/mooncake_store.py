@@ -6,7 +6,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 import requests
 import torch
@@ -297,9 +297,14 @@ class MooncakeBaseStore:
 
         return config
 
-    def register_buffer(self, tensor: torch.Tensor):
+    def register_buffer(self, tensor):
         if self.store is None:
             raise RuntimeError("Mooncake store is not initialized.")
+        if isinstance(tensor, (list, tuple)):
+            for t in tensor:
+                if t is not None:
+                    self.register_buffer(t)
+            return
         ptr = tensor.data_ptr()
         size = tensor.numel() * tensor.element_size()
         ret_code = self.store.register_buffer(ptr, size)
@@ -324,9 +329,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         total = 0
         seen_ptrs: set[int] = set()
 
-        def _add_tensor(t: Optional[torch.Tensor]):
+        def _add_tensor(t: Optional[Union[torch.Tensor, tuple, list]]):
             nonlocal total
             if t is None:
+                return
+            if isinstance(t, (tuple, list)):
+                for item in t:
+                    _add_tensor(item)
                 return
             try:
                 ptr = int(t.data_ptr())
@@ -579,7 +588,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             lambda: [getattr(host_pool, "kv_buffer", None)],
         )
         for buf in get_buffers():
-            if buf is not None:
+            if buf is None:
+                continue
+            if isinstance(buf, (list, tuple)):
+                for b in buf:
+                    if b is not None:
+                        yield b
+            else:
                 yield buf
 
     def check_server(self):
