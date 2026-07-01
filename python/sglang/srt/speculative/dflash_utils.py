@@ -780,15 +780,85 @@ def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 
-    if (
-        req.sampling_params.json_schema is not None
-        or req.sampling_params.regex is not None
-        or req.sampling_params.ebnf is not None
-        or req.sampling_params.structural_tag is not None
-    ):
-        return (
-            "DFLASH speculative decoding does not support "
-            "grammar-constrained decoding yet."
-        )
-
+    # Grammar-constrained decoding (json_schema / regex / ebnf / structural_tag) IS
+    # supported: dflash_worker_v2 verify masks each block position's target logits
+    # along the draft path (apply_dflash_grammar_vocab_mask). No request rejection.
     return None
+
+
+def apply_dflash_grammar_vocab_mask(
+    *,
+    reqs,
+    candidates,
+    next_token_logits,
+    block_size: int,
+) -> None:
+    """Mask the DFlash verify block's target logits to grammar-legal tokens.
+
+    DFLASH verifies a linear block ``[c0, c1, ..., c_{T-1}]`` in one target forward;
+    ``logits[pos]`` predicts the token following ``c_pos``. A grammar FSM is
+    sequential (the legal set at ``pos`` depends on ``c1..c_pos``), so we build the
+    bitmask along the DRAFT path -- mirroring EAGLE's ``generate_token_bitmask``,
+    adapted from a tree to DFlash's linear block:
+
+      * fill position 0 from the request's current FSM state;
+      * for pos = 1..T-1, if the drafted token ``c_pos`` is legal under position
+        ``pos-1``'s mask, advance the FSM and fill position ``pos``; stop at the
+        first grammar-illegal draft (its mask at ``pos-1`` already forbids it,
+        forcing rejection + a legal bonus there).
+
+    Rows left unfilled (non-grammar reqs / positions past a violation or
+    termination) keep ``allocate_vocab_mask``'s all-allowed default, so mixed
+    batches and the non-grammar fast path are unaffected. The FSM is advanced and
+    rolled back here; the commit-time advance is handled generically by the
+    scheduler batch-result processor over the accepted run.
+    """
+    grammar_ref = next(
+        (getattr(r, "grammar", None) for r in reqs if getattr(r, "grammar", None) is not None),
+        None,
+    )
+    if grammar_ref is None:
+        return
+
+    vocab_size = int(next_token_logits.shape[-1])
+    T = int(block_size)
+    bitmask = grammar_ref.allocate_vocab_mask(
+        vocab_size=vocab_size, batch_size=len(reqs) * T, device="cpu"
+    )
+    cand_cpu = candidates.to("cpu")
+    filled = False
+
+    for i, req in enumerate(reqs):
+        g = getattr(req, "grammar", None)
+        # Skip reqs without a grammar AND reqs whose grammar has ALREADY terminated
+        # (e.g. the JSON closed in a prior block): xgrammar raises if you fill the
+        # mask after the stop token was accepted. Their rows stay all-allowed; the
+        # model emits EOS/trailing freely and the scheduler result processor handles
+        # the finished grammar.
+        if g is None or g.is_terminated():
+            continue
+        base = i * T
+        advanced = 0
+        try:
+            g.fill_vocab_mask(bitmask, base)
+            filled = True
+            for pos in range(1, T):
+                tok = int(cand_cpu[i, pos].item())
+                parent = bitmask[base + pos - 1]
+                if tok >= vocab_size or (
+                    int(parent[tok // 32].item()) & (1 << (tok % 32))
+                ) == 0:
+                    break  # draft diverges from grammar; rest stays all-allowed
+                g.accept_token(tok)
+                advanced += 1
+                if g.is_terminated():
+                    break
+                g.fill_vocab_mask(bitmask, base + pos)
+        finally:
+            if advanced:
+                g.rollback(advanced)
+
+    if not filled:
+        return
+    vocab_mask = grammar_ref.move_vocab_mask(bitmask, next_token_logits.device)
+    grammar_ref.apply_vocab_mask(logits=next_token_logits, vocab_mask=vocab_mask)

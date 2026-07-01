@@ -25,6 +25,7 @@ from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
+    apply_dflash_grammar_vocab_mask,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
@@ -1601,6 +1602,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_token_num=int(self.block_size),
             )
 
+        # Grammar-constrained decoding: mask each block position's target logits
+        # to the grammar-legal set along the draft path before accept/argmax, so
+        # accepted drafts and the bonus token are valid. No-op without grammar.
+        if getattr(model_worker_batch, "has_grammar", False):
+            apply_dflash_grammar_vocab_mask(
+                reqs=model_worker_batch.reqs,
+                candidates=draft_tokens,
+                next_token_logits=logits_output.next_token_logits,
+                block_size=int(self.block_size),
+            )
         candidates = draft_tokens
         new_seq_lens = None
         if (
