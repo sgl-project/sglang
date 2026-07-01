@@ -612,7 +612,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         scores = None
         if self.index_share_for_mtp_iteration:
             forward_batch.reuse_mtp_topk_indices = True
-            forward_batch.topk_indices = None
+            spec_info.mtp_topk_indices = None
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -688,7 +688,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             forward_batch.positions.add_(1)
 
         if self.index_share_for_mtp_iteration:
-            forward_batch.topk_indices = None
+            spec_info.mtp_topk_indices = None
             forward_batch.reuse_mtp_topk_indices = False
 
         # Organize the results
@@ -1544,6 +1544,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_index,
         ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
+        clear_unaccepted_c128 = getattr(
+            self.token_to_kv_pool_allocator.get_kvcache(),
+            "clear_unaccepted_c128_draft_states",
+            None,
+        )
+        if clear_unaccepted_c128 is not None and not batch.forward_mode.is_idle():
+            clear_unaccepted_c128(
+                batch.req_pool_indices,
+                batch.seq_lens,
+                accept_lens,
+                self.speculative_num_draft_tokens,
+            )
 
         # Update mamba state for hybrid GDN models after verification
         commit_mamba_states_after_verify(
