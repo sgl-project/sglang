@@ -766,21 +766,16 @@ def _causal_conv1d_update_kernel(
     # first kernel column, configured for weights to handle BLOCK_N features in range
     if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
         idx_tokens = tl.arange(0, NP2_SEQLEN)  # [BLOCK_M]
-        # Update parent mapping for all tokens at once using vectorized operations
         mask_retrieve = idx_tokens < seqlen
-        retrieve_next_token_base = (
-            retrieve_next_token_ptr
-            + (idx_seq * stride_retrieve_next_token_seq)
-            + idx_tokens * stride_retrieve_next_token_token
+        # Load pre-computed parent map directly (computed by build_tree_kernel_efficient)
+        retrieve_parent_token_base = (
+            retrieve_parent_token_ptr
+            + (idx_seq * stride_retrieve_parent_token_seq)
+            + idx_tokens * stride_retrieve_parent_token_token
         )
-        retrieve_next_tokens = tl.load(retrieve_next_token_base, mask_retrieve)
-        retrieve_next_sibling_base = (
-            retrieve_next_sibling_ptr
-            + (idx_seq * stride_retrieve_next_sibling_seq)
-            + idx_tokens * stride_retrieve_next_sibling_token
-        )
-        retrieve_next_siblings = tl.load(retrieve_next_sibling_base, mask_retrieve)
-        parent_idx_tokens = tl.zeros((NP2_SEQLEN,), dtype=tl.int32)
+        parent_idx_tokens = tl.load(
+            retrieve_parent_token_base, mask_retrieve, other=0
+        ).to(tl.int32)
 
     w_base = w_ptr + (idx_feats * stride_w_dim)  # [BLOCK_N,]
     mask_w = idx_feats < dim
@@ -804,32 +799,6 @@ def _causal_conv1d_update_kernel(
         acc = acc_preload
 
         if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
-            # set the parent index of the next token in the eagle tree
-            # next token's parent is the current token
-            retrieve_next_token_idx = tl.sum(
-                tl.where(idx_tokens == idx_token, retrieve_next_tokens, 0)
-            )
-            if retrieve_next_token_idx != -1:  # pad slot id
-                parent_idx_tokens = tl.where(
-                    idx_tokens == retrieve_next_token_idx,
-                    idx_token,
-                    parent_idx_tokens,
-                )
-            # next token's parent is the parent of the current token
-            retrieve_sibling_token_idx = tl.sum(
-                tl.where(idx_tokens == idx_token, retrieve_next_siblings, 0)
-            )
-            if retrieve_sibling_token_idx != -1:  # pad slot id
-                parent_idx_token = tl.sum(
-                    tl.where(idx_tokens == idx_token, parent_idx_tokens, 0)
-                )
-                parent_idx_tokens = tl.where(
-                    idx_tokens == retrieve_sibling_token_idx,
-                    parent_idx_token,
-                    parent_idx_tokens,
-                )
-            # tl.device_print("am", parent_idx_tokens)
-
             _idx_token = idx_token
             x_ptrs_1d = x_base_1d + _idx_token * stride_x_token  # [BLOCK_N]
             matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
@@ -879,9 +848,11 @@ def _causal_conv1d_update_kernel(
 
                 # move to parent for next iteration
                 if _idx_token > 0:
-                    _idx_token = tl.sum(
-                        tl.where(idx_tokens == _idx_token, parent_idx_tokens, 0)
-                    )
+                    _idx_token = tl.load(
+                        retrieve_parent_token_ptr
+                        + idx_seq * stride_retrieve_parent_token_seq
+                        + _idx_token * stride_retrieve_parent_token_token
+                    ).to(tl.int32)
                     x_ptrs_1d = x_base_1d + _idx_token * stride_x_token  # [BLOCK_N]
                     matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
                 else:
@@ -974,18 +945,204 @@ def _causal_conv1d_update_kernel(
 
         tl.store(o_ptrs, acc, mask=mask_1d)
 
-        # fuse: store calculated retrieve_parent_token to tensor
-        if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
-            tl.store(
+
+@triton.jit()
+def _causal_conv1d_verify_token_parallel_kernel(
+    # Pointers to matrices
+    x_ptr,  # (batch, dim, seqlen)
+    w_ptr,  # (dim, width)
+    bias_ptr,
+    conv_state_ptr,
+    conv_state_indices_ptr,
+    retrieve_parent_token_ptr,  # INPUT: pre-computed parent map [batch, seqlen]
+    intermediate_conv_window_ptr,
+    intermediate_state_indices_ptr,
+    o_ptr,  # (batch, dim, seqlen)
+    # Matrix dimensions
+    batch: int,
+    dim: tl.constexpr,
+    seqlen: tl.constexpr,
+    state_len: tl.constexpr,
+    num_cache_lines: tl.constexpr,
+    # Strides
+    stride_x_seq: tl.constexpr,
+    stride_x_dim: tl.constexpr,
+    stride_x_token: tl.constexpr,
+    stride_w_dim: tl.constexpr,
+    stride_w_width: tl.constexpr,
+    stride_conv_state_seq: tl.constexpr,
+    stride_conv_state_dim: tl.constexpr,
+    stride_conv_state_tok: tl.constexpr,
+    stride_state_indices: tl.constexpr,
+    stride_inter_seq: tl.constexpr,
+    stride_inter_step: tl.constexpr,
+    stride_inter_dim: tl.constexpr,
+    stride_inter_win: tl.constexpr,
+    stride_intermediate_state_indices: tl.constexpr,
+    stride_retrieve_parent_token_seq: tl.constexpr,
+    stride_retrieve_parent_token_token: tl.constexpr,
+    stride_o_seq: tl.constexpr,
+    stride_o_dim: tl.constexpr,
+    stride_o_token: tl.constexpr,
+    # others
+    pad_slot_id: tl.constexpr,
+    # Meta-parameters
+    HAS_BIAS: tl.constexpr,
+    KERNEL_WIDTH: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SAVE_INTERMEDIATE: tl.constexpr,
+):
+    """Token-parallel conv1d kernel for tree-verify mode.
+
+    Grid: (batch, cdiv(dim, BLOCK_N), seqlen)
+    Each program handles ONE token independently using pre-computed parent map.
+    Does NOT update conv_state (rollback handles that).
+    """
+    idx_seq = tl.program_id(0)
+    if idx_seq >= batch:
+        return
+
+    idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    idx_token = tl.program_id(2)
+
+    conv_state_batch_coord = tl.load(
+        conv_state_indices_ptr + idx_seq * stride_state_indices
+    ).to(tl.int64)
+
+    if conv_state_batch_coord == pad_slot_id:
+        return
+
+    if SAVE_INTERMEDIATE:
+        intermediate_state_batch_coord = tl.load(
+            intermediate_state_indices_ptr + idx_seq * stride_intermediate_state_indices
+        ).to(tl.int64)
+
+    # Load bias
+    if HAS_BIAS:
+        acc = tl.load(bias_ptr + idx_feats, mask=idx_feats < dim, other=0.0).to(
+            tl.float32
+        )
+    else:
+        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    # Load weights
+    mask_w = idx_feats < dim
+    w_base = w_ptr + (idx_feats * stride_w_dim)
+    if KERNEL_WIDTH >= 2:
+        w_col0 = tl.load(w_base + 0 * stride_w_width, mask_w, other=0.0)
+        w_col1 = tl.load(w_base + 1 * stride_w_width, mask_w, other=0.0)
+    if KERNEL_WIDTH >= 3:
+        w_col2 = tl.load(w_base + 2 * stride_w_width, mask_w, other=0.0)
+    if KERNEL_WIDTH >= 4:
+        w_col3 = tl.load(w_base + 3 * stride_w_width, mask_w, other=0.0)
+
+    # Walk ancestor chain: self, parent, grandparent, ...
+    x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)
+    conv_states_base = (
+        conv_state_ptr
+        + (conv_state_batch_coord * stride_conv_state_seq)
+        + (idx_feats * stride_conv_state_dim)
+    )
+
+    _idx_token = idx_token
+    # Load current token's value
+    x_ptrs_1d = x_base + _idx_token * stride_x_token
+    matrix_x = tl.load(x_ptrs_1d, mask=mask_w)
+
+    for j in tl.static_range(KERNEL_WIDTH):
+        # Select weight for this convolution position
+        if KERNEL_WIDTH == 2:
+            if j == 0:
+                matrix_w = w_col1
+            else:
+                matrix_w = w_col0
+        elif KERNEL_WIDTH == 3:
+            if j == 0:
+                matrix_w = w_col2
+            elif j == 1:
+                matrix_w = w_col1
+            else:
+                matrix_w = w_col0
+        elif KERNEL_WIDTH == 4:
+            if j == 0:
+                matrix_w = w_col3
+            elif j == 1:
+                matrix_w = w_col2
+            elif j == 2:
+                matrix_w = w_col1
+            else:
+                matrix_w = w_col0
+
+        if SAVE_INTERMEDIATE:
+            base_ptr = (
+                intermediate_conv_window_ptr
+                + intermediate_state_batch_coord * stride_inter_seq
+                + idx_token * stride_inter_step
+                + idx_feats * stride_inter_dim
+            )
+            if KERNEL_WIDTH - j - 2 >= 0:
+                tl.store(
+                    base_ptr + (KERNEL_WIDTH - j - 2) * stride_inter_win,
+                    matrix_x,
+                    mask=mask_w,
+                )
+
+        acc += matrix_x * matrix_w
+
+        # Move to parent for next iteration
+        if _idx_token > 0:
+            _idx_token = tl.load(
                 retrieve_parent_token_ptr
                 + idx_seq * stride_retrieve_parent_token_seq
-                + idx_tokens * stride_retrieve_parent_token_token,
-                parent_idx_tokens,
-                mask=mask_retrieve,
-            )
+                + _idx_token * stride_retrieve_parent_token_token
+            ).to(tl.int32)
+            x_ptrs_1d = x_base + _idx_token * stride_x_token
+            matrix_x = tl.load(x_ptrs_1d, mask=mask_w)
+        else:
+            # Load from conv_state history
+            if KERNEL_WIDTH == 2:
+                if _idx_token == 0:
+                    matrix_x = tl.load(
+                        conv_states_base + 0 * stride_conv_state_tok, mask_w, 0.0
+                    )
+            elif KERNEL_WIDTH == 3:
+                if _idx_token == 0:
+                    matrix_x = tl.load(
+                        conv_states_base + 1 * stride_conv_state_tok, mask_w, 0.0
+                    )
+                else:
+                    matrix_x = tl.load(
+                        conv_states_base + 0 * stride_conv_state_tok, mask_w, 0.0
+                    )
+            elif KERNEL_WIDTH == 4:
+                if _idx_token == 0:
+                    matrix_x = tl.load(
+                        conv_states_base + 2 * stride_conv_state_tok, mask_w, 0.0
+                    )
+                elif _idx_token == -1:
+                    matrix_x = tl.load(
+                        conv_states_base + 1 * stride_conv_state_tok, mask_w, 0.0
+                    )
+                else:
+                    matrix_x = tl.load(
+                        conv_states_base + 0 * stride_conv_state_tok, mask_w, 0.0
+                    )
+            _idx_token = _idx_token - 1
 
-    if USE_GDC:
-        tl.extra.cuda.gdc_launch_dependents()
+    # SiLU activation
+    if SILU_ACTIVATION:
+        acc = acc / (1 + tl.exp(-acc))
+
+    # Store output
+    mask_1d = (idx_token < seqlen) & (idx_feats < dim)
+    o_ptrs = (
+        o_ptr
+        + idx_seq * stride_o_seq
+        + idx_token * stride_o_token
+        + idx_feats * stride_o_dim
+    )
+    tl.store(o_ptrs, acc, mask=mask_1d)
 
 
 def causal_conv1d_update(
@@ -1135,67 +1292,139 @@ def causal_conv1d_update(
 
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
 
-    _causal_conv1d_update_kernel[grid](
-        # Pointers to matrices
-        x,
-        weight,
-        bias,
-        conv_state,
-        cache_seqlens,
-        conv_state_indices,
-        num_accept_tokens,
-        intermediate_conv_window if intermediate_conv_window is not None else x,
-        intermediate_state_indices,
-        retrieve_next_token,
-        retrieve_next_sibling,
-        retrieve_parent_token,
-        out,
-        # Matrix dimensions
-        batch,
-        dim,
-        seqlen,
-        state_len,
-        num_cache_lines,
-        # stride
-        stride_x_seq,
-        stride_x_dim,
-        stride_x_token,
-        stride_w_dim,
-        stride_w_width,
-        stride_istate_seq,
-        stride_istate_dim,
-        stride_istate_token,
-        stride_state_indices,
-        stride_inter_seq,
-        stride_inter_step,
-        stride_inter_dim,
-        stride_inter_win,
-        stride_intermediate_state_indices,
-        stride_retrieve_next_token_seq,
-        stride_retrieve_next_token_token,
-        stride_retrieve_next_sibling_seq,
-        stride_retrieve_next_sibling_token,
-        stride_retrieve_parent_token_seq,
-        stride_retrieve_parent_token_token,
-        stride_o_seq,
-        stride_o_dim,
-        stride_o_token,
-        # others
-        pad_slot_id,
-        # META
-        HAS_BIAS=bias is not None,
-        KERNEL_WIDTH=width,
-        SILU_ACTIVATION=activation in ["silu", "swish"],
-        IS_CONTINUOUS_BATCHING=conv_state_indices is not None,
-        IS_SPEC_DECODING=num_accept_tokens is not None,
-        NP2_STATELEN=np2_statelen,
-        NP2_SEQLEN=np2_seqlen,
-        USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=256,
-        SAVE_INTERMEDIATE=intermediate_conv_window is not None,
-        HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
-        **pdl_kwargs,
+    if retrieve_next_token is not None and (
+        retrieve_parent_token is None or retrieve_parent_token.numel() == 0
+    ):
+        raise ValueError(
+            "retrieve_parent_token must be provided and non-empty when retrieve_next_token is provided"
+        )
+
+    # Dispatch: use token-parallel kernel for tree-verify mode (pre-computed parent map,
+    # no spec-decoding accept/reject path which uses num_accept_tokens)
+    use_token_parallel = (
+        retrieve_parent_token is not None
+        and retrieve_parent_token.numel() > 0
+        and num_accept_tokens is None
+        and seqlen > 1
     )
+
+    if use_token_parallel:
+
+        def grid_tp(META):
+            return (
+                batch,
+                triton.cdiv(dim, META["BLOCK_N"]),
+                seqlen,
+            )
+
+        _causal_conv1d_verify_token_parallel_kernel[grid_tp](
+            # Pointers to matrices
+            x,
+            weight,
+            bias,
+            conv_state,
+            conv_state_indices,
+            retrieve_parent_token,
+            intermediate_conv_window if intermediate_conv_window is not None else x,
+            intermediate_state_indices,
+            out,
+            # Matrix dimensions
+            batch,
+            dim,
+            seqlen,
+            state_len,
+            num_cache_lines,
+            # strides
+            stride_x_seq,
+            stride_x_dim,
+            stride_x_token,
+            stride_w_dim,
+            stride_w_width,
+            stride_istate_seq,
+            stride_istate_dim,
+            stride_istate_token,
+            stride_state_indices,
+            stride_inter_seq,
+            stride_inter_step,
+            stride_inter_dim,
+            stride_inter_win,
+            stride_intermediate_state_indices,
+            stride_retrieve_parent_token_seq,
+            stride_retrieve_parent_token_token,
+            stride_o_seq,
+            stride_o_dim,
+            stride_o_token,
+            # others
+            pad_slot_id,
+            # META
+            HAS_BIAS=bias is not None,
+            KERNEL_WIDTH=width,
+            SILU_ACTIVATION=activation in ["silu", "swish"],
+            BLOCK_N=256,
+            SAVE_INTERMEDIATE=intermediate_conv_window is not None,
+        )
+    else:
+        _causal_conv1d_update_kernel[grid](
+            # Pointers to matrices
+            x,
+            weight,
+            bias,
+            conv_state,
+            cache_seqlens,
+            conv_state_indices,
+            num_accept_tokens,
+            intermediate_conv_window if intermediate_conv_window is not None else x,
+            intermediate_state_indices,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            retrieve_parent_token,
+            out,
+            # Matrix dimensions
+            batch,
+            dim,
+            seqlen,
+            state_len,
+            num_cache_lines,
+            # stride
+            stride_x_seq,
+            stride_x_dim,
+            stride_x_token,
+            stride_w_dim,
+            stride_w_width,
+            stride_istate_seq,
+            stride_istate_dim,
+            stride_istate_token,
+            stride_state_indices,
+            stride_inter_seq,
+            stride_inter_step,
+            stride_inter_dim,
+            stride_inter_win,
+            stride_intermediate_state_indices,
+            stride_retrieve_next_token_seq,
+            stride_retrieve_next_token_token,
+            stride_retrieve_next_sibling_seq,
+            stride_retrieve_next_sibling_token,
+            stride_retrieve_parent_token_seq,
+            stride_retrieve_parent_token_token,
+            stride_o_seq,
+            stride_o_dim,
+            stride_o_token,
+            # others
+            pad_slot_id,
+            # META
+            HAS_BIAS=bias is not None,
+            KERNEL_WIDTH=width,
+            SILU_ACTIVATION=activation in ["silu", "swish"],
+            IS_CONTINUOUS_BATCHING=conv_state_indices is not None,
+            IS_SPEC_DECODING=num_accept_tokens is not None,
+            NP2_STATELEN=np2_statelen,
+            NP2_SEQLEN=np2_seqlen,
+            USE_PAD_SLOT=pad_slot_id is not None,
+            BLOCK_N=256,
+            SAVE_INTERMEDIATE=intermediate_conv_window is not None,
+            HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
+            **pdl_kwargs,
+        )
     if unsqueeze:
         out = out.squeeze(-1)
     return out
