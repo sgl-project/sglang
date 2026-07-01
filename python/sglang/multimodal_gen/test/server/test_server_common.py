@@ -19,7 +19,6 @@ import pytest
 import requests
 from openai import OpenAI
 
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server import conftest
@@ -86,18 +85,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
     _fixture_start_time = time.perf_counter()
     server_args = case.server_args
-
-    # Skip ring attention tests on AMD/ROCm - Ring Attention requires Flash Attention
-    # which is not available on AMD. Use Ulysses parallelism instead.
-    if (
-        current_platform.is_hip()
-        and server_args.ring_degree is not None
-        and server_args.ring_degree > 1
-    ):
-        pytest.skip(
-            f"Skipping {case.id}: Ring Attention (ring_degree={server_args.ring_degree}) "
-            "requires Flash Attention which is not available on AMD/ROCm"
-        )
 
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))

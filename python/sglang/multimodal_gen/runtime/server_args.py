@@ -591,18 +591,22 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.component_attention_backends["text_encoder"] = "torch_sdpa"
 
         if self.ring_degree > 1:
-            if self.attention_backend is not None and self.attention_backend not in (
-                "fa",
-                "sage_attn",
+            ring_compatible_backends = ("fa", "sage_attn", "aiter")
+            if (
+                self.attention_backend is not None
+                and self.attention_backend not in ring_compatible_backends
             ):
                 raise ValueError(
-                    "Ring Attention is only supported for flash attention or sage attention backend for now"
+                    f"Ring Attention is only supported for {ring_compatible_backends} backends, "
+                    f"but got '{self.attention_backend}'"
                 )
             if self.attention_backend is None:
-                self.attention_backend = "fa"
+                self._set_default_attention_backend()
+                if self.attention_backend is None:
+                    self.attention_backend = "fa"
                 logger.info(
-                    "Ring Attention is currently only supported for flash attention or sage attention; "
-                    "attention_backend has been automatically set to flash attention"
+                    "Ring Attention: attention_backend has been automatically set to '%s'",
+                    self.attention_backend,
                 )
 
         if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
