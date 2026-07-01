@@ -297,10 +297,12 @@ class OffloaderV2(BaseOffloader):
             # When it is capturing, only wait on prefetches recorded inside this same capture.
             if not offloader.prefetch_in_capture:
                 return
+            assert offloader.copy_done_event is not None
             torch.cuda.current_stream().wait_event(offloader.copy_done_event)
             offloader.prefetch_in_capture = False
         else:
             if offloader.event_valid_for_eager:
+                assert offloader.copy_done_event is not None
                 torch.cuda.current_stream().wait_event(offloader.copy_done_event)
             else:
                 # Event recorded inside a previous capture; join alt_stream.
@@ -329,6 +331,7 @@ class OffloaderV2(BaseOffloader):
             return
         for offloader in self.offloaders:
             if offloader.prefetch_in_capture:
+                assert offloader.copy_done_event is not None
                 torch.cuda.current_stream().wait_event(offloader.copy_done_event)
                 offloader.prefetch_in_capture = False
 
@@ -390,24 +393,28 @@ def _hook_module_forward(
     ``mutates_args`` on the input/output tensors keeps dynamo from reordering
     the wait/start across the layer's compute, while the ops themselves hide
     the underlying ``torch.cuda.Stream`` / ``Event`` from dynamo tracing.
+
+    ``original_forward`` is invoked directly (not through ``module.forward``),
+    so no attribute swap is needed. Avoiding the swap keeps this wrapper free
+    of module-attribute side effects that would break ``torch.compile``'s
+    ``fullgraph=True`` tracing used by the tc_piecewise CUDA graph backend.
     """
     original_forward = module.forward
+    num_layers = None  # resolved lazily; offloader.offloaders is empty until wrap_modules finishes
 
     def forward(*args, **kwargs):
-        module.forward = original_forward
-        try:
-            in_t = _first_tensor_arg(args, kwargs)
-            if in_t is not None:
-                torch.ops.sglang.offloader_v2_wait_prefetch(in_t, index)
-            output = original_forward(*args, **kwargs)
-            num = len(offloader.offloaders)
-            next_idx = (index + offloader.prefetch_step) % num
-            out_t = _first_tensor_out(output)
-            if out_t is not None:
-                torch.ops.sglang.offloader_v2_start_prefetch(out_t, next_idx)
-            return output
-        finally:
-            module.forward = forward
+        nonlocal num_layers
+        in_t = _first_tensor_arg(args, kwargs)
+        if in_t is not None:
+            torch.ops.sglang.offloader_v2_wait_prefetch(in_t, index)
+        output = original_forward(*args, **kwargs)
+        if num_layers is None:
+            num_layers = len(offloader.offloaders)
+        next_idx = (index + offloader.prefetch_step) % num_layers
+        out_t = _first_tensor_out(output)
+        if out_t is not None:
+            torch.ops.sglang.offloader_v2_start_prefetch(out_t, next_idx)
+        return output
 
     module.forward = forward
 
@@ -429,12 +436,17 @@ class _ModuleOffloader:
             "cpu"
         ), "module parameters must start on the device; offloader handles CPU placement"
 
-        # Event when copy is complete.
-        self.copy_done_event = torch.cuda.Event()
-        # Event when forward compute is complete.
-        self.comp_done_event = torch.cuda.Event()
-        # True when the most recent record() happened outside a graph capture
-        # (events recorded during capture are unusable in eager wait).
+        # Persistent events for the eager path (hot inference loop). Events
+        # recorded outside any CUDA graph capture are safe to reuse
+        # indefinitely. Capture invocations allocate fresh events per call
+        # -- reusing a Event across independently-captured CUDA graphs
+        # corrupts PyTorch's stream-capture tracker and manifests as
+        # intermittent ``cudaErrorStreamCaptureUnjoined``.
+        self._eager_comp_done = torch.cuda.Event()
+        self._eager_copy_done = torch.cuda.Event()
+        self.copy_done_event: Optional[torch.cuda.Event] = None
+        # True when the last recorded ``copy_done_event`` is safe to wait on
+        # from eager (events recorded during capture are unusable outside it).
         self.event_valid_for_eager = False
         # True when the most recent prefetch was started inside a capture.
         self.prefetch_in_capture = False
@@ -452,13 +464,6 @@ class _ModuleOffloader:
     def post_init(self):
         for offloader in self._param_offloaders.values():
             offloader.post_init()
-
-    def start_onload(self):
-        if torch.cuda.is_current_stream_capturing():
-            self._device_tensors = self._create_device_tensors()
-            self._load_event = None
-            return
-        self.alt_stream.wait_stream(torch.cuda.current_stream())
 
     def prepare(self) -> None:
         for offloader in self._param_offloaders.values():
@@ -494,46 +499,46 @@ class _ModuleOffloader:
             )
             offloader.assign_device_buffer(buffer)
 
-    # def start_onload(self) -> None:
-    #     """Start parameter fetch task.
+    def start_onload(self) -> None:
+        """Start parameter fetch task.
 
-    #     IMPORTANT: Onload stream must wait for current forward compute to complete.
-    #     And ensure the streams are fully synced. This allows CUDA Graph capturing.
-    #     """
-    #     self.prefetch_in_capture = torch.cuda.is_current_stream_capturing()
+        IMPORTANT: Onload stream must wait for current forward compute to complete.
+        And ensure the streams are fully synced. This allows CUDA Graph capturing.
+        """
+        is_capture = torch.cuda.is_current_stream_capturing()
+        self.prefetch_in_capture = is_capture
 
-    #     # alt_stream waits for forward compute to complete.
-    #     # This orchestration allows alt_stream copy to be captured.
-    #     torch.cuda.current_stream().record_event(self.comp_done_event)
-    #     self.alt_stream.wait_event(self.comp_done_event)
+        if is_capture:
+            # Fresh events per capture invocation: CUDA / PyTorch bind an
+            # event's capture-tracker state to the graph it was recorded in;
+            # touching that event in another capture triggers
+            # ``cudaErrorStreamCaptureUnjoined`` at ``cudaStreamEndCapture``.
+            # Capture only happens during warmup so the extra
+            # ``cudaEventCreate`` calls are one-time cost.
+            comp_done = torch.cuda.Event()
+            copy_done = torch.cuda.Event()
+        else:
+            # Eager (hot) path: reuse persistent events to avoid per-call
+            # ``cudaEventCreate`` overhead. Safe because these events are
+            # never recorded inside a capture.
+            comp_done = self._eager_comp_done
+            copy_done = self._eager_copy_done
 
-    #     # Trigger parameter fetch.
-    #     with torch.cuda.stream(self.alt_stream):
-    #         for offloader in self._param_offloaders.values():
-    #             offloader.load_device_tensor()
+        # alt_stream waits for forward compute to complete.
+        # This orchestration allows alt_stream copy to be captured.
+        torch.cuda.current_stream().record_event(comp_done)
+        self.alt_stream.wait_event(comp_done)
 
-    def offload(self):
-        self._device_tensors = None
-        self._load_event = None
+        # Trigger parameter fetch.
+        with torch.cuda.stream(self.alt_stream):
+            for offloader in self._param_offloaders.values():
+                offloader.load_device_tensor()
 
-    def wait_and_get_device_tensors(self):
-        assert self._device_tensors is not None
-        if torch.cuda.is_current_stream_capturing():
-            if self._load_event is not None:
-                self._device_tensors = self._create_device_tensors()
-                self._load_event = None
-            return self._device_tensors
-        if self._load_event is not None:
-            self._load_event.wait()
-        return self._device_tensors
-
-    def _create_device_tensors(self):
-        return {k: v.create_device_tensor() for k, v in self._param_offloaders.items()}
-        # # Record copy completion event.
-        # self.copy_done_event.record(self.alt_stream)
-        # # Event is only valid for eager wait_event if recorded outside capture.
-        # # Events recorded during capture become invalid after capture ends.
-        # self.event_valid_for_eager = not self.prefetch_in_capture
+        # Record copy completion on alt_stream so the consumer stream can wait
+        # on this specific copy instead of blocking on the whole alt_stream.
+        copy_done.record(self.alt_stream)
+        self.copy_done_event = copy_done
+        self.event_valid_for_eager = not is_capture
 
 
 class _BaseParamOffloader(ABC):
