@@ -162,6 +162,15 @@ jobs:
         working-directory: experimental/sgl-router
         run: cargo check --all-targets
 
+      # `profiling` (the pprof flamegraph debug route) is optional and absent
+      # from every other check/build/test step here, so without this it can
+      # silently stop compiling — discovered only when someone reaches for it
+      # during an incident, the worst possible time. Its actual test
+      # execution happens in the build-and-test job below.
+      - name: cargo check --features profiling
+        working-directory: experimental/sgl-router
+        run: cargo check --features profiling --all-targets
+
       - name: cargo clippy
         working-directory: experimental/sgl-router
         run: cargo clippy --all-targets -- -D warnings
@@ -247,6 +256,13 @@ jobs:
         # full test path `tokenizer::parity::parity_matrix`; substring
         # `parity_matrix` is unique to that test.
         run: cargo test --release -- --skip parity_matrix
+
+      # `profiling`'s own tests (routes::pprof) only exist under this feature
+      # — without this step they'd sit in the tree looking like coverage
+      # while never actually running.
+      - name: cargo test --features profiling
+        working-directory: experimental/sgl-router
+        run: cargo test --release --features profiling -- --skip parity_matrix
 
       # Regenerate the cross-impl block-hash parity fixture and fail if it
       # differs from the committed file.  The Python script replicates

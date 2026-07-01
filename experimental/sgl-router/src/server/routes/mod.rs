@@ -6,4 +6,6 @@ pub mod chat;
 pub mod health;
 pub mod metrics;
 pub mod models;
+#[cfg(feature = "profiling")]
+pub mod pprof;
 pub mod tokenize;

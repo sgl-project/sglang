@@ -2,6 +2,15 @@
 resolver = "2"
 members = ["."]
 
+# Cargo profiles can't be gated by feature, so this applies to every release
+# build, prod included — the prod Dockerfile strips the binary regardless
+# (docker/sgl-router.Dockerfile), making this a no-op on that final shipped
+# artifact, not on the build itself. Only a profiling build that skips that
+# strip step benefits, getting named functions instead of hex addresses in
+# the flamegraph.
+[profile.release]
+debug = 1
+
 [package]
 name = "sgl-router"
 version = "0.1.0"
@@ -84,6 +93,15 @@ rmp-serde = "1"
 sha2 = "0.10"
 url = "2"
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
+
+# Signal-based (SIGPROF/setitimer) CPU profiler, not perf_event_open — works
+# unprivileged in a container regardless of perf_event_paranoid. Optional: only
+# in the binary when built with --features profiling, so the normal image
+# carries no profiling code or attack surface.
+pprof = { version = "0.13", features = ["flamegraph"], optional = true }
+
+[features]
+profiling = ["pprof"]
 
 [dev-dependencies]
 dirs = "5"

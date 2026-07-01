@@ -228,7 +228,7 @@ async fn access_log_and_record(
 }
 
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
         .route("/readyz", get(crate::server::routes::health::readyz))
         .route("/metrics", get(crate::server::routes::metrics::metrics))
@@ -253,7 +253,18 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/flush_cache",
             post(crate::server::routes::cache::flush_cache),
-        )
+        );
+
+    // Debug-only CPU flamegraph endpoint — compiled in only with `--features
+    // profiling` (see Cargo.toml and `routes::pprof`'s module doc), never
+    // present in the normal production image.
+    #[cfg(feature = "profiling")]
+    let router = router.route(
+        "/debug/pprof/profile",
+        get(crate::server::routes::pprof::profile),
+    );
+
+    router
         // Convert a handler panic into a 500 response. hyper otherwise catches
         // the panic and drops the connection WITHOUT a Response, so the failure
         // never reaches the `access_log_and_record` middleware below and is
