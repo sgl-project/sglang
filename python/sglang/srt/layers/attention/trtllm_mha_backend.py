@@ -12,10 +12,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.flashinfer_backend import (
-    FlashInferAttnBackend,
-    FlashInferMultiStepDraftBackend,
-)
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
@@ -66,7 +63,7 @@ class TRTLLMMHAMetadata:
     swa_out_cache_loc: torch.Tensor = None
 
 
-class TRTLLMHAAttnBackend(FlashInferAttnBackend):
+class TRTLLMHAAttnBackend(AttentionBackend):
     """TRTLLM MHA attention kernel from flashinfer."""
 
     # Build the page table on-device from seq_lens (incl. the SWA-translated table
@@ -91,9 +88,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
         )
 
-        super().__init__(
-            model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
-        )
+        super().__init__()
+
+        # These attributes were previously set by FlashInferAttnBackend.__init__.
+        # Now that we inherit directly from AttentionBackend, we set them ourselves.
+        # KV cache memory pool — shared across all attention backends.
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+
+        # SWA (sliding window attention) pool. None if the model doesn't use SWA.
+        self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
+
+        # Whether sliding window attention is enabled for this model.
+        self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
 
         config = model_runner.model_config
 
@@ -132,10 +138,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
-
-        # SWA hybrid models split the KV cache into full and SWA pools with
-        # separate index spaces; SWA layers need a translated page_table.
-        self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
 
         # Static page-table width (upper bound). The CUDA-graph path builds the
         # page table on-device sized to this constant, so it never reads a runtime
@@ -930,7 +932,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
 
-class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
+class TRTLLMHAAttnMultiStepDraftBackend:
     """Multi-step TRTLLM MHA attention kernel used by EAGLE."""
 
     # Per-step backends build the page table on-device (sync-free); mirror that so
@@ -940,15 +942,33 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
     def __init__(
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
     ):
-        super().__init__(model_runner, topk, speculative_num_steps)
+        # Basic parameters (previously inherited from FlashInferMultiStepDraftBackend).
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.speculative_num_draft_tokens = (
+            model_runner.server_args.speculative_num_draft_tokens
+        )
+        self.page_size = model_runner.page_size
+
+        # Create TRTLLM attention backends directly (one per draft step).
+        # The parent FlashInferMultiStepDraftBackend used to create
+        # FlashInferAttnBackend instances and then we immediately replaced
+        # them — now we skip that waste entirely.
+        self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i] = TRTLLMHAAttnBackend(
-                model_runner,
-                skip_prefill=True,
-                kv_indptr_buf=self.kv_indptr[i],
-                kv_last_page_len_buf=self.kv_last_page_len,
-                speculative_step_id=i,
+            self.attn_backends.append(
+                TRTLLMHAAttnBackend(
+                    model_runner,
+                    skip_prefill=True,
+                    speculative_step_id=i,
+                )
             )
+
+        self.max_context_len = (
+            self.attn_backends[0].max_context_len
+            if self.attn_backends
+            else model_runner.model_config.context_len
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
@@ -980,3 +1000,8 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
             self.attn_backends[i].init_forward_metadata_out_graph(
                 inner_fb, in_capture=in_capture
             )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        """Graph-recordable per-step init — simply delegates to each sub-backend."""
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata_in_graph(forward_batch)
