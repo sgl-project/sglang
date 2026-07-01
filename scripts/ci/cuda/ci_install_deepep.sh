@@ -183,3 +183,14 @@ else
     fi
     TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" python3 setup.py install
 fi
+
+# Post-install verification: the legacy v1 `Buffer` must still import (the existing
+# DeepEP backend depends on it), and on the default pin the v2 `ElasticBuffer` must
+# import as well. Importing `ElasticBuffer` also exercises the NCCL symmetric-memory
+# API (nccl::NCCLSymmetricMemoryContext) that deepep_v2 links, so a clean import
+# confirms the build found an NCCL shipping the symmetric-memory headers.
+if [ "$GRACE_BLACKWELL" = "1" ]; then
+    python3 -c "from deep_ep import Buffer; print('DeepEP install verified: v1 Buffer imports')"
+else
+    python3 -c "from deep_ep import Buffer, ElasticBuffer; print('DeepEP install verified: v1 Buffer + v2 ElasticBuffer import')"
+fi
