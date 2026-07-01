@@ -69,24 +69,84 @@ class SchedulerDllmMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
-        if result.next_token_ids:
-            self.token_to_kv_pool_allocator.free_group_begin()
+        fdfo_mode = self.dllm_config.first_done_first_out_mode
+        assert (
+            not fdfo_mode or result.accept_length_per_req_cpu is not None
+        ), "FDFO dLLM result is missing accept lengths."
 
+        # Sync mode emits tokens only once a block fully resolves; FDFO always
+        # commits (resolved blocks decode, unresolved blocks stash + free KV).
+        if fdfo_mode or result.next_token_ids:
+            block_size = self.dllm_config.block_size
+            algo_states = result.dllm_algo_state
+
+            self.token_to_kv_pool_allocator.free_group_begin()
             for idx in range(batch.batch_size()):
                 req = batch.reqs[idx]
 
-                next_token_ids = result.next_token_ids[idx].tolist()
-                new_tokens = len(next_token_ids)
-                if new_tokens == 0:
+                if not fdfo_mode:
+                    next_token_ids = result.next_token_ids[idx].tolist()
+                    new_tokens = len(next_token_ids)
+                    if new_tokens == 0:
+                        continue
+
+                    req.full_untruncated_fill_ids[
+                        req.extend_range.end - new_tokens : req.extend_range.end
+                    ] = array("q", next_token_ids)
+                    self.metrics_reporter.num_generated_tokens += new_tokens
+
+                    req.output_ids.extend(next_token_ids)
+                    req.update_finish_state(new_accepted_len=new_tokens)
+
+                    if req.finished():
+                        release_kv_cache(req, self.tree_cache)
+                        req.time_stats.set_completion_time()
                     continue
 
-                req.full_untruncated_fill_ids[
-                    req.extend_range.end - new_tokens : req.extend_range.end
-                ] = array("q", next_token_ids)
-                self.metrics_reporter.num_generated_tokens += new_tokens
+                next_token_ids = result.next_token_ids[idx]
+                assert len(next_token_ids) == block_size
 
+                if result.accept_length_per_req_cpu[idx] == 0:
+                    # Block unresolved: stash partial state and free the KV slots
+                    # of the still-masked block so the next FDFO round can
+                    # re-denoise it without leaking the previous allocation.
+                    req.dllm_incomplete_ids = array("q", next_token_ids)
+                    req.dllm_algo_state = (
+                        algo_states[idx] if algo_states is not None else None
+                    )
+                    old_prefix_len = len(req.prefix_indices)
+                    new_fill_len = req.extend_range.end
+                    if new_fill_len > old_prefix_len:
+                        kv_indices_to_free = self.req_to_token_pool.req_to_token[
+                            req.req_pool_idx, old_prefix_len:new_fill_len
+                        ]
+                        self.token_to_kv_pool_allocator.free(kv_indices_to_free)
+                    continue
+
+                req.dllm_incomplete_ids = array("q")
+                req.dllm_algo_state = None
+
+                # Mirror the resolved block into the committed fill ids so the
+                # prefix cache keys on the real tokens, not the mask block, next
+                # round. Index relative to extend_range.end (the truncated/
+                # committed length), which can be shorter than
+                # full_untruncated_fill_ids when the staging adder truncates the
+                # block to the KV budget.
+                req.full_untruncated_fill_ids[
+                    req.extend_range.end - block_size : req.extend_range.end
+                ] = array("q", next_token_ids)
+
+                len_input = len(req.origin_input_ids)
+                len_fill = req.extend_range.end
+                if len_fill <= len_input:
+                    continue
+
+                if len_fill - len(next_token_ids) < len_input:
+                    next_token_ids = next_token_ids[len_input - len_fill :]
+
+                self.metrics_reporter.num_generated_tokens += len(next_token_ids)
                 req.output_ids.extend(next_token_ids)
-                req.update_finish_state(new_accepted_len=new_tokens)
+                req.update_finish_state(new_accepted_len=len(next_token_ids))
 
                 if req.finished():
                     release_kv_cache(req, self.tree_cache)
@@ -95,11 +155,10 @@ class SchedulerDllmMixin:
             self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
             self.token_to_kv_pool_allocator.free_group_end()
 
-        can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
             batch=batch,
             prefill_stats=batch.prefill_stats,
-            can_run_cuda_graph=can_run_cuda_graph,
+            can_run_cuda_graph=result.can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 

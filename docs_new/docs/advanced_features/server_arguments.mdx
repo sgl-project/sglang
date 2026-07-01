@@ -2211,6 +2211,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dllm-fdfo`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>First-Done-First-Out (FDFO) scheduling lets completed requests leave the batch immediately instead of waiting for slower requests, eliminating head-of-line blocking. Enabled by default; pass `--no-dllm-fdfo` to fall back to synchronous lockstep scheduling. Works with any dLLM algorithm.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`True`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: bool</td>
+    </tr>
   </tbody>
 </table>
 
