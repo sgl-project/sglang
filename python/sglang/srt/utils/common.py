@@ -1708,17 +1708,25 @@ def get_amdgpu_memory_capacity():
             shell=True,
             text=True,
         )
-        if result.returncode != 0:
-            raise RuntimeError(f"rocm-smi error: {result.stderr.strip()}")
+        # On some stacks (e.g. TheRock ROCm on Strix Halo/gfx1151) rocminfo can
+        # segfault or emit no parseable pool sizes -> fall back to torch.
+        if result.returncode != 0 or not result.stdout.strip():
+            return _cuda_mem_fallback(
+                f"rocminfo returned no memory info (rc={result.returncode})"
+            )
 
-        # Parse the output to extract memory values in MiB
-        memory_values = [
-            float(mem.split("(")[0].strip()) / 1024
-            for mem in result.stdout.strip().split("\n")
-        ]
+        # Parse the output to extract memory values in MiB. Some ROCm stacks
+        try:
+            memory_values = [
+                float(mem.split("(")[0].strip()) / 1024
+                for mem in result.stdout.strip().split("\n")
+                if mem.split("(")[0].strip()
+            ]
+        except ValueError as e:
+            return _cuda_mem_fallback(f"failed to parse rocminfo output: {e}")
 
         if not memory_values:
-            raise ValueError("No GPU memory values found.")
+            return _cuda_mem_fallback("no GPU memory values parsed from rocminfo")
 
         # Return the minimum memory value
         return min(memory_values)
