@@ -6,6 +6,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=103, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=106, suite="stage-b-test-1-gpu-small-amd-mi35x")
+import os
 import time
 from types import SimpleNamespace
 
@@ -24,6 +25,7 @@ from sglang.test.test_utils import (
 
 class TestOnlineQuantizationMemoryLoad(CustomTestCase):
     runner_args = []
+    environment = {}
 
     @classmethod
     def setUpClass(cls):
@@ -55,6 +57,14 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
 
+        cls.original_envs = {}
+        for env_name, env_value in cls.environment.items():
+            original_env = os.environ.get(env_name, None)
+            if original_env is not None:
+                cls.original_envs[env_name] = os.environ.get(env_name, None)
+
+            os.environ[env_name] = env_value
+
         url = cls.base_url + "/health"
         timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
         start_time = time.perf_counter()
@@ -71,20 +81,10 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
                 raise RuntimeError(f"Server {url} failed to start in {timeout}s")
             time.sleep(1)
 
-        # # Extract and display peak GPU memory from logs
-        combined_output = cls.stdout.getvalue() + cls.stderr.getvalue()
-
-        peak_memory_before_load = cls._extract_peak_memory_before_load(combined_output)
-        if is_cuda_alike() and not peak_memory_before_load:
-            raise ValueError("Should have found peak memory")
-        cls.peak_memory_before_load = float(peak_memory_before_load)
-
-        memory_increase_load_weights = cls._extract_memory_increase_load_weights(
-            combined_output
-        )
-        if is_cuda_alike() and not memory_increase_load_weights:
-            raise ValueError("Should have found memory increase in load_weights")
-        cls.memory_increase_load_weights = float(memory_increase_load_weights)
+        # Keep the raw server for memory numbers, which are parsed lazily by
+        # _test_peak_memory so subclasses that don't test memory (e.g. the
+        # NVFP4->MXFP4 accuracy-only class) don't require these log lines.
+        cls.combined_output = cls.stdout.getvalue() + cls.stderr.getvalue()
 
     @classmethod
     def _extract_peak_memory_before_load(cls, log_output):
@@ -99,8 +99,11 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
     @classmethod
     def _extract_memory_increase_load_weights(cls, log_output):
         """Extract memory increase during load_weights call."""
-        # Search for the log message pattern
-        pattern = r"Memory increase during load_weights:\s+([\d.]+)\s+GiB"
+        # Signed: the value is (free_before - free_after) around load_weights.
+        # When the on-device source representation is larger than the loaded
+        # result (e.g. requantizing to a more compact format), loading frees
+        # net memory and the reported increase is negative.
+        pattern = r"Memory increase during load_weights:\s+(-?[\d.]+)\s+GiB"
         match = re.search(pattern, log_output)
         if match:
             return match.group(1)
@@ -108,6 +111,9 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        for env_name, env_value in cls.original_envs.items():
+            os.environ[env_name] = env_value
+
         kill_process_tree(cls.process.pid)
         cls.stdout.close()
         cls.stderr.close()
@@ -119,21 +125,33 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
         if not is_cuda_alike():
             self.skipTest("not is_cuda_alike")
 
+        peak_memory_before_load = self._extract_peak_memory_before_load(
+            self.combined_output
+        )
+        if not peak_memory_before_load:
+            raise ValueError("Should have found peak memory")
+        peak_memory_before_load = float(peak_memory_before_load)
+
+        memory_increase_load_weights = self._extract_memory_increase_load_weights(
+            self.combined_output
+        )
+        if not memory_increase_load_weights:
+            raise ValueError("Should have found memory increase in load_weights")
+        memory_increase_load_weights = float(memory_increase_load_weights)
+
         # NOTE: We can not simply rely on peak memory after `load_weights` as functions used
-        # in-between (e.g. FP8->MXFP4 requantization) during weight loading may have a higher peak memory footprint
+        # in-between (e.g. NVFP4->MXFP4 requantization) during weight loading may have a higher peak memory footprint
         # than simply the allocated weights.
         if add_peak_memory_before_load:
-            reference_gib = (
-                self.memory_increase_load_weights + self.peak_memory_before_load
-            )
+            reference_gib = memory_increase_load_weights + peak_memory_before_load
         else:
-            reference_gib = self.memory_increase_load_weights
+            reference_gib = memory_increase_load_weights
 
         assert reference_gib < threshold
 
         if test_start:
             # Weights initialized on meta device (not for dense BF16->MXFP4)
-            assert self.peak_memory_before_load < 5
+            assert peak_memory_before_load < 5
 
     def _test_gsm8k(self, accuracy_threshold):
         """Helper method to test GSM8K accuracy against a threshold."""
@@ -182,6 +200,20 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
     def test_gsm8k(self):
         # Original Qwen/Qwen3-30B-A3B-Instruct-2507 reference accuracy: 0.94
         self._test_gsm8k(accuracy_threshold=0.89)
+
+
+class TestNVFP4ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
+    # ModelOpt NVFP4 export (quant_method="modelopt", quant_algo="NVFP4") =>
+    # Nvfp4SourceConfig(). Exercises the NVFP4 -> MXFP4 MoE requantization path:
+    # the per-expert dequantize_nvfp4 + dynamic_mxfp4_quant requant, and the w13
+    # gate/up weight_scale_2 split in _requantize_nvfp4_to_mxfp4.
+    model = "nvidia/Qwen3-30B-A3B-NVFP4"  # NVFP4 model
+    tp = 1
+
+    def test_gsm8k(self):
+        # Requantized NVFP4 -> MXFP4 observed accuracy: ~0.88
+        # (BF16 Qwen/Qwen3-30B-A3B reference: ~0.94).
+        self._test_gsm8k(accuracy_threshold=0.85)
 
 
 if __name__ == "__main__":

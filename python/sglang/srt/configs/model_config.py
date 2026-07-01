@@ -222,6 +222,9 @@ def get_num_indexer_layers(config) -> int:
     return getattr(config, "num_indexer_layers", 0)
 
 
+REQUANTIZATION_METHODS = ["quark_mxfp4"]
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -1183,7 +1186,7 @@ class ModelConfig:
             log_str = f"quant={quant_method}"
 
             # Append interesting fields if they exist
-            for field in ["bits", "quant_algo", "fmt"]:
+            for field in ["bits", "quant_algo", "fmt", "requantization_method"]:
                 if field in quant_cfg:
                     log_str += f", {field}={quant_cfg[field]}"
 
@@ -1384,6 +1387,10 @@ class ModelConfig:
                         f"Using draft model's detected quantization: {quant_method}"
                     )
                     self.quantization = quant_method
+                elif self.quantization in REQUANTIZATION_METHODS:
+                    logger.info_once(
+                        f"Requantizing from quant_method='{quant_method}' to the requested online quantization='{self.quantization}'. Beware that requantization may incur a loss in accuracy, the requantized model should be re-validated/re-evaluated. More details at https://docs.sglang.io/advanced_features/quantization.html#online-quantization."
+                    )
                 else:
                     raise ValueError(
                         "Quantization method specified in the model config "

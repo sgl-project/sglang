@@ -879,7 +879,7 @@ Other layers (e.g. projections in the attention layers) have their weights quant
 
 ### `quark_mxfp4` online quantization method
 
-SGLang running on AMD GPUs with hardware FP4 support (CDNA4 architecture, e.g. MI355x) supports the quantization method `--quantization quark_mxfp4`, that will quantize BF16 model weights to MXFP4 at load time, use dynamic MXFP4 quantization for activations and MXFP4 GEMMs instead of BF16 GEMMs.
+SGLang running on AMD GPUs with hardware FP4 support (CDNA4 architecture, e.g. MI355x) supports the quantization method `--quantization quark_mxfp4`, that will quantize BF16 or NVFP4 model weights to MXFP4 at load time, use dynamic MXFP4 quantization for activations and MXFP4 GEMMs instead of BF16 GEMMs.
 
 Example:
 
@@ -889,6 +889,18 @@ sglang serve --model-path Qwen/Qwen3-30B-A3B \
     --quantization quark_mxfp4
 ```
 
+The option `--quantization quark_mxfp4` also supports converting NVFP4 checkpoints (e.g. ModelOpt exports such as `nvidia/Kimi-K2.6-NVFP4`) to MXFP4 at load time to allow efficient inference using supported AMD hardware (gfx95x+):
+
+
+The quantization metadata of the source NVFP4 checkpoint is read from either `config.json` (`quantization_config`) or a standalone `hf_quant_config.json`, and producer-declared excluded modules will remain in higher precision.
+
+Example (NVFP4 to MXFP4 requantization):
+
+```bash
+sglang serve --model-path nvidia/Kimi-K2.6-NVFP4 \
+    --tensor-parallel-size 4 \
+    --quantization quark_mxfp4 \
+```
 ### Intel® Neural Compressor online quantization method
 
 SGLang supports quantization methods based on the advanced algorithm [auto-round](https://github.com/intel/auto-round) in [Intel® Neural Compressor](https://github.com/intel/neural-compressor). You can simply specify `--quantization auto-round-int8` to use this feature. It will quantize the model on the fly to target format. More online quantization methods are on the way.

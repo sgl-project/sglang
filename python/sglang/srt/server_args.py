@@ -168,7 +168,7 @@ QUANTIZATION_CHOICES = [
     "modelslim",  # for NPU
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
-    "quark_mxfp4",  # Online MOE + linear quantization.
+    "quark_mxfp4",  # Online MOE + linear quantization (incl. NVFP4 -> MXFP4 requantization).
     # Apple Silicon MLX backend — on-the-fly quantization of fp16 weights at load
     # time via mlx.nn.quantize. Only takes effect when SGLANG_USE_MLX=1.
     "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
@@ -4567,9 +4567,13 @@ class ServerArgs:
         if self.mamba_radix_cache_strategy == "auto":
             wants_overlap = not self.disable_overlap_schedule
             wants_paging = self.page_size is not None and self.page_size > 1
+            # extra_buffer relies on FLA kernels that only run on CUDA/MUSA/NPU,
+            # so fall back to no_buffer on other platforms (e.g. ROCm).
             if (
-                wants_overlap or wants_paging
-            ) and self._support_mamba_cache_extra_buffer(model_arch):
+                (wants_overlap or wants_paging)
+                and self._support_mamba_cache_extra_buffer(model_arch)
+                and (is_cuda() or is_musa() or is_npu())
+            ):
                 self.mamba_radix_cache_strategy = "extra_buffer"
             else:
                 self.mamba_radix_cache_strategy = "no_buffer"
