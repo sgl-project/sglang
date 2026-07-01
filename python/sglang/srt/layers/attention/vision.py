@@ -40,8 +40,8 @@ _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_npu = is_npu()
 _is_hip = is_hip()
-_is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
@@ -775,6 +775,7 @@ class VisionAMXAttention(nn.Module):
         cu_seqlens: torch.Tensor | SingletonCache | None,
         bsz: int,
         seq_len: int,
+        softmax_scale: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -805,6 +806,7 @@ class VisionAMXAttention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             causal=False,
+            scale=softmax_scale,
         )
 
         return output

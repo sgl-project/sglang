@@ -152,7 +152,7 @@ def update_intermediate_size(model_config, attr_name, intermediate_padding_size)
     elif hasattr(model_config, attr_name):
         attr_value = getattr(model_config, attr_name)
 
-    if attr_value % intermediate_padding_size != 0:
+    if attr_value is not None and attr_value % intermediate_padding_size != 0:
         from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
         attr_value = pad_vocab_size(attr_value, intermediate_padding_size)
@@ -215,20 +215,37 @@ def adjust_config_with_unaligned_cpu_tp(
                 + model_config.hf_config.qk_rope_head_dim,
             )
 
+        swa_num_key_value_heads = getattr(
+            model_config.hf_text_config,
+            "swa_num_key_value_heads",
+            model_config.get_total_num_kv_heads(),
+        )
+        swa_num_attention_heads = getattr(
+            model_config.hf_text_config,
+            "swa_num_attention_heads",
+            model_config.num_attention_heads,
+        )
         query_heads_per_kv = (
             model_config.num_attention_heads // model_config.get_total_num_kv_heads()
         )
+        swa_query_heads_per_kv = swa_num_attention_heads // swa_num_key_value_heads
         total_kv_heads = model_config.get_total_num_kv_heads()
         from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
         head_dim = resolve_head_dim(
             model_config, model_config.num_attention_heads, True
         )
+        swa_head_dim = getattr(model_config.hf_text_config, "swa_head_dim", head_dim)
 
         pad_size = get_num_heads_padding_size(tp_size, weight_block_size, head_dim)
+        swa_pad_size = get_num_heads_padding_size(
+            tp_size, weight_block_size, swa_head_dim
+        )
         num_key_value_heads = pad_vocab_size(total_kv_heads, pad_size)
+        swa_num_key_value_heads = pad_vocab_size(swa_num_key_value_heads, swa_pad_size)
 
         num_attention_heads = num_key_value_heads * query_heads_per_kv
+        swa_num_attention_heads = swa_num_key_value_heads * swa_query_heads_per_kv
         for config in [
             model_config,
             model_config.hf_config,
@@ -236,6 +253,16 @@ def adjust_config_with_unaligned_cpu_tp(
         ]:
             update_config(config, "num_key_value_heads", num_key_value_heads)
             update_config(config, "num_attention_heads", num_attention_heads)
+            update_config(
+                model_config.hf_text_config,
+                "swa_num_key_value_heads",
+                swa_num_key_value_heads,
+            )
+            update_config(
+                model_config.hf_text_config,
+                "swa_num_attention_heads",
+                swa_num_attention_heads,
+            )
 
     adjust_tp_num_heads_if_necessary(model_config.hf_config, tp_size, True)
     if hasattr(model_config.hf_config, "text_config"):
@@ -259,6 +286,24 @@ def adjust_config_with_unaligned_cpu_tp(
             model_config.hf_config,
             "vision_config",
             "siglip_vision_model",
+            "num_attention_heads",
+        ],
+        [
+            model_config.hf_config,
+            "vision_config",
+            "gemma4_vision",
+            "num_attention_heads",
+        ],
+        [
+            model_config.hf_config,
+            "vision_config",
+            "gemma4_vision",
+            "num_key_value_heads",
+        ],
+        [
+            model_config.hf_config,
+            "audio_config",
+            "gemma4_audio",
             "num_attention_heads",
         ],
         [model_config.hf_config, "vision_config", "qwen3_vl_moe", "num_heads"],
@@ -287,6 +332,7 @@ def adjust_config_with_unaligned_cpu_tp(
     for m_config, config_name, model_type, num_head_str in multimodal_config:
         if (
             hasattr(m_config, config_name)
+            and getattr(m_config, config_name) is not None
             and getattr(m_config, config_name).model_type == model_type
         ):
             num_heads = getattr(getattr(m_config, config_name), num_head_str)

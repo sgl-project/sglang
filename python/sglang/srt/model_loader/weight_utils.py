@@ -57,6 +57,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     BAR_FORMAT,
+    cpu_has_amx_support,
     find_local_repo_dir,
     is_cpu,
     log_info_on_rank0,
@@ -65,6 +66,8 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import is_cuda_alike
 from sglang.utils import is_in_ci
 
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup
 except ImportError:
@@ -1334,13 +1337,17 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
             # so if both param and loaded_weight are a scalar,
             # "broadcast" instead of copy
             param.data.fill_(loaded_weight.item())
+        elif param.size() == loaded_weight.size():
+            param.data.copy_(loaded_weight)
+        elif _is_cpu and _is_cpu_amx_available:
+            slices = tuple(slice(0, s) for s in loaded_weight.shape)
+            param.data.zero_()
+            param.data[slices].copy_(loaded_weight)
         else:
             assert param.size() == loaded_weight.size(), (
                 f"Attempted to load weight ({loaded_weight.size()}) "
                 f"into parameter ({param.size()})"
             )
-
-            param.data.copy_(loaded_weight)
     except Exception:
         # NOTE: This exception is added for the purpose of setting breakpoint to
         # debug weight loading issues.

@@ -136,7 +136,8 @@ at::Tensor flash_attn_varlen_func(
     const at::Tensor& cu_seqlens_k,
     int64_t max_seqlen_q,
     int64_t max_seqlen_k,
-    bool causal);
+    bool causal,
+    std::optional<double> scale);
 
 // linear attention
 std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
@@ -241,7 +242,8 @@ at::Tensor fused_experts_cpu(
     const std::optional<at::Tensor>& w2_bias,
     const std::optional<double>& alpha,
     const std::optional<double>& limit,
-    bool is_vnni);
+    bool is_vnni,
+    const std::optional<std::string>& activation);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 at::Tensor shared_expert_cpu(
@@ -325,6 +327,10 @@ at::Tensor causal_conv1d_update_cpu(
     const std::optional<at::Tensor>& conv_state_indices,
     int64_t pad_slot_id,
     bool is_vnni);
+
+// multidimensional rope
+std::tuple<at::Tensor, at::Tensor>
+apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
 #endif
 
 // conv3d fast path for patch embedding
@@ -353,7 +359,7 @@ std::tuple<at::Tensor, at::Tensor>
 apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
 
 // mrope
-std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
+void multimodal_rotary_embedding_cpu(
     at::Tensor& positions,
     at::Tensor& query,
     at::Tensor& key,
@@ -507,7 +513,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // flash attn
   m.def(
       "flash_attn_varlen_func(Tensor q, Tensor k, Tensor v, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
-      "int max_seqlen_q, int max_seqlen_k, bool causal) -> Tensor");
+      "int max_seqlen_q, int max_seqlen_k, bool causal, float? scale=None) -> Tensor");
   m.impl("flash_attn_varlen_func", torch::kCPU, &flash_attn_varlen_func);
 
   // linear attn
@@ -581,7 +587,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
       "inplace, int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, "
       "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, Tensor? w1_bias, Tensor? w2_bias, float? alpha, float? "
-      "limit, bool is_vnni) -> Tensor");
+      "limit, bool is_vnni, str? activation=None) -> Tensor");
   m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
@@ -623,6 +629,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "causal_conv1d_update_cpu(Tensor x, Tensor(a!) conv_states, Tensor weight, Tensor? bias, bool silu_activation,"
       "Tensor? cache_seqlens, Tensor? conv_state_indices, int pad_slot_id, bool is_vnni) -> Tensor");
   m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
+
+  // multidimensional rope
+  m.def(
+      "apply_multidimensional_rope_cpu(Tensor(a!) query, Tensor(b!) key, Tensor cos, Tensor sin) -> (Tensor(a!), "
+      "Tensor(b!))");
+  m.impl("apply_multidimensional_rope_cpu", torch::kCPU, &apply_multidimensional_rope_cpu);
 #endif
 
   // conv3d fast path for patch embedding
@@ -649,7 +661,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // multimodal rope
   m.def(
       "multimodal_rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor "
-      "cos_sin_cache, int[]? mrope_section, bool mrope_interleaved, bool is_neox) -> (Tensor, Tensor)");
+      "cos_sin_cache, int[]? mrope_section, bool mrope_interleaved, bool is_neox) -> ()");
   m.impl("multimodal_rotary_embedding_cpu", torch::kCPU, &multimodal_rotary_embedding_cpu);
 
   // CPU and memory binding

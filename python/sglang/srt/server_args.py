@@ -4246,7 +4246,7 @@ class ServerArgs:
                     self.attention_backend = default_attention_backend
 
             prefill_backend, decode_backend = self.get_attention_backends()
-            accepted_backends = ("trtllm_mha", "triton", "ascend", "intel_xpu")
+            accepted_backends = ("trtllm_mha", "triton", "ascend", "intel_xpu", "intel_amx")
             assert (
                 prefill_backend in accepted_backends
                 and decode_backend in accepted_backends
