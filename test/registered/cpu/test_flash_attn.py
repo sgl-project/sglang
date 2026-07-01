@@ -138,6 +138,7 @@ class TestFlashAttn(CustomTestCase):
             seqlens_q.max().item(),
             seqlens_k.max().item(),
             is_causal,
+            None,
         )
 
         atol = rtol = precision[dtype]
@@ -201,6 +202,7 @@ class TestFlashAttn(CustomTestCase):
             seqlens_q.max().item(),
             seqlens_k.max().item(),
             is_causal,
+            None,
         )
 
         atol = rtol = precision[dtype]
@@ -226,7 +228,7 @@ class TestFlashAttn(CustomTestCase):
             q, k, v, cu_seqlens, cu_seqlens, is_causal=True, enable_gqa=True
         )
         out = flash_attn_varlen_func(
-            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, True
+            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, True, None
         )
 
         atol = rtol = precision[dtype]
