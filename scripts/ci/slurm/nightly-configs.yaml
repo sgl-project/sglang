@@ -188,7 +188,9 @@ dsv4pro-fp8-mi355x-mtp-sglang:
     - isl: 1024
       osl: 1024
       search-space:
-        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+        # conc256 excluded: disagg-decode SWA hybrid pool retract->get_cpu_copy
+        # is an upstream NotImplementedError (crashes decode). See recipe.
+        - conc-list: [1, 8, 16, 32, 64, 128]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d-mtp.yaml
 
 dsv4pro-fp8-mi355x-dp8ep8-sglang:

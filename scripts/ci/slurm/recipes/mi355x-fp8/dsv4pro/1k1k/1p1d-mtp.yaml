@@ -34,12 +34,7 @@ runtime:
   page_size: 256
   max_running_requests: 256
   chunked_prefill_size: 8192
-  # Bumped 0.1 -> 0.2: at conc256 the decode SWA/hybrid KV pool fills, the
-  # scheduler retracts running requests, and retract->offload_kv_cache calls
-  # get_cpu_copy() which is unimplemented for the SWA hybrid pool (raises
-  # NotImplementedError). A larger SWA token budget keeps decode below the
-  # retraction threshold so the offload path is never hit.
-  swa_full_tokens_ratio: 0.2
+  swa_full_tokens_ratio: 0.1
 
 # MTP / EAGLE speculative decoding (NextN head from the base model). Applied to
 # both prefill and decode. Flags mirror
@@ -52,7 +47,14 @@ mtp:
 
 bench:
   # bench_serving --max-concurrency sweep; one result JSON per concurrency.
-  concurrencies: [1, 8, 16, 32, 64, 128, 256]
+  # conc256 is excluded for this leg only: at conc256 the disagg-decode SWA
+  # hybrid KV pool fills, the scheduler retracts running requests, and the
+  # retract->offload_kv_cache path calls get_cpu_copy() which is unimplemented
+  # for the SWA hybrid pool (raises NotImplementedError, crashes the decode
+  # scheduler). Raising swa_full_tokens_ratio (tried up to 0.3) does not help
+  # -- usage climbs to fill the larger budget and still retracts. Until the
+  # upstream get_cpu_copy stub is implemented, cap this leg at 128.
+  concurrencies: [1, 8, 16, 32, 64, 128]
   num_prompts_factor: 4      # num-prompts = concurrency * factor
   random_range_ratio: 1.0
 
