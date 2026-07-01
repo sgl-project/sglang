@@ -100,6 +100,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 # Start text model server
 sglang serve --model-path /home/weights/Qwen2.5-7B-Instruct --attention-backend ascend --host 0.0.0.0 --port 30000 &
 ```
+
 For more details of SGLang server, refer to the [Ascend NPU Quick Start](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start)
 
 #### Execute Accuracy Evaluation
@@ -118,7 +119,7 @@ evalscope eval \
 
 Upon completion, results similar to the following will be displayed:
 
-```
+```text
 +---------------------+-----------+----------+----------+-------+---------+---------+
 | Model               | Dataset   | Metric   | Subset   |   Num |   Score | Cat.0   |
 +=====================+===========+==========+==========+=======+=========+=========+
@@ -225,8 +226,10 @@ For more details, refer to the [EvalScope documentation](https://evalscope.readt
 3. Ensure URL ends with `/v1`, e.g., `http://localhost:30000/v1`
 
 ### EvalScope SSL certificate verification failed
+
 When using EvalScope commands without specifying a dataset or model path, it will attempt to download automatically, which may encounter an SSL certificate verification error:
-```
+
+```text
   File "/usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py", line 605, in get
     return self.request("GET", url, **kwargs)
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -280,8 +283,10 @@ unset HTTPS_PROXY
 ```
 
 ### Download Dataset Error
+
 For this error
-```
+
+```text
 root@localhost:/home/# wget https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv
 --2026-05-12 12:08:01--  https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv
 Connecting to 141.5.152.215:6688... connected.
@@ -289,8 +294,10 @@ ERROR: cannot verify www.modelscope.cn's certificate, issued by ‘CN=Huawei Web
   Self-signed certificate encountered.
 To connect to www.modelscope.cn insecurely, use `--no-check-certificate`.
 ```
-You can add `--no-check-certificate`
-```
+
+You can add `--no-check-certificate'
+
+```bash
 wget https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv --no-check-certificate
 ```
 
