@@ -345,7 +345,7 @@ class Lfm2MoeShortConv(nn.Module):
                 self.conv_weight,
                 self.conv_bias,
                 activation=None,
-                conv_state_indices=meta.cache_indices.to(torch.int32),
+                conv_state_indices=meta.cache_indices,
             )
         else:
             Bx_t = Bx.transpose(0, 1).contiguous()
@@ -354,7 +354,7 @@ class Lfm2MoeShortConv(nn.Module):
                 self.conv_weight,
                 self.conv_bias,
                 query_start_loc=meta.query_start_loc,
-                cache_indices=meta.cache_indices.to(torch.int32),
+                cache_indices=meta.cache_indices,
                 has_initial_state=meta.has_initial_state,
                 conv_states=conv_state,
                 activation=None,

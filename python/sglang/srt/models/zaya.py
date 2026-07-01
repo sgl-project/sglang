@@ -760,15 +760,13 @@ class CCA(nn.Module):
         conv_state = meta.layer_cache.conv[0]
         prev_hs_state = meta.layer_cache.conv[1]
         if forward_batch.forward_mode.is_decode_or_idle():
-            # cache_indices_long is the int64 view, hoisted to once per step by
-            # the backend (index_copy_ in cca_decode requires a long index).
             qk_out, v2_input = cca_decode(
                 qk,
                 hidden_states,
                 self.conv_qk,
                 conv_state,
                 prev_hs_state,
-                meta.cache_indices_long,
+                meta.cache_indices,
                 self.total_padding,
             )
         else:

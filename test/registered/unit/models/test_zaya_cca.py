@@ -172,11 +172,7 @@ class _MockShortConvBackend:
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         indices = self._resolve_indices(forward_batch)  # already int64
         if forward_batch.forward_mode.is_decode_or_idle():
-            return ShortConvMetadata(
-                layer_cache=layer_cache,
-                cache_indices=indices,
-                cache_indices_long=indices,
-            )
+            return ShortConvMetadata(layer_cache=layer_cache, cache_indices=indices)
 
         slot_ids = self._resolve_slot_ids(forward_batch, indices)
         has_prefix = [int(p) > 0 for p in forward_batch.extend_prefix_lens_cpu]
