@@ -1,22 +1,15 @@
-import itertools
-
 import torch
-import triton
-import triton.testing
 from sgl_kernel import concat_mla_absorb_q as aot_absorb_q
 from sgl_kernel import concat_mla_k as aot_k
 
-from sglang.jit_kernel.benchmark.utils import run_benchmark
+from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.concat_mla import concat_mla_absorb_q as jit_absorb_q
 from sglang.jit_kernel.concat_mla import concat_mla_k as jit_k
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
 
 register_cuda_ci(
     est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-
-IS_CI = is_in_ci()
 
 NUM_LOCAL_HEADS = 128
 QK_NOPE_HEAD_DIM = 128
@@ -58,14 +51,11 @@ def torch_concat_mla_absorb_q(a, b, out):
     out[:, :, a_last_dim:] = b
 
 
-if IS_CI:
-    NUM_TOKENS_VALS = [256, 1024]
-else:
-    NUM_TOKENS_VALS = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
-
-K_LINE_VALS = ["aot", "jit", "torch"]
-K_LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "PyTorch"]
-K_STYLES = [("orange", "-"), ("blue", "--"), ("green", "-.")]
+K_FN_MAP = {
+    "aot": aot_concat_mla_k,
+    "jit": jit_concat_mla_k,
+    "torch": torch_concat_mla_k,
+}
 
 
 def _create_concat_mla_k_data(num_tokens):
@@ -92,54 +82,26 @@ def _create_concat_mla_k_data(num_tokens):
     return k, k_nope, k_rope
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["num_tokens"],
-        x_vals=NUM_TOKENS_VALS,
-        line_arg="provider",
-        line_vals=K_LINE_VALS,
-        line_names=K_LINE_NAMES,
-        styles=K_STYLES,
-        ylabel="us",
-        plot_name="concat-mla-k-performance",
-        args={},
-    )
+@marker.parametrize(
+    "num_tokens",
+    [256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
+    [256, 1024],
 )
+@marker.benchmark("provider", ["aot", "jit", "torch"])
 def bench_concat_mla_k(num_tokens: int, provider: str):
     k, k_nope, k_rope = _create_concat_mla_k_data(num_tokens)
-
-    FN_MAP = {
-        "aot": aot_concat_mla_k,
-        "jit": jit_concat_mla_k,
-        "torch": torch_concat_mla_k,
-    }
-    fn = lambda: FN_MAP[provider](k, k_nope, k_rope)
-    return run_benchmark(fn)
-
-
-if IS_CI:
-    ABSORB_Q_VALS = list(itertools.product([4, 16], [16]))
-else:
-    ABSORB_Q_VALS = list(itertools.product([1, 4, 8, 16, 32], [1, 8, 32, 128]))
-
-Q_LINE_VALS = ["aot", "jit", "torch"]
-Q_LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "PyTorch"]
-Q_STYLES = [("orange", "-"), ("blue", "--"), ("green", "-.")]
-
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["dim_0", "dim_1"],
-        x_vals=ABSORB_Q_VALS,
-        line_arg="provider",
-        line_vals=Q_LINE_VALS,
-        line_names=Q_LINE_NAMES,
-        styles=Q_STYLES,
-        ylabel="us",
-        plot_name="concat-mla-absorb-q-performance",
-        args={},
+    return marker.do_bench(
+        K_FN_MAP[provider],
+        input_args=(k, k_nope, k_rope),
+        graph_clone_args=(0, 1, 2),
+        memory_args=(k_nope, k_rope),
+        memory_output=(k,),  # inplace write to k
     )
-)
+
+
+@marker.parametrize("dim_0", [1, 4, 8, 16, 32], [4, 16])
+@marker.parametrize("dim_1", [1, 8, 32, 128], [16])
+@marker.benchmark("provider", ["aot", "jit", "torch"])
 def bench_concat_mla_absorb_q(dim_0: int, dim_1: int, provider: str):
     a = torch.randn(dim_0, dim_1, A_LAST_DIM, dtype=DTYPE, device=DEVICE)
     b = torch.randn(dim_0, dim_1, B_LAST_DIM, dtype=DTYPE, device=DEVICE)
@@ -148,17 +110,23 @@ def bench_concat_mla_absorb_q(dim_0: int, dim_1: int, provider: str):
         out = torch.empty(
             dim_0, dim_1, A_LAST_DIM + B_LAST_DIM, dtype=DTYPE, device=DEVICE
         )
-        fn = lambda: torch_concat_mla_absorb_q(a, b, out)
-    else:
-        FN_MAP = {
-            "aot": aot_concat_mla_absorb_q,
-            "jit": jit_concat_mla_absorb_q,
-        }
-        fn = lambda: FN_MAP[provider](a, b)
+        return marker.do_bench(
+            torch_concat_mla_absorb_q,
+            input_args=(a, b, out),
+            graph_clone_args=(0, 1, 2),
+            memory_args=(a, b),
+            memory_output=(out,),  # inplace write to out
+        )
 
-    return run_benchmark(fn)
+    fn = aot_concat_mla_absorb_q if provider == "aot" else jit_concat_mla_absorb_q
+    return marker.do_bench(
+        fn,
+        input_args=(a, b),
+        graph_clone_args=(0, 1),
+        memory_args=(a, b),
+    )
 
 
 if __name__ == "__main__":
-    bench_concat_mla_k.run(print_data=True)
-    bench_concat_mla_absorb_q.run(print_data=True)
+    bench_concat_mla_k.run()
+    bench_concat_mla_absorb_q.run()

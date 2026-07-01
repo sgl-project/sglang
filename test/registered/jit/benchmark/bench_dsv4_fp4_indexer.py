@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import sys
-
 import torch
 import triton
 
-from sglang.benchmark.bench_utils import run_bench
-from sglang.jit_kernel.benchmark.utils import get_benchmark_range
+from sglang.jit_kernel.benchmark import marker
 from sglang.srt.utils import is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -26,10 +23,8 @@ NUM_HEADS = 64
 BLOCK_KV = 64
 NEXT_N = 1
 
-shape_range = get_benchmark_range(
-    full_range=[(256, 8192), (256, 32768)],
-    ci_range=[(256, 8192)],
-)
+_SM100_SUPPORTED = is_sm100_supported()
+_DEEPGEMM_AVAILABLE = deep_gemm is not None and per_token_cast_to_fp4 is not None
 
 
 def _pack_fp8_cache(k: torch.Tensor, *, num_blocks: int) -> torch.Tensor:
@@ -120,57 +115,65 @@ def _make_case(batch: int, seq_len_kv: int):
     }
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["batch", "seq_len_kv"],
-        x_vals=shape_range,
-        x_log=False,
-        line_arg="provider",
-        line_vals=["fp8", "fp4"],
-        line_names=["Default FP8 indexer", "FP4 indexer"],
-        styles=[("blue", "-"), ("green", "-")],
-        ylabel="us",
-        plot_name="dsv4-fp4-indexer-performance",
-        args={},
+def _fp8_indexer(case):
+    return deep_gemm.fp8_paged_mqa_logits(
+        case["q_fp8"],
+        case["k_cache_fp8"],
+        case["weights_fp8"],
+        case["context_lens"],
+        case["page_table"],
+        case["schedule"],
+        case["padded_len"],
+        clean_logits=False,
+        indices=None,
     )
+
+
+def _fp4_indexer(case):
+    return deep_gemm.fp8_fp4_paged_mqa_logits(
+        (case["q_fp4"], case["q_sf"]),
+        case["k_cache_fp4"],
+        case["weights"],
+        case["context_lens"],
+        case["page_table"],
+        case["schedule"],
+        case["padded_len"],
+        clean_logits=False,
+        logits_dtype=torch.float32,
+        indices=None,
+    )
+
+
+FN_MAP = {
+    "fp8": _fp8_indexer,
+    "fp4": _fp4_indexer,
+}
+
+
+@marker.parametrize(
+    "batch,seq_len_kv",
+    [(256, 8192), (256, 32768)],
+    [(256, 8192)],
 )
-def benchmark(batch: int, seq_len_kv: int, provider: str):
+@marker.benchmark("impl", ["fp8", "fp4"])
+def benchmark(batch: int, seq_len_kv: int, impl: str):
+    if not _DEEPGEMM_AVAILABLE:
+        marker.skip("DeepGEMM is unavailable.")
+
     case = _make_case(batch, seq_len_kv)
-    if provider == "fp8":
-        fn = lambda: deep_gemm.fp8_paged_mqa_logits(
-            case["q_fp8"],
-            case["k_cache_fp8"],
-            case["weights_fp8"],
-            case["context_lens"],
-            case["page_table"],
-            case["schedule"],
-            case["padded_len"],
-            clean_logits=False,
-            indices=None,
-        )
-    elif provider == "fp4":
-        fn = lambda: deep_gemm.fp8_fp4_paged_mqa_logits(
-            (case["q_fp4"], case["q_sf"]),
-            case["k_cache_fp4"],
-            case["weights"],
-            case["context_lens"],
-            case["page_table"],
-            case["schedule"],
-            case["padded_len"],
-            clean_logits=False,
-            logits_dtype=torch.float32,
-            indices=None,
-        )
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
-    return tuple(t * 1000 for t in run_bench(fn, use_cuda_graph=False))
+    return marker.do_bench(
+        FN_MAP[impl],
+        input_args=(case,),
+        # paged MQA logits cannot be CUDA-graph captured
+        use_cuda_graph=False,
+        disable_log_bandwidth=True,  # report us only
+    )
 
 
 if __name__ == "__main__":
-    if not is_sm100_supported():
-        print("[skip] DeepSeek V4 FP4 indexer benchmark requires SM100 CUDA.")
-        sys.exit(0)
-    if deep_gemm is None or per_token_cast_to_fp4 is None:
-        print("[skip] DeepGEMM is unavailable.")
-        sys.exit(0)
-    benchmark.run(print_data=True)
+    if not _SM100_SUPPORTED:
+        print(
+            "[skip] DeepSeek V4 FP4 indexer benchmark requires SM100 (Blackwell) CUDA."
+        )
+    else:
+        benchmark.run()

@@ -2,10 +2,9 @@ import itertools
 from typing import Any, Dict, List
 
 import torch
-import triton
 from sgl_kernel.test_utils import create_per_token_group_quant_test_data
 
-from sglang.jit_kernel.benchmark.utils import get_benchmark_range
+from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.per_token_group_quant_8bit import (
     per_token_group_quant_8bit as sglang_per_token_group_quant_8bit,
 )
@@ -16,7 +15,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
 )
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.bench_utils import bench_kineto
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 
@@ -29,16 +27,12 @@ IS_CI = is_in_ci()
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
-NUM_TESTS = 30 if IS_CI else 300
-
 GROUP_SIZE_RANGE = [128]
 DST_DTYPE_RANGE = [fp8_type_]
 
 # ---- GEMM-like branch (num_ranks=None) ----
-NUM_TOKENS_RANGE_GEMM = get_benchmark_range(
-    full_range=[1, 4, 16, 64, 256, 768, 2048, 8192, 16384],
-    ci_range=[768],
-)
+NUM_TOKENS_RANGE_GEMM = [1, 4, 16, 64, 256, 768, 2048, 8192, 16384]
+NUM_TOKENS_RANGE_GEMM_CI = [768]
 HIDDEN_DIM_RANGE_GEMM = [1536, 7168, 16384]
 NUM_RANKS_RANGE_GEMM = [None]
 
@@ -82,31 +76,27 @@ FLAGS_GEMM_CI: List[Dict[str, Any]] = [
         masked_layout_mode=None,
     ),
 ]
-FLAGS_RANGE_GEMM = get_benchmark_range(
-    full_range=FLAGS_GEMM_FULL, ci_range=FLAGS_GEMM_CI
-)
 
-CONFIGS_GEMM = list(
-    itertools.product(
-        NUM_TOKENS_RANGE_GEMM,
-        HIDDEN_DIM_RANGE_GEMM,
-        GROUP_SIZE_RANGE,
-        NUM_RANKS_RANGE_GEMM,
-        DST_DTYPE_RANGE,
-        FLAGS_RANGE_GEMM,
+
+def _make_configs_gemm(num_tokens_range, flags_range):
+    return list(
+        itertools.product(
+            num_tokens_range,
+            HIDDEN_DIM_RANGE_GEMM,
+            GROUP_SIZE_RANGE,
+            NUM_RANKS_RANGE_GEMM,
+            DST_DTYPE_RANGE,
+            flags_range,
+        )
     )
-)
+
 
 # ---- MoE-like / multi-rank branch (hidden_dim=2048, num_ranks in {8,16,32,48}) ----
-NUM_TOKENS_RANGE_MOE = get_benchmark_range(
-    full_range=[1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
-    ci_range=[768 * 8],
-)
+NUM_TOKENS_RANGE_MOE = [1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8]
+NUM_TOKENS_RANGE_MOE_CI = [768 * 8]
 HIDDEN_DIM_RANGE_MOE = [2048]
-NUM_RANKS_RANGE_MOE = get_benchmark_range(
-    full_range=[8, 16, 32, 48],
-    ci_range=[48],
-)
+NUM_RANKS_RANGE_MOE = [8, 16, 32, 48]
+NUM_RANKS_RANGE_MOE_CI = [48]
 
 FLAGS_MOE: List[Dict[str, Any]] = [
     dict(
@@ -138,25 +128,28 @@ FLAGS_MOE: List[Dict[str, Any]] = [
         masked_layout_mode="extreme",
     ),
 ]
-FLAGS_RANGE_MOE = get_benchmark_range(full_range=FLAGS_MOE, ci_range=FLAGS_MOE)
 
-CONFIGS_MOE = list(
-    itertools.product(
-        NUM_TOKENS_RANGE_MOE,
-        HIDDEN_DIM_RANGE_MOE,
-        GROUP_SIZE_RANGE,
-        NUM_RANKS_RANGE_MOE,
-        DST_DTYPE_RANGE,
-        FLAGS_RANGE_MOE,
+
+def _make_configs_moe(num_tokens_range, num_ranks_range):
+    return list(
+        itertools.product(
+            num_tokens_range,
+            HIDDEN_DIM_RANGE_MOE,
+            GROUP_SIZE_RANGE,
+            num_ranks_range,
+            DST_DTYPE_RANGE,
+            FLAGS_MOE,
+        )
     )
-)
 
-# ---- Final configs ----
-CONFIGS = CONFIGS_GEMM + CONFIGS_MOE
 
-LINE_VALS = ["triton", "sglang"]
-LINE_NAMES = ["Triton (Inaccurate)", "SGL Kernel"]
-STYLES = [("blue", "-"), ("green", "-")]
+# ---- Final configs (full local sweep vs. shrunk CI sweep) ----
+CONFIGS_FULL = _make_configs_gemm(
+    NUM_TOKENS_RANGE_GEMM, FLAGS_GEMM_FULL
+) + _make_configs_moe(NUM_TOKENS_RANGE_MOE, NUM_RANKS_RANGE_MOE)
+CONFIGS_CI = _make_configs_gemm(
+    NUM_TOKENS_RANGE_GEMM_CI, FLAGS_GEMM_CI
+) + _make_configs_moe(NUM_TOKENS_RANGE_MOE_CI, NUM_RANKS_RANGE_MOE_CI)
 
 
 def _flatten_to_2d(t: torch.Tensor) -> torch.Tensor:
@@ -174,11 +167,11 @@ def _make_sglang_bench_fn(
 ):
     """
     Adapter that pre-allocates output tensors and returns a zero-arg callable
-    matching the JIT kernel's signature.
+    matching the JIT kernel signature.
 
     The JIT kernel does not support fuse_silu_and_mul, so when enabled we
-    pre-compute silu+mul on the input. bench_kineto only times the kernel
-    matching the given name, so the pre-processing is not included.
+    pre-compute silu+mul on the input. The pre-processing happens here (outside
+    the returned callable) so it is not included in the timed region.
 
     The JIT kernel expects 2D tensors, so any higher-dimensional inputs
     (e.g. from masked_layout_mode) are flattened to 2D.
@@ -228,62 +221,54 @@ def _make_sglang_bench_fn(
     return _run
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=[
-            "num_tokens",
-            "hidden_dim",
-            "group_size",
-            "num_ranks",
-            "dst_dtype",
-            "flags",
-        ],
-        x_vals=CONFIGS,
-        line_arg="provider",
-        line_vals=LINE_VALS,
-        # Triton has multi kernels and we only report the time for the core one
-        line_names=LINE_NAMES,
-        styles=STYLES,
-        ylabel="us",
-        plot_name="per-token-group-quant-8bit-performance",
-        args={},
-    )
+LINE_VALS = ["triton", "sglang"]
+
+
+@marker.parametrize(
+    "num_tokens,hidden_dim,group_size,num_ranks,dst_dtype,flags",
+    CONFIGS_FULL,
+    CONFIGS_CI,
 )
+@marker.benchmark("provider", LINE_VALS)
 def benchmark(
     num_tokens, hidden_dim, group_size, num_ranks, dst_dtype, flags, provider
 ):
-    print(
-        f"Testing: {num_tokens=} {hidden_dim=} {group_size=} {num_ranks=} {dst_dtype=} {flags=} {provider=}"
-    )
-
     x, masked_m = create_per_token_group_quant_test_data(
         num_tokens=num_tokens, hidden_dim=hidden_dim, num_ranks=num_ranks, flags=flags
     )
 
     if provider == "triton":
-        fn = triton_per_token_group_quant_8bit
-        kernel_names = "_per_token_group_quant_8bit|_silu_and_mul_post_quant_kernel"
-        bench_fn = lambda: fn(
-            x=x,
-            masked_m=masked_m,
-            group_size=group_size,
-            dst_dtype=dst_dtype,
-            **{k: v for k, v in flags.items() if k not in ["masked_layout_mode"]},
+        # Triton runs multiple kernels (incl. silu+mul); the whole call is
+        # timed here, so the number is an upper bound (the original report
+        # labeled it "inaccurate").
+        kwargs = {k: v for k, v in flags.items() if k != "masked_layout_mode"}
+        return marker.do_bench(
+            triton_per_token_group_quant_8bit,
+            input_kwargs=dict(
+                x=x,
+                masked_m=masked_m,
+                group_size=group_size,
+                dst_dtype=dst_dtype,
+                **kwargs,
+            ),
+            graph_clone_kwargs=("x",),
+            disable_log_bandwidth=True,
+            use_cuda_graph=False,
         )
-    elif provider == "sglang":
-        kernel_names = "per_token_group_quant_8bit_kernel"
-        bench_fn = _make_sglang_bench_fn(
-            x=x,
-            group_size=group_size,
-            dst_dtype=dst_dtype,
-            flags=flags,
-        )
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
 
-    time_s = bench_kineto(bench_fn, kernel_names=kernel_names, num_tests=NUM_TESTS)
-    return time_s * 1e6
+    # sglang JIT kernel: silu+mul pre-computed outside the timed callable.
+    run_fn = _make_sglang_bench_fn(
+        x=x,
+        group_size=group_size,
+        dst_dtype=dst_dtype,
+        flags=flags,
+    )
+    return marker.do_bench(
+        run_fn,
+        disable_log_bandwidth=True,
+        use_cuda_graph=False,
+    )
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    benchmark.run()

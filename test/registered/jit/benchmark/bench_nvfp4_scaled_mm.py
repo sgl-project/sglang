@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import sys
-
 import torch
-import triton
 
-from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
+from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm, scaled_fp4_quant
 from sglang.srt.utils import is_sm100_supported, is_sm120_supported
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -44,11 +41,14 @@ def _dequantize_to_fp16(
 ):
     m, packed_k = tensor_fp4.shape
     k = packed_k * 2
-    flat = tensor_fp4.flatten()
+    flat = tensor_fp4.flatten().to(torch.long)
     high = (flat & 0xF0) >> 4
     low = flat & 0x0F
-    f_h = torch.tensor([K_E2M1_TO_FLOAT[x] for x in high], device=tensor_fp4.device)
-    f_l = torch.tensor([K_E2M1_TO_FLOAT[x] for x in low], device=tensor_fp4.device)
+    # Vectorized E2M1->float lookup on-device (equivalent to indexing the
+    # K_E2M1_TO_FLOAT table per element, but without a Python per-element loop).
+    lut = torch.tensor(K_E2M1_TO_FLOAT, device=tensor_fp4.device)
+    f_h = lut[high]
+    f_l = lut[low]
     val = torch.stack((f_l, f_h), dim=-1).reshape(m, k)
 
     rounded_m = ((m + 128 - 1) // 128) * 128
@@ -114,38 +114,25 @@ def _probe_legacy_aot_scaled_mm() -> tuple[bool, str]:
 
 _AOT_SCALED_MM_AVAILABLE, _AOT_SCALED_MM_REASON = _probe_legacy_aot_scaled_mm()
 
-shape_range = get_benchmark_range(
-    full_range=[(128, 4096, 4096), (512, 4096, 4096), (1024, 8192, 4096)],
-    ci_range=[(128, 4096, 4096)],
+
+def _jit_scaled_fp4_mm(a_fp4, b_fp4, a_sf, b_sf, alpha):
+    return cutlass_scaled_fp4_mm(a_fp4, b_fp4, a_sf, b_sf, alpha, torch.bfloat16)
+
+
+def _aot_scaled_fp4_mm(a_fp4, b_fp4, a_sf, b_sf, alpha):
+    return _aot_cutlass_scaled_fp4_mm(a_fp4, b_fp4, a_sf, b_sf, alpha, torch.bfloat16)
+
+
+@marker.parametrize(
+    "m,n,k",
+    [(128, 4096, 4096), (512, 4096, 4096), (1024, 8192, 4096)],
+    [(128, 4096, 4096)],
 )
+@marker.benchmark("impl", ["jit", "aot_sgl_kernel", "torch_ref"])
+def benchmark(m: int, n: int, k: int, impl: str):
+    if impl == "aot_sgl_kernel" and not _AOT_SCALED_MM_AVAILABLE:
+        marker.skip(f"legacy AOT scaled_mm unavailable: {_AOT_SCALED_MM_REASON}")
 
-line_vals = ["jit"]
-line_names = ["JIT NVFP4 GEMM"]
-styles = [("green", "-")]
-if _AOT_SCALED_MM_AVAILABLE:
-    line_vals.append("aot_sgl_kernel")
-    line_names.append("AOT NVFP4 GEMM")
-    styles.append(("orange", "-"))
-line_vals.append("torch_ref")
-line_names.append("Torch Ref")
-styles.append(("blue", "-"))
-
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["m", "n", "k"],
-        x_vals=shape_range,
-        x_log=False,
-        line_arg="provider",
-        line_vals=line_vals,
-        line_names=line_names,
-        styles=styles,
-        ylabel="us",
-        plot_name="nvfp4-scaled-mm-performance",
-        args={},
-    )
-)
-def benchmark(m, n, k, provider):
     a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
     b = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
 
@@ -160,30 +147,28 @@ def benchmark(m, n, k, provider):
     a_fp4, a_sf = scaled_fp4_quant(a, a_global_scale)
     b_fp4, b_sf = scaled_fp4_quant(b, b_global_scale)
 
-    if provider == "jit":
-        fn = lambda: cutlass_scaled_fp4_mm(
-            a_fp4, b_fp4, a_sf, b_sf, alpha, torch.bfloat16
-        )
-    elif provider == "aot_sgl_kernel":
-        fn = lambda: _aot_cutlass_scaled_fp4_mm(
-            a_fp4, b_fp4, a_sf, b_sf, alpha, torch.bfloat16
-        )
-    elif provider == "torch_ref":
+    if impl == "torch_ref":
         a_ref = _dequantize_to_fp16(a_fp4, a_sf, a_global_scale)
         b_ref = _dequantize_to_fp16(b_fp4, b_sf, b_global_scale)
-        fn = lambda: torch.matmul(a_ref, b_ref.t())
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
+        return marker.do_bench(
+            torch.matmul,
+            input_args=(a_ref, b_ref.t()),
+            graph_clone_args=(0, 1),
+            disable_log_bandwidth=True,
+        )
 
-    return run_benchmark(fn)
+    fn = _jit_scaled_fp4_mm if impl == "jit" else _aot_scaled_fp4_mm
+    return marker.do_bench(
+        fn,
+        input_args=(a_fp4, b_fp4, a_sf, b_sf, alpha),
+        # all inputs are read by the GEMM
+        graph_clone_args=(0, 1, 2, 3, 4),
+        disable_log_bandwidth=True,  # compute-bound GEMM; report us only
+    )
 
 
 if __name__ == "__main__":
     if not _NVFP4_SUPPORTED:
-        print("[skip] NVFP4 scaled_mm benchmark requires sm100/sm120 with CUDA 12.8+.")
-        sys.exit(0)
-    if not _AOT_SCALED_MM_AVAILABLE:
-        print(
-            f"[info] legacy AOT scaled_mm baseline unavailable: {_AOT_SCALED_MM_REASON}"
-        )
-    benchmark.run(print_data=True)
+        print("[skip] NVFP4 scaled-mm benchmark requires SM100 (Blackwell) CUDA.")
+    else:
+        benchmark.run()

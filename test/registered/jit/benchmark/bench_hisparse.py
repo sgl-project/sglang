@@ -1,10 +1,8 @@
-import itertools
-from typing import Dict, Tuple
+from typing import Dict
 
 import torch
-import triton
-import triton.testing
 
+from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE, DEFAULT_DTYPE
 from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -17,26 +15,14 @@ DEVICE = DEFAULT_DEVICE
 DTYPE = DEFAULT_DTYPE
 TOP_K = 2048
 ITEM_SIZE_BYTES = 512
-MISS_RATES = [0.2, 0.001]
-ROUNDS = 5
-WARMUP_ROUNDS = 5
-BATCH_SIZES = [1, 10, 100]
-HOT_BUFFER_SIZES = [4096, 8192]
-CONFIGS = [
-    (
-        batch_size,
-        hot_buffer_size,
-        miss_rate,
-        batch_size * round(TOP_K * miss_rate),
-    )
-    for batch_size, hot_buffer_size, miss_rate in itertools.product(
-        BATCH_SIZES, HOT_BUFFER_SIZES, MISS_RATES
-    )
-]
 
-LINE_VALS = ["jit"]
-LINE_NAMES = ["SGL JIT Kernel"]
-STYLES = [("blue", "--")]
+# (hot_buffer_size, miss_rate) correlated axis
+HOT_BUFFER_MISS = [
+    (4096, 0.2),
+    (4096, 0.001),
+    (8192, 0.2),
+    (8192, 0.001),
+]
 
 
 def _make_top_k_tokens(
@@ -118,10 +104,22 @@ def _build_inputs(
     }
 
 
-def _time_kernel(batch_size: int, hot_buffer_size: int, miss_rate: float) -> float:
+@marker.parametrize("hot_buffer_size,miss_rate", HOT_BUFFER_MISS, HOT_BUFFER_MISS[:2])
+@marker.parametrize("batch_size", [1, 10, 100], [1, 10])
+@marker.benchmark("impl", ["jit"])
+def benchmark_latency(
+    hot_buffer_size: int,
+    miss_rate: float,
+    batch_size: int,
+    impl: str,
+):
+    hot_buffer_size = int(hot_buffer_size)
+    miss_rate = float(miss_rate)
     state = _build_inputs(batch_size, hot_buffer_size, miss_rate)
 
     def run_once():
+        # CPU->GPU transfers can not be CUDA-graph captured; reset mutated state
+        # each iteration so the workload matches the original benchmark.
         state["device_buffer_tokens"].copy_(state["initial_device_buffer_tokens"])
         state["lru_slots"].copy_(state["initial_lru_slots"])
         state["top_k_device_locs"].fill_(-1)
@@ -143,50 +141,12 @@ def _time_kernel(batch_size: int, hot_buffer_size: int, miss_rate: float) -> flo
             num_real_reqs=state["num_real_reqs"],
         )
 
-    run_once()
-    torch.cuda.synchronize()
-    for _ in range(WARMUP_ROUNDS):
-        run_once()
-    torch.cuda.synchronize()
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(ROUNDS):
-        run_once()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) * 1000.0 / ROUNDS
-
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["batch_size", "hot_buffer_size", "miss_rate", "miss_tokens_cnt"],
-        x_vals=CONFIGS,
-        line_arg="provider",
-        line_vals=LINE_VALS,
-        line_names=LINE_NAMES,
-        styles=STYLES,
-        ylabel="us",
-        plot_name="hisparse-latency",
-        args={},
+    return marker.do_bench(
+        run_once,
+        use_cuda_graph=False,  # CPU<->GPU memcpy can not be captured in a CUDA graph
+        disable_log_bandwidth=True,
     )
-)
-def benchmark_latency(
-    batch_size: int,
-    hot_buffer_size: int,
-    miss_rate: float,
-    miss_tokens_cnt: int,
-    provider: str,
-) -> Tuple[float, float, float]:
-    assert provider == "jit"
-    batch_size = int(batch_size)
-    hot_buffer_size = int(hot_buffer_size)
-    miss_rate = float(miss_rate)
-    assert miss_tokens_cnt == batch_size * _miss_tokens_per_req(miss_rate)
-    avg_us = _time_kernel(batch_size, hot_buffer_size, miss_rate)
-    return avg_us, avg_us, avg_us
 
 
 if __name__ == "__main__":
-    benchmark_latency.run(print_data=True)
+    benchmark_latency.run()

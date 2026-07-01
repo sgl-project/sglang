@@ -1,14 +1,9 @@
 # Benchmarks SGLang fused layernorm/rmsnorm scale shift kernels
 # 1. fused_norm_scale_shift
 # 2. fused_scale_residual_norm_scale_shift
-import itertools
-from typing import Tuple
-
 import torch
-import triton
-import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import run_benchmark_no_cudagraph
+from sglang.jit_kernel.benchmark import marker
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNormScaleShift,
@@ -16,7 +11,6 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     ScaleResidualRMSNormScaleShift,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
 
 register_cuda_ci(
     est_time=17,
@@ -25,22 +19,14 @@ register_cuda_ci(
     disabled="Temporarily skipped to unblock flashinfer upgrade. Ref: https://github.com/sgl-project/sglang/actions/runs/23735552939/job/69139238979?pr=21422",
 )
 
-if is_in_ci():
-    B_RANGE, S_RANGE, D_RANGE = [1], [128], [1024]
-else:
-    B_RANGE, S_RANGE, D_RANGE = [1], [128, 1024, 4096], [1024, 3072, 4096]
-
+B_RANGE = [1]
+S_RANGE = [128, 1024, 4096]
+D_RANGE = [1024, 3072, 4096]
 NORM_TYPE_RANGE = ["layer", "rms"]
 AFFINE_RANGE = [True, False]
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
 EPS = 1e-5
-LINE_VALS = ["native", "cuda"]
-LINE_NAMES = ["SGLang Native", "SGLang Fused"]
-STYLES = [("red", "-"), ("blue", "--")]
-config = list(
-    itertools.product(B_RANGE, S_RANGE, D_RANGE, NORM_TYPE_RANGE, AFFINE_RANGE)
-)
 
 
 def preprocess_layer(layer, affine: bool, D: int, DTYPE: torch.dtype):
@@ -58,22 +44,15 @@ def preprocess_layer(layer, affine: bool, D: int, DTYPE: torch.dtype):
 # ============================================================================
 # Benchmark 1: fused_norm_scale_shift
 # ============================================================================
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["B", "S", "D", "norm_type", "affine"],
-        x_vals=config,
-        line_arg="provider",
-        line_vals=LINE_VALS,
-        line_names=LINE_NAMES,
-        styles=STYLES,
-        ylabel="us",
-        plot_name="fused_norm_scale_shift",
-        args={},
-    )
-)
+@marker.parametrize("B", B_RANGE, [1])
+@marker.parametrize("S", S_RANGE, [128])
+@marker.parametrize("D", D_RANGE, [1024])
+@marker.parametrize("norm_type", NORM_TYPE_RANGE, ["layer"])
+@marker.parametrize("affine", AFFINE_RANGE, [True])
+@marker.benchmark("provider", ["native", "cuda"])
 def bench_fused_norm_scale_shift(
-    B: int, S: int, D: int, norm_type, affine: bool, provider: str
-) -> Tuple[float, float, float]:
+    B: int, S: int, D: int, norm_type: str, affine: bool, provider: str
+):
     x = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
     scale = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
     shift = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
@@ -83,32 +62,27 @@ def bench_fused_norm_scale_shift(
         layer = RMSNormScaleShift(D, EPS, affine, dtype=DTYPE)
     layer = preprocess_layer(layer, affine, D, DTYPE)
     if provider == "native":
-        fn = lambda: layer.forward_native(x, shift, scale)
+        fn = layer.forward_native
     else:
-        fn = lambda: layer.forward_cuda(x, shift, scale)
+        fn = layer.forward_cuda
 
-    return run_benchmark_no_cudagraph(fn)
+    # Rotate the read tensors per iteration (do_bench clones input_args); a
+    # zero-arg closure would keep them L2-hot and report wrongly fast numbers.
+    return marker.do_bench(fn, input_args=(x, shift, scale))
 
 
 # ============================================================================
 # Benchmark 2: fused_scale_residual_norm_scale_shift
 # ============================================================================
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["B", "S", "D", "norm_type", "affine"],
-        x_vals=config,
-        line_arg="provider",
-        line_vals=LINE_VALS,
-        line_names=LINE_NAMES,
-        styles=STYLES,
-        ylabel="us",
-        plot_name="fused_scale_residual_norm_scale_shift",
-        args={},
-    )
-)
+@marker.parametrize("B", B_RANGE, [1])
+@marker.parametrize("S", S_RANGE, [128])
+@marker.parametrize("D", D_RANGE, [1024])
+@marker.parametrize("norm_type", NORM_TYPE_RANGE, ["layer"])
+@marker.parametrize("affine", AFFINE_RANGE, [True])
+@marker.benchmark("provider", ["native", "cuda"])
 def bench_fused_scale_residual_norm_scale_shift(
-    B: int, S: int, D: int, norm_type, affine: bool, provider: str
-) -> Tuple[float, float, float]:
+    B: int, S: int, D: int, norm_type: str, affine: bool, provider: str
+):
     residual = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
     x = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
     scale = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
@@ -120,20 +94,25 @@ def bench_fused_scale_residual_norm_scale_shift(
         layer = ScaleResidualRMSNormScaleShift(D, EPS, affine, dtype=DTYPE).to(DEVICE)
     layer = preprocess_layer(layer, affine, D, DTYPE)
     if provider == "native":
-        fn = lambda: layer.forward_native(residual, x, gate, shift, scale)
+        fn = layer.forward_native
     else:
-        fn = lambda: layer.forward_cuda(residual, x, gate, shift, scale)
+        fn = layer.forward_cuda
 
-    return run_benchmark_no_cudagraph(fn)
+    # Rotate the read tensors per iteration (do_bench clones input_args); a
+    # zero-arg closure would keep them L2-hot and report wrongly fast numbers.
+    return marker.do_bench(fn, input_args=(residual, x, gate, shift, scale))
+
+
+SEP = "=" * 80
 
 
 if __name__ == "__main__":
-    print(f"\n{'='*80}")
+    print(f"\n{SEP}")
     print("Benchmark: fused_norm_scale_shift")
-    print(f"{'='*80}\n")
-    bench_fused_norm_scale_shift.run(print_data=True)
+    print(f"{SEP}\n")
+    bench_fused_norm_scale_shift.run()
 
-    print(f"\n{'='*80}")
+    print(f"\n{SEP}")
     print("Benchmark: fused_scale_residual_norm_scale_shift")
-    print(f"{'='*80}\n")
-    bench_fused_scale_residual_norm_scale_shift.run(print_data=True)
+    print(f"{SEP}\n")
+    bench_fused_scale_residual_norm_scale_shift.run()

@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import sys
 from typing import Any
 
 import torch
-import triton
 
-from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
+from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.mxfp8 import (
     es_sm100_mxfp8_blockscaled_grouped_quant,
     es_sm100_mxfp8_blockscaled_moe_grouped_gemm,
@@ -38,12 +36,6 @@ def _probe_sgl_kernel_group_mm() -> tuple[bool, str]:
         return False, f"import sgl_kernel failed: {e}"
     if not hasattr(sgl_kernel, "es_sm100_mxfp8_blockscaled_grouped_mm"):
         return False, "sgl_kernel.es_sm100_mxfp8_blockscaled_grouped_mm is missing."
-    try:
-        pass
-
-        # We assume if it's imported, it works
-    except Exception as e:
-        return False, f"calling sgl-kernel grouped_mm op failed: {e}"
     return True, ""
 
 
@@ -52,6 +44,17 @@ _SGL_KERNEL_AVAILABLE, _SGL_KERNEL_REASON = _probe_sgl_kernel_group_mm()
 
 def align(val: int, alignment: int = 128) -> int:
     return int((val + alignment - 1) // alignment * alignment)
+
+
+# Global workspace to avoid allocating ~1GB on every benchmark config.
+_WORKSPACE: torch.Tensor | None = None
+
+
+def _get_workspace() -> torch.Tensor:
+    global _WORKSPACE
+    if _WORKSPACE is None:
+        _WORKSPACE = torch.empty((1024, 1024, 1024), dtype=torch.uint8, device="cuda")
+    return _WORKSPACE
 
 
 def _prepare_case(
@@ -127,8 +130,7 @@ def _prepare_case(
         (num_experts * n_g, k_g // 32), dtype=torch.uint8, device=device
     )
 
-    # Use a global workspace to avoid allocating 1GB every time
-    workspace = torch.empty((1024, 1024, 1024), dtype=torch.uint8, device=device)
+    workspace = _get_workspace()
 
     es_sm100_mxfp8_blockscaled_grouped_quant(
         a,
@@ -173,17 +175,17 @@ def _prepare_case(
     }
 
 
-def _sgl_kernel_group_mm(case: dict[str, Any]) -> torch.Tensor:
+def _sgl_kernel_group_mm(
+    a_quant,
+    sgl_b_quant,
+    a_scale_factor,
+    sgl_b_scale_factor,
+    problem_sizes,
+    expert_offsets,
+    a_blockscale_offsets,
+    dtype,
+) -> torch.Tensor:
     from sgl_kernel import es_sm100_mxfp8_blockscaled_grouped_mm
-
-    a_quant = case["a_quant"]
-    sgl_b_quant = case["sgl_b_quant"]
-    a_scale_factor = case["a_scale_factor"]
-    sgl_b_scale_factor = case["sgl_b_scale_factor"]
-    problem_sizes = case["problem_sizes"]
-    expert_offsets = case["expert_offsets"]
-    a_blockscale_offsets = case["a_blockscale_offsets"]
-    dtype = case["dtype"]
 
     total_tokens = a_quant.shape[0]
     n_g = sgl_b_quant.shape[2]
@@ -203,90 +205,75 @@ def _sgl_kernel_group_mm(case: dict[str, Any]) -> torch.Tensor:
     return d
 
 
-shape_range = get_benchmark_range(
-    full_range=[
-        # (total_tokens, n_g, k_g, num_experts)
-        (1024, 4096, 4096, 64),
-        (2048, 4096, 4096, 64),
-        (4096, 4096, 4096, 64),
+# (total_tokens, n_g, k_g, num_experts)
+_SQUARE_SHAPES = [
+    (1024, 4096, 4096, 64),
+    (2048, 4096, 4096, 64),
+    (4096, 4096, 4096, 64),
+]
+_DSV3_SHAPES = [
+    (total_tokens, n_g, k_g, num_experts)
+    for total_tokens in [32 * (2**i) for i in range(9)]  # 32 to 8192
+    for n_g, k_g, num_experts in [
+        # DeepSeek-V3/R1, gateup, TP = 1, EP = 8
+        (4096, 7168, 32),
+        # DeepSeek-V3/R1, down, TP = 1, EP = 8
+        (7168, 2048, 32),
     ]
-    + [
-        (total_tokens, n_g, k_g, num_experts)
-        for total_tokens in [32 * (2**i) for i in range(9)]  # 32 to 8192
-        for n_g, k_g, num_experts in [
-            # DeepSeek-V3/R1, gateup, TP = 1, EP = 8
-            (4096, 7168, 32),
-            # DeepSeek-V3/R1, down, TP = 1, EP = 8
-            (7168, 2048, 32),
-        ]
-    ],
-    ci_range=[(1024, 2048, 2048, 8)],
+]
+
+
+@marker.parametrize(
+    "total_tokens,n_g,k_g,num_experts",
+    _SQUARE_SHAPES + _DSV3_SHAPES,
+    [(1024, 2048, 2048, 8)],
 )
+@marker.benchmark("impl", ["jit", "sgl_kernel"])
+def benchmark(total_tokens: int, n_g: int, k_g: int, num_experts: int, impl: str):
+    if impl == "sgl_kernel" and not _SGL_KERNEL_AVAILABLE:
+        marker.skip(f"sgl-kernel baseline unavailable: {_SGL_KERNEL_REASON}")
 
-line_vals = ["jit"]
-line_names = ["JIT MXFP8 MoE GroupMM"]
-styles = [("green", "-")]
-
-if _SGL_KERNEL_AVAILABLE:
-    line_vals.append("sgl_kernel")
-    line_names.append("sgl-kernel MXFP8 MoE GroupMM")
-    styles.append(("orange", "-"))
-
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["total_tokens", "n_g", "k_g", "num_experts"],
-        x_vals=shape_range,
-        x_log=False,
-        line_arg="provider",
-        line_vals=line_vals,
-        line_names=line_names,
-        styles=styles,
-        ylabel="us",
-        plot_name="mxfp8-moe-groupmm-performance",
-        args={},
-    )
-)
-def benchmark(total_tokens, n_g, k_g, num_experts, provider):
     case = _prepare_case(total_tokens, n_g, k_g, num_experts, torch.bfloat16)
 
-    if provider == "jit":
-        fn = lambda: es_sm100_mxfp8_blockscaled_moe_grouped_gemm(
-            case["b_quant"],
+    if impl == "jit":
+        # NOTE: workspace is reused scratch (write-only) and is ~1GB, so it is
+        # excluded from graph_clone_args; all other args are read tensors/scalars.
+        return marker.do_bench(
+            es_sm100_mxfp8_blockscaled_moe_grouped_gemm,
+            input_args=(
+                case["b_quant"],
+                case["a_quant"],
+                case["b_scale_factor"],
+                case["a_scale_factor"],
+                case["expert_offsets"],
+                case["a_blockscale_offsets"],
+                case["tokens_per_expert"],
+                case["workspace"],
+                case["dtype"],
+            ),
+            graph_clone_args=(0, 1, 2, 3, 4, 5, 6),  # exclude workspace (7) and dtype
+            disable_log_bandwidth=True,  # compute-bound grouped GEMM; report us only
+        )
+
+    return marker.do_bench(
+        _sgl_kernel_group_mm,
+        input_args=(
             case["a_quant"],
-            case["b_scale_factor"],
+            case["sgl_b_quant"],
             case["a_scale_factor"],
+            case["sgl_b_scale_factor"],
+            case["problem_sizes"],
             case["expert_offsets"],
             case["a_blockscale_offsets"],
-            case["tokens_per_expert"],
-            case["workspace"],
             case["dtype"],
-        )
-    elif provider == "sgl_kernel":
-        fn = lambda: _sgl_kernel_group_mm(case)
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
-
-    # Warm up
-    fn()
-
-    # Profile
-    if provider == "jit":
-        torch.cuda.nvtx.range_push("jit")
-        fn()
-        torch.cuda.nvtx.range_pop()
-    elif provider == "sgl_kernel":
-        torch.cuda.nvtx.range_push("sgl_kernel")
-        fn()
-        torch.cuda.nvtx.range_pop()
-
-    return run_benchmark(fn)
+        ),
+        graph_clone_args=(0, 1, 2, 3, 4, 5, 6),  # dtype (7) is a scalar
+        disable_log_bandwidth=True,  # compute-bound grouped GEMM; report us only
+    )
 
 
 if __name__ == "__main__":
     if not _SM100_SUPPORTED:
-        print("[skip] MXFP8 MoE GroupMM benchmark requires sm100+ with CUDA 12.8+.")
-        sys.exit(0)
-    if not _SGL_KERNEL_AVAILABLE:
-        print(f"[info] sgl-kernel baseline unavailable: {_SGL_KERNEL_REASON}")
-    benchmark.run(print_data=True)
+        print("[skip] MXFP8 MoE benchmark requires SM100 (Blackwell) CUDA.")
+    else:
+        benchmark.run()

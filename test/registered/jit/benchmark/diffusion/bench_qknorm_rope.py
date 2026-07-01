@@ -1,16 +1,9 @@
 from dataclasses import dataclass
-from typing import Tuple
 
 import torch
-import triton
-import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
-    DEFAULT_DEVICE,
-    DEFAULT_DTYPE,
-    get_benchmark_range,
-    run_benchmark_no_cudagraph,
-)
+from sglang.jit_kernel.benchmark import marker
+from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE, DEFAULT_DTYPE
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -41,13 +34,7 @@ BENCH_CASES = (
     CaseSpec("batch2_medium", 2, 2048, 24, 128, 128, False),
 )
 CASE_BY_NAME = {case.name: case for case in BENCH_CASES}
-CASE_NAMES = get_benchmark_range(
-    full_range=[case.name for case in BENCH_CASES],
-    ci_range=[case.name for case in BENCH_CASES],
-)
-LINE_VALS = ["split", "fused"]
-LINE_NAMES = ["JIT QKNorm + FlashInfer RoPE", "SGL JIT Fused QKNorm+RoPE"]
-STYLES = [("red", "-"), ("blue", "--")]
+CASE_NAMES = [case.name for case in BENCH_CASES]
 
 
 def create_cos_sin_cache(
@@ -119,15 +106,6 @@ def make_inputs(case: CaseSpec) -> dict[str, torch.Tensor | bool]:
     }
 
 
-def clone_inputs(
-    inputs: dict[str, torch.Tensor | bool],
-) -> dict[str, torch.Tensor | bool]:
-    out: dict[str, torch.Tensor | bool] = {}
-    for key, value in inputs.items():
-        out[key] = value.clone() if isinstance(value, torch.Tensor) else value
-    return out
-
-
 def split_qknorm_rope(inputs: dict[str, torch.Tensor | bool]) -> None:
     from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 
@@ -167,26 +145,25 @@ def fused_qknorm_rope(inputs: dict[str, torch.Tensor | bool]) -> None:
     )
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["case_name"],
-        x_vals=CASE_NAMES,
-        line_arg="provider",
-        line_vals=LINE_VALS,
-        line_names=LINE_NAMES,
-        styles=STYLES,
-        ylabel="us",
-        plot_name="diffusion-qknorm-rope-performance",
-        args={},
-    )
-)
-def benchmark(case_name: str, provider: str) -> Tuple[float, float, float]:
+FN_MAP = {
+    "split": split_qknorm_rope,
+    "fused": fused_qknorm_rope,
+}
+
+
+@marker.parametrize("case_name", CASE_NAMES, [CASE_NAMES[0]])
+@marker.benchmark("provider", ["split", "fused"])
+def benchmark(case_name: str, provider: str):
     case = CASE_BY_NAME[case_name]
     inputs = make_inputs(case)
-    fn = split_qknorm_rope if provider == "split" else fused_qknorm_rope
-    return run_benchmark_no_cudagraph(lambda: fn(inputs))
+    return marker.do_bench(
+        FN_MAP[provider],
+        input_args=(inputs,),
+        # q / k are written in place; cos_sin_cache / positions / weights are read.
+        memory_output=(inputs["q"], inputs["k"]),
+    )
 
 
 if __name__ == "__main__":
     print("Running diffusion qknorm + rope performance benchmark...")
-    benchmark.run(print_data=True)
+    benchmark.run()

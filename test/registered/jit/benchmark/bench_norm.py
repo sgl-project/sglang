@@ -1,12 +1,9 @@
-import itertools
-
 import torch
-import triton
-import triton.testing
 from flashinfer.norm import fused_add_rmsnorm as fi_fused_add_rmsnorm
 from flashinfer.norm import rmsnorm as fi_rmsnorm
 
-from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
+from sglang.jit_kernel.benchmark import marker
+from sglang.jit_kernel.benchmark.utils import create_random
 from sglang.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
 from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -16,87 +13,64 @@ register_cuda_ci(
 )
 
 
-DTYPE = torch.bfloat16
-DEVICE = "cuda"
-
-BS_LIST = get_benchmark_range(
-    full_range=[2**n for n in range(0, 14)],
-    ci_range=[16, 32],
-)
-HIDDEN_SIZE_LIST = get_benchmark_range(
-    full_range=sorted([1536, *range(1024, 8192 + 1, 1024)]),
-    ci_range=[512, 2048],
-)
-
-LINE_VALS = ["flashinfer", "jit"]
-LINE_NAMES = ["FlashInfer", "SGL JIT Kernel"]
-STYLES = [("blue", "--"), ("green", "-.")]
-NUM_LAYERS = 4  # avoid L2 effect
-
-configs_0 = list(itertools.product(HIDDEN_SIZE_LIST + [16384], BS_LIST))
-configs_1 = list(itertools.product(HIDDEN_SIZE_LIST, BS_LIST))
+HIDDEN_SIZE_LIST = sorted([1536, *range(1024, 8192 + 1, 1024)])
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["hidden_size", "batch_size"],
-        x_vals=configs_0,
-        line_arg="provider",
-        line_vals=LINE_VALS,
-        line_names=LINE_NAMES,
-        styles=STYLES,
-        ylabel="us",
-        plot_name="rmsnorm-performance",
-        args={},
-    )
-)
-def benchmark_rmsnorm(hidden_size: int, batch_size: int, provider: str):
-    input = torch.randn(
-        (NUM_LAYERS, batch_size, hidden_size), dtype=DTYPE, device=DEVICE
-    )
-    weight = torch.randn((NUM_LAYERS, hidden_size), dtype=DTYPE, device=DEVICE)
-    FN_MAP = {"jit": jit_rmsnorm, "flashinfer": fi_rmsnorm}
-
-    def f():
-        fn = FN_MAP[provider]
-        for i in range(NUM_LAYERS):
-            fn(input[i], weight[i], out=input[i])
-
-    return run_benchmark(f, scale=NUM_LAYERS)
+def torch_rmsnorm(input: torch.Tensor, weight: torch.Tensor) -> None:
+    fi_rmsnorm(input, weight, out=input)
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["hidden_size", "batch_size"],
-        x_vals=configs_1,
-        line_arg="provider",
-        line_vals=LINE_VALS,
-        line_names=LINE_NAMES,
-        styles=STYLES,
-        ylabel="us",
-        plot_name="fused-add-rmsnorm-performance",
-        args={},
-    )
-)
-def benchmark_fused_add_rmsnorm(hidden_size: int, batch_size: int, provider: str):
-    input = torch.randn(
-        (NUM_LAYERS, batch_size, hidden_size), dtype=DTYPE, device=DEVICE
-    )
-    residual = torch.randn_like(input)
-    weight = torch.randn((NUM_LAYERS, hidden_size), dtype=DTYPE, device=DEVICE)
-    FN_MAP = {"jit": jit_fused_add_rmsnorm, "flashinfer": fi_fused_add_rmsnorm}
+FN_MAP_RMSNORM = {
+    "jit": lambda input, weight: jit_rmsnorm(input, weight, out=input),
+    "flashinfer": torch_rmsnorm,
+}
 
-    def f():
-        fn = FN_MAP[provider]
-        for i in range(NUM_LAYERS):
-            fn(input[i], residual[i], weight[i])
+FN_MAP_FUSED = {
+    "jit": jit_fused_add_rmsnorm,
+    "flashinfer": fi_fused_add_rmsnorm,
+}
 
-    return run_benchmark(f, scale=NUM_LAYERS)
+
+@marker.parametrize("hidden_size", HIDDEN_SIZE_LIST + [16384], [512, 2048])
+@marker.parametrize("batch_size", [2**n for n in range(0, 14)], [16, 32])
+@marker.benchmark("impl", ["flashinfer", "jit"])
+def benchmark_rmsnorm(hidden_size: int, batch_size: int, impl: str):
+    input = create_random(batch_size, hidden_size)
+    weight = create_random(hidden_size)
+    fn = FN_MAP_RMSNORM[impl]
+    try:
+        return marker.do_bench(
+            fn,
+            input_args=(input, weight),
+            graph_clone_args=(0, 1),
+            memory_output=(input,),  # inplace write to input
+        )
+    except RuntimeError as e:
+        marker.skip(str(e))
+
+
+@marker.parametrize("hidden_size", HIDDEN_SIZE_LIST, [512, 2048])
+@marker.parametrize("batch_size", [2**n for n in range(0, 14)], [16, 32])
+@marker.benchmark("impl", ["flashinfer", "jit"])
+def benchmark_fused_add_rmsnorm(hidden_size: int, batch_size: int, impl: str):
+    input = create_random(batch_size, hidden_size)
+    residual = create_random(batch_size, hidden_size)
+    weight = create_random(hidden_size)
+    fn = FN_MAP_FUSED[impl]
+    try:
+        return marker.do_bench(
+            fn,
+            input_args=(input, residual, weight),
+            graph_clone_args=(0, 1, 2),
+            memory_output=(input, residual),  # inplace write to input, residual
+        )
+    except RuntimeError as e:
+        marker.skip(str(e))
 
 
 if __name__ == "__main__":
     print("Benchmarking rmsnorm...")
-    benchmark_rmsnorm.run(print_data=True)
+    benchmark_rmsnorm.run()
 
     print("Benchmarking fused_add_rmsnorm...")
-    benchmark_fused_add_rmsnorm.run(print_data=True)
+    benchmark_fused_add_rmsnorm.run()

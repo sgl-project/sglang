@@ -1,12 +1,7 @@
 import torch
-import triton
-import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
-    DEFAULT_DEVICE,
-    get_benchmark_range,
-    run_benchmark_no_cudagraph,
-)
+from sglang.jit_kernel.benchmark import marker
+from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE
 from sglang.jit_kernel.ngram_embedding import (
     compute_n_gram_ids,
     compute_n_gram_ids_decode,
@@ -21,10 +16,6 @@ NE_N = 8
 NE_K = 2
 VOCAB_SIZE = 32000
 MAX_CONTEXT_LEN = 1024
-BATCH_SIZE_LIST = get_benchmark_range(
-    full_range=[1, 2, 8, 32, 128, 512, 1024, 2048, 4096],
-    ci_range=[32, 1024],
-)
 
 
 def _make_ngram_params():
@@ -48,19 +39,12 @@ def _make_ngram_params():
     )
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["batch_size"],
-        x_vals=BATCH_SIZE_LIST,
-        line_arg="provider",
-        line_vals=["general", "decode"],
-        line_names=["general compute_n_gram_ids", "decode fast path"],
-        styles=[("blue", "-"), ("orange", "-")],
-        ylabel="us",
-        plot_name="ngram-compute-decode",
-        args={},
-    )
+@marker.parametrize(
+    "batch_size",
+    [1, 2, 8, 32, 128, 512, 1024, 2048, 4096],
+    [32, 1024],
 )
+@marker.benchmark("provider", ["general", "decode"])
 def benchmark(batch_size: int, provider: str):
     num_configs = (NE_N - 1) * NE_K
     max_running_reqs = batch_size + 8
@@ -85,9 +69,9 @@ def benchmark(batch_size: int, provider: str):
         exclusive_req_len_sums = torch.arange(
             batch_size + 1, dtype=torch.int32, device=DEFAULT_DEVICE
         )
-
-        def fn():
-            compute_n_gram_ids(
+        return marker.do_bench(
+            compute_n_gram_ids,
+            input_args=(
                 NE_N,
                 NE_K,
                 ne_weights,
@@ -99,25 +83,26 @@ def benchmark(batch_size: int, provider: str):
                 row_indices,
                 column_starts,
                 n_gram_ids,
-            )
+            ),
+            memory_output=(n_gram_ids,),  # inplace write to n_gram_ids
+        )
 
-    else:
-
-        def fn():
-            compute_n_gram_ids_decode(
-                NE_N,
-                NE_K,
-                ne_weights,
-                ne_mods,
-                exclusive_sums,
-                ne_token_table,
-                row_indices,
-                column_starts,
-                n_gram_ids,
-            )
-
-    return run_benchmark_no_cudagraph(fn)
+    return marker.do_bench(
+        compute_n_gram_ids_decode,
+        input_args=(
+            NE_N,
+            NE_K,
+            ne_weights,
+            ne_mods,
+            exclusive_sums,
+            ne_token_table,
+            row_indices,
+            column_starts,
+            n_gram_ids,
+        ),
+        memory_output=(n_gram_ids,),  # inplace write to n_gram_ids
+    )
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    benchmark.run()

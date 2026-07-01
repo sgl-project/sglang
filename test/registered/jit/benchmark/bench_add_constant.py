@@ -1,13 +1,8 @@
 import torch
-import triton
-import triton.testing
 
 from sglang.jit_kernel.add_constant import _jit_add_constant_module, add_constant
-from sglang.jit_kernel.benchmark.utils import (
-    DEFAULT_DEVICE,
-    get_benchmark_range,
-    run_benchmark_no_cudagraph,
-)
+from sglang.jit_kernel.benchmark import marker
+from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -15,25 +10,14 @@ register_cuda_ci(
 )
 
 CONSTANT = 7
-SIZE_LIST = get_benchmark_range(
-    full_range=[128, 1024, 1025, 4096, 4097, 65536, 2**20, 2**22, 2**24],
-    ci_range=[4096, 2**20],
-)
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["size"],
-        x_vals=SIZE_LIST,
-        line_arg="provider",
-        line_vals=["jit_module", "jit_wrapper", "torch"],
-        line_names=["JIT module", "JIT wrapper", "PyTorch"],
-        styles=[("blue", "-"), ("orange", "-"), ("green", "--")],
-        ylabel="us",
-        plot_name="add-constant-performance",
-        args={},
-    )
+@marker.parametrize(
+    "size",
+    [128, 1024, 1025, 4096, 4097, 65536, 2**20, 2**22, 2**24],
+    [4096, 2**20],
 )
+@marker.benchmark("provider", ["jit_module", "jit_wrapper", "torch"])
 def benchmark(size: int, provider: str):
     src = torch.arange(size, dtype=torch.int32, device=DEFAULT_DEVICE)
 
@@ -41,21 +25,33 @@ def benchmark(size: int, provider: str):
         dst = torch.empty_like(src)
         module = _jit_add_constant_module(CONSTANT)
 
-        def fn():
+        def fn(src):
             module.add_constant(dst, src)
 
+        return marker.do_bench(
+            fn,
+            input_args=(src,),
+            graph_clone_args=(0,),
+            memory_args=(src,),
+            memory_output=(dst,),
+        )
     elif provider == "jit_wrapper":
 
-        def fn():
-            add_constant(src, CONSTANT)
+        def fn(src):
+            return add_constant(src, CONSTANT)
 
     else:
 
-        def fn():
-            src + CONSTANT
+        def fn(src):
+            return src + CONSTANT
 
-    return run_benchmark_no_cudagraph(fn)
+    return marker.do_bench(
+        fn,
+        input_args=(src,),
+        graph_clone_args=(0,),
+        memory_args=(src,),
+    )
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    benchmark.run()

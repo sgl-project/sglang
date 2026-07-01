@@ -1,14 +1,7 @@
-import itertools
-
 import torch
-import triton
-import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
-    DEFAULT_DEVICE,
-    get_benchmark_range,
-    run_benchmark,
-)
+from sglang.jit_kernel.benchmark import marker
+from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE
 from sglang.jit_kernel.clamp_position import clamp_position_cuda
 from sglang.srt.utils import get_compiler_backend
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -17,13 +10,6 @@ register_cuda_ci(
     est_time=13, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
 register_amd_ci(est_time=16, stage="jit-kernel-unit", runner_config="amd")
-
-SIZE_LIST = get_benchmark_range(
-    full_range=[2**n for n in range(4, 16)],
-    ci_range=[256, 4096],
-)
-
-configs = list(itertools.product(SIZE_LIST))
 
 
 def _torch_clamp_position(seq_lens):
@@ -34,34 +20,25 @@ _compiled_clamp_position = torch.compile(
     _torch_clamp_position, dynamic=True, backend=get_compiler_backend()
 )
 
+FN_MAP = {
+    "jit": clamp_position_cuda,
+    "torch_compile": _compiled_clamp_position,
+    "torch": _torch_clamp_position,
+}
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["size"],
-        x_vals=configs,
-        line_arg="provider",
-        line_vals=["jit", "torch_compile", "torch"],
-        line_names=["SGL JIT Kernel", "torch.compile", "PyTorch"],
-        styles=[("blue", "-"), ("green", "-."), ("red", "--")],
-        ylabel="us",
-        plot_name="clamp-position-performance",
-        args={},
-    )
-)
+
+@marker.parametrize("size", [2**n for n in range(4, 16)], [256, 4096])
+@marker.benchmark("provider", ["jit", "torch_compile", "torch"])
 def benchmark(size: int, provider: str):
     seq_lens = torch.randint(
         0, 10000, (size,), dtype=torch.int64, device=DEFAULT_DEVICE
     )
-
-    if provider == "jit":
-        fn = lambda: clamp_position_cuda(seq_lens)
-    elif provider == "torch_compile":
-        fn = lambda: _compiled_clamp_position(seq_lens)
-    else:
-        fn = lambda: _torch_clamp_position(seq_lens)
-
-    return run_benchmark(fn)
+    return marker.do_bench(
+        FN_MAP[provider],
+        input_args=(seq_lens,),
+        graph_clone_args=(0,),
+    )
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    benchmark.run()

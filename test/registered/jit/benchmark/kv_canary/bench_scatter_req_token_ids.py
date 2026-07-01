@@ -1,16 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
-import triton
-import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
-    DEFAULT_DEVICE,
-    get_benchmark_range,
-    run_benchmark_no_cudagraph,
-)
+from sglang.jit_kernel.benchmark import marker
+from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE
 from sglang.jit_kernel.kv_canary.scatter_req_token_ids import (
     launch_scatter_req_token_ids_kernel,
 )
@@ -23,30 +16,12 @@ register_cuda_ci(est_time=180, suite="nightly-kernel-1-gpu", nightly=True)
 register_amd_ci(est_time=180, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 
-_BS_AXIS_FULL: list[int] = [1, 8, 64, 256]
-_SEQ_LEN_AXIS_FULL: list[int] = [128, 512, 2048, 8192]
-_BS_AXIS_CI: list[int] = [1, 64]
-_SEQ_LEN_AXIS_CI: list[int] = [512, 2048]
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class _BenchCase:
-    bs: int
-    seq_len: int
-
-
-def _build_cases() -> list[_BenchCase]:
-    bs_axis = get_benchmark_range(full_range=_BS_AXIS_FULL, ci_range=_BS_AXIS_CI)
-    seq_axis = get_benchmark_range(
-        full_range=_SEQ_LEN_AXIS_FULL, ci_range=_SEQ_LEN_AXIS_CI
-    )
-    return [
-        _BenchCase(bs=bs, seq_len=seq_len) for bs in bs_axis for seq_len in seq_axis
-    ]
-
-
-_X_NAMES = ["bs", "seq_len"]
-_X_VALS = [(c.bs, c.seq_len) for c in _build_cases()]
+_BS_SEQ_FULL: list[tuple[int, int]] = [
+    (bs, seq_len) for bs in (1, 8, 64, 256) for seq_len in (128, 512, 2048, 8192)
+]
+_BS_SEQ_CI: list[tuple[int, int]] = [
+    (bs, seq_len) for bs in (1, 64) for seq_len in (512, 2048)
+]
 
 
 def _build_inputs(*, bs: int, seq_len: int, device: torch.device) -> dict:
@@ -75,25 +50,16 @@ def _build_inputs(*, bs: int, seq_len: int, device: torch.device) -> dict:
     )
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=_X_NAMES,
-        x_vals=_X_VALS,
-        line_arg="provider",
-        line_vals=["triton"],
-        line_names=["Triton"],
-        styles=[("blue", "-")],
-        ylabel="time (us)",
-        plot_name="kv-canary-scatter-req-token-ids",
-        args={},
-    )
-)
-def benchmark(bs: int, seq_len: int, provider: str) -> tuple[float, float, float]:
+@marker.parametrize("bs,seq_len", _BS_SEQ_FULL, _BS_SEQ_CI)
+@marker.benchmark("provider", ["triton"])
+def benchmark(bs: int, seq_len: int, provider: str):
     inputs = _build_inputs(bs=bs, seq_len=seq_len, device=torch.device(DEFAULT_DEVICE))
-    return run_benchmark_no_cudagraph(
-        lambda: launch_scatter_req_token_ids_kernel(**inputs)
+    return marker.do_bench(
+        lambda: launch_scatter_req_token_ids_kernel(**inputs),
+        use_cuda_graph=False,
+        disable_log_bandwidth=True,
     )
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    benchmark.run()

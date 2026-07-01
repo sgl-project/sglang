@@ -1,19 +1,11 @@
-"""Bench the hybrid ``mla_kv_pack_quantize_fp8`` against an inlined naive Triton baseline."""
-
-import itertools
-from typing import Tuple
+"""Bench the hybrid mla_kv_pack_quantize_fp8 against an inlined naive Triton baseline."""
 
 import torch
 import triton
 import triton.language as tl
-import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
-    DEFAULT_DEVICE,
-    DEFAULT_DTYPE,
-    DEFAULT_QUANTILES,
-    get_benchmark_range,
-)
+from sglang.jit_kernel.benchmark import marker
+from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE, DEFAULT_DTYPE
 from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8 as hybrid_pack,
 )
@@ -132,85 +124,55 @@ def _triton_pack(k_nope, k_pe, v, k_out, v_out):
     )
 
 
+def _hybrid_pack(k_nope, k_pe, v, k_out, v_out):
+    hybrid_pack(k_nope, k_pe, v, k_out=k_out, v_out=v_out)
+
+
+FN_MAP = {
+    "hybrid": _hybrid_pack,
+    "triton": _triton_pack,
+}
+
 QK_NOPE = 128
 QK_ROPE = 64
 V_HEAD = 128
 NUM_HEADS = 32
-NUM_LAYERS = 8
 
-BS_RANGE = get_benchmark_range(
-    full_range=[1, 4, 16, 64, 256, 1024, 4096, 8192, 16384],
-    ci_range=[1, 64, 1024, 4096, 16384],
+
+@marker.parametrize(
+    "batch_size",
+    [1, 4, 16, 64, 256, 1024, 4096, 8192, 16384],
+    [1, 64, 1024, 4096, 16384],
 )
-
-LINE_VALS = ["hybrid", "triton"]
-LINE_NAMES = ["hybrid (v0+v1_flat)", "naive Triton"]
-STYLES = [("green", "-"), ("red", "--")]
-CONFIGS = list(itertools.product(BS_RANGE))
-
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["batch_size"],
-        x_vals=CONFIGS,
-        line_arg="provider",
-        line_vals=LINE_VALS,
-        line_names=LINE_NAMES,
-        styles=STYLES,
-        ylabel="us",
-        plot_name="mla-kv-pack-quantize-fp8-performance",
-        args={},
-    )
-)
-def benchmark(batch_size: int, provider: str) -> Tuple[float, float, float]:
+@marker.benchmark("impl", ["hybrid", "triton"])
+def benchmark(batch_size: int, impl: str):
     k_nope = torch.randn(
-        (NUM_LAYERS, batch_size, NUM_HEADS, QK_NOPE),
-        dtype=DEFAULT_DTYPE,
-        device=DEFAULT_DEVICE,
+        (batch_size, NUM_HEADS, QK_NOPE), dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE
     )
     k_pe = torch.randn(
-        (NUM_LAYERS, batch_size, 1, QK_ROPE),
-        dtype=DEFAULT_DTYPE,
-        device=DEFAULT_DEVICE,
+        (batch_size, 1, QK_ROPE), dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE
     )
     v = torch.randn(
-        (NUM_LAYERS, batch_size, NUM_HEADS, V_HEAD),
-        dtype=DEFAULT_DTYPE,
-        device=DEFAULT_DEVICE,
+        (batch_size, NUM_HEADS, V_HEAD), dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE
     )
     k_out = torch.empty(
-        (NUM_LAYERS, batch_size, NUM_HEADS, QK_NOPE + QK_ROPE),
+        (batch_size, NUM_HEADS, QK_NOPE + QK_ROPE),
         dtype=torch.float8_e4m3fn,
         device=DEFAULT_DEVICE,
     )
     v_out = torch.empty(
-        (NUM_LAYERS, batch_size, NUM_HEADS, V_HEAD),
+        (batch_size, NUM_HEADS, V_HEAD),
         dtype=torch.float8_e4m3fn,
         device=DEFAULT_DEVICE,
     )
-    torch.cuda.synchronize()
-
-    if provider == "hybrid":
-
-        def fn():
-            for i in range(NUM_LAYERS):
-                hybrid_pack(k_nope[i], k_pe[i], v[i], k_out=k_out[i], v_out=v_out[i])
-
-    else:
-
-        def fn():
-            for i in range(NUM_LAYERS):
-                _triton_pack(k_nope[i], k_pe[i], v[i], k_out[i], v_out[i])
-
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
-        fn, quantiles=DEFAULT_QUANTILES
-    )
-    return (
-        1000 * ms / NUM_LAYERS,
-        1000 * max_ms / NUM_LAYERS,
-        1000 * min_ms / NUM_LAYERS,
+    return marker.do_bench(
+        FN_MAP[impl],
+        input_args=(k_nope, k_pe, v, k_out, v_out),
+        graph_clone_args=(0, 1, 2),  # read inputs; k_out / v_out are write targets
+        memory_args=(k_nope, k_pe, v),
+        memory_output=(k_out, v_out),
     )
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    benchmark.run()

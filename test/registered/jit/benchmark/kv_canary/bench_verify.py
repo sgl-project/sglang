@@ -3,24 +3,18 @@ from __future__ import annotations
 from typing import Tuple
 
 import torch
-import triton
-import triton.testing
 
+from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.benchmark.kv_canary.utils import (
     RING_CAPACITY,
     SWA_WINDOW,
     BenchCase,
     build_fast_matrix_cases,
     build_full_matrix_cases,
-    cases_to_x_vals,
     make_real_kv_sources,
     naive_slot_copy_fn,
 )
-from sglang.jit_kernel.benchmark.utils import (
-    DEFAULT_DEVICE,
-    get_benchmark_range,
-    run_benchmark,
-)
+from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
@@ -39,25 +33,28 @@ register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
 register_amd_ci(est_time=900, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 
-_X_NAMES = [
-    "scenario",
-    "bs",
-    "prefix_len",
-    "mode",
-    "extend_len",
-    "pool_kind",
-    "real_kv_kind",
-    "hash_mode",
-]
-_X_VALS = cases_to_x_vals(
-    get_benchmark_range(
-        full_range=build_full_matrix_cases(),
-        ci_range=build_fast_matrix_cases(),
-    )
+_MATRIX_NAMES = (
+    "scenario,bs,prefix_len,mode,extend_len,pool_kind,real_kv_kind,hash_mode"
 )
 
-_KERNEL_KIND_X_NAMES = ["kernel_kind_name"]
-_KERNEL_KIND_X_VALS = [(tag.name,) for tag in CanaryLaunchTag]
+
+def _case_to_tuple(c: BenchCase) -> tuple:
+    return (
+        c.scenario,
+        c.bs,
+        c.prefix_len,
+        c.mode,
+        c.extend_len,
+        c.pool_kind,
+        c.real_kv_kind,
+        c.hash_mode,
+    )
+
+
+_MATRIX_FULL = [_case_to_tuple(c) for c in build_full_matrix_cases()]
+_MATRIX_CI = [_case_to_tuple(c) for c in build_fast_matrix_cases()]
+
+_KERNEL_KIND_VALS = [tag.name for tag in CanaryLaunchTag]
 
 
 def _verify_entry_count(case: BenchCase) -> int:
@@ -175,19 +172,8 @@ def _build_context(
     )
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=_X_NAMES,
-        x_vals=_X_VALS,
-        line_arg="provider",
-        line_vals=["canary", "naive"],
-        line_names=["canary_verify_step", "naive index_copy_"],
-        styles=[("blue", "-"), ("red", "--")],
-        ylabel="us",
-        plot_name="kv-canary-verify-perf",
-        args={},
-    )
-)
+@marker.parametrize(_MATRIX_NAMES, _MATRIX_FULL, _MATRIX_CI)
+@marker.benchmark("provider", ["canary", "naive"])
 def benchmark(
     scenario: str,
     bs: int,
@@ -198,7 +184,7 @@ def benchmark(
     real_kv_kind: str,
     hash_mode: str,
     provider: str,
-) -> Tuple[float, float, float]:
+):
     case = BenchCase(
         scenario=scenario,
         bs=bs,
@@ -246,26 +232,15 @@ def benchmark(
     else:
         fn = naive_slot_copy_fn(total=_verify_entry_count(case), device=device)
 
-    return run_benchmark(fn)
+    return marker.do_bench(fn, disable_log_bandwidth=True)
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=_KERNEL_KIND_X_NAMES,
-        x_vals=_KERNEL_KIND_X_VALS,
-        line_arg="provider",
-        line_vals=["canary"],
-        line_names=["canary_verify_step"],
-        styles=[("blue", "-")],
-        ylabel="us",
-        plot_name="kv-canary-verify-kernel-kind-perf",
-        args={},
-    )
-)
+@marker.parametrize("kernel_kind_name", _KERNEL_KIND_VALS)
+@marker.benchmark("provider", ["canary"])
 def benchmark_kernel_kind(
     kernel_kind_name: str,
     provider: str,
-) -> Tuple[float, float, float]:
+):
     case = BenchCase(
         scenario="kernel_kind",
         bs=32,
@@ -310,9 +285,9 @@ def benchmark_kernel_kind(
             check_verify_expected_token=True,
         )
 
-    return run_benchmark(fn)
+    return marker.do_bench(fn, disable_log_bandwidth=True)
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
-    benchmark_kernel_kind.run(print_data=True)
+    benchmark.run()
+    benchmark_kernel_kind.run()

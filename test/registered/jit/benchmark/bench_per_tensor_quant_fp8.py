@@ -1,10 +1,9 @@
 from typing import Optional, Tuple
 
 import torch
-import triton
-import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
+from sglang.jit_kernel.benchmark import marker
+from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE
 from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -54,69 +53,27 @@ def sglang_scaled_fp8_quant(
     return output, scale
 
 
-def calculate_diff(batch_size: int, seq_len: int):
-    device = torch.device("cuda")
-    x = torch.rand((batch_size, seq_len), dtype=torch.bfloat16, device=device)
+FN_MAP = {
+    "vllm": vllm_scaled_fp8_quant,
+    "sglang": sglang_scaled_fp8_quant,
+}
 
-    if not VLLM_AVAILABLE:
-        print("vLLM not available, skipping comparison")
-        return
-
-    vllm_out, vllm_scale = vllm_scaled_fp8_quant(x)
-    sglang_out, sglang_scale = sglang_scaled_fp8_quant(x)
-
-    vllm_out = vllm_out.to(torch.float32)
-    sglang_out = sglang_out.to(torch.float32)
-
-    triton.testing.assert_close(vllm_out, sglang_out, rtol=1e-3, atol=1e-3)
-    triton.testing.assert_close(vllm_scale, sglang_scale, rtol=1e-3, atol=1e-3)
+LINE_VALS = ["vllm", "sglang"] if VLLM_AVAILABLE else ["sglang"]
 
 
-# Benchmark configuration
-element_range = get_benchmark_range(
-    full_range=[2**n for n in range(10, 20)],
-    ci_range=[16384],
-)
-
-if VLLM_AVAILABLE:
-    line_vals = ["vllm", "sglang"]
-    line_names = ["VLLM", "SGL Kernel"]
-    styles = [("blue", "-"), ("green", "-")]
-else:
-    line_vals = ["sglang"]
-    line_names = ["SGL Kernel"]
-    styles = [("green", "-")]
-
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["element_count"],
-        x_vals=element_range,
-        line_arg="provider",
-        line_vals=line_vals,
-        line_names=line_names,
-        styles=styles,
-        ylabel="us",
-        plot_name="per-tensor-quant-fp8-performance",
-        args={},
-    )
-)
-def benchmark(element_count, provider):
+@marker.parametrize("element_count", [2**n for n in range(10, 20)], [16384])
+@marker.benchmark("provider", LINE_VALS)
+def benchmark(element_count: int, provider: str):
     dtype = torch.float16
-    device = torch.device("cuda")
-
-    x = torch.randn(element_count, 4096, device=device, dtype=dtype)
-
-    if provider == "vllm":
-        fn = lambda: vllm_scaled_fp8_quant(x.clone())
-    elif provider == "sglang":
-        fn = lambda: sglang_scaled_fp8_quant(x.clone())
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
-
-    return run_benchmark(fn)
+    x = torch.randn(element_count, 4096, device=DEFAULT_DEVICE, dtype=dtype)
+    return marker.do_bench(
+        FN_MAP[provider],
+        input_args=(x,),
+        graph_clone_args=(0,),  # x is read
+        memory_args=(x,),
+        # returns (output_fp8, scale); counts both
+    )
 
 
 if __name__ == "__main__":
-    calculate_diff(batch_size=4, seq_len=4096)
-    benchmark.run(print_data=True)
+    benchmark.run()

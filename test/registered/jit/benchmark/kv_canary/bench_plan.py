@@ -1,25 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
-import triton
-import triton.testing
 
+from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.benchmark.kv_canary.utils import (
     POOL_AXIS,
     SWA_WINDOW,
-    BenchCase,
     build_fast_matrix_cases,
     build_full_matrix_cases,
     naive_cumsum_fn,
 )
-from sglang.jit_kernel.benchmark.utils import (
-    DEFAULT_DEVICE,
-    get_benchmark_range,
-    run_benchmark,
-)
+from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE
 from sglang.jit_kernel.kv_canary.plan import launch_canary_plan_kernels
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
@@ -102,30 +96,18 @@ def _build_pool_capacity_cases() -> list[_PoolCapacityBenchCase]:
     return cases
 
 
-_X_NAMES_MATRIX = ["scenario", "bs", "prefix_len", "mode", "extend_len", "pool_kind"]
+_MATRIX_FULL = [
+    (c.scenario, c.bs, c.prefix_len, c.mode, c.extend_len, c.pool_kind)
+    for c in build_full_matrix_cases()
+]
+_MATRIX_CI = [
+    (c.scenario, c.bs, c.prefix_len, c.mode, c.extend_len, c.pool_kind)
+    for c in build_fast_matrix_cases()
+]
 
+_TT_VALS = [(c.bs, c.total_tokens, c.pool_kind) for c in _build_total_tokens_cases()]
 
-def _cases_to_matrix_x_vals(
-    cases: list[BenchCase],
-) -> list[tuple[str, int, int, str, int, str]]:
-    return [
-        (c.scenario, c.bs, c.prefix_len, c.mode, c.extend_len, c.pool_kind)
-        for c in cases
-    ]
-
-
-_X_VALS_MATRIX = _cases_to_matrix_x_vals(
-    get_benchmark_range(
-        full_range=build_full_matrix_cases(),
-        ci_range=build_fast_matrix_cases(),
-    )
-)
-
-_X_NAMES_TT = ["bs", "total_tokens", "pool_kind"]
-_X_VALS_TT = [(c.bs, c.total_tokens, c.pool_kind) for c in _build_total_tokens_cases()]
-
-_X_NAMES_PC = ["bs", "bs_padded", "prefix_len", "verify_capacity", "pool_kind"]
-_X_VALS_PC = [
+_PC_VALS = [
     (
         c.bs,
         c.bs_padded if c.bs_padded is not None else c.bs,
@@ -228,19 +210,10 @@ def _make_plan_callable(inputs: dict):
     return fn
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=_X_NAMES_MATRIX,
-        x_vals=_X_VALS_MATRIX,
-        line_arg="provider",
-        line_vals=["canary", "naive"],
-        line_names=["canary_plan_step", "naive torch.cumsum"],
-        styles=[("blue", "-"), ("red", "--")],
-        ylabel="us",
-        plot_name="kv-canary-plan-matrix-perf",
-        args={},
-    )
+@marker.parametrize(
+    "scenario,bs,prefix_len,mode,extend_len,pool_kind", _MATRIX_FULL, _MATRIX_CI
 )
+@marker.benchmark("provider", ["canary", "naive"])
 def benchmark_matrix(
     scenario: str,
     bs: int,
@@ -249,7 +222,7 @@ def benchmark_matrix(
     extend_len: int,
     pool_kind: str,
     provider: str,
-) -> Tuple[float, float, float]:
+):
     del scenario
     del mode
 
@@ -265,28 +238,17 @@ def benchmark_matrix(
         fn = _make_plan_callable(inputs)
     else:
         fn = naive_cumsum_fn(bs=bs, device=device)
-    return run_benchmark(fn)
+    return marker.do_bench(fn, disable_log_bandwidth=True)
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=_X_NAMES_TT,
-        x_vals=_X_VALS_TT,
-        line_arg="provider",
-        line_vals=["canary", "naive"],
-        line_names=["canary_plan_step", "naive torch.cumsum"],
-        styles=[("blue", "-"), ("red", "--")],
-        ylabel="us",
-        plot_name="kv-canary-plan-total-tokens-perf",
-        args={},
-    )
-)
+@marker.parametrize("bs,total_tokens,pool_kind", _TT_VALS)
+@marker.benchmark("provider", ["canary", "naive"])
 def benchmark_total_tokens(
     bs: int,
     total_tokens: int,
     pool_kind: str,
     provider: str,
-) -> Tuple[float, float, float]:
+):
     device = torch.device(DEFAULT_DEVICE)
     per_req_prefix = max(1, total_tokens // max(bs, 1))
     if provider == "canary":
@@ -300,22 +262,11 @@ def benchmark_total_tokens(
         fn = _make_plan_callable(inputs)
     else:
         fn = naive_cumsum_fn(bs=bs, device=device)
-    return run_benchmark(fn)
+    return marker.do_bench(fn, disable_log_bandwidth=True)
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=_X_NAMES_PC,
-        x_vals=_X_VALS_PC,
-        line_arg="provider",
-        line_vals=["canary", "naive"],
-        line_names=["canary_plan_step", "naive torch.cumsum"],
-        styles=[("blue", "-"), ("red", "--")],
-        ylabel="us",
-        plot_name="kv-canary-plan-pool-capacity-perf",
-        args={},
-    )
-)
+@marker.parametrize("bs,bs_padded,prefix_len,verify_capacity,pool_kind", _PC_VALS)
+@marker.benchmark("provider", ["canary", "naive"])
 def benchmark_pool_capacity(
     bs: int,
     bs_padded: int,
@@ -323,7 +274,7 @@ def benchmark_pool_capacity(
     verify_capacity: int,
     pool_kind: str,
     provider: str,
-) -> Tuple[float, float, float]:
+):
     device = torch.device(DEFAULT_DEVICE)
     if provider == "canary":
         inputs = _build_plan_inputs(
@@ -338,10 +289,10 @@ def benchmark_pool_capacity(
         fn = _make_plan_callable(inputs)
     else:
         fn = naive_cumsum_fn(bs=bs, device=device)
-    return run_benchmark(fn)
+    return marker.do_bench(fn, disable_log_bandwidth=True)
 
 
 if __name__ == "__main__":
-    benchmark_matrix.run(print_data=True)
-    benchmark_total_tokens.run(print_data=True)
-    benchmark_pool_capacity.run(print_data=True)
+    benchmark_matrix.run()
+    benchmark_total_tokens.run()
+    benchmark_pool_capacity.run()

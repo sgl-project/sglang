@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import sys
 from typing import Any
 
 import torch
-import triton
 
-from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
+from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.nvfp4 import (
     cutlass_fp4_group_mm,
     scaled_fp4_experts_quant,
@@ -173,6 +171,18 @@ def _aot_cutlass_fp4_group_mm(case: dict[str, Any]) -> torch.Tensor:
     return out
 
 
+def _jit_cutlass_fp4_group_mm(case: dict[str, Any]) -> torch.Tensor:
+    return cutlass_fp4_group_mm(
+        case["a_fp4"],
+        case["b_fp4"],
+        case["a_blockscale"],
+        case["b_blockscale"],
+        case["alphas"],
+        case["dtype"],
+        case["params"],
+    )
+
+
 def _probe_legacy_aot_group_mm() -> tuple[bool, str]:
     if not torch.cuda.is_available():
         return False, "CUDA is not available."
@@ -198,66 +208,36 @@ def _probe_legacy_aot_group_mm() -> tuple[bool, str]:
 
 _AOT_GROUP_MM_AVAILABLE, _AOT_GROUP_MM_REASON = _probe_legacy_aot_group_mm()
 
-shape_range = get_benchmark_range(
-    full_range=[(128, 256, 128, 4), (256, 512, 128, 8), (512, 512, 256, 8)],
-    ci_range=[(128, 256, 128, 4)],
+FN_MAP = {
+    "jit": _jit_cutlass_fp4_group_mm,
+    "aot_sgl_kernel": _aot_cutlass_fp4_group_mm,
+    "torch_ref": _torch_ref_group_mm,
+}
+
+
+@marker.parametrize(
+    "total_tokens,n,k,num_experts",
+    [(128, 256, 128, 4), (256, 512, 128, 8), (512, 512, 256, 8)],
+    [(128, 256, 128, 4)],
 )
+@marker.benchmark("impl", ["jit", "aot_sgl_kernel", "torch_ref"])
+def benchmark(total_tokens: int, n: int, k: int, num_experts: int, impl: str):
+    if impl == "aot_sgl_kernel" and not _AOT_GROUP_MM_AVAILABLE:
+        marker.skip(f"legacy AOT grouped_mm unavailable: {_AOT_GROUP_MM_REASON}")
 
-line_vals = ["jit"]
-line_names = ["JIT NVFP4 MoE GroupMM"]
-styles = [("green", "-")]
-if _AOT_GROUP_MM_AVAILABLE:
-    line_vals.append("aot_sgl_kernel")
-    line_names.append("AOT NVFP4 MoE GroupMM")
-    styles.append(("orange", "-"))
-line_vals.append("torch_ref")
-line_names.append("Torch Ref")
-styles.append(("blue", "-"))
-
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["total_tokens", "n", "k", "num_experts"],
-        x_vals=shape_range,
-        x_log=False,
-        line_arg="provider",
-        line_vals=line_vals,
-        line_names=line_names,
-        styles=styles,
-        ylabel="us",
-        plot_name="nvfp4-blockwise-moe-groupmm-performance",
-        args={},
-    )
-)
-def benchmark(total_tokens, n, k, num_experts, provider):
     case = _prepare_case(total_tokens, n, k, num_experts, torch.bfloat16)
 
-    if provider == "jit":
-        fn = lambda: cutlass_fp4_group_mm(
-            case["a_fp4"],
-            case["b_fp4"],
-            case["a_blockscale"],
-            case["b_blockscale"],
-            case["alphas"],
-            case["dtype"],
-            case["params"],
-        )
-    elif provider == "aot_sgl_kernel":
-        fn = lambda: _aot_cutlass_fp4_group_mm(case)
-    elif provider == "torch_ref":
-        fn = lambda: _torch_ref_group_mm(case)
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
-
-    return run_benchmark(fn)
+    return marker.do_bench(
+        FN_MAP[impl],
+        input_args=(case,),
+        # case holds read tensors; cloning the dict clones them per iter
+        graph_clone_args=(0,),
+        disable_log_bandwidth=True,  # compute-bound grouped GEMM; report us only
+    )
 
 
 if __name__ == "__main__":
     if not _NVFP4_SUPPORTED:
-        print("[skip] NVFP4 blockwise MoE benchmark requires sm100+ with CUDA 12.8+.")
-        sys.exit(0)
-    if not _AOT_GROUP_MM_AVAILABLE:
-        print(
-            f"[info] legacy AOT grouped_mm baseline unavailable: {_AOT_GROUP_MM_REASON}"
-        )
-    benchmark.run(print_data=True)
+        print("[skip] NVFP4 blockwise MoE benchmark requires SM100 (Blackwell) CUDA.")
+    else:
+        benchmark.run()

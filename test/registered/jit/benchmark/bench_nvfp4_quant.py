@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import sys
-
 import torch
-import triton
 
-from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
+from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.nvfp4 import scaled_fp4_quant
 from sglang.srt.utils import is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -121,77 +118,51 @@ def _probe_flashinfer_quant() -> tuple[bool, str]:
 
 _FLASHINFER_QUANT_AVAILABLE, _FLASHINFER_QUANT_REASON = _probe_flashinfer_quant()
 
-shape_range = get_benchmark_range(
-    full_range=[(128, 2048), (512, 4096), (1024, 4096), (2048, 8192)],
-    ci_range=[(128, 2048)],
-)
 
-line_vals = []
-line_names = []
-styles = []
-if _FLASHINFER_QUANT_AVAILABLE:
-    line_vals.append("flashinfer")
-    line_names.append("FlashInfer FP4 Quant")
-    styles.append(("purple", "-"))
-line_vals.append("jit")
-line_names.append("JIT NVFP4 Quant")
-styles.append(("green", "-"))
-if _AOT_QUANT_AVAILABLE:
-    line_vals.append("aot_sgl_kernel")
-    line_names.append("AOT NVFP4 Quant")
-    styles.append(("orange", "-"))
-line_vals.append("torch_ref")
-line_names.append("Torch Ref")
-styles.append(("blue", "-"))
-
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["m", "n"],
-        x_vals=shape_range,
-        x_log=False,
-        line_arg="provider",
-        line_vals=line_vals,
-        line_names=line_names,
-        styles=styles,
-        ylabel="us",
-        plot_name="nvfp4-quant-performance",
-        args={},
+def _flashinfer_quant(x: torch.Tensor, global_scale: torch.Tensor):
+    return flashinfer_fp4_quantize(
+        x,
+        global_scale,
+        BLOCK_SIZE,  # sf_vec_size
+        False,  # use_ue8m0
+        True,  # is_sf_swizzled_layout
     )
+
+
+FN_MAP = {
+    "flashinfer": _flashinfer_quant,
+    "jit": scaled_fp4_quant,
+    "aot_sgl_kernel": _aot_scaled_fp4_quant,
+    "torch_ref": _torch_ref_quant,
+}
+
+
+@marker.parametrize(
+    "m,n",
+    [(128, 2048), (512, 4096), (1024, 4096), (2048, 8192)],
+    [(128, 2048)],
 )
-def benchmark(m, n, provider):
+@marker.benchmark("impl", ["flashinfer", "jit", "aot_sgl_kernel", "torch_ref"])
+def benchmark(m: int, n: int, impl: str):
+    if impl == "flashinfer" and not _FLASHINFER_QUANT_AVAILABLE:
+        marker.skip(f"flashinfer quant unavailable: {_FLASHINFER_QUANT_REASON}")
+    if impl == "aot_sgl_kernel" and not _AOT_QUANT_AVAILABLE:
+        marker.skip(f"legacy AOT quant unavailable: {_AOT_QUANT_REASON}")
+
     x = torch.randn((m, n), dtype=torch.bfloat16, device="cuda")
     tensor_amax = torch.abs(x).max().to(torch.float32)
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
 
-    if provider == "jit":
-        fn = lambda: scaled_fp4_quant(x, global_scale)
-    elif provider == "flashinfer":
-        fn = lambda: flashinfer_fp4_quantize(
-            x,
-            global_scale,
-            BLOCK_SIZE,  # sf_vec_size
-            False,  # use_ue8m0
-            True,  # is_sf_swizzled_layout
-        )
-    elif provider == "aot_sgl_kernel":
-        fn = lambda: _aot_scaled_fp4_quant(x, global_scale)
-    elif provider == "torch_ref":
-        fn = lambda: _torch_ref_quant(x, global_scale)
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
-
-    return run_benchmark(fn)
+    return marker.do_bench(
+        FN_MAP[impl],
+        input_args=(x, global_scale),
+        graph_clone_args=(0,),  # x is read; global_scale is a tiny scalar tensor
+        disable_log_bandwidth=True,  # compute-bound quant; report us only
+    )
 
 
 if __name__ == "__main__":
     if not _NVFP4_SUPPORTED:
-        print("[skip] NVFP4 quant benchmark requires sm100+ with CUDA 12.8+.")
-        sys.exit(0)
-    if not _FLASHINFER_QUANT_AVAILABLE:
-        print(
-            f"[info] flashinfer quant baseline unavailable: {_FLASHINFER_QUANT_REASON}"
-        )
-    if not _AOT_QUANT_AVAILABLE:
-        print(f"[info] legacy AOT quant baseline unavailable: {_AOT_QUANT_REASON}")
-    benchmark.run(print_data=True)
+        print("[skip] NVFP4 quant benchmark requires SM100 (Blackwell) CUDA.")
+    else:
+        benchmark.run()

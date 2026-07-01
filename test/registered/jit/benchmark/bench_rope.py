@@ -1,15 +1,7 @@
-import itertools
-
 import torch
-import triton
-import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
-    DEFAULT_DEVICE,
-    DEFAULT_DTYPE,
-    get_benchmark_range,
-    run_benchmark,
-)
+from sglang.jit_kernel.benchmark import marker
+from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE, DEFAULT_DTYPE
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -157,53 +149,36 @@ def jit_fused_rope_store(
 # Benchmark configuration (shared)
 # ---------------------------------------------------------------------------
 
-BS_RANGE = get_benchmark_range(
-    full_range=[2**n for n in range(0, 16)],
-    ci_range=[16],
-)
-QK_HEAD_RANGE = get_benchmark_range(
-    full_range=[(8, 1), (16, 2), (32, 8)],
-    ci_range=[(16, 2)],
-)
-QK_HEAD_RANGE = [f"{q},{k}" for q, k in QK_HEAD_RANGE]
-IS_NEOX_RANGE = get_benchmark_range(
-    full_range=[True, False],
-    ci_range=[True],
-)
+BS_RANGE = [2**n for n in range(0, 16)]
+BS_CI = [16]
+QK_HEAD_RANGE = [(8, 1), (16, 2), (32, 8)]
+QK_HEAD_CI = [(16, 2)]
+IS_NEOX_RANGE = [True, False]
+IS_NEOX_CI = [True]
 
 
 # ---------------------------------------------------------------------------
 # Benchmark 1: RoPE only
 # ---------------------------------------------------------------------------
 
-ROPE_LINE_VALS = ["flashinfer", "jit_pos_enc", "jit_fused_rope"]
-ROPE_LINE_NAMES = [
-    "FlashInfer",
-    "SGL JIT PosEnc",
-    "SGL JIT Fused RoPE",
-]
-ROPE_STYLES = [("green", "-."), ("red", "-"), ("blue", "--")]
-
-rope_configs = list(itertools.product(QK_HEAD_RANGE, IS_NEOX_RANGE, BS_RANGE))
+ROPE_FN_MAP = {
+    "flashinfer": flashinfer_rope,
+    "jit_pos_enc": sglang_pos_enc_rope,
+    "jit_fused_rope": sglang_fused_rope,
+}
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["num_q_k_heads", "is_neox", "batch_size"],
-        x_vals=rope_configs,
-        line_arg="provider",
-        line_vals=ROPE_LINE_VALS,
-        line_names=ROPE_LINE_NAMES,
-        styles=ROPE_STYLES,
-        ylabel="us",
-        plot_name="rope-performance",
-        args={},
-    )
-)
-def benchmark(batch_size: int, num_q_k_heads: str, is_neox: bool, provider: str):
-    qo, kv = num_q_k_heads.split(",")
-    num_qo_heads = int(qo)
-    num_kv_heads = int(kv)
+@marker.parametrize("batch_size", BS_RANGE, BS_CI)
+@marker.parametrize("is_neox", IS_NEOX_RANGE, IS_NEOX_CI)
+@marker.parametrize("num_qo_heads,num_kv_heads", QK_HEAD_RANGE, QK_HEAD_CI)
+@marker.benchmark("provider", ["flashinfer", "jit_pos_enc", "jit_fused_rope"])
+def benchmark(
+    num_qo_heads: int,
+    num_kv_heads: int,
+    is_neox: bool,
+    batch_size: int,
+    provider: str,
+):
     q = torch.randn(
         (batch_size, num_qo_heads, ROPE_DIM),
         dtype=DEFAULT_DTYPE,
@@ -219,48 +194,38 @@ def benchmark(batch_size: int, num_q_k_heads: str, is_neox: bool, provider: str)
     positions = torch.randint(
         MAX_SEQ_LEN, (batch_size,), device=DEFAULT_DEVICE, dtype=torch.int64
     )
-    torch.cuda.synchronize()
 
-    FN_MAP = {
-        "flashinfer": flashinfer_rope,
-        "jit_pos_enc": sglang_pos_enc_rope,
-        "jit_fused_rope": sglang_fused_rope,
-    }
-    fn = lambda: FN_MAP[provider](q, k, positions, is_neox)
-    return run_benchmark(fn)
+    return marker.do_bench(
+        ROPE_FN_MAP[provider],
+        input_args=(q, k, positions, is_neox),
+        # q, k written in-place; positions read. Clone all read/written tensors.
+        graph_clone_args=(0, 1, 2),
+        memory_args=(q, k, positions),
+        memory_output=(q, k),  # in-place write to q, k
+    )
 
 
 # ---------------------------------------------------------------------------
 # Benchmark 2: RoPE + KV cache store
 # ---------------------------------------------------------------------------
 
-STORE_LINE_VALS = ["jit_rope_then_store", "jit_fused_store"]
-STORE_LINE_NAMES = [
-    "SGL JIT RoPE + Store",
-    "SGL JIT Fused RoPE + Store",
-]
-STORE_STYLES = [("red", "-"), ("blue", "--")]
-
-store_configs = list(itertools.product(QK_HEAD_RANGE, IS_NEOX_RANGE, BS_RANGE))
+STORE_FN_MAP = {
+    "jit_rope_then_store": jit_rope_then_store,
+    "jit_fused_store": jit_fused_rope_store,
+}
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["num_q_k_heads", "is_neox", "batch_size"],
-        x_vals=store_configs,
-        line_arg="provider",
-        line_vals=STORE_LINE_VALS,
-        line_names=STORE_LINE_NAMES,
-        styles=STORE_STYLES,
-        ylabel="us",
-        plot_name="rope-store-performance",
-        args={},
-    )
-)
-def benchmark_store(batch_size: int, num_q_k_heads: str, is_neox: bool, provider: str):
-    qo, kv = num_q_k_heads.split(",")
-    num_qo_heads = int(qo)
-    num_kv_heads = int(kv)
+@marker.parametrize("batch_size", BS_RANGE, BS_CI)
+@marker.parametrize("is_neox", IS_NEOX_RANGE, IS_NEOX_CI)
+@marker.parametrize("num_qo_heads,num_kv_heads", QK_HEAD_RANGE, QK_HEAD_CI)
+@marker.benchmark("provider", ["jit_rope_then_store", "jit_fused_store"])
+def benchmark_store(
+    num_qo_heads: int,
+    num_kv_heads: int,
+    is_neox: bool,
+    batch_size: int,
+    provider: str,
+):
     q = torch.randn(
         (batch_size, num_qo_heads, ROPE_DIM),
         dtype=DEFAULT_DTYPE,
@@ -291,20 +256,20 @@ def benchmark_store(batch_size: int, num_q_k_heads: str, is_neox: bool, provider
     positions = torch.randint(
         MAX_SEQ_LEN, (batch_size,), device=DEFAULT_DEVICE, dtype=torch.int64
     )
-    torch.cuda.synchronize()
 
-    FN_MAP = {
-        "jit_rope_then_store": jit_rope_then_store,
-        "jit_fused_store": jit_fused_rope_store,
-    }
-    fn = lambda: FN_MAP[provider](
-        q, k, v, k_cache, v_cache, positions, out_loc, is_neox
+    return marker.do_bench(
+        STORE_FN_MAP[provider],
+        input_args=(q, k, v, k_cache, v_cache, positions, out_loc, is_neox),
+        # clone read/written q,k,v + read positions,out_loc; not the large caches.
+        graph_clone_args=(0, 1, 2, 5, 6),
+        memory_args=(q, k, v, positions, out_loc),
+        # q, k written in-place by RoPE; the store writes batch_size rows
+        # (~bytes(k)+bytes(v)) into the caches, not the full 1M-row buffers.
+        memory_output=(q, k),
+        extra_memory_args=(k, v),
     )
-    return run_benchmark(fn)
 
 
 if __name__ == "__main__":
-    print("Running RoPE performance benchmark...")
-    benchmark.run(print_data=True)
-    print("\nRunning RoPE + KV cache store performance benchmark...")
-    benchmark_store.run(print_data=True)
+    benchmark.run()
+    benchmark_store.run()
