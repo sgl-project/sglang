@@ -51,6 +51,31 @@ def _apply_deepseek_ocr_overrides(config, model):
     config._name_or_path = model
 
 
+def _restore_glm_moe_dsa_raw_config_fields(config, raw_config):
+    for key in (
+        "head_dim",
+        "index_head_dim",
+        "index_n_heads",
+        "index_share_for_mtp_iteration",
+        "index_skip_topk_offset",
+        "index_topk",
+        "index_topk_freq",
+        "index_topk_pattern",
+        "indexer_rope_interleave",
+        "indexer_types",
+        "kv_lora_rank",
+        "q_lora_rank",
+        "qk_head_dim",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "rope_interleave",
+        "rope_parameters",
+        "v_head_dim",
+    ):
+        if key in raw_config:
+            setattr(config, key, raw_config[key])
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -66,6 +91,18 @@ class HfModelConfigParser(ModelConfigParserBase):
             revision=revision,
             **kwargs,
         )
+
+        raw_glm_moe_dsa_config = None
+        if (
+            config.architectures is not None
+            and config.architectures[0] == "GlmMoeDsaForCausalLM"
+        ):
+            from transformers import PretrainedConfig
+
+            raw_glm_moe_dsa_config, _ = PretrainedConfig.get_config_dict(
+                model, revision=revision, **kwargs
+            )
+            _restore_glm_moe_dsa_raw_config_fields(config, raw_glm_moe_dsa_config)
 
         if (
             config.architectures is not None
@@ -124,6 +161,9 @@ class HfModelConfigParser(ModelConfigParserBase):
                 _apply_deepseek_ocr_overrides(config, model)
             else:
                 config._name_or_path = model
+
+        if raw_glm_moe_dsa_config is not None:
+            _restore_glm_moe_dsa_raw_config_fields(config, raw_glm_moe_dsa_config)
 
         if isinstance(model, str) and config.model_type == "internvl_chat":
             for key, val in config.llm_config.__dict__.items():
