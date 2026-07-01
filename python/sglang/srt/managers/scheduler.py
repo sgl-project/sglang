@@ -4247,6 +4247,23 @@ def run_scheduler_process(
         dp_rank,
     )
     parent_process = psutil.Process().parent()
+    scheduler = None
+
+    def sigterm_handler(signum, frame):
+        """Exit normally on SIGTERM so atexit/C++ destructors run (RDMA teardown).
+
+        Exit code 0 avoids SubprocessWatchdog crash detection.
+        """
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)  # prevent re-entry
+        logger.info(
+            f"SIGTERM received in scheduler process (TP{tp_rank} PP{pp_rank}); "
+            "exiting normally to allow cleanup..."
+        )
+        if scheduler is not None:
+            scheduler.gracefully_exit = True
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, sigterm_handler)
 
     # Set up tracing
     if server_args.enable_trace:
@@ -4263,7 +4280,6 @@ def run_scheduler_process(
         trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
 
     # Create a scheduler and run the event loop
-    scheduler = None
     try:
         scheduler = Scheduler(
             server_args,

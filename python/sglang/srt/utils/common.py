@@ -1323,6 +1323,110 @@ def kill_process_tree(
         _wait_for_reap_or_raise(killed, wait_timeout)
 
 
+CHILD_PROCESS_SHUTDOWN_TIMEOUT_ENV = "SGLANG_CHILD_PROCESS_SHUTDOWN_TIMEOUT"
+DEFAULT_CHILD_PROCESS_SHUTDOWN_TIMEOUT = 10.0
+
+SCHEDULER_SHUTDOWN_WAIT_TIMEOUT_ENV = "SGLANG_SCHEDULER_SHUTDOWN_TIMEOUT"
+DEFAULT_SCHEDULER_SHUTDOWN_WAIT_TIMEOUT = 15.0
+
+
+def get_child_process_shutdown_timeout() -> float:
+    """Seconds to wait for children to clean up on SIGTERM before SIGKILL."""
+    return float(
+        os.environ.get(
+            CHILD_PROCESS_SHUTDOWN_TIMEOUT_ENV,
+            DEFAULT_CHILD_PROCESS_SHUTDOWN_TIMEOUT,
+        )
+    )
+
+
+def get_scheduler_shutdown_wait_timeout() -> float:
+    """Seconds to wait for schedulers to exit via ShutdownReq before SIGTERMing them."""
+    return float(
+        os.environ.get(
+            SCHEDULER_SHUTDOWN_WAIT_TIMEOUT_ENV,
+            DEFAULT_SCHEDULER_SHUTDOWN_WAIT_TIMEOUT,
+        )
+    )
+
+
+def graceful_kill_process_tree(
+    parent_pid=None,
+    include_parent: bool = False,
+    skip_pid: int = None,
+    timeout: float = 10.0,
+):
+    """Gracefully terminate a process tree: SIGTERM first, wait, then SIGKILL stragglers.
+
+    Args:
+        parent_pid: Target PID, defaults to current process.
+        include_parent: Also kill the parent after children are done.
+        skip_pid: A child PID to leave untouched.
+        timeout: Seconds to wait before escalating to SIGKILL.
+    """
+    if parent_pid is None:
+        parent_pid = os.getpid()
+        include_parent = False
+
+    try:
+        itself = psutil.Process(parent_pid)
+    except psutil.NoSuchProcess:
+        return
+
+    children = itself.children(recursive=True)
+
+    # Step 1: SIGTERM all children to let them clean up.
+    signaled = []
+    for child in children:
+        if child.pid == skip_pid:
+            continue
+        try:
+            logger.info(
+                f"Sending SIGTERM to child process {child.pid} ({child.name()})"
+            )
+            child.terminate()  # SIGTERM
+            signaled.append(child)
+        except psutil.NoSuchProcess:
+            pass
+
+    # Step 2: wait for graceful exit, then SIGKILL the rest.
+    if signaled:
+        logger.info(
+            f"Waiting up to {timeout}s for {len(signaled)} child process(es) "
+            "to terminate gracefully..."
+        )
+        deadline = time.monotonic() + timeout
+        alive = signaled
+        while True:
+            alive = _still_holding_resources(alive)
+            if not alive or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+
+        if alive:
+            logger.warning(
+                f"{len(alive)} child process(es) did not terminate within "
+                f"{timeout}s, sending SIGKILL: pids={[p.pid for p in alive]}"
+            )
+            for child in alive:
+                try:
+                    child.kill()  # SIGKILL
+                except psutil.NoSuchProcess:
+                    pass
+            # Best-effort wait for the kernel to reap them.
+            kill_deadline = time.monotonic() + 3
+            while _still_holding_resources(alive) and time.monotonic() < kill_deadline:
+                time.sleep(0.1)
+        else:
+            logger.info("All child processes terminated gracefully.")
+
+    if include_parent:
+        try:
+            itself.kill()
+        except psutil.NoSuchProcess:
+            pass
+
+
 def monkey_patch_p2p_access_check():
     """
     Monkey patch the slow p2p access check.
