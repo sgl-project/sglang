@@ -115,7 +115,30 @@ class GrammarManager:
 
                 if not cache_hit:
                     req.grammar_key = key
-                    add_to_grammar_queue = True
+                    if self.server_args.pp_size > 1:
+                        assert isinstance(value, futures.Future)
+                        try:
+                            req.grammar = value.result()
+                        except Exception as e:
+                            logger.error(
+                                f"Grammar compilation raised an exception: {e}, "
+                                f"grammar_key={req.grammar_key}"
+                            )
+                            req.grammar = InvalidGrammarObject(
+                                f"Grammar compilation failed: {e}"
+                            )
+                        self.grammar_backend.set_cache(
+                            req.grammar_key, req.grammar.copy()
+                        )
+                        self._apply_request_reasoning_budget(req)
+                        if isinstance(req.grammar, InvalidGrammarObject):
+                            error_msg = (
+                                f"Failed to compile {req.grammar_key[0]} grammar: "
+                                f"{req.grammar.error_message}"
+                            )
+                            req.set_finish_with_abort(error_msg)
+                    else:
+                        add_to_grammar_queue = True
                 else:
                     if isinstance(
                         value, InvalidGrammarObject
