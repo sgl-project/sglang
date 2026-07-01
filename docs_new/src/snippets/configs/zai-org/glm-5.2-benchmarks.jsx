@@ -169,4 +169,35 @@ export const benchmarks = [
         ttft_ms: 6370, tpot_ms: 280, tokens_per_sec_per_gpu: 430 },
     ],
   },
+  // ---- MI355X + FP8 ----  gfx950, TP8, DSA tilelang, NO MTP (disabled on AMD).
+  // Measured on lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260618, flush-cache every run.
+  // No spec-decoding, so not directly comparable to the NVIDIA low-latency cells (EAGLE MTP).
+  {
+    match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 634, tpot_ms: 13.56, tokens_per_sec_per_gpu: 9 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 5411, tpot_ms: 23.60, tokens_per_sec_per_gpu: 69 },
+    ],
+  },
+  {
+    match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
+        ttft_ms: 19526, tpot_ms: 46.50, tokens_per_sec_per_gpu: 122 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256 },
+        ttft_ms: 117866, tpot_ms: 56.12, tokens_per_sec_per_gpu: 116 },
+    ],
+  },
+  {
+    match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 432058, tpot_ms: 106.44, tokens_per_sec_per_gpu: 141 },
+    ],
+  },
 ];
