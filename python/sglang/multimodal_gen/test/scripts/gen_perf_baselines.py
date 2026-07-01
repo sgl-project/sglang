@@ -112,7 +112,6 @@ def _run_case(case: DiffusionTestCase) -> dict:
     ctx = mgr.start()
     try:
         sp = case.sampling_params
-        output_size = os.environ.get("SGLANG_TEST_OUTPUT_SIZE", sp.output_size)
         client = _openai_client(ctx.port)
         gen = get_generate_fn(
             model_path=case.server_args.model_path,
