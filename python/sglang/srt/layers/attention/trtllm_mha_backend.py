@@ -494,7 +494,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # The device-side build (_fill_page_table_device) sizes to the static
         # max_num_pages and bounds the actual writes by cache_seqlens, so no
         # runtime host max is needed.
-        metadata = None
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
                 # Draft Decode
@@ -550,6 +549,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
             self._fill_page_table_device(
                 metadata, req_pool_indices, metadata.cache_seqlens_int32
+            )
+        else:
+            raise ValueError(
+                "TRTLLM-MHA CUDA graph metadata build got an unsupported forward "
+                f"mode: {forward_mode}"
             )
         self.forward_metadata = metadata
 
