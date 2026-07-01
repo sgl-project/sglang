@@ -81,12 +81,7 @@ def should_run_flashinfer_autotune(
         get_fp4_gemm_runner_backend,
     )
 
-    if hasattr(mr.model_config, "quantization"):
-        model_quantization = mr.model_config.quantization
-    elif getattr(mr, "is_draft_worker", False):
-        model_quantization = mr.server_args.speculative_draft_model_quantization
-    else:
-        model_quantization = mr.server_args.quantization
+    model_quantization = mr.model_config.quantization
     model_uses_fp4 = model_quantization in (
         "modelopt_fp4",
         "modelopt_mixed",
