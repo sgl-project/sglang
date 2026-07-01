@@ -38,6 +38,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _get_allocator_type(server_args: ServerArgs) -> str:
+    if getattr(server_args, "host_kvcache_allocator", "default") == "shm":
+        return "shm"
+    return server_args.hicache_storage_backend or "default"
+
+
 def _make_layer_mapper(
     layer_mapping: dict[int, int],
     transfer_layer_num: int,
@@ -70,7 +76,7 @@ def build_kv_host_pool(
         server_args.hicache_size,
         page_size,
         server_args.hicache_mem_layout,
-        allocator_type=server_args.hicache_storage_backend,
+        allocator_type=_get_allocator_type(server_args),
         **kwargs,
     )
 
@@ -333,7 +339,7 @@ def build_deepseek_v4_hicache_stack(
         num_host_pages=swa_num_host_pages,
         slot_page_size=kvcache.swa_page_size,
         layout=server_args.hicache_mem_layout,
-        allocator_type=server_args.hicache_storage_backend,
+        allocator_type=_get_allocator_type(server_args),
     )
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
     entries = [
@@ -366,7 +372,7 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
-            allocator_type=server_args.hicache_storage_backend,
+            allocator_type=_get_allocator_type(server_args),
         )
         c4_indexer_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER),
@@ -378,7 +384,7 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
-            allocator_type=server_args.hicache_storage_backend,
+            allocator_type=_get_allocator_type(server_args),
         )
         c4_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
@@ -389,7 +395,7 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=swa_num_host_pages,
             swa_page_size=kvcache.swa_page_size,
             layout=server_args.hicache_mem_layout,
-            allocator_type=server_args.hicache_storage_backend,
+            allocator_type=_get_allocator_type(server_args),
         )
         c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
@@ -400,7 +406,7 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=swa_num_host_pages,
             swa_page_size=kvcache.swa_page_size,
             layout=server_args.hicache_mem_layout,
-            allocator_type=server_args.hicache_storage_backend,
+            allocator_type=_get_allocator_type(server_args),
         )
         entries.extend(
             [
@@ -443,7 +449,7 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
-            allocator_type=server_args.hicache_storage_backend,
+            allocator_type=_get_allocator_type(server_args),
         )
         # C128 state pool is intentionally not registered with hicache.
         # page_size=256 % 128 == 0, so state pool is not consumed on load.
@@ -516,7 +522,7 @@ def build_hybrid_mamba_stack(
         mamba_pool,
         server_args.hicache_ratio,
         server_args.hicache_size,
-        allocator_type=server_args.hicache_storage_backend,
+        allocator_type=_get_allocator_type(server_args),
         layout=server_args.hicache_mem_layout,
     )
     entries = [
@@ -940,7 +946,7 @@ class _DsaStrategy(StackStrategy):
                 full_kv_pool,
                 kv_host_pool,
                 server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
+                allocator_type=_get_allocator_type(server_args),
             ),
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
@@ -1423,7 +1429,7 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
                 kv,
                 kv_host_pool,
                 server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
+                allocator_type=_get_allocator_type(server_args),
             ),
             model_name=server_args.served_model_name,
             storage_backend_extra_config=extra_config,

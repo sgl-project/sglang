@@ -137,6 +137,7 @@ class HostKVCache(abc.ABC):
             )
 
         self.kv_buffer = self.init_kv_buffer()
+        self.fd = getattr(self.allocator, "fd", None)
 
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()

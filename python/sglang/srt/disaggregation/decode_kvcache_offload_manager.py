@@ -56,6 +56,12 @@ class DecodeKVCacheOffloadManager:
                 self.page_size, (env_stride // self.page_size) * self.page_size
             )
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        allocator_type = (
+            "shm"
+            if getattr(server_args, "host_kvcache_allocator", "default") == "shm"
+            else (server_args.hicache_storage_backend or "default")
+        )
+
         if isinstance(kv_cache, MHATokenToKVPool):
             self.decode_host_mem_pool = get_mha_host_pool_cls(kv_cache)(
                 kv_cache,
@@ -63,6 +69,7 @@ class DecodeKVCacheOffloadManager:
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
+                allocator_type=allocator_type,
             )
         elif isinstance(kv_cache, MLATokenToKVPool):
             self.decode_host_mem_pool = MLATokenToKVPoolHost(
@@ -71,6 +78,7 @@ class DecodeKVCacheOffloadManager:
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
+                allocator_type=allocator_type,
             )
         else:
             raise ValueError("Unsupported KV cache type for decode offload")
