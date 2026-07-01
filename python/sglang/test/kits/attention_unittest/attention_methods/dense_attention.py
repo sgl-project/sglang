@@ -17,6 +17,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import set_global_server_args_for_scheduler
@@ -402,6 +403,11 @@ class MockModelRunner(ModelRunner):
         self.is_hybrid_swa = case.sliding_window_size is not None
         self.sliding_window_size = case.sliding_window_size
         self.use_mla_backend = False
+        # Runner-mode helpers mutate speculative graph sizes after construction.
+        self.graph_shared_output = GraphSharedOutput(
+            device=self.device,
+            max_rows=pool_batch_size * max_context_len,
+        )
 
     @property
     def hybrid_gdn_config(self):
