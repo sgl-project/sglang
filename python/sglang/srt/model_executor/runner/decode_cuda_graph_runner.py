@@ -166,6 +166,7 @@ def build_replay_fb_view(
         # when mamba-track is disabled.
         mamba_track_indices=getattr(buffers, "mamba_track_indices", None),
         spec_info=forward_batch.spec_info,
+        dllm_causal_kv_update=getattr(forward_batch, "dllm_causal_kv_update", False),
     )
 
 
@@ -224,6 +225,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
+        self.dllm_causal = False
         self.attn_backend = attn_backend or model_runner.attn_backend
         self.speculative_num_steps = (
             model_runner.server_args.speculative_num_steps
@@ -406,9 +408,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return "lora"
         return "nolora"
 
+    @staticmethod
+    def _compose_variant_label(
+        variant_label: Optional[str], dllm_causal: bool
+    ) -> Optional[str]:
+        if not dllm_causal:
+            return variant_label
+        return f"causal_{variant_label}" if variant_label else "causal"
+
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
+            return False
+        if self.is_dllm and not forward_batch.forward_mode.is_dllm_extend():
             return False
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
@@ -421,9 +433,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        graph_key = cuda_graph_bs
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
+        variant_label = self._resolve_lora_variant(forward_batch)
+        dllm_causal = getattr(forward_batch, "dllm_causal_kv_update", False)
+        graph_key = self._make_graph_key(
+            cuda_graph_bs,
+            get_current_stream_idx() if self.enable_pdmux else None,
+            self._compose_variant_label(variant_label, dllm_causal),
+        )
 
         is_bs_supported = (
             self.backend.can_run(forward_batch, graph_key)
@@ -754,12 +770,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ) as forward:
                     self.capture_one_shape(bs, forward, stream_idx, variant_label)
 
+                    if self.is_dllm and self.dllm_config.causal_context:
+                        causal_variant = self._compose_variant_label(
+                            variant_label, True
+                        )
+                        self.capture_one_shape(
+                            bs,
+                            forward,
+                            stream_idx,
+                            causal_variant,
+                            dllm_causal=True,
+                        )
+
     def capture_one_shape(
         self,
         size: int,
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        dllm_causal: bool = False,
     ):
         bs = size
         num_tokens = bs * self.num_tokens_per_bs
@@ -778,6 +807,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # DeepEP adapter, …) so they must run inside the same ForwardContext
         # that wraps the warmup/capture forward.
         with forward_context(ForwardContext(attn_backend=attn_backend)):
+            if dllm_causal:
+                forward_batch.dllm_causal_kv_update = True
+
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
             if forward_batch.lora_ids is not None:
@@ -928,9 +960,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch.input_embeds
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
+            self.dllm_causal = getattr(forward_batch, "dllm_causal_kv_update", False)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
-                self.bs, stream_idx, variant_label
+                self.bs,
+                stream_idx,
+                self._compose_variant_label(variant_label, self.dllm_causal),
             )
             return
 
@@ -999,6 +1034,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
+        self.dllm_causal = getattr(forward_batch, "dllm_causal_kv_update", False)
 
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
@@ -1006,7 +1042,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
-            self.bs, stream_idx, variant_label
+            self.bs,
+            stream_idx,
+            self._compose_variant_label(variant_label, self.dllm_causal),
         )
 
     def execute(

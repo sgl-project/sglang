@@ -2598,8 +2598,8 @@ class Scheduler(
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
-            for req in self.dllm_manager.staging_queue:
-                self.stash_chunked_request(req)
+            # Stashing DLLM mask-token KV in the radix tree would create
+            # duplicate ownership and a later double-free.
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge

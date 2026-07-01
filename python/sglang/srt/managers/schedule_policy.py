@@ -731,14 +731,8 @@ class PrefillAdder:
         return _rem_tokens
 
     def _add_dllm_req(self, req: Req, prefix_len: int):
-        # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
-        # the diffusion unmask process may have some problems
-        # Make sure at least one page is available
-        trunc_len = (
-            min(self.rem_dllm_tokens, self.dllm_block_size)
-            // self.page_size
-            * self.page_size
-        )
+        # A DLLM block can be smaller than one KV page.
+        trunc_len = min(self.rem_dllm_tokens, self.dllm_block_size)
 
         req.set_extend_range(prefix_len, prefix_len + trunc_len)
 
@@ -751,6 +745,30 @@ class PrefillAdder:
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
         )
+
+    def add_dllm_prompt_cache_req(self, req: Req) -> AddReqResult:
+        """Schedule prompt KV caching as a regular extend pass."""
+        total_tokens = req.extend_range.length + min(
+            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+            CLIP_MAX_NEW_TOKENS,
+        )
+
+        if total_tokens >= self.rem_total_tokens:
+            return AddReqResult.NO_TOKEN
+
+        input_tokens = self.ceil_paged_tokens(req.extend_range.length)
+
+        if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+            return AddReqResult.OTHER
+
+        self.can_run_list.append(req)
+        self._update_prefill_budget(
+            len(req.prefix_indices),
+            input_tokens,
+            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+            req.retracted_stain,
+        )
+        return AddReqResult.CONTINUE
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)

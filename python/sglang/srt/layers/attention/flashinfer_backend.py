@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.srt.dllm.attention import get_dllm_causal_attention
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -194,6 +195,7 @@ def fast_prefill_plan(
     o_data_type: Optional[Union[str, torch.dtype]] = None,
     non_blocking: bool = True,
     fixed_split_size: Optional[int] = None,
+    disable_split_kv: bool = False,
     prefix_len_ptr: Optional[torch.Tensor] = None,
     token_pos_in_items_ptr: Optional[torch.Tensor] = None,
     token_pos_in_items_len: int = 0,
@@ -282,7 +284,7 @@ def fast_prefill_plan(
         causal,
         window_left,
         fixed_split_size if fixed_split_size is not None else -1,
-        False,  # disable_split_kv
+        disable_split_kv,
         0,  # num_colocated_ctas
     ]
     self._plan_info = self._cached_module.plan(*args)
@@ -426,9 +428,12 @@ class FlashInferAttnBackend(AttentionBackend):
 
         fmha_backend = "auto"
         if is_sm100_supported():
-            # Disable CUTLASS backend when piecewise cuda graph is enabled
-            # due to TMA descriptor initialization issues on SM100 GPUs.
-            if not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
+            # Disable CUTLASS backend for piecewise CUDA graphs and DLLM whole-graph
+            # capture due to TMA descriptor initialization issues on SM100 GPUs.
+            if (
+                not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                and not self.is_dllm_model
+            ):
                 fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
@@ -645,9 +650,17 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
+        dllm_causal = getattr(forward_batch, "dllm_causal_kv_update", False)
+
         if in_capture:
             num_tokens = forward_batch.positions.numel()
-            self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
+            self._prepare_cuda_graph_metadata(
+                bs,
+                num_tokens,
+                forward_mode,
+                spec_info,
+                dllm_causal=dllm_causal,
+            )
 
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -674,16 +687,18 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
         elif forward_mode.is_dllm_extend():
+            metadata_key = f"causal_{bs}" if dllm_causal else bs
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[metadata_key],
                 use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
+                disable_split_kv=True,
             )
         elif forward_mode.is_draft_extend_v2():
             self.indices_updater_prefill.update(
@@ -804,6 +819,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 # Use new backend-specific implementation
                 multi_item_params = self._process_multi_item_scoring(forward_batch)
 
+            dllm_disable_split_kv = (
+                self.is_dllm_model and forward_batch.forward_mode.is_dllm_extend()
+            )
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -818,6 +836,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
                 extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
+                disable_split_kv=dllm_disable_split_kv,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -921,6 +940,7 @@ class FlashInferAttnBackend(AttentionBackend):
         num_tokens: int,
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        dllm_causal: bool = False,
     ) -> None:
         if forward_mode.is_decode_or_idle():
             decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
@@ -933,7 +953,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 and getattr(spec_info, "custom_mask", None) is not None
             )
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            metadata_key = (
+                f"causal_{bs}" if forward_mode.is_dllm_extend() and dllm_causal else bs
+            )
+            self.prefill_cuda_graph_metadata[metadata_key] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(
                 prefill_wrappers, forward_mode.is_dllm_extend(), False
             )
@@ -983,9 +1006,14 @@ class FlashInferAttnBackend(AttentionBackend):
                         layer.v_scale,
                     )
 
-            causal = (
-                not layer.is_cross_attention
-                and layer.attn_type != AttentionType.ENCODER_ONLY
+            causal = get_dllm_causal_attention(
+                layer,
+                forward_batch,
+                self.dllm_config,
+                default_causal=(
+                    not layer.is_cross_attention
+                    and layer.attn_type != AttentionType.ENCODER_ONLY
+                ),
             )
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1025,6 +1053,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 or layer.attn_type == AttentionType.ENCODER_ONLY
             ):
                 causal = False
+            causal = get_dllm_causal_attention(
+                layer,
+                forward_batch,
+                self.dllm_config,
+                default_causal=causal,
+            )
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
@@ -1042,6 +1076,21 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
             else:
+                if not self.is_dllm_model:
+                    causal = True
+
+                pdl_kwargs = {}
+                if self.is_dllm_model:
+                    import inspect as _inspect
+
+                    if (
+                        "enable_pdl"
+                        in _inspect.signature(
+                            self.prefill_wrapper_ragged.forward_return_lse
+                        ).parameters
+                    ):
+                        pdl_kwargs["enable_pdl"] = False
+
                 swa_window_left = (
                     layer.sliding_window_size
                     if not (
@@ -1058,6 +1107,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     sm_scale=layer.scaling,
                     window_left=swa_window_left,
                     logits_soft_cap=logits_soft_cap,
+                    **pdl_kwargs,
                 )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1066,6 +1116,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     sm_scale=layer.scaling,
                     window_left=swa_window_left,
                     logits_soft_cap=logits_soft_cap,
+                    **pdl_kwargs,
                 )
 
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
@@ -1452,6 +1503,7 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
+        disable_split_kv: bool = False,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -1471,6 +1523,7 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
+        disable_split_kv: bool = False,
     ):
         if use_ragged:
             assert prefix_lens is not None
@@ -1500,6 +1553,7 @@ class FlashInferIndicesUpdaterPrefill:
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
             seq_lens_cpu=seq_lens_cpu,
+            disable_split_kv=disable_split_kv,
         )
 
     def update_sliding_window(
@@ -1517,6 +1571,7 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
+        disable_split_kv: bool = False,
     ):
         if prefix_lens is None:
             num_accept_tokens = getattr(spec_info, "num_accept_tokens", None)
@@ -1580,6 +1635,7 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
+                disable_split_kv=disable_split_kv,
             )
 
     def _build_swa_prefix_custom_mask(
@@ -1638,6 +1694,7 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
+        disable_split_kv: bool = False,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1669,6 +1726,7 @@ class FlashInferIndicesUpdaterPrefill:
                 cross_attention_custom_mask=(
                     cross_attention_custom_mask if wrapper_id == 1 else None
                 ),
+                disable_split_kv=disable_split_kv,
             )
 
     def call_begin_forward(
@@ -1690,6 +1748,7 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         seq_lens_cpu: Optional[torch.Tensor] = None,
+        disable_split_kv: bool = False,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -1823,6 +1882,7 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask=use_custom_mask,
             non_blocking=True,
             fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
             prefix_len_ptr=prefix_len_ptr,
             token_pos_in_items_ptr=token_pos_in_items_ptr,
             token_pos_in_items_len=token_pos_in_items_len,
