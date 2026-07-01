@@ -44,6 +44,10 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
+from sglang.srt.model_loader.weight_completeness import (
+    required_weight_names,
+    unloaded_required_params,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_available_gpu_memory
 
@@ -325,6 +329,25 @@ def _post_load_weights(model: nn.Module) -> None:
     # `is_nextn=True`, so the loader doesn't need to know.
     if hasattr(model, "post_load_weights"):
         model.post_load_weights()
+
+
+def _not_optional(name: str) -> bool:
+    return False
+
+
+def _load_and_verify_weights(model: nn.Module, weights) -> Optional[set]:
+    loaded_params = model.load_weights(weights)
+    if loaded_params is None or not getattr(model, "verify_weights_on_load", False):
+        return loaded_params
+    is_optional = getattr(model, "is_optional_weight", _not_optional)
+    missing = unloaded_required_params(
+        required_weight_names(model), loaded_params, is_optional
+    )
+    if missing:
+        raise RuntimeError(
+            f"Some weights are not initialized from checkpoints: {sorted(missing)}"
+        )
+    return loaded_params
 
 
 class BaseModelLoader(ABC):
@@ -792,12 +815,12 @@ class DefaultModelLoader(BaseModelLoader):
                 TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
                 FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
             ):
-                model.load_weights(weights)
+                _load_and_verify_weights(model, weights)
             if target_device.type == "cuda":
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
         else:
-            model.load_weights(weights)
+            _load_and_verify_weights(model, weights)
 
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
@@ -986,15 +1009,14 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         def load_weights_proxy(weights):
             if QuantizedRLModelLoader.is_reload_scenario(model):
                 logger.info("[QuantizedRL] Using fast path reload in load_weights")
-                QuantizedRLModelLoader.rebinding_and_load_weights(
+                return QuantizedRLModelLoader.rebinding_and_load_weights(
                     model, original_load_weights, weights
                 )
-            else:
-                original_load_weights(weights)
+            return original_load_weights(weights)
 
         model.load_weights = load_weights_proxy
 
-        model.load_weights(weights)
+        _load_and_verify_weights(model, weights)
         original_weights = dict(model.named_parameters())
 
         # Record pre-quantization state (shape/stride) for torch.as_strided reset
@@ -1860,7 +1882,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
             if self._is_4bit_weight_name(weight_name):
                 continue
 
@@ -1884,7 +1905,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
             if any(
                 target_module in weight_name for target_module in self.target_modules
             ) and weight_name.endswith(".weight"):
@@ -1894,7 +1914,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                     module in weight_name
                     for module in self.column_parallel_weights_modules
                 ):
-
                     total_size = weight_tensor.size(-1)
                     start_index = total_size // tp_size * tp_rank
                     end_index = total_size // tp_size * (tp_rank + 1)
@@ -1955,7 +1974,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         self.model_type = type(model).__name__
 
         logger.info(
-            "Loading weights with BitsAndBytes quantization. " " May take a while ..."
+            "Loading weights with BitsAndBytes quantization.  May take a while ..."
         )
 
         quant_config = getattr(model_config.hf_config, "quantization_config", None)
@@ -1967,8 +1986,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                 pre_quant = True
             else:
                 raise ValueError(
-                    f"BitsAndBytes loader does not support {quant_method} "
-                    "quantization"
+                    f"BitsAndBytes loader does not support {quant_method} quantization"
                 )
 
         # The quant_states in pre_quantized models cannot work with a split
@@ -1987,7 +2005,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
             model_config.model_path, model_config.revision, pre_quant, load_8bit
         )
 
-        model.load_weights(qweight_iterator)
+        _load_and_verify_weights(model, qweight_iterator)
 
         current_platform.empty_cache()
 
@@ -2179,8 +2197,9 @@ class GGUFModelLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
-            model.load_weights(
-                self._get_weights_iterator(local_model_path, gguf_weights_map)
+            _load_and_verify_weights(
+                model,
+                self._get_weights_iterator(local_model_path, gguf_weights_map),
             )
 
             for _, module in model.named_modules():
@@ -2476,7 +2495,7 @@ class RemoteModelLoader(BaseModelLoader):
                     param_data = param_data.narrow(dim, 0, size)
             if tensor.shape != param_shape:
                 logger.warning(
-                    "loading tensor of shape %s into " "parameter '%s' of shape %s",
+                    "loading tensor of shape %s into parameter '%s' of shape %s",
                     tensor.shape,
                     key,
                     param_shape,
@@ -2494,7 +2513,7 @@ class RemoteModelLoader(BaseModelLoader):
 
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
-            model.load_weights(self._get_weights_iterator_fs(client))
+            _load_and_verify_weights(model, self._get_weights_iterator_fs(client))
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
@@ -2564,7 +2583,7 @@ def load_model_with_cpu_quantization(
         )
 
         if not isinstance(self, DummyModelLoader):
-            model.load_weights(self._get_all_weights(model_config, model))
+            _load_and_verify_weights(model, self._get_all_weights(model_config, model))
 
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
