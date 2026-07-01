@@ -24,7 +24,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
     """Test the registry and factory function."""
 
     def test_registry_contains_nvfp4_and_blockfp4(self):
-        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             KV_CACHE_QUANT_REGISTRY,
         )
 
@@ -32,7 +32,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         self.assertIn("fp4_mx_block16", KV_CACHE_QUANT_REGISTRY)
 
     def test_factory_nvfp4(self):
-        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVCacheMethod,
             get_kv_cache_quant_method,
         )
@@ -44,7 +44,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         self.assertEqual(method.name, "nvfp4")
 
     def test_factory_blockfp4(self):
-        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             FP4MXBlock16KVCacheMethod,
             get_kv_cache_quant_method,
         )
@@ -54,7 +54,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         self.assertEqual(method.name, "fp4_mx_block16")
 
     def test_resolve_explicit_recipes(self):
-        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             resolve_kv_cache_quant,
         )
 
@@ -63,7 +63,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         self.assertIsNone(resolve_kv_cache_quant("fp8_e4m3"))
 
     def test_resolve_legacy_fp4_alias_raises(self):
-        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             resolve_kv_cache_quant,
         )
 
@@ -71,7 +71,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
             resolve_kv_cache_quant("fp4_e2m1")
 
     def test_resolve_mxfp4_name_raises(self):
-        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             resolve_kv_cache_quant,
         )
 
@@ -79,7 +79,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
             resolve_kv_cache_quant("mxfp4")
 
     def test_factory_unknown_raises(self):
-        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             get_kv_cache_quant_method,
         )
 
@@ -91,7 +91,7 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
     """Test NVFP4KVCacheMethod buffer creation and properties."""
 
     def test_properties(self):
-        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVCacheMethod,
         )
 
@@ -102,7 +102,7 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
         self.assertTrue(m.needs_global_scale())
 
     def test_create_buffers_shapes(self):
-        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVCacheMethod,
         )
 
@@ -125,7 +125,7 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
         self.assertEqual(bufs["store_dtype"], torch.uint8)
 
     def test_compute_cell_size(self):
-        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVCacheMethod,
         )
 
@@ -135,7 +135,7 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
         self.assertEqual(cell, 4096 + 512 + 2048)
 
     def test_scales_init(self):
-        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVCacheMethod,
         )
 
@@ -148,7 +148,7 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
     @skip_if_no_blackwell_nvfp4
     def test_quantize_dequantize_roundtrip(self):
         """Test NVFP4 quantize->dequantize roundtrip on CUDA."""
-        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVCacheMethod,
         )
 
@@ -200,7 +200,7 @@ class TestFP4MXBlock16KVCacheMethod(CustomTestCase):
     """Test FP4MXBlock16KVCacheMethod buffer creation and roundtrip."""
 
     def test_properties(self):
-        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             FP4MXBlock16KVCacheMethod,
         )
 
@@ -210,7 +210,7 @@ class TestFP4MXBlock16KVCacheMethod(CustomTestCase):
         self.assertFalse(m.needs_global_scale())
 
     def test_create_buffers_shapes(self):
-        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             FP4MXBlock16KVCacheMethod,
         )
 
@@ -225,7 +225,7 @@ class TestFP4MXBlock16KVCacheMethod(CustomTestCase):
 
     def test_quantize_dequantize_roundtrip_cpu(self):
         """Test block-16 FP4 quantize->dequantize roundtrip on CPU."""
-        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             FP4MXBlock16KVCacheMethod,
         )
 
