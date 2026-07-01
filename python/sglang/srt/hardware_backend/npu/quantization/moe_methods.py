@@ -388,15 +388,6 @@ class NPUW8A8Mxfp8MoEMethod(_NPUMoEMethodBase):
 
         # 2) Scale: pad if number of num_groups is odd, then pack into [E, num_groups //2, N, 2]
         num_groups = scale.shape[-1]
-        expected_groups = weight.shape[-1] // self.group_size
-        if num_groups != expected_groups:
-            logger.warning(
-                f"Scale group count {num_groups} does not match expected {expected_groups} "
-                f"for group_size={self.group_size}. The weight layout may be incorrect."
-            )
-        if num_groups  % 2 != 0:
-            scale = torch.nn.functional.pad(scale, (0, 1))
-            num_groups  += 1
         scale.data = scale.data.reshape(scale.shape[0], scale.shape[1], num_groups  // 2, 2)
         # transpose: [E, N, num_groups //2, 2] -> [E, num_groups //2, N, 2]
         scale.data = scale.data.transpose(1, 2).contiguous()
