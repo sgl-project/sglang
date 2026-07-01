@@ -1,8 +1,10 @@
 # GDN Attention Capability Matrix
 
-The main matrix uses the backend in each row for **full attention** and keeps
-the GDN linear-attention kernel on Triton. A separate focused class covers
-FlashInfer GDN prefill using the pure-PyTorch recurrence as its reference.
+This folder covers GDN hybrid-linear attention with a full-attention backend
+plus the Triton GDN linear-attention kernel. The backend in the column header
+is the **full-attention** backend; the **linear-attention** kernel is always
+the Triton GDN kernel. Expected outputs use a separate pure-PyTorch gated-delta
+recurrence reference, not Triton/FLA GDN kernels.
 
 ## Coverage Matrix
 
@@ -18,12 +20,6 @@ kernel = `triton` for all rows). Cells use:
 | `torch_native` | ✓ full representative GDN input sweep | — (no CG hooks on `TorchNativeAttnBackend`) | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | — | — | — | — | — | — | — | — |
 | `triton` | ✓ full representative GDN input sweep | ✓ decode page-boundary | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | ✓ EAGLE chain (topk=1) + EAGLE tree (topk=2) | ✓ EAGLE chain + EAGLE tree (tree uses scoped `5e-2` atol for bf16 recurrent accumulation) | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | — | blocked: same `_replay_metadata` reject | — |
 | `flashinfer` | ✓ full GDN sweep with `head_dim=64` (FlashInfer SM90 prefill constraint) | ✓ decode page-boundary | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | ✓ EAGLE chain (topk=1) + EAGLE tree (topk=2) | ✓ EAGLE chain + EAGLE tree (scoped `5e-2` atol) | — | blocked: same `_replay_metadata` reject | blocked: same `_replay_metadata` reject | — | blocked: same `_replay_metadata` reject | — |
-
-### FlashInfer linear-GDN coverage
-
-`TestFlashInferLinearGDNBackendCorrectness` explicitly selects FlashInfer only
-for GDN prefill and checks a ragged nonzero-prefix case, final recurrent-state
-writeback, and chain/tree target verification.
 
 ## Hybrid dispatch fan-out tests (Triton only, MagicMock-based)
 
@@ -64,13 +60,12 @@ correctness). Each test constructs a `HybridLinearAttnBackend` with two
 
 ## Caveats
 
-- **Prefix continuation uses a synthetic recurrent state.**
-  `build_gdn_attention_fixture` calls `_populate_gdn_prefix_state` to seed a
-  deterministic, nonzero per-request SSM state whenever `prefix_lens > 0`.
-  Actual and reference paths therefore exercise consumption and update of a
-  nontrivial initial state. The fixture does not derive that state by running
-  the prefix tokens through the module, so it does not independently validate
-  prefix-state construction.
+- **Initial SSM state is always zero.** `build_gdn_attention_fixture` does not
+  run prefix tokens through the actual module like dense's `_populate_prefix_kv`
+  does. The SSM state buffer stays at the runner's init zero state. Cases with
+  `prefix_lens > 0` therefore start from zero in both actual and reference
+  paths, so they match trivially — nonzero `prefix_lens` exercise metadata
+  paths only, not recurrent-state continuation.
 
 ## Next Work
 
