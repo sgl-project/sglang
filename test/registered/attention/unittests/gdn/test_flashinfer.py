@@ -10,11 +10,15 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from sglang.srt.server_args import set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
     GDNAttentionCase,
+    build_gdn_attention_fixture,
     make_gdn_cases,
     run_gdn_attention_case,
+    run_gdn_fixture_eager,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_gdn_cuda_graph_decode_case,
@@ -29,6 +33,12 @@ from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+
+_cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+_sm_major = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+_supports_flashinfer_linear_gdn = _sm_major == 9 or (
+    _sm_major == 10 and _cuda_major >= 13
+)
 
 
 @unittest.skipIf(
@@ -320,6 +330,73 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
                     head_k_dim=self.HEAD_K_DIM,
                     head_v_dim=self.HEAD_V_DIM,
                 )
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available()
+    and is_flashinfer_available()
+    and _supports_flashinfer_linear_gdn,
+    "FlashInfer linear GDN requires SM90 or SM100/SM103 with CUDA 13+",
+)
+class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
+    # FlashInfer's SM100 GDN prefill kernel requires head size 128. SM90 supports 64.
+    HEAD_DIM = 128 if _sm_major == 10 else 64
+    CHECKPOINT_CASE = GDNAttentionCase(
+        name="flashinfer_gdn_prefill_state_checkpoints",
+        backend="triton",
+        linear_attn_prefill_backend="flashinfer",
+        forward_mode=ForwardMode.EXTEND,
+        num_k_heads=2,
+        num_v_heads=4,
+        page_size=16,
+        prefix_lens=(0, 64, 128),
+        extend_lens=(64, 65, 129),
+    )
+
+    def test_prefill_tracked_state_checkpoints(self):
+        fixture = build_gdn_attention_fixture(
+            self,
+            self.CHECKPOINT_CASE,
+            head_k_dim=self.HEAD_DIM,
+            head_v_dim=self.HEAD_DIM,
+            max_context_len=320,
+            runner_batch_size=6,
+        )
+        set_global_server_args_for_scheduler(fixture.runner.server_args)
+        batch = fixture.forward_batch
+        # Simulate the tracking metadata produced by the extra-buffer scheduler.
+        # This test covers checkpoint mapping and state copies, not scheduler setup.
+        batch.mamba_track_mask = torch.ones(3, dtype=torch.bool, device="cuda")
+        batch.mamba_track_indices = torch.tensor(
+            [4, 5, 6], dtype=torch.int64, device="cuda"
+        )
+        batch.mamba_track_seqlens = torch.tensor(
+            # The final entry selects the second checkpoint at absolute S256.
+            [64, 129, 257],
+            dtype=torch.int64,
+            device="cuda",
+        )
+
+        cache = fixture.runner.req_to_token_pool.mamba2_layer_cache(0)
+        initial_conv = cache.conv[0].clone()
+        initial_ssm = cache.temporal.clone()
+        flashinfer_output = run_gdn_fixture_eager(fixture)
+        flashinfer_tracked = cache.temporal[batch.mamba_track_indices].clone()
+
+        cache.conv[0].copy_(initial_conv)
+        cache.temporal.copy_(initial_ssm)
+        fixture.backend.linear_attn_backend.kernel_dispatcher.extend_kernel = (
+            TritonGDNKernel()
+        )
+        triton_output = run_gdn_fixture_eager(fixture)
+        triton_tracked = cache.temporal[batch.mamba_track_indices]
+
+        torch.testing.assert_close(
+            flashinfer_output, triton_output, atol=3e-2, rtol=3e-2
+        )
+        torch.testing.assert_close(
+            flashinfer_tracked, triton_tracked, atol=3e-2, rtol=3e-2
+        )
 
 
 if __name__ == "__main__":
