@@ -222,6 +222,17 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
                     )
+        if self.sampling_seed is not None:
+            if not isinstance(self.sampling_seed, int):
+                raise ValueError(
+                    "sampling_seed must be an integer, got "
+                    f"{type(self.sampling_seed).__name__}."
+                )
+            if not -(2**63) <= self.sampling_seed <= 2**63 - 1:
+                raise ValueError(
+                    "sampling_seed must be in [-2**63, 2**63 - 1], got "
+                    f"{self.sampling_seed}."
+                )
 
         grammars = [
             self.json_schema,
