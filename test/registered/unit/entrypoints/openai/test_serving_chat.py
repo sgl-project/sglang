@@ -437,6 +437,10 @@ class ServingChatTestCase(unittest.TestCase):
         """Ensure Jinja chat templates receive OpenAI-shaped tools by default."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
+        # apply_chat_template(tokenize=False) returns a string in production.
+        # Set an explicit return value so the string-concat path doesn't TypeError
+        # on the default Mock return.
+        self.tm.tokenizer.apply_chat_template.return_value = "USER: 2+2?\nASSISTANT:"
 
         req = ChatCompletionRequest(
             model="x",
@@ -495,7 +499,7 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.tm.tokenizer.apply_chat_template.side_effect = [
             RuntimeError("template expects flat tools format"),
-            [1, 2, 3],
+            "USER: What is 2+2?\nASSISTANT:",
         ]
 
         self.chat._process_messages(req, is_multimodal=False)

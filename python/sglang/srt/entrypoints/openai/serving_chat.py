@@ -851,10 +851,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **extra_template_kwargs,
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                    rendered_prompt, **encode_kwargs
-                )
-            except Exception as e:
+            except Exception:
                 # If the first attempt fails, try with flat function-only format.
                 # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
                 tools = (
@@ -873,23 +870,21 @@ class OpenAIServingChat(OpenAIServingBase):
                             **extra_template_kwargs,
                         )
                     )
-                    prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                        rendered_prompt, **encode_kwargs
-                    )
                 except (jinja2.TemplateError, TypeError) as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
                     # and TypeError (e.g., tojson filter on Jinja2 Undefined variables)
                     # should be treated as client errors (400 BadRequest)
                     raise ValueError(str(template_error)) from template_error
 
-            # Append assistant prefix if continue_final_message is enabled
-            if assistant_prefix:
-                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
-                    prompt_ids, assistant_prefix
-                )
-
+            full_prompt = rendered_prompt + (assistant_prefix or "")
             if is_multimodal:
-                prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+                # MM processor re-encodes the prompt string downstream.
+                prompt = full_prompt
+                prompt_ids = []
+            else:
+                prompt_ids = self.tokenizer_manager.tokenizer.encode(
+                    full_prompt, **encode_kwargs
+                )
 
         stop = request.stop
         image_data = image_data if image_data else None
