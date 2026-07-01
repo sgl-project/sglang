@@ -4012,6 +4012,59 @@ def parse_module_path(module_path, function_name, create_dummy):
     return final_module, None
 
 
+def mxfp_supported():
+    """
+    Returns whether the current platform supports MX types.
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx95", "gfx1250"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx95_supported():
+    """
+    Returns whether the current platform supports MX types.
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx95", "gfx1250"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx1250_supported():
+    """
+    Returns whether the current platform is AMD gfx1250.
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return "gfx1250" in gcn_arch
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx942_supported():
+    """
+    Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx942"])
+    else:
+        return False
+
+
+def get_hip_version():
+    if torch.version.hip:
+        return tuple(map(int, torch.version.hip.split("-")[0].split(".")))
+    return (0, 0, 0)
+
+
 # LoRA-related constants and utilities
 SUPPORTED_LORA_TARGET_MODULES = [
     "q_proj",
