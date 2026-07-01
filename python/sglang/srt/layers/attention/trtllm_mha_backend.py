@@ -12,10 +12,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.flashinfer_backend import (
-    FlashInferAttnBackend,
-    FlashInferMultiStepDraftBackend,
-)
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
@@ -66,7 +63,7 @@ class TRTLLMMHAMetadata:
     swa_out_cache_loc: torch.Tensor = None
 
 
-class TRTLLMHAAttnBackend(FlashInferAttnBackend):
+class TRTLLMHAAttnBackend(AttentionBackend):
     """TRTLLM MHA attention kernel from flashinfer."""
 
     # Build the page table on-device from seq_lens (incl. the SWA-translated table
@@ -82,17 +79,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
         speculative_step_id: int = 0,
     ):
-        # Capture workspace size before super().__init__() to preserve user's
-        # SGLANG_FLASHINFER_WORKSPACE_SIZE setting (may be overridden by parent)
+        super().__init__()
+
+        # Kept for temporary call compatibility with older draft wrappers. TRTLLM
+        # MHA builds page tables from seq_lens directly and does not consume these.
+        del kv_indptr_buf, kv_last_page_len_buf
+
         env_var = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE
         workspace_size_bytes = (
             env_var.get()
             if env_var.is_set()
             else DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
-        )
-
-        super().__init__(
-            model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
         )
 
         config = model_runner.model_config
@@ -102,11 +99,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.hidden_size = config.hidden_size
 
         # Runtime parameters
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.req_to_token = self.req_to_token_pool.req_to_token
         self.device = model_runner.device
+        self.skip_prefill = skip_prefill
 
         # Workspace allocation
         self.workspace_size = workspace_size_bytes
@@ -136,6 +136,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # SWA hybrid models split the KV cache into full and SWA pools with
         # separate index spaces; SWA layers need a translated page_table.
         self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
+        self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
 
         # Static page-table width (upper bound). The CUDA-graph path builds the
         # page table on-device sized to this constant, so it never reads a runtime
@@ -930,7 +931,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
 
-class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
+class TRTLLMHAAttnMultiStepDraftBackend:
     """Multi-step TRTLLM MHA attention kernel used by EAGLE."""
 
     # Per-step backends build the page table on-device (sync-free); mirror that so
@@ -940,15 +941,23 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
     def __init__(
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
     ):
-        super().__init__(model_runner, topk, speculative_num_steps)
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i] = TRTLLMHAAttnBackend(
-                model_runner,
-                skip_prefill=True,
-                kv_indptr_buf=self.kv_indptr[i],
-                kv_last_page_len_buf=self.kv_last_page_len,
-                speculative_step_id=i,
+            self.attn_backends.append(
+                TRTLLMHAAttnBackend(
+                    model_runner,
+                    skip_prefill=True,
+                    speculative_step_id=i,
+                )
             )
+
+        self.max_context_len = self.attn_backends[0].max_context_len
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata_in_graph(forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
