@@ -141,6 +141,7 @@ test = [
   "addict",
   "auto-round>=0.13.1",
   "bitsandbytes",
+  "pymupdf",
   "diff-cover",
   "expecttest",
   "granian>=2.6.0",
