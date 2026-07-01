@@ -381,14 +381,16 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         # No full-token contiguous space on NPU; everything ships per-pool via
-        # get_dsv4_state_components(), so the contiguous path is empty.
+        # get_pd_state_components(), so the contiguous path is empty.
         return [], [], []
 
-    def get_dsv4_state_components(
+    def get_pd_state_components(
         self,
     ) -> List[Tuple[str, List[int], List[int], List[int]]]:
-        """Ordered ``(DSV4_* name, data_ptrs, data_lens, item_lens)`` per pool, in a
+        """Ordered ``(AscendStateType, data_ptrs, data_lens, item_lens)`` per pool, in a
         fixed order so prefill and decode register identically (empty pools skipped)."""
+        from sglang.srt.disaggregation.ascend.conn import AscendStateType
+
         components: List[Tuple[str, List[int], List[int], List[int]]] = []
 
         def kv_entry(bufs):
@@ -422,22 +424,22 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
         # KV pools (4D PA_ND).
         if self.swa_kv_pool is not None:
-            components.append(("DSV4_SWA", *kv_entry(self.swa_kv_pool.kv_buffer)))
+            components.append((AscendStateType.DSV4_SWA, *kv_entry(self.swa_kv_pool.kv_buffer)))
         if self.c4_kv_pool is not None:
-            components.append(("DSV4_C4", *kv_entry(self.c4_kv_pool.kv_buffer)))
+            components.append((AscendStateType.DSV4_C4, *kv_entry(self.c4_kv_pool.kv_buffer)))
         if self.c128_kv_pool is not None:
-            components.append(("DSV4_C128", *kv_entry(self.c128_kv_pool.kv_buffer)))
+            components.append((AscendStateType.DSV4_C128, *kv_entry(self.c128_kv_pool.kv_buffer)))
         if self.c4_indexer_kv_pool is not None:
             idx_bufs = list(self.c4_indexer_kv_pool.index_k_buffer) + list(
                 self.c4_indexer_kv_pool.index_scale_buffer
             )
-            components.append(("DSV4_INDEXER", *kv_entry(idx_bufs)))
+            components.append((AscendStateType.DSV4_INDEXER, *kv_entry(idx_bufs)))
 
         # Compress-state pools (paged, flat 2D). c4_state bundles attn-c4-state +
         # indexer-c4-state (same req_to_token_c4_state slot space).
-        components.append(("DSV4_C4_STATE", *state_entry(4, include_indexer=True)))
+        components.append((AscendStateType.DSV4_C4_STATE, *state_entry(4, include_indexer=True)))
         components.append(
-            ("DSV4_C128_STATE", *state_entry(128, include_indexer=False))
+            (AscendStateType.DSV4_C128_STATE, *state_entry(128, include_indexer=False))
         )
 
         # Drop empty components (e.g. a ratio with no layers) so every shipped

@@ -1832,8 +1832,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
             )
             # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
-            # DSV4-on-NPU has no full-token contiguous KV (kv_item_lens empty),
-            # ships per-pool instead, so report 0.
+            # Some pools have no full-token contiguous KV (kv_item_lens empty)
+            # and ship per-pool instead, so report 0.
             kv_item_len = (
                 self.kv_mgr.kv_args.kv_item_lens[0]
                 if self.kv_mgr.kv_args.kv_item_lens

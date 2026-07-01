@@ -47,7 +47,6 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import dsv4_state_payloads
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -62,6 +61,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
@@ -71,6 +71,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 
 def should_force_retry(req: Req) -> bool:
@@ -1072,15 +1074,23 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.MINIMAX_INDEX_K: _dsa_payload,
                 StateType.SWA_RING: _swa_ring_payload,
             }
-            payloads.update(
-                dsv4_state_payloads(
-                    self.req_to_token_pool,
-                    req.req_pool_idx,
-                    seq_len,
-                    page_size,
-                    self.sliding_window_size,
+            if _is_npu and isinstance(
+                self.token_to_kv_pool_allocator.get_kvcache(),
+                DeepSeekV4TokenToKVPool,
+            ):
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+                    dsv4_state_payloads,
                 )
-            )
+
+                payloads.update(
+                    dsv4_state_payloads(
+                        self.req_to_token_pool,
+                        req.req_pool_idx,
+                        seq_len,
+                        page_size,
+                        self.sliding_window_size,
+                    )
+                )
             state_indices = [
                 payloads[st]() if st in payloads else None for st in state_types
             ]

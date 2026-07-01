@@ -381,8 +381,7 @@ class ModelRunnerKVCacheMixin:
                         start_layer=self.start_layer,
                     )
                 elif _is_npu and is_deepseek_v4(self.model_config.hf_config):
-                    # DSV4 on NPU needs the swa/c4/c128(+state) per-req tables on
-                    # the decode side; the stock DecodeReqToTokenPool lacks them.
+                    # Decode-side per-req tables the stock pool lacks.
                     from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
                         DSV4NPUDecodeReqToTokenPool,
                     )
