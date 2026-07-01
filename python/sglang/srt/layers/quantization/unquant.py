@@ -343,7 +343,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         if _is_npu:
             layer.w13_kernel.process_weights_after_loading(layer, "w13")
-            layer.w13_kernel.process_weights_after_loading(layer, "w2")
+            layer.w2_kernel.process_weights_after_loading(layer, "w2")
 
         return
 
