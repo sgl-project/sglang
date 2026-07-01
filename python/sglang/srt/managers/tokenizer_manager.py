@@ -3104,7 +3104,12 @@ def _get_processor_wrapper(server_args):
     return processor
 
 
-def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
+def _determine_tensor_transport_mode(
+    server_args: Optional[ServerArgs],
+) -> TensorTransportMode:
+    if server_args is None or envs.SGLANG_DISABLE_SHM_MM.get():
+        # Fallback to default CPU transport when SHM /psm_* races the parent process-tree lifecycle or server_args is None
+        return "default"
     is_cross_node = server_args.dist_init_addr
 
     if is_cross_node:

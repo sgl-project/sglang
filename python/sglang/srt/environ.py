@@ -738,6 +738,7 @@ class Envs:
 
 
     # VLM Item CUDA IPC Transport
+    SGLANG_DISABLE_SHM_MM = EnvBool(False)
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
     SGLANG_USE_IPC_POOL_HANDLE_CACHE = EnvBool(False)
     SGLANG_MM_FEATURE_CACHE_MB = EnvInt(1 * 1024)
