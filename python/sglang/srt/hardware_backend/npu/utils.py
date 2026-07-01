@@ -2,7 +2,7 @@ import functools
 import logging
 import sys
 from enum import IntEnum
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 
@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 indexer_weight_stream = None
 gva_is_inited = False
+device_print_registered = False
 
 
 class NPUACLFormat(IntEnum):
@@ -344,3 +345,87 @@ def process_routed_expert(hidden_states, topk_output, forward_func):
     with torch.get_device_module().stream(stream):
         shared_output = forward_func(hidden_states, topk_output)
     return shared_output
+
+
+def _mark_op_side_effectful(op: Any) -> None:
+    torch.fx.node.has_side_effect(op)
+    default_overload = getattr(op, "default", None)
+    if default_overload is not None:
+        torch.fx.node.has_side_effect(default_overload)
+
+
+def _ensure_device_print_registered() -> None:
+    global device_print_registered
+    if device_print_registered:
+        return
+    try:
+        # Mark device_print ops side-effectful so FX/Inductor does not DCE or reorder these debug callbacks.
+        import sgl_kernel_npu  # noqa: F401
+
+        _mark_op_side_effectful(torch.ops.npu.device_print)
+        _mark_op_side_effectful(torch.ops.npu.device_print_tensor)
+        device_print_registered = True
+    except AttributeError as exc:
+        raise RuntimeError(
+            "device_print ops are available in sgl_kernel_npu. "
+            "Please install the latest sgl_kernel_npu from source."
+        ) from exc
+
+
+def device_print(
+    value: (
+        torch.Tensor
+        | int
+        | float
+        | bool
+        | str
+        | torch.dtype
+        | torch.device
+        | torch.Size
+    ),
+) -> None:
+    """Print one value from a device callback.
+
+    This helper is intended for debugging. To stay replay-safe under
+    ``torch.npu.graph`` capture/replay, the underlying callback payloads are
+    retained instead of being reclaimed after the first host callback runs.
+    Avoid using it in hot paths or long-running high-frequency loops, otherwise
+    there may be memory issues due to too many retained payloads.
+
+    Supported usage:
+
+        >>> from sglang.srt.hardware_backend.npu.utils import device_print
+        >>> device_print(x)
+        >>> device_print("already formatted text")
+        >>> device_print(7)
+
+    Unsupported usage:
+
+        >>> device_print("x =", x)
+        >>> device_print("This is ", x, "and this is ", y)
+
+    If you need device-time tensor values, pass the tensor itself. If you need
+    text, pass one final string that is already formatted.
+
+    Tensor values are copied to host on the current stream before the callback
+    prints them, so printing remains ordered with respect to the surrounding
+    device work.
+
+    DO NOT FORMAT A DEVICE TENSOR INTO A STRING YOURSELF AND THEN PRINT, for example:
+
+        >>> device_print(f"x = {x}")
+        >>> device_print("x = " + str(x))
+    """
+    _ensure_device_print_registered()
+
+    if isinstance(value, torch.Tensor):
+        torch.ops.npu.device_print_tensor(value)
+    elif isinstance(
+        value, (str, int, float, bool, torch.dtype, torch.device, torch.Size)
+    ):
+        torch.ops.npu.device_print(str(value))
+    else:
+        raise TypeError(
+            f"Unsupported device_print value type: {type(value)!r}. "
+            "Use exactly one argument: device_print(tensor), device_print('formatted text')."
+        )
