@@ -24,14 +24,10 @@ try:
     # `from aiter.mha import ...` does NOT work — that module path only
     # exists as `aiter.ops.mha`.
     from aiter import mha_batch_prefill_func
-    from aiter.ops.triton.gluon.pa_decode_gluon import (
-        get_recommended_splits,
-        pa_decode_gluon,
-    )
+    from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 except ImportError:  # pragma: no cover - import-time guard mirrors aiter_backend
     mha_batch_prefill_func = None
     pa_decode_gluon = None
-    get_recommended_splits = None
 
 from sglang.srt.layers.attention.utils import launch_gather_shuffle_5d_to_linear
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
@@ -139,8 +135,17 @@ def forward_extend_vectorized_5d(
     # SWA→sub-pool mapping when applicable).
     pool = backend.token_to_kv_pool
     if hasattr(pool, "layers_mapping"):
+        # SWAKVPool: full / SWA sub-pool split keyed by layer id.
         sub_layer_id, sub_is_swa = pool.layers_mapping[layer.layer_id]
         sub_pool = pool.swa_kv_pool if sub_is_swa else pool.full_kv_pool
+    elif hasattr(pool, "full_kv_pool") and hasattr(pool, "_transfer_full_attention_id"):
+        # HybridLinearKVPool (GDN/linear + full-attn, e.g. Qwen3.5-MoE):
+        # the 5D K/V buffers live on the inner full_kv_pool, and full-attn
+        # layer ids are remapped into a dense [0, num_full_layers) range
+        # (full_kv_pool.start_layer == 0). The wrapper itself has no
+        # `.k_buffer` / `layers_mapping`, so resolve through full_kv_pool.
+        sub_pool = pool.full_kv_pool
+        sub_layer_id = pool._transfer_full_attention_id(layer.layer_id)
     else:
         sub_pool = pool
         sub_layer_id = layer.layer_id
@@ -258,7 +263,39 @@ def forward_decode_vectorized_5d(
     else:
         block_tables_pa = backend.forward_metadata.kv_indices
         ctx_part = 256
-        max_part_num = get_recommended_splits(bs, num_kv_heads)
+        # Each gluon decode CTA covers exactly `ctx_part` (256) context
+        # The launch grid is (bs, num_kv_heads, max_context_partition_num).
+        # The gluon decode kernel grid-strides over the 256-token context
+        # partitions, so `max_part_num` is purely a PARALLELISM knob — any
+        # value is numerically correct, but too few splits serialize the
+        # per-CTA partition loop. aiter's get_recommended_splits() caps the
+        # count at min(...,8), which starves occupancy for low-KV-head models
+        # (Qwen3.5-MoE has 1 KV head/rank under TP=2, vs gpt-oss's 8): with
+        # only bs*1*8 CTAs the MI355X is <25% utilized and the SAME kernel
+        # that ATOM runs in ~22us takes ~126us. Profiled at conc4/IL8k:
+        # SGLang gluon 125.7us vs ATOM 22.1us for the identical kernel.
+        #
+        # Choose the split count from THREE bounds, all graph-safe (constant
+        # per CUDA-graph bucket):
+        #   1. parts_needed  — partitions to cover the context. Derived from
+        #      the decode page-table WIDTH (kv_indices is
+        #      [bs, max_num_blocks_per_seq]); fixed at capture, mirrors the
+        #      unified_attention path's `page_table.shape[1] * page_size`.
+        #   2. sm_splits     — splits to fill the GPU given bs*num_kv_heads
+        #      CTAs already in flight (scales DOWN at high bs so we don't
+        #      over-split / blow up the per-call temp buffers).
+        #   3. FLYDSL_WARP_SIZE (64) — HARD cap: the flydsl ps-reduce kernel
+        #      only compiles for max_context_partition_num <= 64 (the >64
+        #      else-branch hits an arith.constant std::bad_cast at capture).
+        FLYDSL_REDUCE_MAX_PARTS = 64
+        max_ctx_tokens = block_tables_pa.shape[1] * backend.page_size
+        parts_needed = (int(max_ctx_tokens) + ctx_part - 1) // ctx_part
+        props = torch.cuda.get_device_properties(q.device)
+        # occupancy factor 2 mirrors aiter get_recommended_splits/get_occupancy
+        num_sm = props.multi_processor_count * 2
+        denom = max(1, bs * num_kv_heads)
+        sm_splits = (num_sm + denom - 1) // denom
+        max_part_num = max(1, min(FLYDSL_REDUCE_MAX_PARTS, parts_needed, sm_splits))
         sliding_window_arg = 0
 
     q_in = q.view(-1, num_q_heads, layer.qk_head_dim)
