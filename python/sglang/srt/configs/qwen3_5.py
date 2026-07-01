@@ -109,6 +109,19 @@ class Qwen3_5Config(PretrainedConfig):
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
 
 
+class Qwen3_5MTPTextConfig(Qwen3_5TextConfig):
+    """Text config for Qwen3.5 MTP draft models.
+
+    All MTP layers are full attention, so full_attention_interval=1.
+    """
+
+    model_type = "qwen3_5_mtp_text"
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.full_attention_interval = 1
+
+
 class Qwen3_5MoeVisionConfig(Qwen3_5VisionConfig):
     model_type = "qwen3_5_moe"
 

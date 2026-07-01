@@ -752,6 +752,7 @@ class TestHiSparseUnit(unittest.TestCase):
         queue.tree_cache = SimpleNamespace(
             evictable_size=lambda: 0,
             protected_size=lambda: 0,
+            supports_mamba=lambda: False,
         )
         queue.scheduler = SimpleNamespace(
             enable_hisparse=True,

@@ -494,7 +494,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 best_match_node=self.root_node,
             )
 
-        value, last_node, best_value_len = self._match_prefix_helper(key)
+        value, last_node, best_value_len = self._match_prefix_helper(
+            key, skip_mamba_match=params.skip_mamba_match
+        )
         return self._match_post_processor(params, value, last_node, best_value_len)
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -1028,13 +1030,17 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.req_to_token_pool.mamba_allocator.free(mamba_value)
 
     def _match_prefix_helper(
-        self, key: RadixKey
+        self, key: RadixKey, skip_mamba_match: bool = False
     ) -> Tuple[List[torch.Tensor], TreeNode, int]:
         """
         Mamba prefix matching helper. It factors in the sliding window size such that
         the matched node is guaranteed to either 1. connected to root without mamba tombstone,
         or 2. the number of matching tokens from the matched node to the last mamba tombstone
         node is greater than or equal to the sliding window size.
+
+        When skip_mamba_match is True, every node is treated as having a valid mamba
+        checkpoint (KV-only matching). Used by PD decode where the mamba state is
+        always transferred from prefill, so the cached mamba_value is irrelevant.
         """
         node = self.root_node
         child_key = key.child_key(self.page_size)
@@ -1044,8 +1050,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_last_node = node
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            # update best_value_len and best_last_node if needed
-            if node.mamba_value is not None:
+            if skip_mamba_match or node.mamba_value is not None:
                 best_value_len = len(value)
                 best_last_node = node
 
@@ -1062,8 +1067,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
                 if len(key):
                     child_key = key.child_key(self.page_size)
-        # handle best_value_len and best_last_node, for the case that last node is fully matched
-        if node.mamba_value is not None:
+        if skip_mamba_match or node.mamba_value is not None:
             best_value_len = len(value)
             best_last_node = node
 
@@ -1238,9 +1242,17 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._record_store_event(new_node)
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
+            # Decoding radix cache does not lock mamba ref at match.
+            direct_locks = node.full_lock_ref - sum(
+                c.full_lock_ref for c in node.children.values()
+            )
+            node.mamba_lock_ref = direct_locks
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.insert_mru(node)
-            self.mamba_evictable_size_ += len(mamba_value)
+            if direct_locks > 0:
+                self.mamba_protected_size_ += len(mamba_value)
+            else:
+                self.mamba_evictable_size_ += len(mamba_value)
             node.last_access_time = get_last_access_time()
         else:  # mamba value already exists
             mamba_value_exist = True

@@ -596,6 +596,11 @@ class ModelConfig:
         ]:
             self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
+            from sglang.srt.configs.qwen3_5 import Qwen3_5MTPTextConfig
+
+            self.hf_config.text_config = Qwen3_5MTPTextConfig(
+                **self.hf_config.text_config.to_dict()
+            )
 
         if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoEForCausalLM":
             self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"

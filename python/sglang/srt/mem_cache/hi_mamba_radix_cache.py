@@ -958,11 +958,13 @@ class HiMambaRadixCache(MambaRadixCache):
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
 
-        value, best_last_node, best_value_len = self._match_prefix_helper(key)
+        value, best_last_node, best_value_len = self._match_prefix_helper(
+            key, skip_mamba_match=params.skip_mamba_match
+        )
         return self._match_post_processor(params, value, best_last_node, best_value_len)
 
     def _match_prefix_helper(
-        self, key: RadixKey
+        self, key: RadixKey, skip_mamba_match: bool = False
     ) -> Tuple[List[torch.Tensor], TreeNode, int]:
         """Walk tree to find best_last_node (mamba boundary)."""
         node = self.root_node
@@ -978,7 +980,7 @@ class HiMambaRadixCache(MambaRadixCache):
             if child.evicted and not child.backuped:
                 break
 
-            if node.mamba_value is not None or node.mamba_backuped:
+            if skip_mamba_match or node.mamba_value is not None or node.mamba_backuped:
                 best_value_len = len(value)
                 best_last_node = node
 
@@ -997,7 +999,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 if len(key):
                     child_key = key.child_key(self.page_size)
 
-        if node.mamba_value is not None or node.mamba_backuped:
+        if skip_mamba_match or node.mamba_value is not None or node.mamba_backuped:
             best_value_len = len(value)
             best_last_node = node
 
