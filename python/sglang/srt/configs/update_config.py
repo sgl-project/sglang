@@ -155,15 +155,21 @@ def update_intermediate_size(model_config, attr_name, intermediate_padding_size)
     if attr_value % intermediate_padding_size != 0:
         from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
+        origin_value = attr_value
+        origin_name = "original_" + attr_name
         attr_value = pad_vocab_size(attr_value, intermediate_padding_size)
         if hasattr(model_config, "hf_config"):
             update_config(model_config.hf_config, attr_name, attr_value)
+            update_config(model_config.hf_config, origin_name, origin_value)
             if hasattr(model_config, "hf_text_config"):
                 update_config(model_config.hf_text_config, attr_name, attr_value)
+                update_config(model_config.hf_text_config, origin_name, origin_value)
             if hasattr(model_config.hf_config, "text_config"):
                 update_config(model_config.hf_config.text_config, attr_name, attr_value)
+                update_config(model_config.hf_config.text_config, origin_name, origin_value)
         else:
             update_config(model_config, attr_name, attr_value)
+            update_config(model_config, origin_name, origin_value)
 
     return model_config
 
