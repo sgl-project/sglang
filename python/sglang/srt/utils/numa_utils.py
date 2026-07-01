@@ -16,9 +16,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_xpu
 
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
@@ -59,11 +60,17 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
                 executable, debug_str = _create_numactl_executable(
                     numactl_args=numactl_args
                 )
-                debug_str += (
-                    f", logical_gpu_id={gpu_id}, "
-                    f"physical_gpu_id={_get_nvml_device_index(gpu_id)}, "
-                    f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')}"
-                )
+                if _is_xpu:
+                    debug_str += (
+                        f", logical_gpu_id={gpu_id}, "
+                        f"ZE_AFFINITY_MASK={os.environ.get('ZE_AFFINITY_MASK', '')}"
+                    )
+                else:
+                    debug_str += (
+                        f", logical_gpu_id={gpu_id}, "
+                        f"physical_gpu_id={_get_nvml_device_index(gpu_id)}, "
+                        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')}"
+                    )
                 with _mp_set_executable(executable=executable, debug_str=debug_str):
                     yield
                     return
@@ -354,7 +361,7 @@ def _is_numa_available() -> bool:
     """
     Check if NUMA is available and not already configured externally.
     """
-    if not _is_cuda:
+    if not (_is_cuda or _is_xpu):
         return False
 
     # Check if this is a numa system.
@@ -381,10 +388,14 @@ def _query_numa_node_for_gpu(device_id: int):
     Get the NUMA node affinity list for a GPU device.
 
     Args:
-        device_id: CUDA logical device index (post-CUDA_VISIBLE_DEVICES).
+        device_id: Logical device index (post-CUDA_VISIBLE_DEVICES /
+            ZE_AFFINITY_MASK).
     Returns:
         List of NUMA node IDs that have affinity with the device.
     """
+    if _is_xpu:
+        return _query_numa_node_for_xpu(device_id)
+
     try:
         import pynvml
     except ModuleNotFoundError:
@@ -427,3 +438,85 @@ def _query_numa_node_for_gpu(device_id: int):
             pynvml.nvmlShutdown()
         except Exception:
             pass  # Ignore shutdown errors
+
+
+def _list_xpu_pci_addresses():
+    """
+    Enumerate Intel GPU PCI addresses (display controllers, class 0x03xxxx)
+    sorted by bus/device/function, matching PyTorch XPU's default device order.
+
+    Done purely from sysfs so it can run in the launcher parent without
+    initializing the XPU runtime (mirrors why the CUDA path uses NVML here).
+    """
+    addresses = []
+    for path in glob.glob("/sys/bus/pci/devices/*"):
+        try:
+            with open(os.path.join(path, "vendor")) as f:
+                vendor = f.read().strip()
+            with open(os.path.join(path, "class")) as f:
+                pci_class = f.read().strip()
+        except OSError:
+            continue
+        # Intel vendor (0x8086) and a display controller (PCI base class 0x03).
+        if vendor == "0x8086" and pci_class.startswith("0x03"):
+            addresses.append(os.path.basename(path))
+    addresses.sort()
+    return addresses
+
+
+def _query_numa_node_for_xpu(device_id: int):
+    """
+    Get the NUMA node affinity list for an Intel XPU device via sysfs.
+
+    Args:
+        device_id: Logical XPU device index. ``ZE_AFFINITY_MASK`` (the XPU
+            analogue of ``CUDA_VISIBLE_DEVICES``) is honored when it is a plain
+            comma-separated device list so the logical index maps to the right
+            physical GPU.
+    Returns:
+        List containing the NUMA node ID for the device, or [] if it cannot be
+        determined (e.g. node is -1 on a non-NUMA path).
+    """
+    addresses = _list_xpu_pci_addresses()
+    if not addresses:
+        logger.warning(
+            "No Intel GPU PCI devices found in sysfs, skipping NUMA node "
+            "configuration for XPU"
+        )
+        return []
+
+    # Honor ZE_AFFINITY_MASK when it is a simple comma-separated device list
+    # (e.g. "0,3,5"); composite "x.y" entries are left untranslated.
+    affinity_mask = os.environ.get("ZE_AFFINITY_MASK", "").strip()
+    if affinity_mask:
+        try:
+            visible = [int(tok) for tok in affinity_mask.split(",") if tok != ""]
+            addresses = [addresses[i] for i in visible]
+        except (ValueError, IndexError):
+            logger.warning(
+                f"Could not apply ZE_AFFINITY_MASK={affinity_mask!r} to the XPU "
+                "PCI device list; using the unmasked device order."
+            )
+
+    if device_id >= len(addresses):
+        logger.warning(
+            f"XPU device {device_id} is out of range of the {len(addresses)} "
+            "Intel GPU(s) found in sysfs, skipping NUMA node configuration for XPU"
+        )
+        return []
+
+    numa_path = f"/sys/bus/pci/devices/{addresses[device_id]}/numa_node"
+    try:
+        with open(numa_path) as f:
+            node = int(f.read().strip())
+    except (OSError, ValueError) as e:
+        logger.warning(
+            f"Could not read {numa_path} for XPU {device_id}: {e}, skipping "
+            "NUMA node configuration for XPU"
+        )
+        return []
+
+    # The kernel reports -1 when the device has no NUMA affinity.
+    if node < 0:
+        return []
+    return [node]
