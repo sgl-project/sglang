@@ -216,6 +216,8 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
     dit_offload_prefetch_size: float = 0.0
+    offload_during_compile: bool = True
+    _dit_offloaded_for_compile: bool = field(default=False, repr=False)
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = False
@@ -384,6 +386,7 @@ class ServerArgs(DisaggServerArgsMixin):
         self._adjust_parallelism()
         self._adjust_attention_backend()
         self._adjust_platform_specific()
+        self._adjust_offload_during_compile()
         self._adjust_layerwise_offload_components()
         self._adjust_autocast()
         auto_tuner.finalize_auto_flags()
@@ -964,6 +967,18 @@ class ServerArgs(DisaggServerArgsMixin):
             in cpu_offload_flags_for_layerwise_components(component_names)
         )
 
+    def _adjust_offload_during_compile(self):
+        if (
+            self.offload_during_compile
+            and self.enable_torch_compile
+            and not self.is_dit_layerwise_offload_selected
+            and not self.is_arg_explicitly_set("dit_layerwise_offload")
+            and not self.use_fsdp_inference
+            and os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() != "true"
+        ):
+            self.dit_layerwise_offload = True
+            self._dit_offloaded_for_compile = True
+
     def _adjust_layerwise_offload_components(self):
         explicitly_set_component_names = normalize_layerwise_offload_components(
             self.layerwise_offload_components
@@ -1296,6 +1311,12 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--offload-during-compile",
+            action=StoreBoolean,
+            default=ServerArgs.offload_during_compile,
+            help="Offload the DiT layerwise during torch.compile warmup so max-autotune fits on tighter-memory GPUs, then restore it to resident for fast serving. Only applies when the DiT is not already offloaded by the user.",
         )
 
         parser.add_argument(
