@@ -1336,5 +1336,41 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         self.assertEqual(parsed.sampling_backend, "token_oracle")
 
 
+class TestTrtllmMlaArchGuard(CustomTestCase):
+    """trtllm_mla prefill kernels exist only for SM100/SM103; decode works on all
+    Blackwell (SM120/SM121 auto-dispatch to xqa).
+
+    So on SM120/SM121 (consumer/workstation Blackwell, e.g. RTX PRO 6000 / RTX
+    5090) trtllm_mla *prefill* must be rejected with a clear error instead of
+    crashing inside FlashInfer with "Unsupported architecture", while trtllm_mla
+    *decode* must still be allowed. Regression for #24633; mirrors the
+    trtllm_mha prefill/decode split.
+    """
+
+    @patch("sglang.srt.server_args.is_blackwell_supported", return_value=True)
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    def test_trtllm_mla_prefill_rejected_on_sm120(self, _mock_sm100, _mock_blackwell):
+        # A unified attention_backend implies the prefill path -> reject on SM120.
+        with self.assertRaises(ValueError) as ctx:
+            ServerArgs(
+                model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                attention_backend="trtllm_mla",
+                device="cuda",
+            )
+        self.assertIn("prefill", str(ctx.exception))
+        self.assertIn("SM100/SM103", str(ctx.exception))
+
+    @patch("sglang.srt.server_args.is_blackwell_supported", return_value=True)
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    def test_trtllm_mla_decode_allowed_on_sm120(self, _mock_sm100, _mock_blackwell):
+        # Decode-only trtllm_mla auto-dispatches to xqa and is supported on SM120.
+        args = ServerArgs(
+            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+            decode_attention_backend="trtllm_mla",
+            device="cuda",
+        )
+        self.assertEqual(args.decode_attention_backend, "trtllm_mla")
+
+
 if __name__ == "__main__":
     unittest.main()
