@@ -95,7 +95,7 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=3500
         export HCCL_SOCKET_IFNAME=<network-interface>
@@ -270,7 +270,7 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+
 export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_BUFFSIZE=1200
 export HCCL_SOCKET_IFNAME=<network-interface>
@@ -400,7 +400,7 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=1536
         export HCCL_SOCKET_IFNAME=<network-interface>
@@ -607,7 +607,7 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=800
         export HCCL_SOCKET_IFNAME=<network-interface>
@@ -814,7 +814,7 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=1536
         export HCCL_SOCKET_IFNAME=<network-interface>
@@ -1019,7 +1019,7 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=1536
         export HCCL_SOCKET_IFNAME=<network-interface>
@@ -1224,7 +1224,7 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=1536
         export HCCL_SOCKET_IFNAME=<network-interface>
