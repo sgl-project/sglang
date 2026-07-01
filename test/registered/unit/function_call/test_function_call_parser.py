@@ -1173,6 +1173,55 @@ class TestKimiK2Detector(unittest.TestCase):
         self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"')
 
+    def test_prefixed_counter_tool_call_detect_and_parse(self):
+        """Test parsing tool calls with callNNNNN prefixed counter IDs.
+
+        The model uses this format in multi-turn conversations where previous
+        assistant messages already contain tool_calls. See
+        https://github.com/sgl-project/sglang/issues/25358
+        """
+        text = '<|tool_calls_section_begin|><|tool_call_begin|>call00003<|tool_call_argument_begin|>{"city": "Paris"}<|tool_call_end|><|tool_call_begin|>call00004<|tool_call_argument_begin|>{"city": "London"}<|tool_call_end|><|tool_calls_section_end|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[0].parameters, '{"city": "Paris"}')
+        self.assertEqual(result.calls[1].name, "get_weather")
+        self.assertEqual(result.calls[1].parameters, '{"city": "London"}')
+
+    def test_prefixed_counter_tool_call_streaming(self):
+        """Test streaming parsing of callNNNNN prefixed counter IDs."""
+        self.detector = KimiK2Detector()
+
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>call00003<|tool_call_argument_begin|>{",
+            '"city": "Paris"',
+            "}<|tool_call_end|>",
+            "<|tool_call_begin|>call00004<|tool_call_argument_begin|>{",
+            '"city": "London"',
+            "}<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        ]
+
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if tool_call_chunk.tool_index is not None:
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] += tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"}')
+        self.assertEqual(tool_calls[1]["name"], "get_weather")
+        self.assertEqual(tool_calls[1]["parameters"], '{"city": "London"}')
+
+
 
 class TestDeepSeekV3Detector(unittest.TestCase):
     def setUp(self):
