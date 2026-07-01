@@ -1621,11 +1621,11 @@ class PreshardedModelLoader(DefaultModelLoader):
         dp = _safe(get_moe_data_parallel_world_size)
         ep = _safe(get_moe_expert_parallel_world_size)
         pp = _safe(get_pipeline_model_parallel_world_size)
-        moe_dense_tp_size = get_global_server_args().moe_dense_tp_size
-        local_dense_tp = moe_dense_tp_size if moe_dense_tp_size else tp
         server_args = get_global_server_args()
-        ep_num_redundant_experts = server_args.ep_num_redundant_experts
-        init_expert_location = server_args.init_expert_location
+        moe_dense_tp_size = getattr(server_args, "moe_dense_tp_size", None)
+        ep_num_redundant_experts = getattr(server_args, "ep_num_redundant_experts", None)
+        init_expert_location = getattr(server_args, "init_expert_location", None)
+        local_dense_tp = moe_dense_tp_size if moe_dense_tp_size else tp
 
         parts = [f"TP-{tp}"]
         if dp > 1:
@@ -1638,6 +1638,9 @@ class PreshardedModelLoader(DefaultModelLoader):
             parts.append(f"DenseTP-{local_dense_tp}")
         if model_config.quantization:
             parts.append(f"dtype-{model_config.quantization}")
+        # Always include model dtype in the manual key so that bf16 vs fp16
+        # launches don't collide when structural signature construction fails.
+        parts.append(f"mdtype-{getattr(model_config, 'dtype', 'unknown')}")
         if ep_num_redundant_experts:
             parts.append(f"RedEP-{ep_num_redundant_experts}")
         if init_expert_location and init_expert_location != "trivial":
@@ -1663,9 +1666,22 @@ class PreshardedModelLoader(DefaultModelLoader):
     def _compute_structural_signature(
         self, model_config: ModelConfig
     ) -> Optional[str]:
-        try:
-            from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
+        from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
 
+        def _clear_meta_rope_cache() -> None:
+            # _ROPE_DICT keys do not include device; remove any entries whose
+            # parameters or buffers live on meta so the real model init does
+            # not reuse them and fail with "Cannot copy out of meta tensor".
+            meta_keys = [
+                k
+                for k, v in _ROPE_DICT.items()
+                if any(p.device.type == "meta" for p in v.parameters())
+                or any(b.device.type == "meta" for b in v.buffers())
+            ]
+            for k in meta_keys:
+                del _ROPE_DICT[k]
+
+        try:
             quant_config = _get_quantization_config(model_config, self.load_config)
             with set_default_torch_dtype(model_config.dtype):
                 with torch.device("meta"):
@@ -1678,24 +1694,6 @@ class PreshardedModelLoader(DefaultModelLoader):
                     for name, t in state_dict.items()
                 )
             del meta_model
-            # Remove any rotary-embedding cache entries that were created on
-            # meta device. _ROPE_DICT keys do not include device, so without
-            # this the real model init would reuse a meta-device module and
-            # fail with "Cannot copy out of meta tensor".
-            meta_keys = [
-                k
-                for k, v in _ROPE_DICT.items()
-                if any(
-                    p.device.type == "meta"
-                    for p in v.parameters()
-                )
-                or any(
-                    b.device.type == "meta"
-                    for b in v.buffers()
-                )
-            ]
-            for k in meta_keys:
-                del _ROPE_DICT[k]
             return self._hash_structural_signature(sig_input)
         except Exception as e:
             logger.warning(
@@ -1709,6 +1707,8 @@ class PreshardedModelLoader(DefaultModelLoader):
                 e,
             )
             return None
+        finally:
+            _clear_meta_rope_cache()
 
     @staticmethod
     def _hash_structural_signature(

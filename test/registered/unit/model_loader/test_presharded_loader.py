@@ -546,6 +546,41 @@ class TestStructuralSignature(unittest.TestCase):
         self.assertIsNotNone(sig_wide)
         self.assertNotEqual(sig_narrow, sig_wide)
 
+    def test_meta_rope_cache_cleared_even_on_failure(self):
+        # If _initialize_model partially populates _ROPE_DICT with meta-device
+        # entries before raising, _compute_structural_signature must still
+        # clean them up (via finally), otherwise the real model init reuses
+        # the meta module and fails with "Cannot copy out of meta tensor".
+        import torch.nn as nn
+        from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
+
+        # Plant a fake meta-device rotary module in the global cache.
+        fake_key = ("_test_meta_rope_cleanup_sentinel",)
+        fake_module = nn.Linear(4, 4)
+        with torch.device("meta"):
+            fake_module = nn.Linear(4, 4)
+        _ROPE_DICT[fake_key] = fake_module
+
+        loader = object.__new__(PreshardedModelLoader)
+        loader.load_config = SimpleNamespace()
+
+        with mock.patch(
+            "sglang.srt.model_loader.loader._get_quantization_config",
+            return_value=None,
+        ), mock.patch(
+            "sglang.srt.model_loader.loader._initialize_model",
+            side_effect=RuntimeError("simulated init failure"),
+        ), mock.patch(
+            "sglang.srt.model_loader.loader.set_default_torch_dtype",
+            return_value=mock.MagicMock(__enter__=mock.Mock(), __exit__=mock.Mock()),
+        ):
+            result = loader._compute_structural_signature(
+                SimpleNamespace(quantization=None, dtype=torch.float32)
+            )
+
+        self.assertIsNone(result)
+        self.assertNotIn(fake_key, _ROPE_DICT)
+
 
 if __name__ == "__main__":
     unittest.main()
