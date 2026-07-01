@@ -775,6 +775,14 @@ class ServerArgs:
         "Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
     ] = False
     disable_radix_cache: A[bool, "Disable RadixAttention for prefix caching."] = False
+    enable_page_major_kv_layout: A[
+        bool,
+        "Enable the page-major KV layout: lay out the Mamba state and full/SWA "
+        "KV caches in a page-granularity envelope (page is the outermost axis, "
+        "layer-major within a page) instead of the default per-layer "
+        "(layer-major) layout. Requires the Triton attention / linear-attn / "
+        "Mamba backends.",
+    ] = False
     disable_chunked_prefix_cache: A[
         bool,
         "Disable chunked prefix cache feature for deepseek, which should save overhead for short sequences.",
@@ -1915,6 +1923,7 @@ class ServerArgs:
                 "dynamic",
                 "eic",
                 "simm",
+                "mori",
             ],
         ),
     ] = None
@@ -2637,6 +2646,9 @@ class ServerArgs:
         # deterministic backend is set before auto-detection fills it in.
         self._handle_deterministic_inference()
         self._handle_attention_backend_compatibility()
+        # Must run after the attention backend is resolved so the trtllm_mla
+        # default (auto-selected for DeepseekV3ForCausalLM on sm100) is visible.
+        self._disable_prefill_cuda_graph_for_deepseek_trtllm_mla()
         self._handle_mamba_backend()
         self._handle_int8_mamba_checkpoint()
         self._handle_linear_attn_backend()
@@ -2702,6 +2714,8 @@ class ServerArgs:
 
         # Validate cache settings.
         self._handle_cache_compatibility()
+
+        self._handle_page_major_kv_layout()
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
@@ -3206,6 +3220,34 @@ class ServerArgs:
                 )
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
                 return
+
+    def _disable_prefill_cuda_graph_for_deepseek_trtllm_mla(self):
+        """Disable prefill CUDA graph for dsr1 by default when using the trtllm_mla
+        attention backend. Under any captured prefill CUDA graph (tc_piecewise or
+        breakable) trtllm_mla falls back to FlashAttention for prefill and regresses
+        performance, so disable whichever prefill graph backend is in effect.
+        """
+
+        if (Phase.PREFILL, "backend") in self._cuda_graph_config_locked:
+            return
+        if self.cuda_graph_config.prefill.backend == Backend.DISABLED:
+            return
+        if (
+            "DeepseekV3ForCausalLM"
+            not in self.get_model_config().hf_config.architectures
+        ):
+            return
+        prefill_attention_backend, _ = self.get_attention_backends()
+        if prefill_attention_backend != "trtllm_mla":
+            return
+        logger.warning(
+            "Disabling prefill CUDA graph (%s) by default for the DeepSeek-V3 arch on "
+            "the trtllm_mla attention backend (a captured prefill graph forces a "
+            "FlashAttention fallback that regresses prefill). Set the prefill cuda graph "
+            "backend explicitly (e.g. --cuda-graph-backend-prefill tc_piecewise) to override.",
+            self.cuda_graph_config.prefill.backend,
+        )
+        self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _validate_cuda_graph_config(self):
         if self.cuda_graph_config is None:
@@ -5341,9 +5383,10 @@ class ServerArgs:
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if self.moe_runner_backend == "flashinfer_cutedsl":
-            assert self.quantization in [
-                "modelopt_fp4"
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4'."
+            assert (
+                self.quantization in ["modelopt_fp4"]
+                or self.get_model_config().nvfp4_moe_meta is not None
+            ), f"Invalid quantization '{self.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4' or hybrid NVFP4 models."
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -5564,7 +5607,10 @@ class ServerArgs:
             )
             if self.deepep_mode != "auto":
                 logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
-            if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set():
+            if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
+                self.quantization == "modelopt_fp4"
+                or self.get_model_config().nvfp4_moe_meta is not None
+            ):
                 envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
                 logger.warning(
                     "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
@@ -5572,7 +5618,8 @@ class ServerArgs:
             assert self.moe_runner_backend in [
                 "flashinfer_cutlass",
                 "flashinfer_cutedsl",
-            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass or flashinfer_cutedsl moe runner backend"
+                "flashinfer_trtllm_routed",
+            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass, flashinfer_cutedsl or flashinfer_trtllm_routed moe runner backend"
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size
@@ -6288,6 +6335,38 @@ class ServerArgs:
                     logger.warning(
                         "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
                     )
+
+    def _handle_page_major_kv_layout(self):
+        if not self.enable_page_major_kv_layout:
+            return
+        # Only the Triton attention kernels read the strided 4-D envelope K/V
+        # views; FA3 / FlashInfer do not.
+        backends = {
+            self.attention_backend,
+            self.prefill_attention_backend,
+            self.decode_attention_backend,
+        }
+        backends.discard(None)
+        assert backends <= {"triton"}, (
+            "--enable-page-major-kv-layout requires the Triton attention backend "
+            f"for the full-attention layers; got {sorted(backends)}. Pass "
+            "--attention-backend triton."
+        )
+        # The Mamba state is stored in envelope-strided views; only the
+        # stride-aware Triton causal-conv / SSM kernels read them correctly.
+        linear_backends = {
+            self.linear_attn_backend,
+            self.linear_attn_decode_backend,
+            self.linear_attn_prefill_backend,
+            self.mamba_backend,
+        }
+        linear_backends.discard(None)
+        assert linear_backends <= {"triton"}, (
+            "--enable-page-major-kv-layout requires the Triton linear-attention / "
+            f"Mamba kernels for the strided conv/SSM state; got "
+            f"{sorted(linear_backends)}. Pass --linear-attn-backend triton and "
+            "--mamba-backend triton."
+        )
 
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:

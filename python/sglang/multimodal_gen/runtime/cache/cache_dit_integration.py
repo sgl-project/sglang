@@ -223,25 +223,27 @@ class CacheDitConfig:
 
 
 # Custom BlockAdapter for DiT models absent from cache-dit's BlockAdapterRegister.
-# Value: (blocks attr, forward_pattern, has_separate_cfg). forward_pattern must
+# Value: (blocks attr, forward_pattern). forward_pattern must
 # match the block's forward signature (see cache_dit.ForwardPattern; e.g., ERNIE
-# uses Pattern_3). has_separate_cfg=True aligns cache-dit's step counter for
-# sequential CFG (two forwards per step); cache-dit auto-resolves the remaining
+# uses Pattern_3). has_separate_cfg follows the run (passed by
+# enable_cache_on_transformer); cache-dit auto-resolves the remaining
 # fields.
-_CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, tuple[str, ForwardPattern, bool]] = {
-    "ErnieImageTransformer2DModel": ("layers", ForwardPattern.Pattern_3, True),
+_CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, tuple[str, ForwardPattern]] = {
+    "ErnieImageTransformer2DModel": ("layers", ForwardPattern.Pattern_3),
+    "Krea2Transformer2DModel": ("transformer_blocks", ForwardPattern.Pattern_3),
 }
 
 
 def _build_custom_block_adapter(
     transformer: torch.nn.Module,
+    has_separate_cfg: bool = False,
 ) -> Optional[BlockAdapter]:
     """Build a manual BlockAdapter for a model absent from cache-dit's registry,
     or None if the class is unknown."""
     spec = _CUSTOM_BLOCK_ADAPTER_SPECS.get(transformer.__class__.__name__)
     if spec is None:
         return None
-    blocks_attr, forward_pattern, has_separate_cfg = spec
+    blocks_attr, forward_pattern = spec
     blocks = getattr(transformer, blocks_attr, None)
     if blocks is None:
         raise ValueError(
@@ -262,6 +264,7 @@ def enable_cache_on_transformer(
     model_name: str = "transformer",
     sp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    has_separate_cfg: bool = False,
 ) -> torch.nn.Module:
     """Enable cache-dit on a transformer module, by wrapping the module with cache-dit
 
@@ -272,6 +275,9 @@ def enable_cache_on_transformer(
         model_name: Name of the model for logging purposes.
         sp_group: Sequence parallel process group (for Ulysses/Ring).
         tp_group: Tensor parallel process group.
+        has_separate_cfg: Whether the run issues separate conditional/unconditional
+            passes per step (CFG). Used by custom adapters (ERNIE, Krea-2); a
+            mismatch only disables caching, never corrupts output.
 
     """
     if not config.enabled:
@@ -288,7 +294,9 @@ def enable_cache_on_transformer(
     # _build_custom_block_adapter).
     custom_adapter = None
     if not BlockAdapterRegister.is_supported(transformer):
-        custom_adapter = _build_custom_block_adapter(transformer)
+        custom_adapter = _build_custom_block_adapter(
+            transformer, has_separate_cfg=has_separate_cfg
+        )
         if custom_adapter is None:
             transformer_cls_name = transformer.__class__.__name__
             raise ValueError(
