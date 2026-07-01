@@ -26,6 +26,7 @@ def make_runner(
         linear_attn_prefill_backend=None,
         uses_mamba_radix_cache=False,
         enable_page_major_kv_layout=False,
+        mamba_radix_cache_strategy="no_buffer",
         enable_dynamic_chunking=False,
         chunked_prefill_size=8192,
     )
@@ -73,6 +74,13 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
     def test_selects_flashinfer_for_supported_sm100_gdn(self):
         self.assertEqual(self.apply_policy(make_runner()), "flashinfer")
 
+    def test_selects_flashinfer_for_no_buffer_radix_cache(self):
+        runner = make_runner(
+            uses_mamba_radix_cache=True,
+            mamba_radix_cache_strategy="no_buffer",
+        )
+        self.assertEqual(self.apply_policy(runner), "flashinfer")
+
     def test_preserves_explicit_prefill_override(self):
         for backend in ("triton", "flashinfer", "cutedsl"):
             with self.subTest(backend=backend):
@@ -105,7 +113,20 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
         cases = (
             ("non_triton_base", {"linear_attn_backend": "cutedsl"}),
             ("page_major_kv", {"enable_page_major_kv_layout": True}),
-            ("active_radix", {"uses_mamba_radix_cache": True}),
+            (
+                "extra_buffer",
+                {
+                    "uses_mamba_radix_cache": True,
+                    "mamba_radix_cache_strategy": "extra_buffer",
+                },
+            ),
+            (
+                "extra_buffer_lazy",
+                {
+                    "uses_mamba_radix_cache": True,
+                    "mamba_radix_cache_strategy": "extra_buffer_lazy",
+                },
+            ),
             ("dynamic_chunk", {"enable_dynamic_chunking": True}),
             ("unchunked", {"chunked_prefill_size": -1}),
             ("unknown_chunk", {"chunked_prefill_size": None}),

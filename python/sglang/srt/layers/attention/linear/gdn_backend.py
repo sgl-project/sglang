@@ -67,13 +67,16 @@ def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
     ):
         return
 
+    # Extra-buffer strategies need intermediate state checkpoints.
+    if args.uses_mamba_radix_cache and args.mamba_radix_cache_strategy != "no_buffer":
+        return
+
     cuda_version = torch.version.cuda
     chunk_size = args.chunked_prefill_size
     config = model_runner.hybrid_gdn_config
     if (
         cuda_version is None
         or int(cuda_version.split(".", 1)[0]) < 13
-        or args.uses_mamba_radix_cache
         or args.enable_dynamic_chunking
         or chunk_size is None
         or not 1 <= chunk_size <= 8192
