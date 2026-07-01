@@ -80,12 +80,9 @@ class HpcAttnBackend(AttentionBackend):
 
         # Model config
         self.num_heads = (
-            model_runner.model_config.num_attention_heads
-            // get_parallel().attn_tp_size
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
-        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size
-        )
+        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
         self.head_dim = model_runner.model_config.head_dim
         self.v_head_dim = model_runner.model_config.v_head_dim
         if self.v_head_dim == -1:
@@ -93,9 +90,7 @@ class HpcAttnBackend(AttentionBackend):
 
         # Check constraints
         if self.head_dim != 128:
-            raise ValueError(
-                f"HPC attention backend requires head_dim=128, got {self.head_dim}"
-            )
+            raise ValueError(f"HPC attention backend requires head_dim=128, got {self.head_dim}")
 
         if self.v_head_dim != self.head_dim:
             raise ValueError(
@@ -105,9 +100,7 @@ class HpcAttnBackend(AttentionBackend):
 
         major, _ = torch.cuda.get_device_capability(model_runner.gpu_id)
         if major < 9:
-            raise ValueError(
-                f"HPC attention backend requires SM90+ (Hopper), got SM{major}x"
-            )
+            raise ValueError(f"HPC attention backend requires SM90+ (Hopper), got SM{major}x")
 
         # Page size and KV cache dtype
         self.page_size = model_runner.server_args.page_size or 1
@@ -141,9 +134,7 @@ class HpcAttnBackend(AttentionBackend):
                 "Please use NHD layout (set SGLANG_KV_CACHE_LAYOUT=nhd or equivalent)."
             )
         else:
-            raise ValueError(
-                f"Unexpected KV cache buffer ndim: {k_buffer.ndim}"
-            )
+            raise ValueError(f"Unexpected KV cache buffer ndim: {k_buffer.ndim}")
 
         return kcache, vcache
 
@@ -190,16 +181,12 @@ class HpcAttnBackend(AttentionBackend):
         else:
             # Extend / prefill
             extend_seq_lens = forward_batch.extend_seq_lens[:bs]
-            cu_seqlens_q = torch.zeros(
-                bs + 1, dtype=torch.int32, device=device
-            )
+            cu_seqlens_q = torch.zeros(bs + 1, dtype=torch.int32, device=device)
             cu_seqlens_q[1:] = torch.cumsum(extend_seq_lens, dim=0).to(torch.int32)
 
             # After saving KV, total cache length = seq_lens
             seqlens_kvcache = seq_lens[:bs].to(torch.int32)
-            max_seqlens_q = (
-                int(extend_seq_lens.max().item()) if bs > 0 else 1
-            )
+            max_seqlens_q = int(extend_seq_lens.max().item()) if bs > 0 else 1
             new_kv_included = True
 
         self.forward_metadata = HpcForwardMetadata(
@@ -247,15 +234,13 @@ class HpcAttnBackend(AttentionBackend):
         else:
             extend_seq_lens = forward_batch.extend_seq_lens[:bs]
             self.cuda_graph_cu_seqlens_q[0] = 0
-            self.cuda_graph_cu_seqlens_q[1 : bs + 1] = torch.cumsum(
-                extend_seq_lens, dim=0
-            ).to(torch.int32)
+            self.cuda_graph_cu_seqlens_q[1 : bs + 1] = torch.cumsum(extend_seq_lens, dim=0).to(
+                torch.int32
+            )
             cu_seqlens_q = self.cuda_graph_cu_seqlens_q[: bs + 1]
 
             self.cuda_graph_seqlens_kvcache[:bs] = seq_lens[:bs].to(torch.int32)
-            max_seqlens_q = (
-                int(extend_seq_lens.max().item()) if bs > 0 else 1
-            )
+            max_seqlens_q = int(extend_seq_lens.max().item()) if bs > 0 else 1
             new_kv_included = True
 
         self.forward_metadata = HpcForwardMetadata(
@@ -310,7 +295,6 @@ class HpcAttnBackend(AttentionBackend):
         from hpc import QuantType
 
         md = self.forward_metadata
-        bs = md.bs
 
         # Save new KV to paged cache first
         self._save_kv_cache(k, v, layer, forward_batch, save_kv_cache)
@@ -324,8 +308,11 @@ class HpcAttnBackend(AttentionBackend):
 
         # Output: [num_tokens, num_heads, v_head_dim]
         o = torch.empty(
-            q_3d.shape[0], self.num_heads, self.v_head_dim,
-            dtype=q.dtype, device=q.device,
+            q_3d.shape[0],
+            self.num_heads,
+            self.v_head_dim,
+            dtype=q.dtype,
+            device=q.device,
         )
 
         if self.use_fp8:
@@ -404,8 +391,11 @@ class HpcAttnBackend(AttentionBackend):
 
         # Output: [total_seq, num_heads, v_head_dim]
         o = torch.empty(
-            q_3d.shape[0], self.num_heads, self.v_head_dim,
-            dtype=q.dtype, device=q.device,
+            q_3d.shape[0],
+            self.num_heads,
+            self.v_head_dim,
+            dtype=q.dtype,
+            device=q.device,
         )
 
         if self.use_fp8:
