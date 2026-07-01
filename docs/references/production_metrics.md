@@ -65,29 +65,29 @@ sglang:e2e_request_latency_seconds_bucket{le="50.0",model_name="meta-llama/Llama
 sglang:e2e_request_latency_seconds_bucket{le="60.0",model_name="meta-llama/Llama-3.1-8B-Instruct"} 1513.0
 sglang:e2e_request_latency_seconds_bucket{le="+Inf",model_name="meta-llama/Llama-3.1-8B-Instruct"} 11228.0
 sglang:e2e_request_latency_seconds_count{model_name="meta-llama/Llama-3.1-8B-Instruct"} 11228.0
-# HELP sglang:time_per_output_token_seconds Histogram of time per output token in seconds.
-# TYPE sglang:time_per_output_token_seconds histogram
-sglang:time_per_output_token_seconds_sum{model_name="meta-llama/Llama-3.1-8B-Instruct"} 866964.5791549598
-sglang:time_per_output_token_seconds_bucket{le="0.005",model_name="meta-llama/Llama-3.1-8B-Instruct"} 1.0
-sglang:time_per_output_token_seconds_bucket{le="0.01",model_name="meta-llama/Llama-3.1-8B-Instruct"} 73.0
-sglang:time_per_output_token_seconds_bucket{le="0.015",model_name="meta-llama/Llama-3.1-8B-Instruct"} 382.0
-sglang:time_per_output_token_seconds_bucket{le="0.02",model_name="meta-llama/Llama-3.1-8B-Instruct"} 593.0
-sglang:time_per_output_token_seconds_bucket{le="0.025",model_name="meta-llama/Llama-3.1-8B-Instruct"} 855.0
-sglang:time_per_output_token_seconds_bucket{le="0.03",model_name="meta-llama/Llama-3.1-8B-Instruct"} 1035.0
-sglang:time_per_output_token_seconds_bucket{le="0.04",model_name="meta-llama/Llama-3.1-8B-Instruct"} 1815.0
-sglang:time_per_output_token_seconds_bucket{le="0.05",model_name="meta-llama/Llama-3.1-8B-Instruct"} 11685.0
-sglang:time_per_output_token_seconds_bucket{le="0.075",model_name="meta-llama/Llama-3.1-8B-Instruct"} 433413.0
-sglang:time_per_output_token_seconds_bucket{le="0.1",model_name="meta-llama/Llama-3.1-8B-Instruct"} 4.950195e+06
-sglang:time_per_output_token_seconds_bucket{le="0.15",model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.039435e+06
-sglang:time_per_output_token_seconds_bucket{le="0.2",model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.171662e+06
-sglang:time_per_output_token_seconds_bucket{le="0.3",model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.266055e+06
-sglang:time_per_output_token_seconds_bucket{le="0.4",model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.296752e+06
-sglang:time_per_output_token_seconds_bucket{le="0.5",model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.312226e+06
-sglang:time_per_output_token_seconds_bucket{le="0.75",model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.339675e+06
-sglang:time_per_output_token_seconds_bucket{le="1.0",model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.357747e+06
-sglang:time_per_output_token_seconds_bucket{le="2.5",model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.389414e+06
-sglang:time_per_output_token_seconds_bucket{le="+Inf",model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.400757e+06
-sglang:time_per_output_token_seconds_count{model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.400757e+06
+# HELP sglang:inter_token_latency_seconds Histogram of inter-token latency in seconds.
+# TYPE sglang:inter_token_latency_seconds histogram
+sglang:inter_token_latency_seconds_sum{model_name="meta-llama/Llama-3.1-8B-Instruct"} 866964.5791549598
+sglang:inter_token_latency_seconds_bucket{le="0.005",model_name="meta-llama/Llama-3.1-8B-Instruct"} 1.0
+sglang:inter_token_latency_seconds_bucket{le="0.01",model_name="meta-llama/Llama-3.1-8B-Instruct"} 73.0
+sglang:inter_token_latency_seconds_bucket{le="0.015",model_name="meta-llama/Llama-3.1-8B-Instruct"} 382.0
+sglang:inter_token_latency_seconds_bucket{le="0.02",model_name="meta-llama/Llama-3.1-8B-Instruct"} 593.0
+sglang:inter_token_latency_seconds_bucket{le="0.025",model_name="meta-llama/Llama-3.1-8B-Instruct"} 855.0
+sglang:inter_token_latency_seconds_bucket{le="0.03",model_name="meta-llama/Llama-3.1-8B-Instruct"} 1035.0
+sglang:inter_token_latency_seconds_bucket{le="0.04",model_name="meta-llama/Llama-3.1-8B-Instruct"} 1815.0
+sglang:inter_token_latency_seconds_bucket{le="0.05",model_name="meta-llama/Llama-3.1-8B-Instruct"} 11685.0
+sglang:inter_token_latency_seconds_bucket{le="0.075",model_name="meta-llama/Llama-3.1-8B-Instruct"} 433413.0
+sglang:inter_token_latency_seconds_bucket{le="0.1",model_name="meta-llama/Llama-3.1-8B-Instruct"} 4.950195e+06
+sglang:inter_token_latency_seconds_bucket{le="0.15",model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.039435e+06
+sglang:inter_token_latency_seconds_bucket{le="0.2",model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.171662e+06
+sglang:inter_token_latency_seconds_bucket{le="0.3",model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.266055e+06
+sglang:inter_token_latency_seconds_bucket{le="0.4",model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.296752e+06
+sglang:inter_token_latency_seconds_bucket{le="0.5",model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.312226e+06
+sglang:inter_token_latency_seconds_bucket{le="0.75",model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.339675e+06
+sglang:inter_token_latency_seconds_bucket{le="1.0",model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.357747e+06
+sglang:inter_token_latency_seconds_bucket{le="2.5",model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.389414e+06
+sglang:inter_token_latency_seconds_bucket{le="+Inf",model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.400757e+06
+sglang:inter_token_latency_seconds_count{model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.400757e+06
 # HELP sglang:func_latency_seconds Function latency in seconds
 # TYPE sglang:func_latency_seconds histogram
 sglang:func_latency_seconds_sum{name="generate_request"} 4.514771912145079
@@ -124,6 +124,209 @@ sglang:gen_throughput{model_name="meta-llama/Llama-3.1-8B-Instruct"} 86.50814177
 # TYPE sglang:num_queue_reqs gauge
 sglang:num_queue_reqs{model_name="meta-llama/Llama-3.1-8B-Instruct"} 2826.0
 ```
+
+The snippet above is only a small illustrative sample. The complete list of
+metrics exposed by the server is documented in the
+[Metrics Reference](#metrics-reference) below.
+
+## Metrics Reference
+
+This section lists every metric exposed on the `/metrics` endpoint, grouped by
+area. The **Type** column uses Prometheus metric types (`Counter`, `Gauge`,
+`Histogram`, `Summary`). Any labels listed in **Extra labels** are attached in
+addition to the common labels described below.
+
+### Labels
+
+Two collectors emit metrics, each with its own set of common labels applied to
+every metric it exports:
+
+- **Request metrics** (emitted from the tokenizer/API-server process) carry
+  `model_name`.
+- **Scheduler / engine metrics** carry `model_name`, `engine_type`, `tp_rank`,
+  `pp_rank`, and `moe_ep_rank`. `dp_rank` is added when data parallelism is
+  enabled.
+
+Additional common labels can appear depending on server configuration:
+
+- `priority` — added to all metrics when `--enable-priority-scheduling` is set.
+- Custom labels from `--extra-metric-labels` (both collectors) and
+  `--tokenizer-metrics-allowed-custom-labels` (request metrics).
+
+### Enablement flags
+
+Some metrics are only created when the corresponding feature is turned on:
+
+| Feature | Flag / condition | Metrics |
+| --- | --- | --- |
+| MFU estimation | `--enable-mfu-metrics` | `estimated_flops_per_gpu_total`, `estimated_read_bytes_per_gpu_total`, `estimated_write_bytes_per_gpu_total` |
+| LoRA | LoRA serving enabled | `lora_pool_slots_used`, `lora_pool_slots_total`, `lora_pool_utilization` |
+| Hierarchical (Hi)Cache | `--enable-hierarchical-cache` | `hicache_host_used_tokens`, `hicache_host_total_tokens` |
+| Expert parallelism load balancing | MoE with EP enabled | `eplb_balancedness` |
+| EPLB heatmap | `SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL > 0` | `eplb_gpu_physical_count` |
+| Function latency timer | metrics enabled | `func_latency_seconds` |
+
+### Request metrics
+
+| Metric | Type | Extra labels | Description |
+| --- | --- | --- | --- |
+| `sglang:prompt_tokens_total` | Counter | | Number of prefill tokens processed. |
+| `sglang:generation_tokens_total` | Counter | | Number of generation tokens processed. |
+| `sglang:cached_tokens_total` | Counter | `cache_source` | Number of cached prompt tokens by source (device/host/storage). |
+| `sglang:num_requests_total` | Counter | | Number of requests processed. |
+| `sglang:num_so_requests_total` | Counter | | Number of structured output requests processed. |
+| `sglang:num_aborted_requests_total` | Counter | | Number of requests aborted. |
+| `sglang:prompt_tokens_histogram` | Histogram | | Histogram of prompt token length. |
+| `sglang:generation_tokens_histogram` | Histogram | | Histogram of generation token length. |
+| `sglang:time_to_first_token_seconds` | Histogram | | Histogram of time to first token in seconds. |
+| `sglang:inter_token_latency_seconds` | Histogram | | Histogram of inter-token latency in seconds. |
+| `sglang:e2e_request_latency_seconds` | Histogram | | Histogram of end-to-end request latency in seconds. |
+| `sglang:per_stage_req_latency_seconds` | Histogram | `stage` | Latency of each stage of a request's lifecycle. |
+| `sglang:queue_time_seconds` | Histogram | | Histogram of queueing time in seconds. |
+
+### Scheduler state
+
+| Metric | Type | Extra labels | Description |
+| --- | --- | --- | --- |
+| `sglang:num_running_reqs` | Gauge | | The number of running requests. |
+| `sglang:num_running_reqs_offline_batch` | Gauge | | The number of running low-priority offline batch requests. |
+| `sglang:num_queue_reqs` | Gauge | | The number of requests in the waiting queue. |
+| `sglang:num_grammar_queue_reqs` | Gauge | | The number of requests in the grammar waiting queue. |
+| `sglang:num_paused_reqs` | Gauge | | The number of paused requests by async weight sync. |
+| `sglang:num_used_tokens` | Gauge | | The number of used tokens. |
+| `sglang:max_total_num_tokens` | Gauge | | Maximum total number of tokens in the KV cache pool. |
+| `sglang:token_usage` | Gauge | | The token usage. |
+| `sglang:full_token_usage` | Gauge | | The token usage for full attention layers. |
+| `sglang:swa_token_usage` | Gauge | | The token usage for SWA (sliding window attention) layers. |
+| `sglang:mamba_usage` | Gauge | | The token usage for Mamba layers. |
+| `sglang:pending_prealloc_token_usage` | Gauge | | The token usage for pending preallocated tokens (not preallocated yet). |
+| `sglang:gen_throughput` | Gauge | | The generation throughput (token/s). |
+| `sglang:cache_hit_rate` | Gauge | | The prefix cache hit rate. |
+| `sglang:new_token_ratio` | Gauge | | The new token ratio. |
+| `sglang:decode_sum_seq_lens` | Gauge | | The sum of all sequence lengths in decode. |
+| `sglang:utilization` | Gauge | | The utilization. |
+| `sglang:max_running_requests_under_SLO` | Gauge | | The maximum number of running requests under SLO. |
+| `sglang:cache_config_info` | Gauge | `page_size`, `num_pages` | Cache configuration information. |
+
+### Retraction and retries
+
+| Metric | Type | Extra labels | Description |
+| --- | --- | --- | --- |
+| `sglang:num_retracted_reqs` | Gauge | | The number of retracted requests (point-in-time). |
+| `sglang:num_retracted_requests_total` | Counter | | Total number of retracted requests. |
+| `sglang:num_retracted_input_tokens_total` | Counter | | Total number of retracted input tokens. |
+| `sglang:num_retracted_output_tokens_total` | Counter | | Total number of retracted output tokens. |
+| `sglang:num_retractions` | Histogram | | Histogram of retraction counts per request. |
+| `sglang:num_prefill_retries_total` | Counter | | Total number of prefill retries. |
+
+### Speculative decoding
+
+| Metric | Type | Extra labels | Description |
+| --- | --- | --- | --- |
+| `sglang:spec_accept_length` | Gauge | | The average acceptance length of speculative decoding. |
+| `sglang:spec_accept_rate` | Gauge | | The average acceptance rate of speculative decoding (`accepted tokens / total draft tokens` in batch). |
+
+### Grammar / structured output
+
+| Metric | Type | Extra labels | Description |
+| --- | --- | --- | --- |
+| `sglang:num_grammar_total` | Counter | | Number of total grammar requests. |
+| `sglang:num_grammar_cache_hit_total` | Counter | | Number of grammar cache hits. |
+| `sglang:num_grammar_aborted_total` | Counter | | Number of grammar aborted requests. |
+| `sglang:num_grammar_timeout_total` | Counter | | Number of grammar timeouts. |
+| `sglang:grammar_compilation_time_seconds` | Histogram | | Histogram of grammar compilation time in seconds. |
+| `sglang:grammar_schema_count` | Histogram | | Histogram of grammar schema count. |
+| `sglang:grammar_ebnf_size` | Histogram | | Histogram of grammar EBNF size. |
+| `sglang:grammar_tree_traversal_time_avg` | Histogram | | Histogram of average grammar tree traversal time in seconds. |
+| `sglang:grammar_tree_traversal_time_max` | Histogram | | Histogram of max grammar tree traversal time in seconds. |
+
+### Prefill/Decode disaggregation and KV transfer
+
+| Metric | Type | Extra labels | Description |
+| --- | --- | --- | --- |
+| `sglang:num_prefill_prealloc_queue_reqs` | Gauge | | The number of requests in the prefill prealloc queue. |
+| `sglang:num_prefill_inflight_queue_reqs` | Gauge | | The number of requests in the prefill inflight queue. |
+| `sglang:num_decode_prealloc_queue_reqs` | Gauge | | The number of requests in the decode prealloc queue. |
+| `sglang:num_decode_transfer_queue_reqs` | Gauge | | The number of requests in the decode transfer queue. |
+| `sglang:num_bootstrap_failed_reqs_total` | Counter | | The number of bootstrap failed requests. |
+| `sglang:num_transfer_failed_reqs_total` | Counter | | The number of transfer failed requests. |
+| `sglang:kv_transfer_speed_gb_s` | Histogram | | Histogram of KV cache transfer speed in GB/s. |
+| `sglang:kv_transfer_latency_ms` | Histogram | | Histogram of KV cache transfer latency in ms. |
+| `sglang:kv_transfer_bootstrap_ms` | Histogram | | Histogram of KV transfer bootstrap time in ms. |
+| `sglang:kv_transfer_alloc_ms` | Histogram | | Histogram of KV transfer allocation waiting time in ms. |
+| `sglang:kv_transfer_total_mb` | Histogram | | Histogram of KV cache transfer size in MB. |
+
+### Performance, MFU, and CUDA graph
+
+| Metric | Type | Extra labels | Description |
+| --- | --- | --- | --- |
+| `sglang:realtime_tokens_total` | Counter | `mode` | Total number of tokens processed (updated each log interval). `mode`: `prefill_compute`, `prefill_cache`, `decode`. |
+| `sglang:gpu_execution_seconds_total` | Counter | `category` | Total time that GPU is busy executing a workload. See `ForwardMode` for category labels. |
+| `sglang:gpu_overlap_wait_seconds_total` | Counter | `category` | Total time the GPU forward stream was idle waiting for the CPU schedule stream (overlap bubble). |
+| `sglang:estimated_flops_per_gpu_total` | Counter | | Estimated floating-point operations per GPU (for MFU). |
+| `sglang:estimated_read_bytes_per_gpu_total` | Counter | | Estimated bytes read from memory per GPU (for MFU). |
+| `sglang:estimated_write_bytes_per_gpu_total` | Counter | | Estimated bytes written to memory per GPU (for MFU). |
+| `sglang:cuda_graph_passes_total` | Counter | `mode` | Total number of forward passes categorized by CUDA graph. |
+| `sglang:is_cuda_graph` | Gauge | | Whether the batch is using CUDA graph. |
+| `sglang:dp_cooperation_realtime_tokens_total` | Counter | `mode`, `num_prefill_ranks` | Total tokens processed, labeled with DP cooperation info. |
+| `sglang:dp_cooperation_gpu_execution_seconds_total` | Counter | `category`, `num_prefill_ranks` | GPU busy time, labeled with DP cooperation info. |
+
+### Hierarchical cache, radix cache, and storage
+
+| Metric | Type | Extra labels | Description |
+| --- | --- | --- | --- |
+| `sglang:hicache_host_used_tokens` | Gauge | | Number of tokens currently used in the host KV cache. |
+| `sglang:hicache_host_total_tokens` | Gauge | | Total capacity of the host KV cache in tokens. |
+| `sglang:evicted_tokens_total` | Counter | | The number of tokens evicted from GPU to CPU. |
+| `sglang:eviction_duration_seconds` | Histogram | | Time taken to evict memory from GPU to CPU in seconds. |
+| `sglang:load_back_tokens_total` | Counter | | The number of tokens loaded from CPU to GPU. |
+| `sglang:load_back_duration_seconds` | Histogram | | Time taken to load memory from CPU to GPU in seconds. |
+| `sglang:prefetched_tokens_total` | Counter | | Number of prefetched prompt tokens. |
+| `sglang:backuped_tokens_total` | Counter | | Number of backuped tokens. |
+| `sglang:prefetch_bandwidth` | Histogram | | Histogram of prefetch bandwidth in GB/s. |
+| `sglang:prefetch_pgs` | Histogram | | Histogram of prefetch pages of batches. |
+| `sglang:backup_bandwidth` | Histogram | | Histogram of backup bandwidth in GB/s. |
+| `sglang:backup_pgs` | Histogram | | Histogram of backup pages of batches. |
+
+### LoRA
+
+| Metric | Type | Extra labels | Description |
+| --- | --- | --- | --- |
+| `sglang:lora_pool_slots_used` | Gauge | | Number of LoRA adapter slots currently occupied in GPU memory. |
+| `sglang:lora_pool_slots_total` | Gauge | | Total number of LoRA adapter slots available (`max_loras_per_batch`). |
+| `sglang:lora_pool_utilization` | Gauge | | LoRA pool utilization ratio (used/total); `1.0` means the pool is full. |
+
+### Mixture-of-Experts (EPLB)
+
+| Metric | Type | Extra labels | Description |
+| --- | --- | --- | --- |
+| `sglang:eplb_balancedness` | Summary | `forward_mode` | Balancedness of MoE in expert parallelism. |
+| `sglang:eplb_gpu_physical_count` | Histogram | `layer` | The selected count of physical experts on each layer and GPU rank. |
+
+### Routing keys (multi-tenant)
+
+| Metric | Type | Extra labels | Description |
+| --- | --- | --- | --- |
+| `sglang:num_unique_running_routing_keys` | Gauge | | Number of unique routing keys in the running batch. |
+| `sglang:routing_key_running_req_count` | GaugeHistogram | | Distribution of routing keys by running request count (`gt < count <= le`). |
+| `sglang:routing_key_all_req_count` | GaugeHistogram | | Distribution of routing keys by running+waiting request count (`gt < count <= le`). |
+
+### Prefill delayer
+
+| Metric | Type | Extra labels | Description |
+| --- | --- | --- | --- |
+| `sglang:prefill_delayer_wait_forward_passes` | Histogram | | Histogram of forward passes waited by the prefill delayer. |
+| `sglang:prefill_delayer_wait_seconds` | Histogram | | Histogram of wait time in seconds by the prefill delayer. |
+| `sglang:prefill_delayer_outcomes_total` | Counter | `input_estimation`, `output_allow`, `output_reason`, `actual_execution` | Prefill delayer outcome counts. |
+
+### Engine and process
+
+| Metric | Type | Extra labels | Description |
+| --- | --- | --- | --- |
+| `sglang:engine_startup_time` | Gauge | | The time taken for the engine to start up. |
+| `sglang:engine_load_weights_time` | Gauge | | The time taken for the engine to load weights. |
+| `sglang:process_cpu_seconds_total` | Counter | `component` | Total CPU time consumed by this process (user + system). |
+| `sglang:func_latency_seconds` | Histogram | `name` | Function latency in seconds (per instrumented function). |
 
 ## Setup Guide
 
