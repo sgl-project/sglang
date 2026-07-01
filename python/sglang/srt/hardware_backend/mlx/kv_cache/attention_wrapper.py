@@ -12,6 +12,7 @@ import mlx.nn as nn
 from sglang.srt.hardware_backend.mlx.aot import (
     MlxAOTKernelContext,
     MlxAOTKernelSet,
+    MlxAOTPagedAttentionContext,
     MlxAOTRoPEContext,
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.attention_contract import (
@@ -21,6 +22,10 @@ from sglang.srt.hardware_backend.mlx.kv_cache.attention_contract import (
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_cache import (
     ContiguousAttentionKVCache,
+)
+from sglang.srt.hardware_backend.mlx.kv_cache.paged_metadata import (
+    MLXPagedAttentionMetadata,
+    build_decode_paged_metadata,
 )
 
 _thread_local = threading.local()
@@ -41,6 +46,7 @@ class BatchedDecodeContext:
     # MLX decode path so future AOT kernels can be added without growing this
     # context one field at a time.
     aot: MlxAOTKernelContext = field(default_factory=MlxAOTKernelContext)
+    paged_metadata: MLXPagedAttentionMetadata | None = None
 
     # Derived tensors/metadata, shared across all layers in one forward pass.
     offsets: mx.array = field(init=False)
@@ -57,7 +63,7 @@ class BatchedDecodeContext:
         self.max_len = max_seq_len + 1
         self.valid_lens = self.offsets + 1
         self.needs_padding = min(seq_lens) < max_seq_len
-        self.pad_sizes = [max_seq_len - s for s in seq_lens]
+        self.pad_sizes = [self.max_len - (s + 1) for s in seq_lens]
         self.positions = mx.arange(self.max_len) if self.needs_padding else None
         if not self.attention_pool_index_by_layer:
             self.attention_pool_index_by_layer = {
@@ -76,6 +82,7 @@ class BatchedDecodeContext:
         req_to_token_pool: Any | None,
         attention_layer_indices: list[int] | None = None,
         attention_pool_index_by_layer: dict[int, int] | None = None,
+        paged_attention_supported: bool = True,
     ) -> BatchedDecodeContext:
         batch_size = len(req_ids)
         if attention_layer_indices is None:
@@ -87,6 +94,24 @@ class BatchedDecodeContext:
             [caches[i][layer_idx] for i in range(batch_size)]
             for layer_idx in attention_layer_indices
         ]
+        paged_metadata = None
+        if (
+            paged_attention_supported
+            and kv_pool is not None
+            and req_to_token_pool is not None
+        ):
+            try:
+                paged_metadata = build_decode_paged_metadata(
+                    req_ids=req_ids,
+                    req_pool_idx=req_pool_idx,
+                    req_to_token_pool=req_to_token_pool,
+                    seq_lens_before_decode=seq_lens,
+                )
+            except Exception:  # noqa: BLE001
+                # Metadata is advisory until the paged-attention kernel is
+                # enabled. Keep the existing padded SDPA path untouched.
+                paged_metadata = None
+
         return cls(
             batch_size=batch_size,
             seq_lens=seq_lens,
@@ -100,6 +125,7 @@ class BatchedDecodeContext:
                 req_to_token_pool=req_to_token_pool,
                 layer_caches=attention_layer_caches,
             ),
+            paged_metadata=paged_metadata,
         )
 
 
@@ -200,35 +226,68 @@ class MLXAttentionWrapper(nn.Module):
             keys = inner.rope(keys, offset=offsets)
 
         layer_caches = ctx.attention_layer_caches[attention_pool_idx]
-        pad_sizes = ctx.pad_sizes
+        use_paged_attention = (
+            ctx.aot.rope is not None
+            and ctx.aot.rope.new_token_slots is not None
+            and ctx.aot.paged_attention is not None
+            and ctx.paged_metadata is not None
+        )
+
+        if use_paged_attention:
+            for i in range(B):
+                layer_caches[i].write_token(keys[i : i + 1], values[i : i + 1])
+
+            output = self._paged_attention_aot(
+                queries,
+                attention_pool_idx,
+                ctx.aot.paged_attention,
+                ctx.paged_metadata,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                inner.scale,
+            )
+            output = output.reshape(B, 1, -1)
+            if gate is not None:
+                output = output * mx.sigmoid(gate)
+            return inner.o_proj(output)
 
         # TODO: replace per-request loop with native batched/ragged
         # attention once mx.fast.scaled_dot_product_attention supports
         # variable-length sequences.
         all_k = []
         all_v = []
+        actual_lens = []
 
         for i in range(B):
             layer_caches[i].write_token(keys[i : i + 1], values[i : i + 1])
 
             k_all, v_all = layer_caches[i].get_kv()
+            actual_lens.append(k_all.shape[2])
+            all_k.append(k_all)
+            all_v.append(v_all)
 
-            pad = pad_sizes[i]
+        target_len = max(actual_lens)
+        padded_k = []
+        padded_v = []
+        for k_all, v_all, actual_len in zip(all_k, all_v, actual_lens):
+            pad = target_len - actual_len
             if pad > 0:
                 k_pad = mx.zeros((1, n_kv_heads, pad, head_dim), dtype=k_all.dtype)
                 v_pad = mx.zeros((1, n_kv_heads, pad, head_dim), dtype=v_all.dtype)
                 k_all = mx.concatenate([k_all, k_pad], axis=2)
                 v_all = mx.concatenate([v_all, v_pad], axis=2)
+            padded_k.append(k_all)
+            padded_v.append(v_all)
 
-            all_k.append(k_all)
-            all_v.append(v_all)
-
-        keys_b = mx.concatenate(all_k, axis=0)
-        values_b = mx.concatenate(all_v, axis=0)
+        keys_b = mx.concatenate(padded_k, axis=0)
+        values_b = mx.concatenate(padded_v, axis=0)
 
         attn_mask = None
-        if ctx.needs_padding:
-            mask_bool = ctx.positions[None, :] >= ctx.valid_lens[:, None]
+        if min(actual_lens) < target_len:
+            positions = mx.arange(target_len)
+            valid_lens = mx.array(actual_lens, dtype=mx.int32)
+            mask_bool = positions[None, :] >= valid_lens[:, None]
             attn_mask = mx.where(
                 mask_bool[:, None, None, :],
                 mx.array(mx.finfo(queries.dtype).min, dtype=queries.dtype),
@@ -296,3 +355,30 @@ class MLXAttentionWrapper(nn.Module):
 
         # (B, n_heads, head_dim) -> (B, n_heads, 1, head_dim) for SDPA path
         return q_rot[:, :, None, :], k_rot[:, :, None, :]
+
+    @staticmethod
+    def _paged_attention_aot(
+        queries: mx.array,
+        attention_pool_idx: int,
+        paged_ctx: MlxAOTPagedAttentionContext,
+        metadata: MLXPagedAttentionMetadata,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        scale: float,
+    ) -> mx.array:
+        # (B, n_heads, 1, head_dim) -> (B, n_heads, head_dim)
+        q_flat = queries[:, :, 0, :]
+        k_pool = paged_ctx.kv_pool.k_buffer[attention_pool_idx]
+        v_pool = paged_ctx.kv_pool.v_buffer[attention_pool_idx]
+        return paged_ctx.kernel.paged_attention_decode(
+            q_flat,
+            k_pool,
+            v_pool,
+            metadata.kv_indptr,
+            metadata.kv_indices,
+            num_qo_heads=n_heads,
+            num_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            sm_scale=float(scale),
+        )

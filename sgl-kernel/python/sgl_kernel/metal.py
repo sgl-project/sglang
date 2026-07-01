@@ -110,3 +110,69 @@ def rope_pool_fused(
         num_kv_heads,
         float(rope_base),
     )
+
+
+def paged_attention_decode(
+    q: "mx.array",
+    k_pool: "mx.array",
+    v_pool: "mx.array",
+    kv_indptr: "mx.array",
+    kv_indices: "mx.array",
+    *,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    sm_scale: float,
+) -> "mx.array":
+    """Decode attention over a flat page-size-1 MLX KV pool.
+
+    Args:
+        q: Query tensor with shape `[batch, num_qo_heads, head_dim]`.
+        k_pool: Key pool with shape `[pool_size, num_kv_heads, head_dim]`.
+        v_pool: Value pool with shape `[pool_size, num_kv_heads, head_dim]`.
+        kv_indptr: int32 row pointer with shape `[batch + 1]`.
+        kv_indices: int32 physical slot IDs with shape `[total_visible_kv]`.
+
+    Returns:
+        Attention output with shape `[batch, num_qo_heads, head_dim]`.
+    """
+    if q.ndim != 3:
+        raise ValueError("paged_attention_decode expects q to be 3-D")
+    if k_pool.ndim != 3 or v_pool.ndim != 3:
+        raise ValueError("paged_attention_decode expects pool tensors to be 3-D")
+    if kv_indptr.ndim != 1 or kv_indices.ndim != 1:
+        raise ValueError("paged_attention_decode expects kv metadata to be 1-D")
+
+    q_shape = tuple(q.shape)
+    k_shape = tuple(k_pool.shape)
+    v_shape = tuple(v_pool.shape)
+    if q_shape[1:] != (num_qo_heads, head_dim):
+        raise ValueError(
+            "q shape must be [batch, num_qo_heads, head_dim], " f"got {q.shape}"
+        )
+    if k_shape[1:] != (num_kv_heads, head_dim):
+        raise ValueError(f"k_pool has incompatible shape {k_pool.shape}")
+    if v_shape != k_shape:
+        raise ValueError(
+            f"v_pool shape must match k_pool shape, got {v_pool.shape} vs {k_pool.shape}"
+        )
+    if tuple(kv_indptr.shape) != (q_shape[0] + 1,):
+        raise ValueError("kv_indptr must have batch + 1 entries")
+    if num_qo_heads % num_kv_heads != 0:
+        raise ValueError("num_qo_heads must be divisible by num_kv_heads")
+    if head_dim > 128:
+        raise ValueError("paged_attention_decode currently supports head_dim <= 128")
+    if q.dtype != k_pool.dtype or q.dtype != v_pool.dtype:
+        raise ValueError("q/k_pool/v_pool dtypes must match")
+
+    return _metal.paged_attention_decode(
+        q,
+        k_pool,
+        v_pool,
+        kv_indptr,
+        kv_indices,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        float(sm_scale),
+    )
