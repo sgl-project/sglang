@@ -1664,6 +1664,8 @@ class PreshardedModelLoader(DefaultModelLoader):
         self, model_config: ModelConfig
     ) -> Optional[str]:
         try:
+            from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
+
             quant_config = _get_quantization_config(model_config, self.load_config)
             with set_default_torch_dtype(model_config.dtype):
                 with torch.device("meta"):
@@ -1676,6 +1678,24 @@ class PreshardedModelLoader(DefaultModelLoader):
                     for name, t in state_dict.items()
                 )
             del meta_model
+            # Remove any rotary-embedding cache entries that were created on
+            # meta device. _ROPE_DICT keys do not include device, so without
+            # this the real model init would reuse a meta-device module and
+            # fail with "Cannot copy out of meta tensor".
+            meta_keys = [
+                k
+                for k, v in _ROPE_DICT.items()
+                if any(
+                    p.device.type == "meta"
+                    for p in v.parameters()
+                )
+                or any(
+                    b.device.type == "meta"
+                    for b in v.buffers()
+                )
+            ]
+            for k in meta_keys:
+                del _ROPE_DICT[k]
             return self._hash_structural_signature(sig_input)
         except Exception as e:
             logger.warning(
