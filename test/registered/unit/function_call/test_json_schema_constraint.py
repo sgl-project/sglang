@@ -260,6 +260,90 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         self.assertIn("$defs", schema)
         self.assertIn("NestedType", schema["$defs"])
 
+    def test_specific_tool_choice_preserves_defs(self):
+        """Specific tool_choice schemas should keep referenced $defs."""
+        tools_with_defs = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="complex_tool",
+                    description="Tool with complex schema",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "data": {"$ref": "#/$defs/NestedType"},
+                        },
+                        "required": ["data"],
+                        "$defs": {
+                            "NestedType": {
+                                "type": "object",
+                                "properties": {
+                                    "value": {"type": "string"},
+                                },
+                                "required": ["value"],
+                            },
+                        },
+                    },
+                ),
+            ),
+        ]
+        tool_choice = ToolChoice(
+            type="function", function=ToolChoiceFuncName(name="complex_tool")
+        )
+
+        schema = get_json_schema_constraint(tools_with_defs, tool_choice)
+
+        self.assertIsNotNone(schema)
+        jsonschema.Draft202012Validator.check_schema(schema)
+        self.assertIn("$defs", schema)
+        self.assertIn("NestedType", schema["$defs"])
+        jsonschema.Draft202012Validator(schema).validate(
+            [{"name": "complex_tool", "parameters": {"data": {"value": "ok"}}}]
+        )
+
+    def test_specific_tool_choice_uses_selected_tool_defs_only(self):
+        """Specific tool_choice schemas should not merge unrelated tool $defs."""
+        selected_type = {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+        }
+        other_type = {
+            "type": "object",
+            "properties": {"value": {"type": "number"}},
+        }
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="selected_tool",
+                    parameters={
+                        "type": "object",
+                        "properties": {"data": {"$ref": "#/$defs/Shared"}},
+                        "$defs": {"Shared": selected_type},
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="other_tool",
+                    parameters={
+                        "type": "object",
+                        "properties": {"data": {"$ref": "#/$defs/Shared"}},
+                        "$defs": {"Shared": other_type},
+                    },
+                ),
+            ),
+        ]
+        tool_choice = ToolChoice(
+            type="function", function=ToolChoiceFuncName(name="selected_tool")
+        )
+
+        schema = get_json_schema_constraint(tools, tool_choice)
+
+        self.assertIsNotNone(schema)
+        self.assertEqual(schema["$defs"]["Shared"], selected_type)
+
     def test_tools_without_parameters(self):
         """Test schema generation with tools that have no parameters"""
         tools_without_params = [
