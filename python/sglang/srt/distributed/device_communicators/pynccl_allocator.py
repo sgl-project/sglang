@@ -6,12 +6,26 @@ import traceback
 from contextlib import nullcontext
 
 import torch
-from torch.cuda.memory import (
-    CUDAPluggableAllocator,
-    _cuda_beginAllocateCurrentThreadToPool,
-    _cuda_endAllocateToPool,
-    _cuda_releasePool,
-)
+
+try:
+    from torch.cuda.memory import (
+        CUDAPluggableAllocator,
+        _cuda_beginAllocateCurrentThreadToPool,
+        _cuda_endAllocateToPool,
+        _cuda_releasePool,
+    )
+except ImportError:
+    # These private CUDA memory-pool APIs only exist on torch>=2.8 CUDA builds.
+    # On other builds/backends (e.g. Ascend NPU, which pins torch 2.7 via
+    # torch_npu) the names are absent, and importing them unconditionally would
+    # crash SGLang at startup since this module is imported eagerly everywhere.
+    # They are only used on the NCCL symmetric-memory path (get_nccl_mem_pool /
+    # SymmetricMemoryContext), which is gated behind --enable-symm-mem and never
+    # reached on those backends.
+    CUDAPluggableAllocator = None
+    _cuda_beginAllocateCurrentThreadToPool = None
+    _cuda_endAllocateToPool = None
+    _cuda_releasePool = None
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
