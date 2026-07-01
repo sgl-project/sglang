@@ -102,6 +102,13 @@ def torch_chunk_gated_delta_rule(
     chunk_size: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor, None]:
     """Pure PyTorch chunked gated delta rule matching Megatron's deterministic implementation."""
+    # Normalize memory layout: SGLang passes non-contiguous views (sliced from the fused
+    # qkv projection) while Megatron passes contiguous tensors. Identical values in different
+    # strides make the bf16 L2-norm reduction and downstream fp32 bmm tiling pick different
+    # kernels, tipping ~1 bf16 ULP at the final cast (layer 0 core_attn_out 3.9e-3 diff).
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
     initial_dtype = query.dtype
     query = query.float()
     key = key.float()
