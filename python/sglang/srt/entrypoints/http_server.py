@@ -2673,36 +2673,8 @@ def launch_server(
     )
 
     if envs.SGLANG_RUST_SERVER.get():
-        # The Rust frontend serves HTTP, tokenization, and detokenization, so the
-        # main process has no Python HTTP server / tokenizer manager to run. In
-        # Mode B (standalone api-server + dp_size>1) the DP ranks run headless, so
-        # node 0 also runs the single api-server that connects to all of them over
-        # TCP and serves HTTP; otherwise the embedded frontend(s) in the scheduler
-        # process(es) handle HTTP directly.
-        if (
-            envs.SGLANG_RUST_STANDALONE_API_SERVER.get()
-            and server_args.dp_size > 1
-            and server_args.node_rank == 0
-        ):
-            import threading
-
-            from sglang.srt.managers.scheduler_components.rust_scheduler import (
-                run_rust_api_server,
-            )
-
-            # A daemon thread, not a subprocess: `run_rust_api_server` releases the
-            # GIL (the Rust HTTP server is pure I/O), so it runs concurrently with
-            # this thread's `wait_for_completion` below, and `server_args` is
-            # already here (no pickling). daemon=True so it exits with the launcher.
-            threading.Thread(
-                target=run_rust_api_server,
-                args=(server_args,),
-                daemon=True,
-                name="rust-api-server-standalone",
-            ).start()
-            logger.info("Rust standalone api-server thread started")
-        # Keep the main process alive until the scheduler processes exit; the
-        # api-server thread (if any) serves HTTP in parallel.
+        # The Rust server serves api-server, tokenizer, and detokenizer, so the
+        # main process has no Python HTTP server / tokenizer manager to run.
         scheduler_init_result.wait_for_completion()
         return
 
