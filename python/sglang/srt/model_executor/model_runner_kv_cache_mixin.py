@@ -55,6 +55,7 @@ from sglang.srt.utils.common import (
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
+    is_xpu,
 )
 
 if TYPE_CHECKING:
@@ -658,7 +659,7 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
-        elif self.use_mla_backend and is_dsa_model:
+        elif self.use_mla_backend and is_dsa_model and not is_xpu():
             PoolCls = (
                 HiSparseDSATokenToKVPool if self.enable_hisparse else DSATokenToKVPool
             )
@@ -685,7 +686,7 @@ class ModelRunnerKVCacheMixin:
                 **pool_kwargs,
             )
         elif self.use_mla_backend and not self.mambaish_config:
-            assert not is_dsa_model
+            assert not is_dsa_model or is_xpu()
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 self.token_to_kv_pool = MLATokenToKVPoolFP4(
                     self.max_total_num_tokens,
