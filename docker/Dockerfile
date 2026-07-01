@@ -564,6 +564,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
+# Install system-provided Python packages into pip site-packages for runtime.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --ignore-installed -c /sgl-workspace/constraints.txt \
+    cryptography \
+    distro \
+    pyjwt \
+    pyparsing
+
 # Optional ai-dynamo nightly for Dynamo + SGLang integration testing. Gated by
 # INSTALL_DYNAMO so it lands only in the dev image (release-docker-dev.yml sets
 # it), not the version-tagged release/runtime images. Empty DYNAMO_VERSION
