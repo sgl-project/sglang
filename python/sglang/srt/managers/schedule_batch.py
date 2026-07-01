@@ -2053,9 +2053,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
-            self
-        )
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+
+        if isinstance(self.tree_cache, RefAwareCacheMixin):
+            allow_high = any(
+                self.tree_cache.is_high_priority(req.priority or 0) for req in self.reqs
+            )
+            with self.tree_cache.scoped_evict(allow_low=True, allow_high=allow_high):
+                out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
+                    alloc_for_extend(self)
+                )
+        else:
+            out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
+                alloc_for_extend(self)
+            )
 
         # Set fields
         input_embeds = []
@@ -2452,8 +2463,44 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
-        evict_from_tree_cache(self.tree_cache, num_tokens)
+        self._evict_for_decode(num_tokens, selected_indices)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+
+    def _evict_for_decode(
+        self, num_tokens: int, selected_indices: Optional[List[int]] = None
+    ):
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+
+        if not isinstance(self.tree_cache, RefAwareCacheMixin):
+            evict_from_tree_cache(self.tree_cache, num_tokens)
+            return
+
+        if self.tree_cache.is_chunk_cache():
+            return
+
+        allocator = self.tree_cache.token_to_kv_pool_allocator
+        if allocator.available_size() >= num_tokens:
+            return
+
+        self.tree_cache._evict_tiered(num_tokens, allow_low=True, allow_high=False)
+
+        shortfall = num_tokens - allocator.available_size()
+        if shortfall <= 0:
+            return
+
+        scope = range(len(self.reqs)) if selected_indices is None else selected_indices
+        hp_indices = [
+            i
+            for i in scope
+            if self.tree_cache.is_high_priority(self.reqs[i].priority or 0)
+        ]
+        if not hp_indices:
+            return
+
+        hp_tokens = self.new_tokens_required_next_decode(hp_indices)
+        high_target = min(shortfall, hp_tokens)
+        if high_target > 0:
+            self.tree_cache._evict_tiered(high_target, allow_low=False, allow_high=True)
 
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = retract_all(
@@ -2479,13 +2526,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # TODO(sang): Clean up finish path and support better retract
         # policy.
         if not server_args.speculative_algorithm:
-            sorted_indices.sort(
-                key=lambda i: (
-                    len(self.reqs[i].output_ids),
-                    -len(self.reqs[i].origin_input_ids),
-                ),
-                reverse=True,
-            )
+            from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+
+            if isinstance(self.tree_cache, RefAwareCacheMixin):
+                # KV Space evicted by HP requests can still not be used
+                # by LP requests since it is high_ref.
+                # This will cause OOM issues.
+                sorted_indices.sort(
+                    key=lambda i: (
+                        self.tree_cache.is_high_priority(self.reqs[i].priority or 0),
+                        len(self.reqs[i].output_ids),
+                        -len(self.reqs[i].origin_input_ids),
+                    ),
+                    reverse=True,
+                )
+            else:
+                sorted_indices.sort(
+                    key=lambda i: (
+                        len(self.reqs[i].output_ids),
+                        -len(self.reqs[i].origin_input_ids),
+                    ),
+                    reverse=True,
+                )
 
         retracted_reqs = []
         first_iter = True

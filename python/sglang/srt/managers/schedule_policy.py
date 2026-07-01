@@ -445,6 +445,8 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        enable_ref_aware_kv_buffer: bool = False,
+        high_priority_threshold: int = 1,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -508,6 +510,9 @@ class PrefillAdder:
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
 
+        self.enable_ref_aware_kv_buffer = enable_ref_aware_kv_buffer
+        self.high_priority_threshold = high_priority_threshold
+
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
         max_running_reqs = dllm_config.max_running_requests
@@ -522,6 +527,26 @@ class PrefillAdder:
             )
             * self.new_token_ratio
         )
+
+    def _rem_total_tokens_ref_aware(self, is_high: bool):
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+
+        cache = self.tree_cache
+        assert isinstance(cache, RefAwareCacheMixin)
+        available = self.token_to_kv_pool_allocator.available_size()
+        evictable = cache.safe_evictable_size_by_tier(
+            allow_low=True,
+            allow_high=is_high,
+        )
+        return available + evictable - self.rem_total_token_offset
+
+    def _can_admit_ref_aware_req(
+        self, req: Req, req_is_high: bool, total_tokens: int
+    ) -> bool:
+        ref_aware_budget = self._rem_total_tokens_ref_aware(req_is_high)
+        if total_tokens < ref_aware_budget:
+            return True
+        return False
 
     @property
     def rem_total_tokens(self):
@@ -724,6 +749,15 @@ class PrefillAdder:
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
+        elif self.enable_ref_aware_kv_buffer:
+            # TODO (zhangmj): need to support is_hybrid_swa.
+            req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
+            budget = int(self._rem_total_tokens_ref_aware(req_is_high)) - self.page_size
+            _rem_tokens = min(self.rem_chunk_tokens, max(budget, 0))
+            if _rem_tokens <= 0 and req_is_high:
+                _rem_tokens = self.rem_chunk_tokens
+            elif _rem_tokens <= 0 and not req_is_high:
+                return req
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             if self.is_hybrid_swa:
@@ -925,6 +959,11 @@ class PrefillAdder:
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
+        if self.enable_ref_aware_kv_buffer:
+            req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
+            if not self._can_admit_ref_aware_req(req, req_is_high, total_tokens):
+                return AddReqResult.NO_TOKEN
+
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
@@ -947,6 +986,11 @@ class PrefillAdder:
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
+            if self.enable_ref_aware_kv_buffer:
+                req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
+                if not self._can_admit_ref_aware_req(req, req_is_high, total_tokens):
+                    return AddReqResult.NO_TOKEN
+
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 

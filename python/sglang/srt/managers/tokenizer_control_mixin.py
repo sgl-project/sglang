@@ -53,6 +53,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
+    ReleaseRefReqInput,
+    ReleaseRefReqOutput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -65,6 +67,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateRefReqInput,
+    UpdateRefReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -105,6 +109,8 @@ _COMMUNICATOR_SPECS = [
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    ("release_ref", ReleaseRefReqOutput),
+    ("update_ref", UpdateRefReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -260,6 +266,22 @@ class TokenizerControlMixin:
         return (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
+
+    async def release_ref(
+        self: TokenizerManager, obj: ReleaseRefReqInput
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        results = await self.release_ref_communicator(obj)
+        r = results[0]
+        return r.success, r.message
+
+    async def update_ref(
+        self: TokenizerManager, obj: UpdateRefReqInput
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        results = await self.update_ref_communicator(obj)
+        r = results[0]
+        return r.success, r.message
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

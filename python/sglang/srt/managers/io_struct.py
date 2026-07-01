@@ -1393,6 +1393,25 @@ class FlushCacheReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class ReleaseRefReqInput(BaseReq):
+    session_id: str = ""
+
+
+class ReleaseRefReqOutput(BaseReq):
+    success: bool = True
+    message: str = ""
+
+
+class UpdateRefReqInput(BaseReq):
+    session_id: str = ""
+    new_priority: int = 0
+
+
+class UpdateRefReqOutput(BaseReq):
+    success: bool = True
+    message: str = ""
+
+
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None

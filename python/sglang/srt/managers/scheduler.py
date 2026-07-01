@@ -126,6 +126,8 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    ReleaseRefReqInput,
+    ReleaseRefReqOutput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -142,6 +144,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateRefReqInput,
+    UpdateRefReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -350,6 +354,8 @@ class Scheduler(
         )
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
+        self.enable_ref_aware_kv_buffer = server_args.enable_ref_aware_kv_buffer
+        self.high_priority_threshold = server_args.high_priority_threshold
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.enable_decode_hicache = (
             server_args.disaggregation_decode_enable_radix_cache
@@ -455,6 +461,20 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+
+        # TODO (zhangmj): Can be removed if support ref-aware HiRadixCache in UnifiedRadixCache for hybrid SSM/SWA.
+        if self.enable_ref_aware_kv_buffer:
+            from sglang.srt.mem_cache.ref_aware_cache_mixin import (
+                RefAwareCacheMixin,
+            )
+
+            if not isinstance(self.tree_cache, RefAwareCacheMixin):
+                logger.warning(
+                    "enable_ref_aware_kv_buffer is set but tree_cache is %s, "
+                    "disabling ref-aware KV buffer.",
+                    type(self.tree_cache).__name__,
+                )
+                self.enable_ref_aware_kv_buffer = False
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -669,6 +689,52 @@ class Scheduler(
 
     def handle_get_loads_req(self, req: GetLoadsReqInput):
         return self.load_inquirer.get_loads(req)
+
+    def session_id_for_req(self, req: Req) -> Optional[str]:
+        session_id = getattr(req, "session_id", None)
+        if session_id is None:
+            session_id = getattr(getattr(req, "session", None), "session_id", None)
+        return session_id
+
+    def handle_release_ref(self, recv_req: ReleaseRefReqInput):
+        if self.enable_ref_aware_kv_buffer:
+            from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+
+            if isinstance(self.tree_cache, RefAwareCacheMixin):
+                session_id = self.session_id_for_req(recv_req)
+                success, msg = self.tree_cache.release_ref(session_id)
+                return ReleaseRefReqOutput(success=success, message=msg)
+        return ReleaseRefReqOutput(
+            success=False, message="ref-aware KV buffer not enabled"
+        )
+
+    def handle_update_ref(self, recv_req: UpdateRefReqInput):
+        if not self.enable_ref_aware_kv_buffer:
+            return UpdateRefReqOutput(
+                success=False, message="ref-aware KV buffer not enabled"
+            )
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+
+        if not isinstance(self.tree_cache, RefAwareCacheMixin):
+            return UpdateRefReqOutput(
+                success=False, message="ref-aware KV buffer not enabled"
+            )
+
+        session_id = self.session_id_for_req(recv_req)
+        new_priority = recv_req.new_priority
+        if session_id is not None:
+            for req in getattr(self.running_batch, "reqs", []) or []:
+                if self.session_id_for_req(req) == session_id:
+                    req.priority = new_priority
+            for req in self.waiting_queue or []:
+                if self.session_id_for_req(req) == session_id:
+                    req.priority = new_priority
+            chunked = getattr(self, "chunked_req", None)
+            if chunked is not None and self.session_id_for_req(chunked) == session_id:
+                chunked.priority = new_priority
+
+        success, msg = self.tree_cache.update_ref(session_id, new_priority)
+        return UpdateRefReqOutput(success=success, message=msg)
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -1429,6 +1495,8 @@ class Scheduler(
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (GetLoadsReqInput, self.handle_get_loads_req),
+                (ReleaseRefReqInput, self.handle_release_ref),
+                (UpdateRefReqInput, self.handle_update_ref),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (ConfigureLoggingReq, self.configure_logging),
@@ -2019,14 +2087,9 @@ class Scheduler(
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
-        # Radix-native sessions use only the top-level session_id.
-        radix_native_session = (
-            recv_req.session_id is not None
-            and self.server_args.enable_session_radix_cache
-        )
 
-        if session_id is None or radix_native_session:
-            # Normal non-session request, or a radix-native session request
+        if session_id is None:
+            # Normal request. Top-level session_id is carried on Req for cache consumers.
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
@@ -2731,6 +2794,22 @@ class Scheduler(
 
         return ret
 
+    def _try_add_deferred_chunk(self, adder: PrefillAdder, req: Req):
+        self.chunked_req = adder.add_chunked_req(req)
+        if (
+            self.chunked_req is not None
+            and adder.can_run_list
+            and adder.can_run_list[-1] is not req
+        ):
+            # LP chunk was not admitted due to insufficient token budget.
+            # Retract it so the slot is free for high-priority requests.
+            # Note: if add.can_run_list is empty, the LP chunked request will not
+            # be retracted since there are no HP requests.
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            req.reset_for_retract()
+            self._add_request_to_queue(req)
+            self.chunked_req = None
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -2811,10 +2890,25 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            enable_ref_aware_kv_buffer=self.enable_ref_aware_kv_buffer,
+            high_priority_threshold=self.high_priority_threshold,
         )
 
+        deferred_chunked_req = None
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
+
+        chunk_deferred = False
+        if self.enable_ref_aware_kv_buffer and self.chunked_req is not None:
+            chunk_is_high = self.tree_cache.is_high_priority(
+                self.chunked_req.priority or 0
+            )
+            if not chunk_is_high:
+                chunk_deferred = True
+                deferred_chunked_req = self.chunked_req
+            else:
+                self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        elif self.chunked_req is not None:
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
@@ -2864,6 +2958,14 @@ class Scheduler(
                     req.rid
                 )
 
+            # At the HP->LP boundary, try to insert the deferred LP chunk
+            if chunk_deferred and deferred_chunked_req is not None:
+                req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
+                if not req_is_high:
+                    self._try_add_deferred_chunk(adder, deferred_chunked_req)
+                    deferred_chunked_req = None
+                    chunk_deferred = False
+
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
@@ -2898,6 +3000,11 @@ class Scheduler(
                     )
                     req.mamba_pool_idx = None
                 break
+
+        # If the queue was exhausted without inserting the deferred chunk, handle it
+        if chunk_deferred and deferred_chunked_req is not None:
+            self._try_add_deferred_chunk(adder, deferred_chunked_req)
+            deferred_chunked_req = None
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
@@ -4078,12 +4185,7 @@ class Scheduler(
         return None
 
     def close_session(self, recv_req: CloseSessionReqInput):
-        if self.server_args.enable_session_radix_cache:
-            self.tree_cache.release_radix_session(recv_req.session_id)
-        if recv_req.session_id in self.session_controller or not (
-            self.server_args.enable_session_radix_cache
-        ):
-            self.session_controller.close(recv_req)
+        self.session_controller.close(recv_req)
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:

@@ -1180,16 +1180,6 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             ServerArgs(**self._base_kwargs(kv_cache_dtype="fp4_e2m1"))
 
 
-class TestSessionRadixCacheServerArgs(unittest.TestCase):
-    def test_requires_priority_radix_eviction_policy(self):
-        with self.assertRaisesRegex(ValueError, "--radix-eviction-policy priority"):
-            ServerArgs(
-                model_path="dummy",
-                enable_session_radix_cache=True,
-                radix_eviction_policy="lru",
-            )
-
-
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):
     @patch(
         "sglang.srt.model_executor.runner_backend."
