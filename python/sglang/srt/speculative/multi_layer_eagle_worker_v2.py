@@ -878,3 +878,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             if not success:
                 return success, message
         return True, "Succeeded to update model weights."
+
+    @property
+    def draft_models(self) -> list:
+        return [runner.model for runner in self._draft_worker.draft_runner_list]

@@ -2038,6 +2038,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         shapes,
         group_name,
         load_format: Optional[str] = None,
+        extra_models: Optional[List[torch.nn.Module]] = None,
     ):
         """
         Update specific parameter in the model weights online
@@ -2047,6 +2048,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             name: the name of the parameter to be updated.
             dtype: the data type of the parameter to be updated.
             shape: the shape of the parameter to be updated.
+            extra_models: additional co-located models (e.g. a speculative
+                draft model) to load the same broadcasted tensors into. The
+                broadcast happens once; each model filters to the parameters
+                it owns, so this never issues a second collective.
         """
 
         assert group_name in self._model_update_group, (
@@ -2056,7 +2061,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if load_format == "flattened_bucket":
             return self._update_bucketed_weights_from_distributed(
-                names, dtypes, shapes, group_name
+                names, dtypes, shapes, group_name, extra_models=extra_models
             )
         try:
             weights = []
@@ -2079,6 +2084,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 handle.wait()
 
             self.model.load_weights(weights)
+            for model in extra_models or []:
+                model.load_weights(weights)
             return True, "Succeeded to update parameter online."
 
         except Exception as e:
@@ -2091,7 +2098,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return False, error_msg
 
     def _update_bucketed_weights_from_distributed(
-        self, names, dtypes, shapes, group_name
+        self, names, dtypes, shapes, group_name, extra_models=None
     ):
         try:
             named_tensors = []
@@ -2111,6 +2118,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
             self.model.load_weights(reconstructed_tensors)
+            for model in extra_models or []:
+                model.load_weights(reconstructed_tensors)
             return True, f"Succeeded to update parameter online."
         except Exception as e:
             error_msg = (

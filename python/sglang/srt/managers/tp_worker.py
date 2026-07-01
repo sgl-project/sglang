@@ -151,7 +151,7 @@ class BaseTpWorker(ABC):
         return success, message
 
     def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
+        self, recv_req: UpdateWeightsFromDistributedReqInput, extra_models=None
     ):
         success, message = self.model_runner.update_weights_from_distributed(
             recv_req.names,
@@ -159,6 +159,7 @@ class BaseTpWorker(ABC):
             recv_req.shapes,
             recv_req.group_name,
             recv_req.load_format,
+            extra_models=extra_models,
         )
         return success, message
 

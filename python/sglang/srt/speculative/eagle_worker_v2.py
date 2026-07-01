@@ -1688,3 +1688,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             load_format=recv_req.load_format,
         )
         return success, message
+
+    @property
+    def draft_models(self) -> list:
+        return [self.draft_worker.draft_runner.model]
