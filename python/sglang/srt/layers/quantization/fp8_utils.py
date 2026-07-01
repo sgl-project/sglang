@@ -146,7 +146,7 @@ TORCH_DEVICE_IDENTITY = None
 
 
 def use_rowwise_torch_scaled_mm():
-    if _is_hip:
+    if _is_hip and torch.cuda.is_available():
         # The condition to determine if it is on a platform that supports
         # torch._scaled_mm rowwise feature.
         # The condition is determined once as the operations
