@@ -22,9 +22,9 @@
 
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
-ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
-ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
@@ -86,7 +86,7 @@ ARG SGL_BRANCH=${SGL_DEFAULT}
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
-ARG TRITON_COMMIT="42270451990532c67e69d753fbd026f28fcc4840"
+ARG TRITON_COMMIT="v3.6.0"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
@@ -318,7 +318,8 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 ENV CARGO_BUILD_JOBS=4
 
 # Build and install sgl-model-gateway
-RUN python3 -m pip install --no-cache-dir "maturin<1.14" \
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip install --no-cache-dir "maturin<1.14" \
     && sed -i -E 's|^(smg-[a-zA-Z-]+)\s*=\s*"~1\.0\.0"|\1 = "=1.0.0"|' \
            /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
     && grep -E '^smg-' /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
@@ -539,71 +540,9 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 
 # -----------------------
 # Hot patch: torch-ROCm
-# The artifact hardcoded the supported triton version to be 3.5.1.
-# Rewrite the restriction directly.
-ARG TORCH_ROCM_FILE="torch-2.9.1+rocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl"
-RUN mkdir /tmp/whl && cd /tmp/whl \
-     && export TORCH_ROCM_FILE="${TORCH_ROCM_FILE}" \
-     && cat > hack.py <<"PY"
-import zipfile, csv, os, re
-from pathlib import Path
-
-fname = os.environ["TORCH_ROCM_FILE"]
-in_whl  = Path("/")   / fname
-out_whl = Path("/tmp")/ fname
-work = Path("/tmp/whl")
-
-# 1) Extract
-with zipfile.ZipFile(in_whl, "r") as z:
-    z.extractall(work)
-
-# 2) Locate dist-info and patch METADATA (edit this logic to match your exact line)
-dist_info = next(work.glob("*.dist-info"))
-meta = dist_info / "METADATA"
-txt = meta.read_text(encoding="utf-8")
-
-# Example: replace one exact requirement form.
-# Adjust the string to match what you actually see.
-pat = r"^Requires-Dist:\s*triton==3.5.1[^\s]*;"
-txt2, n = re.subn(pat, r"triton>=3.5.1;", txt, flags=re.MULTILINE)
-if txt2 == txt:
-    raise SystemExit("Did not find expected Requires-Dist line to replace in METADATA")
-meta.write_text(txt2, encoding="utf-8")
-
-# 3) Hacky step: blank hash/size columns in RECORD
-record = dist_info / "RECORD"
-rows = []
-with record.open(newline="", encoding="utf-8") as f:
-    for r in csv.reader(f):
-        if not r:
-            continue
-        # keep filename, blank out hash and size
-        rows.append([r[0], "", ""])
-with record.open("w", newline="", encoding="utf-8") as f:
-    csv.writer(f).writerows(rows)
-
-# 4) Re-zip as a wheel
-with zipfile.ZipFile(out_whl, "w", compression=zipfile.ZIP_DEFLATED) as z:
-    for p in work.rglob("*"):
-        if p.is_file():
-            z.write(p, p.relative_to(work).as_posix())
-
-print("Wrote", out_whl)
-PY
-
-RUN cd /tmp/whl \
-    && case "${GPU_ARCH}" in \
-      *rocm720*) \
-        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
-        python hack.py \
-        && python3 -m pip install --force --no-deps /tmp/${TORCH_ROCM_FILE} \
-        && rm -fr /tmp/whl /tmp/${TORCH_ROCM_FILE} \
-        ;; \
-      *) \
-        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
-        ;; \
-    esac
-
+# The supported Triton version has been hardcoded in Pytorch as version 3.5.1.
+# Rewrite the restriction directly to METADATA file
+RUN sed -i '/Requires-Dist: triton.*/d' /opt/venv/lib/python3.10/site-packages/torch-*dist-info/METADATA
 
 # -----------------------
 # Hot patch: Triton
