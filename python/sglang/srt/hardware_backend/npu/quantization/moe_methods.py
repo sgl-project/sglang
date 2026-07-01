@@ -775,6 +775,7 @@ class NPUUnquantMoEMethod(_NPUFusedMoEMethodBase):
         weight_name = f"{weight_prefix}_weight"
         server_args = get_global_server_args()
         online_quant = server_args.online_quantization if server_args else None
+        online_quant = "ascend_mxfp8"
 
         if online_quant == "ascend_w8a8":
             self._apply_online_w8a8(layer, weight_prefix, weight_name)
