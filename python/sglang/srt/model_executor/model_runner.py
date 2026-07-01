@@ -2078,7 +2078,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             for handle in handles:
                 handle.wait()
 
-            self.model.load_weights(weights)
+            _model_load_weights(self.model, weights, is_full_load=False)
             return True, "Succeeded to update parameter online."
 
         except Exception as e:
@@ -2110,7 +2110,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 group=self._model_update_group[group_name],
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
-            self.model.load_weights(reconstructed_tensors)
+            _model_load_weights(self.model, reconstructed_tensors, is_full_load=False)
             return True, f"Succeeded to update parameter online."
         except Exception as e:
             error_msg = (
@@ -2147,7 +2147,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             custom_loader = dynamic_import(load_format)
             custom_loader(self.model, named_tensors)
         elif load_format is None:
-            self.model.load_weights(named_tensors)
+            _model_load_weights(self.model, named_tensors, is_full_load=False)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
@@ -2180,7 +2180,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reconstructed_tensors = bucket.reconstruct_tensors()
 
         # Load the reconstructed tensors using the standard method
-        self.model.load_weights(reconstructed_tensors)
+        _model_load_weights(self.model, reconstructed_tensors, is_full_load=False)
 
         return True, "Success"
 
@@ -3313,6 +3313,24 @@ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tenso
     params_dict = dict(model.named_parameters())
     for name, tensor in named_tensors:
         default_weight_loader(params_dict[name], tensor)
+
+
+def _model_load_weights(model, weights, *, is_full_load: bool = True):
+    """Call ``model.load_weights``, forwarding ``is_full_load`` only when the model
+    accepts it. Online update paths pass ``is_full_load=False`` so loaders can skip
+    full-checkpoint diagnostics; most models don't take the kwarg, so it is forwarded
+    based on the actual signature rather than assumed."""
+    load_weights = model.load_weights
+    try:
+        supports_is_full_load = (
+            "is_full_load" in inspect.signature(load_weights).parameters
+        )
+    except (TypeError, ValueError):
+        supports_is_full_load = False
+
+    if supports_is_full_load:
+        return load_weights(weights, is_full_load=is_full_load)
+    return load_weights(weights)
 
 
 def _unwrap_tensor(tensor, tp_rank, device):
