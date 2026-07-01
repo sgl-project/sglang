@@ -182,6 +182,8 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     assert is_deepseek_dsa(config)
 
     pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is None:
+        pattern = get_indexer_types(config)
     if pattern is not None:
         return layer_id < len(pattern) and pattern[layer_id] == "S"
 
@@ -220,6 +222,23 @@ def get_num_indexer_layers(config) -> int:
         compress_ratios = getattr(config, "compress_ratios", None) or []
         return sum(1 for r in compress_ratios if r == 4)
     return getattr(config, "num_indexer_layers", 0)
+
+
+def get_indexer_types(config) -> str | None:
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is None:
+        return None
+    # mapping as FFFSSS str
+    mapping = {"full": "F", "shared": "S"}
+    result_parts = []
+    for item in indexer_types:
+        if item in mapping:
+            result_parts.append(mapping[item])
+        else:
+            logger.warning(f"Unknown indexer type '{item}', using 'F' as fallback")
+            result_parts.append("F")
+    output = "".join(result_parts)
+    return output if output else None
 
 
 class ModelConfig:
