@@ -487,15 +487,8 @@ class MambaPool:
                 )
 
             if speculative_num_draft_tokens is not None:
-                if _is_npu:
-                    temporal_state = temporal_state.transpose(-1, -2)
-                    temporal_state_shape = (
-                        *temporal_state_shape[:-2],
-                        temporal_state_shape[-1],
-                        temporal_state_shape[-2],
-                    )
                 # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, V, K]
                 intermediate_ssm_state_cache = torch.zeros(
                     size=(
                         num_mamba_layers,
