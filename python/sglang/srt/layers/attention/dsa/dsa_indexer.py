@@ -1835,8 +1835,13 @@ class Indexer(MultiPlatformOp):
             # creates a Dynamo shape guard. These graph modes never have empty
             # batches.
             if not in_piecewise_or_breakable_cuda_graph:
-                assert forward_batch.seq_lens_cpu is not None
-                if len(forward_batch.seq_lens_cpu) == 0:
+                if forward_batch.seq_lens_cpu is not None:
+                    batch_is_empty = len(forward_batch.seq_lens_cpu) == 0
+                else:
+                    # GPU-only draft-extend can intentionally omit CPU mirrors;
+                    # metadata keeps the real pre-pad batch shape without a sync.
+                    batch_is_empty = metadata.get_seqlens_int32().shape[0] == 0
+                if batch_is_empty:
                     # this seems b/c max-pad, no worries?
                     # if x.shape[0] != 0:
                     #     print(
