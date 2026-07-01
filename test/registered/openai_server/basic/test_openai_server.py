@@ -346,6 +346,124 @@ class TestOpenAIServer(CustomTestCase):
             for parallel_sample_num in [1, 2]:
                 self.run_chat_completion_stream(logprobs, parallel_sample_num)
 
+    def test_chat_tokenize_matches_chat_completion_prompt_tokens(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        messages = [
+            {"role": "system", "content": "You are a concise assistant."},
+            {"role": "user", "content": "Name one city in France."},
+        ]
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0,
+        }
+
+        tokenize_response = requests.post(
+            self.base_url + "/chat/tokenize",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json=payload,
+        )
+        self.assertEqual(tokenize_response.status_code, 200, tokenize_response.text)
+        tokenize_body = tokenize_response.json()
+
+        completion = client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0,
+            max_tokens=1,
+        )
+
+        self.assertEqual(tokenize_body["count"], completion.usage.prompt_tokens)
+        self.assertEqual(len(tokenize_body["tokens"]), tokenize_body["count"])
+
+    def test_completions_tokenize_matches_completion_prompt_tokens(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        prompt = "The capital of France is"
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "temperature": 0,
+        }
+
+        tokenize_response = requests.post(
+            self.base_url + "/completions/tokenize",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json=payload,
+        )
+        self.assertEqual(tokenize_response.status_code, 200, tokenize_response.text)
+        tokenize_body = tokenize_response.json()
+
+        completion = client.completions.create(
+            model=self.model,
+            prompt=prompt,
+            temperature=0,
+            max_tokens=1,
+        )
+
+        self.assertEqual(tokenize_body["count"], completion.usage.prompt_tokens)
+        self.assertEqual(len(tokenize_body["tokens"]), tokenize_body["count"])
+
+    def test_tokenize_dispatches_and_rejects_ambiguous_body(self):
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        chat_payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+        completion_payload = {
+            "model": self.model,
+            "prompt": "hello",
+        }
+
+        chat_tokenize = requests.post(
+            self.base_url + "/chat/tokenize",
+            headers=headers,
+            json=chat_payload,
+        )
+        generic_chat_tokenize = requests.post(
+            self.base_url + "/tokenize",
+            headers=headers,
+            json=chat_payload,
+        )
+        self.assertEqual(chat_tokenize.status_code, 200, chat_tokenize.text)
+        self.assertEqual(
+            generic_chat_tokenize.status_code, 200, generic_chat_tokenize.text
+        )
+        self.assertEqual(chat_tokenize.json(), generic_chat_tokenize.json())
+
+        completions_tokenize = requests.post(
+            self.base_url + "/completions/tokenize",
+            headers=headers,
+            json=completion_payload,
+        )
+        generic_completions_tokenize = requests.post(
+            self.base_url + "/tokenize",
+            headers=headers,
+            json=completion_payload,
+        )
+        self.assertEqual(
+            completions_tokenize.status_code, 200, completions_tokenize.text
+        )
+        self.assertEqual(
+            generic_completions_tokenize.status_code,
+            200,
+            generic_completions_tokenize.text,
+        )
+        self.assertEqual(
+            completions_tokenize.json(), generic_completions_tokenize.json()
+        )
+
+        ambiguous = requests.post(
+            self.base_url + "/tokenize",
+            headers=headers,
+            json={
+                "model": self.model,
+                "prompt": "hello",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+        self.assertEqual(ambiguous.status_code, 400, ambiguous.text)
+        self.assertIn("Exactly one", ambiguous.json()["message"])
+
     def test_regex(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
