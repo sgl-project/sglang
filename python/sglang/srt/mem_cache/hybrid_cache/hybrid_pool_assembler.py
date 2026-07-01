@@ -512,10 +512,24 @@ def build_hybrid_mamba_stack(
         server_args=server_args,
         use_mla=use_mla,
     )
+    mamba_hicache_size = server_args.hicache_size
+    if (
+        server_args.hicache_size > 0
+        and kv_pool.mem_usage > 0
+        and mamba_pool.mem_usage > 0
+    ):
+        scaled_size = int(
+            server_args.hicache_size * mamba_pool.mem_usage / kv_pool.mem_usage
+        )
+        mamba_device_size_gb = mamba_pool.mem_usage * 1.073741824
+        if scaled_size > mamba_device_size_gb:
+            mamba_hicache_size = scaled_size
+        else:
+            mamba_hicache_size = 0
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
         server_args.hicache_ratio,
-        server_args.hicache_size,
+        mamba_hicache_size,
         allocator_type=server_args.hicache_storage_backend,
         layout=server_args.hicache_mem_layout,
     )
