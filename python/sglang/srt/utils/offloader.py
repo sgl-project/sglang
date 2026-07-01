@@ -1,7 +1,7 @@
 import logging
 import os
 from abc import ABC
-from typing import Callable, Generator, List, Optional
+from typing import Callable, Dict, Generator, List, Optional
 
 import torch
 from torch.func import functional_call
@@ -106,15 +106,51 @@ class OffloaderV1(BaseOffloader):
         if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
             return module
 
+        # Record tensor views that alias each parameter's *original* storage
+        # BEFORE we rebind .data to pinned CPU memory. Some hybrid linear-attn
+        # models (e.g. Qwen3-Next) cache such views, which would otherwise point
+        # at orphaned GPU memory after weight loading; we refresh them at forward time.
+        view_aliases: Dict[int, List] = {}
+        param_data_ptr_to_param = {
+            p.data.untyped_storage().data_ptr(): p for p in module.parameters()
+        }
+        for _sub_name, sub in module.named_modules():
+            for attr_name, attr_val in list(sub.__dict__.items()):
+                if not isinstance(attr_val, torch.Tensor):
+                    continue
+                if isinstance(attr_val, torch.nn.Parameter):
+                    # Already registered as a Parameter — handled by functional_call.
+                    continue
+                try:
+                    ptr = attr_val.untyped_storage().data_ptr()
+                except Exception:
+                    continue
+                if ptr not in param_data_ptr_to_param:
+                    continue
+                view_aliases.setdefault(ptr, []).append(
+                    (
+                        sub,
+                        attr_name,
+                        attr_val.size(),
+                        attr_val.stride(),
+                        attr_val.storage_offset(),
+                    )
+                )
+
         pin_memory = is_pin_memory_available()
         # offload parameters to CPU
         # use pin_memory if possible, which helps cudagraph capture speed
         offloaded_parameters = False
+        # Map param_id -> original-storage data_ptr so the forward closure can
+        # look up any registered view aliases for that parameter.
+        param_id_to_orig_ptr: Dict[int, int] = {}
         for p in module.parameters():
             if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
                 # we use per-parameter offloading
                 # one module might have some parameters offloaded and some not
                 break
+
+            orig_ptr = p.data.untyped_storage().data_ptr()
 
             # `torch.empty_like` does not support `pin_memory` argument
             cpu_data = torch.empty_strided(
@@ -129,19 +165,60 @@ class OffloaderV1(BaseOffloader):
             p.data = cpu_data
             self._cpu_offload_bytes += p.data.numel() * p.data.element_size()
             offloaded_parameters = True
+            if orig_ptr in view_aliases:
+                param_id_to_orig_ptr[id(p)] = orig_ptr
 
         if offloaded_parameters:
             original_forward = module.forward
 
             def forward(*args, **kwargs):
                 module.forward = original_forward
-                device_state = {
-                    # here we blindly call `to(device)`
-                    # if the parameter is already on the device, it will be a no-op
-                    k: v.to(device, non_blocking=True)
-                    for k, v in module.state_dict().items()
-                }
-                output = functional_call(module, device_state, args=args, kwargs=kwargs)
+                # Share one device tensor across tied state_dict paths, since
+                # `functional_call(tie_weights=True)` requires tied parameters to be
+                # identical; deduplicate via id() to avoid redundant rematerialization.
+                src_to_dev = {}
+                device_state = {}
+                for k, v in module.state_dict(keep_vars=True).items():
+                    dev = src_to_dev.get(id(v))
+                    if dev is None:
+                        dev = v.to(device, non_blocking=True)
+                        src_to_dev[id(v)] = dev
+                    device_state[k] = dev
+
+                # Re-point any plain-tensor attribute that aliases an offloaded
+                # parameter at the freshly-materialized device tensor, so the
+                # attention backend reads correctly-loaded weights instead of
+                # the original (random, now orphaned) GPU storage.
+                alias_restore = []
+                if param_id_to_orig_ptr:
+                    # Look up each aliased parameter's materialised device
+                    # tensor directly from the pre-built id map, instead of
+                    # re-iterating module.parameters() (which would scan every
+                    # param in the layer on every forward).
+                    dev_by_orig_ptr = {
+                        orig_ptr: src_to_dev[pid]
+                        for pid, orig_ptr in param_id_to_orig_ptr.items()
+                        if pid in src_to_dev
+                    }
+                    for orig_ptr, dev_tensor in dev_by_orig_ptr.items():
+                        for sub, attr_name, size, stride, offset in view_aliases[
+                            orig_ptr
+                        ]:
+                            old = sub.__dict__.get(attr_name, None)
+                            alias_restore.append((sub, attr_name, old))
+                            sub.__dict__[attr_name] = dev_tensor.as_strided(
+                                size, stride, offset
+                            )
+                try:
+                    output = functional_call(
+                        module, device_state, args=args, kwargs=kwargs
+                    )
+                finally:
+                    for sub, attr_name, old in alias_restore:
+                        if old is None:
+                            sub.__dict__.pop(attr_name, None)
+                        else:
+                            sub.__dict__[attr_name] = old
                 module.forward = forward
                 return output
 
