@@ -355,7 +355,8 @@ class FlashAttentionBackend(AttentionBackend):
         # cache via get_key_buffer in the absorbed-MLA path.
         server_args = model_runner.server_args
         self.fa_skip_kv_cache = (
-            server_args.is_embedding
+            server_args.prefill_only_disable_kv_cache
+            and server_args.is_embedding
             and server_args.chunked_prefill_size == -1
             and server_args.disable_radix_cache
             and not self.use_mla

@@ -24,10 +24,16 @@ pooling, that corrupted row IS the returned embedding -> ~40% of *short* inputs
 came back fully NaN (long inputs, which fill the bucket, were unaffected).
 
 This test feeds a spread of short inputs through `fa3 + piecewise + fa_skip_kv_cache`
-and asserts no embedding contains NaN, and that the embeddings match the
-non-piecewise path.
+and asserts no embedding contains NaN, and that the embeddings match the HuggingFace
+reference (cosine).
+
+The fa_skip_kv_cache path is opt-in via `--prefill-only-disable-kv-cache`, so this
+test sets that flag to keep exercising the fast path; it also checks the default
+paged path (flag off, what deployments run unless they opt in) over the same
+no-NaN + HF-parity assertions under the piecewise graph.
 """
 
+import multiprocessing as mp
 import os
 import unittest
 
@@ -36,7 +42,10 @@ import torch
 from sglang import Engine
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.runners import HFRunner
+from sglang.test.test_utils import CustomTestCase, get_similarities
+
+_HF_COSINE_FLOOR = 0.999
 
 # Route to the H100 runner (1-gpu-large, SM90) -- NOT 1-gpu-small, which is an
 # RTX 5090 (SM120/Blackwell) where FA3 does not exist. FA3 + the piecewise embedding
@@ -79,15 +88,20 @@ def _short_prompts():
     return [" ".join(_WORDS[i % len(_WORDS)] for i in range(n)) for n in range(1, 150)]
 
 
-def _embed(prompts, **engine_kwargs):
-    # fa_skip_kv_cache is enabled by: is_embedding + chunked_prefill_size == -1
-    # + disable_radix_cache (+ a non-MLA model + the FA3 backend).
+def _embed(prompts, prefill_only_disable_kv_cache=True, **engine_kwargs):
+    # The raw-K/V fa_skip_kv_cache fast path is opt-in via
+    # --prefill-only-disable-kv-cache. is_embedding + chunked_prefill_size == -1 +
+    # disable_radix_cache (+ a non-MLA model + the FA3 backend) are the structural
+    # preconditions, but the flag is what routes onto the fast path; without it the
+    # request runs the default paged flash_attn_with_kvcache path. This regression
+    # exercises the fast path, so it defaults the flag on.
     engine = Engine(
         model_path=MODEL_PATH,
         is_embedding=True,
         attention_backend="fa3",
         chunked_prefill_size=-1,
         disable_radix_cache=True,
+        prefill_only_disable_kv_cache=prefill_only_disable_kv_cache,
         **engine_kwargs,
     )
     try:
@@ -121,6 +135,12 @@ _PIECEWISE_KWARGS = dict(
 
 
 class TestFaSkipKvCachePiecewiseNoNaN(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        # HFRunner spawns a CUDA subprocess; forking after CUDA is initialized in
+        # the parent fails, so force spawn (matches the other embedding tests).
+        mp.set_start_method("spawn", force=True)
+
     def setUp(self):
         # Gate at runtime: read the SM after CUDA is initialized on the runner. If
         # the hardware can't run FA3 (e.g. SM120 RTX 5090 / SM100 B200), skip --
@@ -132,30 +152,46 @@ class TestFaSkipKvCachePiecewiseNoNaN(CustomTestCase):
                 f"{_FA3_SM_MIN}-{_FA3_SM_MAX} (Ampere/Ada/Hopper); got SM {sm}"
             )
 
-    def test_no_nan_with_piecewise(self):
+    def test_embeddings_no_nan_and_match_hf(self):
         prompts = _short_prompts()
-        embs = _embed(prompts, **_PIECEWISE_KWARGS)
-        nan_idx = [i for i, e in enumerate(embs) if torch.isnan(e).any()]
-        self.assertEqual(
-            nan_idx,
-            [],
-            f"{len(nan_idx)}/{len(embs)} short-input embeddings contain NaN under "
-            f"fa_skip_kv_cache + piecewise CUDA graph (e.g. prompt indices {nan_idx[:10]})",
-        )
-
-    def test_matches_non_piecewise(self):
-        prompts = _short_prompts()
-        with_pcg = _embed(prompts, **_PIECEWISE_KWARGS)
-        without_pcg = _embed(prompts, disable_prefill_cuda_graph=True)
-        for i, (a, b) in enumerate(zip(with_pcg, without_pcg)):
-            self.assertFalse(
-                torch.isnan(a).any(),
-                f"prompt {i}: NaN embedding with piecewise CUDA graph",
-            )
-            cos = torch.nn.functional.cosine_similarity(a, b, dim=0).item()
-            self.assertGreater(
-                cos, 0.99, f"prompt {i}: cosine {cos:.4f} < 0.99 vs non-piecewise"
-            )
+        # HF reference is path-independent: compute once and reuse for both paths.
+        with HFRunner(
+            MODEL_PATH, torch_dtype=torch.float16, model_type="embedding"
+        ) as hf_runner:
+            hf_embs = [
+                torch.tensor(e, dtype=torch.float32)
+                for e in hf_runner.forward(prompts).embed_logits
+            ]
+        # Both attention paths must stay NaN-free under the piecewise CUDA graph and
+        # match the HF reference:
+        #   flag on  -> the opt-in raw-K/V fa_skip_kv_cache fast path (where the bug
+        #               surfaced).
+        #   flag off -> the default paged flash_attn_with_kvcache path that embedding
+        #               deployments run unless they opt in.
+        for prefill_only_disable_kv_cache in (True, False):
+            label = f"prefill_only_disable_kv_cache={prefill_only_disable_kv_cache}"
+            with self.subTest(label):
+                srt_embs = _embed(
+                    prompts,
+                    prefill_only_disable_kv_cache=prefill_only_disable_kv_cache,
+                    **_PIECEWISE_KWARGS,
+                )
+                nan_idx = [i for i, e in enumerate(srt_embs) if torch.isnan(e).any()]
+                self.assertEqual(
+                    nan_idx,
+                    [],
+                    f"{len(nan_idx)}/{len(srt_embs)} short-input embeddings contain NaN "
+                    f"under {label} + piecewise CUDA graph "
+                    f"(e.g. prompt indices {nan_idx[:10]})",
+                )
+                for i, (srt, hf) in enumerate(zip(srt_embs, hf_embs)):
+                    cos = float(get_similarities(hf, srt))
+                    self.assertGreater(
+                        cos,
+                        _HF_COSINE_FLOOR,
+                        f"{label}, prompt {i}: SRT-vs-HF cosine "
+                        f"{cos:.4f} < {_HF_COSINE_FLOOR}",
+                    )
 
 
 if __name__ == "__main__":
