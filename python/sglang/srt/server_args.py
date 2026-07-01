@@ -2793,9 +2793,6 @@ class ServerArgs:
 
         handle_speculative_decoding(self)
 
-        # Force DeepEP low_latency for the CuteDSL FP4 runner (no normal handler).
-        self._handle_cutedsl_deepep_mode()
-
         # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
         self._validate_cutedsl_a2a_token_budget()
 
@@ -5058,27 +5055,6 @@ class ServerArgs:
             )
         return tokens
 
-    def _handle_cutedsl_deepep_mode(self):
-        """Force DeepEP low_latency for the CuteDSL FP4 MoE runner.
-
-        CuteDSL FP4 only has a masked grouped-GEMM kernel, so it can only
-        consume the DeepEP low_latency (masked) dispatch. In `auto` mode prefill
-        would use the normal dispatch, which has no CuteDSL FP4 handler and
-        crashes. low_latency handles both prefill and decode, so coerce instead
-        of failing the documented default config."""
-        if (
-            self.moe_a2a_backend == "deepep"
-            and self.moe_runner_backend == "flashinfer_cutedsl"
-            and self.deepep_mode == "auto"
-        ):
-            self.deepep_mode = "low_latency"
-            logger.warning(
-                "Forcing --deepep-mode low_latency: flashinfer_cutedsl FP4 MoE "
-                "has no DeepEP normal-dispatch handler, so deepep auto mode "
-                "would crash during prefill. low_latency covers both prefill "
-                "and decode."
-            )
-
     def _validate_cutedsl_a2a_token_budget(self):
         """Fail fast if the FlashInfer A2A dispatcher workspace cannot cover the
         largest CuteDSL MoE forward. Runs after speculative decoding is resolved
@@ -5148,6 +5124,19 @@ class ServerArgs:
             )
 
         if a2a_backend == "deepep":
+            if (
+                self.moe_runner_backend == "flashinfer_cutedsl"
+                and self.deepep_mode == "auto"
+            ):
+                # CuteDSL FP4 has no DeepEP normal-dispatch handler, so auto
+                # (normal prefill) crashes; low_latency covers both phases.
+                self.deepep_mode = "low_latency"
+                logger.warning(
+                    "Forcing --deepep-mode low_latency: flashinfer_cutedsl FP4 "
+                    "MoE has no DeepEP normal-dispatch handler, so deepep auto "
+                    "mode would crash during prefill. low_latency covers both "
+                    "prefill and decode."
+                )
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
