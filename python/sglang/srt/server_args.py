@@ -3729,7 +3729,7 @@ class ServerArgs:
                         "shared layers would run sparse attention without indices."
                     )
 
-                if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
+                if not is_npu() and not is_xpu() and not is_cpu():  # CUDA or ROCm GPU
                     if self.enable_prefill_cp:
                         logger.warning(
                             "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
