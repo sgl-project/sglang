@@ -2914,10 +2914,7 @@ class ServerArgs:
                 )
                 setattr(self, attr, "dsv4")
 
-        # --grpc-mode is the deprecated alias for the legacy SMG gRPC server,
-        # now selected by --smg-grpc-mode. The native gRPC server is a separate
-        # path, enabled by --grpc-port (or SGLANG_GRPC_PORT), that runs
-        # alongside HTTP.
+        # --grpc-mode is a deprecated alias for --smg-grpc-mode.
         if self.grpc_mode and not self.smg_grpc_mode:
             import warnings
 
@@ -2930,10 +2927,8 @@ class ServerArgs:
             )
             self.smg_grpc_mode = True
 
-        # Native gRPC tuning knobs stay env-only (internal). They are set as
-        # instance attributes (not dataclass fields) to avoid argparse namespace
-        # lookup in from_cli_args. grpc_port is the user-facing CLI flag that
-        # enables the native server; fall back to SGLANG_GRPC_PORT when unset.
+        # Native gRPC tuning knobs are env-only; --grpc-port (CLI) enables the
+        # native server, falling back to SGLANG_GRPC_PORT.
         self.grpc_worker_threads = envs.SGLANG_GRPC_WORKER_THREADS.get()
         self.grpc_max_prefill_tokens = envs.SGLANG_GRPC_MAX_PREFILL_TOKENS.get()
 
@@ -2941,15 +2936,12 @@ class ServerArgs:
         if self.grpc_port is None and grpc_port_env is not None:
             self.grpc_port = grpc_port_env
 
+        # Legacy SMG defaults its port to --port + 10000. Derive/validate only
+        # when gRPC is in use, so HTTP-only high ports don't fail validation.
         legacy_grpc = self.smg_grpc_mode or self.grpc_mode
-        # Legacy SMG server: default its port to --port + 10000 when unset. Only
-        # derive a port when gRPC is actually in use, so HTTP-only launches on
-        # high ports (e.g. --port 56000) don't fail validation (JustinTong0323).
         if legacy_grpc and self.grpc_port is None:
             self.grpc_port = self.port + 10000
 
-        # Validate grpc_port only when it is set (native: user-provided; legacy:
-        # derived above). HTTP-only launches leave it None and skip validation.
         if self.grpc_port is not None:
             if not (1 <= self.grpc_port <= 65535):
                 raise ValueError(
@@ -2962,12 +2954,8 @@ class ServerArgs:
                     f"({self.grpc_worker_threads}) must be >= 1"
                 )
 
-        # The native gRPC server is enabled purely by --grpc-port and is
-        # incompatible with the legacy SMG server and with launch paths it does
-        # not wire into. Legacy --smg-grpc-mode takes precedence and uses
-        # grpc_port as the SMG port; this keeps __post_init__ idempotent under
-        # the Ray path's dataclasses.replace re-run (which re-sees the derived
-        # grpc_port).
+        # Native gRPC is incompatible with launch paths it doesn't wire into.
+        # Legacy takes precedence over grpc_port, keeping re-runs idempotent.
         native_grpc = self.grpc_port is not None and not legacy_grpc
         if native_grpc:
             if self.use_ray:
@@ -7181,11 +7169,9 @@ class ServerArgs:
                 "Communications quantization is only supported for NPU device"
             )
 
-        if (
-            self.grpc_port is not None
-            and not (self.smg_grpc_mode or self.grpc_mode)
-            and self.grpc_port == self.port
-        ):
+        # grpc_port is None for HTTP-only launches, so the == comparison is
+        # already False there; no explicit None check needed.
+        if not (self.smg_grpc_mode or self.grpc_mode) and self.grpc_port == self.port:
             raise ValueError(
                 f"--grpc-port ({self.grpc_port}) must differ from --port ({self.port})"
             )
