@@ -24,7 +24,13 @@ from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs import NemotronHConfig
-from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
+from sglang.srt.configs.nemotron_h import (
+    ATTENTION,
+    MAMBA,
+    MLP,
+    MOE,
+    _build_mamba2_cache_params,
+)
 from sglang.srt.distributed import (
     get_moe_ep_group,
     get_pp_group,
@@ -483,11 +489,11 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
         self.config = config
         self.layer_id = layer_idx
         self.mixer = MambaMixer2(
-            cache_params=config.mamba2_cache_params,
+            cache_params=_build_mamba2_cache_params(config),
             hidden_size=config.hidden_size,
             use_conv_bias=config.use_conv_bias,
             use_bias=config.use_bias,
-            n_groups=config.mamba_n_groups,
+            n_groups=getattr(config, "mamba_n_groups", getattr(config, "n_groups", 8)),
             rms_norm_eps=config.layer_norm_epsilon,
             activation=config.mamba_hidden_act,
             quant_config=quant_config,
