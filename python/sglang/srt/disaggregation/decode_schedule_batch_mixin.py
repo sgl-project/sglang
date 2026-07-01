@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
+from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -29,14 +30,14 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         self.forward_mode = ForwardMode.PREBUILT
         reqs = self.reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = []
         pre_lens = []
         req_pool_indices = []
 
         # Pre-calculate total size
-        total_size = sum(req.extend_input_len for req in reqs)
+        total_size = sum(req.extend_range.length for req in reqs)
         out_cache_loc = torch.empty(total_size, dtype=torch.int64, device=self.device)
 
         # Fill the tensor in one pass
@@ -46,29 +47,32 @@ class ScheduleBatchDisaggregationDecodeMixin:
             pre_len = len(req.prefix_indices)
 
             chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                pre_len : pre_len + req.extend_input_len
+                pre_len : pre_len + req.extend_range.length
             ]
             assert (
-                offset + req.extend_input_len <= total_size
-            ), f"Exceeds total size: offset={offset}, req.extend_input_len={req.extend_input_len}, total_size={total_size}"
-            out_cache_loc[offset : offset + req.extend_input_len] = chunk
-            offset += req.extend_input_len
+                offset + req.extend_range.length <= total_size
+            ), f"Exceeds total size: offset={offset}, req.extend_range.length={req.extend_range.length}, total_size={total_size}"
+            out_cache_loc[offset : offset + req.extend_range.length] = chunk
+            offset += req.extend_range.length
 
             seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
             seq_lens.append(seq_len)
             if len(req.output_ids) == 0:
                 assert (
-                    seq_len - pre_len == req.extend_input_len
-                ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
+                    seq_len - pre_len == req.extend_range.length
+                ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_range.length={req.extend_range.length}"
 
             if not req.retracted_stain:
-                req.cached_tokens += pre_len - req.already_computed
+                # Clamp to avoid double-counting: already_computed is seeded from
+                # the prefill-reported cached_tokens in _commit_transfer_to_req, so
+                # a decode-side prefix shorter than the prefill report must not
+                # subtract from cached_tokens.
+                delta = max(0, pre_len - req.already_computed)
+                req.cached_tokens += delta
+                req.cached_tokens_device += delta
                 req.already_computed = seq_len
             req.is_retracted = False
             pre_lens.append(pre_len)
-            req.extend_logprob_start_len = 0
-
-        extend_input_logprob_token_ids = None
 
         # Set fields
         self.input_ids = torch.tensor(
@@ -92,9 +96,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         self.extend_num_tokens = extend_num_tokens
         self.prefix_lens = [len(r.prefix_indices) for r in reqs]
-        self.extend_lens = [r.extend_input_len for r in reqs]
-        self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
-        self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
+        self.extend_lens = [r.extend_range.length for r in reqs]
+        self.extend_logprob_start_lens = None
+        self.extend_input_logprob_token_ids = None
         self.multimodal_inputs = [r.multimodal_inputs for r in reqs]
 
         # Build sampling info
@@ -145,7 +149,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
         if spec_info is not None:
             self.spec_info = spec_info
         else:
-            # Non-spec: positive last token feeds decode directly. No FutureMap
-            # bootstrap needed (SB self-maintains seq_lens; resolve_future is
-            # a no-op on positive input_ids).
-            self.input_ids = last_tokens_tensor
+            # Non-spec: stash last token into the relay so the first DECODE's
+            # resolve_forward_inputs gathers it like any other decode iter.
+            future_map.stash(
+                self.req_pool_indices, RelayPayload(bonus_tokens=last_tokens_tensor)
+            )
+            self.input_ids = None

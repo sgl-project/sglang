@@ -33,7 +33,7 @@ This mode is intended for debugging only — it eliminates the performance benef
 For production use, you can mark specific functions as "non-graphable" using the `@eager_on_graph` decorator. During CUDA graph capture, these functions run eagerly between captured graph segments. Outside of capture, they behave normally.
 
 ```python
-from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import eager_on_graph
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import eager_on_graph
 
 @eager_on_graph(enable=True)
 def my_dynamic_op(x):
@@ -44,7 +44,7 @@ def my_dynamic_op(x):
 You can also insert a bare graph break (no computation) using the `break_graph()` helper:
 
 ```python
-from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import break_graph
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import break_graph
 
 def forward(self, x):
     x = self.layer1(x)
@@ -139,8 +139,8 @@ Some models fork work onto secondary CUDA streams (e.g., for overlapped computat
 
 ## Compatibility
 
-- **NVIDIA CUDA only.** Breakable CUDA graph is not supported on ROCm/HIP or other non-CUDA platforms. On unsupported platforms, `--debug-cuda-graph` is automatically disabled with a warning.
-- **Requires `cuda-python`.** The `cuda.bindings` package must be installed (`pip install cuda-python`).
+- **CUDA and ROCm/HIP.** Breakable CUDA graph runs on both NVIDIA and AMD GPUs. Other platforms (NPU, CPU, MPS, XPU) are unsupported; there `--debug-cuda-graph` is automatically disabled with a warning.
+- **Requires `cuda-python` on NVIDIA.** Stream-capture-status queries use the CUDA runtime via `cuda.bindings` (`pip install cuda-python`); the portable `torch.cuda.is_current_stream_capturing()` has proven unreliable on CUDA. On ROCm/HIP — where `cuda-python` is unavailable — the portable `torch.cuda` API (which maps to the HIP runtime) is used instead.
 - **Not compatible with memory saver mode.** Cannot be used together with `SGLANG_MEMORY_SAVER_CUDA_GRAPH`.
 
 ## Performance
@@ -169,16 +169,16 @@ For typical use cases with a small number of graph breaks, the overhead is negli
   </thead>
   <tbody>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/model_executor/breakable_cuda_graph/breakable_cuda_graph.py</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/breakable_cuda_graph.py</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Core implementation: <code>eager_on_graph</code>, <code>BreakableCUDAGraph</code>, <code>BreakableCUDAGraphCapture</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/model_executor/breakable_cuda_graph/cuda_utils.py</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA runtime binding utilities</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/cuda_utils.py</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA runtime binding utilities (NVIDIA stream-capture queries)</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/model_executor/cuda_graph_runner.py</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Integration with the main CUDA graph runner</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Integration with CUDA graph runner backends</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/server_args.py</code></td>

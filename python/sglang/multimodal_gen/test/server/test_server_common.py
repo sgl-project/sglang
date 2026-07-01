@@ -23,6 +23,11 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server import conftest
+from sglang.multimodal_gen.test.server.realtime_consistency import (
+    pop_realtime_key_frames,
+    pop_realtime_perf_stats,
+    validate_realtime_perf_stats,
+)
 from sglang.multimodal_gen.test.server.test_server_utils import (
     VALIDATOR_REGISTRY,
     PerformanceValidator,
@@ -35,6 +40,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionTestCase,
     PerformanceSummary,
     ScenarioConfig,
+    get_model_task_type_for_server_args,
 )
 from sglang.multimodal_gen.test.test_utils import (
     SGL_TEST_FILES_CI_DATA_REVISION,
@@ -57,7 +63,7 @@ logger = init_logger(__name__)
 
 # Track test cases missing estimated_full_test_time_s for time measurement output
 _MISSING_ESTIMATED_TIME_CASES: set[str] = set()
-_PENDING_BASELINE_DUMPS: dict[str, tuple["PerformanceSummary", bool]] = {}
+_PENDING_BASELINE_DUMPS: dict[str, tuple[PerformanceSummary, bool]] = {}
 _OPENAI_REQUEST_TIMEOUT_SECS = float(
     os.environ.get("SGLANG_TEST_OPENAI_REQUEST_TIMEOUT_SECS", "600")
 )
@@ -95,7 +101,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
-    sampling_params = case.sampling_params
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
     extra_args = f"--model-type diffusion {extra_args}".strip()
 
@@ -108,7 +113,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         extra_args += f" --ulysses-degree {server_args.ulysses_degree}"
 
     if server_args.dit_layerwise_offload:
-        extra_args += f" --dit-layerwise-offload true"
+        extra_args += " --dit-layerwise-offload true"
 
     if server_args.dit_offload_prefetch_size:
         extra_args += (
@@ -116,7 +121,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         )
 
     if server_args.text_encoder_cpu_offload:
-        extra_args += f" --text-encoder-cpu-offload"
+        extra_args += " --text-encoder-cpu-offload"
 
     if server_args.ring_degree is not None:
         extra_args += f" --ring-degree {server_args.ring_degree}"
@@ -131,6 +136,22 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     # Strict ports: fail immediately if port is occupied instead of silently
     # picking another one (which causes the test client to connect to the wrong server).
     extra_args += " --strict-ports"
+
+    # Shape-only mesh cases (e.g. hunyuan3d_shape_gen) validate geometry via
+    # mesh-correctness and must NOT run the paint/texture stages, whose
+    # verification checks texture artifacts (paint_mesh/normal_maps/renderer)
+    # that the shape-only path never produces. Inject a pipeline-config override
+    # disabling paint for these cases.
+    if server_args.custom_validator == "mesh":
+        import json as _json
+        import tempfile as _tempfile
+
+        _paint_off_cfg = os.path.join(
+            _tempfile.gettempdir(), f"{case.id}_paint_off.json"
+        )
+        with open(_paint_off_cfg, "w") as _f:
+            _json.dump({"paint_enable": False}, _f)
+        extra_args += f" --config {_paint_off_cfg}"
 
     for arg in server_args.extras:
         extra_args += f" {arg}"
@@ -180,17 +201,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
                 f"is not available in the installed version. "
                 f"Upgrade diffusers to enable this test."
             )
-        raise
-
-    try:
-        # Reconstruct output size for OpenAI API
-        # Allow override via environment variable (useful for AMD where large resolutions can cause GPU hang)
-        output_size = os.environ.get(
-            "SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size
-        )
-    except Exception as exc:
-        logger.error("Warm-up failed for %s: %s", case.id, exc)
-        ctx.cleanup()
         raise
 
     try:
@@ -403,14 +413,11 @@ class DiffusionServerBase:
             if not is_baseline_generation_mode:
                 missing_scenario = True
 
-        # Check for missing estimated_full_test_time_s
-        missing_estimated_time = False
         if (
             not missing_scenario
             and not is_baseline_generation_mode
             and scenario.estimated_full_test_time_s is None
         ):
-            missing_estimated_time = True
             _MISSING_ESTIMATED_TIME_CASES.add(case.id)
 
         validator_name = case.server_args.custom_validator or "default"
@@ -512,7 +519,7 @@ class DiffusionServerBase:
     def _dump_baseline_for_testcase(
         self,
         case: DiffusionTestCase,
-        summary: "PerformanceSummary",
+        summary: PerformanceSummary,
         missing_scenario: bool = False,
         measured_full_time: float | None = None,
     ) -> None:
@@ -623,7 +630,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         thresholds = get_consistency_thresholds(case.id, is_video=is_video)
 
         if is_video:
-            output_frames = extract_key_frames_from_video(content)
+            output_frames = pop_realtime_key_frames(case.id)
+            if output_frames is None:
+                output_frames = extract_key_frames_from_video(content)
         else:
             output_frames = [image_bytes_to_numpy(content)]
 
@@ -726,10 +735,12 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         is_video = case.server_args.modality == "video"
 
         if is_video:
-            # Extract key frames from video
-            frames = extract_key_frames_from_video(
-                content, num_frames=case.sampling_params.num_frames
-            )
+            # realtime consistency uses websocket raw frames to avoid lossy mp4 drift
+            frames = pop_realtime_key_frames(case.id)
+            if frames is None:
+                frames = extract_key_frames_from_video(
+                    content, num_frames=case.sampling_params.num_frames
+                )
 
             if len(frames) != 3:
                 logger.warning(
@@ -1085,19 +1096,10 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert (
             model["num_gpus"] == case.server_args.num_gpus
         ), f"num_gpus mismatch: expected {case.server_args.num_gpus}, got {model['num_gpus']}"
-        # Verify task_type is consistent with the modality specified in the test config.
-        # We can't access pipeline_config from test config, but we can validate against modality.
-        modality_to_valid_task_types = {
-            "image": {"T2I", "I2I", "TI2I"},
-            "video": {"T2V", "I2V", "TI2V"},
-            "3d": {"I2M"},
-        }
-        valid_task_types = modality_to_valid_task_types.get(
-            case.server_args.modality, set()
-        )
-        assert model["task_type"] in valid_task_types, (
-            f"task_type '{model['task_type']}' not valid for modality "
-            f"'{case.server_args.modality}'. Expected one of: {valid_task_types}"
+        expected_task_type = get_model_task_type_for_server_args(case.server_args).name
+        assert model["task_type"] == expected_task_type, (
+            f"task_type mismatch: expected {expected_task_type}, "
+            f"got {model['task_type']}"
         )
         logger.info(
             "[Models API] GET /v1/models returned valid response with extended fields"
@@ -1118,9 +1120,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         # Verify extended fields on single model endpoint too
         assert "num_gpus" in single_model, "Single model missing 'num_gpus' field"
         assert "task_type" in single_model, "Single model missing 'task_type' field"
-        assert single_model["task_type"] in valid_task_types, (
-            f"Single model task_type '{single_model['task_type']}' not valid for modality "
-            f"'{case.server_args.modality}'. Expected one of: {valid_task_types}"
+        assert single_model["task_type"] == expected_task_type, (
+            f"Single model task_type mismatch: expected {expected_task_type}, "
+            f"got {single_model['task_type']}"
         )
         logger.info(
             "[Models API] GET /v1/models/{model_path} returned valid response with extended fields"
@@ -1209,11 +1211,12 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         )
 
         # Single generation - output is reused for both validations
+        is_realtime_case = case.sampling_params.realtime_num_chunks is not None
         perf_record, content = self.run_and_collect(
             diffusion_server,
             case.id,
             generate_fn,
-            collect_perf=not is_gt_gen_mode,
+            collect_perf=not is_gt_gen_mode and not is_realtime_case,
         )
 
         if is_gt_gen_mode:
@@ -1231,10 +1234,23 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                     raise
                 failures.append((name, str(exc)))
 
-        run_case_check(
-            "performance",
-            lambda: self._validate_and_record(case, perf_record),
-        )
+        if is_realtime_case:
+            run_case_check(
+                "performance",
+                lambda: validate_realtime_perf_stats(
+                    case.id,
+                    pop_realtime_perf_stats(case.id),
+                    case.sampling_params.realtime_perf_thresholds,
+                    ignore_initial_chunks=(
+                        case.sampling_params.realtime_perf_ignore_initial_chunks
+                    ),
+                ),
+            )
+        else:
+            run_case_check(
+                "performance",
+                lambda: self._validate_and_record(case, perf_record),
+            )
 
         if case.server_args.custom_validator == "mesh":
             from sglang.multimodal_gen.test.server.test_server_utils import (
