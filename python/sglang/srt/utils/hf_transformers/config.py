@@ -52,6 +52,8 @@ def _apply_deepseek_ocr_overrides(config, model):
 
 
 def _restore_glm_moe_dsa_raw_config_fields(config, raw_config):
+    if not raw_config:
+        return
     for key in (
         "head_dim",
         "index_head_dim",
