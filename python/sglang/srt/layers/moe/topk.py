@@ -543,6 +543,32 @@ class TopK(MultiPlatformOp):
         )
         return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
 
+    def forward_xpu(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    ) -> TopKOutput:
+        # XPU only supports STANDARD output format; raise early for unsupported formats.
+        output_format = self.topk_config.output_format
+        if output_format is not None and output_format != TopKOutputFormat.STANDARD:
+            raise ValueError(
+                f"XPU does not support output_format={output_format!r}. "
+                "Only TopKOutputFormat.STANDARD is supported on XPU."
+            )
+
+        self.topk_config.torch_native = False
+        return select_experts(
+            hidden_states=hidden_states,
+            layer_id=self.layer_id,
+            router_logits=router_logits,
+            topk_config=self.topk_config,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+        )
+
     def forward_npu(
         self,
         hidden_states: torch.Tensor,
