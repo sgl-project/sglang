@@ -3,7 +3,14 @@ import sys
 import pytest
 import torch
 from sgl_kernel import int8_scaled_mm
-from utils import is_sm10x
+
+
+def _int8_unsupported() -> bool:
+    # int8_scaled_mm covers sm75-sm90 and sm120/sm121 (consumer Blackwell,
+    # via the SM89 tiling). Skip GPUs below sm75 and datacenter Blackwell
+    # (sm100-sm11x), neither of which has an int8 path.
+    cap = torch.cuda.get_device_capability()
+    return cap < (7, 5) or (10, 0) <= cap < (12, 0)
 
 
 def to_int8(tensor: torch.Tensor) -> torch.Tensor:
@@ -34,8 +41,8 @@ def _test_accuracy_once(M, N, K, with_bias, out_dtype, device):
 
 
 @pytest.mark.skipif(
-    is_sm10x(),
-    reason="int8_scaled_mm is only supported on sm90 and lower",
+    _int8_unsupported(),
+    reason="int8_scaled_mm has no kernel for sm100-sm11x (datacenter Blackwell)",
 )
 @pytest.mark.parametrize("M", [1, 16, 32, 64, 128, 512, 1024, 4096, 8192])
 @pytest.mark.parametrize("N", [16, 128, 512, 1024, 4096, 8192, 16384])
