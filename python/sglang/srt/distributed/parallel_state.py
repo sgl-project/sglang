@@ -56,6 +56,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_cuda_alike,
+    is_gfx95_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -79,6 +80,17 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 # Reuse the user-provided distributed timeout for model-parallel subgroup
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
+
+
+def _should_use_1stage_mxfp4_ar(input_: torch.Tensor) -> bool:
+    hidden_size = input_.shape[-1]
+    tokens = input_.numel() // hidden_size
+    if hidden_size == 7168:
+        # CUDA-graph microbench: direct MXFP4 epilogue is faster through 56
+        # tokens, while fallback wins from 64 tokens onward.
+        return tokens <= 56
+    total_bytes = input_.numel() * input_.element_size()
+    return total_bytes <= 128 * 1024
 
 
 def get_torch_distributed_pg_options(group_name=None):
@@ -734,6 +746,168 @@ class GroupCoordinator:
             use_1stage_ar,
         )
         return fused_outputs
+
+    def fused_allreduce_rmsnorm_mxfp4_quant(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        emit_bf16: bool = False,
+    ):
+        """Attempt fused all-reduce + RMSNorm + MXFP4 quant via AITER custom AR."""
+        if not (is_hip() and is_gfx95_supported()):
+            return None
+
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+        if not hasattr(ca_comm, "custom_fused_ar_rms_mxfp4_quant"):
+            return None
+
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        else:
+            use_1stage_ar = _should_use_1stage_mxfp4_ar(input_)
+
+        try:
+            return ca_comm.custom_fused_ar_rms_mxfp4_quant(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                use_1stage_ar,
+                emit_bf16=emit_bf16,
+            )
+        except Exception:
+            return None
+
+    def fused_allreduce_rmsnorm_quant_per_group(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        group_size: int = 128,
+        emit_bf16: bool = False,
+    ) -> Optional[Tuple[torch.Tensor, ...]]:
+        """Attempt fused all-reduce + RMSNorm + per-group FP8 quant.
+
+        ROCm/aiter/gfx95-only entry point. Returns ``None`` on any other
+        platform or when the aiter custom-all-reduce communicator cannot
+        service the request, letting the caller fall back to the existing
+        ``fused_allreduce_rmsnorm`` + separate per-group quant path.
+
+        When ``emit_bf16=True`` the fused kernel also writes the
+        pre-quantization bf16/fp16 normed output and returns
+        ``(fp8, residual_out, scale, bf16)`` — used by GDN-style layers that
+        need both an FP8 projection and a bf16 gating projection without
+        launching a separate per-group quant kernel.
+        """
+        if not (is_hip() and is_gfx95_supported()):
+            return None
+
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+        if not hasattr(ca_comm, "custom_fused_ar_rms_per_group_quant"):
+            return None
+
+        # Shape / size eligibility mirrors aiter's internal gate so we fail
+        # fast without entering the HIP kernel dispatch.
+        K = input_.shape[-1]
+        if K % group_size != 0 or K > 16384:
+            return None
+        total_bytes = input_.numel() * input_.element_size()
+        if total_bytes == 0 or total_bytes > 8 * 1024 * 8192:
+            return None
+        if self.world_size == 6:
+            return None
+
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        else:
+            token_num = input_.numel() // K
+            use_1stage_ar = total_bytes <= 128 * 1024
+            if (
+                # Keep the default 128 KiB cutoff except for the measured TP=8
+                # K=7168 graph-replay crossover. K=4096 remains on the default
+                # rule because token_num=8/16 still favored 1-stage there.
+                self.world_size == 8
+                and 4096 < K <= 7168
+                and token_num >= 8
+                and use_1stage_ar
+            ):
+                use_1stage_ar = False
+
+        try:
+            return ca_comm.custom_fused_ar_rms_per_group_quant(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                group_size,
+                use_1stage_ar,
+                emit_bf16=emit_bf16,
+            )
+        except Exception:
+            return None
+
+    def fused_allreduce_rmsnorm_quant_per_token(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> Optional[Tuple[torch.Tensor, ...]]:
+        """Attempt fused all-reduce + RMSNorm + per-token FP8 quant in ONE kernel.
+
+        ROCm/aiter/gfx95-only entry point backed by the aiter custom-all-reduce
+        ``custom_fused_ar_rms_quant`` (``post_per_token_quant=True``). Returns
+        ``(fp8, residual_out, per_token_scale)`` with ``per_token_scale`` shaped
+        ``(M, 1)``, or ``None`` when the backend cannot service the request so
+        the caller can fall back to the ``fused_allreduce_rmsnorm`` + separate
+        per-token-quant path.
+
+        Unlike the per-group entry point this kernel does not emit a bf16
+        sidecar, so GDN-style layers that need an unquantized normed output must
+        use the 2-kernel fallback.
+        """
+        if not (is_hip() and is_gfx95_supported()):
+            return None
+
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+        if not hasattr(ca_comm, "custom_fused_ar_rms_quant"):
+            return None
+
+        # Mirror the per-group eligibility gate so we fail fast without entering
+        # the HIP kernel dispatch.
+        K = input_.shape[-1]
+        if K > 16384:
+            return None
+        total_bytes = input_.numel() * input_.element_size()
+        if total_bytes == 0 or total_bytes > 8 * 1024 * 8192:
+            return None
+        if self.world_size == 6:
+            return None
+
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        else:
+            use_1stage_ar = total_bytes <= 128 * 1024
+
+        try:
+            return ca_comm.custom_fused_ar_rms_quant(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                use_1stage_ar,
+            )
+        except Exception:
+            return None
 
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
