@@ -1699,8 +1699,9 @@ class PreshardedModelLoader(DefaultModelLoader):
             logger.warning(
                 "Failed to build a structural signature for the presharded "
                 "cache key (model_class=%s); falling back to the manually "
-                "enumerated parallelism key only. This is safe but means "
-                "sharding knobs not already enumerated in "
+                "enumerated parallelism key only. This preserves existing "
+                "behavior, but only the explicitly enumerated key fields will "
+                "be protected -- sharding knobs not listed in "
                 "_build_subfolder_name won't be caught automatically. "
                 "Error: %s",
                 getattr(getattr(model_config, "hf_config", None), "model_type", "unknown"),
