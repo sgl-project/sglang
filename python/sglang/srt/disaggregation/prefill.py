@@ -477,6 +477,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+            self.process_waiting_queue()
             if self._engine_paused:
                 continue
 
@@ -509,6 +510,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+            self.process_waiting_queue()
             if self._engine_paused:
                 continue
 
@@ -851,6 +853,40 @@ class SchedulerDisaggregationPrefillMixin:
                 transferred_rids.append(req.rid)
 
         return transferred_rids
+
+    def process_waiting_queue(self: Scheduler) -> None:
+        """Process waiting_queue requests marked failed by decode abort (e.g. waiting timeout)."""
+        if not self.waiting_queue:
+            return
+
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in self.waiting_queue],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+
+        remaining_waiting: List[Req] = []
+        for req, poll in zip(self.waiting_queue, polls):
+            if poll == KVPoll.Failed:
+                # The requests in waiting queue usually have no KV yet.
+                # Defensive check to prevent leaks.
+                if req.req_pool_idx is not None or self.tree_cache.supports_mamba():
+                    release_kv_cache(req, self.tree_cache)
+                maybe_release_metadata_buffer(
+                    req, self.req_to_metadata_buffer_idx_allocator
+                )
+                sender = req.disagg_kv_sender
+                if hasattr(sender, "clear"):
+                    sender.clear()
+                if self.enable_hicache_storage:
+                    self.tree_cache.release_aborted_request(req.rid)
+                logger.debug(
+                    f"Dropped waiting_queue request after decode abort: "
+                    f"{req.rid=} {req.bootstrap_room=}"
+                )
+            else:
+                remaining_waiting.append(req)
+        self.waiting_queue = remaining_waiting
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
         error_message = (
