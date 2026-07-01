@@ -93,7 +93,7 @@ class TestDeepseekV32TPMTP(CustomTestCase):
         args = SimpleNamespace(
             num_shots=20,
             data_path=None,
-            num_questions=200,
+            num_questions=1319,
             parallel=64,
             max_new_tokens=512,
             host="http://127.0.0.1",

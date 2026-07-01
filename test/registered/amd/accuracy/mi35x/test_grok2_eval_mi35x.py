@@ -61,7 +61,7 @@ def get_answer_value(answer_str):
         return INVALID
 
 
-def run_gsm8k_benchmark(base_url, num_questions=200, num_shots=5, parallel=64):
+def run_gsm8k_benchmark(base_url, num_questions=1319, num_shots=5, parallel=64):
     import sglang as sgl
     from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 
@@ -104,7 +104,7 @@ class TestGrok2EvalMI35x(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
+        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
         cls.accuracy_threshold = 0.90
 
     def test_grok2_accuracy(self):
