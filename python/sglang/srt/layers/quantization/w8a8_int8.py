@@ -23,14 +23,17 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.rvv_utils import _rvv_process_weight_after_loading
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    cpu_has_rvv_support,
     is_cpu,
     is_cuda,
     is_host_cpu_arm64,
     set_weight_attrs,
     use_intel_amx_backend,
+    use_riscv_rvv_backend,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
@@ -41,7 +44,7 @@ _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_cpu_arm64 = is_host_cpu_arm64()
-
+_is_cpu_rvv_available = cpu_has_rvv_support()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
 
@@ -163,10 +166,12 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         if _is_cpu:
             if _is_cpu_amx_available:
                 _amx_process_weight_after_loading(layer, ["weight"])
+            elif _is_cpu_rvv_available:
+                _rvv_process_weight_after_loading(layer, ["weight"])
             elif _is_cpu_arm64:
                 layer.weight = Parameter(layer.weight.data, requires_grad=False)
             else:
-                assert False, "W8A8Int8LinearMethod on CPU only works on AMX or Arm64"
+                assert False, "W8A8Int8LinearMethod on CPU requires Intel AMX, RISC-V RVV, or Arm64 support"
         else:
             layer.weight = Parameter(layer.weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
@@ -208,14 +213,14 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
-        if use_intel_amx_backend(layer) or _is_cpu_arm64:
+        if use_intel_amx_backend(layer) or use_riscv_rvv_backend(layer) or _is_cpu_arm64:
             return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
                 x,
                 layer.weight,
                 layer.weight_scale,
                 bias,
                 x.dtype,
-                True,  # is_vnni
+                True,  # is_vnni / is_packed
             )
         x_q, x_scale = per_token_quant_int8(x)
 
