@@ -143,7 +143,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             tp_group=ctx.tp_group,
         )
 
-    if getattr(server_args, "enable_flexkv", False):
+    if server_args.enable_flexkv:
         # Importing the package side-effect registers the explicit
         # ``--radix-cache-backend=flexkv`` factory; we then call the
         # factory directly so --enable-flexkv stands on its own.
@@ -153,9 +153,10 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
         # Honor a CLI --flexkv-config-file by forwarding it via the env
         # var that FlexKV's config loader actually reads.
-        cli_cfg = getattr(server_args, "flexkv_config_file", None)
-        if cli_cfg and not os.environ.get("FLEXKV_CONFIG_PATH"):
-            os.environ["FLEXKV_CONFIG_PATH"] = cli_cfg
+        if server_args.flexkv_config_file and not os.environ.get(
+            "FLEXKV_CONFIG_PATH"
+        ):
+            os.environ["FLEXKV_CONFIG_PATH"] = server_args.flexkv_config_file
         return _flexkv_factory(ctx)
 
     from sglang.srt.mem_cache.radix_cache import RadixCache

@@ -65,7 +65,10 @@ def _flexkv_factory(ctx):
         server_args=server_args,
         tp_rank=ctx.tp_rank,
         tp_size=ctx.tp_size,
-        dp_rank=getattr(server_args, "dp_rank", 0),
+        # ``dp_rank`` isn't carried on TreeCacheBuildContext or ServerArgs
+        # at construction time; the connector normalizes ``None`` to 0
+        # for the single-DP-rank case that this factory targets.
+        dp_rank=None,
         pp_rank=pp_rank,
         attn_cp_rank=attn_cp_rank,
         tp_group=ctx.tp_group,

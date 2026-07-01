@@ -384,3 +384,44 @@ Supported:
 * `--radix-cache-backend=flexkv` and `--enable-flexkv` are
   mutually equivalent today; we don't yet emit a deprecation
   warning if both are set.
+
+## Benchmarks
+
+Setup: Qwen3-8B on 1× H20. Server flags:
+
+    --attention-backend triton --mem-fraction-static 0.32
+    --max-running-requests 32 --chunked-prefill-size 16384
+    --context-length 32000
+
+Workload: 120 prompts sampled from
+[`princeton-nlp/SWE-bench_Lite_oracle`](https://huggingface.co/datasets/princeton-nlp/SWE-bench_Lite_oracle)
+with input length ≤ 28k tokens (p50 = 7088, max = 27961). Two passes —
+pass 1 populates the host cache, pass 2 is the measured run. `qps=2.0`,
+`concurrency=24`, `max_new_tokens=32`, `temperature=0`.
+
+### Warm-pass results
+
+| Config | TTFT avg / p50 / p90 / p99 | E2E p50 | Throughput | Output tok/s | H2D / D2H |
+| --- | --- | --- | --- | --- | --- |
+| baseline | 6.86 / 8.04 / 9.88 / 10.89 s | 8.15 s | 1.86 req/s | 37.7 | — |
+| `--enable-hierarchical-cache` | **0.04 / 0.04 / 0.06 / 0.06 s** | 0.23 s | 2.02 req/s | 40.8 | — |
+| `--enable-flexkv`             | **0.05 / 0.05 / 0.07 / 0.08 s** | 0.24 s | 2.02 req/s | 40.8 | 86 / 155 |
+
+Server-side (via `ReqTimeStats` in the sglang log): 76 / 76 non-EOS-immediate
+warm-pass requests have `cached_input_len == input_len` for both `hicache`
+and `flexkv` (100 % prefix recovery); baseline stays at ~59 tokens
+(system-prompt header only). The 86 `H2D transfer` log lines under `flexkv`
+confirm the CPU-tier loadbacks actually fired.
+
+### Output correctness
+
+Byte-level diff of generated text across 32 prompts, `temperature=0`:
+
+* baseline: cold pass == warm pass (32 / 32; fully deterministic without cache)
+* `hicache`: warm vs baseline warm — 29 / 32 identical, 3 diverge
+* `flexkv`:  warm vs baseline warm — 29 / 32 identical, 3 diverge (mostly the same 3 as `hicache`)
+
+The ~10 % divergence at `temperature=0` is the well-known KV-cache-reuse
+artifact caused by floating-point non-associativity between "prefill in
+place" and "load pre-computed KV" paths; it affects the mainline
+`--enable-hierarchical-cache` at the same rate and is not FlexKV-specific.
