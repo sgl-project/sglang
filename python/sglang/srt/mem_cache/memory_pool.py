@@ -2735,6 +2735,26 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope_fp8,
                 cache_k_rope_fp8,
             )
+        elif envs.SGLANG_AITER_FUSED_MLA_CONCAT_CACHE.get() and self.dtype == fp8_dtype:
+            # Fused concat[nope, rope] + FP8 quant + paged write in one aiter
+            # kernel, replacing the two .to(fp8) casts + set_mla_kv_buffer_triton.
+            # Writes into the same [size, 1, kv_lora + rope] buffer at `loc`,
+            # contiguous [nope | rope], matching the triton writer's layout. The
+            # "fp8" mode + e4m3 buffer view reproduces the unfused direct cast
+            # byte-for-byte (scale 1.0).
+            from aiter import concat_and_cache_mla
+
+            kv_buf = self.kv_buffer[layer_id - self.start_layer]
+            if self.store_dtype != self.dtype:
+                kv_buf = kv_buf.view(self.dtype)
+            concat_and_cache_mla(
+                cache_k_nope.squeeze(1),
+                cache_k_rope.squeeze(1),
+                kv_buf,
+                loc,
+                "fp8",
+                torch.ones((), dtype=torch.float32, device=loc.device),
+            )
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)

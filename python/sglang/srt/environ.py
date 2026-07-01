@@ -528,6 +528,9 @@ class Envs:
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    # Fuse the MLA FP8 latent-cache write (concat[nope, rope] + FP8 quant +
+    # paged write) into a single aiter concat_and_cache_mla kernel on ROCm.
+    SGLANG_AITER_FUSED_MLA_CONCAT_CACHE = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
     # Enable dual-stream MoE (shared experts vs routed experts) on the
