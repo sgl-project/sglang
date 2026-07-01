@@ -58,6 +58,23 @@ try:
 except ImportError:
     use_deepep = False
 
+# DeepEP V2 introduces `ElasticBuffer` alongside the legacy `Buffer`
+# (deepseek-ai/DeepEP#605, merged 2026-04-29). On V2 both classes are
+# exported from `deep_ep.__init__`, so the existing `from deep_ep import
+# Buffer` surface above continues to work unchanged — `ElasticBuffer` is
+# an additional, MoE-shape ctor with auto-QP sizing that callers may
+# opt into. The probe below is orthogonal to `use_deepep` and does not
+# affect the default code path. V2 usage is further gated on
+# `SGLANG_DEEPEP_USE_V2=1`. Mirrors the `HAVE_DEEP_EP_V2` probe shape
+# already used in NVIDIA/Megatron-LM's `fused_a2a.py`.
+try:
+    from deep_ep import ElasticBuffer
+
+    have_deepep_v2 = True
+except ImportError:
+    ElasticBuffer = None
+    have_deepep_v2 = False
+
 from enum import Enum, IntEnum, auto
 
 import torch
@@ -182,6 +199,22 @@ class DeepEPBuffer:
         cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         cls._num_experts = num_experts
 
+        # Opt-in V2 path: construct `deep_ep.ElasticBuffer` instead of the
+        # legacy `deep_ep.Buffer`. V2 uses a MoE-shape ctor and infers the
+        # dispatch layout internally (no `get_dispatch_config` /
+        # `get_combine_config` / `get_nvl_buffer_size_hint` /
+        # `get_rdma_buffer_size_hint` calls). Gated behind an env var so
+        # the default code path is byte-identical to V1.
+        if have_deepep_v2 and get_bool_env_var("SGLANG_DEEPEP_USE_V2", default="false"):
+            cls._buffer = cls._build_v2_buffer(
+                group,
+                hidden_size,
+                deepep_mode,
+                num_max_dispatch_tokens_per_rank,
+                num_experts,
+            )
+            return cls._buffer
+
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
             hidden_bytes = hidden_size * param_bytes
@@ -267,7 +300,71 @@ class DeepEPBuffer:
         return cls._buffer
 
     @classmethod
+    def _build_v2_buffer(
+        cls,
+        group: dist.ProcessGroup,
+        hidden_size: int,
+        deepep_mode: DeepEPMode,
+        num_max_dispatch_tokens_per_rank: int,
+        num_experts: int,
+    ):
+        """Construct a DeepEP V2 `ElasticBuffer` for opt-in V2 usage.
+
+        DeepEP V2 (deepseek-ai/DeepEP#605) collapses the V1 NVL/RDMA
+        byte-pool ctor into a single MoE-shape ctor and derives the
+        internal buffer size from `num_max_tokens_per_rank`, `hidden`,
+        and `num_topk`. `num_allocated_qps=0` asks V2 to auto-size and
+        auto-cap the Queue-Pair budget — on AWS EFA this clamps to the
+        safe 128-slot GIN ring ceiling (see the EFA fast-path in
+        `deep_ep/buffers/elastic.py`).
+
+        V2 does not expose `get_dispatch_config` / `get_combine_config`
+        / `num_qps_per_rank`, so the matching V1 code above is skipped.
+        """
+        # Keep the num_tokens / num_topk source consistent with the V1
+        # low-latency path. For the normal path where
+        # `num_max_dispatch_tokens_per_rank == -1`, fall back to the
+        # SGLang env default that already bounds the V1 path.
+        if num_max_dispatch_tokens_per_rank <= 0:
+            num_max_dispatch_tokens_per_rank = (
+                envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+            )
+        # `num_topk` is not known at buffer-construction time in SGLang
+        # (the router choice is per-forward). DeepEP V2 accepts
+        # `num_topk=0` and falls back to a group-size-based conservative
+        # hint, so we pass 0 here and let V2 compute the ceiling.
+        num_topk = 0
+        # Low-latency mode still requires `num_experts % group.size() ==
+        # 0`. The normal mode works with `num_experts == -1`.
+        if deepep_mode.enable_low_latency():
+            assert num_experts != -1 and num_experts % group.size() == 0
+
+        logger.info(
+            "SGLANG_DEEPEP_USE_V2=1: constructing deep_ep.ElasticBuffer "
+            "(num_max_tokens_per_rank=%d, hidden=%d, num_topk=%d).",
+            num_max_dispatch_tokens_per_rank,
+            hidden_size,
+            num_topk,
+        )
+        return ElasticBuffer(
+            group=group,
+            num_max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
+            hidden=hidden_size,
+            num_topk=num_topk,
+            use_fp8_dispatch=False,
+            allow_hybrid_mode=True,
+            # num_allocated_qps=0 -> V2 auto-sizes with an EFA safety cap
+            # (see deep_ep/buffers/elastic.py _is_efa_fabric()).
+            num_allocated_qps=0,
+        )
+
+    @classmethod
     def clean_buffer(cls):
+        # DeepEP V2's `ElasticBuffer` does not expose `low_latency_mode`
+        # or `clean_low_latency_buffer` — low-latency cleanup is handled
+        # internally via `EPHandle` lifetime. Fall through for V2.
+        if not hasattr(cls._buffer, "clean_low_latency_buffer"):
+            return
         if not cls._buffer.low_latency_mode:
             return
         cls._buffer.clean_low_latency_buffer(
