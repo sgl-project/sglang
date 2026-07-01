@@ -33,10 +33,7 @@ from sglang.srt.layers.utils import MultiPlatformOp, copy_or_rebind_param
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
-    get_device_sm,
     is_cpu,
-    is_cuda,
-    is_flashinfer_available,
     is_hip,
     is_npu,
     set_weight_attrs,
@@ -56,7 +53,6 @@ if TYPE_CHECKING:
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
-_is_cuda = is_cuda()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -92,26 +88,6 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
     backend = Bf16GemmBackend(server_args.bf16_gemm_backend)
 
     if backend.is_flashinfer():
-        if not (_is_cuda and is_flashinfer_available()):
-            raise RuntimeError(
-                "FlashInfer BF16 GEMM requested via --bf16-gemm-backend=flashinfer, "
-                "but it's not available. This backend requires an NVIDIA GPU with "
-                "FlashInfer installed."
-            )
-
-        from flashinfer.cute_dsl.utils import is_cute_dsl_available
-        from flashinfer.gemm import mm_bf16
-
-        if not (
-            mm_bf16.is_backend_supported("tgv", get_device_sm())
-            and is_cute_dsl_available()
-        ):
-            raise RuntimeError(
-                "FlashInfer BF16 GEMM requested via --bf16-gemm-backend=flashinfer, "
-                "but it's not supported on this GPU/FlashInfer build. This backend "
-                "requires Blackwell (SM100) GPUs with FlashInfer CuTe DSL support."
-            )
-
         from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE, bf16_gemm_sm100
         from flashinfer.utils import _get_cache_buf
 
