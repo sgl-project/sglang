@@ -44,10 +44,12 @@ def _chunk(text: str, finish: str = None) -> dict:
 class _MockTokenizerManager:
     """Minimal mock satisfying OpenAIServingTranscription.__init__ and stream loop."""
 
-    def __init__(self, stream_chunks: List[dict]):
+    def __init__(self, stream_chunks: List[dict], architectures=None):
         self.model_config = Mock()
         self.model_config.hf_config = Mock()
-        self.model_config.hf_config.architectures = ["WhisperForConditionalGeneration"]
+        self.model_config.hf_config.architectures = architectures or [
+            "WhisperForConditionalGeneration"
+        ]
         # Not a real ServerArgs, so base class sets allowed_custom_labels=None.
         # Default tests assume cumulative-text streaming (the sglang upstream
         # default); tests for incremental_streaming_output=True override this.
@@ -303,6 +305,39 @@ class TestStreamingIncrementalOutputMode(CustomTestCase):
         self.assertFalse(any("<|" in d for d in emitted))
         self.assertEqual("".join(emitted), "Hello world")
         self.assertEqual(request.language, "en")
+
+
+class TestStreamingAdapterPostprocess(CustomTestCase):
+    """Non-fused token streaming still applies model-specific text cleanup."""
+
+    def test_moss_special_token_scrubbed_before_delta_slicing(self):
+        chunks = [
+            _chunk("[0.00][S01]你好[1.00]"),
+            _chunk("[0.00][S01]你好[1.00]<|im_end|>", finish="stop"),
+        ]
+        tm = _MockTokenizerManager(
+            chunks,
+            architectures=["MossTranscribeDiarizeForConditionalGeneration"],
+        )
+        serving = OpenAIServingTranscription(tm)
+        request = TranscriptionRequest(
+            model="moss-transcribe-diarize",
+            stream=True,
+        )
+        adapted = GenerateReqInput(text="", modalities=["audio"])
+
+        async def drive():
+            frames = []
+            async for frame in serving._generate_transcription_stream(
+                adapted, request, Mock()
+            ):
+                frames.append(frame)
+            return frames
+
+        frames = get_or_create_event_loop().run_until_complete(drive())
+        deltas = _deltas_from_sse(frames)
+        self.assertEqual(deltas, ["[0.00][S01]你好[1.00]"])
+        self.assertFalse(any("<|" in delta for delta in deltas))
 
 
 if __name__ == "__main__":
