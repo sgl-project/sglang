@@ -32,6 +32,11 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.low_precision_linear import (
+    TeNvfp4LinearRunner,
+    maybe_get_te_nvfp4_linear_runner,
+    te_nvfp4_linear_target_enabled,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -76,7 +81,14 @@ def _ltx2_residual_gate_add(
     return residual + update * gate
 
 
+_LTX2_TE_NVFP4_VIDEO_FFN_TARGET = "ltx2.video_ffn"
 _LTX2_FUSED_ADA_VALUES_RUNTIME_DISABLED = False
+
+
+def _ltx2_te_nvfp4_video_ffn_target() -> str | None:
+    if te_nvfp4_linear_target_enabled(_LTX2_TE_NVFP4_VIDEO_FFN_TARGET):
+        return _LTX2_TE_NVFP4_VIDEO_FFN_TARGET
+    return None
 
 
 def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
@@ -891,6 +903,7 @@ class LTX2FeedForward(nn.Module):
         dim_out: int | None = None,
         mult: int = 4,
         quant_config: QuantizationConfig | None = None,
+        te_nvfp4_target: str | None = None,
     ) -> None:
         super().__init__()
         if dim_out is None:
@@ -908,10 +921,41 @@ class LTX2FeedForward(nn.Module):
             input_is_parallel=True,
             quant_config=quant_config,
         )
+        if (
+            te_nvfp4_target is not None
+            and dim == 4096
+            and dim_out == 4096
+            and inner_dim == 16384
+        ):
+            self._te_nvfp4_linear: TeNvfp4LinearRunner | None = (
+                maybe_get_te_nvfp4_linear_runner(te_nvfp4_target)
+            )
+        else:
+            self._te_nvfp4_linear = None
+
+    def _try_te_nvfp4_linear(
+        self, cache_key: str, layer: nn.Module, x: torch.Tensor
+    ) -> torch.Tensor | None:
+        if self._te_nvfp4_linear is None:
+            return None
+        return self._te_nvfp4_linear.try_apply(
+            cache_key,
+            layer,
+            x,
+            training=self.training,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x, _ = self.proj_in(x)
-        x = self.act(x)
+        te_proj_in = self._try_te_nvfp4_linear("proj_in", self.proj_in, x)
+        if te_proj_in is not None:
+            x = self.act(te_proj_in)
+        else:
+            x, _ = self.proj_in(x)
+            x = self.act(x)
+
+        te_proj_out = self._try_te_nvfp4_linear("proj_out", self.proj_out, x)
+        if te_proj_out is not None:
+            return te_proj_out
         x, _ = self.proj_out(x)
         return x
 
@@ -1038,9 +1082,16 @@ class LTX2TransformerBlock(nn.Module):
         )
 
         # 4. Feedforward layers
-        self.ff = LTX2FeedForward(dim, dim_out=dim, quant_config=quant_config)
+        self.ff = LTX2FeedForward(
+            dim,
+            dim_out=dim,
+            quant_config=quant_config,
+            te_nvfp4_target=_ltx2_te_nvfp4_video_ffn_target(),
+        )
         self.audio_ff = LTX2FeedForward(
-            audio_dim, dim_out=audio_dim, quant_config=quant_config
+            audio_dim,
+            dim_out=audio_dim,
+            quant_config=quant_config,
         )
 
         # 5. Modulation Parameters
