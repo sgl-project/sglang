@@ -313,6 +313,22 @@ class MooncakeBaseStore:
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     @staticmethod
+    def _validate_mooncake_allocators(mem_pool: Any) -> bool:
+        """Require every buffer-backed host pool to use MooncakeHostTensorAllocator.
+
+        Logical pools (e.g. the V4 LogicalHostPool anchor) are skipped.
+        """
+        entries = getattr(mem_pool, "entries", None)
+        if entries:
+            return all(
+                isinstance(entry.host_pool.allocator, MooncakeHostTensorAllocator)
+                for entry in entries
+                if entry.host_pool.allocator is not None
+            )
+        else:
+            return isinstance(mem_pool.allocator, MooncakeHostTensorAllocator)
+
+    @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
         """Compute total bytes of host buffers that must be visible to the real client.
 
@@ -426,7 +442,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     )
                     device_name = ""
             if self.config.standalone_storage:
-                if not isinstance(mem_pool.allocator, MooncakeHostTensorAllocator):
+                if not self._validate_mooncake_allocators(mem_pool):
                     raise RuntimeError(
                         "MooncakeStore with standalone_storage=True requires MooncakeHostTensorAllocator. "
                         "Please set standalone_storage=False "
