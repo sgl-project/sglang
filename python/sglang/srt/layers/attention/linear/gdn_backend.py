@@ -68,13 +68,6 @@ def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
     ):
         return
 
-    # With radix caching enabled, only the regular extra-buffer flow is validated.
-    if (
-        args.uses_mamba_radix_cache
-        and args.mamba_radix_cache_strategy != "extra_buffer"
-    ):
-        return
-
     cuda_version = torch.version.cuda
     chunk_size = args.chunked_prefill_size
     config = model_runner.hybrid_gdn_config
