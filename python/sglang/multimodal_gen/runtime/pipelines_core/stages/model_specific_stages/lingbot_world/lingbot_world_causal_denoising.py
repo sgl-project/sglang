@@ -120,6 +120,23 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             )
         )
 
+    def _apply_causal_cache_overrides(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        super()._apply_causal_cache_overrides(batch, server_args)
+        self._sync_interactive_kv_cache_window(server_args)
+
+    def _sync_interactive_kv_cache_window(self, server_args: ServerArgs) -> None:
+        if not self._interactive_kv_window_enabled(server_args):
+            return
+        if self.local_attn_size != -1:
+            return
+        self.sliding_window_num_frames = (
+            self._effective_interactive_kv_cache_num_frames(server_args)
+        )
+
     def _effective_interactive_kv_cache_num_frames(
         self,
         server_args: ServerArgs,
@@ -129,9 +146,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             return cache_window
 
         pipeline_config = server_args.pipeline_config
-        moving_window = max(
-            0, int(getattr(pipeline_config, "interactive_kv_moving_window", 0))
-        )
+        moving_window = self._moving_kv_sample_num_frames(server_args) or 0
         still_window = max(
             0, int(getattr(pipeline_config, "interactive_kv_still_window", 0))
         )
@@ -163,6 +178,19 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         )
         return sample_frames if sample_frames > 0 else None
 
+    def _moving_kv_sample_num_frames(
+        self,
+        server_args: ServerArgs,
+    ) -> int | None:
+        moving_window = getattr(
+            server_args.pipeline_config,
+            "interactive_kv_moving_window",
+            None,
+        )
+        if moving_window is None:
+            return self._base_kv_sample_num_frames()
+        return max(0, int(moving_window))
+
     def _get_interactive_kv_sample_num_frames(
         self,
         cache_state,
@@ -186,9 +214,9 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             dynamic_state["consecutive_still_chunks"] = 0
             dynamic_state["sample_num_frames"] = None
 
-        moving_window = int(
-            getattr(pipeline_config, "interactive_kv_moving_window", 12)
-        )
+        moving_window = self._moving_kv_sample_num_frames(server_args)
+        if moving_window is None:
+            return None
         still_window = int(getattr(pipeline_config, "interactive_kv_still_window", 3))
         still_chunks_threshold = max(
             1, int(getattr(pipeline_config, "interactive_kv_still_chunks", 2))
@@ -213,6 +241,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> int | None:
+        self._sync_interactive_kv_cache_window(server_args)
         sample_frames = self._get_interactive_kv_sample_num_frames(
             cache_state,
             batch,

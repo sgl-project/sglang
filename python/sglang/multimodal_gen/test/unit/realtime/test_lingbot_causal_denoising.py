@@ -244,7 +244,8 @@ def test_lingbot_interactive_kv_window_samples_base_moving_and_still():
     batch = SimpleNamespace(condition_inputs={})
     previous = stage._set_lingbot_kv_sample_tokens(cache_state, batch, server_args)
     assert previous is None
-    assert batch.realtime_causal_kv_sample_tokens == 60
+    assert stage.sliding_window_num_frames == 24
+    assert batch.realtime_causal_kv_sample_tokens == 120
     policy = stage._build_realtime_causal_cache_policy(batch, server_args)
     assert policy.expected_cache_tokens == 240
 
@@ -263,6 +264,63 @@ def test_lingbot_interactive_kv_window_samples_base_moving_and_still():
     cache_state.chunk_idx = 2
     stage._set_lingbot_kv_sample_tokens(cache_state, batch, server_args)
     assert batch.realtime_causal_kv_sample_tokens == 30
+
+
+def test_lingbot_interactive_kv_window_none_uses_base_moving_window():
+    stage = LingBotWorldCausalDMDDenoisingStage.__new__(
+        LingBotWorldCausalDMDDenoisingStage
+    )
+    stage.local_attn_size = -1
+    stage.sink_size = 9
+    stage.num_token_per_frame = 10
+    stage.num_frames_per_block = 3
+    stage.sliding_window_num_frames = 18
+    stage.transformer = SimpleNamespace(num_attention_heads=1)
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            realtime_causal_sink_size=9,
+            realtime_causal_kv_cache_num_frames=18,
+            interactive_kv_window_enable=True,
+            interactive_kv_moving_window=None,
+            interactive_kv_still_window=3,
+            interactive_kv_still_chunks=2,
+        )
+    )
+    cache_state = RealtimeCausalDiTState()
+    batch = SimpleNamespace(condition_inputs={"camera_actions": [["w"], [], []]})
+
+    stage._set_lingbot_kv_sample_tokens(cache_state, batch, server_args)
+    assert batch.realtime_causal_kv_sample_tokens == 60
+    policy = stage._build_realtime_causal_cache_policy(batch, server_args)
+    assert policy.expected_cache_tokens == 180
+
+
+def test_lingbot_interactive_kv_window_updates_total_window_for_moving_default():
+    stage = LingBotWorldCausalDMDDenoisingStage.__new__(
+        LingBotWorldCausalDMDDenoisingStage
+    )
+    stage.local_attn_size = -1
+    stage.sink_size = 9
+    stage.num_token_per_frame = 10
+    stage.num_frames_per_block = 3
+    stage.sliding_window_num_frames = 18
+    stage.transformer = SimpleNamespace(num_attention_heads=1)
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            realtime_causal_sink_size=9,
+            realtime_causal_kv_cache_num_frames=18,
+            interactive_kv_window_enable=True,
+            interactive_kv_moving_window=12,
+            interactive_kv_still_window=3,
+            interactive_kv_still_chunks=2,
+        )
+    )
+    batch = SimpleNamespace(condition_inputs={"camera_actions": [["w"], [], []]})
+
+    policy = stage._build_realtime_causal_cache_policy(batch, server_args)
+
+    assert stage.sliding_window_num_frames == 24
+    assert policy.expected_cache_tokens == 240
 
 
 def test_lingbot_interactive_kv_window_allocates_expected_cache_size():
