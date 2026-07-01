@@ -819,11 +819,39 @@ def get_mm_http_session() -> requests.Session:
     return session
 
 
+class _AudioTooLongError(ValueError):
+    """Audio exceeds the configured maximum decode duration."""
+
+
+def _audio_too_long(duration_s: float, max_duration_s: float) -> _AudioTooLongError:
+    return _AudioTooLongError(
+        f"Audio exceeds the maximum allowed decode duration of "
+        f"{max_duration_s}s (input is at least {float(duration_s):.1f}s). Set "
+        f"SGLANG_MAX_AUDIO_DECODE_DURATION_S to change this limit."
+    )
+
+
+def _validate_audio_sample_rate(sample_rate: Optional[int], name: str) -> int:
+    if sample_rate is None or sample_rate <= 0:
+        raise ValueError(f"{name} must be positive, got {sample_rate}.")
+    return sample_rate
+
+
 def load_audio(
-    audio_file: str, sr: Optional[int] = None, mono: bool = True
+    audio_file: str,
+    sr: Optional[int] = None,
+    mono: bool = True,
+    max_duration_s: Optional[float] = None,
 ) -> np.ndarray:
     if sr is None:
         sr = 16000
+    else:
+        sr = _validate_audio_sample_rate(sr, "Sample rate")
+    if max_duration_s is None:
+        max_duration_s = envs.SGLANG_MAX_AUDIO_DECODE_DURATION_S.get()
+    # A small compressed payload can expand into hours of PCM (decompression
+    # bomb). cap bounds how much audio we will materialize; <= 0 disables it.
+    cap = max_duration_s if max_duration_s and max_duration_s > 0 else None
 
     # Normalize input: resolve URL / base64 / file:// to bytes or path
     if isinstance(audio_file, bytes):
@@ -853,26 +881,62 @@ def load_audio(
                 sample_rate=sr,
                 num_channels=1 if mono else None,
             )
-            samples = decoder.get_all_samples()
-            if mono:
-                return samples.data.squeeze(0).numpy()
-            return samples.data.T.numpy()
         except Exception as e:
             # torchcodec's bytes-buffer IO can fail on WAV files that carry
             # large trailing metadata chunks. Fall back to soundfile, which reads the PCM payload directly.
             logger.warning(
                 f"torchcodec AudioDecoder failed ({e}); falling back to soundfile + torchaudio."
             )
+        else:
+            try:
+                if cap is None:
+                    samples = decoder.get_all_samples()
+                else:
+                    # Fast-reject from header metadata when it is trustworthy.
+                    metadata = decoder.metadata
+                    header_s = getattr(
+                        metadata, "duration_seconds_from_header", None
+                    ) or getattr(metadata, "duration_seconds", None)
+                    if header_s is not None and header_s > cap:
+                        raise _audio_too_long(header_s, cap)
+                    # Bounded decode: only ever materialize ~cap seconds of PCM,
+                    # so a missing or forged header cannot become a memory bomb.
+                    samples = decoder.get_samples_played_in_range(
+                        0.0, stop_seconds=cap + 1.0
+                    )
+                    if samples.data.shape[-1] / sr > cap:
+                        raise _audio_too_long(samples.data.shape[-1] / sr, cap)
+            except _AudioTooLongError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    f"torchcodec decode failed ({e}); falling back to soundfile + torchaudio."
+                )
+            else:
+                if mono:
+                    return samples.data.squeeze(0).numpy()
+                return samples.data.T.numpy()
 
     # Fallback: soundfile + torchaudio (ARM / no FFmpeg / torchcodec failure)
     import soundfile as sf
     import torch
     import torchaudio
 
-    if isinstance(source, bytes):
-        audio, original_sr = sf.read(BytesIO(source))
-    else:
-        audio, original_sr = sf.read(source)
+    audio_input = BytesIO(source) if isinstance(source, bytes) else source
+    with sf.SoundFile(audio_input) as f:
+        original_sr = _validate_audio_sample_rate(
+            f.samplerate, "Audio file sample rate"
+        )
+        if cap is not None:
+            # Bounded read: pull at most cap-worth of frames (+1 to detect
+            # overflow), so an over-long or mis-declared file is rejected
+            # without reading the whole PCM payload into memory.
+            max_frames = int(cap * original_sr)
+            audio = f.read(frames=max_frames + 1)
+            if len(audio) > max_frames:
+                raise _audio_too_long(len(audio) / original_sr, cap)
+        else:
+            audio = f.read()
 
     if mono and len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
