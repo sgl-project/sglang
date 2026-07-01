@@ -50,7 +50,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.utils import ceil_align
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import is_sm89_supported, is_sm120_supported
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -59,6 +59,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_sm120 = is_sm120_supported()
+_is_sm89 = is_sm89_supported()
+_use_flashmla_fallback_path = _is_sm120 or _is_sm89
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +112,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if _is_sm120:
+    if _use_flashmla_fallback_path:
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -1403,7 +1405,7 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if _is_sm120:
+            if _use_flashmla_fallback_path:
                 from sglang.srt.layers.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
                 )

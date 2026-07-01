@@ -84,6 +84,7 @@ from sglang.srt.utils.common import (
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
+    is_sm89_supported,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -102,6 +103,16 @@ from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
+
+def apply_deepseek_v4_sm89_defaults() -> None:
+    # Ada/L20 lacks the Hopper/Blackwell-only DeepGEMM and topk_v2 paths used by
+    # DeepSeek-V4's FP8 indexer and MHC prenorm fast paths.
+    envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+    envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+    envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+    envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
@@ -3955,7 +3966,9 @@ class ServerArgs:
 
             validate_deepseek_v4_cp(self)
 
-            if is_sm120_supported():
+            if is_sm89_supported():
+                apply_deepseek_v4_sm89_defaults()
+            elif is_sm120_supported():
                 if self.moe_runner_backend == "auto":
                     self.moe_runner_backend = "marlin"
                     logger.info(
