@@ -86,6 +86,133 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
     ) -> bool:
         return True
 
+    @staticmethod
+    def _chunk_has_camera_motion(actions) -> bool:
+        if not actions:
+            return False
+        for frame_actions in actions:
+            if frame_actions:
+                return True
+        return False
+
+    def _uses_interactive_kv_window(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> bool:
+        pipeline_config = server_args.pipeline_config
+        if not bool(getattr(pipeline_config, "interactive_kv_window_enable", False)):
+            return False
+        condition_inputs = getattr(batch, "condition_inputs", None) or {}
+        return "camera_actions" in condition_inputs
+
+    def _effective_interactive_kv_cache_num_frames(
+        self,
+        server_args: ServerArgs,
+    ) -> int:
+        cache_window = int(self.sliding_window_num_frames)
+        if self.local_attn_size != -1:
+            return cache_window
+
+        pipeline_config = server_args.pipeline_config
+        moving_window = max(
+            0, int(getattr(pipeline_config, "interactive_kv_moving_window", 0))
+        )
+        still_window = max(
+            0, int(getattr(pipeline_config, "interactive_kv_still_window", 0))
+        )
+        return max(
+            cache_window,
+            int(self.sink_size)
+            + max(moving_window, still_window)
+            + int(self.num_frames_per_block),
+        )
+
+    def _build_realtime_causal_cache_policy(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> CausalDMDCachePolicy:
+        policy = super()._build_realtime_causal_cache_policy(batch, server_args)
+        if self._uses_interactive_kv_window(batch, server_args):
+            policy.expected_cache_tokens = (
+                self._effective_interactive_kv_cache_num_frames(server_args)
+                * self.num_token_per_frame
+            )
+        return policy
+
+    def _base_kv_sample_num_frames(self) -> int | None:
+        sample_frames = (
+            int(self.sliding_window_num_frames)
+            - int(self.sink_size)
+            - int(self.num_frames_per_block)
+        )
+        return sample_frames if sample_frames > 0 else None
+
+    def _get_interactive_kv_sample_num_frames(
+        self,
+        cache_state,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> int | None:
+        pipeline_config = server_args.pipeline_config
+        if not bool(getattr(pipeline_config, "interactive_kv_window_enable", False)):
+            return None
+        if not self._uses_interactive_kv_window(batch, server_args):
+            return self._base_kv_sample_num_frames()
+
+        dynamic_state = cache_state.runtime_cache.setdefault(
+            "lingbot_interactive_kv_window",
+            {
+                "consecutive_still_chunks": 0,
+                "sample_num_frames": None,
+            },
+        )
+        if cache_state.chunk_idx == 0:
+            dynamic_state["consecutive_still_chunks"] = 0
+            dynamic_state["sample_num_frames"] = None
+
+        moving_window = int(
+            getattr(pipeline_config, "interactive_kv_moving_window", 12)
+        )
+        still_window = int(getattr(pipeline_config, "interactive_kv_still_window", 3))
+        still_chunks_threshold = max(
+            1, int(getattr(pipeline_config, "interactive_kv_still_chunks", 2))
+        )
+        if dynamic_state["sample_num_frames"] is None:
+            dynamic_state["sample_num_frames"] = moving_window
+
+        condition_inputs = getattr(batch, "condition_inputs", None) or {}
+        if self._chunk_has_camera_motion(condition_inputs.get("camera_actions")):
+            dynamic_state["consecutive_still_chunks"] = 0
+            dynamic_state["sample_num_frames"] = moving_window
+        else:
+            dynamic_state["consecutive_still_chunks"] += 1
+            if dynamic_state["consecutive_still_chunks"] >= still_chunks_threshold:
+                dynamic_state["sample_num_frames"] = still_window
+
+        return int(dynamic_state["sample_num_frames"])
+
+    def _set_lingbot_kv_sample_tokens(
+        self,
+        cache_state,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> int | None:
+        sample_frames = self._get_interactive_kv_sample_num_frames(
+            cache_state,
+            batch,
+            server_args,
+        )
+        sample_tokens = (
+            None
+            if sample_frames is None
+            else int(sample_frames) * self.num_token_per_frame
+        )
+        previous = getattr(batch, "realtime_causal_kv_sample_tokens", None)
+        batch.realtime_causal_kv_sample_tokens = sample_tokens
+        return previous
+
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
         result.add_check(
@@ -96,6 +223,35 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         result.add_check("scheduler", batch.scheduler, V.not_none)
         result.add_check("prompt_embeds", batch.prompt_embeds, V.list_not_empty)
         return result
+
+    def _denoise_realtime_causal_chunk(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        ctx,
+        cache_ctx,
+        chunk_latents: torch.Tensor,
+        prepare_model_input,
+        prepare_context_input,
+    ) -> torch.Tensor:
+        previous_sample_tokens = self._set_lingbot_kv_sample_tokens(
+            cache_ctx.cache_state,
+            batch,
+            server_args,
+        )
+        try:
+            return super()._denoise_realtime_causal_chunk(
+                batch,
+                server_args,
+                ctx=ctx,
+                cache_ctx=cache_ctx,
+                chunk_latents=chunk_latents,
+                prepare_model_input=prepare_model_input,
+                prepare_context_input=prepare_context_input,
+            )
+        finally:
+            batch.realtime_causal_kv_sample_tokens = previous_sample_tokens
 
     def _get_causal_dmd_latents(self, batch: Req) -> torch.Tensor:
         latents = batch.latents

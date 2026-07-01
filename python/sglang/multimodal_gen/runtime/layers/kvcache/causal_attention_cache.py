@@ -110,6 +110,7 @@ class CausalSelfAttentionKVCache:
         value: torch.Tensor,
         current_chunk_start: int,
         cache_head_start: int | None = None,
+        recent_window_tokens: int | None = None,
         debug_name: str = "causal KV cache",
     ) -> CausalAttentionKVView:
         """write fresh kv into the cache, returns the part of view visible to the current chunk
@@ -265,17 +266,22 @@ class CausalSelfAttentionKVCache:
         if cache_head_slice is None:
             self.k[:, local_start_index:local_end_index] = key
             self.v[:, local_start_index:local_end_index] = value
-            visible_k = self.k[:, attn_start_index:updated_local_end]
-            visible_v = self.v[:, attn_start_index:updated_local_end]
+            visible_k, visible_v = self._visible_attention_kv(
+                local_start_index=local_start_index,
+                updated_local_end=updated_local_end,
+                attn_start_index=attn_start_index,
+                recent_window_tokens=recent_window_tokens,
+            )
         else:
             self.k[:, local_start_index:local_end_index, cache_head_slice, :] = key
             self.v[:, local_start_index:local_end_index, cache_head_slice, :] = value
-            visible_k = self.k[
-                :, attn_start_index:updated_local_end, cache_head_slice, :
-            ]
-            visible_v = self.v[
-                :, attn_start_index:updated_local_end, cache_head_slice, :
-            ]
+            visible_k, visible_v = self._visible_attention_kv(
+                local_start_index=local_start_index,
+                updated_local_end=updated_local_end,
+                attn_start_index=attn_start_index,
+                recent_window_tokens=recent_window_tokens,
+                cache_head_slice=cache_head_slice,
+            )
 
         self._write_indices(
             global_end_index=updated_global_end,
@@ -288,6 +294,80 @@ class CausalSelfAttentionKVCache:
             local_end_index=local_end_index,
             visible_local_end=updated_local_end,
             visible_global_end=updated_global_end,
+        )
+
+    def _visible_attention_kv(
+        self,
+        *,
+        local_start_index: int,
+        updated_local_end: int,
+        attn_start_index: int,
+        recent_window_tokens: int | None,
+        cache_head_slice: slice | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if recent_window_tokens is None or recent_window_tokens <= 0:
+            if cache_head_slice is None:
+                return (
+                    self.k[:, attn_start_index:updated_local_end],
+                    self.v[:, attn_start_index:updated_local_end],
+                )
+            return (
+                self.k[:, attn_start_index:updated_local_end, cache_head_slice, :],
+                self.v[:, attn_start_index:updated_local_end, cache_head_slice, :],
+            )
+
+        sink_end = min(self.sink_tokens, updated_local_end)
+        recent_start = max(sink_end, local_start_index - recent_window_tokens)
+        if recent_start <= sink_end:
+            if cache_head_slice is None:
+                return self.k[:, :updated_local_end], self.v[:, :updated_local_end]
+            return (
+                self.k[:, :updated_local_end, cache_head_slice, :],
+                self.v[:, :updated_local_end, cache_head_slice, :],
+            )
+        if sink_end <= 0:
+            if cache_head_slice is None:
+                return (
+                    self.k[:, recent_start:updated_local_end],
+                    self.v[:, recent_start:updated_local_end],
+                )
+            return (
+                self.k[:, recent_start:updated_local_end, cache_head_slice, :],
+                self.v[:, recent_start:updated_local_end, cache_head_slice, :],
+            )
+
+        if cache_head_slice is None:
+            return (
+                torch.cat(
+                    [
+                        self.k[:, :sink_end],
+                        self.k[:, recent_start:updated_local_end],
+                    ],
+                    dim=1,
+                ),
+                torch.cat(
+                    [
+                        self.v[:, :sink_end],
+                        self.v[:, recent_start:updated_local_end],
+                    ],
+                    dim=1,
+                ),
+            )
+        return (
+            torch.cat(
+                [
+                    self.k[:, :sink_end, cache_head_slice, :],
+                    self.k[:, recent_start:updated_local_end, cache_head_slice, :],
+                ],
+                dim=1,
+            ),
+            torch.cat(
+                [
+                    self.v[:, :sink_end, cache_head_slice, :],
+                    self.v[:, recent_start:updated_local_end, cache_head_slice, :],
+                ],
+                dim=1,
+            ),
         )
 
 

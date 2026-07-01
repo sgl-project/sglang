@@ -299,6 +299,11 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             value=v,
             current_chunk_start=current_start,
             cache_head_start=cache_head_start,
+            recent_window_tokens=(
+                None
+                if update_cache_only
+                else getattr(forward_batch, "realtime_causal_kv_sample_tokens", None)
+            ),
             debug_name="LingBot KV cache",
         )
         if update_cache_only:

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
+    CausalSelfAttentionKVCache,
     CrossAttentionKVCache,
 )
 from sglang.multimodal_gen.runtime.models.dits import (
@@ -18,6 +19,7 @@ from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
     LingBotWorldCausalDMDDenoisingStage,
 )
+from sglang.multimodal_gen.runtime.realtime.states import RealtimeCausalDiTState
 
 
 def test_lingbot_denoising_stage_does_not_own_realtime_cache_refs():
@@ -179,6 +181,82 @@ def test_lingbot_realtime_attention_cache_rolls_with_sink_window():
         4.0,
         4.0,
     ]
+
+
+def test_lingbot_realtime_attention_cache_samples_sink_and_recent_window():
+    cache = CausalSelfAttentionKVCache(
+        k=torch.zeros(1, 8, 1, 1),
+        v=torch.zeros(1, 8, 1, 1),
+        global_end_index=torch.zeros(1, dtype=torch.long),
+        local_end_index=torch.zeros(1, dtype=torch.long),
+        global_end_index_int=0,
+        local_end_index_int=0,
+        cache_size=8,
+        sink_tokens=2,
+        attention_window_size=8,
+    )
+
+    cache.update_and_get_attention_kv(
+        key=torch.ones(1, 3, 1, 1),
+        value=torch.ones(1, 3, 1, 1),
+        current_chunk_start=0,
+    )
+    cache.update_and_get_attention_kv(
+        key=torch.full((1, 3, 1, 1), 2.0),
+        value=torch.full((1, 3, 1, 1), 2.0),
+        current_chunk_start=3,
+    )
+    sampled_view = cache.update_and_get_attention_kv(
+        key=torch.full((1, 3, 1, 1), 3.0),
+        value=torch.full((1, 3, 1, 1), 3.0),
+        current_chunk_start=6,
+        recent_window_tokens=1,
+    )
+
+    assert sampled_view.k.flatten().tolist() == [1.0, 1.0, 2.0, 3.0, 3.0, 3.0]
+    assert sampled_view.v.flatten().tolist() == [1.0, 1.0, 2.0, 3.0, 3.0, 3.0]
+
+
+def test_lingbot_interactive_kv_window_samples_base_moving_and_still():
+    stage = LingBotWorldCausalDMDDenoisingStage.__new__(
+        LingBotWorldCausalDMDDenoisingStage
+    )
+    stage.local_attn_size = -1
+    stage.sink_size = 9
+    stage.num_token_per_frame = 10
+    stage.num_frames_per_block = 3
+    stage.sliding_window_num_frames = 18
+    stage.transformer = SimpleNamespace(num_attention_heads=1)
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            interactive_kv_window_enable=True,
+            interactive_kv_moving_window=12,
+            interactive_kv_still_window=3,
+            interactive_kv_still_chunks=2,
+        )
+    )
+    cache_state = RealtimeCausalDiTState()
+
+    batch = SimpleNamespace(condition_inputs={})
+    previous = stage._set_lingbot_kv_sample_tokens(cache_state, batch, server_args)
+    assert previous is None
+    assert batch.realtime_causal_kv_sample_tokens == 60
+
+    batch.condition_inputs = {"camera_actions": [["w"], [], []]}
+    cache_state.chunk_idx = 0
+    stage._set_lingbot_kv_sample_tokens(cache_state, batch, server_args)
+    assert batch.realtime_causal_kv_sample_tokens == 120
+    policy = stage._build_realtime_causal_cache_policy(batch, server_args)
+    assert policy.expected_cache_tokens == 240
+
+    batch.condition_inputs = {"camera_actions": [[], [], []]}
+    cache_state.chunk_idx = 1
+    stage._set_lingbot_kv_sample_tokens(cache_state, batch, server_args)
+    assert batch.realtime_causal_kv_sample_tokens == 120
+
+    cache_state.chunk_idx = 2
+    stage._set_lingbot_kv_sample_tokens(cache_state, batch, server_args)
+    assert batch.realtime_causal_kv_sample_tokens == 30
 
 
 def test_lingbot_i2v_model_input_writer_reuses_buffer():

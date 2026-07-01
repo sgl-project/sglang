@@ -325,6 +325,10 @@ class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
     warp_denoising_step: bool = True
     realtime_causal_sink_size: int | None = None
     realtime_causal_kv_cache_num_frames: int | None = None
+    interactive_kv_window_enable: bool = True
+    interactive_kv_still_window: int = 3
+    interactive_kv_moving_window: int = 12
+    interactive_kv_still_chunks: int = 2
 
     def postprocess_image_latent(self, latent_condition, batch):
         """Build condition tensor aligned to chunk_size (num_frames_per_block).
