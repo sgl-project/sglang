@@ -1,0 +1,184 @@
+name: _benchmark-amd
+
+# Reusable child of nightly-benchmark-amd.yml: runs every config of ONE model
+# group on AMD. Called once per model group so the Actions UI nests the
+# per-config jobs (1k1k / 8k1k / base / mtp ...) under an expandable per-model
+# entry. Do not trigger directly; edit scripts/ci/amd/benchmark-configs.yaml to
+# change what runs.
+
+on:
+  workflow_call:
+    inputs:
+      group:
+        description: 'Model group to run (a model-prefix, e.g. dsv4).'
+        required: true
+        type: string
+      ref:
+        required: false
+        type: string
+        default: ''
+      configs:
+        required: false
+        type: string
+        default: ''
+      variants:
+        required: false
+        type: string
+        default: ''
+      isl:
+        required: false
+        type: string
+        default: ''
+      osl:
+        required: false
+        type: string
+        default: ''
+      dp_attention:
+        required: false
+        type: string
+        default: ''
+      conc_list:
+        required: false
+        type: string
+        default: ''
+      model_path:
+        required: false
+        type: string
+        default: ''
+      benchmark_repo:
+        required: false
+        type: string
+        default: 'SemiAnalysisAI/InferenceX'
+      benchmark_ref:
+        required: false
+        type: string
+        default: 'c1383387104b0bb3dea03577a0fcfca5e5bb016a'
+      continue_on_error:
+        required: false
+        type: boolean
+        default: true
+
+env:
+  DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+  DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+jobs:
+  # Expand this model group's configs (filtered by GROUP_FILTER) into a
+  # {config x variant} matrix.
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Generate benchmark matrix
+        id: gen
+        env:
+          GROUP_FILTER: ${{ inputs.group }}
+          CONFIGS_FILTER: ${{ inputs.configs }}
+          VARIANTS_FILTER: ${{ inputs.variants }}
+          OVERRIDE_ISL: ${{ inputs.isl }}
+          OVERRIDE_OSL: ${{ inputs.osl }}
+          OVERRIDE_DP_ATTN: ${{ inputs.dp_attention }}
+          OVERRIDE_CONC_LIST: ${{ inputs.conc_list }}
+          OVERRIDE_MODEL: ${{ inputs.model_path }}
+        run: |
+          set -x
+          # Ensure pyyaml (usually preinstalled). PEP668-safe; fail loudly if it
+          # genuinely can't be installed (no masking).
+          python3 -c 'import yaml' 2>/dev/null \
+            || python3 -m pip install -q --break-system-packages pyyaml \
+            || python3 -m pip install -q pyyaml
+          # Redirect (not pipe) so a generator failure aborts the step; cat so
+          # the matrix is visible in the log.
+          python3 scripts/ci/amd/generate_benchmark_matrix.py scripts/ci/amd/benchmark-configs.yaml > /tmp/matrix.json
+          cat /tmp/matrix.json
+          echo "matrix=$(cat /tmp/matrix.json)" >> "$GITHUB_OUTPUT"
+
+  benchmark:
+    needs: setup
+    runs-on: ${{ matrix.config.runs_on }}
+    name: ${{ matrix.config.name }} / ${{ matrix.config.variant }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJson(needs.setup.outputs.matrix) }}
+    steps:
+      - name: Checkout sglang (under test)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Checkout benchmark recipes (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.benchmark_repo || 'SemiAnalysisAI/InferenceX' }}
+          ref: ${{ inputs.benchmark_ref || 'c1383387104b0bb3dea03577a0fcfca5e5bb016a' }}
+          path: benchmark-recipes
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (${{ matrix.config.rocm_version }})
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.config.rocm_version }}"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          # --skip-test-time-deps: throughput + GSM8K don't need lmms-eval / human-eval.
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Run benchmark (${{ matrix.config.name }} / ${{ matrix.config.variant }})
+        timeout-minutes: 600
+        run: |
+          > github_summary.md
+          set +e
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            -e BENCHMARK_DIR="/sglang-checkout/benchmark-recipes" \
+            -e MODEL_PREFIX="${{ matrix.config.model_prefix }}" \
+            -e PRECISION="${{ matrix.config.precision }}" \
+            -e RUNNER="${{ matrix.config.runner }}" \
+            -e FRAMEWORK="${{ matrix.config.framework }}" \
+            -e VARIANT="${{ matrix.config.variant }}" \
+            -e BENCH_MODEL="${{ matrix.config.model }}" \
+            -e TP="${{ matrix.config.tp }}" \
+            -e EP_SIZE="${{ matrix.config.ep }}" \
+            -e ISL="${{ matrix.config.isl }}" \
+            -e OSL="${{ matrix.config.osl }}" \
+            -e DP_ATTENTION="${{ matrix.config.dp_attn }}" \
+            -e CONC_LIST="${{ matrix.config.conc_list }}" \
+            -e LAUNCH_SPEC_B64="${{ matrix.config.launch_spec_b64 }}" \
+            -e RESULT_OUT_DIR="/sglang-checkout/benchmark_results" \
+            bash scripts/ci/amd/run_benchmark.sh
+          RC=$?
+          set -e
+          echo "$(<github_summary.md)" >> "$GITHUB_STEP_SUMMARY" || true
+          if [ "${{ inputs.continue_on_error }}" = "true" ]; then
+            echo "continue-on-error: not failing the job (rc=$RC)"
+            exit 0
+          fi
+          exit $RC
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.config.name }}-${{ matrix.config.variant }}-${{ github.run_id }}
+          path: benchmark_results/**
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Clean up container
+        if: always()
+        continue-on-error: true
+        run: docker rm -f ci_sglang 2>/dev/null || true

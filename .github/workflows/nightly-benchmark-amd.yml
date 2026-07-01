@@ -1,0 +1,169 @@
+name: Nightly Benchmark (AMD)
+
+# Runs SemiAnalysis serving benchmarks against the sglang build *under test* on
+# AMD GPUs, so throughput / TTFT / TPOT / ITL / E2EL stay apples-to-apples with
+# the published dashboard.
+#
+# Two levels for a readable Actions UI: this parent fans out one nested job per
+# model group (model-prefix), each calling the reusable _benchmark-amd.yml,
+# which in turn runs that model's configs (1k1k / 8k1k / base / mtp ...). Expand
+# a model entry in the run to see its per-config jobs.
+#
+# Models -- and the ROCm image each one uses -- are config-driven: edit
+# scripts/ci/amd/benchmark-configs.yaml to add a model. Do NOT edit this
+# workflow for routine config changes.
+
+on:
+  schedule:
+    - cron: '0 18 * * *'  # nightly, offset from other AMD nightly runs
+  # TEMPORARY (remove or narrow before merging to main): workflow_dispatch and
+  # schedule only register from the default branch, so a feature branch is
+  # otherwise invisible in the Actions tab. This lets the workflow run on every
+  # push to the dev branch. NOTE: each push runs the full GPU benchmark on the
+  # self-hosted MI35x runner.
+  push:
+    branches:
+      - amd_benchmark
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'sglang git ref to test (leave empty for the triggering sha).'
+        required: false
+        type: string
+        default: ''
+      configs:
+        description: 'Comma-separated config names to run (empty = all in benchmark-configs.yaml).'
+        required: false
+        type: string
+        default: ''
+      variants:
+        description: 'Comma-separated variants to keep, e.g. base,mtp (empty = each config default).'
+        required: false
+        type: string
+        default: ''
+      isl:
+        description: 'Override input sequence length for all rows (empty = per-config).'
+        required: false
+        type: string
+        default: ''
+      osl:
+        description: 'Override output sequence length for all rows (empty = per-config).'
+        required: false
+        type: string
+        default: ''
+      dp_attention:
+        description: 'Override DP-attention for all rows (empty = per-config).'
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - 'false'
+          - 'true'
+      conc_list:
+        description: 'Override concurrencies for all rows (one launch sweeps all of them).'
+        required: false
+        type: string
+        default: ''
+      model_path:
+        description: 'Override model id/path for all rows (a path starting with / skips download).'
+        required: false
+        type: string
+        default: ''
+      benchmark_repo:
+        description: 'Benchmark recipe repo (owner/name).'
+        required: false
+        type: string
+        default: 'SemiAnalysisAI/InferenceX'
+      benchmark_ref:
+        description: 'Benchmark recipe repo ref (SHA recommended for reproducibility).'
+        required: false
+        type: string
+        default: 'c1383387104b0bb3dea03577a0fcfca5e5bb016a'
+      continue_on_error:
+        description: 'Do not fail the workflow on benchmark errors.'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: nightly-benchmark-amd-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' && github.event_name != 'schedule' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Discover the distinct model groups (model-prefix) from benchmark-configs.yaml
+  # so the parent can fan out one nested job per model. To add/remove benchmarks,
+  # edit that YAML only.
+  # ---------------------------------------------------------------------------
+  setup-groups:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      groups: ${{ steps.gen.outputs.groups }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: List model groups
+        id: gen
+        env:
+          CONFIGS_FILTER: ${{ inputs.configs }}
+        run: |
+          set -x
+          # Ensure pyyaml (usually preinstalled). PEP668-safe; fail loudly if it
+          # genuinely can't be installed (no masking).
+          python3 -c 'import yaml' 2>/dev/null \
+            || python3 -m pip install -q --break-system-packages pyyaml \
+            || python3 -m pip install -q pyyaml
+          # Redirect (not pipe) so a generator failure aborts the step; cat so
+          # the group list is visible in the log.
+          python3 scripts/ci/amd/generate_benchmark_matrix.py scripts/ci/amd/benchmark-configs.yaml --list-groups > /tmp/groups.json
+          cat /tmp/groups.json
+          echo "groups=$(cat /tmp/groups.json)" >> "$GITHUB_OUTPUT"
+
+  # One nested (reusable-workflow) job per model group -> the Actions UI shows an
+  # expandable per-model entry whose children are the per-config benchmark jobs.
+  model:
+    needs: setup-groups
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJson(needs.setup-groups.outputs.groups) }}
+    uses: ./.github/workflows/_benchmark-amd.yml
+    with:
+      group: ${{ matrix.group }}
+      ref: ${{ inputs.ref }}
+      configs: ${{ inputs.configs }}
+      variants: ${{ inputs.variants }}
+      isl: ${{ inputs.isl }}
+      osl: ${{ inputs.osl }}
+      dp_attention: ${{ inputs.dp_attention }}
+      conc_list: ${{ inputs.conc_list }}
+      model_path: ${{ inputs.model_path }}
+      benchmark_repo: ${{ inputs.benchmark_repo }}
+      benchmark_ref: ${{ inputs.benchmark_ref }}
+      # schedule / push always continue-on-error; dispatch honors the input.
+      continue_on_error: ${{ github.event_name != 'workflow_dispatch' || inputs.continue_on_error }}
+    secrets: inherit
+
+  check-all-jobs:
+    if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch')
+    needs:
+      - model
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if any model group failed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more benchmark model groups failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more benchmark model groups were cancelled"
+            exit 1
+          fi
+          echo "All benchmark model groups passed"

@@ -4450,10 +4450,13 @@ class ServerArgs:
             self._handle_mamba_radix_cache(model_arch=model_arch)
 
         elif model_arch in ["MiniMaxM2ForCausalLM"]:
-            self.enable_tf32_matmul = True
-            logger.info(
-                "Enable TF32 matmul for MiniMaxM2ForCausalLM model to improve gate gemm performance."
-            )
+            # TF32 matmul is a CUDA-only TensorFloat32 path; skip the auto-enable
+            # on ROCm/HIP where it does not apply.
+            if not is_hip():
+                self.enable_tf32_matmul = True
+                logger.info(
+                    "Enable TF32 matmul for MiniMaxM2ForCausalLM model to improve gate gemm performance."
+                )
 
         if (
             model_arch in ["Qwen3VLForConditionalGeneration"]

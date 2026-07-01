@@ -1,0 +1,198 @@
+# AMD nightly serving-benchmark configurations.
+#
+# The workflow (.github/workflows/nightly-benchmark-amd-rocm720.yml) launches an
+# sglang server *itself* with the flags/env below (so the launch is fully under
+# your control and one launch sweeps every concurrency), then drives load with
+# the SemiAnalysis InferenceX client (utils/bench_serving/benchmark_serving.py)
+# so the metrics stay apples-to-apples with the published dashboard.
+#
+# It expands into one job per (config x variant). To add a model: add an entry
+# below. Do NOT edit the workflow YAML for routine config changes.
+#
+# Per-run knobs (override-able from workflow_dispatch inputs):
+#   name          unique id (used in artifact / result-file names)
+#   model-prefix  short id, e.g. dsv4
+#   precision     fp4 | fp8 | ...
+#   runner        mi355x | mi325x | ...
+#   framework     sglang
+#   model         HF id, or local /path (a path starting with / skips download)
+#   runs-on       GitHub Actions runner label
+#   rocm-version  ROCm image to pull via amd_ci_start_container (rocm720 | rocm700)
+#   variants      list of: base (STP) | mtp (EAGLE speculative decoding)
+#   tp / ep       parallel sizes (default 8 / 1)
+#   dp-attn       enable DP-attention path (default false; true for high conc)
+#   isl / osl     sequence lengths (default 1024 / 1024)
+#   conc-list     space/comma concurrencies; ONE server launch sweeps all of them
+#
+# Launch spec (your control over how the server starts; not dispatch-overridable):
+#   env             map of env vars exported before launch (base + every variant)
+#   mtp-env         extra env merged in only for the mtp variant
+#   server-args     extra `sglang.launch_server` flags (base + every variant)
+#   mtp-server-args extra launch flags only for the mtp variant (EAGLE chain)
+#   chat-template   path (relative to the benchmark repo, or absolute) -> --chat-template
+#   client-args     extra benchmark_serving.py flags (every variant)
+#   mtp-client-args extra client flags only for mtp (e.g. --dsv4 chat framing)
+#   bench-backend   benchmark_serving.py --backend value (default vllm)
+#
+# The launcher always supplies --model-path/--host/--port/--tensor-parallel-size,
+# the --dp/--enable-dp-attention (when dp-attn) and --ep-size (when ep>1) flags,
+# --context-length (isl+osl+256) and --max-running-requests (max of conc-list).
+
+configs:
+  - name: dsv4-fp4-mi355x-sglang
+    model-prefix: dsv4
+    precision: fp4
+    runner: mi355x
+    framework: sglang
+    model: deepseek-ai/DeepSeek-V4-Pro
+    runs-on: linux-mi35x-gpu-8
+    rocm-version: rocm720
+    variants: [base, mtp]
+    tp: 8
+    ep: 1
+    dp-attn: false
+    isl: 1024
+    osl: 1024
+    conc-list: "1 4 16 32"      # one launch sweeps all of these
+    # --- launch spec (lifted from InferenceX dsv4_fp4_mi355x_sglang.sh) --------
+    # NOTE: these were tuned for InferenceX's pinned -DSv4 image. If they crash
+    # on the under-test mainline rocm/sgl-dev image, the known-good set used by
+    # test/registered/amd/test_deepseek_v4_pro_fp4.py is a good reference
+    # (it uses --attention-backend dsv4 + SGLANG_OPT_USE_AITER_INDEXER=true +
+    # SGLANG_OPT_FP8_WO_A_GEMM=false instead of the tilelang-indexer path below).
+    env:
+      SGLANG_REASONING_EFFORT: "max"
+      SGLANG_OPT_USE_FUSED_COMPRESS: "true"
+      SGLANG_OPT_USE_OLD_COMPRESSOR: "false"
+      SGLANG_OPT_USE_TILELANG_SWA_PREPARE: "false"
+      SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK: "false"
+      SGLANG_OPT_USE_FUSED_HASH_TOPK: "true"
+      SGLANG_OPT_DEEPGEMM_HC_PRENORM: "false"
+      SGLANG_OPT_USE_TILELANG_MHC_PRE: "false"
+      SGLANG_OPT_USE_TILELANG_MHC_POST: "false"
+      SGLANG_OPT_USE_AITER_MHC_PRE: "true"
+      SGLANG_OPT_USE_AITER_MHC_POST: "true"
+      SGLANG_ENABLE_THINKING: "1"
+      SGLANG_USE_AITER: "1"
+      SGLANG_USE_ROCM700A: "1"
+      SGLANG_TOPK_TRANSFORM_512_TORCH: "0"
+      SGLANG_FP8_PAGED_MQA_LOGITS_TORCH: "1"
+      SGLANG_DSV4_FP4_EXPERTS: "True"
+      SGLANG_OPT_DPSK_V4_RADIX: "1"
+      SGLANG_OPT_USE_OVERLAP_STORE_CACHE: "false"
+      SGLANG_OPT_USE_FUSED_STORE_CACHE: "true"
+      SGLANG_FORCE_TRITON_MOE_FP8: "0"
+      SGLANG_HACK_FLASHMLA_BACKEND: "triton"
+      SGLANG_OPT_USE_TILELANG_INDEXER: "true"
+      SGLANG_OPT_USE_TRITON_SWA_PREPARE: "true"
+      AITER_BF16_FP8_MOE_BOUND: "0"
+      SGLANG_OPT_FUSE_WQA_WKV: "true"
+      SGLANG_OPT_USE_FUSED_PAGED_COMPRESS: "true"
+      SGLANG_OPT_USE_MULTI_STREAM_OVERLAP: "0"
+    mtp-env:
+      SGLANG_OPT_USE_TRITON_FUSED_MHC: "1"
+      SGLANG_OPT_C4_SPARSE_TOPK: "512"
+    server-args: >-
+      --trust-remote-code
+      --disable-radix-cache
+      --attention-backend compressed
+      --mem-fraction-static 0.90
+      --swa-full-tokens-ratio 0.15
+      --page-size 256
+      --chunked-prefill-size 8192
+      --disable-shared-experts-fusion
+      --tool-call-parser deepseekv4
+      --reasoning-parser deepseek-v4
+      --watchdog-timeout 1800
+    # TP-only low-conc EAGLE chain (3,1,4). For the dp-attn high-conc regime the
+    # InferenceX recipe uses (2,1,3) -- add a separate dp-attn:true entry for it.
+    mtp-server-args: >-
+      --speculative-algorithm EAGLE
+      --speculative-num-steps 3
+      --speculative-eagle-topk 1
+      --speculative-num-draft-tokens 4
+    chat-template: benchmarks/single_node/chat_templates/deepseek_v4_thinking.jinja
+    # MTP needs chat-formatted input or EAGLE acceptance silently regresses;
+    # --dsv4 routes through InferenceX's encoding_dsv4.py framing.
+    mtp-client-args: "--dsv4"
+    bench-backend: vllm
+
+  # MiniMax-M2.5 TP4 on rocm700. InferenceX has no sglang minimax recipe yet, so
+  # the launch spec is lifted from the nightly TP4 test
+  # (test/registered/amd/accuracy/mi35x/test_minimax_m25_tp4_eval_mi35x.py;
+  # TP4 + unified attention + FP8 KV cache). base-only (no MTP variant). The
+  # 1k1k and 8k1k entries share one launch spec via YAML anchors -- tune env /
+  # server-args in one place.
+  - name: minimaxm25-fp8-mi355x-sglang-1k1k
+    model-prefix: minimaxm25
+    precision: fp8
+    runner: mi355x
+    framework: sglang
+    model: MiniMaxAI/MiniMax-M2.5
+    runs-on: linux-mi35x-gpu-8
+    rocm-version: rocm700
+    variants: [base]
+    tp: 4
+    ep: 1
+    dp-attn: false
+    isl: 1024
+    osl: 1024
+    conc-list: "4 8 16 32 64 128"
+    env: &minimax_m25_env
+      SGLANG_USE_AITER: "1"
+      SGLANG_USE_AITER_UNIFIED_ATTN: "1"
+    server-args: &minimax_m25_server_args >-
+      --dtype bfloat16
+      --trust-remote-code
+      --attention-backend aiter
+      --mem-fraction-static 0.85
+      --disable-radix-cache
+      --kv-cache-dtype fp8_e4m3
+      --page-size 16
+      --stream-interval 10
+      --scheduler-recv-interval 10
+      --watchdog-timeout 1200
+    bench-backend: vllm
+
+  - name: minimaxm25-fp8-mi355x-sglang-8k1k
+    model-prefix: minimaxm25
+    precision: fp8
+    runner: mi355x
+    framework: sglang
+    model: MiniMaxAI/MiniMax-M2.5
+    runs-on: linux-mi35x-gpu-8
+    rocm-version: rocm700
+    variants: [base]
+    tp: 4
+    ep: 1
+    dp-attn: false
+    isl: 8192
+    osl: 1024
+    conc-list: "4 8 16 32 64 128"
+    env: *minimax_m25_env
+    server-args: *minimax_m25_server_args
+    bench-backend: vllm
+
+  # --- examples: copy an entry above and adjust to add coverage ---------------
+  #
+  # High-concurrency DP-attention sweep (mirrors the dsv4 search space in
+  # InferenceX amd-master.yaml; uses the (2,1,3) EAGLE chain for MTP):
+  #
+  # - name: dsv4-fp4-mi355x-sglang-dp
+  #   model-prefix: dsv4
+  #   precision: fp4
+  #   runner: mi355x
+  #   framework: sglang
+  #   model: deepseek-ai/DeepSeek-V4-Pro
+  #   runs-on: linux-mi35x-gpu-8
+  #   variants: [base, mtp]
+  #   tp: 8
+  #   dp-attn: true
+  #   conc-list: "64 256 1024"
+  #   env: { ... same as above ... }
+  #   server-args: >- ... same ...
+  #   mtp-server-args: >-
+  #     --speculative-algorithm EAGLE --speculative-num-steps 2
+  #     --speculative-eagle-topk 1 --speculative-num-draft-tokens 3
+  #   chat-template: benchmarks/single_node/chat_templates/deepseek_v4_thinking.jinja
+  #   mtp-client-args: "--dsv4"
