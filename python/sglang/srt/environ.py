@@ -232,6 +232,12 @@ class Envs:
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
+    # HTTP server
+    # Decompress request bodies tagged with `x-body-compressed`.
+    SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
+    # Override parsed request fields from headers.
+    SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
+
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
