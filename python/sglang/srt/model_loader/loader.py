@@ -2151,10 +2151,40 @@ class GGUFModelLoader(BaseModelLoader):
             gguf_to_hf_name_map[f"{gguf_name}.{suffix}"] = hf_name
         return gguf_to_hf_name_map
 
+    def _get_gguf_files(self, first_shard_path: str) -> List[str]:
+        # A sharded GGUF checkpoint is split into sibling files like
+        # `<name>-00001-of-000NN.gguf`. Given any one shard, rebuild the full
+        # set by shard index (1..total) rather than globbing, so a sibling
+        # model with a similar prefix is never pulled in. Padding width comes
+        # from the matched name; a non-sharded path is returned unchanged.
+        match = re.search(r"-(\d+)-of-(\d+)\.gguf$", os.path.basename(first_shard_path))
+        if match is None:
+            return [first_shard_path]
+        total = int(match.group(2))
+        num_digits = len(match.group(1))
+        directory = os.path.dirname(first_shard_path)
+        base = os.path.basename(first_shard_path)
+        prefix, suffix = base[: match.start(1)], base[match.end(2) :]
+        files = [
+            os.path.join(
+                directory,
+                f"{prefix}{i:0{num_digits}d}-of-{total:0{num_digits}d}{suffix}",
+            )
+            for i in range(1, total + 1)
+        ]
+        missing = [f for f in files if not os.path.isfile(f)]
+        if missing:
+            raise ValueError(
+                f"Incomplete sharded GGUF for {first_shard_path}: missing "
+                f"{len(missing)} of {total} shards: {missing}"
+            )
+        return files
+
     def _get_weights_iterator(
-        self, model_name_or_path: str, gguf_to_hf_name_map: Dict[str, str]
+        self, gguf_files: List[str], gguf_to_hf_name_map: Dict[str, str]
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-        return gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
+        for gguf_file in gguf_files:
+            yield from gguf_quant_weights_iterator(gguf_file, gguf_to_hf_name_map)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config.model_path)
@@ -2167,11 +2197,16 @@ class GGUFModelLoader(BaseModelLoader):
     ) -> nn.Module:
 
         local_model_path = self._prepare_weights(model_config.model_path)
+        gguf_files = self._get_gguf_files(local_model_path)
         gguf_weights_map = self._get_gguf_weights_map(model_config)
-        # we can only know if tie word embeddings after mapping weights
-        if "lm_head.weight" in get_gguf_extra_tensor_names(
-            local_model_path, gguf_weights_map
-        ):
+        # we can only know about tied word embeddings after mapping weights;
+        # treat a tensor as absent only if it is missing from every shard.
+        extra_tensor_names = set(gguf_weights_map.values())
+        for gguf_file in gguf_files:
+            extra_tensor_names &= set(
+                get_gguf_extra_tensor_names(gguf_file, gguf_weights_map)
+            )
+        if "lm_head.weight" in extra_tensor_names:
             model_config.hf_config.update({"tie_word_embeddings": True})
 
         target_device = torch.device(device_config.device)
@@ -2179,9 +2214,7 @@ class GGUFModelLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
-            model.load_weights(
-                self._get_weights_iterator(local_model_path, gguf_weights_map)
-            )
+            model.load_weights(self._get_weights_iterator(gguf_files, gguf_weights_map))
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
