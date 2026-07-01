@@ -1,6 +1,6 @@
 import logging
 from enum import Enum, auto
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 
 import torch
 from torch.cuda import Event as CudaEvent
@@ -28,13 +28,26 @@ class LoRAOverlapLoader:
         )
         self.lora_to_overlap_load_event: Dict[Optional[str], CudaEvent] = {}
 
+        # Track adapters whose pipelined loading has started (forward can proceed)
+        self.pipelined_loading_loras: Set[Optional[str]] = set()
+
     def try_overlap_load_lora(
         self, lora_id: Optional[str], running_loras: set[Optional[str]]
     ) -> bool:
         """
-        Check a LoRA adapter's asynchronous load status, and try to load it if there's capacity
-        in the memory pool. Returns whether or not the adapter has been loaded.
+        Check a LoRA adapter's asynchronous load status, and try to load it if there's
+        capacity in the memory pool. Returns whether or not the adapter is ready for
+        forward pass execution.
+
+        Returns True as soon as loading has STARTED (not finished),
+        because per-layer flags in forward() will gate execution.
         """
+        if lora_id in self.pipelined_loading_loras:
+            # Verify adapter is still in GPU memory (not evicted)
+            if lora_id in self.lora_manager.memory_pool.uid_to_buffer_id:
+                return True
+            self.pipelined_loading_loras.discard(lora_id)
+
         # Drain completed async loads before status/capacity checks so finished
         # adapters no longer count as in-flight.
         self._drain_completed_overlap_loads()
@@ -46,10 +59,14 @@ class LoRAOverlapLoader:
             res = self._try_start_overlap_load(lora_id, running_loras)
             if res:
                 logger.debug(f"Loading LoRA adapter {lora_id} asynchronously")
-
+                # will synchronize inside forward()
+                self.pipelined_loading_loras.add(lora_id)
+                return True
             return False
         else:
             assert lora_pipeline_load_status == LoRAOverlapLoadStatus.LOADED
+            # Clean up pipelined tracking
+            self.pipelined_loading_loras.discard(lora_id)
             return True
 
     def _check_overlap_load_status(
@@ -85,7 +102,12 @@ class LoRAOverlapLoader:
             return False
 
         with self.load_stream_context:
-            self.lora_manager.fetch_new_loras({lora_id}, loras_to_be_loaded)
+            self.lora_manager.fetch_new_loras(
+                {lora_id},
+                loras_to_be_loaded,
+                loading_stream=self.load_stream,
+            )
+
             event = self.device_module.Event()
             event.record(self.load_stream)
 

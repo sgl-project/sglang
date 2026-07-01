@@ -25,6 +25,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.lora_pipeline_sync import LoRAPipelineFlag
 from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -44,6 +45,25 @@ class BaseLayerWithLoRA(nn.Module):
             self.weight = self.base_layer.weight
         if hasattr(self.base_layer, "bias") and self.base_layer.bias is not None:
             self.bias = self.base_layer.bias
+
+        # Pipeline sync flag -- initialized by LoRAManager when overlap loading is enabled.
+        # All modules within the same transformer layer share a single flag
+        # since their weights are loaded together in one DMA batch.
+        self._pipeline_flag: Optional[LoRAPipelineFlag] = None
+
+    def init_pipeline_flag(self, flag: LoRAPipelineFlag) -> None:
+        """Set the pipeline synchronization flag for this module."""
+        self._pipeline_flag = flag
+
+    def _sync_lora_loads(self) -> None:
+        """Wait for LoRA weights to be ready before forward computation.
+
+        Only called during prefill. Decode skips this entirely since the
+        adapter is guaranteed loaded by end of prefill.
+        No-op when overlap loading is disabled or no load is in progress.
+        """
+        if self._pipeline_flag is not None:
+            self._pipeline_flag.wait_until_ready(torch.cuda.current_stream())
 
     def forward(self, x: torch.Tensor):
         return self.base_layer.forward(x)
@@ -194,6 +214,8 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         Extra tokens (tokens >= vocab_size) are now handled efficiently
         in the backend's run_lora_a_embedding method.
         """
+        self._sync_lora_loads()
+
         batch_info = self.lora_backend.batch_info
 
         # Get base embedding output
@@ -371,6 +393,8 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         return lora_output
 
     def forward(self, hidden_states: torch.Tensor):
+        self._sync_lora_loads()
+
         # Apply base linear transformation
         base_output = F.linear(
             hidden_states, self.weight, bias=getattr(self.base_layer, "bias", None)
@@ -460,6 +484,8 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         return lora_output
 
     def forward(self, input_: torch.Tensor):
+        self._sync_lora_loads()
+
         # duplicate the logic in ColumnParallelLinear
         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
         output_parallel = self.base_layer.quant_method.apply(
@@ -710,6 +736,8 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         return lora_output
 
     def forward(self, input_: torch.Tensor, skip_all_reduce=False, forward_batch=None):
+        self._sync_lora_loads()
+
         if self.base_layer.input_is_parallel:
             input_parallel = input_
         else:
@@ -845,6 +873,8 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
         return lora_output
 
     def forward(self, x: torch.Tensor):
+        self._sync_lora_loads()
+
         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
         output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
         if self.set_lora:
@@ -1024,6 +1054,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         1. After gate_up projection, before activation
         2. After down projection, before final reduction
         """
+        self._sync_lora_loads()
 
         # Build LoRA info for this batch
         lora_info = self._get_lora_info()
