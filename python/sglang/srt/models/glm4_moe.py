@@ -57,6 +57,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     should_skip_post_experts_all_reduce,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -374,8 +375,13 @@ class Glm4MoeGate(nn.Module):
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
+        correction_bias_dtype = (
+            torch.bfloat16
+            if get_moe_runner_backend().is_flashinfer_trtllm()
+            else torch.float32
+        )
         self.e_score_correction_bias = nn.Parameter(
-            torch.empty((config.n_routed_experts), dtype=torch.float32)
+            torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
         )
         # GLM requires FP32 gate projection; cache to avoid per-forward cast.
         # FIXME: if gate weight is updated at runtime (e.g. expert rebalancing), _weight_fp32 must be invalidated.

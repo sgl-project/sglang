@@ -458,6 +458,8 @@ class MoEGate(nn.Module):
                     "quark",
                 ):
                     correction_bias_dtype = torch.bfloat16
+            elif get_moe_runner_backend().is_flashinfer_trtllm():
+                correction_bias_dtype = torch.bfloat16
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
             )
