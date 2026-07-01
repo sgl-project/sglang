@@ -350,5 +350,64 @@ def test_moe_fused_gate_sigmoid_matches_aot(
     )
 
 
+@pytest.mark.parametrize(
+    "num_experts,num_expert_group,topk_group,topk",
+    [
+        (256, 8, 4, 8),  # DeepSeek-V3
+        (128, 8, 4, 6),
+        (256, 4, 2, 8),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_moe_fused_gate_grouped_matches_production_impl(
+    num_experts: int,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    dtype: torch.dtype,
+) -> None:
+    """Grouped Triton routing must match the definitional biased_grouped_topk_impl.
+
+    The kernel adds DeepSeek-V3 grouped routing (per-group top-2-sum group scores,
+    keep topk_group groups, then top-k within). biased_grouped_topk_impl is the
+    eager reference the production grouped path is defined against.
+    """
+    M = 256
+    torch.manual_seed(num_experts * 7 + num_expert_group * 13 + topk)
+    gating = torch.randn(M, num_experts, dtype=dtype, device=DEVICE) * 2.0
+    bias = torch.randn(num_experts, dtype=torch.float32, device=DEVICE) * 0.5
+    hidden = torch.randn(M, 16, dtype=dtype, device=DEVICE)
+
+    tri_w, tri_i = moe_fused_gate(
+        gating,
+        bias,
+        topk=topk,
+        scoring_func="sigmoid",
+        renormalize=True,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+    )
+    ref_w, ref_i = biased_grouped_topk_impl(
+        hidden,
+        gating,
+        bias,
+        topk,
+        True,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=1.0,
+        apply_routed_scaling_factor_on_output=False,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        _scatter_by_expert(tri_w, tri_i, num_experts),
+        _scatter_by_expert(ref_w, ref_i, num_experts),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

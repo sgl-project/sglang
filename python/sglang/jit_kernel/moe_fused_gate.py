@@ -101,6 +101,10 @@ def _router_triton_kernel(
     BLOCK_M: tl.constexpr,  # rows processed per program (row tiling)
     BLOCK_N: tl.constexpr,  # >= N, power of 2
     BLOCK_K: tl.constexpr,  # >= K, power of 2
+    N_GROUP: tl.constexpr,  # expert groups (1 = ungrouped)
+    TOPK_GROUP: tl.constexpr,  # groups kept per token (grouped routing)
+    EXPERTS_PER_GROUP: tl.constexpr,  # N // N_GROUP
+    BLOCK_G: tl.constexpr,  # >= N_GROUP, power of 2
     SCORING_FUNC: tl.constexpr,  # 0 = sigmoid, 1 = sqrtsoftplus, 2 = softmax
     HAS_SOFTCAP: tl.constexpr,  # tanh softcapping (softmax only)
     RENORMALIZE: tl.constexpr,
@@ -162,6 +166,32 @@ def _router_triton_kernel(
         activated = exp_row / row_sum
 
     biased = tl.where(mask_n[None, :], biased, -float("inf"))  # [BLOCK_M, BLOCK_N]
+
+    # Grouped routing (DeepSeek-V3 noaux_tc): per-group score = sum of the top-2
+    # biased values; keep TOPK_GROUP groups (lowest group id wins ties); mask the
+    # experts of dropped groups to -inf before the top-k below. Weight is still the
+    # bias-free `activated`. Constexpr N_GROUP <= 1 skips this entirely (ungrouped).
+    if N_GROUP > 1:
+        offs_g = tl.arange(0, BLOCK_G)  # [BLOCK_G]
+        group_of_n = offs_n // EXPERTS_PER_GROUP  # [BLOCK_N]
+        group_score = tl.full([BLOCK_M, BLOCK_G], -float("inf"), dtype=tl.float32)
+        for g in tl.static_range(N_GROUP):
+            in_g = (group_of_n[None, :] == g) & mask_n[None, :]
+            vals = tl.where(in_g, biased, -float("inf"))
+            top1 = tl.max(vals, axis=1)[:, None]  # [BLOCK_M, 1]
+            vals2 = tl.where(vals >= top1, -float("inf"), vals)
+            top2 = tl.max(vals2, axis=1)[:, None]  # [BLOCK_M, 1]
+            group_score = tl.where(offs_g[None, :] == g, top1 + top2, group_score)
+
+        gcur = group_score
+        keep = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        for _i in tl.static_range(TOPK_GROUP):
+            gmax = tl.max(gcur, axis=1)[:, None]  # [BLOCK_M, 1]
+            glane = tl.where(gcur == gmax, offs_g[None, :], N_GROUP + 1)
+            win_g = tl.min(glane, axis=1)[:, None]  # [BLOCK_M, 1] lowest-id on ties
+            keep = tl.where(group_of_n[None, :] == win_g, 1.0, keep)
+            gcur = tl.where(offs_g[None, :] == win_g, -float("inf"), gcur)
+        biased = tl.where(keep > 0.0, biased, -float("inf"))
 
     offs_k = tl.arange(0, BLOCK_K)  # [BLOCK_K]
     mask_k_total = offs_k < K
@@ -229,12 +259,16 @@ def moe_fused_gate(
     routed_scaling_factor: float = 1.0,
     apply_routed_scaling_factor_on_output: bool = False,
     moe_softcapping: float = 0.0,
+    num_expert_group: int = 1,
+    topk_group: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
 
-    Mirrors the semantics of :func:`moe_fused_gate_jit` (the CUDA JIT kernel)
-    for the ungrouped case (``num_expert_group == 1``). The first argument is
-    named ``scores`` (raw GEMM logits) to match the existing call sites.
+    Mirrors the semantics of :func:`moe_fused_gate_jit` (the CUDA JIT kernel).
+    With ``num_expert_group > 1`` it performs DeepSeek-V3 grouped routing
+    (per-group top-2-sum group scores, keep ``topk_group`` groups, then top-k
+    within). The first argument is named ``scores`` (raw GEMM logits) to match
+    the existing call sites.
     """
     scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
     assert (
@@ -254,6 +288,11 @@ def moe_fused_gate(
     M, N = scores.shape
     K = topk
     K_routed = topk - num_fused_shared_experts
+    if num_expert_group > 1:
+        assert N % num_expert_group == 0, "num_experts must be divisible by group count"
+        assert 1 <= topk_group <= num_expert_group, "invalid topk_group"
+    experts_per_group = N // num_expert_group
+    BLOCK_G = triton.next_power_of_2(num_expert_group)
 
     weights = torch.empty((M, K), dtype=torch.float32, device=scores.device)
     indices = torch.empty((M, K), dtype=torch.int32, device=scores.device)
@@ -283,6 +322,10 @@ def moe_fused_gate(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        N_GROUP=num_expert_group,
+        TOPK_GROUP=topk_group,
+        EXPERTS_PER_GROUP=experts_per_group,
+        BLOCK_G=BLOCK_G,
         SCORING_FUNC=scoring_func_int,
         HAS_SOFTCAP=bool(moe_softcapping != 0.0),
         RENORMALIZE=bool(renormalize),
