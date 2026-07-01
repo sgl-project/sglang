@@ -621,9 +621,9 @@ def get_available_gpu_memory(
 
         if empty_cache:
             empty_device_cache(torch.xpu)
-        used_memory = torch.xpu.memory_allocated()
-        total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
-        free_gpu_memory = total_gpu_memory - used_memory
+        # Use mem_get_info() to reflect true OS-level free memory
+        # including graph pool reservations; avoids KV-cache over-allocation.
+        free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info(gpu_id)
 
     elif device == "hpu":
         num_gpus = torch.hpu.device_count()
