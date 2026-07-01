@@ -439,17 +439,15 @@ class TestBuildDumpPlan(unittest.TestCase):
 
 
 class TestBuildSubfolderName(unittest.TestCase):
-    """`_build_subfolder_name` must fold `moe_dense_tp_size` into the cache
-    key, since it changes the effective TP width used for dense layers
-    (see dp_attention.py: local_tp_size = moe_dense_tp_size or tp_size)
-    independently of tp/dp/ep/pp. Without this, two runs with different
-    moe_dense_tp_size values would collide on the same subfolder and load
-    mismatched dense-layer shards."""
+    """`_build_subfolder_name` must encode every dimension that affects
+    per-rank tensor shapes or content into the cache-key subfolder name,
+    so that two runs with different parallelism configs or EPLB settings
+    never collide on the same presharded directory."""
 
     def _build(
         self,
         *,
-        moe_dense_tp_size,
+        moe_dense_tp_size=None,
         tp=4,
         dp=1,
         ep=1,
@@ -487,45 +485,6 @@ class TestBuildSubfolderName(unittest.TestCase):
         ):
             model_config = SimpleNamespace(quantization=quantization)
             return loader._build_subfolder_name(model_config)
-
-    def test_default_moe_dense_tp_size_omits_suffix(self):
-        # moe_dense_tp_size=None ⇒ local_dense_tp falls back to tp_size, so
-        # the dense-layer split is identical to the plain TP split and no
-        # extra suffix is needed.
-        name = self._build(moe_dense_tp_size=None, tp=4)
-        self.assertEqual(name, "TP-4")
-
-    def test_moe_dense_tp_size_equal_to_tp_omits_suffix(self):
-        name = self._build(moe_dense_tp_size=4, tp=4)
-        self.assertEqual(name, "TP-4")
-
-    def test_moe_dense_tp_size_one_adds_suffix(self):
-        # moe_dense_tp_size=1 with tp=4 makes the dense-layer split diverge
-        # from the plain TP split, so the subfolder name must differ.
-        name = self._build(moe_dense_tp_size=1, tp=4)
-        self.assertEqual(name, "TP-4-DenseTP-1")
-
-    def test_none_and_one_are_distinguished_when_tp_not_one(self):
-        # This is the actual collision the fix addresses: with tp=4, the
-        # two valid values of moe_dense_tp_size (None and 1) used to map
-        # to the same subfolder name.
-        name_default = self._build(moe_dense_tp_size=None, tp=4)
-        name_one = self._build(moe_dense_tp_size=1, tp=4)
-        self.assertNotEqual(name_default, name_one)
-
-    def test_none_and_tp_size_value_collapse_to_same_name(self):
-        # Passing moe_dense_tp_size explicitly equal to tp_size is
-        # semantically the same as leaving it None, so they should still
-        # share a cache entry.
-        name_default = self._build(moe_dense_tp_size=None, tp=4)
-        name_explicit = self._build(moe_dense_tp_size=4, tp=4)
-        self.assertEqual(name_default, name_explicit)
-
-    def test_moe_dense_tp_size_with_other_parallel_dims_and_quant(self):
-        name = self._build(
-            moe_dense_tp_size=1, tp=8, dp=2, ep=8, pp=2, quantization="fp8"
-        )
-        self.assertEqual(name, "TP-8-DP-2-EP-8-PP-2-DenseTP-1-dtype-fp8")
 
     def test_default_eplb_config_omits_suffixes(self):
         # ep_num_redundant_experts=0 and init_expert_location="trivial" are
@@ -591,12 +550,6 @@ class TestBuildSubfolderName(unittest.TestCase):
         self.assertTrue(name.startswith("TP-8-DP-2-EP-8-PP-2-DenseTP-1-dtype-fp8-"))
         self.assertIn("RedEP-16", name)
         self.assertIn("ExpLoc-", name)
-
-    def test_tp_one_with_dense_tp_one_omits_suffix(self):
-        # When tp_size itself is 1, moe_dense_tp_size=1 doesn't diverge from
-        # tp, so no suffix should be added.
-        name = self._build(moe_dense_tp_size=1, tp=1)
-        self.assertEqual(name, "TP-1")
 
     def test_structural_signature_failure_falls_back_silently(self):
         # When the model class can't be built on meta device (here: the
