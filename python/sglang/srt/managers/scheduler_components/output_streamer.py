@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     List,
@@ -29,6 +30,10 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler_components.rust_server import RustServer
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,6 +50,10 @@ class SchedulerOutputStreamer:
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
     enable_hicache_storage: Callable[[], bool]
+    # When SGLANG_RUST_SERVER is on, generation output is pushed to the embedded
+    # Rust egress ring via `rust_server.push_generation` instead of the zmq
+    # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
+    rust_server: Optional[RustServer] = None
     _test_stream_output_count: int = 0
 
     def _get_storage_backend_type(self) -> str:
@@ -143,6 +152,7 @@ class SchedulerOutputStreamer:
             default_stream_interval=self.server_args.stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,
+            rust_mode=self.rust_server is not None,
         )
         for req in reqs:
             if req is skip_req:
@@ -161,7 +171,10 @@ class SchedulerOutputStreamer:
             is_idle_batch=is_idle_batch,
         )
         if payload is not None:
-            self.send_to_detokenizer.send_output(payload)
+            if self.rust_server is not None:
+                self.rust_server.push_generation(payload)
+            else:
+                self.send_to_detokenizer.send_output(payload)
 
     def _maybe_log_time_stats(self, *, req: Req) -> None:
         if (
@@ -255,7 +268,6 @@ class _GenerationStreamAccumulator:
     default_stream_interval: int
     default_force_stream_interval: int
     get_cached_tokens_details: Callable[[Req], Optional[CachedTokensDetails]]
-
     rids: list = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
     finished_reasons: list = field(default_factory=list)
@@ -297,6 +309,10 @@ class _GenerationStreamAccumulator:
     input_token_ids_logprobs_idx: Optional[list] = None
     output_token_ids_logprobs_val: Optional[list] = None
     output_token_ids_logprobs_idx: Optional[list] = None
+    # Rust server mode: the Rust detokenizer reconstructs text/ids from the raw
+    # output tokens itself and never consumes the scheduler's incremental-detok
+    # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
+    rust_mode: bool = False
 
     def __post_init__(self) -> None:
         if self.return_hidden_states:
@@ -359,15 +375,21 @@ class _GenerationStreamAccumulator:
             req.finished_reason.to_json() if req.finished_reason else None
         )
         self.decoded_texts.append(req.decoded_text)
-        decode_ids, read_offset = req.init_incremental_detokenize()
-
-        self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+        if self.rust_mode:
+            # Rust detok works from raw output tokens and ignores decode_ids /
+            # read_offset, so skip the per-step incremental-detok bookkeeping
+            # (surr_and_decode_ids) entirely. Placeholders keep the parallel
+            # lists aligned; the Rust egress (push_generation) never reads them.
+            self.decode_ids_list.append([])
+            self.read_offsets.append(0)
+        else:
+            decode_ids, read_offset = req.init_incremental_detokenize()
+            self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+            req.send_decode_id_offset = len(decode_ids)
+            self.read_offsets.append(read_offset)
 
         # Exclude the tokens after stop condition
         output_ids_ = req.output_ids_through_stop
-
-        req.send_decode_id_offset = len(decode_ids)
-        self.read_offsets.append(read_offset)
         self.output_ids.append(output_ids_[send_token_offset:])
         req.send_token_offset = len(output_ids_)
         self.skip_special_tokens.append(req.sampling_params.skip_special_tokens)

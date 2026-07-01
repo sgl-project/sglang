@@ -2505,6 +2505,12 @@ def launch_server(
         run_detokenizer_process_func=run_detokenizer_process_func,
     )
 
+    if envs.SGLANG_RUST_SERVER.get():
+        # The Rust server serves api-server, tokenizer, and detokenizer, so the
+        # main process has no Python HTTP server / tokenizer manager to run.
+        scheduler_init_result.wait_for_completion()
+        return
+
     _setup_and_run_http_server(
         server_args,
         tokenizer_manager,
