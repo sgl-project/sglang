@@ -305,6 +305,14 @@ def _is_qwen3(ctx):
     )
 
 
+def _is_qwen3_5(ctx):
+    return ctx.has_text("<|im_start|>") and ctx.has_text("<think>") and not ctx.has_text("enable_thinking")
+
+
+def _is_deepseek_v4(ctx):
+    return ctx.has_text("reasoning_effort") and ctx.has_text("</think>")
+
+
 def _is_deepseek_v3(ctx):
     return ctx.reasoning_config == ReasoningToggleConfig(
         toggle_param="thinking", default_enabled=False
@@ -342,6 +350,8 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="qwen3", value="qwen3", predicate=_is_qwen3),
     DetectionRule(name="deepseek_v4", value="deepseek-v4", predicate=_is_deepseek_v4),
     DetectionRule(name="deepseek_v3", value="deepseek-v3", predicate=_is_deepseek_v3),
+    DetectionRule(name="qwen3_5", value="qwen3", predicate=_is_qwen3_5),
+    DetectionRule(name="deepseek_v4", value="deepseek-v3", predicate=_is_deepseek_v4),
     DetectionRule(
         name="deepseek_r1_force", value="deepseek-r1", predicate=_is_deepseek_r1
     ),
