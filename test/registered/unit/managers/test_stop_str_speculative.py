@@ -17,8 +17,10 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 # Token id -> decoded text; decode() concatenates. Distinct symbols so no
 # accidental cross-matches (10-39 are lowercase letters).
 STOP_ID = 1
+EOS_ID = 2
 ID_TO_TEXT = {
     STOP_ID: "STOP",
+    EOS_ID: "",
     **{i: chr(ord("a") + i % 26) for i in range(10, 40)},
     60: "a",
     61: ".",
@@ -48,7 +50,7 @@ class _MockTokenizerForNormalize:
         return list(range(len(s)))  # One "token" per character
 
 
-def _make_req(output_ids, stop=None, stop_regex=None):
+def _make_req(output_ids, stop=None, stop_regex=None, eos_token_ids=frozenset()):
     sp = SamplingParams(max_new_tokens=1000, stop=stop, stop_regex=stop_regex)
     sp.normalize(tokenizer=_MockTokenizerForNormalize())  # char-based stop_str_max_len
     req = Req(
@@ -56,7 +58,7 @@ def _make_req(output_ids, stop=None, stop_regex=None):
         origin_input_text="",
         origin_input_ids=array("q", [0]),
         sampling_params=sp,
-        eos_token_ids=set(),
+        eos_token_ids=eos_token_ids,
         vocab_size=10_000,
     )
     req.tokenizer = _FakeTokenizer()
@@ -79,6 +81,18 @@ class TestStopStrSpeculative(unittest.TestCase):
         self.assertTrue(req.finished())
         self.assertEqual(req.finished_reason.matched, "STOP")
         self.assertEqual(req.finished_len, 4)
+
+    def test_stop_str_wins_over_eos_in_same_step(self):
+        # A step accepting both the stop string and EOS must finish as
+        # FINISH_MATCHED_STR with finished_len past the stop string, not as
+        # FINISH_MATCHED_TOKEN trimming only the EOS token (which leaks "STOP").
+        req = _make_req(
+            [10, 11, STOP_ID, EOS_ID], stop=["STOP"], eos_token_ids={EOS_ID}
+        )
+        req.update_finish_state(new_accepted_len=4)
+        self.assertTrue(req.finished())
+        self.assertEqual(req.finished_reason.matched, "STOP")
+        self.assertEqual(req.finished_len, 3)
 
     def test_stop_str_at_chunk_end_uses_full_len(self):
         # Stop is the last token -> loop never matches before the full window ->

@@ -18,24 +18,14 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
+from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-
-if envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
-    # NOTE: should eventually be the only compressor backend
-    from sglang.srt.layers.attention.dsv4.compressor_v2 import (
-        CompressorBackendMixin,
-        FusedCompressMetadata,
-        create_paged_compressor_data,
-    )
-else:
-    from sglang.srt.layers.attention.dsv4.compressor import (
-        CompressorBackendMixin,
-        FusedCompressMetadata,
-        create_paged_compressor_data,
-    )
-
-from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
+from sglang.srt.layers.attention.dsv4.compressor_v2 import (
+    CompressorBackendMixin,
+    FusedCompressMetadata,
+    create_paged_compressor_data,
+)
 from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
     dequantize_k_cache_paged,
 )
@@ -55,12 +45,9 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
 )
-from sglang.srt.layers.dp_attention import (
-    get_attention_cp_rank,
-    get_attention_cp_size,
-)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.utils import ceil_align
 from sglang.srt.utils.common import is_sm120_supported
@@ -311,8 +298,8 @@ class DSV4AttnMetadata:
     ]
 
     def apply_cp_reindex(self) -> None:
-        cp_rank = get_attention_cp_rank()
-        cp_size = get_attention_cp_size()
+        cp_rank = get_parallel().attn_cp_rank
+        cp_size = get_parallel().attn_cp_size
         idx = slice(cp_rank, None, cp_size)
         pre_global_len = self.seq_lens_casual.shape[0]
         assert pre_global_len % cp_size == 0, (

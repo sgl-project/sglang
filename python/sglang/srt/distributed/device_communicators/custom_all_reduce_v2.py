@@ -16,10 +16,11 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_vmm_utils imp
     VmmGraphInputManager,
     is_vmm_pointer,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.utils import is_sm100_supported, log_info_on_rank0
+from sglang.srt.utils import is_sm100_supported
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,7 @@ class CustomAllReduceV2:
         self.max_size = max(max_pull_size, max_push_size)
         self.override_shot(None)  # set default config based on world size
         self.override_algo: Optional[AllReduceAlgo] = None
+        self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         self.obj = get_custom_all_reduce_cls()(
             rank=self.rank,
             world_size=self.world_size,
@@ -79,7 +81,6 @@ class CustomAllReduceV2:
         )
         self._post_init_obj()
         self.disabled = False
-        log_info_on_rank0(logger, "Custom allreduce v2 initialized successfully")
 
     def override_shot(self, shot: int | None):
         if shot is None:
@@ -103,7 +104,7 @@ class CustomAllReduceV2:
             yield
             return
         try:
-            self.obj.set_cuda_graph_capture(True)
+            self.obj.set_cuda_graph_capture(not self.tms_cudagraph)
             yield
         finally:
             self.obj.set_cuda_graph_capture(False)
@@ -129,9 +130,6 @@ class CustomAllReduceV2:
         offsets_all = self._share_list(offsets)
         result = [list(zip(o, h)) for o, h in zip(offsets_all, handles_all)]
         self.obj.register_inputs(result)
-        log_info_on_rank0(
-            logger, f"Registered {len(pairs)} cuda graph addresses via IPC"
-        )
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         """Check if the input tensor is suitable for custom all-reduce."""
@@ -151,7 +149,7 @@ class CustomAllReduceV2:
                 self.obj.set_cuda_graph_capture(False)
                 return self._all_reduce(input)
             finally:
-                self.obj.set_cuda_graph_capture(True)
+                self.obj.set_cuda_graph_capture(not self.tms_cudagraph)
         return self._all_reduce(input)
 
     def close(self):

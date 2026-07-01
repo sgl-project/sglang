@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::{borrow::Cow, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use axum::{
@@ -29,9 +29,9 @@ use crate::{
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+        chat::ChatCompletionRequest,
         classify::ClassifyRequest,
-        common::{InputIds, StringOrArray},
+        common::{GenerationRequest, InputIds, StringOrArray},
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
@@ -56,6 +56,11 @@ pub struct PDRouter {
     pub enable_igw: bool,
 }
 
+struct PreparedWorkerRequest<'a> {
+    endpoint_url: String,
+    body: Cow<'a, Value>,
+}
+
 #[derive(Clone)]
 struct PDRequestContext<'a> {
     route: &'static str,
@@ -77,16 +82,20 @@ struct PDRequestContext<'a> {
 struct BreakerOutcomesRecorded;
 
 impl PDRouter {
+    fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
+        api_path(worker.base_url(), endpoint)
+    }
+
     async fn proxy_to_first_prefill_worker(
         &self,
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
         let workers = self.worker_registry.get_prefill_workers();
-        let first_worker_url = workers.first().map(|w| w.url().to_string());
 
-        if let Some(worker_url) = first_worker_url {
-            self.proxy_to_worker(worker_url, endpoint, headers).await
+        if let Some(worker) = workers.first() {
+            self.proxy_to_worker(worker.as_ref(), endpoint, headers)
+                .await
         } else {
             error::service_unavailable("no_prefill_servers", "No prefill servers available")
         }
@@ -94,11 +103,11 @@ impl PDRouter {
 
     async fn proxy_to_worker(
         &self,
-        worker_url: String,
+        worker: &dyn Worker,
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
-        let url = format!("{}/{}", worker_url, endpoint);
+        let url = Self::worker_endpoint_url(worker, endpoint);
         let mut request_builder = self.client.get(&url);
 
         if let Some(headers) = headers {
@@ -224,6 +233,7 @@ impl PDRouter {
     const BOOTSTRAP_HOST_KEY: &'static str = "bootstrap_host";
     const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
+    const DISAGG_PREFILL_DP_RANK_KEY: &'static str = "disagg_prefill_dp_rank";
 
     fn inject_bootstrap_into_value(
         mut original: Value,
@@ -283,6 +293,73 @@ impl PDRouter {
             );
         }
         Ok(original)
+    }
+
+    fn inject_prefill_dp_rank_for_decode<'a>(
+        decode_request: Cow<'a, Value>,
+        prefill_worker: &dyn Worker,
+    ) -> Result<Cow<'a, Value>, String> {
+        let Some(prefill_dp_rank) = prefill_worker.dp_rank() else {
+            return Ok(decode_request);
+        };
+
+        let mut decode_request = decode_request.into_owned();
+        let Some(obj) = decode_request.as_object_mut() else {
+            return Err(
+                "Failed to insert disagg_prefill_dp_rank because request body is not an object"
+                    .to_string(),
+            );
+        };
+
+        obj.insert(
+            Self::DISAGG_PREFILL_DP_RANK_KEY.to_string(),
+            Value::from(prefill_dp_rank as u64),
+        );
+        Ok(Cow::Owned(decode_request))
+    }
+
+    async fn prepare_worker_request<'a>(
+        route: &'static str,
+        worker: &dyn Worker,
+        json_request: Cow<'a, Value>,
+    ) -> Result<PreparedWorkerRequest<'a>, String> {
+        let body = if worker.is_dp_aware() {
+            Cow::Owned(
+                worker
+                    .prepare_request(json_request.into_owned())
+                    .await
+                    .map_err(|err| {
+                        format!(
+                            "Failed to prepare request for worker {}: {}",
+                            worker.url(),
+                            err
+                        )
+                    })?,
+            )
+        } else {
+            json_request
+        };
+
+        Ok(PreparedWorkerRequest {
+            endpoint_url: Self::worker_endpoint_url(worker, route),
+            body,
+        })
+    }
+
+    async fn prepare_pd_worker_requests<'a>(
+        route: &'static str,
+        json_request: &'a Value,
+        prefill: &dyn Worker,
+        decode: &dyn Worker,
+    ) -> Result<(PreparedWorkerRequest<'a>, PreparedWorkerRequest<'a>), String> {
+        let prefill_request =
+            Self::prepare_worker_request(route, prefill, Cow::Borrowed(json_request)).await?;
+        let decode_json_request =
+            Self::inject_prefill_dp_rank_for_decode(Cow::Borrowed(json_request), prefill)?;
+        let decode_request =
+            Self::prepare_worker_request(route, decode, decode_json_request).await?;
+
+        Ok((prefill_request, decode_request))
     }
 
     async fn execute_dual_dispatch<T: Serialize + Clone>(
@@ -586,20 +663,33 @@ impl PDRouter {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
+        let (prepared_prefill, prepared_decode) = match Self::prepare_pd_worker_requests(
+            context.route,
+            &json_request,
+            prefill.as_ref(),
+            decode.as_ref(),
+        )
+        .await
+        {
+            Ok(requests) => requests,
+            Err(e) => {
+                error!("Failed to prepare PD worker requests: {}", e);
+                return error::internal_error("pd_request_preparation_failed", e);
+            }
+        };
+
         // Build both requests
         let prefill_request = self.build_post_with_headers(
             &self.client,
-            prefill.url(),
-            context.route,
-            &json_request,
+            &prepared_prefill.endpoint_url,
+            &prepared_prefill.body,
             headers,
             false,
         );
         let decode_request = self.build_post_with_headers(
             &self.client,
-            decode.url(),
-            context.route,
-            &json_request,
+            &prepared_decode.endpoint_url,
+            &prepared_decode.body,
             headers,
             false,
         );
@@ -788,6 +878,28 @@ impl PDRouter {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
         prefill_policy.needs_request_text() || decode_policy.needs_request_text()
+    }
+
+    /// Builds the text used for cache-aware routing of a chat request.
+    ///
+    /// This must reflect the *full* conversation (system prompt, prior turns,
+    /// the current message and tool context) so that KV-cache prefix matching
+    /// routes to the worker that actually shares the most prefix. Using only the
+    /// first message ignores the conversation history that drives KV reuse in
+    /// multi-turn chats. See https://github.com/sgl-project/sglang/issues/26263.
+    ///
+    /// Returns `None` when the conversation has no text to route on, preserving
+    /// the prior behavior of not feeding an empty key into prefix matching.
+    fn build_chat_request_text(body: &ChatCompletionRequest) -> Option<String> {
+        // `extract_text_for_routing` walks every message (system, prior turns,
+        // current message, tool content) and is the same routing text the regular
+        // (non-PD) router uses, keeping cache-aware routing consistent across both.
+        let text = body.extract_text_for_routing();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 
     async fn select_pd_pair(
@@ -1179,13 +1291,12 @@ impl PDRouter {
     fn build_post_with_headers(
         &self,
         client: &Client,
-        url: &str,
-        route: &'static str,
+        endpoint_url: &str,
         json_request: &Value,
         headers: Option<&HeaderMap>,
         connection_close: bool,
     ) -> reqwest::RequestBuilder {
-        let mut request = client.post(api_path(url, route)).json(json_request);
+        let mut request = client.post(endpoint_url).json(json_request);
         if connection_close {
             request = request.header("Connection", "close");
         }
@@ -1293,12 +1404,11 @@ impl RouterTrait for PDRouter {
             }
         };
 
-        let prefill_url = format!("{}/health_generate", prefill.url());
+        let prefill_url = Self::worker_endpoint_url(prefill.as_ref(), "health_generate");
+        let decode_url = Self::worker_endpoint_url(decode.as_ref(), "health_generate");
         let (prefill_result, decode_result) = tokio::join!(
             self.client.get(&prefill_url).send(),
-            self.client
-                .get(format!("{}/health_generate", decode.url()))
-                .send()
+            self.client.get(&decode_url).send()
         );
 
         // Check results
@@ -1422,18 +1532,7 @@ impl RouterTrait for PDRouter {
         let return_logprob = body.logprobs;
 
         let request_text = if self.policies_need_request_text() {
-            body.messages.first().and_then(|msg| match msg {
-                ChatMessage::User { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::Developer { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::System { content, .. } => Some(content.to_simple_string()),
-                _ => None,
-            })
+            Self::build_chat_request_text(body)
         } else {
             None
         };
@@ -1550,7 +1649,7 @@ impl RouterTrait for PDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorkerBuilder, WorkerType};
+    use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -1573,6 +1672,55 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    #[test]
+    fn test_chat_request_text_uses_full_conversation() {
+        // Regression test for https://github.com/sgl-project/sglang/issues/26263
+        // Cache-aware routing must build its text from the full conversation, not
+        // just the first message, so that KV-cache prefix matching reflects what
+        // the worker will actually process in a multi-turn chat.
+        let body: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "First question about apples."},
+                {"role": "assistant", "content": "Apples are red."},
+                {"role": "user", "content": "Follow up question about oranges."}
+            ]
+        }))
+        .expect("valid chat request");
+
+        let text = PDRouter::build_chat_request_text(&body)
+            .expect("multi-message chat should produce routing text");
+
+        assert!(
+            text.contains("apples"),
+            "routing text must include earlier turns, got: {text:?}"
+        );
+        assert!(
+            text.contains("oranges"),
+            "routing text must include later turns (not only the first message), got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_chat_request_text_none_when_no_text() {
+        // When the conversation carries no text content, no routing text should
+        // be produced (None) rather than an empty string, preserving the prior
+        // PD behavior. See https://github.com/sgl-project/sglang/issues/26263.
+        let body: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": ""}
+            ]
+        }))
+        .expect("valid chat request");
+
+        assert!(
+            PDRouter::build_chat_request_text(&body).is_none(),
+            "empty conversation text should produce None, not Some(\"\")"
+        );
     }
 
     #[tokio::test]
@@ -1617,6 +1765,101 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));
+    }
+
+    #[test]
+    fn test_worker_endpoint_url_uses_base_url_for_dp_aware_worker() {
+        let worker = DPAwareWorkerBuilder::new("http://prefill:30000", 2, 4)
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+
+        assert_eq!(
+            PDRouter::worker_endpoint_url(&worker, "health_generate"),
+            "http://prefill:30000/health_generate"
+        );
+        assert_eq!(
+            PDRouter::worker_endpoint_url(&worker, "/v1/models"),
+            "http://prefill:30000/v1/models"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prepare_pd_worker_requests_uses_dp_aware_rank() {
+        let prefill = DPAwareWorkerBuilder::new("http://prefill:30000", 2, 4)
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        let decode = DPAwareWorkerBuilder::new("http://decode:30001", 1, 4)
+            .worker_type(WorkerType::Decode)
+            .build();
+        let request = json!({
+            "prompt": "shared prefix",
+            "max_tokens": 8,
+            "bootstrap_host": "prefill",
+            "bootstrap_port": 8998,
+            "bootstrap_room": 1234,
+        });
+
+        let (prefill_request, decode_request) =
+            PDRouter::prepare_pd_worker_requests("/v1/completions", &request, &prefill, &decode)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            prefill_request.endpoint_url,
+            "http://prefill:30000/v1/completions"
+        );
+        assert_eq!(prefill_request.body["data_parallel_rank"], 2);
+        assert!(prefill_request.body.get("disagg_prefill_dp_rank").is_none());
+
+        assert_eq!(
+            decode_request.endpoint_url,
+            "http://decode:30001/v1/completions"
+        );
+        assert_eq!(decode_request.body["data_parallel_rank"], 1);
+        assert_eq!(decode_request.body["disagg_prefill_dp_rank"], 2);
+        assert_eq!(decode_request.body["bootstrap_room"], 1234);
+        assert!(matches!(prefill_request.body, Cow::Owned(_)));
+        assert!(matches!(decode_request.body, Cow::Owned(_)));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_pd_worker_requests_preserves_non_dp_workers() {
+        let prefill = BasicWorkerBuilder::new("http://prefill:30000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        let decode = BasicWorkerBuilder::new("http://decode:30001")
+            .worker_type(WorkerType::Decode)
+            .build();
+        let request = json!({
+            "prompt": "shared prefix",
+            "max_tokens": 8,
+            "bootstrap_room": 1234,
+        });
+
+        let (prefill_request, decode_request) =
+            PDRouter::prepare_pd_worker_requests("/v1/completions", &request, &prefill, &decode)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            prefill_request.endpoint_url,
+            "http://prefill:30000/v1/completions"
+        );
+        assert_eq!(
+            decode_request.endpoint_url,
+            "http://decode:30001/v1/completions"
+        );
+        assert!(prefill_request.body.get("data_parallel_rank").is_none());
+        assert!(decode_request.body.get("data_parallel_rank").is_none());
+        assert!(decode_request.body.get("disagg_prefill_dp_rank").is_none());
+        assert!(matches!(prefill_request.body, Cow::Borrowed(_)));
+        assert!(matches!(decode_request.body, Cow::Borrowed(_)));
     }
 
     #[test]

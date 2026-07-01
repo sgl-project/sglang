@@ -72,9 +72,32 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def fast_sample(probs: torch.Tensor, num_samples: int = 1):
+    sample_index = torch.multinomial(probs, num_samples=num_samples)
+    sample_p = probs.gather(1, sample_index)
+    return sample_p, sample_index
+
+
+def renorm_draft_probs(
+    next_token_logits: torch.Tensor,
+    sampling_info,
+    use_rejection_sampling: bool,
+) -> torch.Tensor:
+    """Draft-side next-token distribution.
+
+    Plain softmax, except under rejection sampling where logits are
+    temperature-scaled so the draft proposal q tracks the target sampling
+    temperature (higher acceptance; correctness holds for any q).
+    """
+    if not use_rejection_sampling or not next_token_logits.size(0):
+        return torch.softmax(next_token_logits, dim=-1)
+    return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
+
+
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
+SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = (
@@ -294,11 +317,16 @@ def generate_simulated_accept_index(
     accept_index,
     predict,
     num_correct_drafts,
+    candidates,
+    target_predict,
     bs,
     spec_steps,
     simulate_acc_len: float = SIMULATE_ACC_LEN,
     simulate_acc_method: str = SIMULATE_ACC_METHOD,
+    simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
 ):
+    use_real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
+
     assert simulate_acc_len > 0.0
     simulate_acc_len = _sample_simulated_acc_len(
         simulate_acc_len, simulate_acc_method, spec_steps + 1
@@ -312,7 +340,21 @@ def generate_simulated_accept_index(
         simulate_acc_len, device=accept_index.device
     )
     num_correct_drafts.fill_(simulate_acc_len - 1)
-    predict.fill_(100)  # some legit token id
+
+    if not use_real_draft_tokens:
+        predict.fill_(100)  # some legit token id
+        return sim_accept_index
+
+    # Use the topk=1 draft chain for forced acceptance, then a target-derived bonus.
+    if simulate_acc_len > 1:
+        draft_node_indices = sim_accept_index[:, : simulate_acc_len - 1].long()
+        predict[draft_node_indices] = candidates[:, 1:simulate_acc_len].to(
+            dtype=predict.dtype
+        )
+    bonus_node_indices = sim_accept_index[:, simulate_acc_len - 1].long()
+    predict[bonus_node_indices] = target_predict[:, simulate_acc_len - 1].to(
+        dtype=predict.dtype
+    )
     return sim_accept_index
 
 
@@ -628,3 +670,15 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             model=model_runner.model,
         )
+
+
+def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
+    """eagle/ngram share a stateless free function; dflash keeps stateful
+    prep on its draft input -- the dispatcher routes.
+    """
+    if batch.spec_algorithm.is_dflash():
+        batch.spec_info.prepare_for_decode(batch)
+    else:
+        from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
+
+        eagle_prepare_for_decode(batch)
