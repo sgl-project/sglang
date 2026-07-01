@@ -1000,8 +1000,8 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        # Reserve page_size for page-alignment overhead. The paged allocator
-        # may consume up to one extra page per request (see alloc_extend), and
+        # Reserve page_size for page-alignment overhead: the paged allocator may
+        # consume one extra page per request (see alloc_extend), which
         # _update_prefill_budget also deducts.
         max_new = (
             min(
