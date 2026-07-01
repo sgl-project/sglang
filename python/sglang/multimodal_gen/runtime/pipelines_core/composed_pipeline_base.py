@@ -33,6 +33,12 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentResidencyStrategy,
     get_global_component_residency_manager,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    is_layerwise_offloaded_module,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    layerwise_component_matches_any_selection,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
 )
@@ -146,6 +152,7 @@ class ComposedPipelineBase(ABC):
         # Load modules directly in initialization
         logger.info("Loading pipeline modules...")
         self.modules = self.load_modules(server_args, loaded_modules)
+        self._offload_during_compile_done = False
 
         self.__post_init__()
 
@@ -971,6 +978,12 @@ class ComposedPipelineBase(ABC):
         Returns:
             Req: The batch with the generated video or image.
         """
+        if server_args._offloaded_for_compile and not batch.is_warmup and not self._offload_during_compile_done:
+            keep = server_args._offload_during_compile_keep
+            for name, module in self.modules.items():
+                if is_layerwise_offloaded_module(module) and not layerwise_component_matches_any_selection(name, keep):
+                    module.disable_offload()
+            self._offload_during_compile_done = True
 
         if self.is_lora_set() and not self.is_lora_effective():
             logger.warning(
