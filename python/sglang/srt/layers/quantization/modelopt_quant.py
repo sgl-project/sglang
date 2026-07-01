@@ -2294,7 +2294,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_flashinfer_cutlass():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
 
-        self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        # The plain CUTLASS backend uses the direct cutlass_moe_fp4 fused path
+        # (see apply()), not a registered MoeRunner fused func, so skip creating
+        # a MoeRunner for it -- constructing one would fail the fused-func check.
+        if not moe_runner_backend.is_cutlass():
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
 
     def apply(
         self,

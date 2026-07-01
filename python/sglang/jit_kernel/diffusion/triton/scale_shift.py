@@ -224,7 +224,6 @@ def _fused_scale_shift_4d_kernel(
     scale_ptr,
     shift_ptr,
     scale_constant: tl.constexpr,  # scale_constant is either 0 or 1.
-    rows,
     inner_dim,
     seq_len,
     num_frames,
@@ -386,7 +385,6 @@ def fuse_scale_shift_kernel(
             scale_reshaped,
             shift_reshaped,
             scale_constant,
-            rows,
             C,
             L,
             num_frames,

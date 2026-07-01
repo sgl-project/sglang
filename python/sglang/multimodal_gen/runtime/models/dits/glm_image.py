@@ -901,7 +901,7 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             ]
         ] = None,
         ###
-        guidance: torch.Tensor = None,  # TODO: this should probably be removed
+        guidance: torch.Tensor = None,
     ) -> Tuple[torch.Tensor]:
         if kv_caches is not None:
             kv_caches.set_mode(kv_caches_mode)
