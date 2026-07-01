@@ -77,6 +77,25 @@ def synchronized(func):
 
 
 class HostKVCache(abc.ABC):
+    """Base class for host-side KV cache pools.
+
+    Attributes:
+        is_mooncake_registerable: Whether this pool's buffer can be zero-copy
+            registered with Mooncake's distributed memory store. Defaults to True
+            for pools with physical buffers. Logical anchors and pools using
+            non-Mooncake allocators override this to False.
+    """
+
+    @property
+    def is_mooncake_registerable(self) -> bool:
+        """Whether this pool's buffer can be zero-copy registered with Mooncake.
+
+        Returns True if the allocator produces Mooncake-compatible tensors.
+        Returns False for:
+        - Logical anchors (no physical buffer, only page indices)
+        - Pools using non-Mooncake allocators (e.g., mmap for draft pools)
+        """
+        return self.allocator.is_mooncake_compatible
 
     def __init__(
         self,

@@ -39,6 +39,11 @@ class MooncakeHostTensorAllocator(HostTensorAllocator):
         self.allocator = MooncakeHostMemAllocator()
         self.ptr = None
 
+    @property
+    def is_mooncake_compatible(self) -> bool:
+        """Mooncake allocator is compatible with Mooncake registration."""
+        return True
+
     def allocate(
         self, dims: tuple, dtype: torch.dtype, device: str = "cpu"
     ) -> torch.Tensor:
@@ -643,10 +648,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+
         if getattr(self.mem_pool_host, "kv_buffer", None) is None:
-            # Hybrid logical anchors only own allocation indices. Their physical
-            # tensors are registered through register_mem_host_pool_v2().
+            # Logical anchor: no physical buffer to register.
+            # Use marker keys for existence tracking in batch_exists/batch_get/batch_set.
+            self._logical_kv_anchor = True
+            self.gb_per_page = 0.0
+            logger.info(
+                "Detected logical KV anchor pool (%s), "
+                "using marker keys for existence tracking",
+                type(mem_pool_host).__name__,
+            )
             return
+
         try:
             for buffer in self._iter_host_pool_buffers(self.mem_pool_host):
                 super().register_buffer(buffer)
@@ -1001,6 +1015,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Apply extra_backend_tag prefix if available
         keys = self._tag_keys(keys)
 
+        # Logical anchor: check marker keys instead of physical KV data
+        if getattr(self, "_logical_kv_anchor", False):
+            return self._batch_get_logical_anchor(keys)
+
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
         start_time = time.perf_counter()
@@ -1029,6 +1047,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         # Apply extra_backend_tag prefix if available
         keys = self._tag_keys(keys)
+
+        # Logical anchor: set marker keys instead of physical KV data
+        if getattr(self, "_logical_kv_anchor", False):
+            return self._batch_set_logical_anchor(keys)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
         key_multiplier = len(key_strs) // len(keys)
@@ -1204,6 +1226,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Apply extra_backend_tag prefix if available
         keys = self._tag_keys(keys)
 
+        # Logical anchor: check marker keys instead of physical KV keys
+        if getattr(self, "_logical_kv_anchor", False):
+            query_keys = [self._logical_anchor_key(key) for key in keys]
+            exist_result = self._batch_exist(query_keys)
+            for i in range(len(query_keys)):
+                if exist_result[i] != 1:
+                    return i
+            return len(query_keys)
+
         if self.is_mla_backend:
             query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
             key_multiplier = 1
@@ -1275,6 +1306,34 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
+
+    @staticmethod
+    def _logical_anchor_key(key: str) -> str:
+        """Generate marker key for logical anchor existence tracking."""
+        return f"{key}_logical_kv"
+
+    def _batch_set_logical_anchor(self, keys: List[str]) -> List[bool]:
+        """Set marker keys for logical anchor pages.
+
+        Uses 1-byte markers since Mooncake put() rejects zero-length payloads.
+        Only writes keys that don't already exist to avoid redundant writes.
+        """
+        key_strs = [self._logical_anchor_key(key) for key in keys]
+        exist_result = self._batch_exist(key_strs)
+        results = [state == 1 for state in exist_result]
+
+        # Mooncake put() rejects zero-length payloads, so use one byte
+        marker = b"1"
+        for i, key in enumerate(key_strs):
+            if results[i]:
+                continue
+            results[i] = self.store.put(key, marker) == 0
+        return results
+
+    def _batch_get_logical_anchor(self, keys: List[str]) -> List[bool]:
+        """Check marker key existence for logical anchor pages."""
+        key_strs = [self._logical_anchor_key(key) for key in keys]
+        return [state == 1 for state in self._batch_exist(key_strs)]
 
     def get_stats(self):
         storage_metrics = StorageMetrics()
