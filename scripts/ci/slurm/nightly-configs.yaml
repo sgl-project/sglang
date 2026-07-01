@@ -320,3 +320,40 @@ dsv4pro-fp4-mi355x-dp8ep8-mtp-sglang:
       search-space:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4pro/1k1k/1p1d-dp8ep8-mtp.yaml
+
+# Kimi-K2.6 (FP8) on the SAME MI355X 2N 1P1D harness. Proves the launcher is
+# model-agnostic: Kimi is added by recipe YAML only, no launcher changes. Base
+# and -mtp legs (both validated on cluster: GSM8K 0.941 / 0.948). The -mtp leg
+# uses EAGLE3 with an external draft checkpoint (recipe mtp.algorithm +
+# mtp.draft_model_path), which the launcher resolves and passes through.
+kimik26-fp8-mi355x-sglang:
+  model: moonshotai/Kimi-K2.6
+  model-prefix: kimik26
+  model_path: /it-share/model_coverage/models--moonshotai--Kimi-K2.6
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/1p1d.yaml
+
+kimik26-fp8-mi355x-mtp-sglang:
+  model: moonshotai/Kimi-K2.6
+  model-prefix: kimik26
+  model_path: /it-share/model_coverage/models--moonshotai--Kimi-K2.6
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/1p1d-mtp.yaml

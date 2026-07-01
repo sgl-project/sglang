@@ -1,0 +1,77 @@
+# MI355X Kimi-K2.6 (FP8) 2-node 1P1D disaggregation recipe (base).
+#
+# Demonstrates the launcher is model-agnostic: all Kimi-specific config lives
+# here, nothing about Kimi is hardcoded in launch_mi355x.sh. The DP8/EP8 + MTP
+# variants in this dir `extends:` this file and override only their delta.
+#
+# Config mirrors the single-node registered test
+# test/registered/amd/accuracy/mi35x/test_kimi_k26_eval_mi35x.py (TP8, split
+# attention backends, multithread loader, GSM8K > 0.92).
+#
+# Consumed by:
+#   * scripts/ci/slurm/process_result.py reads `resources` and
+#     `backend.sglang_config` (TP/EP/DP + worker counts) for the summary table.
+#   * scripts/ci/slurm/launch_mi355x.sh reads `runtime`, `bench`, `model`, `mtp`.
+
+resources:
+  prefill_workers: 1
+  decode_workers: 1
+
+backend:
+  sglang_config:
+    prefill:
+      tensor-parallel-size: 8
+      expert-parallel-size: 1
+      data-parallel-size: 1
+    decode:
+      tensor-parallel-size: 8
+      expert-parallel-size: 1
+      data-parallel-size: 1
+
+# Model-specific docker env + sglang server args (written verbatim via
+# model_flags.sh). Each server arg + value is a SEPARATE list item.
+model:
+  env:
+    SGLANG_USE_AITER: 1
+    SGLANG_ROCM_FUSED_DECODE_MLA: 0
+  server_args:
+    - --model-loader-extra-config
+    - '{"enable_multithread_load": true}'
+    - --watchdog-timeout
+    - 1200
+    - --reasoning-parser
+    - kimi_k2
+    - --tool-call-parser
+    - kimi_k2
+
+runtime:
+  image: lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623
+  # Kimi uses split attention backends (aiter prefill / triton decode), not a
+  # single --attention-backend.
+  prefill_attention_backend: aiter
+  decode_attention_backend: triton
+  # RoCE HCAs MORI uses for cross-node KV transfer.
+  ib_devices: rdma0,rdma1,rdma2,rdma3
+  prefill_port: 30025
+  decode_port: 30026
+  prefill_bootstrap_port: 8998
+  decode_bootstrap_port: 9001
+  lb_port: 8000
+  mem_fraction_static: 0.90
+  page_size: 256
+  max_running_requests: 256
+  chunked_prefill_size: 8192
+
+bench:
+  # bench_serving --max-concurrency sweep; one result JSON per concurrency.
+  concurrencies: [1, 8, 16, 32, 64, 128, 256]
+  num_prompts_factor: 4      # num-prompts = concurrency * factor
+  random_range_ratio: 1.0
+
+  # Correctness gate run through the PD path before the perf sweep. Mirrors the
+  # registered single-node Kimi-K2.6 eval (full GSM8K, 8-shot, accuracy > 0.92).
+  accuracy:
+    enabled: true
+    num_shots: 8
+    num_questions: 1319    # full GSM8K test set
+    threshold: 0.92

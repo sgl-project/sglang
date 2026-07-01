@@ -1,0 +1,15 @@
+# Kimi-K2.6-FP8 1P1D — base topology + EAGLE3 MTP. Only the delta vs 1p1d.yaml.
+extends: 1p1d.yaml
+
+# EAGLE3 speculative decoding with an EXTERNAL draft checkpoint (unlike DSV4's
+# built-in EAGLE NextN head). The launcher resolves draft_model_path through the
+# HF-cache snapshot logic and appends --speculative-draft-model-path. The draft
+# dir must live under /it-share (the container's :ro mount). Applied to both
+# prefill and decode. Mirrors the Kimi-K2.6 serving cookbook.
+mtp:
+  enabled: true
+  algorithm: EAGLE3
+  num_steps: 3
+  eagle_topk: 1
+  num_draft_tokens: 4
+  draft_model_path: /it-share/model_coverage/models--lightseekorg--kimi-k2.6-eagle3.1-mla
