@@ -433,14 +433,42 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         assert isinstance(mixed_qkv, torch.Tensor)
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv,
-            conv_states,
-            layer.conv_weights,
-            layer.bias,
-            layer.activation,
-            conv_state_indices=cache_indices,
-        )
+        if is_batch_invariant_mode_enabled():
+            # Deterministic fixed-order fp32 conv to bit-match Megatron's batch-invariant
+            # path (gated_delta_net.py: _causal_depthwise_conv1d in fp32, fp32 silu, then
+            # cast to bf16). The fused causal_conv1d_update CUDA kernel accumulates the
+            # 4-tap FMA in a different order and diverges by ~1 bf16 ULP on the current
+            # token even when all inputs (current token + cached columns) are bit-identical.
+            # mixed_qkv is [B, dim] (one decode token); conv_states is [slots, dim, state_len]
+            # holding the state_len (=width-1) preceding raw pre-conv columns, oldest first.
+            state_len = conv_states.shape[-1]
+            valid = cache_indices != PAD_SLOT_ID
+            idx = cache_indices[valid]
+            x_new = mixed_qkv[valid]  # [Bv, dim]
+            prev = conv_states[idx]  # [Bv, dim, state_len], oldest first
+            window = torch.cat([prev, x_new.unsqueeze(-1)], dim=-1)  # [Bv, dim, width]
+            conv_out = _causal_depthwise_conv1d(
+                window.float(),
+                layer.conv_weights.unsqueeze(1).float(),
+                layer.bias.float() if layer.bias is not None else None,
+            )  # [Bv, dim, width]; last column is the current token's conv output
+            act = conv_out[..., -1]
+            if layer.activation in ("silu", "swish"):
+                act = F.silu(act)
+            out = mixed_qkv.clone()
+            out[valid] = act.to(mixed_qkv.dtype)
+            mixed_qkv = out
+            # Roll conv_states left: drop oldest, append the current raw pre-conv column.
+            conv_states[idx] = window[:, :, -state_len:].to(conv_states.dtype)
+        else:
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_states,
+                layer.conv_weights,
+                layer.bias,
+                layer.activation,
+                conv_state_indices=cache_indices,
+            )
 
         # Skip split + reshape + separate gating kernel by consuming
         # the packed mixed_qkv directly in a single fused Triton kernel.
