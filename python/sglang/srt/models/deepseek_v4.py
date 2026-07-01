@@ -1939,6 +1939,19 @@ class DeepseekV4Model(nn.Module):
                 )
                 for aux in aux_hidden_states
             ]
+            # cp_all_gather_rerange_output pads the first dim to the next
+            # cp_size multiple (e.g. 93 real tokens -> 96 for cp_size=4); the
+            # extra rows are zero-padded. DSpark stores the full aux tensor
+            # (CaptureHiddenMode.FULL, no row indexing), so trim it back to the
+            # real token count to match out_cache_loc / positions. The main
+            # hidden path already selects real rows via cumsum(extend), so it
+            # is left untouched.
+            if forward_batch.extend_seq_lens_cpu is not None:
+                real_n = int(sum(forward_batch.extend_seq_lens_cpu))
+                aux_hidden_states = [
+                    aux[:real_n] if aux.shape[0] > real_n else aux
+                    for aux in aux_hidden_states
+                ]
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
