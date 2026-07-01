@@ -201,6 +201,12 @@ class BaseMultimodalProcessor(ABC):
         else:
             self._tokenizer = self._processor
 
+        # Same guard as in serving_chat.py against double BOS.
+        try:
+            self._tokenizer_auto_adds_specials = len(self._tokenizer.encode("")) > 0
+        except Exception:
+            self._tokenizer_auto_adds_specials = False
+
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
 
@@ -463,6 +469,12 @@ class BaseMultimodalProcessor(ABC):
 
                 npu_apply_glm46v_image_preprocess_patch()
                 kwargs["device"] = "npu"
+
+        # Avoid double BOS when the chat template already wrote one.
+        if self._tokenizer_auto_adds_specials and isinstance(input_text, str):
+            bos = getattr(self._tokenizer, "bos_token", None)
+            if bos and input_text.startswith(bos):
+                kwargs.setdefault("add_special_tokens", False)
 
         result = processor.__call__(
             text=[input_text],
