@@ -42,6 +42,11 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
     StandardDispatchOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher.torch_npu import (
+    TorchNpuCombineInput,
+    TorchNpuDispatcher,
+    TorchNpuDispatchOutput,
+)
 
 __all__ = [
     "BaseDispatcher",
@@ -74,4 +79,7 @@ __all__ = [
     "DeepEPLLDispatchOutput",
     "DeepEPLLCombineInput",
     "DeepEPNormalCombineInput",
+    "TorchNpuDispatcher",
+    "TorchNpuDispatchOutput",
+    "TorchNpuCombineInput",
 ]

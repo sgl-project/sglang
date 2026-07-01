@@ -12,7 +12,7 @@ from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
     gptq_marlin_moe_repack,
 )
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    NPUW4A16Int4DynamicMoEMethod,
+    NPUW4A16Int4MoEMethod,
 )
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
@@ -36,6 +36,15 @@ if TYPE_CHECKING:
         CompressedTensorsConfig,
     )
 
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
+from sglang.srt.layers.moe.moe_runner.torch_npu import (
+    TorchNpuQuantInfo,
+)
 
 __all__ = [
     "CompressedTensorsWNA16MoE",
@@ -569,7 +578,8 @@ class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
         else:
             self.group_size = 128
 
-        self.kernel = NPUW4A16Int4DynamicMoEMethod()
+        self.w13_kernel = NPUW4A16Int4MoEMethod()
+        self.w2_kernel = NPUW4A16Int4MoEMethod()
 
     # TODO: See if we can merge this method's logic
     # with CompressedTensorsWNA16MoE. Need more models and tests.
@@ -684,35 +694,33 @@ class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
         set_weight_attrs(w2_weight_shape, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self.kernel.process_weights_after_loading(layer)
+        self.w13_kernel.process_weights_after_loading(layer, "w13")
+        self.w2_kernel.process_weights_after_loading(layer, "w2")
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        layer.w13_kernel = self.w13_kernel
+        layer.w2_kernel = self.w2_kernel
+        moe_runner_config.layer = layer
         self.moe_runner_config = moe_runner_config
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = MoeRunnerBackend.TORCH_NPU
+        self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply_weights(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
-        return self.kernel.apply(layer, dispatch_output)
-
-    def apply_without_routing_weights(
-        self,
-        layer,
-        hidden_states,
-        hidden_states_scale,
-        group_list_type,
-        group_list,
-        output_dtype,
-    ):
-        return self.kernel.apply_without_routing_weights(
-            layer,
-            hidden_states,
-            hidden_states_scale,
-            group_list_type,
-            group_list,
-            output_dtype,
+        backend = self.runner.runner_backend
+        quant_info = TorchNpuQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w13_offset=layer.w13_weight_offset,
+            w2_offset=layer.w2_weight_offset,
         )
+        return self.runner.run(dispatch_output, quant_info)
