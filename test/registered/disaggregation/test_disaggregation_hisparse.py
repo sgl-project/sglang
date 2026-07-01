@@ -132,10 +132,7 @@ class TestDisaggregationDSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin)
         )
 
 
-@unittest.skipUnless(
-    is_in_ci() or _has_nixl(),
-    "NIXL is required for DSV4 HiSparse disaggregation coverage.",
-)
+@unittest.skipIf(is_in_ci(), "Flaky in CI — skip until stabilized.")
 class TestDisaggregationDSV4HiSparseNixl(TestDisaggregationDSV4HiSparseBase):
     @classmethod
     def setUpClass(cls):

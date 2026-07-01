@@ -925,6 +925,19 @@ class ModelConfig:
         if "IQuestLoopCoderForCausalLM" in self.hf_config.architectures:
             loop_num = getattr(self.hf_text_config, "loop_num", 1)
             self.num_attention_layers = int(self.num_hidden_layers * int(loop_num))
+        if "HrmTextForCausalLM" in self.hf_config.architectures:
+            # Compute KV slot count explicitly: native 5.9.0 configs inflate
+            # num_hidden_layers to this in __post_init__, but non-native ones
+            # may carry the raw per-stack count.
+            H_cycles = self.hf_text_config.H_cycles
+            L_cycles = self.hf_text_config.L_cycles
+            num_layers_per_stack = (
+                getattr(self.hf_text_config, "num_layers_per_stack", None)
+                or self.num_hidden_layers
+            )
+            self.num_attention_layers = (
+                int(num_layers_per_stack) * H_cycles * (L_cycles + 1)
+            )
         if "WhisperForConditionalGeneration" in self.hf_config.architectures:
             # Whisper has unique layer ID scheme:
             # - Encoder self-attention: 0 to encoder_layers-1 (no KV cache)
@@ -1459,6 +1472,18 @@ class ModelConfig:
             # while for GLM-4.6v, it is 'glm4v_moe_vision'.
         )
         needs_tf_v5 = is_glm_46vmoe
+        # Older transformers lacks the native hrm_text config, so it silently
+        # falls back to TransformersForCausalLM and loads fused weights as junk.
+        architectures = getattr(self.hf_config, "architectures", []) or []
+        is_hrm_text = getattr(self.hf_config, "model_type", None) == "hrm_text" or (
+            "HrmTextForCausalLM" in architectures
+        )
+        if is_hrm_text and version.parse(tf_version_str) < version.parse("5.9.0"):
+            raise ValueError(
+                f"HRM-Text (model type {self.hf_config.model_type!r}) requires "
+                f"transformers >= 5.9.0, but {tf_version_str} is installed. "
+                "Please upgrade transformers."
+            )
 
         tf_version = version.parse(tf_version_str)
         required_version = version.parse("5.0.0dev0")
@@ -1703,6 +1728,7 @@ multimodal_model_archs = [
     "Qwen3ASRForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
+    "LocateAnythingForConditionalGeneration",
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
     "InternS1ProForConditionalGeneration",

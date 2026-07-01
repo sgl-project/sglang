@@ -97,6 +97,7 @@ def renorm_draft_probs(
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
+SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = (
@@ -317,11 +318,16 @@ def generate_simulated_accept_index(
     accept_index,
     predict,
     num_correct_drafts,
+    candidates,
+    target_predict,
     bs,
     spec_steps,
     simulate_acc_len: float = SIMULATE_ACC_LEN,
     simulate_acc_method: str = SIMULATE_ACC_METHOD,
+    simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
 ):
+    use_real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
+
     assert simulate_acc_len > 0.0
     simulate_acc_len = _sample_simulated_acc_len(
         simulate_acc_len, simulate_acc_method, spec_steps + 1
@@ -335,7 +341,21 @@ def generate_simulated_accept_index(
         simulate_acc_len, device=accept_index.device
     )
     num_correct_drafts.fill_(simulate_acc_len - 1)
-    predict.fill_(100)  # some legit token id
+
+    if not use_real_draft_tokens:
+        predict.fill_(100)  # some legit token id
+        return sim_accept_index
+
+    # Use the topk=1 draft chain for forced acceptance, then a target-derived bonus.
+    if simulate_acc_len > 1:
+        draft_node_indices = sim_accept_index[:, : simulate_acc_len - 1].long()
+        predict[draft_node_indices] = candidates[:, 1:simulate_acc_len].to(
+            dtype=predict.dtype
+        )
+    bonus_node_indices = sim_accept_index[:, simulate_acc_len - 1].long()
+    predict[bonus_node_indices] = target_predict[:, simulate_acc_len - 1].to(
+        dtype=predict.dtype
+    )
     return sim_accept_index
 
 
