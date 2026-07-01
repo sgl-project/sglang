@@ -67,6 +67,30 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
 
+# DeepEP's FINISHED_SUM_TAG: low_latency dispatch asserts at this token count.
+DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS = 1024
+
+
+def estimate_low_latency_rdma_size_bytes(
+    num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int
+) -> int:
+    """Replica of DeepEP's C++ LowLatencyLayout.total_bytes, for the auto
+    mem_fraction heuristic to size the buffer before deep_ep is importable.
+    """
+    num_scales = hidden // 128
+    bytes_per_dispatch = 16 + max(hidden * 2, hidden + num_scales * 4)
+    bytes_per_combine = num_scales * 4 + hidden * 2
+    num_msg = num_experts * num_max_dispatch_tokens_per_rank
+    send = max(
+        num_max_dispatch_tokens_per_rank * bytes_per_dispatch,
+        num_msg * bytes_per_combine,
+    )
+    recv = max(num_msg * bytes_per_dispatch, num_msg * bytes_per_combine)
+    signaling = ((num_experts * 4 + 127) // 128) * 128
+    total = (send + recv + signaling) * 2
+    # DeepEP appends one extra 128-byte alignment unit past the aligned total.
+    return ((total + 127) // 128) * 128 + 128
+
 
 def _is_mnnvl_fabric_supported() -> bool:
     if not is_flashinfer_available():
@@ -353,13 +377,8 @@ class _DeepEPDispatcherImplBase:
         self.deepep_mode = deepep_mode
 
         self.params_bytes = 2
-        # A large value will lead to large memory occupation, thus users should change it accordingly
-        self.num_max_dispatch_tokens_per_rank = (
-            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-        )
-        # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
-        # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
-        assert self.num_max_dispatch_tokens_per_rank <= 1024
+        # Resolved lazily: model_runner may auto-tune the env before first forward.
+        self._num_max_dispatch_tokens_per_rank: Optional[int] = None
 
         self.handle = None
 
@@ -369,6 +388,14 @@ class _DeepEPDispatcherImplBase:
         self.meta_overlap_args: Optional[dict] = None
 
         self.set_deepep_dispatcher_dtype()
+
+    @property
+    def num_max_dispatch_tokens_per_rank(self) -> int:
+        if self._num_max_dispatch_tokens_per_rank is None:
+            value = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+            assert value <= DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS
+            self._num_max_dispatch_tokens_per_rank = value
+        return self._num_max_dispatch_tokens_per_rank
 
     def dispatch_a(
         self,

@@ -1336,5 +1336,227 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         self.assertEqual(parsed.sampling_backend, "token_oracle")
 
 
+class TestDeepEPCaptureBsClamp(unittest.TestCase):
+    """get_batch_sizes_to_capture clamps the decode capture list to the
+    DeepEP low_latency dispatch buffer when deepep runs the low_latency path,
+    so HT can drop --max-running-requests without tripping the dispatch
+    assertion during graph capture.
+    """
+
+    def _make_runner(
+        self, moe_a2a_backend="deepep", deepep_mode="auto", max_draft_tokens=None
+    ):
+        # The non-spec decode capture list for max_bs=512 (see
+        # _generate_decode_cuda_graph_batch_sizes): includes 256 and 512.
+        decode_bs = (
+            [1, 2, 4, 8, 12]
+            + list(range(16, 257, 8))
+            + list(range(272, 512, 16))
+            + [512]
+        )
+        server_args = SimpleNamespace(
+            moe_a2a_backend=moe_a2a_backend,
+            deepep_mode=deepep_mode,
+            max_speculative_num_draft_tokens=max_draft_tokens,
+            enable_two_batch_overlap=False,
+            enable_torch_compile=False,
+            torch_compile_max_bs=32,
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(bs=list(decode_bs)),
+            ),
+        )
+        runner = MagicMock()
+        runner.server_args = server_args
+        # req_to_token_pool.size large enough not to clamp before the DeepEP gate.
+        runner.req_to_token_pool.size = 2048
+        return runner
+
+    @patch(
+        "sglang.srt.model_executor.runner.base_cuda_graph_runner.require_gathered_buffer",
+        return_value=False,
+    )
+    @patch("sglang.srt.model_executor.runner.base_cuda_graph_runner.get_parallel")
+    def test_clamps_to_deepep_buffer_in_auto_mode(self, mock_get_parallel, _):
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
+        runner = self._make_runner("deepep", "auto")
+        capture_bs, _ = get_batch_sizes_to_capture(runner)
+        self.assertGreater(max(capture_bs), 0)
+        # DeepEP low_latency buffer default is 128; capture list must not exceed it.
+        self.assertLessEqual(max(capture_bs), 128)
+        self.assertIn(128, capture_bs)
+
+    @patch(
+        "sglang.srt.model_executor.runner.base_cuda_graph_runner.require_gathered_buffer",
+        return_value=False,
+    )
+    @patch("sglang.srt.model_executor.runner.base_cuda_graph_runner.get_parallel")
+    def test_clamps_to_deepep_buffer_in_low_latency_mode(self, mock_get_parallel, _):
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
+        runner = self._make_runner("deepep", "low_latency")
+        capture_bs, _ = get_batch_sizes_to_capture(runner)
+        self.assertLessEqual(max(capture_bs), 128)
+
+    @patch(
+        "sglang.srt.model_executor.runner.base_cuda_graph_runner.require_gathered_buffer",
+        return_value=False,
+    )
+    @patch("sglang.srt.model_executor.runner.base_cuda_graph_runner.get_parallel")
+    def test_clamps_by_adaptive_max_draft_tokens(self, mock_get_parallel, _):
+        # Adaptive spec: startup num_tokens_per_bs=2 but draft tokens can grow to
+        # 8 at runtime; the clamp must use the max (8), so bs*8 <= 128 -> bs <= 16.
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
+        runner = self._make_runner("deepep", "auto", max_draft_tokens=8)
+        capture_bs, _ = get_batch_sizes_to_capture(runner, num_tokens_per_bs=2)
+        self.assertLessEqual(max(capture_bs) * 8, 128)
+        self.assertLessEqual(max(capture_bs), 16)
+
+    @patch(
+        "sglang.srt.model_executor.runner.base_cuda_graph_runner.require_gathered_buffer",
+        return_value=False,
+    )
+    @patch("sglang.srt.model_executor.runner.base_cuda_graph_runner.get_parallel")
+    def test_does_not_clamp_in_normal_mode(self, mock_get_parallel, _):
+        # normal mode disables cuda graph; the clamp must not fire.
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
+        runner = self._make_runner("deepep", "normal")
+        capture_bs, _ = get_batch_sizes_to_capture(runner)
+        self.assertIn(512, capture_bs)
+
+    @patch(
+        "sglang.srt.model_executor.runner.base_cuda_graph_runner.require_gathered_buffer",
+        return_value=False,
+    )
+    @patch("sglang.srt.model_executor.runner.base_cuda_graph_runner.get_parallel")
+    def test_does_not_clamp_non_deepep_backend(self, mock_get_parallel, _):
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
+        runner = self._make_runner("none", "auto")
+        capture_bs, _ = get_batch_sizes_to_capture(runner)
+        self.assertIn(512, capture_bs)
+
+
+class TestDeepEPMemReserveTiering(unittest.TestCase):
+    """_adjust_mem_fraction_for_deepep_capture tiers the reserved num_max down so
+    the low_latency buffer + capture reservation fits under the cap: a tight,
+    short-context / high-concurrency config (V3.2 TBO on a 140 GiB H200) picks a
+    smaller num_max than the 1024 ceiling, while a wide-memory / large-slack
+    config keeps 1024 so decode throughput is unaffected.
+    """
+
+    def _reserve(
+        self,
+        *,
+        gpu_gib,
+        slack_gib,
+        hidden,
+        num_experts,
+        moe_intermediate,
+        max_running=None,
+        dp_size=8,
+        mem_fraction=0.858,
+    ):
+        hf_config = SimpleNamespace(
+            n_routed_experts=num_experts,
+            moe_intermediate_size=moe_intermediate,
+        )
+        model_config = SimpleNamespace(hidden_size=hidden, hf_config=hf_config)
+        ns = SimpleNamespace(
+            _auto_mem_fraction_gpu_mib=gpu_gib * 1024,
+            moe_a2a_backend="deepep",
+            deepep_mode="auto",
+            max_speculative_num_draft_tokens=None,
+            speculative_num_draft_tokens=None,
+            max_running_requests=max_running,
+            dp_size=dp_size,
+            _auto_mem_chunked_slack_mib=slack_gib * 1024,
+            mem_fraction_static=mem_fraction,
+            get_model_config=lambda: model_config,
+        )
+        ServerArgs._adjust_mem_fraction_for_deepep_capture(ns)
+        return ns
+
+    def test_tight_card_tiers_num_max_down(self):
+        # V3.2-class: 140 GiB H200, short-context slack ~10.5 GiB, 256x2048x7168.
+        # The 1024 ceiling's ~14 GiB buffer + capture exceeds the 12% cap, so the
+        # reservation tiers down to 512 (its buffer fits un-clamped).
+        ns = self._reserve(
+            gpu_gib=139.8,
+            slack_gib=10.5,
+            hidden=7168,
+            num_experts=256,
+            moe_intermediate=2048,
+        )
+        self.assertEqual(ns._deepep_reserved_num_max, 512)
+        self.assertLess(ns.mem_fraction_static, 0.858)
+
+    def test_wide_card_keeps_ceiling(self):
+        # GLM-5.2-class on GB300: large chunked slack credits buffer + capture, so
+        # the 1024 ceiling fits and is kept (no decode-concurrency clamp).
+        ns = self._reserve(
+            gpu_gib=185,
+            slack_gib=36,
+            hidden=6144,
+            num_experts=256,
+            moe_intermediate=2048,
+        )
+        self.assertEqual(ns._deepep_reserved_num_max, 1024)
+
+    def test_user_max_running_caps_num_max(self):
+        # An explicit --max-running-requests bounds num_max below the ceiling even
+        # on a wide card (per-rank concurrency is the real dispatch bound).
+        ns = self._reserve(
+            gpu_gib=185,
+            slack_gib=36,
+            hidden=6144,
+            num_experts=256,
+            moe_intermediate=2048,
+            max_running=2048,
+            dp_size=8,
+        )
+        self.assertEqual(ns._deepep_reserved_num_max, 256)
+
+    def test_unreadable_config_falls_back_conservative(self):
+        # An unreadable model config must not silently skip: that leaves no reserved
+        # ceiling and re-arms the unbounded num_max auto-tune. Pin the conservative
+        # default (128) and leave mem_fraction untouched.
+        def _raise():
+            raise RuntimeError("no config")
+
+        ns = SimpleNamespace(
+            _auto_mem_fraction_gpu_mib=139.8 * 1024,
+            moe_a2a_backend="deepep",
+            deepep_mode="auto",
+            max_speculative_num_draft_tokens=None,
+            speculative_num_draft_tokens=None,
+            max_running_requests=None,
+            dp_size=8,
+            _auto_mem_chunked_slack_mib=10.5 * 1024,
+            mem_fraction_static=0.858,
+            get_model_config=_raise,
+        )
+        ServerArgs._adjust_mem_fraction_for_deepep_capture(ns)
+        self.assertEqual(ns._deepep_reserved_num_max, 128)
+        self.assertEqual(ns.mem_fraction_static, 0.858)
+
+
 if __name__ == "__main__":
     unittest.main()

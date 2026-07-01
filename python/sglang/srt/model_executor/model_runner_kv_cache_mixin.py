@@ -15,9 +15,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_minimax_sparse,
 )
-from sglang.srt.distributed.parallel_state import (
-    get_world_group,
-)
+from sglang.srt.distributed.parallel_state import get_moe_ep_group, get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
@@ -1076,7 +1074,71 @@ class ModelRunnerKVCacheMixin:
                 requested_per_worker,
                 max_num_reqs,
             )
-        return max_num_reqs
+
+        return self._clamp_deepep_low_latency_concurrency(max_num_reqs)
+
+    def _is_deepep_low_latency(self: ModelRunner) -> bool:
+        from sglang.srt.layers.moe.utils import MoeA2ABackend
+
+        return (
+            MoeA2ABackend(self.server_args.moe_a2a_backend).is_deepep()
+            and self.server_args.deepep_mode != "normal"
+        )
+
+    def _clamp_deepep_low_latency_concurrency(
+        self: ModelRunner, max_num_reqs: int
+    ) -> int:
+        """Cap per-rank decode concurrency for the DeepEP low_latency path.
+
+        The all-to-all buffer is collective, so after bounding each rank by the
+        buffer's num_max we take the EP-group MIN: the result is uniform and <=
+        every rank's concurrency, so the buffer fits and no rank overruns it.
+        """
+        from sglang.srt.layers.moe.token_dispatcher.deepep import (
+            DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
+        )
+
+        if not self._is_deepep_low_latency():
+            return max_num_reqs
+
+        # Each request dispatches num_tokens_per_bs tokens, so the concurrency
+        # ceiling shrinks by that multiplier.
+        tokens_per_req = (
+            self.server_args.max_speculative_num_draft_tokens
+            or self.server_args.speculative_num_draft_tokens
+            or 1
+        )
+        # Bound concurrency by the num_max the buffer is actually sized for, else the
+        # decode batch dispatches past it and trips the deep_ep assert. That num_max is
+        # the reserved ceiling when the auto mem_fraction set one and the env isn't
+        # overridden, else the env value (a user setting, or the static default when no
+        # reservation ran — e.g. the kill-switch is off, where it would otherwise stay
+        # at the loose FINISHED_SUM_TAG bound while the buffer is the small default).
+        env = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
+        hard = getattr(self.server_args, "_deepep_reserved_num_max", None)
+        buffer_num_max = hard if (hard is not None and not env.is_set()) else env.get()
+        capped = min(
+            max_num_reqs,
+            DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS // tokens_per_req,
+            max(1, buffer_num_max // tokens_per_req),
+        )
+        ep_group = get_moe_ep_group()
+        if ep_group.world_size > 1:
+            tensor = torch.tensor(capped, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor, op=torch.distributed.ReduceOp.MIN, group=ep_group.cpu_group
+            )
+            capped = int(tensor.item())
+
+        if capped < max_num_reqs:
+            logger.warning(
+                "DeepEP low_latency capped per-rank decode concurrency to %d "
+                "(from %d) to keep the all-to-all dispatch buffer within the "
+                "FINISHED_SUM_TAG bound and uniform across the EP group.",
+                capped,
+                max_num_reqs,
+            )
+        return capped
 
     def _apply_memory_pool_config(self: ModelRunner, config: MemoryPoolConfig):
         """Apply a resolved MemoryPoolConfig and initialize pools."""

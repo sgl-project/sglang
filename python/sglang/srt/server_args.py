@@ -2684,6 +2684,8 @@ class ServerArgs:
         # Handle MoE configurations.
         self._handle_moe_kernel_config()
         self._handle_a2a_moe()
+        # After _handle_a2a_moe so the deepep auto-flip is final.
+        self._adjust_mem_fraction_for_deepep_capture()
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
         self._handle_elastic_ep()
@@ -3484,6 +3486,26 @@ class ServerArgs:
                 if gpu_mem is not None
                 else 0.88
             )
+            # Stash the auto inputs for _adjust_mem_fraction_for_deepep_capture;
+            # left unset on the user-set / unknown-capacity path, which no-ops it.
+            if gpu_mem is not None:
+                self._auto_mem_fraction_gpu_mib = gpu_mem
+                self._auto_mem_fraction_reserved_mib = reserved_mem
+                # reserved_mem counts the un-divided chunked_prefill_size, but DP
+                # attention divides it per-rank, so the over-reservation is slack the
+                # deepep reservation draws from instead of double-counting. Only EP MoE
+                # shrinks the per-rank batch; TP MoE all-gathers, so keeps no slack.
+                self._auto_mem_chunked_slack_mib = 0.0
+                if (
+                    self.chunked_prefill_size > 0
+                    and self.enable_dp_attention
+                    and self.dp_size > 1
+                    and self.moe_a2a_backend == "deepep"
+                ):
+                    per_rank = self.chunked_prefill_size // self.dp_size
+                    self._auto_mem_chunked_slack_mib = (
+                        max(0, self.chunked_prefill_size - per_rank) * 1.5
+                    )
 
             # Multimodal models need more memory for the image processing,
             # so we adjust the mem_fraction_static accordingly.
@@ -3498,6 +3520,145 @@ class ServerArgs:
                 "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
                 "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
             )
+
+    def _adjust_mem_fraction_for_deepep_capture(self):
+        """Reserve the DeepEP low_latency buffer + decode capture in the auto
+        mem_fraction. Both are allocated after the KV pool (the buffer via
+        nvshmem, outside the torch allocator), so the reserved_mem heuristic
+        under-counts them and deepep+DP OOMs at capture without hand-set flags.
+        Only shrinks the auto value; no-ops for a user-set mem_fraction.
+        """
+        if not envs.SGLANG_ENABLE_DEEPEP_AUTO_MEM_RESERVE.get():
+            return
+        gpu_mem = getattr(self, "_auto_mem_fraction_gpu_mib", None)
+        if gpu_mem is None:
+            return
+        if self.moe_a2a_backend != "deepep" or self.deepep_mode == "normal":
+            return
+
+        # Conservative ceiling for the fallbacks below: main's static num_max, which
+        # fits without an explicit reservation.
+        conservative_num_max = (
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.default
+        )
+        try:
+            model_config = self.get_model_config()
+            hidden = model_config.hidden_size
+            hf_config = model_config.hf_config
+            num_experts = None
+            for attr in (
+                "n_routed_experts",
+                "num_experts",
+                "num_local_experts",
+                "moe_num_experts",
+            ):
+                value = getattr(hf_config, attr, None)
+                if value:
+                    num_experts = int(value)
+                    break
+        except Exception as e:
+            # Don't swallow this: with no reserved ceiling the num_max auto-tune runs
+            # unbounded and OOMs at capture. Pin the conservative default and warn.
+            logger.warning(
+                "DeepEP auto mem reserve: could not read model config (%s); pinning "
+                "num_max=%d and skipping the mem_fraction reservation. Set "
+                "--mem-fraction-static if capture OOMs.",
+                e,
+                conservative_num_max,
+            )
+            self._deepep_reserved_num_max = conservative_num_max
+            return
+        if not hidden or not num_experts:
+            logger.warning(
+                "DeepEP auto mem reserve: model config missing hidden_size/num_experts;"
+                " pinning num_max=%d and skipping the mem_fraction reservation.",
+                conservative_num_max,
+            )
+            self._deepep_reserved_num_max = conservative_num_max
+            return
+
+        from sglang.srt.layers.moe.token_dispatcher.deepep import (
+            DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
+            estimate_low_latency_rdma_size_bytes,
+        )
+
+        # Capture + deep_gemm warmup footprint is driven by the grouped-GEMM size
+        # (num_experts * moe_intermediate * hidden), NOT num_layers * hidden — a
+        # layer-based estimate inverts the GLM-5.2 vs DeepSeek-V4 ordering.
+        moe_intermediate = (
+            getattr(hf_config, "moe_intermediate_size", None)
+            or getattr(hf_config, "intermediate_size", None)
+            or hidden
+        )
+        coef = envs.SGLANG_DEEPEP_CAPTURE_COEF.get()
+        capture_mib = coef * num_experts * moe_intermediate * hidden / (1024**2)
+
+        # Credit the chunked over-reservation already baked into mem_fraction (slack
+        # the runtime never uses under deepep+DP) so the net change stays a reduction
+        # — never above main's un-divided baseline, so we can't OOM a config main passed.
+        slack_mib = getattr(self, "_auto_mem_chunked_slack_mib", 0.0)
+        max_reserve_mib = envs.SGLANG_DEEPEP_MAX_RESERVE_FRACTION.get() * gpu_mem
+        # Headroom for the transient deep_gemm warmup that runs right after capture.
+        safety_mib = 2 * 1024
+
+        spec_mult = (
+            self.max_speculative_num_draft_tokens
+            or self.speculative_num_draft_tokens
+            or 1
+        )
+        if self.max_running_requests is not None:
+            user_cap = max(
+                1, (self.max_running_requests // max(1, self.dp_size)) * spec_mult
+            )
+        else:
+            user_cap = DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS
+
+        # Largest num_max whose buffer + capture still fits under the cap. Pinning a
+        # tight, high-concurrency config (V3.2 TBO) at the 1024 ceiling lets the cap
+        # clamp its ~14 GiB buffer and starve capture; tiering down keeps the
+        # reservation un-clamped. Wide-memory cards still select 1024. Safe because
+        # the runtime clamps decode dispatch to this ceiling (only trims batch).
+        num_max_upper = min(user_cap, 128)
+        for candidate in (1024, 512, 256, 128):
+            if candidate > user_cap:
+                continue
+            rdma_mib = estimate_low_latency_rdma_size_bytes(
+                candidate, hidden, num_experts
+            ) / (1024**2)
+            required = max(0.0, rdma_mib + capture_mib + safety_mib - slack_mib)
+            if required <= max_reserve_mib:
+                num_max_upper = candidate
+                break
+
+        # Publish as the hard ceiling the post-KV auto-tune + concurrency clamp honor,
+        # so the runtime can't size num_max past what this reservation covers.
+        self._deepep_reserved_num_max = num_max_upper
+        deepep_mib = estimate_low_latency_rdma_size_bytes(
+            num_max_upper, hidden, num_experts
+        ) / (1024**2)
+        delta_mib = max(0.0, capture_mib + deepep_mib + safety_mib - slack_mib)
+        if delta_mib > max_reserve_mib:
+            logger.warning(
+                "DeepEP auto mem reserve %.1f GiB exceeds the %.0f%% cap (%.1f GiB); "
+                "clamping. Raise SGLANG_DEEPEP_MAX_RESERVE_FRACTION or set "
+                "--mem-fraction-static if capture OOMs.",
+                delta_mib / 1024,
+                envs.SGLANG_DEEPEP_MAX_RESERVE_FRACTION.get() * 100,
+                max_reserve_mib / 1024,
+            )
+            delta_mib = max_reserve_mib
+        new_mem_fraction = round(self.mem_fraction_static - delta_mib / gpu_mem, 3)
+        logger.info(
+            "DeepEP auto mem reserve: num_max=%d buffer=%.2f GiB capture=%.2f GiB "
+            "slack=%.2f GiB; mem_fraction_static %.3f -> %.3f",
+            num_max_upper,
+            deepep_mib / 1024,
+            capture_mib / 1024,
+            slack_mib / 1024,
+            self.mem_fraction_static,
+            new_mem_fraction,
+        )
+        self.mem_fraction_static = new_mem_fraction
 
     def _generate_decode_cuda_graph_batch_sizes(self, max_bs: int):
         """
