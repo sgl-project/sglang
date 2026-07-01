@@ -547,11 +547,28 @@ class CommonKVManager(BaseKVManager):
                 len(sliced_src_kv_ptrs),
             )
 
-        # Regular MLA PP slicing
+        # Slice per buffer group (e.g. NSA K/V/IK) so layers stay aligned and
+        # any decode-side draft/MTP tail is skipped. GPU has groups=1.
         start_layer = self.kv_args.prefill_start_layer
-        end_layer = start_layer + len(src_kv_ptrs)
-        # Decode pp size should be equal to prefill pp size or 1
-        sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
+        groups = getattr(self.kv_args, "kv_buf_groups", 1) or 1
+        local_layers = len(src_kv_ptrs) // groups
+        end_layer = start_layer + local_layers
+        if groups > 1:
+            total_target = getattr(self.kv_args, "total_kv_layers", 0)
+            per_group = len(dst_kv_ptrs) // groups
+            dst_total_layers = (
+                total_target
+                if total_target and total_target <= per_group
+                else per_group
+            )
+            sliced_dst_kv_ptrs = []
+            for g in range(groups):
+                base = g * dst_total_layers
+                sliced_dst_kv_ptrs.extend(
+                    dst_kv_ptrs[base + start_layer : base + end_layer]
+                )
+        else:
+            sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
         return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
 
     def _mla_slice_ptrs_for_pp(
