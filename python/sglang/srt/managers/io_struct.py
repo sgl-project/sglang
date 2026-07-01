@@ -2029,6 +2029,10 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq):
     added_tokens_config: Optional[Dict[str, Any]] = None
     lora_id: Optional[str] = None
     load_format: Optional[str] = None
+    # When True, update the weights of an already-registered adapter in place
+    # instead of registering a new adapter (used for the fixed LoRA pool /
+    # page-table design where adapters are never unloaded).
+    override_existing: bool = False
 
     def to_ref(self) -> LoRARef:
         return LoRARef(
@@ -2050,6 +2054,10 @@ class LoadLoRAAdapterFromDistributedReqInput(BaseReq):
     pinned: bool = False
     added_tokens_config: Optional[Dict[str, Any]] = None
     lora_id: Optional[str] = None
+    # When True, update the weights of an already-registered adapter in place
+    # instead of registering a new adapter (used for the fixed LoRA pool /
+    # page-table design where adapters are never unloaded).
+    override_existing: bool = False
 
     def to_ref(self) -> LoRARef:
         return LoRARef(
