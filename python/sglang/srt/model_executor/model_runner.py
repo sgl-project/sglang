@@ -1073,7 +1073,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from mooncake.engine import TransferEngine
         except ImportError as e:
             logger.warning(
-                "Please install mooncake for using remote instance transfer engine: pip install mooncake"
+                "Please install mooncake for using remote instance transfer engine: pip install mooncake-transfer-engine"
             )
             return
         self.remote_instance_transfer_engine = TransferEngine()
