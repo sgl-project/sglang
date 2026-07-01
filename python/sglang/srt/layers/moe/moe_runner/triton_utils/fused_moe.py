@@ -319,7 +319,7 @@ def fused_experts(
 
 @torch.compile
 def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
-    torch.sum(x, dim=1, out=out)
+    torch.sum(x, dim=1, out=out.detach())
     out.mul_(routed_scaling_factor)
 
 
