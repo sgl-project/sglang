@@ -1573,9 +1573,20 @@ def set_mamba_track_indices_from_reqs(batch):
     all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
         batch.req_pool_indices
     ]  # (bs, ping_pong_size), int64, on device
+    # A finished/retracted request whose mamba state was already freed
+    # (free_mamba_cache / reset_for_retract null mamba_next_track_idx) can still be
+    # present in a TARGET_VERIFY batch for one iteration under the overlap
+    # scheduler's result lag. Building the int64 gather index from a None raises.
+    # Use a safe in-range gather index (0) for those rows, then mark their OUTPUT
+    # track index -1 so the track scatter skips them via its dst<0 guard, instead
+    # of committing a stale row into a live cache slot.
+    next_track_idx = [req.mamba_next_track_idx for req in batch.reqs]
+    none_rows = [i for i, v in enumerate(next_track_idx) if v is None]
+    for i in none_rows:
+        next_track_idx[i] = 0
     idx = (
         torch.tensor(
-            [req.mamba_next_track_idx for req in batch.reqs],
+            next_track_idx,
             dtype=torch.int64,
             pin_memory=True,
         )
@@ -1585,6 +1596,10 @@ def set_mamba_track_indices_from_reqs(batch):
     batch.mamba_track_indices = (
         torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
     )
+    if none_rows:
+        batch.mamba_track_indices[
+            torch.tensor(none_rows, dtype=torch.int64, device=all_buffers.device)
+        ] = -1
 
 
 def release_req(

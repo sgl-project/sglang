@@ -1161,6 +1161,22 @@ class HybridLinearAttnBackend(AttentionBackend):
         """
         request_number = last_correct_step_indices.shape[0]
 
+        # Freed/lingering rows (flagged with mamba_track_indices < 0 by
+        # set_mamba_track_indices_from_reqs) must also be excluded from the first
+        # (non-track) commit scatter below, which keys off state_indices_tensor +
+        # last_correct_step_indices and never reads mamba_track_indices. For a freed
+        # row last_correct_step_indices is >= 0 and state_indices_tensor is a
+        # stale-but-in-range slot, so without this the scatter would write a freed
+        # request's stale verify state into a slot that may have been re-allocated to
+        # a live request. Clamp the commit step to -1 so the kernel's step<0 guard
+        # drops these rows from both commit scatters.
+        if mamba_track_indices is not None:
+            last_correct_step_indices = torch.where(
+                mamba_track_indices[:request_number] < 0,
+                torch.full_like(last_correct_step_indices, -1),
+                last_correct_step_indices,
+            )
+
         state_indices_tensor = (
             self.linear_attn_backend.forward_metadata.mamba_cache_indices[
                 :request_number
