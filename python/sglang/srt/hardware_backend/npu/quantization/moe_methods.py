@@ -270,7 +270,7 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
 
     @staticmethod
-    def maybe_apply_fuseep_weights(layer: torch.nn.Module) -> bool:
+    def maybe_process_fuseep_weights(layer: torch.nn.Module) -> bool:
         """Apply the FuseEP weight layout if --moe-a2a-backend is ascend_fuseep.
 
         Returns True when the FuseEP layout was (or has already been) applied,
@@ -297,7 +297,7 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
     ) -> None:
         # If the FuseEP weight layout is used, process weights via
         # maybe_apply_fuseep_weights and skip the rest of this method.
-        if self.maybe_apply_fuseep_weights(layer):
+        if self.maybe_process_fuseep_weights(layer):
             return
 
         self._validate_weight_prefix(layer, weight_prefix)
