@@ -5225,6 +5225,14 @@ class TestGemma4Detector(unittest.TestCase):
         self.assertIsInstance(result[3], dict)
         self.assertEqual(result[3]["key"], "val")
 
+    def test_parse_gemma4_array_nested_array_with_bracket_in_string(self):
+        # A string element inside a nested array may itself contain '[' or ']'
+        # characters. These must not be counted when tracking bracket depth,
+        # otherwise the nested array is mis-sliced and a stray ']' can make the
+        # parser spin forever. Regression test for that hang/mis-parse.
+        result = _parse_gemma4_array('[<|"|>a]b<|"|>, <|"|>c<|"|>]')
+        self.assertEqual(result, [["a]b", "c"]])
+
     def test_parse_gemma4_value_types(self):
         self.assertIs(_parse_gemma4_value("true"), True)
         self.assertIs(_parse_gemma4_value("false"), False)
