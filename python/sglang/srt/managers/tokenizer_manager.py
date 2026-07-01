@@ -241,6 +241,21 @@ class InputFormat(Enum):
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
 
 
+def _seed_for_parallel_sample(
+    sampling_params: SamplingParams, sample_index: int
+) -> SamplingParams:
+    """Offset the seed for the sample_index-th parallel sample (unseeded: as-is).
+
+    multinomial_with_seed hashes sampling_seed, so without this an n>1 request
+    with a fixed seed yields N identical completions.
+    """
+    if sampling_params.sampling_seed is None:
+        return sampling_params
+    offset = copy.copy(sampling_params)
+    offset.sampling_seed = (offset.sampling_seed + sample_index) & 0xFFFFFFFFFFFFFFFF
+    return offset
+
+
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
@@ -1628,7 +1643,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+                for j in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
@@ -1637,6 +1652,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         tokenized_obj.mm_inputs.mm_items = [
                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                         ]
+                    tokenized_obj.sampling_params = _seed_for_parallel_sample(
+                        tokenized_obj.sampling_params, j
+                    )
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     self._init_req_state(tmp_obj)
                     state = self.rid_to_state[tmp_obj.rid]
