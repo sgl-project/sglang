@@ -1710,24 +1710,15 @@ class Indexer(MultiPlatformOp):
             # fusion-aware, so this also covers the fused path here.
             if weights_proj_lora:
                 raise RuntimeError(GRAPH_WEIGHTS_PROJ_LORA_ERROR)
-            graph_k_only = return_indices and (
-                self._should_skip_logits_computation(forward_batch)
-                and not self.dsa_enable_prefill_cp
-            )
             if return_indices:
-                topk_result = (
-                    torch.empty(
-                        (x_meta.shape[0], self.index_topk),
-                        device=x_meta.device,
-                        dtype=torch.int32,
-                    )
-                    if graph_k_only
-                    else torch.full(
-                        (x_meta.shape[0], self.index_topk),
-                        -1,
-                        device=x_meta.device,
-                        dtype=torch.int32,
-                    )
+                # The split op decides whether this replay is K-only from the
+                # real forward metadata. Allocate without clearing here so a
+                # capture-time dummy shape cannot force a redundant fill on the
+                # K-only path.
+                topk_result = torch.empty(
+                    (x_meta.shape[0], self.index_topk),
+                    device=x_meta.device,
+                    dtype=torch.int32,
                 )
             else:
                 topk_result = torch.empty(
@@ -2354,6 +2345,11 @@ def pcg_dsa_indexer_prefill_split(
             topk_result=topk_result,
         )
         return
+
+    # Non-K-only paths overwrite all valid rows below. Only padded suffix rows
+    # need sentinel initialization, and K-only replays return before this point.
+    if extend_num_tokens < topk_result.shape[0]:
+        topk_result[extend_num_tokens:].fill_(-1)
 
     # Fused path stores K (no-Hadamard) and computes q_fp8 + head gate in the
     # fused kernels, sliced to the unpadded count. Single stream: the split op is
