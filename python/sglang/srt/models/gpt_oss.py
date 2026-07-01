@@ -879,12 +879,23 @@ class GptOssForCausalLM(nn.Module):
         quant_config_name = (
             self.quant_config.get_name() if self.quant_config is not None else None
         )
-        if quant_config_name != "mxfp4":
-            self._load_normal_weights(
+        if quant_config_name == "mxfp4":
+            self._load_weights_mxfp4(
                 weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping
             )
+        elif quant_config_name == "quark":
+            from sglang.srt.layers.quantization.quark.weights import (
+                load_gptoss_weight_quark,
+            )
+
+            load_gptoss_weight_quark(
+                self,
+                weights,
+                is_nextn=is_nextn,
+                weight_name_mapping=weight_name_mapping,
+            )
         else:
-            self._load_weights_mxfp4(
+            self._load_normal_weights(
                 weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping
             )
 

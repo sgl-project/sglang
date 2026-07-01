@@ -915,6 +915,19 @@ class ModelConfig:
         if "IQuestLoopCoderForCausalLM" in self.hf_config.architectures:
             loop_num = getattr(self.hf_text_config, "loop_num", 1)
             self.num_attention_layers = int(self.num_hidden_layers * int(loop_num))
+        if "HrmTextForCausalLM" in self.hf_config.architectures:
+            # Compute KV slot count explicitly: native 5.9.0 configs inflate
+            # num_hidden_layers to this in __post_init__, but non-native ones
+            # may carry the raw per-stack count.
+            H_cycles = self.hf_text_config.H_cycles
+            L_cycles = self.hf_text_config.L_cycles
+            num_layers_per_stack = (
+                getattr(self.hf_text_config, "num_layers_per_stack", None)
+                or self.num_hidden_layers
+            )
+            self.num_attention_layers = (
+                int(num_layers_per_stack) * H_cycles * (L_cycles + 1)
+            )
         if "WhisperForConditionalGeneration" in self.hf_config.architectures:
             # Whisper has unique layer ID scheme:
             # - Encoder self-attention: 0 to encoder_layers-1 (no KV cache)
@@ -1187,9 +1200,12 @@ class ModelConfig:
             return True
 
         # Check for HuggingFace quantization config
-        from sglang.srt.utils import has_hf_quant_config
+        quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if quant_cfg is None:
+            from sglang.srt.utils import has_hf_quant_config
 
-        return has_hf_quant_config(self.model_path)
+            return has_hf_quant_config(self.model_path)
+        return True
 
     def _get_modelopt_quant_type(self) -> str:
         """Extract ModelOpt quantization type from unified quantization flag."""
@@ -1269,6 +1285,7 @@ class ModelConfig:
             "mxfp4",
             "mxfp8",
             "auto-round",
+            "auto-round-int8",
             "quark_int4fp8_moe",
             "quark_mxfp4",
         ]
@@ -1304,6 +1321,7 @@ class ModelConfig:
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
+            "auto-round-int8": ["compressed-tensors", "compressed_tensors"],
         }
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
@@ -1444,6 +1462,18 @@ class ModelConfig:
             # while for GLM-4.6v, it is 'glm4v_moe_vision'.
         )
         needs_tf_v5 = is_glm_46vmoe
+        # Older transformers lacks the native hrm_text config, so it silently
+        # falls back to TransformersForCausalLM and loads fused weights as junk.
+        architectures = getattr(self.hf_config, "architectures", []) or []
+        is_hrm_text = getattr(self.hf_config, "model_type", None) == "hrm_text" or (
+            "HrmTextForCausalLM" in architectures
+        )
+        if is_hrm_text and version.parse(tf_version_str) < version.parse("5.9.0"):
+            raise ValueError(
+                f"HRM-Text (model type {self.hf_config.model_type!r}) requires "
+                f"transformers >= 5.9.0, but {tf_version_str} is installed. "
+                "Please upgrade transformers."
+            )
 
         tf_version = version.parse(tf_version_str)
         required_version = version.parse("5.0.0dev0")
@@ -1688,6 +1718,7 @@ multimodal_model_archs = [
     "Qwen3ASRForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
+    "LocateAnythingForConditionalGeneration",
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
     "InternS1ProForConditionalGeneration",
@@ -1702,6 +1733,7 @@ multimodal_model_archs = [
     "NVILAForConditionalGeneration",
     "NVILALiteForConditionalGeneration",
     "DeepseekOCRForCausalLM",
+    "UnlimitedOCRForCausalLM",
     "JetVLMForConditionalGeneration",
     "PaddleOCRVLForConditionalGeneration",
     "MiDashengLMModel",
@@ -1858,6 +1890,7 @@ def is_hybrid_swa_model(
         "Gemma4ForConditionalGeneration",
         "Gemma4UnifiedForConditionalGeneration",
         "LagunaForCausalLM",
+        "UnlimitedOCRForCausalLM",
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):
         # Only treat Laguna as hybrid SWA when it actually has a sliding window.
@@ -1944,6 +1977,9 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "full_attention"
         ]
+    elif "UnlimitedOCRForCausalLM" in model_architectures:
+        swa_attention_layer_ids = list(range(num_hidden_layers))
+        full_attention_layer_ids = []
     elif getattr(hf_text_config, "hybrid_layer_pattern", None) is not None:
         # Generic fallback for custom hybrid SWA models that opt in via
         # hf_text_config.is_hybrid_swa and expose a hybrid_layer_pattern

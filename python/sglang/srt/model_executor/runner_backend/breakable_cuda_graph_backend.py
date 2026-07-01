@@ -30,6 +30,9 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_backend.cuda_graph_dedup_mixin import (
+    DedupedCudaGraphMixin,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
@@ -51,7 +54,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
-class BreakableCudaGraphBackend(BaseCudaGraphBackend):
+class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     """Segmented capture: graphs break at attention / mamba boundaries;
     attention metadata is recomputed at replay outside captured segments.
     """
@@ -63,6 +66,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         enable_memory_saver: bool = False,
         debug_eager: bool = False,
     ) -> None:
+        self._model_runner = cuda_graph_runner.model_runner
         self._graphs: Dict[Any, BreakableCUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
@@ -90,11 +94,15 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None
+        self.begin_cuda_graph_capture()
         try:
             with self.replay_session():
                 yield
         finally:
-            self._capture_stream = None
+            try:
+                self.end_cuda_graph_capture()
+            finally:
+                self._capture_stream = None
 
     def capture_one(
         self,
@@ -111,7 +119,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-        graph = BreakableCUDAGraph()
+        graph = BreakableCUDAGraph(self.deduped_cuda_graph)
         captured_fn = (
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
@@ -208,6 +216,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
+        self.close()
         self._graphs.clear()
         self._outputs.clear()
         self._pool = None
