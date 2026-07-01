@@ -61,6 +61,7 @@ from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner imp
 from sglang.srt.speculative.multi_layer_eagle_utils import rotate_input_ids_triton
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    commit_mamba_states_after_verify,
     draft_tp_context,
     record_stream_each,
     record_stream_for_v2_verify,
@@ -162,7 +163,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # Chain-style MTP: each step propagates its own output hidden states to the
         # next step.  Non-chain: each step uses the target model's hidden states.
         draft_arch = self.draft_worker.model_config.hf_config.architectures[0]
-        self.chain_mtp_hidden_states = draft_arch in ["Step3p5MTP"]
+        self.chain_mtp_hidden_states = draft_arch in [
+            "Step3p5MTP",
+            "GigaChat35ForCausalLMNextN",
+        ]
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
@@ -821,6 +825,14 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             accept_index,
         ) = eagle_sample(verify_input, batch, logits_output)
         new_seq_lens = batch.seq_lens + accept_lens
+
+        commit_mamba_states_after_verify(
+            self.target_worker,
+            batch,
+            accept_lens,
+            accept_index,
+            self.speculative_num_draft_tokens,
+        )
 
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
