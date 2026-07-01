@@ -565,6 +565,11 @@ class Envs:
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
+    # Experimental: run a compressed-tensors W4A16 (int4 group) MoE on the native
+    # aiter a16wi4 kernel (int4 weights x bf16 activations). Transcodes the int4
+    # weights to aiter's preshuffled i4x2 layout once at load. Requires
+    # SGLANG_USE_AITER + the flydsl package.
+    SGLANG_MOE_W4A16_AITER = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
