@@ -89,7 +89,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ModelList,
     ResponsesRequest,
     ScoringRequest,
-    TokenizeRequest,
     V1RerankReqInput,
 )
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
@@ -310,7 +309,9 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
-        _global_state.tokenizer_manager, _global_state.template_manager
+        _global_state.tokenizer_manager,
+        fast_api_app.state.openai_serving_chat,
+        fast_api_app.state.openai_serving_completion,
     )
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
         _global_state.tokenizer_manager
@@ -1614,6 +1615,34 @@ async def openai_v1_chat_completions(
 
 
 @app.post(
+    "/v1/chat/tokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_chat_tokenize(request: ChatCompletionRequest, raw_request: Request):
+    """OpenAI-compatible chat tokenization endpoint."""
+    return await raw_request.app.state.openai_serving_tokenize.handle_chat_request(
+        request, raw_request
+    )
+
+
+@app.post(
+    "/v1/completions/tokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_completions_tokenize(
+    request: CompletionRequest, raw_request: Request
+):
+    """OpenAI-compatible text completion tokenization endpoint."""
+    return (
+        await raw_request.app.state.openai_serving_tokenize.handle_completions_request(
+            request, raw_request
+        )
+    )
+
+
+@app.post(
     "/v1/embeddings",
     response_class=ORJSONResponse,
     dependencies=[Depends(validate_json_request)],
@@ -1648,7 +1677,9 @@ async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
     dependencies=[Depends(validate_json_request)],
     include_in_schema=False,
 )
-async def openai_v1_tokenize(request: TokenizeRequest, raw_request: Request):
+async def openai_v1_tokenize(
+    request: Annotated[Dict[str, Any], Body()], raw_request: Request
+):
     """OpenAI-compatible tokenization endpoint."""
     return await raw_request.app.state.openai_serving_tokenize.handle_request(
         request, raw_request
