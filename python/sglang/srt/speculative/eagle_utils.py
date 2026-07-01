@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
+    alloc_paged_token_slots_extend_npu,
+)
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    maybe_build_dsv4_verify_bundle,
+)
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -32,6 +39,14 @@ if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
+
+
+ALLOC_EXTEND_FUNCS = defaultdict(
+    lambda: alloc_paged_token_slots_extend,
+    {
+        "npu": alloc_paged_token_slots_extend_npu,
+    },
+)
 
 
 def per_step_draft_out_cache_loc(
@@ -367,6 +382,10 @@ def eagle_prepare_for_verify(
             device=device,
         )
 
+        batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
+            batch, verify_input.draft_token_num
+        )
+
         prepare_mamba_track_for_verify(batch)
 
         # TBO's split_spec_info reads these; no-verify-sync leaves both None.
@@ -429,6 +448,7 @@ def eagle_sample(
     from sglang.srt.server_args import get_global_server_args
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
+        SIMULATE_ACC_TOKEN_MODE,
         generate_simulated_accept_index,
     )
     from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
@@ -486,6 +506,7 @@ def eagle_sample(
     num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
     # Sample tokens
+    target_predict = None
     if sampling_info.is_all_greedy or _is_npu or _is_hip:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
@@ -600,11 +621,33 @@ def eagle_sample(
         # Do simulation. The helper builds (and returns) a replacement
         # accept_index of width spec_steps + 1, so pass max_tree_depth - 1
         # to keep the simulated width identical to the real one.
+        if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
+            raise ValueError(
+                "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
+                f"{SIMULATE_ACC_TOKEN_MODE!r}; expected 'fixed' or "
+                "'real-draft-token'."
+            )
+
+        if SIMULATE_ACC_TOKEN_MODE == "real-draft-token":
+            if verify_input.tree_topk != 1:
+                raise ValueError(
+                    "SGLANG_SIMULATE_ACC_LEN with real draft tokens currently "
+                    "requires speculative_eagle_topk=1."
+                )
+
+            # Use target argmax as the synthetic bonus for non-greedy requests.
+            if target_predict is None:
+                target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
+                    bs, verify_input.draft_token_num
+                )
         accept_index = generate_simulated_accept_index(
             accept_index=accept_index,
             predict=predict,  # mutable
             num_correct_drafts=num_correct_drafts,  # mutable
+            candidates=candidates,
+            target_predict=target_predict,
             simulate_acc_len=SIMULATE_ACC_LEN,
+            simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
             bs=bs,
             spec_steps=verify_input.max_tree_depth - 1,
         )
@@ -675,7 +718,8 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             batch.req_pool_indices,
             cur_kv_lens_device,
         )
-        out_cache_loc = alloc_paged_token_slots_extend(
+        device_type = getattr(batch.device, "type", str(batch.device).split(":", 1)[0])
+        out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
             batch.tree_cache,
             cur_kv_lens_device,
             cur_kv_lens_cpu,
@@ -683,8 +727,9 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             nxt_kv_lens_cpu,
             last_loc,
             num_needed_tokens,
+            req_pool_indices=batch.req_pool_indices,
+            batch=batch,
         )
-
     assign_req_to_token_pool_func(
         batch.req_pool_indices,
         batch.req_to_token_pool.req_to_token,
