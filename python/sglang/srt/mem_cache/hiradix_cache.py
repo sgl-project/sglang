@@ -1087,7 +1087,7 @@ class HiRadixCache(RadixCache):
         heap = self._make_eviction_heap()
         num_evicted = 0
         while num_evicted < num_tokens and heap:
-            _priority, x = heapq.heappop(heap)
+            _, x = heapq.heappop(heap)
             if x.lock_ref > 0:
                 continue
             if x.backuped:
@@ -1103,18 +1103,31 @@ class HiRadixCache(RadixCache):
         """
         heap = self._make_eviction_heap()
         num_evicted = 0
+        staged: List[TreeNode] = []
+
+        def flush_staged() -> None:
+            if not staged:
+                return
+            self.writing_check(write_back=True)
+            for n in staged:
+                n.release_host()
+            staged.clear()
+
         while num_evicted < num_tokens and heap:
-            _priority, x = heapq.heappop(heap)
+            _, x = heapq.heappop(heap)
             if x.lock_ref > 0:
                 continue
             if x.backuped:
                 num_evicted += self._evict_backuped(x)
             elif self.write_backup(x, write_back=True) > 0:
-                self.writing_check(write_back=True)
+                x.protect_host()
+                staged.append(x)
                 num_evicted += self._evict_backuped(x)
             else:
+                flush_staged()
                 num_evicted += self._drop_subtree_no_host(x)
             self._promote_parent(x, heap)
+        flush_staged()
         return num_evicted
 
     def _evict_backuped(self, node: TreeNode):
@@ -1190,7 +1203,7 @@ class HiRadixCache(RadixCache):
 
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
-            _priority, x = heapq.heappop(eviction_heap)
+            _, x = heapq.heappop(eviction_heap)
             if x == self.root_node:
                 break
             # only evict the host value of evicted nodes
