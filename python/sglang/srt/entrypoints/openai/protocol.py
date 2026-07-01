@@ -226,6 +226,23 @@ class StructuresResponseFormat(BaseModel):
     end: str
 
 
+class JSONObjectFormat(BaseModel):
+    type: Literal["json_object"]
+
+
+class JSONSchemaFormat(BaseModel):
+    type: Literal["json_schema"]
+    name: str
+    description: Optional[str] = None
+    # use alias to workaround pydantic conflict
+    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
+    strict: Optional[bool] = False
+
+
+class ResponseTextFormat(BaseModel):
+    format: Union[JSONSchemaFormat, JSONObjectFormat]
+
+
 # NOTE(dark): keep this for backward compatibility
 class LegacyStructuralTagResponseFormat(BaseModel):
     type: Literal["structural_tag"]
@@ -1385,12 +1402,13 @@ class ResponsesRequest(BaseModel):
     store: Optional[bool] = True
     stream: Optional[bool] = False
     temperature: Optional[float] = None
-    tool_choice: Literal["auto", "required", "none"] = "auto"
+    tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
     top_logprobs: Optional[int] = 0
     top_p: Optional[float] = None
     truncation: Optional[Literal["auto", "disabled"]] = "disabled"
     user: Optional[str] = None
+    text: Optional[ResponseTextFormat] = None
 
     # Extra SGLang parameters
     request_id: str = Field(
@@ -1414,6 +1432,18 @@ class ResponsesRequest(BaseModel):
     top_k: Optional[int] = None
     min_p: Optional[float] = None
     repetition_penalty: Optional[float] = None
+    chat_template_kwargs: Optional[Dict] = None
+    # For PD disaggregation
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For DP routing — external router assigns a specific DP worker
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+    # Deprecated: use routed_dp_rank instead
+    data_parallel_rank: Optional[int] = None
 
     # Default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
@@ -1516,6 +1546,14 @@ class ResponsesRequest(BaseModel):
         if self.repetition_penalty is not None:
             params["repetition_penalty"] = self.repetition_penalty
 
+        if self.text and self.text.format:
+            if self.text.format.type == "json_schema":
+                params["json_schema"] = convert_json_schema_to_str(
+                    self.text.format.schema_
+                )
+            elif self.text.format.type == "json_object":
+                params["json_schema"] = '{"type": "object"}'
+
         # Apply any additional default parameters
         for key, value in default_params.items():
             if key not in params or params[key] is None:
@@ -1553,6 +1591,21 @@ class PromptTokenUsageInfo(BaseModel):
     cached_tokens: int = 0
 
 
+class OutputTokenUsageInfo(BaseModel):
+    """Output token usage details."""
+
+    reasoning_tokens: int = 0
+
+
+class ResponseUsageInfo(BaseModel):
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    # only used to return cached tokens when --enable-cache-report is set
+    input_tokens_details: Optional[PromptTokenUsageInfo] = None
+    output_tokens_details: Optional[OutputTokenUsageInfo] = None
+
+
 class ResponsesResponse(BaseModel):
     """Response body for v1/responses endpoint."""
 
@@ -1565,9 +1618,9 @@ class ResponsesResponse(BaseModel):
         Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
     ] = Field(default_factory=list)
     status: Literal["queued", "in_progress", "completed", "failed", "cancelled"]
-    usage: Optional[UsageInfo] = None
+    usage: Optional[ResponseUsageInfo] = None
     parallel_tool_calls: bool = True
-    tool_choice: str = "auto"
+    tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
 
     # OpenAI compatibility fields. not all are used at the moment.
@@ -1601,7 +1654,7 @@ class ResponsesResponse(BaseModel):
             Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
         ],
         status: str,
-        usage: Optional[UsageInfo],
+        usage: Optional[ResponseUsageInfo],
     ) -> ResponsesResponse:
         """Create a response from a request."""
 
@@ -1677,7 +1730,7 @@ class RequestResponseMetadata(BaseModel):
     """Metadata for request/response tracking."""
 
     request_id: str
-    final_usage_info: Optional[UsageInfo] = None
+    final_usage_info: Optional[ResponseUsageInfo] = None
 
 
 @dataclass
