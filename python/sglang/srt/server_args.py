@@ -5469,8 +5469,6 @@ class ServerArgs:
                 self.moe_runner_backend == "flashinfer_cutedsl"
                 and self.deepep_mode == "auto"
             ):
-                # CuteDSL FP4 has no DeepEP normal-dispatch handler, so auto
-                # (normal prefill) crashes; low_latency covers both phases.
                 self.deepep_mode = "low_latency"
                 logger.warning(
                     "Forcing --deepep-mode low_latency: flashinfer_cutedsl FP4 "
