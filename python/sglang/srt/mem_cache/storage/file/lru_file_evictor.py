@@ -28,7 +28,7 @@ import logging
 import os
 import threading
 from collections import OrderedDict
-from typing import Any, Optional, Set, Tuple
+from typing import Any, Callable, Optional, Set, Tuple
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import human_readable_int
@@ -70,11 +70,15 @@ class LRUFileEvictor:
         *,
         tp_rank: int,
         is_mla_model: bool,
+        shard_dir_fn: Callable[[str], str],
         extra_config: Optional[dict] = None,
     ) -> None:
         self.file_path = file_path
         self.config_suffix = config_suffix
         self._tp_rank = tp_rank
+        # Injected by HiCacheFile so the evictor resolves the same sharded paths;
+        # avoids a back-import (the backend imports this evictor lazily).
+        self._shard_dir_fn = shard_dir_fn
 
         # MLA ranks share the same physical files, so centralize LRU bookkeeping
         # on rank 0; non-MLA ranks each own their own files via the suffix.
@@ -295,28 +299,55 @@ class LRUFileEvictor:
 
     def _scan_existing_files(self) -> None:
         """Seed LRU index from disk on startup (oldest mtime first)."""
-        try:
-            names = os.listdir(self.file_path)
-        except FileNotFoundError:
-            return
+        # Walk shard subdirs (the LRU key stays the bare stem; only discovery
+        # and unlink are shard-aware, not the index keys).
         entries = []
-        for fn in names:
-            if not fn.endswith(".bin"):
-                continue
-            stem = fn[:-4]
-            # Only files belonging to this rank/model.
-            if not stem.endswith(self.config_suffix):
-                continue
-            fp = os.path.join(self.file_path, fn)
-            try:
-                st = os.stat(fp)
-            except OSError:
-                continue
-            entries.append((st.st_mtime, stem, st.st_size))
+        for root, _dirs, files in os.walk(self.file_path):
+            for fn in files:
+                if not fn.endswith(".bin"):
+                    continue
+                stem = fn[:-4]
+                # Only files belonging to this rank/model.
+                if not stem.endswith(self.config_suffix):
+                    continue
+                fp = os.path.join(root, fn)
+                try:
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                entries.append((st.st_mtime, stem, st.st_size))
         entries.sort(key=lambda e: e[0])  # oldest first
         for _, stem, size in entries:
             self._lru[stem] = size
             self._total_bytes += size
+
+    def _sharded_path(self, filename: str) -> str:
+        """Resolve a ``.bin`` filename to its full sharded path under file_path.
+
+        Delegates the bucket layout to the backend-supplied ``shard_dir_fn`` so
+        the evictor's scan/unlink paths can never desynchronize from where the
+        backend writes.
+        """
+        return os.path.join(self.file_path, self._shard_dir_fn(filename), filename)
+
+    def _rmdir_empty_shard(self, tensor_path: str) -> None:
+        """Remove now-empty hash-prefix subdirs after unlinking a victim.
+
+        ``rmdir`` only succeeds on an empty directory, so a shard still holding
+        other pages is left intact; the backend recreates the dir (``makedirs``
+        with ``exist_ok``) before its next write. Without this, per-file eviction
+        would slowly leak up to 256*256 empty directories.
+        """
+        shard_dir = os.path.dirname(tensor_path)
+        if shard_dir == self.file_path:
+            return  # unsharded fallback bucket; nothing to prune
+        try:
+            os.rmdir(shard_dir)  # inner <cd> level
+            parent = os.path.dirname(shard_dir)
+            if parent != self.file_path:
+                os.rmdir(parent)  # outer <ab> level
+        except OSError:
+            pass  # dir still holds other pages -> keep it
 
     def _evict_one_lru_locked(self) -> Tuple[str, int]:
         """Evict the single oldest evictable LRU entry. Caller holds _lock.
@@ -338,10 +369,11 @@ class LRUFileEvictor:
             # Keep in-flight reservations; their file isn't committed yet.
             self._lru[evict_stem] = evict_size
             return "skipped", 0
-        tensor_path = os.path.join(self.file_path, f"{evict_stem}.bin")
+        tensor_path = self._sharded_path(f"{evict_stem}.bin")
         try:
             os.remove(tensor_path)
             freed = evict_size
+            self._rmdir_empty_shard(tensor_path)
         except FileNotFoundError:
             freed = 0  # file already gone; still drop the stale index entry
         except OSError as e:
