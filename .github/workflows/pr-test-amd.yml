@@ -432,7 +432,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        part: [0, 1, 2, 3, 4, 5, 6, 7]
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
@@ -454,7 +454,7 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 2400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 8 --timeout-per-file 2400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-small-amd-nondeterministic:
     name: ${{ format('stage-b-test-1-gpu-small-amd-nondeterministic (linux-{0}-1gpu-sglang)', inputs.runner_arch || 'mi325') }}
@@ -911,7 +911,7 @@ jobs:
           stage-name: stage-b-amd
           jobs: |
             [
-              {"prefix": "stage-b-test-1-gpu-small-amd", "expected_count": 14},
+              {"prefix": "stage-b-test-1-gpu-small-amd", "expected_count": 8},
               {"prefix": "stage-b-test-2-gpu-large-amd", "expected_count": 2}
             ]
           max-wait-minutes: '480'
