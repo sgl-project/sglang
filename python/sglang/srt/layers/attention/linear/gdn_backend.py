@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.linear.utils import (
     get_linear_attn_prefill_backend,
 )
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    PAD_SLOT_ID,
     causal_conv1d_fn,
     causal_conv1d_update,
 )
@@ -561,6 +562,37 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 weight = layer.conv_weights.unsqueeze(1).float()
                 bias = layer.bias.float() if layer.bias is not None else None
                 conv_out = _causal_depthwise_conv1d(x, weight, bias)
+                # Persist conv state. The fused causal_conv1d_fn kernel (non-BI path
+                # below) updates conv_states in place with the last state_len=width-1
+                # raw pre-conv input columns of each sequence; decode reads these as its
+                # initial conv window. The BI path skips the kernel, so without this the
+                # first width-1 decode tokens see stale conv_states (layer 0 post_conv_qkv
+                # diverged by ~23 at decode token 1, decaying to bit-exact by token 4).
+                # `mixed_qkv` is [dim, total_len] raw pre-conv input (pre-transpose above).
+                state_len = conv_states.shape[-1]
+                qsl_cpu = query_start_loc.tolist()
+                cidx_cpu = cache_indices.tolist()
+                has_init_cpu = has_initial_states.tolist()
+                for i in range(len(qsl_cpu) - 1):
+                    c = cidx_cpu[i]
+                    if c == PAD_SLOT_ID:
+                        continue
+                    start, end = qsl_cpu[i], qsl_cpu[i + 1]
+                    seqlen_i = end - start
+                    if seqlen_i <= 0:
+                        continue
+                    seg = mixed_qkv[:, start:end]  # [dim, seqlen_i] raw pre-conv input
+                    if seqlen_i >= state_len:
+                        conv_states[c] = seg[:, -state_len:]
+                    elif has_init_cpu[i]:
+                        # Shift the existing window left and append the new columns.
+                        conv_states[c] = torch.cat(
+                            [conv_states[c][:, seqlen_i:], seg], dim=-1
+                        )
+                    else:
+                        keep = state_len - seqlen_i
+                        conv_states[c, :, :keep] = 0
+                        conv_states[c, :, keep:] = seg
                 mixed_qkv = F.silu(conv_out[..., :total_len]).to(mixed_qkv.dtype).squeeze(0).transpose(0, 1)[:seq_len]
             else:
                 mixed_qkv = causal_conv1d_fn(
