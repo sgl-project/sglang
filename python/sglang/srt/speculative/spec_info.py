@@ -158,6 +158,14 @@ class SpeculativeAlgorithm(Enum):
             return build_eagle_disagg_draft_input(
                 batch, server_args, last_tokens_tensor, future_map
             )
+        if self.is_dspark():
+            from sglang.srt.speculative.dspark_disaggregation import (
+                build_dspark_disagg_draft_input,
+            )
+
+            return build_dspark_disagg_draft_input(
+                batch, server_args, last_tokens_tensor, future_map
+            )
         return None
 
     def need_topk(self) -> bool:
