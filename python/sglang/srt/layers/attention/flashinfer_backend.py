@@ -58,6 +58,25 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+FLASHINFER_MIS_MAX_ITEM_LEN = (1 << 16) - 1
+
+
+def _max_multi_item_scoring_item_len(delimiter_indices_cpu, seq_len: int) -> int:
+    """Return the largest item length represented by delimiter indices."""
+    if len(delimiter_indices_cpu) == 0:
+        return 0
+
+    delimiter_indices = delimiter_indices_cpu.tolist()
+    if not isinstance(delimiter_indices, list):
+        delimiter_indices = [delimiter_indices]
+    delimiter_indices = [int(index) for index in delimiter_indices]
+
+    max_item_len = max(0, int(seq_len) - delimiter_indices[-1] - 1)
+    for prev_delim, next_delim in zip(delimiter_indices, delimiter_indices[1:]):
+        max_item_len = max(max_item_len, next_delim - prev_delim - 1)
+
+    return max_item_len
+
 
 def _cuda_graph_capture_max_bs(server_args, max_bs: int) -> int:
     """Pad max_bs to the alignment cuda-graph capture uses (see get_batch_sizes_to_capture)."""
@@ -550,7 +569,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         prefix_cache_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
         extend_seq_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-        prefix_len_ptr, token_pos_in_items_ptr = [], []
+        prefix_len_ptr, token_pos_in_items_ptr, max_item_lens = [], [], []
         token_pos_in_items_len = 0
         device = forward_batch.input_ids.device
 
@@ -567,11 +586,24 @@ class FlashInferAttnBackend(AttentionBackend):
                 continue
 
             first_delim = delimiter_indices_cpu[0].item()  # CPU .item(), no GPU sync
+            max_item_len = _max_multi_item_scoring_item_len(
+                delimiter_indices_cpu, seq_len
+            )
+            if max_item_len > FLASHINFER_MIS_MAX_ITEM_LEN:
+                raise ValueError(
+                    "FlashInfer multi-item scoring uses uint16 item-position "
+                    f"metadata and supports item lengths up to "
+                    f"{FLASHINFER_MIS_MAX_ITEM_LEN} tokens, but sequence {i} "
+                    f"contains an item with {max_item_len} tokens. Disable "
+                    "--enable-mis or split the scored item into shorter chunks."
+                )
+
             delimiter_indices = delimiter_indices_cpu.to(device, non_blocking=True)
             prefix_len = first_delim + (
                 prefix_cache_lens[i] if prefix_cache_lens is not None else 0
             )
             prefix_len_ptr.append(prefix_len)
+            max_item_lens.append(max_item_len)
 
             # Compute relative positions within items using searchsorted (no GPU sync).
             #   suffix_range      = [0, 1, 2, 3, 4, ...]
@@ -622,12 +654,8 @@ class FlashInferAttnBackend(AttentionBackend):
             ),
             token_pos_in_items_ptr=torch.cat(token_pos_in_items_ptr, dim=0),
             token_pos_in_items_len=token_pos_in_items_len & 0xFFFFFFFF,
-            max_item_len_ptr=torch.stack(
-                [
-                    t.to(torch.int32).max().to(torch.uint16)
-                    for t in token_pos_in_items_ptr
-                ],
-                dim=0,
+            max_item_len_ptr=torch.tensor(
+                max_item_lens, dtype=torch.uint16, device=device
             ),
         )
 
