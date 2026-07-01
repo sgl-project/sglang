@@ -5,24 +5,22 @@ from typing import Any, Dict
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
-    NPUW4A4Int4MoEMethod,
-)
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimMoEScheme
 from sglang.srt.utils import set_weight_attrs
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUW8A8Mxfp8MoEMethod,
+)
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "ModelSlimW4A4Int4MoE",
+    "ModelSlimW8A8Mxfp8MoE",
 ]
 
 
-class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
+class ModelSlimW8A8Mxfp8MoE(ModelSlimMoEScheme):
     """
-    W4A4 integer MoE scheme that creates weights for either the
-    w13 (gate+up) or w2 (down) projection group.
+    W8A8 MXFP8 MoE scheme for NPU.
 
     Two instances of this class are used per MoE layer:
       - weight_prefix="w13"   → handles the fused gate_proj + up_proj weights
@@ -35,11 +33,13 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
         weight_prefix: str,  # "w13" or "w2"
         group_size: int = 0,
     ) -> None:
+        if group_size == 0:
+            group_size = quant_config.quant_description.get("group_size", 32)
         self.quant_config = quant_config
-        self.kernel = NPUW4A4Int4MoEMethod()
+        self.kernel = NPUW8A8Mxfp8MoEMethod(group_size=group_size)
         self.weight_prefix = weight_prefix
         self.group_size = group_size
-        self.is_per_channel_weight = group_size == 0
+
         if weight_prefix not in ("w13", "w2"):
             raise ValueError(
                 f"weight_prefix must be 'w13' or 'w2', got '{weight_prefix}'"
@@ -53,46 +53,33 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
         intermediate_size_per_partition: int,
         **extra_weight_attrs,
     ) -> None:
-        """
-        Create and register weight, scale, and offset parameters for the layer.
-        Shape depends on the W4A4 packing environment flag and whether the weight
-        prefix is "w13" or "w2".
-        """
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-
+    
+        # Mark the weight scale as group‑wise so the fused loader can shard it correctly.
         extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
+            {"quant_method": FusedMoeWeightScaleSupported.GROUP.value}
         )
-        # --- compute shapes based on the packing path and prefix ---
-        if envs.SGLANG_NPU_W4A4_NEW_PACKING.get():
-            if self.weight_prefix == "w13":
-                out_features = intermediate_size_per_partition
-                in_features = hidden_size
-            else:  # w2
-                out_features = hidden_size // 2
-                in_features = intermediate_size_per_partition
-
-            weight_shape = (num_experts, out_features, in_features)
-            scale_shape = (num_experts, 2 * out_features, 1)
+    
+        # --- fixed shapes per prefix ---
+        if self.weight_prefix == "w13":
+            out_features = 2 * intermediate_size_per_partition
+            in_features = hidden_size
+        else:  # w2
+            out_features = hidden_size
+            in_features = intermediate_size_per_partition
+    
+        weight_shape = (num_experts, out_features, in_features)
+    
+        if self.group_size > 0:
+            scale_shape = (num_experts, out_features, in_features // self.group_size)
         else:
-            if self.weight_prefix == "w13":
-                a_dim = 2 * intermediate_size_per_partition
-                b_dim = hidden_size
-            else:  # w2
-                a_dim = hidden_size
-                b_dim = intermediate_size_per_partition
-
-            weight_shape = (num_experts, a_dim, b_dim)
-            scale_shape = (num_experts, a_dim, 1)
-
-        offset_shape = scale_shape  # offset always matches scale
-
+            scale_shape = (num_experts, out_features, 1)
+    
         self._create_weight_params(
             layer,
             self.weight_prefix,
             weight_shape,
             scale_shape,
-            offset_shape,
             extra_weight_attrs,
         )
 
@@ -102,36 +89,30 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
         prefix: str,
         weight_shape: tuple,
         scale_shape: tuple,
-        offset_shape: tuple,
         extra_weight_attrs: dict,
     ) -> None:
-        """Helper that registers weight, scale, and offset as parameters."""
-        # Weight
+        """Register weight (float8_e4m3fn) and scale (uint8) parameters."""
+        # Weight (e4m3fn)
         weight = torch.nn.Parameter(
-            torch.empty(weight_shape, dtype=torch.int8),
+            torch.empty(weight_shape, dtype=torch.float8_e4m3fn),
             requires_grad=False,
         )
         layer.register_parameter(f"{prefix}_weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
-        # Scale
+        # Scale (uint8, as used by the MXFP8 kernel)
         scale = torch.nn.Parameter(
-            torch.empty(scale_shape, dtype=torch.float32),
+            torch.empty(scale_shape, dtype=torch.uint8),
             requires_grad=False,
         )
         layer.register_parameter(f"{prefix}_weight_scale", scale)
         set_weight_attrs(scale, extra_weight_attrs)
 
-        # Offset
-        offset = torch.nn.Parameter(
-            torch.empty(offset_shape, dtype=torch.float32),
-            requires_grad=False,
-        )
-        layer.register_parameter(f"{prefix}_weight_offset", offset)
-        set_weight_attrs(offset, extra_weight_attrs)
+        # No offset in the MXFP8 scheme.
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """
         Delegate weight processing to the NPU kernel for the fixed weight group.
+        The kernel will handle transposes and scale reshaping as required.
         """
         self.kernel.process_weights_after_loading(layer, self.weight_prefix)

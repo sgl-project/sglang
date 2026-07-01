@@ -559,8 +559,6 @@ export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DEEPEP_BF16_DISPATCH=0
 export ASCEND_USE_FIA=1
 
-export SGLANG_NPU_FUSED_MOE_MODE=2
-
 python3 -m sglang.launch_server \
         --model-path  /path/to/MiMo-V2-Flash-w8a8-all-0512 \
         --attention-backend ascend \
@@ -574,7 +572,6 @@ python3 -m sglang.launch_server \
         --base-gpu-id 8 \
         --disable-radix-cache \
         --cuda-graph-bs 1 2 4 8 10 12 14 16 \
-        --quantization modelslim \
         --speculative-draft-model-quantization unquant \
         --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
         --enable-multi-layer-eagle \

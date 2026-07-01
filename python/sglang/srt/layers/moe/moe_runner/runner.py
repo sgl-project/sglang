@@ -4,6 +4,9 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any, Optional
 
+from sglang.srt.layers.moe.moe_runner.ascend import (
+    AscendRunnerCore,
+)
 from sglang.srt.layers.moe.moe_runner.base import (
     FusedOpPool,
     MoeRunnerConfig,
@@ -39,6 +42,8 @@ class MoeRunner:
 
         if runner_backend.is_triton():
             self.runner_core = TritonRunnerCore(config)
+        elif runner_backend.is_ascend():
+            self.runner_core = AscendRunnerCore(config)
         elif runner_backend.is_triton_kernels():
             self.runner_core = TritonKernelsRunnerCore(config)
         elif runner_backend.is_deep_gemm():
