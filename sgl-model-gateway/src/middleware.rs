@@ -618,8 +618,24 @@ pub async fn concurrency_limit_middleware(
 // HTTP Metrics Layer (Layer 1: SMG metrics)
 // ============================================================================
 
-/// Global counter for active HTTP connections (handlers currently executing)
-static ACTIVE_HTTP_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+/// RAII guard for the active HTTP connections gauge.
+///
+/// Increments `smg_http_connections_active` on construction and decrements on Drop,
+/// so the count stays correct even if the request future is cancelled mid-flight.
+struct HttpConnectionGuard;
+
+impl HttpConnectionGuard {
+    fn new() -> Self {
+        Metrics::inc_http_connections_active();
+        HttpConnectionGuard
+    }
+}
+
+impl Drop for HttpConnectionGuard {
+    fn drop(&mut self) {
+        Metrics::dec_http_connections_active();
+    }
+}
 
 /// Tower Layer for HTTP metrics collection (SMG Layer 1 metrics)
 #[derive(Clone)]
@@ -675,9 +691,10 @@ where
         let in_flight_request_tracker = self.in_flight_request_tracker.clone();
 
         Box::pin(async move {
-            // Increment inside async block - ensures no leak if future is dropped before polling
-            let active = ACTIVE_HTTP_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
-            Metrics::set_http_connections_active(active as usize);
+            // RAII guard: increment now, decrement on Drop. This is cancellation-safe —
+            // if the future is dropped mid-flight (client disconnect, timeout, abort) the
+            // decrement still runs, unlike a manual fetch_sub after `.await` which would leak.
+            let _conn_guard = HttpConnectionGuard::new();
 
             let guard = in_flight_request_tracker.track();
 
@@ -685,10 +702,6 @@ where
             let result = inner.call(req).await;
 
             drop(guard);
-
-            // Always decrement, regardless of success or failure
-            let active = ACTIVE_HTTP_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-            Metrics::set_http_connections_active(active as usize);
 
             let response = result?;
 
