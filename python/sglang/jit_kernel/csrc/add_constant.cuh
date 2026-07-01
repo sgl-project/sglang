@@ -62,11 +62,11 @@ void add_constant(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
   // 1. Validate input tensors
   SymbolicSize N = {"num_elements"};
   SymbolicDevice device_;
-  TensorMatcher({N})                  // 1D tensor, must be contiguous
-      .with_dtype<int32_t>()          // must be int32
+  TensorMatcher({N})                 // 1D tensor, must be contiguous
+      .with_dtype<int32_t>()         // must be int32
       .with_device<kDLGPU>(device_)  // must be on GPU device (CUDA or ROCm)
-      .verify(dst)                    // check tensor dst
-      .verify(src);                   // check tensor src
+      .verify(dst)                   // check tensor dst
+      .verify(src);                  // check tensor src
 
   // 2. Extract required parameters, prepare for kernel launch
   const size_t num_elements = N.unwrap();
