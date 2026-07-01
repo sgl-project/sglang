@@ -2552,13 +2552,9 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
             ),
         )
 
-    # CUTLASS mm_mxfp8 requires per-shard N >= 128 and K >= 128 (K also a multiple of
-    # BLOCK). Shards with N < 128 -- only the tiny fused in_proj_ba (N=16/shard) here --
-    # are zero-padded in N up to the 128 tile; it stays a true MXFP8 W8A8 GEMM (~1x
-    # memory) and the padded output rows are sliced off in apply(). K is never padded:
-    # it cannot be zero-extended without a matching activation extension, so a K < 128 /
-    # K % BLOCK != 0 shard fails loudly rather than silently falling back (a bf16 dequant
-    # would ~2x a large shard's memory and risk OOM).
+    # CUTLASS mm_mxfp8 requires per-shard N to be a multiple of 128, so
+    # non-aligned shards are zero-padded in N and sliced back in apply().
+    # K must remain aligned to MXFP8's 32-element scale block.
     ALIGN = 128
 
     @staticmethod
@@ -2595,10 +2591,9 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
         self._mm_mxfp8 = flashinfer_mm_mxfp8
 
         n, k = layer.weight.shape
-        if k < self.ALIGN or k % self.BLOCK != 0:
+        if k % self.BLOCK != 0:
             raise ValueError(
-                f"MXFP8 CUTLASS requires in_features >= {self.ALIGN} and a multiple of "
-                f"{self.BLOCK}, got {k} (K cannot be padded)."
+                f"MXFP8 requires in_features divisible by {self.BLOCK}, got {k}"
             )
 
         scale_cols = k // self.BLOCK
@@ -2609,14 +2604,15 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
             .reshape(n, scale_cols)
         )
 
-        # CUTLASS rejects N < 128: zero-pad the (necessarily small) shard up to the tile;
-        # padded rows produce zero output, sliced back to mxfp8_orig_n in apply().
+        # CUTLASS rejects N that is not 128-aligned. Padded rows produce zero
+        # output and are sliced back to mxfp8_orig_n in apply().
         layer.mxfp8_orig_n = n
-        if n < self.ALIGN:
-            pad_n = self.ALIGN - n
+        aligned_n = ((n + self.ALIGN - 1) // self.ALIGN) * self.ALIGN
+        if aligned_n != n:
+            pad_n = aligned_n - n
             weight = torch.nn.functional.pad(weight, (0, 0, 0, pad_n))
             scale_u8 = torch.nn.functional.pad(scale_u8, (0, 0, 0, pad_n))
-            n = self.ALIGN
+            n = aligned_n
 
         layer.weight = Parameter(weight.contiguous(), requires_grad=False)
         layer.weight_scale = Parameter(
@@ -2628,7 +2624,9 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
         # (swizzled SF layout); the weight scale was swizzled to the F8_128x4 layout at
         # load. Kernel callables bound in process_weights_after_loading (not per call).
         out_dtype = (
-            x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+            x.dtype
+            if x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            else torch.bfloat16
         )
         x_2d = x.view(-1, x.shape[-1]).contiguous()
         q_x, x_scale = self._mxfp8_quantize(x_2d, is_sf_swizzled_layout=True)

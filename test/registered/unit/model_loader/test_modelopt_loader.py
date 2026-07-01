@@ -6,6 +6,7 @@ applies NVIDIA Model Optimizer quantization to models during loading.
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -861,6 +862,48 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
                     DummyFusedMoE(),
                     "model.layers.0.mlp.experts",
                 )
+
+    def test_mxfp8_process_pads_n_and_accepts_block_aligned_k_below_128(self):
+        from sglang.srt.layers.quantization import fp8_utils
+
+        method = ModelOptMxfp8LinearMethod()
+        layer = nn.Module()
+        layer.weight = torch.nn.Parameter(
+            torch.empty((160, 64), dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            torch.empty((160, 2), dtype=torch.uint8),
+            requires_grad=False,
+        )
+
+        with (
+            patch.object(fp8_utils, "flashinfer_mxfp8_quantize", object(), create=True),
+            patch.object(fp8_utils, "flashinfer_mm_mxfp8", object(), create=True),
+        ):
+            method.process_weights_after_loading(layer)
+
+        self.assertEqual(layer.mxfp8_orig_n, 160)
+        self.assertEqual(layer.weight.shape, (256, 64))
+        self.assertEqual(layer.weight_scale.dtype, torch.uint8)
+
+    def test_mxfp8_apply_preserves_fp32_output_dtype(self):
+        method = ModelOptMxfp8LinearMethod()
+        method._mxfp8_quantize = lambda x, **_: (x, torch.empty(0))
+
+        def fake_mm_mxfp8(*_, out_dtype, **__):
+            return torch.empty((2, 8), dtype=out_dtype)
+
+        method._mm_mxfp8 = fake_mm_mxfp8
+        layer = SimpleNamespace(
+            weight=torch.empty((8, 64)),
+            weight_scale=torch.empty(0),
+            mxfp8_orig_n=8,
+        )
+
+        output = method.apply(layer, torch.zeros((2, 64), dtype=torch.float32))
+
+        self.assertEqual(output.dtype, torch.float32)
 
     def test_mxfp8_linear_uses_v2_weight_loader(self):
         self.assertIn("ModelOptMxfp8LinearMethod", WEIGHT_LOADER_V2_SUPPORTED)
