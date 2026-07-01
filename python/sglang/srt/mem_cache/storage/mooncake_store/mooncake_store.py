@@ -597,6 +597,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+
+        # Check if this is a logical anchor (non-registerable)
+        self._logical_kv_anchor = getattr(mem_pool_host, "is_mooncake_registerable", True) is False
+
+        if self._logical_kv_anchor:
+            # Logical anchor: no physical buffer, use marker keys for tracking
+            logger.info(
+                f"Detected logical KV anchor pool ({type(mem_pool_host).__name__}), "
+                "using marker keys for existence tracking"
+            )
+            self.gb_per_page = 0.0
+            return
+
+        # Physical buffer: proceed with normal registration
         assert self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
@@ -843,6 +857,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Apply extra_backend_tag prefix if available
         keys = self._tag_keys(keys)
 
+        # Logical anchor: check marker keys instead of physical KV data
+        if getattr(self, "_logical_kv_anchor", False):
+            return self._batch_get_logical_anchor(keys)
+
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
         start_time = time.perf_counter()
@@ -867,6 +885,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     ) -> List[bool]:
         # Apply extra_backend_tag prefix if available
         keys = self._tag_keys(keys)
+
+        # Logical anchor: set marker keys instead of physical KV data
+        if getattr(self, "_logical_kv_anchor", False):
+            return self._batch_set_logical_anchor(keys)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
         exist_result = self._batch_exist(key_strs)
@@ -1032,6 +1054,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     ) -> int:
         # Apply extra_backend_tag prefix if available
         keys = self._tag_keys(keys)
+
+        # Logical anchor: check marker keys instead of physical KV keys
+        if getattr(self, "_logical_kv_anchor", False):
+            query_keys = [self._logical_anchor_key(key) for key in keys]
+            exist_result = self._batch_exist(query_keys)
+            for i in range(len(query_keys)):
+                if exist_result[i] != 1:
+                    return i
+            return len(query_keys)
 
         if self.is_mla_backend:
             query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
