@@ -832,10 +832,10 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         setattr(self, f"{weight_name}_scale", w_scale_t)
     
         torch.npu.empty_cache()
+        self.hidden_states_quantizer = HiddenStatesMXFP8DynamicQuant()
     
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
-            self.hidden_states_quantizer = HiddenStatesMXFP8DynamicQuant()
 
     def apply(self, quant_info, hidden_states, expert_tokens,
               pertoken_scale, output_dtype, weight_prefix, group_list_type):
