@@ -80,6 +80,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -744,9 +745,10 @@ class Scheduler(
         if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
             initialize_moe_config(self.server_args)
 
-        # Initialize GEMM-related configuration for FP8 and FP4 backends.
+        # Initialize GEMM-related configuration for FP8, FP4, and BF16 backends.
         initialize_fp8_gemm_config(self.server_args)
         initialize_fp4_gemm_config(self.server_args)
+        initialize_bf16_gemm_config(self.server_args)
 
         # This must be called after initialize_moe_config
         self.require_mlp_sync = require_mlp_sync(self.server_args)
