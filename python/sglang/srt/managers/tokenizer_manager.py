@@ -1011,6 +1011,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
             self._validate_token_ids_logprob(obj)
+            self._validate_top_logprobs_num(obj)
             if (
                 obj.return_hidden_states
                 and not self.server_args.enable_return_hidden_states
@@ -1090,6 +1091,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"token_ids_logprob contains out-of-vocabulary token id "
                     f"{token_id}; valid range is [0, {vocab_size})."
                 )
+
+    def _validate_top_logprobs_num(self, obj: GenerateReqInput) -> None:
+        # top_logprobs_num is a single int here (batch requests are split
+        # upstream, like _validate_token_ids_logprob). It feeds logprobs.topk(k),
+        # which raises when k > vocab_size; reject that at the boundary instead.
+        top_logprobs_num = obj.top_logprobs_num
+        if top_logprobs_num is None:
+            return
+        if isinstance(top_logprobs_num, bool) or not isinstance(top_logprobs_num, int):
+            raise ValueError("top_logprobs_num must be an integer.")
+        vocab_size = self.model_config.vocab_size
+        if top_logprobs_num < 0 or top_logprobs_num > vocab_size:
+            raise ValueError(
+                f"Requested top_logprobs_num ({top_logprobs_num}) is out of "
+                f"range; valid range is [0, {vocab_size}]."
+            )
 
     def _validate_input_ids_in_vocab(
         self, input_ids: Union[List[int], List[List[int]]], vocab_size: int
