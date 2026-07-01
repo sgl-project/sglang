@@ -778,20 +778,20 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         online_quant = "ascend_mxfp8"
         print(online_quant)
 
-        if online_quant == "ascend_w8a8":
-            self._apply_online_w8a8(layer, weight_prefix, weight_name)
-        elif online_quant == "ascend_mxfp8":
-            self._apply_online_mxfp8(layer, weight_prefix, weight_name)
-        else:
+        #if online_quant == "ascend_w8a8":
+        #    self._apply_online_w8a8(layer, weight_prefix, weight_name)
+        #elif online_quant == "ascend_mxfp8":
+        self._apply_online_mxfp8(layer, weight_prefix, weight_name)
+        #else:
             # Pure BF16 path
-            weight: torch.Tensor = getattr(layer, weight_name)
-            formatted_weight = npu_format_cast(weight.data.transpose(1, 2))
-            layer.__setattr__(
-                weight_name,
-                torch.nn.Parameter(formatted_weight, requires_grad=False),
-            )
-            if weight_prefix == "w13":
-                self._set_dispatcher_output_dtype(layer, "bf16")
+            #weight: torch.Tensor = getattr(layer, weight_name)
+            #formatted_weight = npu_format_cast(weight.data.transpose(1, 2))
+            #layer.__setattr__(
+            #    weight_name,
+            #    torch.nn.Parameter(formatted_weight, requires_grad=False),
+            #)
+            #if weight_prefix == "w13":
+            #    self._set_dispatcher_output_dtype(layer, "bf16")
 
     # ------------------------------------------------------------------
     # W8A8 int8 online quantisation (existing logic)
