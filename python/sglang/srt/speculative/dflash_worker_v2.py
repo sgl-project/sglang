@@ -1,5 +1,7 @@
 import logging
 import math
+import time
+from copy import deepcopy
 from copy import deepcopy
 from typing import List, Optional
 
@@ -286,6 +288,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+
+        # DFlash Repetition Penalty: persistent state (per-request to survive batch changes)
+        self._dflash_cumulated: Optional[torch.Tensor] = None
+        self._dflash_fingerprint: Optional[tuple] = None  # kept for backward compat
+        self._dflash_cumulated_map: dict[str, torch.Tensor] = {}  # rid -> [vocab_size]
+        self._dflash_cumulated_ts: dict[str, float] = {}          # rid -> last access time
+        self._dflash_step_counter: int = 0
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -1561,6 +1570,43 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
 
+        # === DFlash Hijack: inject persistent penalty matrix before forward ===
+        if sampling_info is not None:
+            acc_sc_frame = getattr(sampling_info, "acc_scaling_penalties", None)
+            if acc_sc_frame is not None:
+                reqs = model_worker_batch.reqs
+                rids = [req.rid for req in reqs]
+                vocab_size = acc_sc_frame.shape[1]
+
+                if len(rids) == 0:
+                    self._dflash_cumulated = None
+                    sampling_info.acc_scaling_penalties = None
+                else:
+                    # --- Per-request state restore (with shape check for rid reuse) ---
+                    for i, rid in enumerate(rids):
+                        if rid not in self._dflash_cumulated_map or \
+                           self._dflash_cumulated_map[rid].shape[0] != vocab_size:
+                            self._dflash_cumulated_map[rid] = acc_sc_frame[i].clone()
+
+                    # --- Build cumulated matrix for current batch ---
+                    cumulated_list = [self._dflash_cumulated_map[rid] for rid in rids]
+                    self._dflash_cumulated = torch.stack(cumulated_list, dim=0)
+
+                    # --- LRU timestamp update + cleanup ---
+                    now = time.time()
+                    for rid in rids:
+                        self._dflash_cumulated_ts[rid] = now
+                    self._dflash_step_counter += 1
+                    if self._dflash_step_counter % 10 == 0:
+                        expired = [r for r, t in self._dflash_cumulated_ts.items() if now - t > 60.0]
+                        for r in expired:
+                            self._dflash_cumulated_map.pop(r, None)
+                            self._dflash_cumulated_ts.pop(r, None)
+
+                    # --- Inject into sampling_info ---
+                    sampling_info.acc_scaling_penalties = self._dflash_cumulated
+        # === End DFlash Hijack ===
+
         need_mamba_verify_commit = hasattr(
             self.target_worker.model_runner.attn_backend,
             "update_mamba_state_after_mtp_verify",
@@ -1685,6 +1731,89 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens.scatter_(
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
+
+        # === DFlash Hard Guard & Accounting (V2 Final) ===
+        si = model_worker_batch.sampling_info
+        if si is not None:
+            bs = bonus.shape[0]
+            if bs == 0:
+                pass  # Empty batch, skip all accounting
+            else:
+                device = candidates.device
+
+                # self.block_size is the V2 attribute (verified at line 171)
+                if candidates.dim() == 1:
+                    draft_tokens = candidates.view(bs, int(self.block_size))
+                else:
+                    draft_tokens = candidates
+
+                max_k = draft_tokens.shape[1] - 1
+                correct_len = accept_len
+                verified_id = draft_tokens[:, 0]
+
+                # --- L3: Hard Guard (Zero-Sync, no .item()) ---
+                meltdown = torch.zeros(bs, dtype=torch.bool, device=device)
+                if max_k > 0:
+                    # .all(): entire block must be identical to trigger — avoids false positives
+                    is_repeating_draft = (draft_tokens[:, 1:] == verified_id.unsqueeze(1)).all(dim=1)
+                    # >= and <=: V1 uses these (line 1246-1247), covers edge cases
+                    full_loop = (correct_len >= max_k) & is_repeating_draft
+                    zero_loop = (correct_len <= 0) & (bonus == verified_id)
+                    meltdown = full_loop | zero_loop
+
+                if meltdown.any():
+                    # Zero-sync: no .item() on hot path
+                    logger.warning(f"[DFLASH_HARD_GUARD] Triggered for {int(meltdown.sum())}/{bs} seqs.")
+
+                    vocab_sz_src = getattr(si, "acc_scaling_penalties", None)
+                    vocab_size = vocab_sz_src.shape[1] if vocab_sz_src is not None else 32000
+
+                    vid_md = verified_id[meltdown]
+                    alt = torch.where(vid_md + 1 < vocab_size, vid_md + 1, torch.clamp(vid_md - 1, min=0))
+                    idx = meltdown.nonzero(as_tuple=True)[0]
+                    bonus[idx] = alt
+
+                    # ★★★ 修复：将修正后的 bonus 写回 out_tokens ★★★
+                    out_tokens.scatter_(1, accept_len[meltdown].to(torch.int64)[:, None], alt[:, None])
+
+                # --- L1/L2: Token Accounting (hijack moved to pre-forward) ---
+                cumulated = self._dflash_cumulated
+                
+                if cumulated is not None:
+                    # ★ 动态提取 pfac，避免 batch size 变化导致的形状不匹配
+                    rp_list = [req.sampling_params.repetition_penalty for req in model_worker_batch.reqs]
+                    pfac = torch.tensor(rp_list, dtype=torch.float32, device=device).view(-1, 1)
+                    
+                    # rp=1 shortcut: skip accounting if no penalty
+                    if (pfac == 1.0).all():
+                        pass
+                    else:
+                        vocab_size = cumulated.shape[1]
+                        # Draft tokens
+                        if max_k > 0:
+                            safe_cl = torch.clamp(correct_len, min=0)
+                            pos_idx = torch.arange(max_k, device=device)
+                            valid_mask = pos_idx.unsqueeze(0) < safe_cl.unsqueeze(1)
+                            b_idx, p_idx = torch.where(valid_mask)
+                            
+                            if b_idx.numel() > 0:
+                                toks = draft_tokens[b_idx, p_idx + 1]
+                                safe = (toks >= 0) & (toks < vocab_size)
+                                b_idx_s, toks_s = b_idx[safe], toks[safe]
+                                if b_idx_s.numel() > 0:
+                                    cumulated[b_idx_s, toks_s] = pfac[b_idx_s].flatten()
+                        
+                        # Bonus token
+                        bon_safe = (bonus >= 0) & (bonus < vocab_size)
+                        if bon_safe.any():
+                            bon_bids = torch.arange(bs, device=device)[bon_safe]
+                            cumulated[bon_bids, bonus[bon_safe]] = pfac.squeeze(-1)[bon_safe]
+                    
+                    # Write back updated penalties to per-request dict
+                    reqs = model_worker_batch.reqs
+                    for i, req in enumerate(reqs):
+                        self._dflash_cumulated_map[req.rid] = cumulated[i].clone()
+        # === End DFlash Hard Guard & Accounting ===
 
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None

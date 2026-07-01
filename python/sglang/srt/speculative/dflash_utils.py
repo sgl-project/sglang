@@ -195,6 +195,37 @@ def apply_dflash_verify_logits_adjustments(
             )
         get_logits_3d().add_(logit_bias[:, None, :])
 
+    # === DFlash Repetition Penalty (Multiplicative Scaling - V2 Final) ===
+    acc_scaling = getattr(sampling_info, "acc_scaling_penalties", None)
+    if acc_scaling is not None:
+        try:
+            # Zero-copy view (no clone), shares memory with next_token_logits
+            logits_3d = next_token_logits.view(bs, draft_token_num, -1)
+            # non_blocking=True: avoid GPU-CPU sync on small batches
+            safe_scaling = acc_scaling.to(next_token_logits.device, non_blocking=True).unsqueeze(1).clamp(min=1.0, max=2.5)
+
+            # NaN/Inf safety — prevents kernel hang on extreme values
+            torch.nan_to_num(logits_3d, nan=0.0, posinf=50.0, neginf=-50.0, out=logits_3d)
+
+            # 🎯 ONLY target bonus token (last position), skip draft verification positions
+            # This preserves accept rate for speculative decoding
+            bonus_slice = logits_3d[:, -1:, :]
+            # Use V2 compiled function for scaling
+            from sglang.srt.sampling.penaltylib.repetition_penalty import (
+                apply_scaling_penalties,
+            )
+            apply_scaling_penalties(bonus_slice, safe_scaling)
+
+        except Exception as e:
+            import logging
+            logging.error(f"[DFlash] Scaling fallback due to: {e}")
+            # Fallback: still only bonus position (protect accept rate)
+            logits_3d = next_token_logits.view(bs, draft_token_num, -1)
+            ts = acc_scaling.to(next_token_logits.device, non_blocking=True).unsqueeze(1).clamp(min=1.0, max=2.5)
+            bonus_slice = logits_3d[:, -1:, :]
+            torch.where(bonus_slice < 0, bonus_slice * ts, bonus_slice / ts, out=bonus_slice)
+    # === End DFlash Repetition Penalty ===
+
 
 def _get_or_create_chain_verify_buffers(
     *,
