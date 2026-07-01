@@ -649,7 +649,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         if loaded_shard_id is None:
             if isinstance(param, PerTensorScaleParameter):
-                if self.tp_size > 1 and loaded_weight.shape == param.data.shape:
+                if loaded_weight.numel() == 1 and param.data.numel() > 1:
+                    param.data.fill_(loaded_weight.reshape(-1)[0])
+                    return
+                if loaded_weight.shape == param.data.shape:
                     param.data.copy_(loaded_weight)
                     return
                 param.load_merged_column_weight(loaded_weight=loaded_weight, shard_id=0)
@@ -869,6 +872,12 @@ class QKVParallelLinear(ColumnParallelLinear):
     ):
         if loaded_shard_id is None:  # special case for certain models
             if isinstance(param, PerTensorScaleParameter):
+                if loaded_weight.numel() == 1 and param.data.numel() > 1:
+                    param.data.fill_(loaded_weight.reshape(-1)[0])
+                    return
+                if loaded_weight.shape == param.data.shape:
+                    param.data.copy_(loaded_weight)
+                    return
                 param.load_qkv_weight(loaded_weight=loaded_weight, shard_id=0)
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):

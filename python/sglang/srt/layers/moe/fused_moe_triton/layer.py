@@ -13,10 +13,6 @@ from torch.nn.parameter import UninitializedParameter
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-    get_moe_tensor_parallel_rank,
-    get_moe_tensor_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -65,6 +61,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -182,6 +179,7 @@ class FusedMoE(torch.nn.Module):
         with_bias=False,
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
+        gate_up_interleaved: bool = True,
     ):
         super().__init__()
         if params_dtype is None:
@@ -196,10 +194,10 @@ class FusedMoE(torch.nn.Module):
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
         )
-        self.moe_ep_size = get_moe_expert_parallel_world_size()
-        self.moe_ep_rank = get_moe_expert_parallel_rank()
-        self.moe_tp_size = get_moe_tensor_parallel_world_size()
-        self.moe_tp_rank = get_moe_tensor_parallel_rank()
+        self.moe_ep_size = get_parallel().moe_ep_size
+        self.moe_ep_rank = get_parallel().moe_ep_rank
+        self.moe_tp_size = get_parallel().moe_tp_size
+        self.moe_tp_rank = get_parallel().moe_tp_rank
 
         # DeepEP: each rank has its own shared expert slot, so total shared
         # weight slots = num_fused_shared_experts * ep_size.
@@ -268,6 +266,7 @@ class FusedMoE(torch.nn.Module):
             swiglu_limit=swiglu_limit,
             is_gated=is_gated,
             routing_method_type=routing_method_type,
+            gate_up_interleaved=gate_up_interleaved,
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
@@ -1104,6 +1103,7 @@ class FusedMoE(torch.nn.Module):
                     topk_output.topk_config.correction_bias,
                     topk_output.topk_config.renormalize,
                     self.layer_id,
+                    topk_output.topk_config.allow_routed_experts_capture,
                 )
             else:
                 # Make sure there is torch lib op registration for the whole moe layer
@@ -1354,6 +1354,7 @@ def fused_moe_bypassed_piecewise_cuda_graph_impl(
     correction_bias: Optional[torch.Tensor],
     renormalize: bool,
     layer_id: int,
+    allow_routed_experts_capture: bool,
 ) -> torch.Tensor:
     topk_output = BypassedTopKOutput(
         hidden_states=hidden_states,
@@ -1364,6 +1365,7 @@ def fused_moe_bypassed_piecewise_cuda_graph_impl(
             num_expert_group=num_expert_group,
             correction_bias=correction_bias,
             renormalize=renormalize,
+            allow_routed_experts_capture=allow_routed_experts_capture,
         ),
     )
     forward_context = get_tc_piecewise_forward_context()

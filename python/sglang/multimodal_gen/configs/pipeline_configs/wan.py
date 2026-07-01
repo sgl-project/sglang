@@ -109,6 +109,22 @@ class TurboWanT2V480PConfig(WanT2V480PConfig):
 
 
 @dataclass
+class TurboWanT2V1_3B480PConfig(TurboWanT2V480PConfig):
+    """Configuration for TurboWan T2V 1.3B DMD pipeline."""
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+            keep_resident_min_available_gb=60,
+            keep_resident_components=(
+                "text_encoder",
+                "image_encoder",
+                "vae",
+            ),
+        )
+
+
+@dataclass
 class WanT2V720PConfig(WanT2V480PConfig):
     """Base configuration for Wan T2V 14B 720P pipeline architecture."""
 
@@ -182,6 +198,17 @@ class FastWan2_1_T2V_480P_Config(WanT2V480PConfig):
     dmd_denoising_steps: list[int] | None = field(
         default_factory=lambda: [1000, 757, 522]
     )
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+            keep_resident_min_available_gb=60,
+            keep_resident_components=(
+                "text_encoder",
+                "image_encoder",
+                "vae",
+            ),
+        )
 
 
 @dataclass

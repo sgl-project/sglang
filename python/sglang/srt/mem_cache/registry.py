@@ -42,6 +42,7 @@ class TreeCacheBuildContext:
     tp_size: int
     tp_rank: int
     tp_group: Any
+    full_tokens_per_layer: Optional[int] = None
 
 
 RadixCacheFactory = Callable[[TreeCacheBuildContext], BasePrefixCache]
@@ -84,6 +85,10 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
             return ChunkCache(params)
+        if ctx.full_tokens_per_layer == 0:
+            from sglang.srt.mem_cache.chunk_cache import PureSWAChunkCache
+
+            return PureSWAChunkCache(params)
         from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
         return SWAChunkCache(params)
@@ -112,6 +117,10 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         return cache
 
     if ctx.is_hybrid_swa:
+        if ctx.full_tokens_per_layer == 0:
+            from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
+
+            return PureSWARadixCache(params=params)
         from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
         return SWARadixCache(params=params)
