@@ -164,6 +164,8 @@ def sgl_build_tree_kernel_efficient_triton(
                                 ):
                                     cur_position = cp
                                     found = 1
+                        if found == 0:
+                            should_continue = 0
 
             tl.store(
                 positions_ptr + batch_idx * draft_token_num + draft_tokenx,
