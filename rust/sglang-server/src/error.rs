@@ -33,6 +33,12 @@ pub enum Error {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// An error received over the wire from a remote sglang-server (headless
+    /// mode): carries the original message + HTTP status verbatim so the
+    /// api-server can surface them unchanged.
+    #[error("{message}")]
+    Remote { message: String, status: u16 },
 }
 
 impl Error {
@@ -43,6 +49,7 @@ impl Error {
             Error::Validation(_) => 400,
             Error::Disconnected => 499, // nginx-style client closed request
             Error::QueueFull => 503,
+            Error::Remote { status, .. } => *status,
             _ => 500,
         }
     }

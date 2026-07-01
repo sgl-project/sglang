@@ -8,11 +8,10 @@
 //! Edges driven here (from the design table):
 //!   Received      → Validating
 //!   Validating    → Normalizing   (generate: sampling-param normalize/verify)
-//!   Validating    → PreSendValidating   (control: no tokenize, no sampling params)
-//!   Normalizing   → {Encoding | Tokenizing | PreSendValidating}  (by ValidationOutcome)
-//!   Tokenizing    → PreSendValidating   (on TokenizeDone, when the request returns)
-//!   PreSendValidating → Queued          (checks needing the tokenized length)
-//!   Queued        → ring                (handed to the scheduler)
+//!   Validating    → Queued        (control: no tokenize, no sampling params)
+//!   Normalizing   → {Encoding | Tokenizing | Queued}   (by ValidationOutcome)
+//!   Tokenizing    → Queued        (on TokenizeDone, when the request returns)
+//!   Queued        → ring          (handed to the scheduler)
 //!
 //! The egress edges (Streaming/Finalizing/Completed) are driven on the egress
 //! side (see `egress` + `detokenizer`).
@@ -20,336 +19,154 @@
 use bytes::Bytes;
 
 use crate::error::Error;
-use crate::fsm::{Event, RequestState, ValidationOutcome};
-
+use crate::fsm::{Event, ValidationOutcome};
+use crate::ids::RequestId;
 use crate::message::{
-    AbortReq, ControlRequest, DetokMsg, EgressItem, GenerateRequest, IngressMsg, Request,
-    RequestKind,
+    EgressItem, GenerateRequest, IngressMsg, Request, RequestKind, TokenizedReqPayload,
+    abort_req_msgpack, control_req_msgpack,
 };
-use crate::ring::IngressProducer;
-use crate::runtime::{Runnable, ServerArgs};
-use crate::tokenizer_manager::{AbortSource, Senders, TmEvent};
+use crate::runtime::Runnable;
+use crate::runtime::channels::{DetokMsg, Senders, TmEvent};
+use crate::runtime::ring::IngressProducer;
+use crate::tokenizer_manager::sampling::normalize_sampling_params;
 
 /// Ingress FSM dispatcher stage. Owns its inbox + downstream handles, so the
 /// runtime spawns it as a [`Runnable`] rather than calling a free `run_*` fn
 /// with positional arguments.
 pub struct Ingress {
     rx: flume::Receiver<TmEvent>,
-    /// Unbounded abort lane (see [`Senders::abort`]). Selected against `rx` so an
-    /// abort is handled promptly even while the bounded inbox is saturated.
-    abort_rx: flume::Receiver<AbortSource>,
     senders: Senders,
     ingress: IngressProducer,
-    limits: Limits,
-    shutdown: flume::Receiver<()>,
-}
-
-/// Longest client-supplied rid accepted. It keys the detok table and travels on
-/// every chunk, so its length is a recurring cost; Python mints 32-byte uuid hex.
-const MAX_RID_LEN: usize = 128;
-
-/// What ingress admits, resolved once at boot from the scheduler's `server_args`.
-/// A struct rather than more positional `new` arguments — these grew from two to
-/// six, and every one of them is a `u64`/`bool` that would be trivial to swap at
-/// a call site.
-///
-/// NOT `Default`-able on purpose. `vocab_size` and `context_len` are mandatory,
-/// and their zero value is the most restrictive setting there is — a derived
-/// `Default` would silently build limits that reject every request rather than
-/// failing loudly. Tests construct these explicitly (see `test_limits`).
-#[derive(Clone, Debug)]
-pub struct Limits {
-    /// Token-ids-in mode: a generate request must arrive already tokenized.
-    pub skip_tokenizer_init: bool,
-    /// `model_config.vocab_size`; bounds client-supplied token ids. Mandatory —
-    /// [`ServerArgs::validate_mandatory`](crate::runtime::ServerArgs) rejects a
-    /// boot without it, so ingress can check unconditionally.
-    pub vocab_size: u64,
-    /// `model_config.context_len`, the ceiling for input + `max_new_tokens`.
-    /// Mandatory, as above.
-    pub context_len: u64,
-    /// Output slots reserved on top of the input (eagle draft tokens).
-    pub num_reserved_tokens: u64,
-    /// Clamp `max_new_tokens` to what fits instead of rejecting the request.
-    pub allow_auto_truncate: bool,
-    /// Whether the server can produce hidden states at all.
-    pub enable_return_hidden_states: bool,
-}
-
-impl TryFrom<&ServerArgs> for Limits {
-    type Error = Error;
-
-    fn try_from(sa: &ServerArgs) -> Result<Self, Self::Error> {
-        Ok(Self {
-            skip_tokenizer_init: sa.skip_tokenizer_init,
-            vocab_size: sa
-                .model_config
-                .vocab_size
-                .ok_or_else(|| Error::Validation("vocab_size missing".into()))?,
-            context_len: sa
-                .model_config
-                .context_len
-                .ok_or_else(|| Error::Validation("context_len missing".into()))?,
-            num_reserved_tokens: sa.num_reserved_tokens,
-            allow_auto_truncate: sa.allow_auto_truncate,
-            enable_return_hidden_states: sa.enable_return_hidden_states,
-        })
-    }
+    skip_tokenizer_init: bool,
 }
 
 impl Ingress {
     pub fn new(
         rx: flume::Receiver<TmEvent>,
-        abort_rx: flume::Receiver<AbortSource>,
         senders: Senders,
         ingress: IngressProducer,
-        limits: Limits,
-        shutdown: flume::Receiver<()>,
+        skip_tokenizer_init: bool,
     ) -> Self {
         Self {
             rx,
-            abort_rx,
             senders,
             ingress,
-            limits,
-            shutdown,
+            skip_tokenizer_init,
         }
     }
 }
 
-/// Which lane produced the next item.
-enum Lane {
-    Abort(AbortSource),
-    Event(TmEvent),
-}
-
 impl Runnable for Ingress {
     fn run(self) {
-        loop {
-            // Select, not a drain-then-block: an abort arriving while the inbox is
-            // idle must still be handled at once.
-            let next = flume::Selector::new()
-                .recv(&self.abort_rx, |r| r.ok().map(Lane::Abort))
-                .recv(&self.rx, |r| r.ok().map(Lane::Event))
-                .recv(&self.shutdown, |_| None)
-                .wait();
-            match next {
-                Some(Lane::Abort(rid)) => self.on_abort(rid),
-                // A fresh request and one returning from the tokenizer pool.
-                Some(Lane::Event(TmEvent::Ingress(req) | TmEvent::Tokenized(req))) => {
-                    self.drive(req)
-                }
-                None => {
-                    // Shutdown, or the inbox closed. Drain whatever is still queued
-                    // on the abort lane first: those requests are in flight on the
-                    // scheduler, and the selector may report the closed inbox before
-                    // it ever looks at a pending abort.
-                    while let Ok(source) = self.abort_rx.try_recv() {
-                        self.on_abort(source);
-                    }
-                    return;
-                }
+        while let Ok(ev) = self.rx.recv() {
+            match ev {
+                TmEvent::Ingress(req) => self.on_ingress(req),
+                TmEvent::Tokenized(req) => self.on_tokenized(req),
+                TmEvent::Abort(id) => self.on_abort(id),
             }
         }
     }
 }
 
 impl Ingress {
-    /// Reject a request: → `Failed`, notify the client, deregister (unconditional
-    /// — a no-op when nothing was registered).
-    /// `registered` says whether this request ever reached `register_detok`. It
-    /// must: `Deregister`'s handler is a bare `table.remove(&rid)`, so a
-    /// request rejected BEFORE registering would evict whatever entry currently
-    /// holds that key — a concurrent request's sink — leaving that client with no
-    /// terminal frame and a hung connection. Python cannot hit this because it
-    /// validates before `rid_to_state[obj.rid] = state`.
-    fn fail(&self, req: &mut Request, err: Error, registered: bool) {
-        // Log only server faults (500); 4xx/499/503 are expected and would spam.
-        if err.http_status() == 500 {
-            tracing::error!(rid = %req.rid, error = %err, "ingress rejected request");
+    /// Validate a fresh request and route it onto the correct ingress branch.
+    fn on_ingress(&self, mut req: Request) {
+        // Received → Validating, plus payload validation; reject invalid requests.
+        if let Err(e) = validate(&mut req, self.skip_tokenizer_init) {
+            fail(&mut req, e);
+            return;
         }
-        let _ = req.state.apply(Event::Error(err.clone()));
-        let _ = req.sink.try_send(EgressItem::Error(err)); // client may be gone
-        if registered {
-            let _ = self.senders.detok_for(&req.rid).send(DetokMsg::Deregister {
-                rid: req.rid.clone(),
-            });
+
+        // Register the egress sink with the owning detok shard *before* the
+        // request leaves Rust, so the response (generate chunks or a control
+        // result) has a home. Routing is by id only.
+        let shard = self.senders.detok_for(req.id);
+        if shard
+            .send(DetokMsg::Register {
+                id: req.id,
+                sink: req.sink.clone(),
+            })
+            .is_err()
+        {
+            fail(&mut req, Error::Internal("detok shard gone".into()));
+            return;
         }
+
+        // Branch by kind. Copy the control tag out so the borrow of `req.kind`
+        // ends before we move `req` downstream.
+        let control_tag = match &req.kind {
+            RequestKind::Control(c) => Some(c.tag),
+            RequestKind::Generate(_) => None,
+        };
+        if let Some(tag) = control_tag {
+            // Control requests skip tokenization entirely: validate straight to
+            // Queued and push the bare `[tag, rid, nil]` control message.
+            let _ = req
+                .state
+                .apply(Event::Validated(ValidationOutcome::AlreadyTokenized)); // → Queued
+            self.push_control_to_ring(req, tag);
+            return;
+        }
+
+        // Validating → Normalizing: normalize + verify the sampling params here
+        // (the Rust server replaces the Python TokenizerManager, where this runs)
+        // so the work stays off the scheduler's latency-critical loop. Sets
+        // `is_normalized=true` on the wire; the scheduler then skips its pass.
+        let _ = req.state.apply(Event::Normalized);
+        if let RequestKind::Generate(g) = &mut req.kind
+            && let Err(e) = normalize_sampling_params(&mut g.payload.sampling_params)
+        {
+            fail(&mut req, e);
+            return;
+        }
+
+        self.route_generate(req);
     }
 
-    /// Drive a request through its ingress states until it terminates (failed or
-    /// pushed to the ring) or is handed to the tokenizer pool (re-entering as a
-    /// `Tokenized` event). Each arm acts and advances the FSM; the loop
-    /// re-dispatches. The arms are the design table's states, `Failed` the single
-    /// reject path.
-    fn drive(&self, mut req: Request) {
-        // Flipped once `register_detok` succeeds; `fail` must not deregister before
-        // that (see `fail`). A pool return re-enters `drive` already registered.
-        let mut registered = !matches!(req.state, RequestState::Received);
-        loop {
-            match req.state.clone() {
-                // Validate, then register the sink before the request leaves Rust.
-                // Failures move to `Failed` and fall through to the reject arm.
-                RequestState::Received => {
-                    if let Err(e) = validate(&mut req, &self.limits) {
-                        let _ = req.state.apply(Event::Error(e)); // → Failed
-                        continue;
-                    }
-                    if !self.register_detok(&req) {
-                        let _ = req
-                            .state
-                            .apply(Event::Error(Error::Internal("detok shard gone".into())));
-                        continue;
-                    }
-                    registered = true;
-                    // `validate` advanced Received → Validating; keep driving.
+    /// Route a validated generate request: queue directly when it already carries
+    /// token ids, else hand it to the tokenizer pool.
+    fn route_generate(&self, mut req: Request) {
+        let RequestKind::Generate(g) = &req.kind else {
+            return; // unreachable: control is handled by the caller
+        };
+        match classify(g) {
+            ValidationOutcome::AlreadyTokenized => {
+                if let RequestKind::Generate(g) = &mut req.kind {
+                    g.input_ids = g.payload.input_ids.clone();
                 }
-                // Control skips normalization (no sampling params) straight to the
-                // pre-send checks; generate goes to Normalizing.
-                RequestState::Validating => match &req.kind {
-                    RequestKind::Control(_) => {
-                        let _ = req
-                            .state
-                            .apply(Event::Validated(ValidationOutcome::AlreadyTokenized));
-                    }
-                    RequestKind::Generate(_) => {
-                        let _ = req.state.apply(Event::NeedsNormalize);
-                    }
-                },
-                // Normalize + verify sampling params (off the scheduler loop), then
-                // pick the branch; a bad param becomes `Failed`.
-                RequestState::Normalizing => {
-                    let outcome = {
-                        let RequestKind::Generate(g) = &mut req.kind else {
-                            // Unreachable (control never reaches here); reject so a
-                            // bug can't leak/hang a registered request.
-                            self.fail(
-                                &mut req,
-                                Error::Internal("non-generate request in Normalizing".into()),
-                                registered,
-                            );
-                            return;
-                        };
-                        match g
-                            .sampling_params
-                            .normalize(self.limits.skip_tokenizer_init, self.limits.vocab_size)
-                        {
-                            Err(e) => Err(e),
-                            // Client ids skip the pool; text goes to the tokenizer.
-                            Ok(()) if g.already_tokenized() => {
-                                Ok(ValidationOutcome::AlreadyTokenized)
-                            }
-                            Ok(()) => Ok(ValidationOutcome::NeedsTokenize),
-                        }
-                    };
-                    match outcome {
-                        Err(e) => {
-                            let _ = req.state.apply(Event::Error(e)); // → Failed
-                        }
-                        Ok(o) => {
-                            // AlreadyTokenized → Queued, NeedsTokenize → Tokenizing.
-                            let _ = req.state.apply(Event::Validated(o));
-                        }
-                    }
+                let _ = req
+                    .state
+                    .apply(Event::Validated(ValidationOutcome::AlreadyTokenized)); // → Queued
+                self.push_to_ring(req); // no tokenize hop
+            }
+            ValidationOutcome::NeedsTokenize => {
+                let _ = req
+                    .state
+                    .apply(Event::Validated(ValidationOutcome::NeedsTokenize)); // → Tokenizing
+                if self.senders.tok.send(req).is_err() {
+                    tracing::error!("tokenizer pool gone");
                 }
-                // Hand off to the tokenizer pool; it returns the request as a
-                // `Tokenized` event (PreSendValidating, or Failed on error).
-                // Doesn't loop.
-                RequestState::Tokenizing => {
-                    if let Err(err) = self.senders.tok.send(req) {
-                        // Pool gone (workers exited); flume hands the request back.
-                        let mut req = err.into_inner();
-                        // Past `Received`, so registration happened.
-                        self.fail(
-                            &mut req,
-                            Error::Internal("tokenizer pool gone".into()),
-                            true,
-                        );
-                    }
-                    return;
-                }
-                // The checks that need the final `input_ids`: every branch
-                // converges here (client ids arrive directly, text arrives from
-                // the tokenizer pool), so they run once per request regardless of
-                // how it was tokenized. `validate` runs too early — at `Received`
-                // a text request has no ids yet.
-                RequestState::PreSendValidating => {
-                    if let RequestKind::Generate(g) = &mut req.kind
-                        && let Err(e) = check_total_tokens(g, &self.limits)
-                    {
-                        let _ = req.state.apply(Event::Error(e)); // → Failed
-                        continue;
-                    }
-                    let _ = req.state.apply(Event::PreSendValidated); // → Queued
-                }
-                // Push the wire message (control frame or generate payload) to the ring.
-                RequestState::Queued => {
-                    // `matches!` reads the discriminant without holding a borrow,
-                    // so `req` can be moved into the push below.
-                    if matches!(req.kind, RequestKind::Generate(_)) {
-                        self.push_to_ring(req);
-                    } else {
-                        self.push_control_to_ring(req);
-                    }
-                    return;
-                }
-                // The single reject path for every post-register failure.
-                RequestState::Failed(e) => {
-                    self.fail(&mut req, e, registered);
-                    return;
-                }
-                // Unreachable (egress states never reach here). Reject via `fail`/
-                // return (not apply + continue, which would spin on a terminal state).
-                other => {
-                    self.fail(
-                        &mut req,
-                        Error::Internal(format!("unexpected ingress state: {other:?}")),
-                        registered,
-                    );
-                    return;
+            }
+            ValidationOutcome::HasMultimodal => {
+                // Encoder deferred this iteration: treat as a plain tokenize.
+                let _ = req
+                    .state
+                    .apply(Event::Validated(ValidationOutcome::NeedsTokenize));
+                if self.senders.tok.send(req).is_err() {
+                    tracing::error!("tokenizer pool gone");
                 }
             }
         }
     }
 
-    /// Register the egress sink with the owning detok shard (by id) so the response
-    /// has a home. Carries the per-request detok flags — `return_text_in_logprobs`
-    /// (decode logprob text on this shard) and `no_stop_trim` (keep the matched
-    /// stop in the output) — so the shard needs no back-reference to the request.
-    /// Returns `false` if the shard is gone.
-    fn register_detok(&self, req: &Request) -> bool {
-        let (decode_logprob_text, no_stop_trim) = match &req.kind {
-            RequestKind::Generate(g) => (
-                g.return_text_in_logprobs.unwrap_or(false),
-                g.sampling_params.no_stop_trim,
-            ),
-            RequestKind::Control(_) => (false, false),
-        };
-        self.senders
-            .detok_for(&req.rid)
-            .send(DetokMsg::Register {
-                rid: req.rid.clone(),
-                sink: req.sink.clone(),
-                decode_logprob_text,
-                no_stop_trim,
-            })
-            .is_ok()
-    }
-
     /// Push a bare control request (`[tag, rid, nil]`) onto the ingress ring. The
     /// scheduler dispatches it (e.g. `GetInternalStateReq`) and replies via the
     /// egress ring as a single `Result`.
-    fn push_control_to_ring(&self, mut req: Request) {
-        let encode = match &req.kind {
-            RequestKind::Control(control) => control.encode(),
-            _ => Err(Error::Internal(
-                "non-control request reached push_control_to_ring".into(),
-            )),
-        };
-        let header = match encode {
+    fn push_control_to_ring(&self, mut req: Request, tag: &str) {
+        let header = match control_req_msgpack(tag, &req.id.0.to_string()) {
             Ok(b) => b,
             Err(e) => {
-                self.fail(&mut req, e, true); // on the push path: registered
+                fail(&mut req, e);
                 return;
             }
         };
@@ -358,853 +175,127 @@ impl Ingress {
             header,
             ids: Bytes::new(),
         }) {
-            self.fail(&mut req, Error::QueueFull, true); // registered
+            fail(&mut req, Error::QueueFull);
         }
     }
 
-    /// Client disconnected (or a detok terminal): deregister the sink, then push an
-    /// `AbortReq(rid)` so the scheduler stops generating for it.
-    ///
-    /// A failed push is logged, not retried: the scheduler keeps generating and the
-    /// chunks arrive for a rid no longer in the detok table, where they are dropped.
-    /// That wastes GPU work until the request finishes on its own, but it cannot be
-    /// misdelivered — the rid is unique to this request for the process's lifetime
-    /// ([`Rid::from_client`]), so no later request can ever answer to it.
-    fn on_abort(&self, source: AbortSource) {
-        let rid = source.rid().clone();
-        let _ = self
-            .senders
-            .detok_for(&rid)
-            .send(DetokMsg::Deregister { rid: rid.clone() });
-
-        // The ring is BOUNDED and drops pushes under exactly the load this matters
-        // for, so report the miss rather than assuming the scheduler was told.
-        match ControlRequest::AbortReq(AbortReq::new(rid.as_str().to_string(), false)).encode() {
+    /// Client disconnected: push an `AbortReq(rid)` onto the ingress ring so the
+    /// scheduler stops generating. Fire-and-forget — there's no sink left (the
+    /// client is gone); a full ring just drops the abort (the request will still
+    /// finish at EOS, only later).
+    fn on_abort(&self, id: RequestId) {
+        match abort_req_msgpack(&id.0.to_string()) {
             Ok(header) => {
                 if !self.ingress.try_push(IngressMsg {
                     header,
                     ids: Bytes::new(),
                 }) {
-                    tracing::error!(
-                        rid = %rid,
-                        "abort dropped: ingress ring full; the scheduler keeps generating \
-                         for this request until it finishes on its own"
-                    );
+                    tracing::warn!(rid = id.0, "abort dropped: ingress ring full");
                 }
             }
-            Err(e) => tracing::error!(rid = %rid, error = %e, "abort encode failed"),
+            Err(e) => tracing::warn!(rid = id.0, error = %e, "abort encode failed"),
         }
     }
 
-    /// Serialize the tokenized request to its `TokenizedGenerateReqInput` wire and
-    /// push it onto the ingress ring for the scheduler. On backpressure, fail it.
+    /// A request returned from the Tokenizer pool with `input_ids` filled in.
+    fn on_tokenized(&self, mut req: Request) {
+        // Tokenizing → Queued
+        let _ = req.state.apply(Event::TokenizeDone);
+        self.push_to_ring(req);
+    }
+
+    /// Build the msgpack `TokenizedGenerateReqInput` and push it onto the ingress
+    /// ring for the scheduler. On backpressure, fail the request.
     fn push_to_ring(&self, mut req: Request) {
         // Only generate requests reach here (control uses `push_control_to_ring`).
-        // Validate + serialize while borrowing `g` immutably; the resulting `Bytes`
-        // own their data, so the borrow ends before any `fail(&mut req)`.
-        let serialized = match &req.kind {
-            RequestKind::Generate(g) if g.already_tokenized() => g
-                .encode_header()
-                .map(|header| (header, g.encode_data_buf())),
-            RequestKind::Generate(_) => Err(Error::Tokenize("empty input_ids".into())),
-            _ => Err(Error::Internal(
-                "non-generate request reached push_to_ring".into(),
-            )),
+        let RequestKind::Generate(g) = &mut req.kind else {
+            fail(
+                &mut req,
+                Error::Internal("non-generate request reached push_to_ring".into()),
+            );
+            return;
         };
-        let (header, ids) = match serialized {
-            Ok(v) => v,
-            Err(e) => {
-                self.fail(&mut req, e, true); // on the push path: registered
+        // Move (not clone) the generate fields out; `take` leaves valid empties so
+        // the borrow of `req.kind` ends and `req` is free for the `fail` path.
+        let input_ids = g.input_ids.take();
+        let input_text = g.payload.text.take();
+        let sampling_params = g.payload.sampling_params.take();
+        let stream = g.stream;
+
+        let input_ids = match input_ids {
+            Some(ids) if !ids.is_empty() => ids,
+            _ => {
+                fail(&mut req, Error::Tokenize("empty input_ids".into()));
                 return;
             }
         };
 
+        let payload = TokenizedReqPayload {
+            rid: req.id.0.to_string(),
+            input_text,
+            input_ids,
+            sampling_params,
+            stream,
+        };
+
+        // Columnar split: scalar header through msgpack, the ids tensor as a raw
+        // int64 buffer alongside (concatenated across the batch in `recv_requests`).
+        let header: Bytes = match payload.to_header_msgpack() {
+            Ok(b) => b,
+            Err(e) => {
+                fail(&mut req, e);
+                return;
+            }
+        };
+        let ids = payload.input_ids_i64_le();
+
         if !self.ingress.try_push(IngressMsg { header, ids }) {
-            self.fail(&mut req, Error::QueueFull, true); // registered
+            fail(&mut req, Error::QueueFull);
         }
-        // On success the scheduler owns the request (egress arrives by rid); we
-        // drop our `Request` here — the detok shard holds the sink.
+        // On success the request is now owned by the scheduler; egress will
+        // arrive by rid. We intentionally drop our `Request` here (state ==
+        // Queued); the detok shard holds the sink.
     }
 }
 
-/// `Received → Validating` + admissibility check. Under `skip_tokenizer_init` a
-/// generate request must already carry token ids (no tokenizer to byte-encode
-/// text); control requests carry none and are exempt.
-fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
-    let (skip_tokenizer_init, vocab_size) = (limits.skip_tokenizer_init, limits.vocab_size);
+/// Validating phase: drive `Received → Validating` and check the payload is
+/// admissible. `Err` rejects the request (it never reaches a branch).
+///
+/// `skip_tokenizer_init` means no tokenizer is loaded, so a generate request
+/// *must* already carry token ids; a text-only request is rejected here rather
+/// than being silently byte-encoded by the stub tokenizer. Control requests
+/// carry no token ids and are exempt.
+fn validate(req: &mut Request, skip_tokenizer_init: bool) -> Result<(), Error> {
+    // Received → Validating
     let _ = req
         .state
         .apply(Event::Validated(ValidationOutcome::NeedsTokenize));
-
-    // The rid is the request's identity everywhere downstream: it keys the detok
-    // table, and it rides on EVERY chunk of EVERY decode step. An unbounded
-    // client-supplied rid is therefore a per-step cost, not a one-off. Python's is
-    // a 32-byte uuid hex, so this is generous.
-    // Measured on the CLIENT-facing form: the uniquifier `Rid::from_client` appends
-    // is this server's own overhead, and charging the client for bytes it did not
-    // send would reject a rid exactly at the documented limit.
-    let client_rid_len = req.rid.client_facing().len();
-    if client_rid_len > MAX_RID_LEN {
-        return Err(Error::Validation(format!(
-            "rid is {client_rid_len} bytes, over the {MAX_RID_LEN}-byte limit"
-        )));
-    }
+    // The skip check is generate-only: control requests carry no token ids, so
+    // matching `Generate` naturally exempts them.
     if skip_tokenizer_init
-        && matches!(&req.kind, RequestKind::Generate(g) if !g.already_tokenized())
+        && matches!(&req.kind, RequestKind::Generate(g) if !g.payload.already_tokenized())
     {
-        // `Validation` (400), not `Tokenize` (500): the client sent a request this
-        // server cannot serve, which is their error to fix — Python 400s it too.
-        return Err(Error::Validation(
+        return Err(Error::Tokenize(
             "skip_tokenizer_init is set: request must provide input_ids".into(),
         ));
     }
 
-    // Client-supplied token ids must be in-vocabulary: an out-of-range id
-    // reaches the embedding lookup and kills the scheduler process, so 400
-    // here instead — mirroring the Python `TokenizerManager` validation.
-    if let RequestKind::Generate(g) = &req.kind {
-        if let Some(ids) = &g.input_ids {
-            for &id in ids {
-                if id < 0 || id as u64 >= vocab_size {
-                    return Err(Error::Validation(format!(
-                        "input_ids contains out-of-vocabulary token id {id}; \
-                         valid range is [0, {vocab_size})"
-                    )));
-                }
-            }
-        }
-        if let Some(ids) = &g.token_ids_logprob {
-            for &id in ids {
-                if id < 0 || id as u64 >= vocab_size {
-                    return Err(Error::Validation(format!(
-                        "token_ids_logprob contains out-of-vocabulary token id \
-                         {id}; valid range is [0, {vocab_size})"
-                    )));
-                }
-            }
-        }
-    }
-
-    // The scheduler only computes hidden states when launched for it, so without
-    // this the request would 200 with `meta_info.hidden_states` silently absent
-    // (Python `TokenizerManager._validate_one_request`).
-    if !limits.enable_return_hidden_states
-        && matches!(&req.kind, RequestKind::Generate(g) if g.return_hidden_states)
-    {
-        return Err(Error::Validation(
-            "The server is not configured to return the hidden states. \
-             Please set `--enable-return-hidden-states` to enable this feature."
-                .into(),
-        ));
-    }
-
     Ok(())
 }
 
-/// The context-window checks that need the tokenized length, mirroring Python
-/// `TokenizerManager._validate_one_request`: the input alone must fit, and then
-/// input + `max_new_tokens` must fit. Without them the scheduler silently clamps
-/// and the client gets a 200 with a truncated completion instead of an actionable
-/// 400.
-///
-/// Under `allow_auto_truncate` both clamp instead of rejecting — the launch flag
-/// opted into that.
-fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Error> {
-    let max_req_len = limits.context_len;
-    // Python counts the reserved slots as part of the input, so a request can be
-    // rejected for them even when the prompt alone fits.
-    let input_len =
-        g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64 + limits.num_reserved_tokens;
-
-    // Input length first, and unconditionally: `max_new_tokens: null` means "no
-    // cap", which must not disable this. Python's comparison is `>=` — a prompt
-    // that exactly fills the window leaves no room to generate.
-    if input_len >= max_req_len {
-        if !limits.allow_auto_truncate {
-            return Err(Error::Validation(format!(
-                "The input ({input_len} tokens) is longer than the model's context \
-                 length ({max_req_len} tokens)."
-            )));
-        }
-        if let Some(ids) = &mut g.input_ids {
-            ids.truncate(max_req_len as usize);
-        }
+/// Pick the ingress branch for a validated generate request.
+fn classify(g: &GenerateRequest) -> ValidationOutcome {
+    if g.payload.has_multimodal() {
+        ValidationOutcome::HasMultimodal
+    } else if g.payload.already_tokenized() {
+        ValidationOutcome::AlreadyTokenized
+    } else {
+        ValidationOutcome::NeedsTokenize
     }
-    let input_len =
-        g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64 + limits.num_reserved_tokens;
-
-    let Some(max_new_tokens) = g.sampling_params.max_new_tokens else {
-        return Ok(()); // no cap requested → nothing to add to the input length
-    };
-    let total = input_len.saturating_add(max_new_tokens.max(0) as u64);
-    if total <= max_req_len {
-        return Ok(());
-    }
-    if !limits.allow_auto_truncate {
-        return Err(Error::Validation(format!(
-            "Requested token count exceeds the model's maximum context length of \
-             {max_req_len} tokens. You requested a total of {total} tokens: {input_len} \
-             tokens from the input messages and {max_new_tokens} tokens for the \
-             completion. Please reduce the number of tokens in the input messages or \
-             the completion to fit within the limit."
-        )));
-    }
-    let clamped = max_req_len.saturating_sub(input_len) as i64;
-    // Re-check what the clamp can break. `verify` already ran (in Normalizing), so
-    // lowering `max_new_tokens` here can leave `min_new_tokens > max_new_tokens` —
-    // and `is_normalized: true` stops the scheduler from re-verifying, so nothing
-    // downstream would catch it. Python validates before it verifies; we can't
-    // reorder the FSM, so we re-assert the one invariant the clamp can violate.
-    if g.sampling_params.min_new_tokens > clamped {
-        return Err(Error::Validation(format!(
-            "min_new_tokens must be in [0, max_new_tokens({clamped})], got {}",
-            g.sampling_params.min_new_tokens
-        )));
-    }
-    g.sampling_params.max_new_tokens = Some(clamped);
-    Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fsm::RequestState;
-    use crate::message::{EgressSink, GenerateRequest, SamplingParams};
-    use crate::ring::{IngressConsumer, ingress_ring};
-    use tokio::sync::mpsc;
-
-    /// An `Ingress` plus its detok-shard receiver, ring consumer (keep alive —
-    /// dropping it closes the ring → false QueueFull), and tm inbox sender.
-    fn make_ingress() -> (
-        Ingress,
-        flume::Receiver<DetokMsg>,
-        IngressConsumer,
-        flume::Sender<TmEvent>,
-    ) {
-        make_ingress_with(test_limits())
-    }
-
-    fn make_ingress_with_abort(
-        abort_rx: flume::Receiver<AbortSource>,
-    ) -> (
-        Ingress,
-        flume::Receiver<DetokMsg>,
-        IngressConsumer,
-        flume::Sender<TmEvent>,
-    ) {
-        make_ingress_inner(test_limits(), abort_rx)
-    }
-
-    fn make_ingress_with(
-        limits: Limits,
-    ) -> (
-        Ingress,
-        flume::Receiver<DetokMsg>,
-        IngressConsumer,
-        flume::Sender<TmEvent>,
-    ) {
-        let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
-        std::mem::forget(abort_tx); // keep the lane open; tests end by dropping tm_tx
-        make_ingress_inner(limits, abort_rx)
-    }
-
-    fn make_ingress_inner(
-        limits: Limits,
-        abort_rx: flume::Receiver<AbortSource>,
-    ) -> (
-        Ingress,
-        flume::Receiver<DetokMsg>,
-        IngressConsumer,
-        flume::Sender<TmEvent>,
-    ) {
-        let (tok_tx, _tok_rx) = flume::unbounded();
-        let (detok_tx, detok_rx) = flume::unbounded();
-        let senders = Senders {
-            tm: flume::unbounded().0,
-            abort: flume::unbounded().0,
-            tok: tok_tx,
-            detok: vec![detok_tx],
-        };
-        let (ingress_producer, consumer) = ingress_ring(16);
-        let (tm_tx, tm_rx) = flume::unbounded();
-        // Keep the shutdown sender alive (leak) so its branch never fires — tests
-        // end `run` by dropping `tm_tx`, not by shutdown.
-        let (sd_tx, sd_rx) = flume::unbounded::<()>();
-        std::mem::forget(sd_tx);
-        let ingress = Ingress::new(tm_rx, abort_rx, senders, ingress_producer, limits, sd_rx);
-        (ingress, detok_rx, consumer, tm_tx)
-    }
-
-    /// Both abort sources do the same two things: drop the detok entry so no
-    /// further chunk can be delivered, and tell the scheduler to stop generating.
-    ///
-    /// Neither releases anything, and nothing needs them to. Release ordering used
-    /// to be the delicate part here — `AbortGuard::drop` releasing a rid right
-    /// after enqueuing the abort ordered the SEND, not the EFFECT, so a retry of
-    /// the same rid could `Register` ahead of the stale abort and be torn down by
-    /// it. `Rid::from_client` removes the premise: a retry carries a different
-    /// `Rid`, so no abort in flight can name it.
-    #[test]
-    fn every_abort_source_deregisters_and_stops_the_scheduler() {
-        for source in [
-            AbortSource::Guard("x".into()),
-            AbortSource::Detok("x".into()),
-        ] {
-            let (detok_tx, detok_rx) = flume::unbounded::<DetokMsg>();
-            let (ingress_producer, consumer) = ingress_ring(16);
-            let (sd_tx, sd_rx) = flume::unbounded::<()>();
-            std::mem::forget(sd_tx);
-            let ingress = Ingress::new(
-                flume::unbounded().1,
-                flume::unbounded().1,
-                Senders {
-                    tm: flume::unbounded().0,
-                    abort: flume::unbounded().0,
-                    tok: flume::unbounded().0,
-                    detok: vec![detok_tx],
-                },
-                ingress_producer,
-                test_limits(),
-                sd_rx,
-            );
-
-            ingress.on_abort(source.clone());
-
-            assert!(
-                matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "x"),
-                "{source:?} must drop the detok entry",
-            );
-            assert_eq!(
-                consumer.drain(8).headers.len(),
-                1,
-                "{source:?} must push an AbortReq so the scheduler stops",
-            );
-        }
-    }
-
-    /// A context ceiling high enough that only a test which sets one on purpose
-    /// can reach it. `context_len` is mandatory now, so "no ceiling" has to be a
-    /// large number rather than `None`; kept well below `u64::MAX` so the
-    /// `as i64` in the auto-truncate clamp cannot go negative if a future test
-    /// does reach this path.
-    const NO_CONTEXT_CEILING: u64 = 1 << 40;
-
-    /// The default test limits: a real tokenizer, vocab 1000, no context ceiling.
-    /// Spelled out rather than `..Default::default()` — `Limits` deliberately has
-    /// no `Default`, because a zero `vocab_size`/`context_len` would reject every
-    /// request instead of behaving like "unset".
-    fn test_limits() -> Limits {
-        Limits {
-            skip_tokenizer_init: false,
-            vocab_size: 1000,
-            context_len: NO_CONTEXT_CEILING,
-            num_reserved_tokens: 0,
-            allow_auto_truncate: false,
-            enable_return_hidden_states: false,
-        }
-    }
-
-    fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
-        let (tx, _rx) = mpsc::channel(8);
-        Request {
-            rid: id.to_string().into(),
-            state: RequestState::Received,
-            sink: EgressSink::Local(tx),
-            kind: RequestKind::Generate(Box::new(GenerateRequest {
-                rid: id.to_string().into(),
-                input_ids: Some(vec![1, 2, 3]),
-                sampling_params,
-                ..Default::default()
-            })),
-        }
-    }
-
-    /// `input + max_new_tokens` past the context window is an actionable 400, not a
-    /// silently truncated 200 (Python `TokenizerManager._validate_one_request`).
-    /// The message names both halves so the client can fix the right one.
-    #[test]
-    fn total_tokens_over_context_is_rejected() {
-        let limits = Limits {
-            context_len: 10,
-            ..test_limits()
-        };
-        let mut g = GenerateRequest {
-            input_ids: Some(vec![1, 2, 3]),
-            sampling_params: SamplingParams {
-                max_new_tokens: Some(100),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let err = check_total_tokens(&mut g, &limits).unwrap_err();
-        let msg = err.to_string();
-        assert_eq!(err.http_status(), 400);
-        assert!(msg.contains("total of 103 tokens"), "{msg}");
-        assert!(msg.contains("3 tokens from the input"), "{msg}");
-        assert!(msg.contains("100 tokens for the completion"), "{msg}");
-        // Exactly filling the window is allowed (Python compares with `>`).
-        g.sampling_params.max_new_tokens = Some(7);
-        assert!(check_total_tokens(&mut g, &limits).is_ok());
-        assert_eq!(g.sampling_params.max_new_tokens, Some(7), "left alone");
-    }
-
-    /// The reserved slots (eagle draft tokens) count as input, so a request can be
-    /// rejected for them even when the prompt alone would fit.
-    #[test]
-    fn reserved_tokens_count_toward_the_limit() {
-        let limits = Limits {
-            context_len: 10,
-            num_reserved_tokens: 5,
-            ..test_limits()
-        };
-        let mut g = GenerateRequest {
-            input_ids: Some(vec![1, 2, 3]),
-            sampling_params: SamplingParams {
-                max_new_tokens: Some(3), // 3 + 3 fits, but 3 + 5 + 3 does not
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let msg = check_total_tokens(&mut g, &limits).unwrap_err().to_string();
-        assert!(msg.contains("8 tokens from the input"), "{msg}");
-    }
-
-    /// `--allow-auto-truncate` opts into clamping instead of rejecting; with no
-    /// context length, or no `max_new_tokens` cap, there is nothing to check.
-    #[test]
-    fn auto_truncate_clamps_and_unknowns_skip() {
-        let sp = |max_new_tokens| SamplingParams {
-            max_new_tokens,
-            ..Default::default()
-        };
-        let mut g = GenerateRequest {
-            input_ids: Some(vec![1, 2, 3]),
-            sampling_params: sp(Some(100)),
-            ..Default::default()
-        };
-        let truncating = Limits {
-            context_len: 10,
-            allow_auto_truncate: true,
-            ..test_limits()
-        };
-        assert!(check_total_tokens(&mut g, &truncating).is_ok());
-        assert_eq!(g.sampling_params.max_new_tokens, Some(7), "clamped to fit");
-
-        // Unknown context length → no ceiling to enforce.
-        g.sampling_params = sp(Some(100));
-        assert!(check_total_tokens(&mut g, &test_limits()).is_ok());
-        assert_eq!(g.sampling_params.max_new_tokens, Some(100), "untouched");
-
-        // No cap requested → nothing to add to the input length, but the input
-        // itself is still checked (see `input_length_is_checked_unconditionally`).
-        g.sampling_params = sp(None);
-        let roomy = Limits {
-            context_len: 100,
-            ..test_limits()
-        };
-        assert!(check_total_tokens(&mut g, &roomy).is_ok());
-    }
-
-    /// `max_new_tokens: null` means "no cap", NOT "skip the checks" — the input
-    /// alone must still fit. Gating the whole function on `max_new_tokens` let an
-    /// over-long prompt through to the scheduler with no ingress error at all.
-    /// Python compares with `>=`: a prompt that exactly fills the window leaves no
-    /// room to generate.
-    #[test]
-    fn input_length_is_checked_unconditionally() {
-        let limits = Limits {
-            context_len: 3,
-            ..test_limits()
-        };
-        let req = |max_new_tokens| GenerateRequest {
-            input_ids: Some(vec![1, 2, 3]), // exactly fills a 3-token window
-            sampling_params: SamplingParams {
-                max_new_tokens,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        for max_new_tokens in [None, Some(1)] {
-            let err = check_total_tokens(&mut req(max_new_tokens), &limits)
-                .expect_err("input == context_len must be rejected (Python uses >=)");
-            assert_eq!(err.http_status(), 400);
-            assert!(err.to_string().contains("longer than the model's context"));
-        }
-        // One token shorter fits, with or without a cap.
-        let mut g = GenerateRequest {
-            input_ids: Some(vec![1, 2]),
-            ..Default::default()
-        };
-        g.sampling_params.max_new_tokens = None;
-        assert!(check_total_tokens(&mut g, &limits).is_ok());
-
-        // Under auto-truncate the input is cut to fit instead of rejected.
-        let truncating = Limits {
-            allow_auto_truncate: true,
-            ..limits.clone()
-        };
-        let mut g = req(None);
-        assert!(check_total_tokens(&mut g, &truncating).is_ok());
-        assert_eq!(
-            g.input_ids.as_deref(),
-            Some(&[1, 2, 3][..]),
-            "fits at the cap"
-        );
-    }
-
-    /// The clamp runs AFTER `verify` (which happens in `Normalizing`), so lowering
-    /// `max_new_tokens` can leave `min_new_tokens > max_new_tokens`. Nothing
-    /// downstream re-checks — `is_normalized: true` makes the scheduler's own
-    /// verify early-return — so the clamp has to re-assert it here.
-    #[test]
-    fn auto_truncate_cannot_invert_min_and_max_new_tokens() {
-        let limits = Limits {
-            context_len: 10,
-            allow_auto_truncate: true,
-            ..test_limits()
-        };
-        let mut g = GenerateRequest {
-            input_ids: Some(vec![1, 2, 3]), // clamps max_new_tokens to 7
-            sampling_params: SamplingParams {
-                max_new_tokens: Some(100),
-                min_new_tokens: 50, // …which is below min_new_tokens
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let err = check_total_tokens(&mut g, &limits)
-            .expect_err("a clamp that inverts min/max must 400, not ride the wire");
-        assert_eq!(err.http_status(), 400);
-        assert!(err.to_string().contains("min_new_tokens"), "{err}");
-
-        // A clamp that keeps the invariant still clamps.
-        g.sampling_params.min_new_tokens = 2;
-        g.sampling_params.max_new_tokens = Some(100);
-        assert!(check_total_tokens(&mut g, &limits).is_ok());
-        assert_eq!(g.sampling_params.max_new_tokens, Some(7));
-    }
-
-    /// `return_hidden_states` on a server not launched for it is a 400: the
-    /// scheduler never computes them, so the request would otherwise 200 with
-    /// `meta_info.hidden_states` silently missing.
-    #[test]
-    fn hidden_states_gated_on_server_support() {
-        let req = |want| {
-            let mut r = generate_req(31, SamplingParams::default());
-            if let RequestKind::Generate(g) = &mut r.kind {
-                g.return_hidden_states = want;
-            }
-            r
-        };
-        let disabled = test_limits();
-        let err = validate(&mut req(true), &disabled).unwrap_err();
-        assert_eq!(err.http_status(), 400);
-        assert!(
-            err.to_string().contains("--enable-return-hidden-states"),
-            "message must name the flag: {err}"
-        );
-        // Not asking for them (the client sent `false`, or sent nothing and
-        // `into_requests` resolved the default), or asking on a server that
-        // supports them, is fine.
-        assert!(validate(&mut req(false), &disabled).is_ok());
-        let enabled = Limits {
-            enable_return_hidden_states: true,
-            ..test_limits()
-        };
-        assert!(validate(&mut req(true), &enabled).is_ok());
-    }
-
-    /// End-to-end through `drive`: an over-context request is rejected on the way
-    /// to the ring, after registration — so it must be deregistered, not leaked.
-    #[test]
-    fn over_context_request_deregisters_and_never_reaches_the_ring() {
-        let (ingress, detok_rx, consumer, _tm_tx) = make_ingress_with(Limits {
-            context_len: 4,
-            ..test_limits()
-        });
-        ingress.drive(generate_req(
-            33,
-            SamplingParams {
-                max_new_tokens: Some(64),
-                ..Default::default()
-            },
-        ));
-        assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "33"),
-            "registered before the check",
-        );
-        assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "33"),
-            "must deregister on reject",
-        );
-        assert!(
-            consumer.drain(16).headers.is_empty(),
-            "must not reach the scheduler"
-        );
-    }
-
-    /// A dropped ring push is survivable, and this pins WHY. The ring is bounded,
-    /// so under load the scheduler never learns to stop and keeps generating; its
-    /// chunks then arrive for a rid the detok table no longer holds and are
-    /// dropped. That wastes GPU work but cannot MISDELIVER, because
-    /// `Rid::from_client` guarantees no later request ever answers to that rid.
-    /// The detok entry is dropped either way — that is the half that must not
-    /// depend on the ring.
-    ///
-    /// Ring capacity 1: the first abort pushes, the second finds it full.
-    #[test]
-    fn abort_deregisters_even_when_the_ring_push_is_dropped() {
-        let (tok_tx, _tok_rx) = flume::unbounded();
-        let (detok_tx, detok_rx) = flume::unbounded();
-        let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
-        let senders = Senders {
-            tm: flume::unbounded().0,
-            abort: abort_tx,
-            tok: tok_tx,
-            detok: vec![detok_tx],
-        };
-        let (producer, _consumer) = ingress_ring(1);
-        let (_tm_tx, tm_rx) = flume::unbounded();
-        let (sd_tx, sd_rx) = flume::unbounded::<()>();
-        std::mem::forget(sd_tx);
-        let ingress = Ingress::new(tm_rx, abort_rx, senders, producer, test_limits(), sd_rx);
-
-        ingress.on_abort(AbortSource::Guard("pushed".into()));
-        ingress.on_abort(AbortSource::Guard("dropped".into()));
-
-        // Both deregisters land regardless of whether the ring accepted the push.
-        for expected in ["pushed", "dropped"] {
-            assert!(
-                matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == expected),
-                "{expected}: the detok entry must be dropped even when the ring is full",
-            );
-        }
-    }
-
-    /// The rid keys the detok table and rides on every chunk of every decode step,
-    /// so an unbounded client-supplied one is a recurring cost, not a one-off.
-    #[test]
-    fn oversized_rid_is_rejected() {
-        let mut req = generate_req(51, SamplingParams::default());
-        req.rid = "x".repeat(MAX_RID_LEN + 1).into();
-        let err = validate(&mut req, &test_limits()).expect_err("must be rejected");
-        assert_eq!(err.http_status(), 400);
-        assert!(err.to_string().contains("over the"), "{err}");
-
-        // A uuid-sized rid — what Python mints — is nowhere near the cap.
-        let mut req = generate_req(52, SamplingParams::default());
-        req.rid = "0123456789abcdef0123456789abcdef".into();
-        assert!(validate(&mut req, &test_limits()).is_ok());
-    }
-
-    /// A request rejected BEFORE `register_detok` must not send `Deregister`: the
-    /// handler is a bare `table.remove(&rid)`, so it would evict whatever entry
-    /// holds that key — a concurrent request's sink — leaving that client hung with
-    /// no terminal frame. Python validates before it inserts, so it cannot hit this.
-    #[test]
-    fn pre_registration_failure_does_not_deregister() {
-        // Rejected inside `validate` (out-of-vocab id), which runs before registration.
-        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
-        let mut req = generate_req(41, SamplingParams::default());
-        if let RequestKind::Generate(g) = &mut req.kind {
-            g.input_ids = Some(vec![2_000_000_000]);
-        }
-        ingress.drive(req);
-        assert!(
-            detok_rx.try_recv().is_err(),
-            "a pre-registration reject must send NOTHING to the shard — a Deregister \
-             here removes a live request's sink"
-        );
-
-        // A post-registration reject still deregisters (the leak fix stays fixed).
-        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
-        ingress.drive(generate_req(
-            42,
-            SamplingParams {
-                top_p: 2.0, // rejected by `normalize`, after registration
-                ..Default::default()
-            },
-        ));
-        assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
-        assert!(matches!(
-            detok_rx.try_recv(),
-            Ok(DetokMsg::Deregister { .. })
-        ));
-    }
-
-    /// A request rejected at normalization (post-register) must not leak: the shard
-    /// sees `Register` then `Deregister`. Regression for RSS growth on bad input.
-    #[test]
-    fn rejected_request_deregisters_from_shard() {
-        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
-        // top_p = 2.0 is outside (0, 1], so `SamplingParams::normalize` rejects it.
-        let bad = SamplingParams {
-            top_p: 2.0,
-            ..Default::default()
-        };
-        ingress.drive(generate_req(7, bad));
-
-        assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "7"),
-            "expected Register for rid 7",
-        );
-        assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "7"),
-            "expected Deregister for rid 7 (leak fix)",
-        );
-        assert!(
-            detok_rx.try_recv().is_err(),
-            "no further shard messages — registration fully cleaned up",
-        );
-    }
-
-    /// Regression: an out-of-vocabulary client token id must be rejected at
-    /// ingress with a 400 — passed through, it reaches the embedding lookup
-    /// and kills the scheduler process (`make_ingress` bounds vocab at 1000).
-    #[test]
-    fn out_of_vocab_input_ids_rejected() {
-        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
-        let mut req = generate_req(21, SamplingParams::default());
-        if let RequestKind::Generate(g) = &mut req.kind {
-            g.input_ids = Some(vec![1, 2_000_000_000]);
-        }
-        ingress.drive(req);
-        // Rejected before registration: the only shard message is nothing at
-        // all, or a Deregister if registration happened first — never a push.
-        match detok_rx.try_recv() {
-            Err(_) => {}
-            Ok(DetokMsg::Deregister { .. }) => {}
-            Ok(_) => panic!("out-of-vocab request must not be admitted"),
-        }
-    }
-
-    /// Same guard for negative ids and for `token_ids_logprob` entries.
-    #[test]
-    fn negative_and_logprob_token_ids_rejected() {
-        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
-        let mut req = generate_req(22, SamplingParams::default());
-        if let RequestKind::Generate(g) = &mut req.kind {
-            g.input_ids = Some(vec![-1]);
-        }
-        ingress.drive(req);
-        match detok_rx.try_recv() {
-            Err(_) | Ok(DetokMsg::Deregister { .. }) => {}
-            Ok(_) => panic!("negative token id must not be admitted"),
-        }
-
-        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
-        let mut req = generate_req(23, SamplingParams::default());
-        if let RequestKind::Generate(g) = &mut req.kind {
-            g.token_ids_logprob = Some(vec![999_999]);
-        }
-        ingress.drive(req);
-        match detok_rx.try_recv() {
-            Err(_) | Ok(DetokMsg::Deregister { .. }) => {}
-            Ok(_) => panic!("out-of-vocab token_ids_logprob must not be admitted"),
-        }
-    }
-
-    /// A valid request is registered and handed onward — never deregistered.
-    #[test]
-    fn admitted_request_keeps_registration() {
-        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
-        // Empty map → all sampling defaults, passes normalization.
-        ingress.drive(generate_req(9, SamplingParams::default()));
-
-        assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "9"),
-            "expected Register for rid 9",
-        );
-        assert!(
-            detok_rx.try_recv().is_err(),
-            "admitted request must not be deregistered",
-        );
-    }
-
-    /// A pool return in `Failed` state (failed encode) is rejected via the same
-    /// path and deregistered, not leaked.
-    #[test]
-    fn tokenize_failure_deregisters_via_ingress() {
-        let (ingress, detok_rx, _consumer, tm_tx) = make_ingress();
-        // The pool marks a failed encode as `Failed(err)` before returning it.
-        let mut req = generate_req(11, SamplingParams::default());
-        let _ = req
-            .state
-            .apply(Event::Error(Error::Tokenize("boom".into())));
-        tm_tx.send(TmEvent::Tokenized(req)).unwrap();
-        // Close the inbox so the run loop returns after draining the one event.
-        drop(tm_tx);
-        ingress.run();
-
-        assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "11"),
-            "tokenize failure must deregister rid 11",
-        );
-        assert!(detok_rx.try_recv().is_err(), "no further shard messages");
-    }
-
-    /// An abort deregisters (by the id hashed from the rid string), so a request
-    /// aborted before any terminal chunk can't leak.
-    #[test]
-    fn abort_deregisters_from_shard() {
-        // Aborts arrive on their own unbounded lane now, not the request inbox.
-        let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
-        let (ingress, detok_rx, _consumer, tm_tx) = make_ingress_with_abort(abort_rx);
-        abort_tx.send(AbortSource::Guard("rid-13".into())).unwrap();
-        drop(abort_tx);
-        drop(tm_tx);
-        ingress.run();
-
-        assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "rid-13"),
-            "abort must deregister by rid",
-        );
-        assert!(detok_rx.try_recv().is_err(), "no further shard messages");
-    }
-
-    /// A successful pool return (Queued, ids filled) is pushed to the ring, not
-    /// rejected; its registration is untouched.
-    #[test]
-    fn tokenized_return_pushes_without_deregister() {
-        let (ingress, detok_rx, _consumer, tm_tx) = make_ingress();
-        let mut req = generate_req(15, SamplingParams::default());
-        // Simulate a successful pool return: ids filled, PreSendValidating.
-        if let RequestKind::Generate(g) = &mut req.kind {
-            g.input_ids = Some(vec![1, 2, 3]);
-        }
-        req.state = RequestState::PreSendValidating;
-        tm_tx.send(TmEvent::Tokenized(req)).unwrap();
-        drop(tm_tx);
-        ingress.run();
-
-        // Pushed to the ring; the shard sees nothing.
-        assert!(
-            detok_rx.try_recv().is_err(),
-            "a queued pool-return must be pushed, not touch the shard",
-        );
-    }
-
-    /// If the pool is gone, a request needing tokenization is rejected +
-    /// deregistered, not silently dropped.
-    #[test]
-    fn tokenize_pool_gone_deregisters() {
-        // `make_ingress` drops the tok receiver, so `tok.send` fails.
-        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
-        // No ids → NeedsTokenize → Tokenizing branch.
-        let mut req = generate_req(21, SamplingParams::default());
-        if let RequestKind::Generate(g) = &mut req.kind {
-            g.input_ids = None;
-        }
-        ingress.drive(req);
-
-        assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "21"),
-            "expected Register for rid 21",
-        );
-        assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "21"),
-            "pool-gone hand-off must deregister rid 21",
-        );
-        assert!(detok_rx.try_recv().is_err(), "no further shard messages");
-    }
+fn fail(req: &mut Request, err: Error) {
+    let _ = req.state.apply(Event::Error(err.clone()));
+    // Best-effort notify the client; sink may already be closed.
+    let _ = req.sink.try_send(EgressItem::Error(err));
 }

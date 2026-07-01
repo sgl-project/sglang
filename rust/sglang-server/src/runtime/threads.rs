@@ -1,5 +1,5 @@
-//! Thread-group machinery: CPU-core partitioning and the pinned-thread
-//! spawners (for [`Runnable`] stages) used by `runtime::start`.
+//! Thread-group machinery: the [`Runnable`] stage trait, CPU-core partitioning,
+//! and the pinned-thread spawners used by `runtime::start`.
 //!
 //! Adding a new thread group (encoder, weight loader, KV-cache offloader, …) is
 //! three small steps and no spawn boilerplate:
@@ -11,26 +11,23 @@ use std::thread::JoinHandle;
 
 use core_affinity::CoreId;
 
-use super::{Runnable, RuntimeConfig};
+use super::RuntimeConfig;
+
+/// A pipeline stage that owns its channel handles + config and runs a blocking
+/// loop until its inbox closes. Lets the runtime spawn stages uniformly via
+/// [`spawn_stage`] / [`spawn_pool`] instead of free `run_*` functions with
+/// positional handles. Implemented by every CPU-bound worker and TM router.
+pub trait Runnable: Send + 'static {
+    fn run(self);
+}
 
 /// Cores reserved for the two TokenizerManager router threads (`tm-ingress`,
 /// `tm-egress`) — light, latency-sensitive channel routers, so one core each.
 ///
-/// TODO(tm-scaling): both TM threads are single-consumer serialization points,
-/// each with its own ceiling. `tm-ingress` runs validate + `normalize_sampling_params`
-/// for *every* request before fanning out to the (pooled) tokenizer workers, so a
-/// high request-arrival / short-request workload is bounded by that one thread's
-/// per-request cost (kept O(fields), see `sampling::normalize_sampling_params`).
-/// Sharding ingress by rid — like the tokenizer/detok pools — lifts that ceiling.
-///
-/// `tm-egress` is a head-of-line ceiling of a different kind — it
-/// does a *blocking* send per chunk to the owning detok shard, so one slow shard
-/// stalls the dispatcher and thus every shard (see `Egress::route`). Sharding the
-/// dispatcher alone doesn't fix it: each egress-ring frame is a whole batch fanned
-/// to *all* shards, so any dispatcher still blocks on the slow one. The real fix
-/// is a per-shard egress ring (the scheduler pushing each request's output to its
-/// shard's ring), each drained by its own dispatcher — at which point this needs
-/// one core per ingress/egress shard rather than a fixed 2.
+/// TODO(tm-scaling): if a single egress dispatcher becomes a bottleneck at high
+/// aggregate token rates, the FSM dispatch can be sharded by `RequestId` (each
+/// shard draining its own ring / channel) — at which point this needs to grow
+/// to one core per ingress/egress shard rather than a fixed 2.
 const TM_CORES: usize = 2;
 
 /// Partition the machine's cores into four disjoint sets: the I/O-bound API
@@ -46,18 +43,18 @@ pub(super) struct CorePlan {
 }
 
 pub(super) fn plan_cores(cfg: &RuntimeConfig) -> Option<CorePlan> {
-    // `cores` carries the pinning decision: `None`/empty → run unpinned. The
-    // caller (Python `_partition_cores`) passes this rank's NUMA-local cores
-    // minus the scheduler's reserved launch cores.
-    let cores: Vec<CoreId> = match &cfg.rust_server_args.cores {
+    if !cfg.pin_cores {
+        return None;
+    }
+    // Prefer an explicit core list (NUMA-local cores minus the scheduler's
+    // reserved launch cores); otherwise use every core this process is allowed
+    // on. When NUMA binding is active, `get_core_ids` already reflects the
+    // NUMA-local set via `sched_getaffinity`.
+    let cores: Vec<CoreId> = match &cfg.cores {
         Some(ids) if !ids.is_empty() => ids.iter().map(|&id| CoreId { id }).collect(),
-        _ => return None,
+        _ => core_affinity::get_core_ids()?,
     };
-    if cores.len()
-        < cfg.rust_server_args.api_worker_num
-            + cfg.server_args.tokenizer_worker_num
-            + cfg.server_args.detokenizer_worker_num
-    {
+    if cores.len() < cfg.api_worker_num + cfg.tokenizer_worker_num + cfg.detokenizer_worker_num {
         tracing::warn!(
             available = cores.len(),
             "not enough cores to pin all pools; running unpinned"
@@ -65,18 +62,9 @@ pub(super) fn plan_cores(cfg: &RuntimeConfig) -> Option<CorePlan> {
         return None;
     }
     let mut it = cores.into_iter();
-    let api: Vec<CoreId> = it
-        .by_ref()
-        .take(cfg.rust_server_args.api_worker_num)
-        .collect();
-    let tok = it
-        .by_ref()
-        .take(cfg.server_args.tokenizer_worker_num)
-        .collect();
-    let detok = it
-        .by_ref()
-        .take(cfg.server_args.detokenizer_worker_num)
-        .collect();
+    let api: Vec<CoreId> = it.by_ref().take(cfg.api_worker_num).collect();
+    let tok = it.by_ref().take(cfg.tokenizer_worker_num).collect();
+    let detok = it.by_ref().take(cfg.detokenizer_worker_num).collect();
     // The two TM router threads get up to `TM_CORES` leftover cores; when none
     // are spare they fall back to the API set so they never float onto the
     // CPU-bound tokenizer/detok cores.
