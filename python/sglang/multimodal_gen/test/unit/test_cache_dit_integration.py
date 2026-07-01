@@ -230,7 +230,7 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         blocks = ["block_0", "block_1"]
         transformer = _make_transformer("ErnieImageTransformer2DModel", blocks)
 
-        adapter = module._build_custom_block_adapter(transformer)
+        adapter = module._build_custom_block_adapter(transformer, has_separate_cfg=True)
 
         self.assertIsNotNone(adapter)
         self.assertEqual(adapter.blocks, blocks)
@@ -249,6 +249,28 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             module._build_custom_block_adapter(transformer)
+
+    def test_has_separate_cfg_follows_runtime(self):
+        # No model pins the mode; has_separate_cfg always follows the run's CFG mode
+        # (Krea-2 Raw -> True, Krea-2 Turbo -> False).
+        module = _import_module_with_stub()
+        blocks = ["block_0", "block_1"]
+
+        transformer_raw = _make_transformer("Krea2Transformer2DModel")
+        transformer_raw.transformer_blocks = blocks
+        adapter_raw = module._build_custom_block_adapter(
+            transformer_raw, has_separate_cfg=True
+        )
+        self.assertEqual(adapter_raw.blocks, blocks)
+        self.assertEqual(adapter_raw.forward_pattern, "Pattern_3")
+        self.assertTrue(adapter_raw.has_separate_cfg)
+
+        transformer_turbo = _make_transformer("Krea2Transformer2DModel")
+        transformer_turbo.transformer_blocks = blocks
+        adapter_turbo = module._build_custom_block_adapter(
+            transformer_turbo, has_separate_cfg=False
+        )
+        self.assertFalse(adapter_turbo.has_separate_cfg)
 
 
 if __name__ == "__main__":

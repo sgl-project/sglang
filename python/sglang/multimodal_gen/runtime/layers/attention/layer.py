@@ -425,6 +425,7 @@ class USPAttention(nn.Module):
         prefix: str = "",
         dropout_rate: float = 0.0,
         skip_sequence_parallel: bool = False,
+        enable_packed_qkv_input_a2a: bool = False,
         **extra_impl_args,
     ) -> None:
         """
@@ -480,6 +481,7 @@ class USPAttention(nn.Module):
         self.dropout_p = dropout_rate
 
         self.skip_sequence_parallel = skip_sequence_parallel
+        self.enable_packed_qkv_input_a2a = bool(enable_packed_qkv_input_a2a)
 
     def _get_usp_a2a_stream(self):
         if USPAttention._usp_a2a_stream is None:
@@ -781,9 +783,21 @@ class USPAttention(nn.Module):
         # Ulysses-style All-to-All for sequence/head sharding
         if sp_size > 1:
             # -> [B, S, H_local, D]
-            q = _usp_input_all_to_all(q, head_dim=2)
-            k = _usp_input_all_to_all(k, head_dim=2)
-            v = _usp_input_all_to_all(v, head_dim=2)
+            if self.enable_packed_qkv_input_a2a and q.device.type == "cuda":
+                q, k, v = async_a2a_communicate(
+                    [q, k, v],
+                    sp_size,
+                    get_sp_group().ulysses_group,
+                    self._get_usp_a2a_stream(),
+                    local_seq_2_local_head=True,
+                )
+                q = q.contiguous()
+                k = k.contiguous()
+                v = v.contiguous()
+            else:
+                q = _usp_input_all_to_all(q, head_dim=2)
+                k = _usp_input_all_to_all(k, head_dim=2)
+                v = _usp_input_all_to_all(v, head_dim=2)
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
