@@ -1,5 +1,6 @@
 from sglang.srt.configs.afmoe import AfmoeConfig
 from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
+from sglang.srt.configs.bamba import BambaConfig
 from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.cohere2_moe import Cohere2MoeConfig
 from sglang.srt.configs.dbrx import DbrxConfig
@@ -45,6 +46,7 @@ from sglang.srt.configs.zaya import ZayaConfig
 
 __all__ = [
     "AfmoeConfig",
+    "BambaConfig",
     "BailingHybridConfig",
     "ExaoneConfig",
     "ChatGLMConfig",
