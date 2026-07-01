@@ -212,7 +212,7 @@ from sglang.srt.managers.scheduler_components.profiler_manager import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_components.rust_scheduler import RustServer
+from sglang.srt.managers.scheduler_components.rust_server import RustServer
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
