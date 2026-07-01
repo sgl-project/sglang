@@ -85,6 +85,7 @@ dependencies = [
   "uvloop",
   "watchfiles",
   "xgrammar==0.2.1",
+  "zstandard",
 ]
 
 [[tool.uv.index]]
