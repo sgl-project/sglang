@@ -520,16 +520,27 @@ class ServerArgs:
             )
         ),
     ] = "auto"
+    # Implemented as a separate field (rather than an
+    # Arg(aliases=["--config-format"]) on model_config_parser) so that
+    # passing both flags with conflicting values raises an error instead of
+    # silently letting whichever flag appears last on the command line win;
+    # see _handle_config_format().
     config_format: A[
         Optional[str],
         Arg(
             help=(
                 "vLLM-style alias for --model-config-parser. Accepts the same "
                 'values ("auto", "hf", "mistral", or any plugin-registered '
-                "parser name). When set, this takes precedence over "
-                "--model-config-parser. Provided so vLLM-style Mistral "
-                "invocations (--config-format mistral --load-format mistral) "
-                "work verbatim on SGLang."
+                "parser name; matching is case- and whitespace-insensitive). "
+                "If --model-config-parser is also explicitly set to a "
+                "different value, this raises an error rather than silently "
+                'picking one -- "auto" is compared like any other explicit '
+                "value, so e.g. --config-format=auto together with an "
+                "explicit --model-config-parser=hf also raises. If "
+                "--config-format=mistral and --load-format is left at its "
+                'default, --load-format is also set to "mistral" so '
+                "vLLM-style Mistral invocations (--config-format mistral "
+                "--load-format mistral) work verbatim on SGLang."
             )
         ),
     ] = None
@@ -2603,6 +2614,11 @@ class ServerArgs:
         self._validate_prefill_only_disable_kv_cache_args()
         self._handle_dcp_validation()
 
+        # Reconcile the vLLM-style --config-format alias with
+        # --model-config-parser before the dummy-model short-circuit below,
+        # so a conflicting-flags mistake is caught even for dummy/none models.
+        self._handle_config_format()
+
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
             return
@@ -2712,11 +2728,6 @@ class ServerArgs:
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
         self._validate_cutedsl_a2a_token_budget()
-
-        # Reconcile the vLLM-style --config-format alias with
-        # --model-config-parser before load-format handling, which relies on
-        # model_config_parser being finalized.
-        self._handle_config_format()
 
         # Handle model loading format.
         self._handle_load_format()
@@ -5915,9 +5926,13 @@ class ServerArgs:
         # picking a winner.
         if self.config_format is None:
             return
+        self.config_format = self.config_format.strip().lower()
+        if not self.config_format:
+            # "" / whitespace-only is treated the same as not passing the flag.
+            return
         if (
-            self.model_config_parser != "auto"
-            and self.model_config_parser != self.config_format
+            self.model_config_parser.lower() != "auto"
+            and self.model_config_parser.lower() != self.config_format
         ):
             raise ValueError(
                 f"--config-format={self.config_format!r} conflicts with "
@@ -5925,6 +5940,12 @@ class ServerArgs:
                 "Pass only one."
             )
         self.model_config_parser = self.config_format
+        # vLLM-style invocations often pass --load-format mistral explicitly,
+        # but when they don't, the alias's "mistral" choice should still
+        # drive weight loading -- unless the user already picked a different
+        # load format explicitly.
+        if self.config_format == "mistral" and self.load_format == "auto":
+            self.load_format = "mistral"
 
     def _handle_load_format(self):
         if (

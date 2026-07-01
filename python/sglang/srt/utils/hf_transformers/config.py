@@ -204,8 +204,10 @@ def get_config(
     if is_gguf:
         if model_config_parser not in ("auto", "hf"):
             raise ValueError(
-                f"model_config_parser={model_config_parser!r} is incompatible "
-                "with GGUF inputs; only 'hf' (or 'auto') is supported."
+                f"model_config_parser={model_config_parser!r} (set via "
+                "--model-config-parser or its --config-format alias) is "
+                "incompatible with GGUF inputs; only 'hf' (or 'auto') is "
+                "supported."
             )
         _ensure_gguf_version()
         kwargs["gguf_file"] = model

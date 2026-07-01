@@ -1340,19 +1340,20 @@ class TestConfigFormatAlias(CustomTestCase):
     """--config-format is a vLLM-parity alias for --model-config-parser.
 
     Tests the reconciliation function _handle_config_format directly on a
-    minimal SimpleNamespace stand-in for ServerArgs -- this isolates the four
+    minimal SimpleNamespace stand-in for ServerArgs -- this isolates the
     reconciliation states without going through prepare_server_args, which
     would try to actually load a model config (and would rightly fail for a
     non-Mistral model when config_format='mistral' is set).
     """
 
     @staticmethod
-    def _reconcile(config_format, model_config_parser):
+    def _reconcile(config_format, model_config_parser, load_format="auto"):
         from sglang.srt.server_args import ServerArgs
 
         ns = SimpleNamespace(
             config_format=config_format,
             model_config_parser=model_config_parser,
+            load_format=load_format,
         )
         ServerArgs._handle_config_format(ns)
         return ns
@@ -1374,6 +1375,64 @@ class TestConfigFormatAlias(CustomTestCase):
     def test_matching_flags_accepted(self):
         ns = self._reconcile(config_format="mistral", model_config_parser="mistral")
         self.assertEqual(ns.model_config_parser, "mistral")
+
+    def test_explicit_auto_config_format_conflicts_like_any_other_value(self):
+        # "auto" is compared as a literal value on the config_format side,
+        # same as "hf"/"mistral"/etc -- it is only treated as "not set" on
+        # the model_config_parser side (the default). This is intentional:
+        # an explicit --config-format=auto together with an explicit,
+        # different --model-config-parser is a real, reportable conflict.
+        with self.assertRaisesRegex(ValueError, "conflicts with"):
+            self._reconcile(config_format="auto", model_config_parser="hf")
+
+    def test_config_format_case_and_whitespace_normalized(self):
+        ns = self._reconcile(config_format="  Mistral  ", model_config_parser="auto")
+        self.assertEqual(ns.model_config_parser, "mistral")
+        self.assertEqual(ns.config_format, "mistral")
+
+    def test_config_format_case_insensitive_matches_parser(self):
+        ns = self._reconcile(config_format="Mistral", model_config_parser="mistral")
+        self.assertEqual(ns.model_config_parser, "mistral")
+
+    def test_empty_config_format_is_noop(self):
+        ns = self._reconcile(config_format="", model_config_parser="hf")
+        self.assertEqual(ns.model_config_parser, "hf")
+
+    def test_whitespace_only_config_format_is_noop(self):
+        ns = self._reconcile(config_format="   ", model_config_parser="hf")
+        self.assertEqual(ns.model_config_parser, "hf")
+
+    def test_config_format_mistral_sets_load_format_when_auto(self):
+        ns = self._reconcile(config_format="mistral", model_config_parser="auto")
+        self.assertEqual(ns.load_format, "mistral")
+
+    def test_config_format_mistral_does_not_override_explicit_load_format(self):
+        ns = self._reconcile(
+            config_format="mistral",
+            model_config_parser="auto",
+            load_format="safetensors",
+        )
+        self.assertEqual(ns.load_format, "safetensors")
+
+    def test_dummy_model_path_still_validates_config_format(self):
+        # Regression test: _handle_config_format() must run before the
+        # dummy/none model_path short-circuit in __post_init__, so a
+        # conflicting-flags mistake is still caught for dummy models.
+        from sglang.srt.server_args import ServerArgs
+
+        with self.assertRaisesRegex(ValueError, "conflicts with"):
+            ServerArgs(
+                model_path="dummy",
+                config_format="mistral",
+                model_config_parser="hf",
+            )
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            config_format="mistral",
+            model_config_parser="auto",
+        )
+        self.assertEqual(server_args.model_config_parser, "mistral")
 
 
 if __name__ == "__main__":
