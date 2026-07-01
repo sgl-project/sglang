@@ -2209,6 +2209,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         def auto_weight_loader(module):
             return getattr(module, "weight_loader", default_weight_loader)
 
+        disable_async_weight_load = envs.SGLANG_DSV4_DISABLE_ASYNC_WEIGHT_LOAD.get()
+        if disable_async_weight_load:
+            log_info_on_rank0(
+                logger,
+                "DeepSeek V4 async weight loading disabled by "
+                "SGLANG_DSV4_DISABLE_ASYNC_WEIGHT_LOAD.",
+            )
+
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
             nextn_spec_weight_names_out_of_layer = [
@@ -2233,7 +2241,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             weight_names = []
             for name, loaded_weight in weights:
                 try:
-                    use_async_loading = should_async_load(loaded_weight)
+                    use_async_loading = (
+                        not disable_async_weight_load
+                    ) and should_async_load(loaded_weight)
 
                     name = self.remap_weight_name_to_dpsk_hf_format(
                         name,
