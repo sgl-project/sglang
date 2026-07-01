@@ -34,6 +34,9 @@ from sglang.srt.utils.common import is_sm100_supported
 from torch import Tensor
 
 
+NVFP4_SM100_GLOBAL_SCALE_MULTIPLIER = 6.0
+
+
 class KVCacheQuantMethodBase(ABC):
     """Abstract base for KV cache quantization strategies.
 
@@ -215,10 +218,12 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
                 if hasattr(layer, "v_scale") and layer.v_scale is not None
                 else 1.0
             )
-            # SM100 requires a 6× adjustment to align FP4 range with hardware expectations
+            # The model stores NVFP4 scales in the checkpoint convention.
+            # SM100 FlashInfer KV kernels expect the scale multiplied by the FP4
+            # E2M1 max value; keep that architecture detail local to this method.
             if is_sm100_supported():
-                k_scale *= 6.0
-                v_scale *= 6.0
+                k_scale *= NVFP4_SM100_GLOBAL_SCALE_MULTIPLIER
+                v_scale *= NVFP4_SM100_GLOBAL_SCALE_MULTIPLIER
             k_scales_cpu[layer_id] = k_scale
             v_scales_cpu[layer_id] = v_scale
             self.k_scales_float[layer_id] = k_scale
@@ -289,10 +294,10 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
     ) -> None:
         from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
 
-        cache_k, cache_k_fp4_sf, _ = NVFP4KVQuantizeUtil.fi_nvfp4_quantize(
+        cache_k, cache_k_fp4_sf, _ = NVFP4KVQuantizeUtil.quantize(
             cache_k.contiguous(), k_scale
         )
-        cache_v, cache_v_fp4_sf, _ = NVFP4KVQuantizeUtil.fi_nvfp4_quantize(
+        cache_v, cache_v_fp4_sf, _ = NVFP4KVQuantizeUtil.quantize(
             cache_v.contiguous(), v_scale
         )
 
@@ -331,10 +336,10 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
 
         cur_k_scale = self.k_scales_gpu[layer_id : layer_id + 1]
         cur_v_scale = self.v_scales_gpu[layer_id : layer_id + 1]
-        k_bf16 = NVFP4KVQuantizeUtil.cuda_nvfp4_dequantize(
+        k_bf16 = NVFP4KVQuantizeUtil.dequantize(
             k_fp4.view(torch.uint8), k_scales, cur_k_scale
         )
-        v_bf16 = NVFP4KVQuantizeUtil.cuda_nvfp4_dequantize(
+        v_bf16 = NVFP4KVQuantizeUtil.dequantize(
             v_fp4.view(torch.uint8), v_scales, cur_v_scale
         )
         return k_bf16.to(torch.float8_e4m3fn), v_bf16.to(torch.float8_e4m3fn)

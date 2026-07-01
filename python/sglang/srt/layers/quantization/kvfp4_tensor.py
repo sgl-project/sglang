@@ -130,10 +130,10 @@ class NVFP4KVQuantizeUtil:
             return torch.tensor([global_scale], dtype=torch.float32, device=device)
         if global_scale.dim() == 0:
             global_scale = global_scale.unsqueeze(0)
-        return global_scale.to(device=device, dtype=torch.float32).contiguous()
+        return global_scale.contiguous()
 
     @staticmethod
-    def fi_nvfp4_quantize(tensor: torch.Tensor, global_scale: torch.Tensor):
+    def quantize(tensor: torch.Tensor, global_scale: torch.Tensor):
         try:
             from flashinfer import nvfp4_kv_quantize
         except ImportError as exc:
@@ -154,7 +154,7 @@ class NVFP4KVQuantizeUtil:
         return tensor_fp4, tensor_fp4_sf, global_scale
 
     @staticmethod
-    def cuda_nvfp4_dequantize(
+    def dequantize(
         quant_tensor: torch.Tensor,
         block_scales: torch.Tensor,
         global_scale: torch.Tensor,
