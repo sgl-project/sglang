@@ -2,7 +2,9 @@ import importlib
 import unittest
 
 import torch
+from sgl_kernel import sgl_per_token_group_quant_8bit
 
+from sglang.jit_kernel.utils import should_run_full_tests
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -68,6 +70,97 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
         cls.quant_weight_ue8m0 = staticmethod(fp8_utils.quant_weight_ue8m0)
         cls.transform_scale_ue8m0 = staticmethod(fp8_utils.transform_scale_ue8m0)
         cls.block_quant_dequant = staticmethod(fp8_utils.block_quant_dequant)
+
+    def test_fused_group_major_quant_matches_per_group_reference(self):
+        torch.manual_seed(1)
+        torch.cuda.manual_seed_all(1)
+
+        G, T, D = 5, 9, 384
+        group_size = 128
+        device = torch.device("cuda")
+        o_group_major = (
+            torch.randn(G, T, D, device=device, dtype=torch.float32) * 0.25
+        ).to(torch.bfloat16)
+
+        o_fp8, o_s = self.quant_helper(o_group_major, group_size=group_size)
+        scale_inner = (D // group_size + 3) // 4
+        aligned_t = (T + 3) // 4 * 4
+        o_fp8_ref = torch.empty_like(o_fp8)
+        o_s_ref = torch.empty(
+            (G, scale_inner, aligned_t), device=device, dtype=torch.int32
+        ).transpose(-1, -2)[:, :T, :]
+        for g in range(G):
+            sgl_per_token_group_quant_8bit(
+                o_group_major[g],
+                o_fp8_ref[g],
+                o_s_ref[g],
+                group_size,
+                1e-10,
+                float(torch.finfo(torch.float8_e4m3fn).min),
+                float(torch.finfo(torch.float8_e4m3fn).max),
+                True,
+                False,
+                None,
+                enable_v2=True,
+            )
+        torch.cuda.synchronize()
+
+        self.assertEqual(o_fp8.shape, (G, T, D))
+        self.assertEqual(o_s.shape, (G, T, scale_inner))
+        self.assertFalse(o_s.is_contiguous())
+        self.assertTrue(torch.equal(o_fp8.view(torch.int8), o_fp8_ref.view(torch.int8)))
+        self.assertTrue(torch.equal(o_s, o_s_ref))
+
+    def test_fused_group_major_quant_large_token_dimension(self):
+        torch.manual_seed(2)
+        torch.cuda.manual_seed_all(2)
+
+        cases = [
+            # Covers >10k live tokens / large decode batch without using much memory.
+            (1, 10_001, 128),
+            # Covers >10k live tokens with the DeepSeek-V4 wo_a model shape.
+            (16, 10_001, 512),
+        ]
+        if should_run_full_tests():
+            # Exercises 64-bit token indexing for long-context-sized token axes
+            # and group-major offsets with g > 0.
+            cases.append((2, 900_001, 128))
+
+        group_size = 128
+        device = torch.device("cuda")
+        for G, T, D in cases:
+            with self.subTest(G=G, T=T, D=D):
+                o_group_major = (
+                    torch.randn(G, T, D, device=device, dtype=torch.float32) * 0.25
+                ).to(torch.bfloat16)
+
+                o_fp8, o_s = self.quant_helper(o_group_major, group_size=group_size)
+                o_fp8_ref = torch.empty_like(o_fp8)
+                scale_inner = (D // group_size + 3) // 4
+                aligned_t = (T + 3) // 4 * 4
+                o_s_ref = torch.empty(
+                    (G, scale_inner, aligned_t), device=device, dtype=torch.int32
+                ).transpose(-1, -2)[:, :T, :]
+                for g in range(G):
+                    sgl_per_token_group_quant_8bit(
+                        o_group_major[g],
+                        o_fp8_ref[g],
+                        o_s_ref[g],
+                        group_size,
+                        1e-10,
+                        float(torch.finfo(torch.float8_e4m3fn).min),
+                        float(torch.finfo(torch.float8_e4m3fn).max),
+                        True,
+                        False,
+                        None,
+                        enable_v2=True,
+                    )
+                torch.cuda.synchronize()
+
+                self.assertTrue(
+                    torch.equal(o_fp8.view(torch.int8), o_fp8_ref.view(torch.int8))
+                )
+                self.assertTrue(torch.equal(o_s, o_s_ref))
 
     def test_fp8_wo_a_einsum_uses_group_major_activation_scales(self):
         torch.manual_seed(0)

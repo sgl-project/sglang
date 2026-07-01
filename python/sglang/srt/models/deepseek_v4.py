@@ -70,11 +70,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.mhc import mhc_fused_post_pre, npu_hc_pre
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.quantization.fp8_kernel import (
-    fp8_dtype,
-    fp8_max,
-    fp8_min,
-)
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -131,7 +126,6 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
-    ceil_align,
     get_bool_env_var,
     is_gfx95_supported,
     log_info_on_rank0,
@@ -162,40 +156,11 @@ def _fp8_wo_a_group_major_quant_ue8m0_for_deep_gemm(
     backed by the TMA-aligned layout expected by DeepGEMM on SM100. Do not make
     the scale tensor contiguous.
     """
-    from sglang.srt.layers.quantization.fp8_kernel import (
-        sgl_per_token_group_quant_8bit,
+    from sglang.jit_kernel.dsv4 import (
+        fp8_wo_a_group_major_quant_ue8m0,
     )
 
-    G, T, D = o_group_major.shape
-    scale_inner = ceil_align(D // group_size, 4) // 4
-    aligned_t = ceil_align(T, 4)
-    o_fp8 = torch.empty(
-        o_group_major.shape, device=o_group_major.device, dtype=fp8_dtype
-    )
-    o_s = torch.empty(
-        (G, scale_inner, aligned_t),
-        device=o_group_major.device,
-        dtype=torch.int,
-    ).transpose(-1, -2)[:, :T, :]
-
-    # The generic wrapper cannot express this preallocated group-major scale
-    # buffer. Write each group's [T, D] rows into the DeepGEMM TMA layout.
-    for g in range(G):
-        sgl_per_token_group_quant_8bit(
-            o_group_major[g],
-            o_fp8[g],
-            o_s[g],
-            group_size,
-            1e-10,
-            fp8_min,
-            fp8_max,
-            True,
-            False,
-            None,
-            enable_v2=True,
-        )
-
-    return o_fp8, o_s
+    return fp8_wo_a_group_major_quant_ue8m0(o_group_major, group_size=group_size)
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:

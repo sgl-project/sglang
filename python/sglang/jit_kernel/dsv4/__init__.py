@@ -17,6 +17,7 @@ from .elementwise import (
     fused_q_norm_rope,
     fused_rope_inplace,
 )
+from .fp8_wo_a import fp8_wo_a_group_major_quant_ue8m0
 from .gemm import linear_bf16_fp32
 from .moe import (
     hash_topk,
@@ -41,6 +42,7 @@ __all__ = [
     "fused_q_indexer_rope_hadamard_fp4_quant",
     "fused_q_indexer_rope_hadamard_quant",
     "fused_k_norm_rope_flashmla",
+    "fp8_wo_a_group_major_quant_ue8m0",
     "make_name",
     "linear_bf16_fp32",
     "get_paged_mqa_logits_metadata",
