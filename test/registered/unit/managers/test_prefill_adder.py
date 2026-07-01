@@ -81,7 +81,10 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = []
         req.output_ids = [0] * output_len
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
-        req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
+        req.time_stats = SimpleNamespace(
+            wait_queue_entry_time=wait_time,
+            set_first_prefill_attempt_time=MagicMock(),
+        )
         req.retracted_stain = False
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
