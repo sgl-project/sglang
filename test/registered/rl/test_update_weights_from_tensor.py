@@ -148,7 +148,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
             new_tensors.append((name, new_tensor))
 
         # Create a flattened bucket
-        flattened_bucket = FlattenedTensorBucket(named_tensors=new_tensors)
+        flattened_bucket = FlattenedTensorBucket.from_tensors(named_tensors=new_tensors)
 
         # Extract the flattened tensor and metadata in the format expected by model_runner
         flattened_tensor = flattened_bucket.get_flattened_tensor()
