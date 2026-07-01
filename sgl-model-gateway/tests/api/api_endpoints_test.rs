@@ -1627,3 +1627,172 @@ mod rerank_tests {
         ctx.shutdown().await;
     }
 }
+
+mod classify_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_classify_native_success() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 19001,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "text": "This is a test input",
+            "model": "test-reward-model"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/classify")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Mock worker returns {"embedding": [score]}
+        assert!(body_json.get("embedding").is_some());
+        let embedding = body_json["embedding"].as_array().unwrap();
+        assert_eq!(embedding.len(), 1);
+        // Default mock score for text without "good" is -1.359375
+        let score = embedding[0].as_f64().unwrap();
+        assert!((score - (-1.359375)).abs() < 1e-6);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_classify_native_worker_failure() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 19002,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 1.0, // Always fail
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "text": "This is a test input",
+            "model": "test-reward-model"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/classify")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Worker failure should propagate as a server error
+        assert!(resp.status().is_server_error());
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_classify_native_not_404() {
+        // Smoke test: /classify must be registered and not return 404
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 19003,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "text": "hello",
+            "model": "m"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/classify")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "/classify route must be registered"
+        );
+
+        ctx.shutdown().await;
+    }
+}
+
+mod route_registration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_all_protected_routes_are_registered() {
+        // Smoke test: every protected POST endpoint should NOT return 404.
+        // A 404 means the route was never registered in build_app().
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 19010,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let minimal_generate = json!({"text": "hi", "model": "m"});
+        let minimal_chat = json!({"messages": [{"role": "user", "content": "hi"}], "model": "m"});
+        let minimal_rerank = json!({"query": "q", "documents": ["d"], "model": "m"});
+        let minimal_classify = json!({"text": "hi", "model": "m"});
+
+        let routes_and_payloads: Vec<(&str, serde_json::Value)> = vec![
+            ("/generate", minimal_generate.clone()),
+            ("/classify", minimal_classify.clone()),
+            ("/v1/chat/completions", minimal_chat.clone()),
+            ("/v1/completions", minimal_generate.clone()),
+            ("/rerank", minimal_rerank.clone()),
+            ("/flush_cache", json!({})),
+        ];
+
+        for (route, payload) in routes_and_payloads {
+            let req = Request::builder()
+                .method("POST")
+                .uri(route)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "Route {} must be registered (got 404)",
+                route
+            );
+        }
+
+        ctx.shutdown().await;
+    }
+}
