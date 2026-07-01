@@ -45,7 +45,9 @@ def create_flashinfer_backend(runner):
                 or not runner.plan_stream_for_flashinfer
             ):
                 runner.plan_stream_for_flashinfer = torch.cuda.Stream()
-        return FlashInferAttnBackend(runner, init_new_workspace=runner.init_new_workspace)
+        return FlashInferAttnBackend(
+            runner, init_new_workspace=runner.init_new_workspace
+        )
     else:
         from sglang.srt.layers.attention.flashinfer_mla_backend import (
             FlashInferMLAAttnBackend,
@@ -137,7 +139,9 @@ def create_dsv4_backend(runner):
             DeepseekV4HipRadixBackend,
         )
 
-        logger.info("Using DeepseekV4HipRadixBackend for compressed attention backend (HIP).")
+        logger.info(
+            "Using DeepseekV4HipRadixBackend for compressed attention backend (HIP)."
+        )
         return DeepseekV4HipRadixBackend(runner)
     else:
         from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -196,7 +200,8 @@ def create_flashattention_v3_backend(runner):
         return FlashAttentionBackend(runner)
     else:
         assert major == 3 and minor >= 1, (
-            "FlashAttention v3 Backend requires MP>=31. " "Please use `--attention-backend triton`."
+            "FlashAttention v3 Backend requires MP>=31. "
+            "Please use `--attention-backend triton`."
         )
         from sglang.srt.hardware_backend.musa.attention import (
             MusaFlashAttentionBackend,
@@ -320,7 +325,9 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             full_attn_layers = [0]
         else:
             full_attn_layers = cfg.full_attention_layer_ids
-        return HybridLinearAttnBackend(full_attn_backend, linear_attn_backend, full_attn_layers)
+        return HybridLinearAttnBackend(
+            full_attn_backend, linear_attn_backend, full_attn_layers
+        )
 
     return full_attn_backend
 

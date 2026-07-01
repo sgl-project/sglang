@@ -54,7 +54,10 @@ class MoeRunner:
                 self.runner_core = MarlinLoraRunnerCore(config)
             else:
                 self.runner_core = None  # Marlin only supports fused path
-        elif runner_backend.is_flashinfer_trtllm() or runner_backend.is_flashinfer_trtllm_routed():
+        elif (
+            runner_backend.is_flashinfer_trtllm()
+            or runner_backend.is_flashinfer_trtllm_routed()
+        ):
             self.runner_core = None  # FlashInfer TRT-LLM only supports fused path
         elif runner_backend.is_flashinfer_cutedsl():
             self.runner_core = None  # FlashInfer CuteDSL only supports fused path
@@ -75,7 +78,9 @@ class MoeRunner:
             runner_backend_name = runner_backend.value
 
             # TODO(cwan): add a server argument to disable fused func
-            self.fused_func = FusedOpPool.get_fused_func(a2a_backend_name, runner_backend_name)
+            self.fused_func = FusedOpPool.get_fused_func(
+                a2a_backend_name, runner_backend_name
+            )
 
             if self.runner_core is None and self.fused_func is None:
                 raise NotImplementedError(
@@ -86,9 +91,13 @@ class MoeRunner:
         self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
 
-        SGLANG_CI_DISABLE_MOE_FUSED_FUNC = os.environ.get("SGLANG_CI_DISABLE_MOE_FUSED_FUNC", "0")
+        SGLANG_CI_DISABLE_MOE_FUSED_FUNC = os.environ.get(
+            "SGLANG_CI_DISABLE_MOE_FUSED_FUNC", "0"
+        )
         if SGLANG_CI_DISABLE_MOE_FUSED_FUNC == "1":
-            logger.info("SGLANG_CI_DISABLE_MOE_FUSED_FUNC is set to 1, disabling fused func")
+            logger.info(
+                "SGLANG_CI_DISABLE_MOE_FUSED_FUNC is set to 1, disabling fused func"
+            )
             self.fused_func = None
 
     def run(
@@ -129,7 +138,9 @@ class MoeRunner:
 
         dispatch_format = dispatch_output.format.value
         runner_format = self.runner_core.runner_backend.value
-        self.pre_permute_func = PermuteMethodPool.get_pre_permute(dispatch_format, runner_format)
+        self.pre_permute_func = PermuteMethodPool.get_pre_permute(
+            dispatch_format, runner_format
+        )
 
         running_state = {}
         if self.down_gemm_overlap_args is not None:
@@ -143,10 +154,14 @@ class MoeRunner:
 
         hooks = _maybe_build_lora_hooks(runner_input)
 
-        runner_output = self.runner_core.run(runner_input, quant_info, running_state, hooks=hooks)
+        runner_output = self.runner_core.run(
+            runner_input, quant_info, running_state, hooks=hooks
+        )
         runner_format = self.runner_core.runner_backend.value
         combine_format = dispatch_output.format.value
-        self.post_permute_func = PermuteMethodPool.get_post_permute(runner_format, combine_format)
+        self.post_permute_func = PermuteMethodPool.get_post_permute(
+            runner_format, combine_format
+        )
         combine_input = self.post_permute_func(
             runner_output, quant_info, self.config, running_state
         )
