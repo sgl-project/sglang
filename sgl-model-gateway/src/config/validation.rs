@@ -297,6 +297,14 @@ impl ConfigValidator {
             }
         }
 
+        if config.max_inflight_requests < -1 {
+            return Err(ConfigError::InvalidValue {
+                field: "max_inflight_requests".to_string(),
+                value: config.max_inflight_requests.to_string(),
+                reason: "Must be >= -1 (-1 or 0 disables the in-flight cap)".to_string(),
+            });
+        }
+
         if config.worker_startup_timeout_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "worker_startup_timeout_secs".to_string(),

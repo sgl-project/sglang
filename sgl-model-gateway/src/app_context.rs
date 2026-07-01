@@ -41,6 +41,9 @@ pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Option<Arc<TokenBucket>>,
+    /// True semaphore (refill_rate=0) capping in-flight requests. `None`
+    /// when `max_inflight_requests <= 0`.
+    pub inflight_limiter: Option<Arc<TokenBucket>>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
@@ -73,6 +76,7 @@ pub struct AppContextBuilder {
     client: Option<Client>,
     router_config: Option<RouterConfig>,
     rate_limiter: Option<Arc<TokenBucket>>,
+    inflight_limiter: Option<Arc<TokenBucket>>,
     tokenizer_registry: Option<Arc<TokenizerRegistry>>,
     reasoning_parser_factory: Option<ReasoningParserFactory>,
     tool_parser_factory: Option<ToolParserFactory>,
@@ -113,6 +117,7 @@ impl AppContextBuilder {
             client: None,
             router_config: None,
             rate_limiter: None,
+            inflight_limiter: None,
             tokenizer_registry: None,
             reasoning_parser_factory: None,
             tool_parser_factory: None,
@@ -142,6 +147,11 @@ impl AppContextBuilder {
 
     pub fn rate_limiter(mut self, rate_limiter: Option<Arc<TokenBucket>>) -> Self {
         self.rate_limiter = rate_limiter;
+        self
+    }
+
+    pub fn inflight_limiter(mut self, inflight_limiter: Option<Arc<TokenBucket>>) -> Self {
+        self.inflight_limiter = inflight_limiter;
         self
     }
 
@@ -249,6 +259,7 @@ impl AppContextBuilder {
             client: self.client.ok_or(AppContextBuildError("client"))?,
             router_config,
             rate_limiter: self.rate_limiter,
+            inflight_limiter: self.inflight_limiter,
             tokenizer_registry: self
                 .tokenizer_registry
                 .ok_or(AppContextBuildError("tokenizer_registry"))?,
@@ -293,6 +304,7 @@ impl AppContextBuilder {
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
+            .maybe_inflight_limiter(&router_config)
             .with_tokenizer_registry(&router_config)?
             .with_reasoning_parser_factory()
             .with_tool_parser_factory()
@@ -385,6 +397,16 @@ impl AppContextBuilder {
                     rate_limit_tokens as usize,
                 )))
             }
+        };
+        self
+    }
+
+    /// In-flight cap: a true semaphore (`refill_rate = 0`); `None` when
+    /// `max_inflight_requests <= 0`.
+    fn maybe_inflight_limiter(mut self, config: &RouterConfig) -> Self {
+        self.inflight_limiter = match config.max_inflight_requests {
+            n if n <= 0 => None,
+            n => Some(Arc::new(TokenBucket::new(n as usize, 0))),
         };
         self
     }

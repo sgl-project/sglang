@@ -353,6 +353,10 @@ struct CliArgs {
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
 
+    /// Hard cap on concurrently in-flight requests (true semaphore; 0 disables)
+    #[arg(long, default_value_t = 0, help_heading = "Rate Limiting")]
+    max_inflight_requests: i32,
+
     // ==================== Retry Configuration ====================
     /// Maximum number of retry attempts
     #[arg(long, default_value_t = 5, help_heading = "Retry Configuration")]
@@ -1015,6 +1019,7 @@ impl CliArgs {
             .pool_max_idle_per_host(self.pool_max_idle_per_host)
             .tcp_keepalive_secs(self.tcp_keepalive_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
+            .max_inflight_requests(self.max_inflight_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
             .cors_allowed_origins(self.cors_allowed_origins.clone())

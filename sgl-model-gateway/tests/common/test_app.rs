@@ -1,4 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use axum::Router;
 use data_connector::{
@@ -11,7 +14,7 @@ use smg::{
     core::{
         BasicWorkerBuilder, LoadMonitor, ModelCard, RuntimeType, Worker, WorkerRegistry, WorkerType,
     },
-    middleware::{AuthConfig, TokenBucket},
+    middleware::{AuthConfig, ConcurrencyLimiter, TokenBucket},
     policies::PolicyRegistry,
     routers::RouterTrait,
     server::{build_app, AppState},
@@ -41,6 +44,11 @@ pub fn create_test_app(
         }
     };
 
+    let inflight_limiter = match router_config.max_inflight_requests {
+        n if n <= 0 => None,
+        n => Some(Arc::new(TokenBucket::new(n as usize, 0))),
+    };
+
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
     let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
@@ -68,6 +76,7 @@ pub fn create_test_app(
             .router_config(router_config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
+            .inflight_limiter(inflight_limiter)
             .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
             .reasoning_parser_factory(None) // reasoning_parser_factory
             .tool_parser_factory(None) // tool_parser_factory
@@ -125,11 +134,21 @@ pub fn create_test_app_with_context(
     router: Arc<dyn RouterTrait>,
     app_context: Arc<AppContext>,
 ) -> Router {
+    // Build the request queue from the config, matching the real server.
+    let (limiter, processor) = ConcurrencyLimiter::new(
+        app_context.rate_limiter.clone(),
+        app_context.router_config.queue_size,
+        Duration::from_secs(app_context.router_config.queue_timeout_secs),
+    );
+    if let Some(proc) = processor {
+        tokio::spawn(proc.run());
+    }
+
     // Create AppState with the test router and context
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
-        concurrency_queue_tx: None,
+        concurrency_queue_tx: limiter.queue_tx,
         router_manager: None,
         mesh_handler: None,
         mesh_sync_manager: None,
@@ -163,8 +182,6 @@ pub fn create_test_app_with_context(
         router_config.cors_allowed_origins.clone(),
     )
 }
-
-/// Create a minimal test AppContext for unit tests
 #[allow(dead_code)]
 pub async fn create_test_app_context() -> Arc<AppContext> {
     let router_config = RouterConfig::default();

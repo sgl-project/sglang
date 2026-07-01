@@ -47,6 +47,12 @@ pub struct RouterConfig {
     pub queue_timeout_secs: u64,
     /// If not set, defaults to max_concurrent_requests
     pub rate_limit_tokens_per_second: Option<i32>,
+    /// Hard cap on concurrently in-flight requests (a true semaphore;
+    /// permits return only when a response stream ends). Independent of
+    /// `max_concurrent_requests` (a req/s bucket). `0` (default) or `-1`
+    /// disables it.
+    #[serde(default)]
+    pub max_inflight_requests: i32,
     pub cors_allowed_origins: Vec<String>,
     pub retry: RetryConfig,
     pub circuit_breaker: CircuitBreakerConfig,
@@ -529,6 +535,7 @@ impl Default for RouterConfig {
             queue_size: 100,
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,
+            max_inflight_requests: 0,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
