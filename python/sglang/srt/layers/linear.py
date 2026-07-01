@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/linear.py"""
 
 from __future__ import annotations
@@ -13,12 +15,11 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.srt.distributed import (
     divide,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     get_tp_group,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_quant_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -37,6 +38,8 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -54,10 +57,7 @@ logger = logging.getLogger(__name__)
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
-    "AWQMarlinLinearMethod",
     "AWQLinearMethod",
-    "AWQLinearAscendMethod",
-    "AWQLinearIntelAMXMethod",
     "GPTQMarlinLinearMethod",
     "Fp8LinearMethod",
     "BlockInt8LinearMethod",
@@ -269,7 +269,9 @@ class ReplicatedLinear(LinearBase):
                     param.dtype == loaded_weight.dtype
                 ), "init para dtype and loaded weight dtype should be the same"
 
-        assert param.size() == loaded_weight.size()
+        assert (
+            param.size() == loaded_weight.size()
+        ), f"{param.shape=} {param.dtype=} {loaded_weight.shape=} {loaded_weight.dtype=}"
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -335,9 +337,9 @@ class ColumnParallelLinear(LinearBase):
 
         # Divide the weight matrix along the last dimension.
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_parallel().tp_size
         self.tp_rank, self.tp_size = tp_rank, tp_size
         assert self.quant_method is not None
         self.output_size_per_partition = divide(self.output_size, tp_size)
@@ -429,7 +431,9 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert param_data.shape == loaded_weight.shape
+        assert (
+            param_data.shape == loaded_weight.shape
+        ), f"param_data.shape={param_data.shape} != loaded_weight.shape={loaded_weight.shape}"
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):
@@ -521,9 +525,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     ):
         self.output_sizes = output_sizes
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_parallel().tp_size
         self.tp_rank, self.tp_size = tp_rank, tp_size
         assert all(output_size % tp_size == 0 for output_size in output_sizes)
         self.use_presharded_weights = use_presharded_weights
@@ -938,9 +942,9 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.total_num_kv_heads = total_num_kv_heads
         # Divide the weight matrix along the last dimension.
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_parallel().tp_size
         self.tp_rank, self.tp_size = tp_rank, tp_size
         self.num_heads = divide(self.total_num_heads, tp_size)
         if tp_size >= self.total_num_kv_heads:
@@ -1050,7 +1054,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         block_n, _ = self.quant_method.quant_config.weight_block_size
         q_size = self.total_num_heads * self.head_size // block_n
         k_size = self.total_num_kv_heads * self.head_size // block_n
-        v_size = self.total_num_kv_heads * self.head_size // block_n
+        v_size = self.total_num_kv_heads * self.v_head_size // block_n
         shard_offsets = [
             # (shard_id, shard_offset, shard_size)
             ("q", 0, q_size),
@@ -1385,9 +1389,9 @@ class RowParallelLinear(LinearBase):
 
         # Divide the weight matrix along the last dimension.
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_parallel().tp_size
         self.tp_rank, self.tp_size = tp_rank, tp_size
         self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None
@@ -1512,7 +1516,7 @@ class RowParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_, skip_all_reduce=False):
+    def forward(self, input_, skip_all_reduce=False, forward_batch=None):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1539,7 +1543,18 @@ class RowParallelLinear(LinearBase):
             if self.use_dp_attention_reduce:
                 output = get_attention_tp_group().all_reduce(output_parallel)
             else:
-                output = tensor_model_parallel_all_reduce(output_parallel)
+                quantize_communications = (
+                    (
+                        not forward_batch.forward_mode.is_decode_or_idle()
+                        and get_global_server_args().enable_quant_communications
+                    )
+                    if forward_batch is not None
+                    else False
+                )
+                if quantize_communications:
+                    output = tensor_model_parallel_quant_all_reduce(output_parallel)
+                else:
+                    output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
 
@@ -1589,8 +1604,8 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
             prefix=prefix,
         )
         self.num_column_parallel = len(column_output_sizes)
-        self.tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_parallel().tp_rank
+        self.tp_size = get_parallel().tp_size
 
         self.output_partition_sizes = [
             divide(x, self.tp_size) for x in column_output_sizes
@@ -1641,8 +1656,8 @@ class ColumnParallelBatchedLinear(nn.Module):
         self, batch: int, input_size: int, output_size: int, dtype: torch.dtype
     ):
         super().__init__()
-        self.tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_parallel().tp_rank
+        self.tp_size = get_parallel().tp_size
         self.weight = nn.Parameter(
             torch.empty(batch, output_size // self.tp_size, input_size, dtype=dtype),
             requires_grad=False,

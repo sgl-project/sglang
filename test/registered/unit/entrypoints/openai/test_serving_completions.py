@@ -22,7 +22,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _MockTemplateManager:
@@ -61,9 +61,15 @@ class ServingCompletionTestCase(unittest.TestCase):
 
     # ---------- prompt-handling ----------
     def test_single_string_prompt(self):
-        req = CompletionRequest(model="x", prompt="Hello world", max_tokens=100)
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello world",
+            max_tokens=100,
+            session_id="session-1",
+        )
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.text, "Hello world")
+        self.assertEqual(internal.session_id, "session-1")
 
     def test_single_token_ids_prompt(self):
         req = CompletionRequest(model="x", prompt=[1, 2, 3, 4], max_tokens=100)
@@ -139,6 +145,17 @@ class ServingCompletionTestCase(unittest.TestCase):
         # The schema should be converted to string by convert_json_schema_to_str
         self.assertIn("json_schema", sampling_params)
         self.assertIsInstance(sampling_params["json_schema"], str)
+
+    def test_response_format_json_schema_missing_schema(self):
+        """Test that json_schema response_format without a schema raises a ValueError."""
+        req = CompletionRequest(
+            model="x",
+            prompt="Generate a JSON object:",
+            max_tokens=100,
+            response_format={"type": "json_schema"},
+        )
+        with self.assertRaises(ValueError):
+            self.sc._build_sampling_params(req)
 
     def test_response_format_structural_tag(self):
         """Test that response_format structural_tag is correctly processed in sampling params."""
@@ -255,6 +272,117 @@ class ServingCompletionTestCase(unittest.TestCase):
         # Check that there is an error chunk and a DONE chunk, and possibly a role chunk
         self.assertGreaterEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
+
+    def test_non_streaming_cached_tokens_details_emits_sglext(self):
+        """Test that non-streaming completion responses emit cached token details in sglext."""
+
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello world",
+            max_tokens=100,
+            return_cached_tokens_details=True,
+        )
+        ret = [
+            {
+                "text": "Cached response",
+                "meta_info": {
+                    "id": "cmpl-cache-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": 6,
+                    "cached_tokens_details": {
+                        "device": 4,
+                        "host": 1,
+                        "storage": 1,
+                        "storage_backend": "file",
+                    },
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.sc._build_completion_response(req, ret, 1234567890)
+
+        self.assertIsNotNone(response.sglext)
+        self.assertEqual(
+            response.sglext.cached_tokens_details.model_dump(exclude_none=True),
+            {
+                "device": 4,
+                "host": 1,
+                "storage": 1,
+                "storage_backend": "file",
+            },
+        )
+
+    def test_streaming_cached_tokens_details_emits_sglext(self):
+        """Test that streaming completion responses emit cached token details in sglext."""
+
+        async def _mock_generate_with_cached_tokens_details(*args, **kwargs):
+            yield {
+                "text": "Cached response",
+                "meta_info": {
+                    "id": "cmpl-cache-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": 6,
+                    "cached_tokens_details": {
+                        "device": 4,
+                        "host": 1,
+                        "storage": 1,
+                        "storage_backend": "file",
+                    },
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.sc.tokenizer_manager.generate_request = (
+            _mock_generate_with_cached_tokens_details
+        )
+
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello world",
+            max_tokens=100,
+            stream=True,
+            return_cached_tokens_details=True,
+        )
+
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+
+        async def run_stream():
+            chunks = []
+            async for chunk in self.sc._generate_completion_stream(
+                adapted_request, req, self.fastapi_request
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        loop = get_or_create_event_loop()
+        chunks = loop.run_until_complete(run_stream())
+
+        sglext_chunks = []
+        for chunk in chunks:
+            if not chunk.startswith("data: ") or chunk.strip() == "data: [DONE]":
+                continue
+            data = json.loads(chunk[len("data: ") :])
+            if "sglext" in data:
+                sglext_chunks.append(data)
+
+        self.assertEqual(len(sglext_chunks), 1)
+        self.assertEqual(sglext_chunks[0]["choices"], [])
+        self.assertEqual(
+            sglext_chunks[0]["sglext"]["cached_tokens_details"],
+            {
+                "device": 4,
+                "host": 1,
+                "storage": 1,
+                "storage_backend": "file",
+            },
+        )
 
 
 if __name__ == "__main__":

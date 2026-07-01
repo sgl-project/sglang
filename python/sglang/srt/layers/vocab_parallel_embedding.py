@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.3.post1/vllm/model_executor/layers/vocab_parallel_embedding.py
 
 import logging
@@ -9,21 +11,19 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.srt.distributed import (
     divide,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_allocation_symmetric,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -32,6 +32,7 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_compiler_backend,
@@ -39,6 +40,7 @@ from sglang.srt.utils import (
     is_npu,
     set_weight_attrs,
 )
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
@@ -158,6 +160,28 @@ def get_masked_input_and_mask(
     return input_, ~vocab_mask
 
 
+def get_embedding_tp_kwargs() -> dict:
+    """Vocab-parallel layout kwargs for the *input embedding* of models that
+    support embedding replication (the DeepSeek-V2 target family: DeepSeek
+    V3.1 / Kimi K2.5, plus their EAGLE3 / NextN drafts).
+
+    EAGLE / NextN share the target's ``embed_tokens.weight`` tensor with the
+    draft (``set_embed`` / ``set_embed_and_head``), so the target and every
+    draft that shares it MUST use the same vocab-parallel layout -- otherwise
+    the draft's masking/index math runs against a tensor with a different
+    layout and accept_len silently drops. Route all of them through this one
+    helper so they can never drift.
+    """
+    if envs.SGLANG_ENABLE_EMBED_REPLICATION.get():
+        # Replicate the full table on every rank: skips the embed all-reduce
+        # at the cost of duplicated embedding weights.
+        return {"enable_tp": False}
+    # Shard along the vocab dim. Under DP attention each rank owns only its
+    # local tokens, so reduce within the attention-TP group, not the full TP
+    # group.
+    return {"enable_tp": True, "use_attn_tp_group": is_dp_attention_enabled()}
+
+
 class VocabParallelEmbedding(torch.nn.Module):
     """Embedding parallelized in the vocabulary dimension.
 
@@ -218,11 +242,11 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.use_attn_tp_group = use_attn_tp_group
         if self.enable_tp:
             if use_attn_tp_group:
-                tp_rank = get_attention_tp_rank()
-                self.tp_size = get_attention_tp_size()
+                tp_rank = get_parallel().attn_tp_rank
+                self.tp_size = get_parallel().attn_tp_size
             else:
-                tp_rank = get_tensor_model_parallel_rank()
-                self.tp_size = get_tensor_model_parallel_world_size()
+                tp_rank = get_parallel().tp_rank
+                self.tp_size = get_parallel().tp_size
         else:
             assert use_attn_tp_group is False
             tp_rank = 0
@@ -469,6 +493,11 @@ class VocabParallelEmbedding(torch.nn.Module):
         param[loaded_weight.shape[0] :].data.fill_(0)
 
     def forward(self, input_):
+        # Surface a bad token id (>= vocab_size, or a negative / unmasked sentinel) as a
+        # located async assert instead of a silent OOB embedding gather (tp=1 does not mask).
+        maybe_detect_oob(
+            input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
+        )
         if self.tp_size > 1:
             # Build the mask.
             masked_input, input_mask = get_masked_input_and_mask(

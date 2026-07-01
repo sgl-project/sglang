@@ -18,7 +18,7 @@
 import logging
 from contextlib import nullcontext
 from functools import lru_cache
-from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 import triton
@@ -33,9 +33,7 @@ from sglang.jit_kernel.all_reduce import (
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -48,8 +46,6 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     get_attention_tp_group,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -74,11 +70,18 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
+    narrow_padded_param_and_loaded_weight,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 
 # get_bool_env_var is defined in sglang.srt.utils.common, not sglang.srt.distributed.
@@ -89,17 +92,26 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
+    cpu_has_amx_support,
     get_bool_env_var,
     get_compiler_backend,
+    is_cpu,
     is_cuda,
     is_non_idle_and_non_empty,
+    is_npu,
     make_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
+_is_cpu = is_cpu()
+_is_amx_available = cpu_has_amx_support()
 _is_cuda = is_cuda()
+_is_npu = is_npu()
+
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_tp_rmsnorm_rope import split_qkv_tp_rmsnorm_rope
 
 
 @triton.jit
@@ -274,8 +286,8 @@ class MiniMaxM2RMSNormTP(nn.Module):
 
     def __init__(self, hidden_size: int, num_heads: int, eps: float = 1e-6) -> None:
         super().__init__()
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         # Align with QKVParallelLinear pattern
         if self.attn_tp_size >= num_heads:
@@ -306,6 +318,20 @@ class MiniMaxM2RMSNormTP(nn.Module):
         """Custom weight loader that handles TP sharding."""
         shard_id = self.attn_tp_rank // self.num_head_replicas
         shard_size = param.data.shape[0]
+
+        if _is_cpu and _is_amx_available:
+            # Handle uneven TP sharding on CPU
+            param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                param.data,
+                loaded_weight,
+                0,  # param_data_start
+                shard_id * shard_size,  # weight_start
+                0,  # shard_axis
+                shard_size,
+            )
+            param_data.copy_(loaded_weight)
+            return
+
         shard_end = (shard_id + 1) * shard_size
         assert shard_end <= loaded_weight.shape[0], (
             f"Weight shard out of bounds: shard [{shard_id * shard_size}:{shard_end}] "
@@ -389,6 +415,8 @@ class MiniMaxM2QKRMSNorm:
             if counter is not None:
                 self._counter = counter
                 self._forward_impl = self._forward_fused
+        elif _is_cpu and _is_amx_available:
+            self._forward_impl = self._forward_cpu
 
     @lru_cache
     @staticmethod
@@ -450,6 +478,12 @@ class MiniMaxM2QKRMSNorm:
         )
         return q, k
 
+    def _forward_cpu(self, q: torch.Tensor, k: torch.Tensor):
+        # TODO: add c++ kernel for cpu
+        q = self._q_norm(q.contiguous())
+        k = self._k_norm(k.contiguous())
+        return q, k
+
 
 class MiniMaxM2MoE(nn.Module):
     """MiniMax MoE implementation using DeepEP for Expert Parallel support."""
@@ -462,7 +496,7 @@ class MiniMaxM2MoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         if self.tp_size > config.num_local_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -509,7 +543,7 @@ class MiniMaxM2MoE(nn.Module):
         self.layer_id = layer_id
 
         if get_moe_a2a_backend().is_deepep():
-            self.ep_size = get_moe_expert_parallel_world_size()
+            self.ep_size = get_parallel().moe_ep_size
             self.top_k = config.num_experts_per_tok
 
     @staticmethod
@@ -601,7 +635,7 @@ class MiniMaxM2MoE(nn.Module):
         if router_logits is not None:
             ctx = (
                 nullcontext()
-                if not get_global_server_args().disable_piecewise_cuda_graph
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 else get_global_expert_distribution_recorder().with_current_layer(
                     self.layer_id
                 )
@@ -639,7 +673,7 @@ class MiniMaxM2MoE(nn.Module):
         if self.ep_size > 1:
             ctx = (
                 nullcontext()
-                if not get_global_server_args().disable_piecewise_cuda_graph
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 else get_global_expert_distribution_recorder().with_current_layer(
                     self.layer_id
                 )
@@ -697,8 +731,8 @@ class MiniMaxM2Attention(nn.Module):
         self.hidden_size = config.hidden_size
 
         # Use attention TP rank/size for dp-attention support
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         # Get dimensions from config
         self.total_num_heads = config.num_attention_heads
@@ -816,6 +850,43 @@ class MiniMaxM2Attention(nn.Module):
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
+    def forward_prepare_npu(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if hidden_states.shape[0] == 0:
+            assert (
+                not self.o_proj.reduce_results
+            ), "short-circuiting allreduce will lead to hangs"
+            return hidden_states, forward_batch, None
+        qkv, _ = self.qkv_proj(hidden_states)
+        if self.use_qk_norm:
+            cos_sin = self.rotary_emb.cos_sin_cache.index_select(0, positions.flatten())
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            q, k, v = split_qkv_tp_rmsnorm_rope(
+                input=qkv,
+                cos=cos,
+                sin=sin,
+                q_weight=self.q_norm.weight,
+                k_weight=self.k_norm.weight,
+                q_hidden_size=self.q_size,
+                kv_hidden_size=self.kv_size,
+                head_dim=self.head_dim,
+                rotary_dim=self.rotary_dim,
+                eps=self.q_norm.variance_epsilon,
+                tp_world=self.q_norm.attn_tp_size,
+                tp_group=get_attention_tp_group().device_group,
+            )
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = q.contiguous(), k.contiguous()
+            q, k = self.rotary_emb(positions, q, k)
+
+        inner_state = q, k, v, forward_batch
+        return None, forward_batch, inner_state
+
     def forward_core(self, intermediate_state):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
@@ -830,11 +901,18 @@ class MiniMaxM2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        s = self.forward_prepare(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
+        if not _is_npu:
+            s = self.forward_prepare(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        else:
+            s = self.forward_prepare_npu(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
         return self.forward_core(s)
 
     def op_prepare(self, state):
@@ -912,10 +990,16 @@ class MiniMaxM2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
         # Self Attention
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+            )
         )
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.self_attn(
@@ -985,12 +1069,6 @@ class MiniMaxM2DecoderLayer(nn.Module):
                 state.pop("residual_after_input_ln"),
                 state.forward_batch,
             )
-        )
-
-    def op_mlp(self, state):
-        hidden_states = state.pop("hidden_states_mlp_input")
-        state.hidden_states_mlp_output = self.block_sparse_moe(
-            hidden_states, state.forward_batch
         )
 
     def op_comm_postprocess_layer(self, state):
@@ -1095,18 +1173,19 @@ class MiniMaxM2Model(nn.Module):
             for i in range(self.start_layer, self.end_layer):
                 ctx = (
                     nullcontext()
-                    if not get_global_server_args().disable_piecewise_cuda_graph
+                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
-                    if i in self.layers_to_capture:
-                        aux_hidden_states.append(hidden_states + residual)
                     layer = self.layers[i]
                     hidden_states, residual = layer(
                         positions=positions,
                         forward_batch=forward_batch,
                         hidden_states=hidden_states,
                         residual=residual,
+                        captured_last_layer_outputs=(
+                            aux_hidden_states if i in self.layers_to_capture else None
+                        ),
                     )
 
         if not self.pp_group.is_last_rank:

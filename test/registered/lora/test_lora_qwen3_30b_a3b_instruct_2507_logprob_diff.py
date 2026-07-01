@@ -34,10 +34,7 @@ import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(
-    est_time=160,
-    suite="stage-c-test-4-gpu-b200-small",
-)
+register_cuda_ci(est_time=100, stage="extra-b", runner_config="4-gpu-b200")
 
 BASE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 LORA_HF_REPO = "yushengsu/lora-diff-Qwen3-30B-A3B-Instruct-2507"
@@ -85,6 +82,7 @@ class TestLoRAQwen3_30B_A3B_Instruct_2507_LogprobDiff(CustomTestCase):
             lora_paths={"my_lora": adapter_path},
             lora_backend=LORA_BACKEND,
             attention_backend="flashinfer",
+            flashinfer_allreduce_fusion_backend="trtllm",
             moe_runner_backend=MOE_RUNNER_BACKEND,
             experts_shared_outer_loras=EXPERTS_SHARED_OUTER_LORAS,
             prefill_attention_backend=PREFILL_ATTENTION_BACKEND,

@@ -477,9 +477,9 @@ def main():
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
 
-    args = parser.parse_args()
+    args, unknown_args = parser.parse_known_args()
 
-    server_args = ServerArgs.from_cli_args(args)
+    server_args = ServerArgs.from_cli_args(args, unknown_args)
     bench_args = BenchArgs.from_cli_args(args)
 
     set_global_server_args(server_args)

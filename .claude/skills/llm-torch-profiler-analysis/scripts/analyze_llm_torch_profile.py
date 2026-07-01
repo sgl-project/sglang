@@ -11,6 +11,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import triage_kernel_helpers as kernel_helpers
 import triage_overlap_helpers as overlap_helpers
 from profile_common import (
+    DEFAULT_DECODE_INPUT_LEN,
+    DEFAULT_DECODE_OUTPUT_LEN,
+    DEFAULT_PREFILL_INPUT_LEN,
+    DEFAULT_PREFILL_OUTPUT_LEN,
+    DEFAULT_WARMUP_STEPS,
+    PROFILE_WORKLOAD_CHOICES,
     discover_trace_targets,
     framework_display_name,
     load_server_args,
@@ -28,8 +34,8 @@ def build_triage_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="analyze_llm_torch_profile.py",
         description=(
-            "Compact LLM torch-profiler triage entrypoint for SGLang, vLLM, and "
-            "TensorRT-LLM. "
+            "Compact LLM torch-profiler triage entrypoint for SGLang, vLLM, "
+            "TensorRT-LLM, and TokenSpeed. "
             "This prints three tables: kernel mapping, overlap opportunities, "
             "and fuse opportunities. "
             "Use either a single trace/profile input or a mapping+formal two-trace pair."
@@ -39,7 +45,17 @@ def build_triage_parser() -> argparse.ArgumentParser:
         "--framework",
         type=str,
         default="auto",
-        choices=["auto", "sglang", "vllm", "trtllm", "tllm", "tensorrt-llm"],
+        choices=[
+            "auto",
+            "sglang",
+            "vllm",
+            "trtllm",
+            "tllm",
+            "tensorrt-llm",
+            "tokenspeed",
+            "token-speed",
+            "ts",
+        ],
         help=(
             "Serving framework. Use auto to detect from trace contents, path hints, "
             "or URL features."
@@ -57,8 +73,10 @@ def build_triage_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Running server URL for single-trace triage. SGLang supports direct "
-            "capture through its profiler HTTP API. vLLM and TensorRT-LLM require "
-            "a server-side torch-profiler output path exposed via --output-dir."
+            "capture via sglang.profiler. vLLM and TensorRT-LLM require a server-side "
+            "torch-profiler output path exposed via --output-dir. TokenSpeed live "
+            "capture uses the server's /start_profile and /stop_profile endpoints "
+            "when they are available."
         ),
     )
     parser.add_argument(
@@ -68,7 +86,8 @@ def build_triage_parser() -> argparse.ArgumentParser:
         help=(
             "Trace output dir when using --url. For vLLM this should match the "
             "server's torch_profiler_dir. For TensorRT-LLM it should match the "
-            "directory or file path configured by TLLM_TORCH_PROFILE_TRACE."
+            "directory or file path configured by TLLM_TORCH_PROFILE_TRACE. "
+            "For TokenSpeed this is passed as start_profile.output_dir."
         ),
     )
     parser.add_argument(
@@ -77,7 +96,8 @@ def build_triage_parser() -> argparse.ArgumentParser:
         default="triage-trace",
         help=(
             "Profile prefix when generating a trace from --url. SGLang uses it "
-            "directly; vLLM and TensorRT-LLM may ignore it on the HTTP profiler path."
+            "directly; TokenSpeed maps it to profile_id; vLLM and TensorRT-LLM may "
+            "ignore it on the HTTP profiler path."
         ),
     )
     parser.add_argument(
@@ -132,7 +152,13 @@ def build_triage_parser() -> argparse.ArgumentParser:
         "--num-steps",
         type=int,
         default=5,
-        help="Profiler steps when generating traces from URLs.",
+        help="Active profiler steps when generating traces from URLs.",
+    )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=DEFAULT_WARMUP_STEPS,
+        help="Warmup steps to run before arming the profiler for URL capture.",
     )
     parser.add_argument(
         "--profile-by-stage", action=argparse.BooleanOptionalAction, default=True
@@ -152,10 +178,44 @@ def build_triage_parser() -> argparse.ArgumentParser:
     parser.add_argument("--probe-max-new-tokens", type=int, default=None)
     parser.add_argument("--probe-delay", type=float, default=0.5)
     parser.add_argument(
+        "--profile-workload",
+        choices=PROFILE_WORKLOAD_CHOICES,
+        default="both",
+        help=(
+            "Live-capture workload shape. Default 'both' captures separate "
+            "prefill and decode profiles instead of one mixed request. Use "
+            "'legacy' to keep the old --probe-prompt behavior."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-input-len",
+        type=int,
+        default=DEFAULT_PREFILL_INPUT_LEN,
+        help="Synthetic input length for the prefill profile workload.",
+    )
+    parser.add_argument(
+        "--prefill-output-len",
+        type=int,
+        default=DEFAULT_PREFILL_OUTPUT_LEN,
+        help="Output length for the prefill profile workload.",
+    )
+    parser.add_argument(
+        "--decode-input-len",
+        type=int,
+        default=DEFAULT_DECODE_INPUT_LEN,
+        help="Synthetic input length for the decode profile workload.",
+    )
+    parser.add_argument(
+        "--decode-output-len",
+        type=int,
+        default=DEFAULT_DECODE_OUTPUT_LEN,
+        help="Output length for the decode profile workload.",
+    )
+    parser.add_argument(
         "--start-step",
         type=int,
         default=None,
-        help="SGLang-only profiler start step when generating traces from URLs.",
+        help="Pass through to sglang.profiler when generating traces from URLs.",
     )
     parser.add_argument(
         "--pid-substring",
@@ -239,9 +299,15 @@ def resolve_profile_targets(
             probe_prompt=args.probe_prompt,
             probe_max_new_tokens=args.probe_max_new_tokens,
             probe_delay=args.probe_delay,
+            warmup_steps=args.warmup_steps,
             start_step=args.start_step,
             framework=framework,
             framework_hint_path=output_dir,
+            profile_workload=args.profile_workload,
+            prefill_input_len=args.prefill_input_len,
+            prefill_output_len=args.prefill_output_len,
+            decode_input_len=args.decode_input_len,
+            decode_output_len=args.decode_output_len,
         )
         traces, server_args = discover_trace_targets(target_dir, all_traces=False)
         resolved_framework = resolve_framework(

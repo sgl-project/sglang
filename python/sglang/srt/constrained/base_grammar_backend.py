@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,8 @@ class InvalidGrammarObject(BaseGrammarObject):
 
 
 class BaseGrammarBackend:
+    _enable_strict_thinking: bool = False
+
     def __init__(self):
         self.executor = ThreadPoolExecutor()
         self.cache: Dict[Tuple[str, str], BaseGrammarObject] = {}
@@ -135,6 +138,24 @@ class BaseGrammarBackend:
     def _not_supported(self, key_type: str, key_string: str) -> BaseGrammarObject:
         logger.warning(f"Skip unsupported {key_type=}, {key_string=}")
         return InvalidGrammarObject()
+
+    @property
+    def enable_strict_thinking(self):
+        return self._enable_strict_thinking
+
+    @property
+    def is_support_token_filter(self):
+        return False
+
+    def set_token_filter(
+        self, vocab_mask, token_ids, batch_idx, is_allowed=True, reset_vocab_mask=True
+    ):
+        """Set or clear specific tokens in the vocab mask. No-op by default."""
+        pass
+
+    def init_strict_reasoning_grammar(self, reasoning: bool):
+        """Create a grammar object for strict token filtering only. Returns None by default."""
+        return None
 
     def dispatch_fallback(self, key_type: str, key_string: str) -> BaseGrammarObject:
         """
@@ -239,6 +260,13 @@ def create_grammar_backend(
                 any_whitespace=not server_args.constrained_json_disable_any_whitespace,
             )
         except TokenizerNotSupportedError as e:
+            if server_args.enable_strict_thinking:
+                raise ValueError(
+                    f"--enable-strict-thinking requires a grammar backend with "
+                    f"token filtering support, but XGrammar failed to initialize: "
+                    f"{e}. Cannot fall back to grammar_backend='none' with strict "
+                    f"thinking enabled."
+                ) from e
             logger.warning(
                 f"Grammar backend disabled because tokenizer is not supported by XGrammar: {e}. "
                 "Falling back to grammar_backend='none'. "
@@ -255,6 +283,13 @@ def create_grammar_backend(
             whitespace_pattern=server_args.constrained_json_whitespace_pattern,
         )
     elif name == "none":
+        if server_args.enable_strict_thinking:
+            raise ValueError(
+                "--enable-strict-thinking requires a grammar backend that supports "
+                "token filtering, but grammar_backend='none' was specified. Use "
+                "--grammar-backend xgrammar or another backend that supports token "
+                "filtering."
+            )
         return None
     else:
         raise ValueError(f"Invalid grammar backend: {name}")
@@ -264,6 +299,15 @@ def create_grammar_backend(
             ReasonerGrammarBackend,
         )
 
-        grammar_backend = ReasonerGrammarBackend(grammar_backend, think_end_id)
+        reasoning_parser = ReasoningParser(
+            model_type=server_args.reasoning_parser, stream_reasoning=False
+        )
+
+        grammar_backend = ReasonerGrammarBackend(
+            grammar_backend,
+            reasoning_parser,
+            tokenizer,
+            enable_strict_thinking=server_args.enable_strict_thinking,
+        )
 
     return grammar_backend

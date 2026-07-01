@@ -13,17 +13,16 @@
 # ==============================================================================
 
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
+from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -37,8 +36,6 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -63,11 +60,23 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    general_mm_embed_routine,
+)
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
+from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
+from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
@@ -79,6 +88,38 @@ from sglang.srt.utils import (
 MiMoV2Config = None
 
 logger = logging.getLogger(__name__)
+
+
+def load_mimo_v2_qkv_proj_weight(
+    name, param, loaded_weight, expected_fused_tp_size: Optional[int] = None
+):
+    if loaded_weight.shape == param.shape:
+        # The checkpoint already stores this rank's qkv_proj shard.
+        default_weight_loader(param, loaded_weight)
+        return
+
+    if loaded_weight.ndim != param.ndim or loaded_weight.shape[1:] != param.shape[1:]:
+        raise ValueError(
+            f"qkv_proj weight {name}: unexpected shape {tuple(loaded_weight.shape)}; "
+            f"expected sharded {tuple(param.shape)}"
+        )
+
+    tp_size = get_parallel().attn_tp_size
+    tp_rank = get_parallel().attn_tp_rank
+    if expected_fused_tp_size is not None and tp_size != expected_fused_tp_size:
+        raise ValueError(
+            f"MiMoV2 fused qkv_proj checkpoint is TP={expected_fused_tp_size}-"
+            f"interleaved; got attention tp_size={tp_size} while loading {name}."
+        )
+
+    fused_shape = (param.shape[0] * tp_size, *param.shape[1:])
+    if tuple(loaded_weight.shape) != fused_shape:
+        raise ValueError(
+            f"qkv_proj weight {name}: unexpected shape {tuple(loaded_weight.shape)}; "
+            f"expected fused {fused_shape} or sharded {tuple(param.shape)}"
+        )
+
+    default_weight_loader(param, loaded_weight.chunk(tp_size, dim=0)[tp_rank])
 
 
 class MiMoV2MLP(nn.Module):
@@ -185,7 +226,7 @@ class MiMoV2MoE(nn.Module):
         is_nextn: bool = False,
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
 
         self.config = config
         self.layer_id = layer_id
@@ -229,6 +270,7 @@ class MiMoV2MoE(nn.Module):
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
+            scoring_func=config.scoring_func,
             quant_config=quant_config,
             routed_scaling_factor=1.0,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
@@ -238,9 +280,13 @@ class MiMoV2MoE(nn.Module):
         )
 
         # todo : implement tbo forward needed
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+        ):
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_moe_expert_parallel_world_size()
+            self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
                 config.n_routed_experts
                 + get_global_server_args().ep_num_redundant_experts
@@ -255,7 +301,9 @@ class MiMoV2MoE(nn.Module):
             )
 
         self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_ascend_fuseep()
         )
 
     def get_moe_weights(self):
@@ -419,8 +467,8 @@ class MiMoV2Attention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
@@ -764,10 +812,6 @@ class MiMoV2DecoderLayer(nn.Module):
             )
         )
 
-    def op_mlp(self, state):
-        hidden_states = state.pop("hidden_states_mlp_input")
-        state.hidden_states_mlp_output = self.mlp(hidden_states, state.forward_batch)
-
     def op_comm_postprocess_layer(self, state):
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             state.pop("hidden_states_mlp_output"),
@@ -927,8 +971,8 @@ class MiMoV2Model(nn.Module):
     # factors (or else raise an exception). Thus, handled exceptions should
     # make sure to leave KV cache scale factors in a known good (dummy) state
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
         for layer_idx, scaling_factor in kv_cache_scales_loader(
             quantization_param_path,
             attn_tp_rank,
@@ -947,7 +991,7 @@ class MiMoV2Model(nn.Module):
                 )
 
 
-class MiMoV2ForCausalLM(nn.Module):
+class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -967,6 +1011,13 @@ class MiMoV2ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    # Prefixes for weight routing in encoder_only/language_only modes
+    _LANGUAGE_WEIGHT_PREFIXES = ("model.", "lm_head.")
+    _VISION_WEIGHT_PREFIXES = ("visual.", "vision_model.")
+    # ``audio_`` already covers ``audio_encoder.`` so a single prefix is enough.
+    _AUDIO_WEIGHT_PREFIXES = ("audio_",)
+    _AUDIO_WEIGHT_SUBSTRING = "speech_embeddings"
+
     def __init__(
         self,
         config: MiMoV2Config,
@@ -977,30 +1028,60 @@ class MiMoV2ForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        self.model = MiMoV2Model(
-            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        self._encoder_processor = None  # lazy-created in preprocess_mm_for_encoder
+
+        if not self.config.encoder_only:
+            self.model = MiMoV2Model(
+                config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+            )
+
+            if self.pp_group.is_last_rank:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                )
+            else:
+                self.lm_head = PPMissingLayer()
+        else:
+            self.model = None
+            self.lm_head = None
+
+        self.logits_processor = (
+            LogitsProcessor(config) if not self.config.encoder_only else None
         )
 
-        if self.pp_group.is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-            )
-        else:
-            # ranks other than the last rank will have a placeholder layer
-            self.lm_head = PPMissingLayer()
+        vision_config = getattr(config, "vision_config", None)
+        audio_config = getattr(config, "audio_config", None)
+        self._is_multimodal = vision_config is not None and audio_config is not None
+        # Always build vision/audio encoders so P can fall back to local
+        # encoding when the EPD encoder is unreachable.
+        if self._is_multimodal:
+            if hasattr(vision_config, "to_dict"):
+                vision_config = vision_config.to_dict()
+            if hasattr(audio_config, "to_dict"):
+                audio_config = audio_config.to_dict()
 
-        self.logits_processor = LogitsProcessor(config)
+            self.visual = MiMoVisionTransformer(
+                MiMoVLVisionConfig.from_dict(vision_config),
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                quant_config=None,
+                prefix=add_prefix("visual", prefix),
+            )
+            self.build_audio_encoder(MiMoAudioEncoderConfig(**audio_config))
 
         self._routed_experts_weights_of_layer = LazyValue(
-            lambda: {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, MiMoV2MoE)
-            }
+            lambda: (
+                {
+                    layer_id: layer.mlp.get_moe_weights()
+                    for layer_id, layer in enumerate(self.model.layers)
+                    if isinstance(layer.mlp, MiMoV2MoE)
+                }
+                if self.model is not None
+                else {}
+            )
         )
 
     @property
@@ -1008,10 +1089,112 @@ class MiMoV2ForCausalLM(nn.Module):
         return self._routed_experts_weights_of_layer.value
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
+        assert (
+            self.model is not None
+        ), "get_input_embedding() is not available in encoder_only mode"
         return self.model.get_input_embedding(input_ids)
 
-    def get_input_embeddings(self) -> nn.Embedding:
-        return self.model.embed_tokens
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
+
+    def preprocess_mm_for_encoder(self, mm_data, modality, config):
+        if self._encoder_processor is None:
+            from sglang.srt.multimodal.processors.mimo_v2 import MiMoProcessor
+
+            self._encoder_processor = MiMoProcessor.from_hf_config(
+                self.config, mm_config=config
+            )
+        return self._encoder_processor.preprocess_for_encoder(mm_data, modality)
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
+            self.visual.dtype
+        )
+        image_grid_thw = torch.cat([item.image_grid_thw for item in items], dim=0)
+        assert pixel_values.dim() == 2, pixel_values.dim()
+        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
+        return self.visual(pixel_values, grid_thw=image_grid_thw)
+
+    def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
+            self.visual.dtype
+        )
+        video_grid_thw = torch.cat([item.video_grid_thw for item in items], dim=0)
+        assert pixel_values.dim() == 2, pixel_values.dim()
+        assert video_grid_thw.dim() == 2, video_grid_thw.dim()
+        return self.visual(pixel_values, grid_thw=video_grid_thw)
+
+    @torch.inference_mode()
+    def encode_video_audio(self, mm_inputs: Dict) -> Optional[torch.Tensor]:
+        # EPD-side hook: encode audio tracks pulled from videos and trim to the
+        # interleaved per-video segments produced by MiMoProcessor (segment
+        # starts / lens / per_video_num_units). Returns None if there is no
+        # audio to encode. The server passes the result through to the receiver
+        # under aux_data["video_audio_embedding"].
+        import numpy as np
+
+        audio_features = mm_inputs.get("video_audio_features")
+        if not audio_features:
+            return None
+
+        def _as_tensor(data):
+            if isinstance(data, torch.Tensor):
+                return data
+            if isinstance(data, np.ndarray):
+                return torch.tensor(data)
+            if isinstance(data, list) and data and isinstance(data[0], np.ndarray):
+                return torch.tensor(np.array(data))
+            if isinstance(data, list) and data and isinstance(data[0], (int, float)):
+                return torch.tensor(data)
+            return data
+
+        audio_feature_lens = mm_inputs["video_audio_feature_lens"]
+        audio_item = MultimodalDataItem.from_dict(
+            {
+                "modality": Modality.AUDIO,
+                "feature": _as_tensor(audio_features),
+            }
+        )
+        audio_item.set("audio_feature_lens", _as_tensor(audio_feature_lens))
+
+        audio_embedding = self.get_audio_feature([audio_item]).cpu()
+        if audio_embedding.ndim != 2:
+            audio_embedding = audio_embedding.reshape(-1, audio_embedding.shape[-1])
+
+        segment_lens_flat = mm_inputs["video_audio_segment_lens_flat"]
+        segment_starts_flat = mm_inputs["video_audio_segment_starts_flat"]
+        per_video_num_units = mm_inputs["video_audio_per_video_num_units"]
+        per_video_audio_token_lens = (
+            audio_feature_lens.tolist()
+            if hasattr(audio_feature_lens, "tolist")
+            else list(audio_feature_lens)
+        )
+
+        trimmed_chunks = []
+        emb_offset = 0
+        unit_idx = 0
+        audio_video_idx = 0
+        for num_units in per_video_num_units:
+            if num_units <= 0:
+                continue
+            vid_audio_len = per_video_audio_token_lens[audio_video_idx]
+            for _ in range(num_units):
+                start = segment_starts_flat[unit_idx]
+                seg_len = segment_lens_flat[unit_idx]
+                trimmed_chunks.append(
+                    audio_embedding[emb_offset + start : emb_offset + start + seg_len]
+                )
+                unit_idx += 1
+            emb_offset += vid_audio_len
+            audio_video_idx += 1
+
+        return (
+            torch.cat(trimmed_chunks, dim=0) if trimmed_chunks else audio_embedding[:0]
+        )
+
+    def get_input_embeddings(self) -> Optional[nn.Embedding]:
+        return self.model.embed_tokens if self.model is not None else None
 
     @torch.no_grad()
     def forward(
@@ -1022,13 +1205,27 @@ class MiMoV2ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states, hidden_states_before_norm = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            input_embeds,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
+        assert (
+            not self.config.encoder_only
+        ), "forward() should not be called in encoder_only mode"
+
+        if self._is_multimodal:
+            hidden_states, hidden_states_before_norm = general_mm_embed_routine(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                language_model=self.model,
+                multimodal_model=self,
+                positions=positions,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        else:
+            hidden_states, hidden_states_before_norm = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
@@ -1043,11 +1240,11 @@ class MiMoV2ForCausalLM(nn.Module):
 
     @property
     def start_layer(self):
-        return self.model.start_layer
+        return self.model.start_layer if self.model is not None else 0
 
     @property
     def end_layer(self):
-        return self.model.end_layer
+        return self.model.end_layer if self.model is not None else 0
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -1055,6 +1252,11 @@ class MiMoV2ForCausalLM(nn.Module):
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        stacked_params_mapping_vit = [
+            # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
@@ -1068,8 +1270,72 @@ class MiMoV2ForCausalLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
+        skipped_mtp_weights = False
 
         for name, loaded_weight in weights:
+            is_vision_weight = name.startswith(self._VISION_WEIGHT_PREFIXES)
+            is_audio_weight = (
+                name.startswith(self._AUDIO_WEIGHT_PREFIXES)
+                or self._AUDIO_WEIGHT_SUBSTRING in name
+            )
+
+            if not self._is_multimodal and (is_vision_weight or is_audio_weight):
+                continue
+
+            if self.config.encoder_only and name.startswith(
+                self._LANGUAGE_WEIGHT_PREFIXES
+            ):
+                continue
+
+            if self._is_multimodal and is_audio_weight:
+                if name.startswith("audio_encoder."):
+                    name = name[len("audio_encoder.") :]
+                name = self.remap_audio_weight_name(name)
+                if name not in params_dict:
+                    logger.warning(
+                        f"Audio param {name} not found in params_dict, skipping"
+                    )
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                if self._AUDIO_WEIGHT_SUBSTRING in name:
+                    weight_loader(param, loaded_weight[: param.shape[0], :])
+                else:
+                    weight_loader(param, loaded_weight)
+                continue
+
+            if self._is_multimodal and "visual" in name:
+                name = name.replace("vision_model.", "")
+                name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
+                match_stacked_vit = False
+                for param_name, weight_name, shard_id in stacked_params_mapping_vit:
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        match_stacked_vit = True
+                        continue
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    match_stacked_vit = True
+                    break
+                if match_stacked_vit:
+                    continue
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+
+                if name.endswith("patch_embed.proj.weight"):
+                    patch_embed = self.get_submodule(name.rsplit(".", 2)[0])
+                    if hasattr(patch_embed, "sync_proj_weight_linear_format"):
+                        patch_embed.sync_proj_weight_linear_format()
+                continue
+
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
@@ -1099,21 +1365,35 @@ class MiMoV2ForCausalLM(nn.Module):
                 else:
                     continue
 
-            # TODO: skip mtp weights for now, need to implement mtp
             if "mtp" in name:
+                if not skipped_mtp_weights:
+                    logger.info(
+                        "Skipping draft-only MiMo-V2 MTP weights while loading the "
+                        "target model; MiMoV2MTP loads these weights in the draft "
+                        "model runner."
+                    )
+                    skipped_mtp_weights = True
                 continue
 
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:
                 if name in params_dict:
-                    tp_size = get_attention_tp_size()
-                    tp_rank = get_attention_tp_rank()
                     param = params_dict[name]
-                    loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
-                    default_weight_loader(param, loaded_weight)
+                    expected_fused_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
+                        self.config
+                    )
+                    load_mimo_v2_qkv_proj_weight(
+                        name, param, loaded_weight, expected_fused_tp_size
+                    )
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
+                if (
+                    "compression_attention" in name
+                    or "hybrid_softmax_attention" in name
+                    or "compressed_softmax_attn" in name
+                ):
+                    continue
                 if weight_name not in name:
                     continue
                 if ("mlp.experts." in name) and name not in params_dict:
@@ -1152,7 +1432,7 @@ class MiMoV2ForCausalLM(nn.Module):
                     if name in params_dict.keys():
                         param = params_dict[name]
                         if "attention_sink_bias" in name:
-                            start = get_attention_tp_rank() * param.numel()
+                            start = get_parallel().attn_tp_rank * param.numel()
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )
@@ -1165,9 +1445,15 @@ class MiMoV2ForCausalLM(nn.Module):
                         logger.warning(f"Parameter {name} not found in params_dict")
 
     def get_embed_and_head(self):
+        assert (
+            self.model is not None and self.lm_head is not None
+        ), "get_embed_and_head() is not available in encoder_only mode"
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
+        assert (
+            self.model is not None and self.lm_head is not None
+        ), "set_embed_and_head() is not available in encoder_only mode"
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
@@ -1176,7 +1462,8 @@ class MiMoV2ForCausalLM(nn.Module):
         torch.cuda.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        self.model.load_kv_cache_scales(quantization_param_path)
+        if self.model is not None:
+            self.model.load_kv_cache_scales(quantization_param_path)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

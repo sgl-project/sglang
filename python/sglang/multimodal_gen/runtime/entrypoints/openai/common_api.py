@@ -66,6 +66,7 @@ async def set_lora(
     lora_path: Optional[Union[str, List[Optional[str]]]] = Body(None, embed=True),
     target: Union[str, List[str]] = Body("all", embed=True),
     strength: Union[float, List[float]] = Body(1.0, embed=True),
+    merge_mode: Optional[str] = Body(None, embed=True),
 ):
     """
     Set LoRA adapter(s) for the specified transformer(s).
@@ -84,12 +85,14 @@ async def set_lora(
         strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
             If a list, must match the length of lora_nickname. Values < 1.0 reduce the effect,
             values > 1.0 amplify the effect.
+        merge_mode: Optional LoRA merge mode: "auto", "merge", or "dynamic".
     """
     req = SetLoraReq(
         lora_nickname=lora_nickname,
         lora_path=lora_path,
         target=target,
         strength=strength,
+        merge_mode=merge_mode,
     )
     nickname_str, target_str, strength_str = format_lora_message(
         lora_nickname, target, strength

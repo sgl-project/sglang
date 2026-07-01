@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=109, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=109, stage="base-b", runner_config="1-gpu-small")
 
 MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-NVFP4"
 
@@ -32,7 +32,7 @@ class FP4GemmSM120Base:
             "modelopt_fp4",
             "--fp4-gemm-backend",
             cls.backend,
-            "--disable-piecewise-cuda-graph",
+            "--cuda-graph-backend-prefill=disabled",
         ]
         cls.process = popen_launch_server(
             cls.model,

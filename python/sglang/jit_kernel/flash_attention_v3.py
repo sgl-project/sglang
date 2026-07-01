@@ -16,15 +16,15 @@ SGL_FA3_KERNEL_REVISION = "v1"
 DEFAULT_FA3_KERNEL_LOCKFILE = "kernels.lock"
 
 
-def _call_fa3_kernel(kernel, *args, out=None):
+def _call_fa3_kernel(kernel, *args, out=None, **kwargs):
     if out is None:
-        return kernel(*args)
+        return kernel(*args, **kwargs)
     try:
-        return kernel(*args, out=out)
+        return kernel(*args, **kwargs, out=out)
     except TypeError as exc:
         if "unexpected keyword argument 'out'" not in str(exc):
             raise
-        return kernel(*args)
+        return kernel(*args, **kwargs)
 
 
 @cache_once
@@ -128,6 +128,7 @@ def flash_attn_with_kvcache(
     scheduler_metadata=None,
     num_splits=0,  # Can be tuned for speed
     pack_gqa=None,  # Can be tuned for speed
+    only_qv=False,  # Skip K matmul when qk rope dim is 0 (requires qv)
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
@@ -138,7 +139,11 @@ def flash_attn_with_kvcache(
             "flash_attn at sgl-kernel is only supported on sm90 and above"
         )
 
-    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
+    # When only_qv=True the caller may pass k_cache=None (synthetic K is
+    # allocated inside the sgl-kernel wrapper). Skip the stride check in that
+    # case so the rope=0 path doesn't trip the assertion.
+    if k_cache is not None:
+        assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
 
     return _call_fa3_kernel(
@@ -171,9 +176,10 @@ def flash_attn_with_kvcache(
         scheduler_metadata,
         num_splits,
         pack_gqa,
-        sm_margin,
-        return_softmax_lse,
-        sinks,
+        sm_margin=sm_margin,
+        only_qv=only_qv,
+        return_softmax_lse=return_softmax_lse,
+        sinks=sinks,
         out=out,
     )
 
@@ -201,6 +207,7 @@ def flash_attn_varlen_func(
     softcap=0.0,
     num_splits=1,
     pack_gqa=None,
+    only_qv=False,
     sm_margin=0,
     return_softmax_lse=False,
     sinks=None,
@@ -208,11 +215,42 @@ def flash_attn_varlen_func(
 ):
 
     if not _is_fa3_supported():
-        raise NotImplementedError(
-            "flash_attn at sgl-kernel is only supported on sm90 and above"
-        )
+        # Fall back to flash_attn package (FA2) on platforms without sgl-kernel FA3
+        # (e.g. ROCm, or CUDA < sm90)
+        if cu_seqlens_q is not None:
+            from flash_attn import flash_attn_varlen_func as fa2_flash_attn_varlen_func
 
-    return _load_fa3_kernels()["flash_attn_varlen_func"](
+            return fa2_flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                return_attn_probs=return_softmax_lse,
+            )
+        else:
+            # 4D inputs (batch, seqlen, nheads, headdim) without cu_seqlens
+            from flash_attn import flash_attn_func as fa2_flash_attn_func
+
+            return fa2_flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                return_attn_probs=return_softmax_lse,
+            )
+
+    return _call_fa3_kernel(
+        _load_fa3_kernels()["flash_attn_varlen_func"],
         q=q,
         k=k,
         v=v,
@@ -234,6 +272,7 @@ def flash_attn_varlen_func(
         softcap=softcap,
         num_splits=num_splits,
         pack_gqa=pack_gqa,
+        only_qv=only_qv,
         sm_margin=sm_margin,
         return_softmax_lse=return_softmax_lse,
         sinks=sinks,

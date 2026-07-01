@@ -158,6 +158,7 @@ class Qwen3Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        attention_lengths: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         # QKV projection
         qkv, _ = self.qkv_proj(hidden_states)
@@ -185,12 +186,60 @@ class Qwen3Attention(nn.Module):
         k = k.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
 
         # Attention
-        attn_output = self.attn(q, k, v)
+        attn_output = self._masked_causal_attention(q, k, v, attention_lengths)
         attn_output = attn_output.reshape(batch_size, seq_len, -1)
 
         # Output projection
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _masked_causal_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attention_lengths: tuple[int, ...] | None,
+    ) -> torch.Tensor:
+        if attention_lengths is None:
+            return self.attn(q, k, v)
+
+        seq_len = q.shape[1]
+        if all(valid_len == seq_len for valid_len in attention_lengths):
+            return self.attn(q, k, v)
+
+        outputs: list[torch.Tensor] = []
+        for batch_index, valid_len in enumerate(attention_lengths):
+            q_item = q[batch_index : batch_index + 1]
+            k_item = k[batch_index : batch_index + 1]
+            v_item = v[batch_index : batch_index + 1]
+
+            real_output = self.attn(
+                q_item[:, :valid_len],
+                k_item[:, :valid_len],
+                v_item[:, :valid_len],
+            )
+            if valid_len == seq_len:
+                outputs.append(real_output)
+                continue
+
+            pad_q = q_item[:, valid_len:].transpose(1, 2)
+            real_k = k_item[:, :valid_len].transpose(1, 2)
+            real_v = v_item[:, :valid_len].transpose(1, 2)
+            if self.num_heads != self.num_kv_heads:
+                repeat_factor = self.num_heads // self.num_kv_heads
+                real_k = real_k.repeat_interleave(repeat_factor, dim=1)
+                real_v = real_v.repeat_interleave(repeat_factor, dim=1)
+            pad_output = torch.nn.functional.scaled_dot_product_attention(
+                pad_q,
+                real_k,
+                real_v,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=self.scaling,
+            ).transpose(1, 2)
+            outputs.append(torch.cat([real_output, pad_output], dim=1))
+
+        return torch.cat(outputs, dim=0)
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -241,6 +290,7 @@ class Qwen3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        attention_lengths: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
@@ -249,7 +299,11 @@ class Qwen3DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            attention_lengths=attention_lengths,
+        )
 
         # MLP
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -335,6 +389,13 @@ class Qwen3ForCausalLM(TextEncoder):
                 0, hidden_states.shape[1], device=hidden_states.device
             ).unsqueeze(0)
 
+        attention_lengths = None
+        if attention_mask is not None:
+            attention_lengths = tuple(
+                int(valid_len)
+                for valid_len in attention_mask.sum(dim=-1).detach().cpu().tolist()
+            )
+
         all_hidden_states: tuple[Any, ...] | None = () if output_hidden_states else None
 
         for layer in self.layers:
@@ -344,7 +405,9 @@ class Qwen3ForCausalLM(TextEncoder):
                     if residual is None
                     else (hidden_states + residual,)
                 )
-            hidden_states, residual = layer(position_ids, hidden_states, residual)
+            hidden_states, residual = layer(
+                position_ids, hidden_states, residual, attention_lengths
+            )
 
         hidden_states, _ = self.norm(hidden_states, residual)
 

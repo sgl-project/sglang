@@ -4,6 +4,7 @@ export const GLM5Deployment = () => {
   // Supported quantization per hardware:
   //   H100 / H200 / MI300X / MI325X / MI355X → BF16 (AMD only) + FP8 (NV only)
   //   B200 → NVFP4 (default), FP8, BF16
+  //   B300 → NVFP4 (default), FP8
   //
   // BF16 always needs 2x GPUs compared to FP8. AMD only supports BF16.
   const options = {
@@ -13,6 +14,7 @@ export const GLM5Deployment = () => {
       items: [
         { id: 'h200',   label: 'H200',            default: true  },
         { id: 'b200',   label: 'B200',            default: false },
+        { id: 'b300',   label: 'B300',            default: false },
         { id: 'h100',   label: 'H100',            default: false },
         { id: 'mi300x', label: 'MI300X/MI325X',   default: false },
         { id: 'mi355x', label: 'MI355X',          default: false }
@@ -24,11 +26,12 @@ export const GLM5Deployment = () => {
       getDynamicItems: (values) => {
         const hw = values.hardware;
         const isAMD = hw === 'mi300x' || hw === 'mi355x';
-        const isB200 = hw === 'b200';
+        const isB300 = hw === 'b300';
+        const isBlackwell = hw === 'b200' || isB300;
         return [
-          { id: 'bf16',  label: 'BF16',  subtitle: 'Full Weights',        default: isAMD },
-          { id: 'fp8',   label: 'FP8',   subtitle: 'High Throughput',     default: !isAMD && !isB200, disabled: isAMD,  disabledReason: 'FP8 not verified on AMD' },
-          { id: 'nvfp4', label: 'NVFP4', subtitle: 'Highest Throughput',  default: isB200,            disabled: !isB200, disabledReason: 'NVFP4 only on B200' }
+          { id: 'bf16',  label: 'BF16',  subtitle: 'Full Weights',        default: isAMD, disabled: isB300, disabledReason: isB300 ? 'BF16 requires more than the validated 8-GPU B300 node' : '' },
+          { id: 'fp8',   label: 'FP8',   subtitle: 'High Throughput',     default: !isAMD && !isBlackwell, disabled: isAMD,  disabledReason: 'FP8 not verified on AMD' },
+          { id: 'nvfp4', label: 'NVFP4', subtitle: 'Highest Throughput',  default: isBlackwell,            disabled: !isBlackwell, disabledReason: 'NVFP4 only on B200/B300' }
         ];
       }
     },
@@ -75,6 +78,7 @@ export const GLM5Deployment = () => {
     h100:   { fp8: { tp: 16, mem: 0.85 }, bf16: { tp: 32, mem: 0.85 } },
     h200:   { fp8: { tp: 8,  mem: 0.85 }, bf16: { tp: 16, mem: 0.85 } },
     b200:   { nvfp4: { tp: 4, mem: 0.9 }, fp8: { tp: 8, mem: 0.9 }, bf16: { tp: 16, mem: 0.9 } },
+    b300:   { nvfp4: { tp: 4, mem: 0.9 }, fp8: { tp: 8, mem: 0.9 } },
     mi300x: { bf16: { tp: 8, mem: 0.80 } },
     mi355x: { bf16: { tp: 8, mem: 0.80 } }
   };
@@ -147,7 +151,10 @@ export const GLM5Deployment = () => {
       modelName = `zai-org/GLM-5${suffix}`;
     }
 
-    const hwConfig = modelConfigs[hardware][effectiveQuant];
+    const hwConfig = modelConfigs[hardware]?.[effectiveQuant];
+    if (!hwConfig) {
+      return '# Please select a valid hardware and quantization combination';
+    }
     const tpValue = hwConfig.tp;
     const memFraction = hwConfig.mem;
 
@@ -155,36 +162,47 @@ export const GLM5Deployment = () => {
     cmd += `  --model-path ${modelName}`;
     cmd += ` \\\n  --tp ${tpValue}`;
 
-    // NVFP4 B200: trtllm NSA backends, flashinfer fusion, FP8 KV cache.
     if (isNVFP4) {
       cmd += ' \\\n  --trust-remote-code';
-      cmd += ' \\\n  --quantization modelopt_fp4';
-      cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
-      cmd += ' \\\n  --nsa-decode-backend trtllm';
-      cmd += ' \\\n  --nsa-prefill-backend trtllm';
-      cmd += ' \\\n  --moe-runner-backend flashinfer_trtllm';
-      cmd += ' \\\n  --enable-flashinfer-allreduce-fusion';
-      cmd += ' \\\n  --enable-dp-lm-head';
-      cmd += ' \\\n  --disable-radix-cache';
-      cmd += ' \\\n  --max-prefill-tokens 32768';
-      cmd += ' \\\n  --chunked-prefill-size 32768';
+      if (hardware === 'b300') {
+        cmd += ' \\\n  --attention-backend flashinfer';
+        cmd += ' \\\n  --enforce-disable-flashinfer-allreduce-fusion';
+        cmd += ' \\\n  --cuda-graph-backend-prefill disabled';
+        cmd += ' \\\n  --moe-runner-backend flashinfer_cutlass';
+        cmd += ' \\\n  --cuda-graph-backend-decode disabled';
+        cmd += ' \\\n  --disable-flashinfer-autotune';
+      } else {
+        cmd += ' \\\n  --quantization modelopt_fp4';
+        cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
+        cmd += ' \\\n  --dsa-decode-backend trtllm';
+        cmd += ' \\\n  --dsa-prefill-backend trtllm';
+        cmd += ' \\\n  --moe-runner-backend flashinfer_trtllm';
+        cmd += ' \\\n  --enable-flashinfer-allreduce-fusion';
+        cmd += ' \\\n  --enable-dp-lm-head';
+        cmd += ' \\\n  --disable-radix-cache';
+        cmd += ' \\\n  --max-prefill-tokens 32768';
+        cmd += ' \\\n  --chunked-prefill-size 32768';
+      }
       cmd += ` \\\n  --mem-fraction-static ${memFraction}`;
       cmd += ' \\\n  --scheduler-recv-interval 10';
       cmd += ' \\\n  --tokenizer-worker-num 6';
       return cmd;
     }
 
-    // AMD-specific: NSA tilelang backend.
+    // AMD-specific: DSA tilelang backend.
     if (isAMD) {
       cmd += ' \\\n  --trust-remote-code';
-      cmd += ' \\\n  --nsa-prefill-backend tilelang';
-      cmd += ' \\\n  --nsa-decode-backend tilelang';
+      cmd += ' \\\n  --dsa-prefill-backend tilelang';
+      cmd += ' \\\n  --dsa-decode-backend tilelang';
       cmd += ' \\\n  --chunked-prefill-size 131072';
       cmd += ' \\\n  --watchdog-timeout 1200';
     }
 
     if (values.dpattention === 'enabled') {
       cmd += ` \\\n  --dp ${tpValue} \\\n  --enable-dp-attention`;
+      if (hardware === 'b300') {
+        cmd += ' \\\n  --cuda-graph-max-bs-decode 256';
+      }
     }
     if (values.reasoning === 'enabled') cmd += ' \\\n  --reasoning-parser glm45';
     if (values.toolcall  === 'enabled') cmd += ' \\\n  --tool-call-parser glm47';
@@ -199,10 +217,21 @@ export const GLM5Deployment = () => {
     if (hardware === 'b200' && effectiveQuant === 'fp8') {
       cmd += ' \\\n  --ep 1';
       cmd += ' \\\n  --quantization fp8';
-      cmd += ' \\\n  --attention-backend nsa';
-      cmd += ' \\\n  --nsa-decode-backend trtllm';
-      cmd += ' \\\n  --nsa-prefill-backend trtllm';
+      cmd += ' \\\n  --attention-backend dsa';
+      cmd += ' \\\n  --dsa-decode-backend trtllm';
+      cmd += ' \\\n  --dsa-prefill-backend trtllm';
       cmd += ' \\\n  --moe-runner-backend flashinfer_trtllm';
+      cmd += ' \\\n  --enable-flashinfer-allreduce-fusion';
+    }
+
+    if (hardware === 'b300' && effectiveQuant === 'fp8') {
+      cmd += ' \\\n  --attention-backend flashinfer';
+      cmd += ' \\\n  --enforce-disable-flashinfer-allreduce-fusion';
+      cmd += ' \\\n  --cuda-graph-backend-prefill disabled';
+    }
+
+    // H200 FP8: flashinfer allreduce fusion.
+    if (hardware === 'h200' && effectiveQuant === 'fp8') {
       cmd += ' \\\n  --enable-flashinfer-allreduce-fusion';
     }
 

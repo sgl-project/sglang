@@ -54,6 +54,7 @@ This repo now contains:
 - diffusion-side NVFP4 loading from ModelOpt exports
 - FLUX.2 packed-QKV detection that distinguishes packed NVFP4 checkpoints from standard diffusers exports
 - automatic protection against incompatible FP8 CPU offload while keeping layerwise DiT offload available
+- separate online diffusion quantization paths such as `--quantization fp8` / `mxfp4`; keep those out of this ModelOpt PTQ/export workflow unless the user explicitly asks for runtime quantization
 - FP8 transformer build:
   [`python/sglang/multimodal_gen/tools/build_modelopt_fp8_transformer.py`](../../../tools/build_modelopt_fp8_transformer.py)
 - NVFP4 mixed transformer build:
@@ -61,15 +62,41 @@ This repo now contains:
 - trajectory similarity validation:
   [`python/sglang/multimodal_gen/tools/compare_diffusion_trajectory_similarity.py`](../../../tools/compare_diffusion_trajectory_similarity.py)
 
-Validated documentation and CI coverage currently center on six ModelOpt diffusion transformer override families:
+Validated documentation and CI coverage currently center on these ModelOpt diffusion transformer override families:
 
-- FP8: FLUX.1-dev, FLUX.2-dev, Wan2.2
+- FP8: FLUX.1-dev, FLUX.2-dev, Wan2.2, HunyuanVideo, Qwen Image, Qwen Image Edit
 - NVFP4: FLUX.1-dev, FLUX.2-dev, Wan2.2
 
 Treat a new family, a new precision, or a new checkpoint layout as unsupported until it has a documented matrix row and a matching validation story.
-Before writing CLI examples, re-read the active branch's `docs/diffusion/quantization.md`: FLUX.2 NVFP4 is an official `black-forest-labs/*` repo rather than a `BBuf/*` converted repo, and its preferred flag depends on the current documented loader flow. Use `--transformer-path` for a component override directory with `config.json`; use `--transformer-weights-path` when the repo or path should be probed as raw weights.
+Current B200 CI also contains an Ideogram4 NVFP4 native load case
+(`ideogram4_nvfp4_t2i` via `Comfy-Org/Ideogram-4`). Treat that as source
+evidence for an existing NVFP4 path, but do not expand the ModelOpt support
+matrix to Ideogram4 unless `docs/diffusion/quantization.md` is updated with the
+exact checkpoint, loader path, quality check, and benchmark scope.
+Before writing CLI examples, re-read the active branch's `docs/diffusion/quantization.md`: FLUX.2 NVFP4 is an official `black-forest-labs/*` repo rather than a `lmsys/*` converted repo, and its preferred flag depends on the current documented loader flow. Use `--transformer-path` for a component override directory with `config.json`; use `--transformer-weights-path` when the repo or path should be probed as raw weights.
 
 B200 CI coverage can include loose BF16-vs-quantized quality checks. Inspect the active branch's `run_suite.py` before assuming they are part of the suite; mainline and feature branches may differ. Those checks are intended to catch blank, corrupted, or obviously divergent images, not exact image parity.
+
+Mainline documentation now uses `lmsys/*` for the eight converted ModelOpt
+checkpoint repos; the FLUX.2 NVFP4 raw export remains
+`black-forest-labs/FLUX.2-dev-NVFP4`. Do not use older `BBuf/*` examples unless
+you are explicitly testing a historical branch.
+
+## Related PR Watchlist
+
+These related SGLang PRs are useful as ModelOpt diffusion support history.
+Re-check the PR state and the active source tree before treating any item as
+current behavior, and keep the docs/CI matrix as the support boundary.
+
+- #23155 added Qwen Image ModelOpt FP8 support.
+- #23199 adds HunyuanVideo ModelOpt FP8 support.
+- #23373 adds a runtime quantization flag; keep PTQ/export workflows separate from runtime quant examples until the CLI behavior is merged.
+- #24024 adds transformer FP8-cast compatibility mode.
+- #24186 re-enables B200 multimodal CI with NVFP4 fixes for FLUX.2 and Wan2.2.
+
+Do not expand the validated matrix beyond the documented rows solely because a
+related PR exists. Add a row only after the exact checkpoint, loader path,
+accuracy check, and benchmark scope are validated on the active branch.
 
 ## Documentation Maintenance
 
@@ -172,6 +199,55 @@ For `FLUX.1-dev`, the validated fallback set currently keeps these modules in BF
 - `single_transformer_blocks.*.proj_mlp`
 
 Use `--model-type flux1` to force that profile, or rely on `--model-type auto` when the export config identifies `FluxTransformer2DModel`.
+
+HunyuanVideo uses `HunyuanVideoTransformer3DModel`, so the validated
+HunyuanVideo FP8 fallback preset keeps these modules in BF16:
+
+- `context_embedder.*`
+- `x_embedder.proj`
+- `time_text_embed.(timestep_embedder|guidance_embedder|text_embedder).linear_[12]`
+- `norm_out.linear`
+- `proj_out`
+- `transformer_blocks.*.norm1.linear`
+- `transformer_blocks.*.norm1_context.linear`
+- `single_transformer_blocks.*.norm.linear`
+
+Use `--model-type hunyuan-video` to force that profile, or rely on
+`--model-type auto` when the export config identifies
+`HunyuanVideoTransformer3DModel`.
+
+HunyuanVideo ModelOpt exports use diffusers module names that differ from
+SGLang runtime names for fused QKV and fused QKV+MLP layers. Keep the
+diffusers-to-runtime mapping in `build_modelopt_fp8_transformer.py` in sync
+with `runtime/models/dits/hunyuanvideo.py` before trusting converted scale
+tensors.
+
+Qwen Image and Qwen Image Edit share `QwenImageTransformer2DModel`, so one
+ModelOpt FP8 fallback preset covers both. The validated Qwen Image fallback set
+keeps these modules in BF16:
+
+- `img_in`
+- `txt_in`
+- `time_text_embed.timestep_embedder.linear_1`
+- `time_text_embed.timestep_embedder.linear_2`
+- `norm_out.linear`
+- `proj_out`
+- `transformer_blocks.*.img_mlp.net.2`
+- `transformer_blocks.*.img_mod`
+- `transformer_blocks.*.txt_mod`
+
+Use `--model-type qwen-image` to force that profile, or rely on
+`--model-type auto` when the export config identifies
+`QwenImageTransformer2DModel`.
+
+Qwen modulation weights can appear in safetensors as `.img_mod.1.weight` and
+`.txt_mod.1.weight`. Canonicalize those module names to `.img_mod` and
+`.txt_mod` before fallback matching.
+
+For Qwen Image FP8, explicit BF16 fallback tensors must be written before
+honoring ModelOpt ignored weights. Otherwise converter stats can report a
+fallback while the output checkpoint still retains the source FP8 tensor, which
+causes severe image-quality regressions.
 
 For FLUX.1-dev NVFP4 model families that need a mixed BF16+NVFP4 checkpoint, build the merged transformer explicitly:
 

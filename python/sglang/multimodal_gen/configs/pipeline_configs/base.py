@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import json
+import math
 import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
@@ -21,8 +22,12 @@ from sglang.multimodal_gen.configs.models import (
 )
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.utils import update_config_from_args
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
 )
@@ -101,6 +106,44 @@ def postprocess_text(output: BaseEncoderOutput, _text_inputs) -> torch.tensor:
     raise NotImplementedError
 
 
+@dataclass(frozen=True)
+class TextConditioningOutput:
+    """Text embeddings and masks aligned to postprocessed sequence length.
+
+    `prompt_embeds_mask` and `prompt_seq_lens` describe real text tokens after
+    model-specific trimming or packing, not the raw tokenizer output.
+    """
+
+    prompt_embeds: torch.Tensor
+    prompt_embeds_mask: torch.Tensor | None = None
+    prompt_seq_lens: list[int] | None = None
+
+
+def pad_text_embeddings_with_mask(
+    text_embeds: list[torch.Tensor],
+) -> TextConditioningOutput:
+    """Pad variable-length text embeddings and return the valid-token mask."""
+    if not text_embeds:
+        raise ValueError("text_embeds must contain at least one tensor")
+
+    max_seq_len = max(e.size(0) for e in text_embeds)
+    prompt_embeds = torch.stack(
+        [
+            torch.cat([e, e.new_zeros(max_seq_len - e.size(0), e.size(1))])
+            for e in text_embeds
+        ]
+    )
+    seq_lens = [int(e.size(0)) for e in text_embeds]
+    seq_lens_tensor = torch.tensor(
+        seq_lens,
+        device=prompt_embeds.device,
+        dtype=torch.long,
+    )
+    positions = torch.arange(max_seq_len, device=prompt_embeds.device).unsqueeze(0)
+    prompt_embeds_mask = positions < seq_lens_tensor.unsqueeze(1)
+    return TextConditioningOutput(prompt_embeds, prompt_embeds_mask, seq_lens)
+
+
 def shard_rotary_emb_for_sp(emb):
     """
     Shard rotary embeddings [S, D] along sequence for SP.
@@ -139,6 +182,9 @@ def shard_rotary_emb_for_sp(emb):
 def maybe_unpad_latents(latents, batch):
     # If SP padding was applied, remove extra tokens before reshaping
     raw_shape = batch.raw_latent_shape
+    if len(raw_shape) == 5 and latents.dim() == 5:
+        return latents[:, :, : raw_shape[2], :, :]
+
     if len(raw_shape) == 3:
         # Sequence format [B, S, D]: use seq_len directly
         target_tokens = raw_shape[1]
@@ -168,6 +214,7 @@ class PipelineConfig:
     # controls the timestep embedding generation
     should_use_guidance: bool = True
     embedded_cfg_scale: float = 6.0
+    cfg_policy: CFGPolicy = field(default_factory=CFGPolicy)
     generator_device: str | None = None
     flow_shift: float | None = None
     disable_autocast: bool = False
@@ -186,6 +233,7 @@ class PipelineConfig:
     # Image encoder configuration
     image_encoder_config: EncoderConfig = field(default_factory=EncoderConfig)
     image_encoder_precision: str = "fp32"
+    image_encoder_extra_args: dict = field(default_factory=lambda: {})
 
     # Text encoder configuration
     DEFAULT_TEXT_ENCODER_PRECISIONS = ("fp32",)
@@ -196,8 +244,8 @@ class PipelineConfig:
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
     text_encoder_extra_args: list[dict] = field(default_factory=lambda: [{}])
 
-    # image encoding
-    image_encoder_extra_args: dict = field(default_factory=lambda: {})
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig()
 
     def postprocess_image(self, image):
         return image.last_hidden_state
@@ -219,11 +267,12 @@ class PipelineConfig:
     # DMD parameters
     dmd_denoising_steps: list[int] | None = field(default=None)
 
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # return the model-specific config for optimal deployment setting
+        return ModelDeploymentConfig()
+
     # Wan2.2 TI2V parameters
     boundary_ratio: float | None = None
-
-    # Compilation
-    # enable_torch_compile: bool = False
 
     # calculate the adjust size for condition image
     # width: original condition image width
@@ -262,8 +311,17 @@ class PipelineConfig:
             (target_width, target_height), PIL.Image.Resampling.LANCZOS
         ), (target_width, target_height)
 
+    def preprocess_realtime_condition_image(self, batch, _vae_image_processor) -> bool:
+        return False
+
     def prepare_calculated_size(self, image):
         return self.calculate_condition_image_size(image, image.width, image.height)
+
+    def preprocess_realtime_condition_image(self, batch, _vae_image_processor) -> bool:
+        """Realtime hook: optionally preprocess the first-frame condition image
+        in-place. Return True if handled (skip the standard path), False to fall
+        back to the normal condition-image preprocessing. Default: not handled."""
+        return False
 
     def prepare_image_processor_kwargs(self, batch, neg=False):
         return {}
@@ -308,6 +366,13 @@ class PipelineConfig:
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
         return tokenizer(prompt, **tok_kwargs)
 
+    def is_flux_v1(self) -> bool:
+        """True if this pipeline is FLUX v1 (dual CLIP + T5 text encoders).
+
+        Used by text encoding (e.g. fixed CLIP context). Other pipelines return False.
+        """
+        return False
+
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         height = batch.height // self.vae_config.arch_config.spatial_compression_ratio
         width = batch.width // self.vae_config.arch_config.spatial_compression_ratio
@@ -329,6 +394,41 @@ class PipelineConfig:
     def allow_set_num_frames(self):
         return False
 
+    def supports_dynamic_batching(self):
+        """Return whether this pipeline can opt in to dynamic batching.
+
+        The scheduler still checks each request before merging it into a batch.
+        """
+        return self.task_type in (ModelTaskType.T2I, ModelTaskType.T2V)
+
+    def estimate_request_cost(self, batch) -> float:
+        """Return the relative cost used for batching admission caps.
+
+        This is compared with `max_cost` from the batching config; it is not a
+        memory estimate. The default cost is latent tokens times frames times
+        outputs; pipelines can override it for model-specific admission.
+        """
+        latent_tokens = float(batch.n_tokens or 0)
+        if latent_tokens <= 0:
+            width = int(batch.width or 0)
+            height = int(batch.height or 0)
+            if width > 0 and height > 0:
+                vae_scale = getattr(
+                    self.vae_config.arch_config, "vae_scale_factor", None
+                )
+                if vae_scale is None and hasattr(
+                    self.vae_config, "get_vae_scale_factor"
+                ):
+                    vae_scale = self.vae_config.get_vae_scale_factor()
+                vae_scale = max(1, int(vae_scale or 1))
+                latent_tokens = math.ceil(width / vae_scale) * math.ceil(
+                    height / vae_scale
+                )
+
+        num_frames = max(1, int(batch.num_frames or 1))
+        num_outputs = max(1, int(batch.num_outputs_per_prompt or 1))
+        return latent_tokens * num_frames * num_outputs
+
     def get_decode_scale_and_shift(self, device, dtype, vae):
         vae_arch_config = self.vae_config.arch_config
         scaling_factor = getattr(vae_arch_config, "scaling_factor", None)
@@ -346,6 +446,10 @@ class PipelineConfig:
 
     def maybe_prepare_latent_ids(self, latents):
         return None
+
+    # called before vae encode
+    def preprocess_vae_encode(self, image, vae):
+        return image
 
     # called after vae encode
     def postprocess_vae_encode(self, image_latents, vae):
@@ -468,6 +572,92 @@ class PipelineConfig:
         """
         return text_inputs.get("attention_mask")
 
+    def build_text_conditioning_mask(
+        self,
+        text_inputs: dict,
+        text_encoder_attention_mask: "torch.Tensor | None",
+        prompt_embeds: "torch.Tensor",
+        encoder_index: int,
+    ) -> "torch.Tensor":
+        """Return a mask aligned with post-processed prompt embeddings.
+
+        True values mark valid text tokens. Dynamic batching must carry
+        post-processed semantic text lengths explicitly; if a model-specific
+        postprocessor changes the sequence length, it must return
+        TextConditioningOutput with an embedding-aligned mask.
+        """
+        if prompt_embeds.ndim < 2:
+            raise ValueError(
+                "prompt_embeds must have shape [batch, seq, ...] to build text conditioning mask"
+            )
+
+        if prompt_embeds.ndim == 2:
+            batch_size, embed_seq_len = 1, prompt_embeds.shape[0]
+        else:
+            batch_size, embed_seq_len = prompt_embeds.shape[:2]
+        device = prompt_embeds.device
+        if text_encoder_attention_mask is None:
+            return torch.ones(
+                (batch_size, embed_seq_len), dtype=torch.bool, device=device
+            )
+
+        raw_mask = text_encoder_attention_mask.to(device=device).bool()
+        if raw_mask.ndim != 2 or raw_mask.shape[0] != batch_size:
+            raise ValueError(
+                "text attention mask must have shape [batch, seq] matching prompt_embeds batch"
+            )
+
+        if raw_mask.shape[1] == embed_seq_len:
+            return raw_mask
+
+        if prompt_embeds.ndim == 2 and raw_mask.shape[0] == 1:
+            return torch.ones((1, embed_seq_len), dtype=torch.bool, device=device)
+
+        raise ValueError(
+            "text attention mask length does not match postprocessed prompt embeddings. "
+            "Postprocess functions that trim, pack, or otherwise change text sequence "
+            "length must return TextConditioningOutput with an embedding-aligned mask."
+        )
+
+    @staticmethod
+    def seq_lens_from_text_conditioning_mask(mask: "torch.Tensor") -> list[int]:
+        if mask.ndim != 2:
+            raise ValueError("text conditioning mask must have shape [batch, seq]")
+        return torch.count_nonzero(mask, dim=1).tolist()
+
+    def require_text_seq_lens(
+        self,
+        batch,
+        encoder_index: int,
+        *,
+        negative: bool = False,
+        expected_batch_size: int | None = None,
+    ) -> list[int]:
+        """Return postprocessed text lengths captured during text encoding.
+
+        Dynamic batches use these lengths for model masks, RoPE, and cache
+        sizing after text embeddings have been padded.
+        """
+        seq_lens_by_encoder = (
+            batch.negative_prompt_seq_lens if negative else batch.prompt_seq_lens
+        )
+        kind = "negative" if negative else "positive"
+        if seq_lens_by_encoder is None or encoder_index >= len(seq_lens_by_encoder):
+            raise ValueError(
+                f"Missing {kind} prompt_seq_lens for text encoder {encoder_index}; "
+                "dynamic text conditioning requires explicit sequence lengths."
+            )
+
+        seq_lens = [int(x) for x in seq_lens_by_encoder[encoder_index]]
+        if expected_batch_size is not None and len(seq_lens) != int(
+            expected_batch_size
+        ):
+            raise ValueError(
+                f"{kind} prompt_seq_lens for text encoder {encoder_index} has "
+                f"{len(seq_lens)} entries, expected {expected_batch_size}."
+            )
+        return seq_lens
+
     def get_text_encoder_pooler_output(
         self, outputs: "BaseEncoderOutput", encoder_index: int
     ) -> "torch.Tensor | None":
@@ -504,6 +694,9 @@ class PipelineConfig:
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {}
+
+    def prepare_world_condition(self, batch, device, dtype):
+        return None
 
     def _unpad_and_unpack_latents(self, latents, audio_latents, batch, vae, audio_vae):
         raise NotImplementedError("not yet implemented")
@@ -555,6 +748,31 @@ class PipelineConfig:
             dest=f"{prefix_with_dot.replace('-', '_')}resolution",
             default=None,
             help="Override the selected pipeline config's resolution setting. Only applies to pipelines that define a resolution field.",
+        )
+
+        # SANA-WM streaming knobs. default=None so they only apply to pipeline
+        # configs that define these fields (e.g. SanaWMPipelineConfig); other
+        # configs are left untouched by update_config_from_args.
+        parser.add_argument(
+            f"--{prefix_with_dot}streaming",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}streaming",
+            default=None,
+            help="SANA-WM: enable chunk-causal streaming (forward_long) generation.",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}refiner-chunked",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}refiner_chunked",
+            default=None,
+            help="SANA-WM: chunk-wise streaming refiner (vs whole-clip dense refiner).",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}num-frame-per-block",
+            type=int,
+            dest=f"{prefix_with_dot.replace('-', '_')}num_frame_per_block",
+            default=None,
+            help="SANA-WM: latent frames per streaming chunk (default 3).",
         )
 
         # DiT configuration
@@ -624,6 +842,18 @@ class PipelineConfig:
             type=parse_int_list,
             default=PipelineConfig.dmd_denoising_steps,
             help="Comma-separated list of denoising steps (e.g., '1000,757,522')",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}realtime-causal-sink-size",
+            type=int,
+            default=None,
+            help="Override the number of sink frames kept by realtime causal DiT pipelines that support it.",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}realtime-causal-kv-cache-num-frames",
+            type=int,
+            default=None,
+            help="Override the total frame capacity of realtime causal DiT KV cache for pipelines that support it.",
         )
 
         # Add VAE configuration arguments
@@ -742,6 +972,30 @@ class PipelineConfig:
                 )
             # 1.5. Adjust pipeline config for fine-tuned VAE if needed
             pipeline_config_cls = model_info.pipeline_config_cls
+            # If an explicit pipeline_class_name refines the model-default config
+            # (e.g. SanaWMRealtimePipeline -> SanaWMRealtimeConfig, a subclass of
+            # the model-resolved SanaWMPipelineConfig), prefer the pipeline's own
+            # config so realtime-only wiring (the /v1/realtime_video adapter) is
+            # selected. Only applies when the explicit config strictly subclasses
+            # the model default, so non-realtime pipelines are unaffected.
+            if pipeline_class_name:
+                explicit_config_classes = get_pipeline_config_classes(
+                    pipeline_class_name
+                )
+                if explicit_config_classes is not None:
+                    explicit_config_cls = explicit_config_classes[0]
+                    if (
+                        isinstance(explicit_config_cls, type)
+                        and isinstance(pipeline_config_cls, type)
+                        and explicit_config_cls is not pipeline_config_cls
+                        and issubclass(explicit_config_cls, pipeline_config_cls)
+                    ):
+                        logger.info(
+                            f"Refining pipeline config {pipeline_config_cls.__name__} "
+                            f"-> {explicit_config_cls.__name__} for explicit "
+                            f"pipeline_class_name={pipeline_class_name}"
+                        )
+                        pipeline_config_cls = explicit_config_cls
         vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
         if vae_path is None:
             component_paths = kwargs.get(
@@ -876,6 +1130,8 @@ class ImagePipelineConfig(PipelineConfig):
     def shard_latents_for_sp(self, batch, latents):
         # latents: [B, H * W, C]
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
+        if batch.enable_sequence_shard:
+            return latents, False
         seq_len = latents.shape[1]
 
         # TODO: reuse code in PipelineConfig::shard_latents_for_sp

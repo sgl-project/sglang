@@ -18,7 +18,7 @@ from sglang.srt.parser.reasoning_parser import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class TestStreamingParseResult(CustomTestCase):
@@ -861,6 +861,37 @@ class TestReasoningParser(CustomTestCase):
         self.assertEqual(reasoning, "Let me think")
         self.assertEqual(normal, "The answer is 42.")
 
+    def test_parse_non_stream_preserves_payload_whitespace(self):
+        """Non-streaming parsing must not rewrite text inside or after reasoning."""
+        parser = ReasoningParser("qwen3")
+        reasoning, normal = parser.parse_non_stream(
+            "<think>\nLet me think\n</think>\n\nThe answer is 42.\n"
+        )
+        self.assertEqual(reasoning, "\nLet me think\n")
+        self.assertEqual(normal, "\n\nThe answer is 42.\n")
+
+    def test_parse_non_stream_strips_repeated_leading_start_tokens(self):
+        """Repeated leading start tokens are markers, not reasoning payload."""
+        parser = ReasoningParser("qwen3")
+        reasoning, normal = parser.parse_non_stream(
+            "<think><think>Let me think</think>The answer is 42."
+        )
+        self.assertEqual(reasoning, "Let me think")
+        self.assertEqual(normal, "The answer is 42.")
+
+    def test_parse_stream_chunk_preserves_payload_whitespace(self):
+        """Streaming parsing preserves the same generated payload whitespace."""
+        parser = ReasoningParser("qwen3")
+        reasoning, normal = parser.parse_stream_chunk("<think>")
+        self.assertEqual(reasoning, "")
+        self.assertEqual(normal, "")
+
+        reasoning, normal = parser.parse_stream_chunk(
+            "\nLet me think\n</think>\n\nThe answer is 42.\n"
+        )
+        self.assertEqual(reasoning, "\nLet me think\n")
+        self.assertEqual(normal, "\n\nThe answer is 42.\n")
+
     def test_parse_stream_chunk(self):
         """Test streaming chunk parsing."""
         parser = ReasoningParser("qwen3")
@@ -1497,6 +1528,22 @@ class TestGptOssDetectorToolCall(CustomTestCase):
             all_normal += result.normal_text
         self.assertIn("reason", all_reasoning)
         self.assertIn("done", all_normal)
+
+
+class TestPoolsideV1Registered(CustomTestCase):
+    """poolside_v1 (Laguna-XS.2) reuses the Qwen3 `<think>...</think>` envelope.
+    Request dispatch differs (Mimo-style explicit `enable_thinking=True`,
+    asserted in test_serving_chat.py), driven by
+    `reasoning_default = "explicit_enable_thinking"` on the detector."""
+
+    def test_registered_to_qwen3_subclass(self):
+        cls = ReasoningParser.DetectorMap["poolside_v1"]
+        self.assertTrue(issubclass(cls, Qwen3Detector))
+
+    def test_explicit_enable_thinking_default(self):
+        rp = ReasoningParser("poolside_v1", stream_reasoning=True)
+        self.assertEqual(rp.detector.reasoning_default, "explicit_enable_thinking")
+        self.assertTrue(rp.detector.thinks_internally)
 
 
 if __name__ == "__main__":

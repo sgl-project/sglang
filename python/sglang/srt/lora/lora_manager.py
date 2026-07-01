@@ -21,6 +21,7 @@ from typing import Dict, Iterable, List, Optional
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -35,6 +36,7 @@ from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
+    DSA_INDEXER_LORA_NAMES,
     EMBEDDING_NAMES,
     LoRAType,
     auto_detect_lora_target_modules,
@@ -46,6 +48,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +125,17 @@ class LoRAManager:
             num_tokens_per_bs=num_tokens_per_bs,
         )
 
+        # ===== TO BE REFACTORED ====
+        # Pre-create the experimental LoRA two-stream side stream now (gated) so the
+        # torch.cuda.Stream() call never lands inside a cuda-graph capture region.
+        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+            from sglang.srt.lora.trtllm_lora_temp import (
+                init_lora_two_stream_resources,
+            )
+
+            init_lora_two_stream_resources(self.device)
+        # ===== END TO BE REFACTORED ====
+
     def init_cuda_graph_moe_buffers(
         self, max_bs: int, max_loras: int, compute_dtype, moe_layer
     ):
@@ -191,7 +206,12 @@ class LoRAManager:
         """
         if lora_config.lora_added_tokens_size > 0:
             raise ValueError(
-                f"LoRA serving currently doesn't support adapters that add tokens to the vocabulary"
+                f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support adapters that add tokens to the vocabulary"
+            )
+
+        if lora_config.use_dora:
+            raise ValueError(
+                f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support DoRA adapters"
             )
 
         # Check if this LoRA adapter is already loaded
@@ -311,6 +331,8 @@ class LoRAManager:
         lora_ranks = [0] * self.max_loras_per_batch
         scalings = [0] * self.max_loras_per_batch
         for i, uid in enumerate(forward_batch.lora_ids):
+            if uid not in self.memory_pool.uid_to_buffer_id:
+                continue
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
             if uid is not None:
                 lora = self.loras[uid]
@@ -584,6 +606,21 @@ class LoRAManager:
                 # Otherwise, infer target_modules from adapter configs.
                 self.target_modules.update(adapter_target_modules)
 
+        # Fusion folds wk + weights_proj into wk_weights_proj, so the modules
+        # LoRA wraps are absent and an indexer-targeted adapter is silently dropped.
+        indexer_targets = self.target_modules & DSA_INDEXER_LORA_NAMES
+        if indexer_targets:
+            from sglang.srt.layers.attention.dsa.dsa_indexer import (
+                _use_dsa_indexer_fusion,
+            )
+
+            if _use_dsa_indexer_fusion:
+                raise ValueError(
+                    f"LoRA targets the DSA indexer ({sorted(indexer_targets)}), which is "
+                    "incompatible with DSA indexer Q/K fusion. Set "
+                    "SGLANG_DISABLE_DSA_INDEXER_FUSION=1 to disable fusion and use indexer LoRA."
+                )
+
         if max_lora_rank is not None:
             self.max_lora_rank = max_lora_rank
         else:
@@ -620,12 +657,9 @@ class LoRAManager:
             self.base_hf_config,
             self.load_config,
             self.lora_backend,
+            base_model=self.base_model,
         )
         lora_adapter.initialize_weights()
-
-        # If we want to overlap loading LoRA adapters with compute, they must be pinned in CPU memory
-        if self.enable_lora_overlap_loading:
-            lora_adapter.pin_weights_in_cpu()
 
         self.loras[lora_ref.lora_id] = lora_adapter
 
@@ -641,6 +675,7 @@ class LoRAManager:
             self.base_hf_config,
             self.load_config,
             self.lora_backend,
+            base_model=self.base_model,
         )
         lora_adapter.initialize_weights_from_tensors(tensors)
         self.loras[lora_ref.lora_id] = lora_adapter
@@ -698,6 +733,7 @@ class LoRAManager:
             lora_added_tokens_size=self.lora_added_tokens_size,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             strict_loading=self.lora_strict_loading,
+            enable_lora_overlap_loading=self.enable_lora_overlap_loading,
         )
 
         # Initializing memory pool with base model
@@ -793,7 +829,11 @@ class LoRAManager:
                 continue
 
             # The module should be converted if it is included in target_names
-            if module_name.split(".")[-1] in self.target_modules:
+            parts = module_name.split(".")
+            if (
+                parts[-1] in self.target_modules
+                or ".".join(parts[-2:]) in self.target_modules
+            ):
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
                     continue
@@ -806,6 +846,12 @@ class LoRAManager:
                 x in self.target_modules for x in ["gate_up_proj", "down_proj"]
             ):
                 layer_id = get_layer_id(module_name)
+                if layer_id is None:
+                    # FusedMoE submodules outside the decoder layer hierarchy
+                    # (e.g. nested helpers under non-".layers." prefixes) have
+                    # no resolvable layer id; skip them so we don't index
+                    # `self.lora_modules` with `None`.
+                    continue
                 lora_module = self.set_lora_module(module_name, module)
                 lora_module.experts_shared_outer_loras = self.experts_shared_outer_loras
                 lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts

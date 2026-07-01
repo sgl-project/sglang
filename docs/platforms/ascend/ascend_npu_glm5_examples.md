@@ -161,8 +161,6 @@ P_IP=('your ip1' 'your ip2')
 P_MASTER="${P_IP[0]}:your port"
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 
-export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -182,7 +180,9 @@ do
         --mem-fraction-static 0.8\
         --port 8000 \
         --served-model-name glm-5 \
-        --cuda-graph-max-bs 16 \
+        --cuda-graph-max-bs 32 \
+        --moe-a2a-backend deepep \
+        --deepep-mode auto \
         --disable-radix-cache
         NODE_RANK=$i
         break

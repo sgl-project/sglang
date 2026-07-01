@@ -19,14 +19,15 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=12, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 # ---------------------------------------------------------------------------
@@ -74,7 +75,6 @@ def _build_swa_tree(page_size, sliding_window_size, kv_size=1024, kv_size_swa=51
         head_dim=head_dim,
         swa_attention_layer_ids=swa_ids,
         full_attention_layer_ids=full_ids,
-        enable_kvcache_transpose=False,
         device=device,
     )
     allocator = SWATokenToKVPoolAllocator(
@@ -110,6 +110,7 @@ def _make_req(req_pool_idx, token_ids, cache_protected_len, tree):
         extra_key=None,
         last_node=tree.root_node,
         swa_uuid_for_lock=None,
+        swa_prefix_lock_released=False,
         prefix_indices=torch.tensor([], dtype=torch.int64, device=tree.device),
         _kv_committed_len=len(token_ids),
     )

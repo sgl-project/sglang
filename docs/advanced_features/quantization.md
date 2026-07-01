@@ -43,6 +43,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
 | `bitsandbytes` | Yes | Experimental | No | Depends on bitsandbytes ROCm support |
 | `torchao` (`int4wo`, etc.) | Yes | Partial | No | `int4wo` not supported on AMD; other methods may work |
 | `modelslim` | No | No | Yes | Ascend quantization; Uses CANN kernels |
+| `mxfp8` (diffusion) | No | No | Yes (A2/A3) | Ascend NPU only; online MXFP8 quantization for diffusion models (e.g., Wan2.2); requires CANN ≥ 8.0.RC3 |
 
 On AMD, several of these methods use [Aiter](https://github.com/ROCm/aiter) for acceleration -- set `SGLANG_USE_AITER=1` where noted. See [AMD GPU setup](../platforms/amd_gpu.md) for installation and configuration details.
 
@@ -589,6 +590,36 @@ python3 -m sglang.launch_server \
 SGLang running on AMD GPUs (CDNA3 or CDNA4 architecture) supports the quantization method `--quantization quark_int4fp8_moe`, that will replace [MoE layers](https://github.com/sgl-project/sglang/blob/v0.4.8/python/sglang/srt/layers/moe/fused_moe_triton/layer.py#L271) originally in high precision (bfloat16, float16 or float32) to use weights dynamically quantized to int4, that are upcasted to float8 during inference to run compute in float8 precision with activations dynamically quantized on the fly to float8.
 
 Other layers (e.g. projections in the attention layers) have their weights quantized online to float8 directly.
+
+## Diffusion Model Quantization on Ascend NPU
+
+SGLang-Diffusion supports MXFP8 quantization for diffusion models (such as Wan2.2) on Ascend A5 NPUs, in both online and offline (ModelSlim) modes. This is separate from the LLM serving path and uses the `sglang serve` / `sglang generate` CLI.
+
+**Requirements:** Ascend A5, CANN ≥ 8.0.RC3
+
+### Online MXFP8
+
+Pass `--quantization mxfp8` to dynamically quantize FP16/BF16 transformer weights to MXFP8 at load time:
+
+```bash
+sglang serve \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --quantization mxfp8 \
+  --num-gpus 4
+```
+
+### Offline MXFP8 (ModelSlim)
+
+Pre-quantize with [msModelSlim](https://gitcode.com/Ascend/msmodelslim) and load the checkpoint directly — the quantization scheme is auto-detected from `quant_model_description.json`:
+
+```bash
+sglang generate \
+  --model-path /path/to/wan2_2_mxfp8_diffusers \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+
+For the full quantization + format conversion workflow and a complete list of supported schemes, see [Diffusion Quantization on Ascend NPU](../platforms/ascend/ascend_npu_quantization.md#diffusion-model-quantization-on-ascend-npu) and [SGLang-Diffusion Quantization](../diffusion/quantization.md#modelslim).
 
 ## Reference
 

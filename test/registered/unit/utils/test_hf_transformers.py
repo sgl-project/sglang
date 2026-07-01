@@ -24,7 +24,7 @@ from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_patte
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +480,15 @@ class TestPatchRemovedSymbols(unittest.TestCase):
 
 
 class TestPatchRopeParametersValidation(unittest.TestCase):
+    # -----------------------------------------------------------------------
+    # Test ``rope_theta`` injection into ``rope_scaling``.
+    #
+    # Upstream `transformers.PretrainedConfig` now natively handles this
+    # logic. While the manual injection patch has been removed, these
+    # test cases are retained to ensure regression testing of the
+    # configuration's injection behavior.
+    # -----------------------------------------------------------------------
+
     def test_injects_rope_theta_into_rope_scaling(self):
         config_dict = {
             "model_type": "llama",

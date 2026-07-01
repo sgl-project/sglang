@@ -13,10 +13,11 @@ Usage:
     python -m pytest test/registered/unit/lora/test_mem_pool_ep_unit.py -v
 """
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # CPU-only unit test; no CUDA/distributed dependencies.
-register_cuda_ci(est_time=9, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
 
 import types
 import unittest
@@ -195,7 +196,11 @@ class TestIterLocalExpertWeightsDict(unittest.TestCase):
             moe_use_local_expert_ids=False,
         )
         weights = {gid: torch.full((2,), float(gid)) for gid in range(4)}
-        got = {lid: w.tolist() for lid, w in pool._iter_local_expert_weights(weights)}
+        cache_keys = {gid: f"expert.{gid}" for gid in weights}
+        got = {
+            lid: w.tolist()
+            for lid, w, _ in pool._iter_local_expert_weights(weights, cache_keys)
+        }
         self.assertEqual(
             got, {0: [0.0, 0.0], 1: [1.0, 1.0], 2: [2.0, 2.0], 3: [3.0, 3.0]}
         )
@@ -208,7 +213,11 @@ class TestIterLocalExpertWeightsDict(unittest.TestCase):
             moe_use_local_expert_ids=True,
         )
         weights = {gid: torch.full((2,), float(gid)) for gid in range(8)}
-        got = {lid: w.tolist() for lid, w in pool._iter_local_expert_weights(weights)}
+        cache_keys = {gid: f"expert.{gid}" for gid in weights}
+        got = {
+            lid: w.tolist()
+            for lid, w, _ in pool._iter_local_expert_weights(weights, cache_keys)
+        }
         # Rank 0 sees globals 0,1 remapped to locals 0,1.
         self.assertEqual(got, {0: [0.0, 0.0], 1: [1.0, 1.0]})
 
@@ -220,7 +229,11 @@ class TestIterLocalExpertWeightsDict(unittest.TestCase):
             moe_use_local_expert_ids=True,
         )
         weights = {gid: torch.full((2,), float(gid)) for gid in range(8)}
-        got = {lid: w.tolist() for lid, w in pool._iter_local_expert_weights(weights)}
+        cache_keys = {gid: f"expert.{gid}" for gid in weights}
+        got = {
+            lid: w.tolist()
+            for lid, w, _ in pool._iter_local_expert_weights(weights, cache_keys)
+        }
         # Rank 3 sees globals 6,7 remapped to locals 0,1.
         self.assertEqual(got, {0: [6.0, 6.0], 1: [7.0, 7.0]})
 
@@ -241,8 +254,12 @@ class TestIterLocalExpertWeightsDict(unittest.TestCase):
             5: torch.full((2,), 5.0),
             7: torch.full((2,), 7.0),
         }
+        cache_keys = {gid: f"expert.{gid}" for gid in weights}
         # Rank 2 owns globals 4, 5 -> locals 0, 1.
-        got = {lid: w.tolist() for lid, w in pool._iter_local_expert_weights(weights)}
+        got = {
+            lid: w.tolist()
+            for lid, w, _ in pool._iter_local_expert_weights(weights, cache_keys)
+        }
         self.assertEqual(got, {0: [4.0, 4.0], 1: [5.0, 5.0]})
 
     def test_no_experts_owned_yields_nothing(self):
@@ -257,7 +274,8 @@ class TestIterLocalExpertWeightsDict(unittest.TestCase):
         )
         # Only globals 4, 5 present (owned by rank 2).
         weights = {4: torch.full((2,), 4.0), 5: torch.full((2,), 5.0)}
-        got = list(pool._iter_local_expert_weights(weights))
+        cache_keys = {gid: f"expert.{gid}" for gid in weights}
+        got = list(pool._iter_local_expert_weights(weights, cache_keys))
         self.assertEqual(got, [])
 
 
@@ -274,9 +292,21 @@ class TestIterLocalExpertWeightsTensor(unittest.TestCase):
         )
         # [num_experts, rank, hidden] with values carrying the expert id.
         weights = torch.arange(4 * 2 * 3, dtype=torch.float32).reshape(4, 2, 3)
-        got = [(lid, w.clone()) for lid, w in pool._iter_local_expert_weights(weights)]
-        self.assertEqual([lid for lid, _ in got], [0, 1, 2, 3])
-        for lid, w in got:
+        got = [
+            (lid, w.clone(), cache_key)
+            for lid, w, cache_key in pool._iter_local_expert_weights(weights, "weights")
+        ]
+        self.assertEqual([lid for lid, _, _ in got], [0, 1, 2, 3])
+        self.assertEqual(
+            [cache_key for _, _, cache_key in got],
+            [
+                "weights#expert0",
+                "weights#expert1",
+                "weights#expert2",
+                "weights#expert3",
+            ],
+        )
+        for lid, w, _ in got:
             self.assertTrue(torch.equal(w, weights[lid]))
 
     def test_rank1_of_ep2_sees_upper_half(self):
@@ -287,11 +317,18 @@ class TestIterLocalExpertWeightsTensor(unittest.TestCase):
             moe_use_local_expert_ids=True,
         )
         weights = torch.arange(4 * 2 * 3, dtype=torch.float32).reshape(4, 2, 3)
-        got = [(lid, w.clone()) for lid, w in pool._iter_local_expert_weights(weights)]
+        got = [
+            (lid, w.clone(), cache_key)
+            for lid, w, cache_key in pool._iter_local_expert_weights(weights, "weights")
+        ]
         # Rank 1 of EP=2 with 4 experts owns globals 2, 3 -> locals 0, 1.
-        self.assertEqual([lid for lid, _ in got], [0, 1])
+        self.assertEqual([lid for lid, _, _ in got], [0, 1])
         self.assertTrue(torch.equal(got[0][1], weights[2]))
         self.assertTrue(torch.equal(got[1][1], weights[3]))
+        self.assertEqual(
+            [cache_key for _, _, cache_key in got],
+            ["weights#expert2", "weights#expert3"],
+        )
 
     def test_rank_with_partial_tensor_coverage(self):
         """Defensive: tensor has fewer experts than the expected local slice
@@ -309,7 +346,7 @@ class TestIterLocalExpertWeightsTensor(unittest.TestCase):
         weights = torch.arange(6 * 2, dtype=torch.float32).reshape(6, 2)
         # Note: this is 2D, not 3D -> should raise (sanity check).
         with self.assertRaises(TypeError):
-            list(pool._iter_local_expert_weights(weights))
+            list(pool._iter_local_expert_weights(weights, "weights"))
 
 
 class TestModuleLevelHelpers(unittest.TestCase):
@@ -605,6 +642,126 @@ class TestMoeBufferShardsByMoeTp(unittest.TestCase):
         q_b = pool.get_lora_B_shape("qkv_proj", model, 8, 0)
         # head_dim * (heads + 2*kv_heads) / tp_size = 8 * 24 / 4 = 48.
         self.assertEqual(q_b, (2, 48, 8))
+
+
+class TestLoadBufferPassesMoeTpRankToSlice(unittest.TestCase):
+    """Regression: `load_lora_weight_to_buffer` must hand `moe_tp_rank` (not
+    the outer `tp_rank`) to `slice_moe_lora_{a,b}_weights`.
+
+    Per-expert MoE weights are sharded along
+    `moe_tp_size = tp_size // ep_size // dp_size`, NOT the outer `tp_size`.
+    The bug only surfaces when those two values differ — i.e. when
+    `1 < ep_size < tp_size`. Concrete reproducer (`tp=4 ep=2`):
+
+      moe_tp_size = 2; outer rank 3 has moe_tp_rank=1.
+      `intermediate_size_per_partition = moe_inter / 2 = 384`.
+      Slicing with the OUTER rank (3) computes `start = 3 * 384 = 1152`,
+      which is past the full `moe_inter = 768`, returning a `[r, 0]`-shaped
+      tensor that fails the shape-match assert in `load_lora_weight_tensor`.
+
+    This test exercises `load_lora_weight_to_buffer` end-to-end with a
+    minimal mocked `FusedMoEWithLoRA` whose slicer captures-and-raises so
+    we don't need to satisfy buffer-copy shape constraints.
+    """
+
+    class _StopAfterCapture(Exception):
+        """Sentinel raised from the mocked slicer to short-circuit
+        execution before the buffer-copy phase (which would need real
+        shapes the test does not provide)."""
+
+    def test_moe_tp_rank_used_for_slicing_when_ep_lt_tp(self):
+        from sglang.srt.lora.layers import FusedMoEWithLoRA
+
+        # tp=4 ep=2 → moe_tp_size=2. Pick OUTER rank 3 so moe_tp_rank=1.
+        # The two values differ; the bug would surface on this exact rank.
+        pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.tp_size = 4
+        pool.tp_rank = 3
+        pool.moe_tp_size = 2
+        pool.moe_tp_rank = 1
+        pool.moe_ep_size = 2
+        pool.moe_ep_rank = 1
+        pool.moe_use_local_expert_ids = True
+        pool._num_experts_local = 1
+        pool.num_layer = 1
+        pool.target_modules = {"gate_up_proj", "down_proj"}
+        pool.experts_shared_outer_loras = False
+        pool.strict_loading = False
+        pool.lora_added_tokens_size = 0
+        # Tiny placeholder buffers — the mocked slicer raises before any of
+        # this is read in the buffer-copy phase.
+        pool.A_buffer = {
+            "gate_up_proj_moe": [torch.zeros(1, 1, 1, 1)],
+            "down_proj_moe": [torch.zeros(1, 1, 1, 1)],
+        }
+        pool.B_buffer = {
+            "gate_up_proj_moe": [torch.zeros(1, 1, 1, 1)],
+            "down_proj_moe": [torch.zeros(1, 1, 1, 1)],
+        }
+        pool.embedding_A_buffer = {}
+        pool.embedding_B_buffer = {}
+        pool.lm_head_A_buffer = {}
+        pool.lm_head_B_buffer = {}
+        pool.new_embeddings_buffer = {}
+
+        captured_ranks = []
+
+        moe_mod = mock.MagicMock(spec=FusedMoEWithLoRA)
+
+        def capture_a(weights, tp_rank, target_module):
+            captured_ranks.append(("A", target_module, tp_rank))
+            raise TestLoadBufferPassesMoeTpRankToSlice._StopAfterCapture()
+
+        def capture_b(weights, tp_rank, target_module):
+            captured_ranks.append(("B", target_module, tp_rank))
+            raise TestLoadBufferPassesMoeTpRankToSlice._StopAfterCapture()
+
+        moe_mod.slice_moe_lora_a_weights.side_effect = capture_a
+        moe_mod.slice_moe_lora_b_weights.side_effect = capture_b
+
+        # Adapter with one per-expert MoE LoRA-A weight. The expert regex
+        # `experts\.(\d+)\.` must match the key, which routes the weight
+        # into `temp_A_buffer["gate_up_proj_moe"]` — the dict shape that
+        # makes `temp_A_buffer.get("gate_up_proj_moe") is not None` true,
+        # which in turn triggers `slice_moe_lora_a_weights` (and the
+        # capture).
+        adapter = mock.MagicMock()
+        adapter.config.r = 4
+        adapter.scaling = 1.0
+        adapter.embedding_layers = {}
+        adapter.added_tokens_embeddings = {}
+        adapter.layers = [
+            types.SimpleNamespace(
+                weights={
+                    "model.layers.0.mlp.experts.0.gate_up_proj.lora_A.weight": (
+                        torch.zeros(8, 4)
+                    ),
+                },
+                pinned_weights={},
+            )
+        ]
+
+        with self.assertRaises(TestLoadBufferPassesMoeTpRankToSlice._StopAfterCapture):
+            pool.load_lora_weight_to_buffer(
+                uid="test",
+                buffer_id=0,
+                lora_adapter=adapter,
+                lora_modules=[{"mlp.experts": moe_mod}],
+                lora_embed_tokens_module=None,
+                lora_lm_head_module=None,
+            )
+
+        self.assertGreater(len(captured_ranks), 0, "slicing was never invoked")
+        for ab, target_module, rank in captured_ranks:
+            self.assertEqual(
+                rank,
+                pool.moe_tp_rank,
+                f"slice_moe_lora_{ab.lower()}_weights for {target_module} "
+                f"received rank={rank}; expected moe_tp_rank="
+                f"{pool.moe_tp_rank} (outer tp_rank is {pool.tp_rank}). "
+                "Passing the outer tp_rank slices past "
+                "intermediate_size_per_partition when ep_size < tp_size.",
+            )
 
 
 if __name__ == "__main__":

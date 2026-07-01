@@ -35,7 +35,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 from typing_extensions import Literal
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.utils import ImageData, read_system_prompt_from_file
+from sglang.srt.utils import ImageData, VideoData, read_system_prompt_from_file
 
 
 class SeparatorStyle(IntEnum):
@@ -67,6 +67,7 @@ class SeparatorStyle(IntEnum):
     GEMMA3 = auto()
     MPT = auto()
     PADDLE_OCR = auto()
+    UNLIMITED_OCR = auto()
 
 
 @dataclasses.dataclass
@@ -97,7 +98,7 @@ class Conversation:
     audio_token: str = "<audio>"
 
     image_data: Optional[List[ImageData]] = None
-    video_data: Optional[List[str]] = None
+    video_data: Optional[List[Union[str, VideoData]]] = None
     modalities: Optional[List[str]] = None
     stop_token_ids: Optional[int] = None
 
@@ -398,6 +399,18 @@ class Conversation:
                 else:
                     ret += role + ": "  # must be end with a space
             return ret
+        elif self.sep_style == SeparatorStyle.UNLIMITED_OCR:
+            seps = [self.sep, self.sep2]
+            if system_prompt == "" or system_prompt is None:
+                ret = ""
+            else:
+                ret = system_prompt + seps[0]
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    ret += role + message + seps[i % 2]
+                else:
+                    ret += role
+            return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
 
@@ -413,9 +426,14 @@ class Conversation:
         """Append a new image."""
         self.image_data.append(ImageData(url=image, detail=detail))
 
-    def append_video(self, video: str):
+    def append_video(self, video: str, preprocess_kwargs: Optional[Dict] = None):
         """Append a new video."""
-        self.video_data.append(video)
+        if preprocess_kwargs:
+            self.video_data.append(
+                VideoData(video, preprocess_kwargs=preprocess_kwargs)
+            )
+        else:
+            self.video_data.append(video)
 
     def append_audio(self, audio: str):
         """Append a new audio."""
@@ -638,7 +656,7 @@ def generate_chat_conv(
                         conv.modalities.append(content.modalities)
                 image_token = (
                     conv.image_token + "\n"
-                    if conv.name not in ("qwen2-vl", "moss-vl")
+                    if conv.name not in ("qwen2-vl", "moss-vl", "unlimited-ocr")
                     else conv.image_token
                 )
                 add_token_as_needed: bool = (
@@ -651,7 +669,7 @@ def generate_chat_conv(
                 video_token = conv.video_token
                 for content in message.content:
                     if content.type == "text":
-                        if num_image_url > 16:
+                        if num_image_url > 16 and conv.name not in ("unlimited-ocr",):
                             real_content += "\n"  # for video
                         real_content += content.text
                     elif content.type == "image_url":
@@ -884,6 +902,22 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
+        name="unlimited-ocr",
+        system_template="{system_message}",
+        system_message="",
+        roles=("", ""),
+        messages=(),
+        offset=0,
+        sep_style=SeparatorStyle.UNLIMITED_OCR,
+        sep="",
+        sep2="",
+        image_token="<image>",
+        image_token_at_prefix=True,
+    )
+)
+
+register_conv_template(
+    Conversation(
         name="paddle-ocr",
         system_message="",
         system_template="<|begin_of_sentence|>{system_message}",
@@ -1071,6 +1105,7 @@ MODEL_TYPE_TO_TEMPLATE = {
     "minicpmo": "minicpmo",
     "moss_vl": "moss-vl",
     "deepseek-ocr": "deepseek-ocr",
+    "unlimited-ocr": "unlimited-ocr",
     "paddleocr_vl": "paddle-ocr",
     "whisper": "whisper",
 }
@@ -1145,10 +1180,19 @@ def match_qwen_chat_ml(model_path: str):
 
 @register_conv_template_matching_function
 def match_minicpm(model_path: str):
+    # MiniCPM-V 4.6+ uses its own chat_template.jinja with `<|image_pad|>` and
+    # must NOT fall back to the legacy `minicpmv` conv template (which encodes
+    # the old `(<image>./</image>)` placeholder used by 2.x/4.0/4.5).
+    model_type = get_model_type(model_path)
+    if model_type == "minicpmv4_6":
+        return None
+    # For HF-hub paths (where config.json isn't on local disk yet), fall back
+    # to a path-version check: exclude 4.6 and later, match only legacy 2.x/4.0/4.5.
+    if re.search(r"minicpm-(v|o)-4[._]6", model_path, re.IGNORECASE):
+        return None
     match = re.search(r"minicpm-(v|o)", model_path, re.IGNORECASE)
     if match:
         return f"minicpm{match.group(1).lower()}"
-    model_type = get_model_type(model_path)
     return MODEL_TYPE_TO_TEMPLATE.get(model_type)
 
 
@@ -1166,6 +1210,17 @@ def match_deepseek_ocr(model_path: str):
         return "deepseek-ocr"
     model_type = get_model_type(model_path)
     return MODEL_TYPE_TO_TEMPLATE.get(model_type)
+
+
+@register_conv_template_matching_function
+def match_unlimited_ocr(model_path: str):
+    """Match unlimited-ocr model by path or model type."""
+    if "unlimited" in model_path.lower():
+        return "unlimited-ocr"
+    model_type = get_model_type(model_path)
+    if model_type == "unlimited-ocr":
+        return "unlimited-ocr"
+    return None
 
 
 @register_conv_template_matching_function
