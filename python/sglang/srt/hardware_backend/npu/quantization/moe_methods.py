@@ -776,6 +776,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         server_args = get_global_server_args()
         online_quant = server_args.online_quantization if server_args else None
         online_quant = "ascend_mxfp8"
+        print(online_quant)
 
         if online_quant == "ascend_w8a8":
             self._apply_online_w8a8(layer, weight_prefix, weight_name)
@@ -853,7 +854,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         torch.npu.empty_cache()
 
         if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "float8_e4m3fn")
+            self._set_dispatcher_output_dtype(layer, "bf16")
 
         self.hidden_states_quantizer = HiddenStatesMXFP8DynamicQuant()
 
@@ -872,6 +873,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
     ) -> torch.Tensor:
         # If we have a hidden_states quantizer (online int8 or MXFP8),
         # dynamically quantise activations and build scale arguments.
+        print(self.hidden_states_quantizer)
         if self.hidden_states_quantizer is not None:
             if pertoken_scale is None:
                 hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
@@ -882,6 +884,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             }
             # For MXFP8, the scale dtypes must be specified.
             if isinstance(self.hidden_states_quantizer, HiddenStatesMXFP8DynamicQuant):
+                print('MXFP8_QUANT!!!")
                 scale_args["scale_dtype"] = torch_npu.float8_e8m0fnu
                 scale_args["per_token_scale_dtype"] = torch_npu.float8_e8m0fnu
             return self.matmul.forward(
