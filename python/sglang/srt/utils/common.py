@@ -87,6 +87,7 @@ import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
 from PIL import Image
+from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
@@ -1586,13 +1587,76 @@ def set_prometheus_multiproc_dir():
     logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
 
 
+def _make_guarded_metrics_app(
+    generate_metrics: Callable[[], bytes],
+    content_type: str,
+    scrape_timeout_s: float = 5.0,
+):
+    scrape_task: Optional[asyncio.Task] = None
+
+    def clear_scrape_task(done_task: asyncio.Task):
+        nonlocal scrape_task
+        try:
+            done_task.exception()
+        except asyncio.CancelledError:
+            pass
+        if scrape_task is done_task:
+            scrape_task = None
+
+    async def guarded_metrics_app(scope, receive, send):
+        nonlocal scrape_task
+
+        if scope.get("type") != "http":
+            response = PlainTextResponse("not found\n", status_code=404)
+            await response(scope, receive, send)
+            return
+
+        if scrape_task is not None and not scrape_task.done():
+            response = PlainTextResponse(
+                "metrics scrape already in progress\n", status_code=503
+            )
+            await response(scope, receive, send)
+            return
+
+        scrape_task = asyncio.create_task(asyncio.to_thread(generate_metrics))
+        scrape_task.add_done_callback(clear_scrape_task)
+        try:
+            output = await asyncio.wait_for(
+                asyncio.shield(scrape_task), timeout=scrape_timeout_s
+            )
+        except asyncio.TimeoutError:
+            response = PlainTextResponse("metrics scrape timed out\n", status_code=504)
+            await response(scope, receive, send)
+            return
+        except Exception:
+            logger.exception("Failed to generate Prometheus metrics")
+            response = PlainTextResponse(
+                "failed to generate metrics\n", status_code=500
+            )
+            await response(scope, receive, send)
+            return
+
+        response = Response(output, headers={"Content-Type": content_type})
+        await response(scope, receive, send)
+
+    return guarded_metrics_app
+
+
 def add_prometheus_middleware(app):
     # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
+    from prometheus_client import (
+        CONTENT_TYPE_LATEST,
+        CollectorRegistry,
+        generate_latest,
+        multiprocess,
+    )
 
     registry = CollectorRegistry()
     multiprocess.MultiProcessCollector(registry)
-    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+    metrics_app = _make_guarded_metrics_app(
+        partial(generate_latest, registry), CONTENT_TYPE_LATEST
+    )
+    metrics_route = Mount("/metrics", metrics_app)
 
     # Workaround for 307 Redirect for /metrics
     metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
