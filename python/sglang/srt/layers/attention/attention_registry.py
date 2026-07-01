@@ -337,3 +337,10 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("hpc")
+def create_hpc_backend(runner):
+    from sglang.srt.layers.attention.hpc_backend import HpcAttnBackend
+
+    return HpcAttnBackend(runner)
