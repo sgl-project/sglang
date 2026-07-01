@@ -656,6 +656,7 @@ class SchedulerMetricsReporter:
             self.stats.fwd_occupancy = self.fwd_occupancy
             self._update_lora_metrics()
             self._log_hicache_stats()
+            self._log_radix_cache_size()
             self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
@@ -874,6 +875,7 @@ class SchedulerMetricsReporter:
             self.stats.fwd_occupancy = self.fwd_occupancy
             self._update_lora_metrics()
             self._log_hicache_stats()
+            self._log_radix_cache_size()
             self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
@@ -951,6 +953,21 @@ class SchedulerMetricsReporter:
             host_pool.size - host_pool.available_size()
         )
         self.stats.hicache_host_total_tokens = host_pool.size
+
+    def _log_radix_cache_size(self):
+        """Push radix cache footprint gauges (entry count + total tokens)."""
+        tree_cache = getattr(self.scheduler, "tree_cache", None)
+        if tree_cache is None:
+            return
+        collector = getattr(tree_cache, "metrics_collector", None)
+        if collector is None or not hasattr(tree_cache, "get_cache_stats"):
+            return
+        try:
+            entry_count, total_tokens = tree_cache.get_cache_stats()
+        except Exception as e:
+            logger.warning(f"Failed to get radix cache stats: {e}")
+            return
+        collector.set_cache_size(entry_count, total_tokens)
 
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""

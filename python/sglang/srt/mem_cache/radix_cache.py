@@ -338,6 +338,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         self.root_node.hash_value = []
         self.evictable_size_ = 0
         self.protected_size_ = 0
+        self.entry_count_ = 0
         self.evictable_leaves.clear()
         self._reset_session_radix_state()
         self._empty_match_result = MatchResult(
@@ -632,6 +633,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         # protected size refers to the size of the cache that is locked
         return self.protected_size_
 
+    def get_cache_stats(self) -> Tuple[int, int]:
+        """Return (entry_count, total_tokens) currently held in the radix tree."""
+        return self.entry_count_, self.evictable_size_ + self.protected_size_
+
     def all_values_flatten(self):
         values = []
 
@@ -685,6 +690,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
         new_node.parent.children[key.child_key(self.page_size)] = new_node
+        self.entry_count_ += 1
 
         # Split hash_value if it was already computed, otherwise leave as None
         new_node.hash_value, child.hash_value = split_node_hash_value(
@@ -749,6 +755,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
+            self.entry_count_ += 1
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
@@ -779,6 +786,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
+        self.entry_count_ -= 1
         self._discard_session_leaf(node)
         self.evictable_size_ -= len(node.key)
         if node in self.evictable_leaves:
