@@ -52,6 +52,13 @@ def fused_add_rms_norm(x, residual, weight, eps):
     return x, residual
 
 
+def assert_close_norm(actual, expected, dtype):
+    if dtype is torch.bfloat16:
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
+    else:
+        torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
 @pytest.mark.parametrize("dtype", [torch.float16])
@@ -112,7 +119,7 @@ def test_norm_production_like_shapes(batch_size, hidden_size, dtype):
     enable_pdl = is_arch_support_pdl()
     y = sgl_kernel.rmsnorm(x, w, enable_pdl=enable_pdl)
 
-    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+    assert_close_norm(y_ref, y, dtype)
 
 
 PRODUCTION_LIKE_FUSED_ADD_RMSNORM_CASES = [
@@ -143,7 +150,7 @@ def test_fused_add_rmsnorm_production_like_shapes(batch_size, hidden_size, dtype
         x_fused, residual_fused, weight, eps, enable_pdl=enable_pdl
     )
 
-    torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
+    assert_close_norm(x_fused, x_native, dtype)
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
 
 

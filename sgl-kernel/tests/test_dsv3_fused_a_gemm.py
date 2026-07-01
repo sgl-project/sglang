@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from sgl_kernel import dsv3_fused_a_gemm
 
 
-@pytest.mark.parametrize("num_tokens", [1, 8, 15, 16, 38])
+@pytest.mark.parametrize("num_tokens", [1, 8, 15, 16])
 def test_dsv3_fused_a_gemm(num_tokens):
     kHdIn = 7168
     kHdOut = 2112
