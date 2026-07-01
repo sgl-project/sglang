@@ -705,6 +705,11 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
+    hicache_kvtc_params: str = ""
+    hicache_kvtc_k_cr: float = 0.0
+    hicache_kvtc_v_cr: float = 0.0
+    hicache_kvtc_sliding_window: int = 0
+    dump_kv_path: str = ""
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -6589,6 +6594,38 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
+        )
+
+        # KVTC
+        parser.add_argument(
+            "--hicache-kvtc-params",
+            type=str,
+            default=ServerArgs.hicache_kvtc_params,
+            help="Path to KVTC calibration file",
+        )
+        parser.add_argument(
+            "--hicache-kvtc-k-cr",
+            type=float,
+            default=ServerArgs.hicache_kvtc_k_cr,
+            help="KVTC compression ratio of the K cache",
+        )
+        parser.add_argument(
+            "--hicache-kvtc-v-cr",
+            type=float,
+            default=ServerArgs.hicache_kvtc_v_cr,
+            help="KVTC compression ratio of the V cache",
+        )
+        parser.add_argument(
+            "--hicache-kvtc-sw",
+            type=int,
+            default=ServerArgs.hicache_kvtc_sliding_window,
+            help="KVTC sliding window size",
+        )
+        parser.add_argument(
+            "--dump-kv-path",
+            type=str,
+            default=ServerArgs.dump_kv_path,
+            help="Path for dumping KV-cache contents onto local storage",
         )
 
         # Hierarchical sparse attention
