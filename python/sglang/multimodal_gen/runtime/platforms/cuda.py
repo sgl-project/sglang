@@ -337,6 +337,12 @@ class CudaPlatformBase(Platform):
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SparseLinearAttentionBackend"
         elif selected_backend == AttentionBackendEnum.SAGE_SLA_ATTN:
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SageSparseLinearAttentionBackend"
+        elif selected_backend == AttentionBackendEnum.SM120_TRITON_ATTN:
+            if not cls.is_sm120():
+                raise ValueError(
+                    "sm120_triton_attn is only supported on SM12.x CUDA GPUs."
+                )
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sm120_triton_attn.SM120TritonAttentionBackend"
         elif selected_backend == AttentionBackendEnum.FA2:
             from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2 import (  # noqa: F401
                 FlashAttention2Backend,

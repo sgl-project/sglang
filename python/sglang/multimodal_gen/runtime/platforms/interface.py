@@ -36,6 +36,7 @@ class AttentionBackendEnum(enum.Enum):
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
     AITER_SAGE = enum.auto()
+    SM120_TRITON_ATTN = enum.auto()
     SLA_ATTN = enum.auto()
     SAGE_SLA_ATTN = enum.auto()
     LASER_ATTN = enum.auto()
