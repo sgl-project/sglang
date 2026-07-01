@@ -661,7 +661,7 @@ class Qwen3MoeAttention(nn.Module):
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
-        if not _is_npu:
+        if not _is_npu or torch.compiler.is_compiling():
             return self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,

@@ -15,6 +15,7 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
+from contextlib import nullcontext
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -1011,6 +1012,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
             or not self.attn_output_gate
+            or torch.compiler.is_compiling()
         ):
             q, k, v, gate = self.forward_prepare_native(
                 positions=positions,
@@ -1287,9 +1289,16 @@ class Qwen3_5ForCausalLM(nn.Module):
         # Pass through decoder layers
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
-            with get_global_expert_distribution_recorder().with_current_layer(
-                layer_idx
-            ):
+            ctx = (
+                nullcontext()
+                if get_global_server_args().cuda_graph_config is not None
+                and get_global_server_args().cuda_graph_config.prefill.backend
+                == Backend.TC_PIECEWISE
+                else get_global_expert_distribution_recorder().with_current_layer(
+                    layer_idx
+                )
+            )
+            with ctx:
                 hidden_states, residual = layer(
                     positions=positions,
                     hidden_states=hidden_states,

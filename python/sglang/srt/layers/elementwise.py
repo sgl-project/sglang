@@ -6,10 +6,11 @@ import triton.language as tl
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.layers.triton_ops.softcap import softcap_out as fused_softcap
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 
 # cast to float + softcap
@@ -597,6 +598,15 @@ def fused_sigmoid_mul(
         head_dim = hidden_dim
         gate_stride_row = hidden_dim
         gate_stride_head = hidden_dim
+
+    if _is_npu and torch.compiler.is_compiling():
+        gate_reshaped = (
+            gate.view_as(attn_output) if gate.numel() == attn_output.numel() else gate
+        )
+        if inplace:
+            attn_output.mul_(torch.sigmoid(gate_reshaped))
+            return attn_output
+        return attn_output * torch.sigmoid(gate_reshaped)
 
     out = attn_output if inplace else torch.empty_like(attn_output)
     block_h = 1024 if num_tokens < 1024 else 2048

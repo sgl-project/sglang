@@ -1,7 +1,16 @@
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from sgl_kernel_npu.norm.l1_norm import l1_norm
+
+from sglang.srt.utils.custom_op import register_custom_op
+
+
+@register_custom_op(out_shape=0)
+def _l1_norm(x: torch.Tensor) -> torch.Tensor:
+    from sgl_kernel_npu.norm.l1_norm import l1_norm
+
+    return l1_norm(x)
+
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
@@ -37,7 +46,7 @@ def fused_topk_npu(
         )
 
         if renormalize:
-            topk_weights = l1_norm(
+            topk_weights = _l1_norm(
                 topk_weights
                 if topk_config.num_fused_shared_experts == 0
                 else topk_weights[:, :-1]

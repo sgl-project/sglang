@@ -173,6 +173,45 @@ def install_torch_compiled(
                 if val is not None:
                     _mark_dynamic_on_value(val, dims)
 
+        # The annotation-based dyn_map only marks dim 0 of top-level Tensor params,
+        # but the real token dimension isn't always dim 0 (e.g. mrope `positions` is
+        # [3, num_tokens] -> token dim is index 1) and tensors reached via
+        # forward_batch.<field> (input_ids/positions/out_cache_loc/...) aren't covered
+        # at all. Left unmarked they get specialized to the first captured bucket size,
+        # so a later bucket triggers a runtime dynamo recompile -> the piecewise graph
+        # re-captures on a live request, which on NPU corrupts order-sensitive
+        # mamba/linear recurrence (garbled spec-decoding output). Mark EVERY dim whose
+        # size == num_tokens dynamic, on both the top-level tensor args and the
+        # ForwardBatch tensor fields, so one dynamic graph covers all buckets and the
+        # init-captured graph is reused at runtime.
+        _ntok = None
+        _fb = None
+        for _v in ba.arguments.values():
+            if type(_v).__name__ == "ForwardBatch":
+                _fb = _v
+                _ref = getattr(_v, "input_ids", None)
+                if isinstance(_ref, torch.Tensor) and _ref.dim() >= 1:
+                    _ntok = _ref.shape[0]
+                break
+
+        def _mark_token_dims(_t):
+            if isinstance(_t, torch.Tensor) and _ntok is not None:
+                for _d in range(_t.dim()):
+                    if _t.shape[_d] == _ntok:
+                        torch._dynamo.maybe_mark_dynamic(_t, _d)
+            elif isinstance(_t, (list, tuple)):
+                for _item in _t:
+                    _mark_token_dims(_item)
+            elif isinstance(_t, dict):
+                for _item in _t.values():
+                    _mark_token_dims(_item)
+
+        if _ntok is not None:
+            for _v in ba.arguments.values():
+                _mark_token_dims(_v)
+            for _t in vars(_fb).values():
+                _mark_token_dims(_t)
+
         # Avoid cross-instance cache reuse
         torch._dynamo.eval_frame.remove_from_cache(unbound_fwd.__code__)
 

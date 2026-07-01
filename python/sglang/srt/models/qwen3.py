@@ -287,7 +287,7 @@ class Qwen3Attention(nn.Module):
                 positions, hidden_states, forward_batch
             )
             save_kv_cache = False
-        elif not _is_npu:
+        elif not _is_npu or torch.compiler.is_compiling():
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -425,8 +425,8 @@ class Qwen3DecoderLayer(nn.Module):
             ),
         )
         hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
-        if _is_npu and get_cmo_stream():
-            wait_cmo_stream()
+        if _is_npu and get_cmo_stream() is not None:
+            hidden_states = wait_cmo_stream(hidden_states)
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )

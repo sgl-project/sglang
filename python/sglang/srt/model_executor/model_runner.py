@@ -2731,7 +2731,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 elif hasattr(layer.self_attn, "attn_mqa"):
                     # For DeepSeek model
                     attn_layer = layer.self_attn.attn_mqa
-                    if _is_hip and hasattr(layer.self_attn, "attn_mha"):
+                    if (_is_hip or _is_npu) and hasattr(layer.self_attn, "attn_mha"):
                         attn_layer._pcg_mha_companion = layer.self_attn.attn_mha
             # For hybrid model
             elif hasattr(layer, "attn"):

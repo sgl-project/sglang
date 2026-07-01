@@ -470,7 +470,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output=topk_output,
         )
         if enable_dual_stream:
-            wait_share_stream()
+            final_hidden_states = wait_share_stream(final_hidden_states)
 
         if shared_output is not None:
             final_hidden_states.add_(shared_output)
