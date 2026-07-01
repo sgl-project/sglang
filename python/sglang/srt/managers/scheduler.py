@@ -2888,15 +2888,18 @@ class Scheduler(
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
-                if (
-                    not added
-                    and req.mamba_pool_idx is not None
-                    and not getattr(req, "session", None)
-                ):
-                    self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                        req.mamba_pool_idx.unsqueeze(-1)
-                    )
-                    req.mamba_pool_idx = None
+                if not added:
+                    # init_next_round_input() may stage deferred Mamba COW/clear
+                    # metadata before add_one_req() rejects the request.
+                    req.mamba_cow_src_index = None
+                    req.mamba_needs_clear = False
+                    if req.mamba_pool_idx is not None and not getattr(
+                        req, "session", None
+                    ):
+                        self.tree_cache.req_to_token_pool.mamba_allocator.free(
+                            req.mamba_pool_idx.unsqueeze(-1)
+                        )
+                        req.mamba_pool_idx = None
                 break
 
         if mamba_allocator is not None:
