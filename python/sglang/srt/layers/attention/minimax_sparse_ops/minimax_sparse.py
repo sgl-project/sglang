@@ -1,5 +1,6 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
+import logging
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -10,6 +11,20 @@ from .decode.flash_with_topk_idx import flash_decode_with_topk_idx
 from .decode.topk_sparse import flash_decode_with_gqa_share_sparse
 from .prefill.flash_with_topk_idx import flash_prefill_with_topk_index
 from .prefill.topk_sparse import flash_prefill_with_gqa_share_sparse
+
+logger = logging.getLogger(__name__)
+_msa_fallback_warned = False
+
+
+def _warn_msa_fallback(err: Exception) -> None:
+    global _msa_fallback_warned
+    if _msa_fallback_warned:
+        return
+    logger.warning(
+        "MiniMax MSA backend is unavailable (%s); falling back to Triton sparse attention.",
+        err,
+    )
+    _msa_fallback_warned = True
 
 
 def minimax_sparse_prefill(
@@ -96,21 +111,42 @@ def minimax_sparse_prefill(
     # replaces this step; the indexer above is unchanged. MSA has no attn-sink
     # input, so keep the Triton path when sink is present.
     if use_msa and sink is None:
-        from .msa import msa_sparse_prefill_main
+        from .msa import MSAUnavailableError, msa_sparse_prefill_main
 
-        o = msa_sparse_prefill_main(
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            topk_idx=topk_idx,
-            req_to_token=req_to_token,
-            slot_ids=slot_ids,
-            cu_seqlens=cu_seqlens,
-            seq_lens=seq_lens,
-            prefix_lens=prefix_lens,
-            block_size_k=block_size_k,
-            sm_scale=sm_scale,
-        )
+        try:
+            o = msa_sparse_prefill_main(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                topk_idx=topk_idx,
+                req_to_token=req_to_token,
+                slot_ids=slot_ids,
+                cu_seqlens=cu_seqlens,
+                seq_lens=seq_lens,
+                prefix_lens=prefix_lens,
+                block_size_k=block_size_k,
+                sm_scale=sm_scale,
+            )
+        except MSAUnavailableError as err:
+            _warn_msa_fallback(err)
+            o = flash_prefill_with_gqa_share_sparse(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                sink=sink,
+                req_to_token=req_to_token,
+                slot_ids=slot_ids,
+                topk_idx=topk_idx,
+                block_size_q=block_size_q,
+                block_size_k=block_size_k,
+                cu_seqlens=cu_seqlens,
+                seq_lens=seq_lens,
+                prefix_lens=prefix_lens,
+                max_seqlen_q=max_seqlen_q,
+                sm_scale=sm_scale,
+                cu_seqblocks_q=cu_seqblocks_q,
+                max_seqblock_q=max_seqblock_q,
+            )
     else:
         o = flash_prefill_with_gqa_share_sparse(
             q=q,
@@ -203,21 +239,36 @@ def minimax_sparse_decode(
         # Step 3: Sparse attention using topk index (main head). The MSA path
         # only replaces this step; keep the Triton path when sink is present.
         if use_msa and sink is None:
-            from .msa import msa_sparse_decode_main
+            from .msa import MSAUnavailableError, msa_sparse_decode_main
 
-            o = msa_sparse_decode_main(
-                q=q,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                topk_idx=topk_idx,
-                req_to_token=req_to_token,
-                slot_ids=slot_ids,
-                seq_lens=seq_lens,
-                block_size_k=block_size_k,
-                sm_scale=sm_scale,
-                kv_indices=msa_kv_indices,
-                plan=msa_plan,
-            )
+            try:
+                o = msa_sparse_decode_main(
+                    q=q,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    topk_idx=topk_idx,
+                    req_to_token=req_to_token,
+                    slot_ids=slot_ids,
+                    seq_lens=seq_lens,
+                    block_size_k=block_size_k,
+                    sm_scale=sm_scale,
+                    kv_indices=msa_kv_indices,
+                    plan=msa_plan,
+                )
+            except MSAUnavailableError as err:
+                _warn_msa_fallback(err)
+                o = flash_decode_with_gqa_share_sparse(
+                    q=q,
+                    sink=sink,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    req_to_token=req_to_token,
+                    seq_lens=seq_lens,
+                    slot_ids=slot_ids,
+                    block_size=block_size_k,
+                    topk_idx=topk_idx,
+                    sm_scale=sm_scale,
+                )
         else:
             o = flash_decode_with_gqa_share_sparse(
                 q=q,

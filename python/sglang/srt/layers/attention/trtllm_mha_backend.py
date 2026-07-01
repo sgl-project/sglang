@@ -23,7 +23,6 @@ from sglang.srt.layers.attention.triton_ops.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.layers.attention.utils import canonicalize_stride
-from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -287,17 +286,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         k_scale = self._get_scalar_scale(layer, "k_scale_float", "k_scale")
         v_scale = self._get_scalar_scale(layer, "v_scale_float", "v_scale")
         return q_scale * k_scale * layer.scaling, v_scale
-
-    def _maybe_quantize_q(
-        self, q: torch.Tensor, *, force_fp8: bool = False
-    ) -> tuple[torch.Tensor, float | torch.Tensor]:
-        if self.data_type != torch.float8_e4m3fn:
-            return q, 1.0
-        if self.is_xqa_impl and not force_fp8:
-            return q, 1.0
-
-        q_2d, q_scale = scaled_fp8_quant(q.reshape(-1, q.shape[-1]).contiguous(), None)
-        return q_2d.reshape(q.shape), q_scale
 
     def init_cuda_graph_state(
         self,
@@ -787,9 +775,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     layer.v_scale,
                 )
 
-        # For XQA, q_dtype should be bf16. TRT-LLM-GEN uses FP8 Q; dynamically
-        # quantize it and pass the descale into BMM1 instead of unscaled casting.
-        q, q_scale = self._maybe_quantize_q(q)
+        # For XQA, q_dtype should be bf16. For trtllm-gen,
+        # q_dtype should be FP8 when KV is in FP8.
+        q_scale = 1.0
+        if self.data_type == torch.float8_e4m3fn and not self.is_xqa_impl:
+            q = q.to(torch.float8_e4m3fn)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         # shape conversion:
@@ -870,9 +860,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     layer.v_scale,
                 )
 
-        q, q_scale = self._maybe_quantize_q(
-            q, force_fp8=not forward_batch.forward_mode.is_target_verify()
-        )
+        q_scale = 1.0
+        if self.data_type == torch.float8_e4m3fn and (
+            not self.is_xqa_impl or not forward_batch.forward_mode.is_target_verify()
+        ):
+            q = q.to(torch.float8_e4m3fn)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
