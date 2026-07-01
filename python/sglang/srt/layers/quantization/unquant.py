@@ -342,16 +342,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
 
         if _is_npu:
-            for weight_name in ["w13_weight", "w2_weight"]:
-                weight = getattr(layer, weight_name)
-                origin_weight = weight.data.transpose(1, 2)
-                new_weight = origin_weight.contiguous()
-                origin_weight.untyped_storage().resize_(0)
-                weight.data = npu_format_cast(new_weight)
-                if hasattr(layer, "dispatcher"):
-                    layer.dispatcher.set_quant_config(
-                        {"dispatcher_output_dtype": "bf16"}
-                    )
+            layer.w13_kernel.process_weights_after_loading(layer, "w13")
+            layer.w13_kernel.process_weights_after_loading(layer, "w2")
 
         return
 
