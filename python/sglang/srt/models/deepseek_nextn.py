@@ -110,7 +110,9 @@ class DeepseekModelNextN(nn.Module):
                 config.hidden_size,
                 bias=False,
                 quant_config=quant_config,
-                prefix=add_prefix("eh_proj", prefix),
+                # Layer-indexed prefix so the quark `exclude` (keyed
+                # "model.layers.<N>.eh_proj") matches and eh_proj stays bf16.
+                prefix=add_prefix(f"layers.{config.num_hidden_layers}.eh_proj", prefix),
             )
         else:
             self.eh_proj = nn.Linear(
@@ -308,7 +310,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 should_ignore_layer,
             )
 
-            ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
+            # Probe a concrete excluded sub-module (eh_proj); should_ignore_layer
+            # matches full module names, so the bare layer prefix never matches.
+            ckpt_prefix = f"model.layers.{config.num_hidden_layers}.eh_proj"
             mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
             if should_ignore_layer(mapped_prefix, nextn_quant_config.exclude_layers):
                 nextn_quant_config = None
