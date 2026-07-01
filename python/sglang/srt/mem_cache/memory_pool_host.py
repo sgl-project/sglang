@@ -111,7 +111,13 @@ class MHATokenToKVPoolHost(HostKVCache):
             allocator_type,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+        # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
+        # helpers in hicache.cuh are guarded by USE_ROCM and the staged
+        # write-back kernel has a ROCm path, so enable them on HIP too. This
+        # keeps the ROCm write-back path consistent with CUDA; without it, ROCm
+        # falls back to the C++ kernel that requires CUDA-resident destination
+        # indices and crashes when cache_controller keeps host indices on CPU.
+        self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
             element_size=self.element_dim * self.dtype.itemsize
         )
 
@@ -193,7 +199,13 @@ class MHATokenToKVPoolHost(HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
+        # The staged write-back JIT kernel builds with hipcc and has a ROCm path,
+        # so enable it on HIP too. This keeps the ROCm write-back path consistent
+        # with CUDA instead of falling back to the C++ kernel that requires
+        # device-resident destination indices.
+        self.can_use_write_back_jit = (
+            _is_cuda or _is_hip
+        ) and can_use_write_back_jit_kernel(
             element_size=self.element_dim * self.dtype.itemsize,
         )
         if not self.can_use_write_back_jit:
@@ -1282,7 +1294,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             device,
             allocator_type,
         )
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+        # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
+        # helpers in hicache.cuh are guarded by USE_ROCM and the staged
+        # write-back kernel has a ROCm path, so enable them on HIP too. This
+        # keeps the ROCm write-back path consistent with CUDA; without it, ROCm
+        # falls back to the C++ kernel that requires CUDA-resident destination
+        # indices and crashes when cache_controller keeps host indices on CPU.
+        self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize
         )
 
@@ -1402,7 +1420,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
+        # The staged write-back JIT kernel builds with hipcc and has a ROCm path,
+        # so enable it on HIP too. This keeps the ROCm write-back path consistent
+        # with CUDA instead of falling back to the C++ kernel that requires
+        # device-resident destination indices.
+        self.can_use_write_back_jit = (
+            _is_cuda or _is_hip
+        ) and can_use_write_back_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize,
         )
         if not self.can_use_write_back_jit:

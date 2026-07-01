@@ -37,44 +37,86 @@ inline constexpr auto get_mem_package() {
 template <int kUnit>
 using PackageType = decltype(get_mem_package<kUnit>());
 
+// NVIDIA exposes an explicit "do not allocate in L1" cache hint via PTX. ROCm
+// has no equivalent PTX, but non-temporal (streaming) loads/stores express the
+// same intent for one-shot HiCache write-back traffic that should not pollute
+// the cache. Guard the PTX behind USE_ROCM so the JIT module also compiles with
+// hipcc; see python/sglang/jit_kernel/utils.py for the ROCm build flags.
+#ifdef USE_ROCM
+// Native Clang vector types so a single __builtin_nontemporal_{load,store} maps
+// to one vectorized global_{load,store}_dwordx{2,4}. Issuing N independent
+// 32-bit nontemporal ops instead leaves merging to the LoadStoreVectorizer,
+// which is not guaranteed and may drop the nontemporal hint, throttling HiCache
+// bandwidth. uint2/uint4 already carry 8B/16B alignment matching the vector
+// types, so the pointer reinterpret_casts stay correctly aligned.
+typedef uint32_t native_uint2 __attribute__((ext_vector_type(2)));
+typedef uint32_t native_uint4 __attribute__((ext_vector_type(4)));
+#endif
+
 SGL_DEVICE uint1 load_nc(const uint1* __restrict__ src) {
+#ifndef USE_ROCM
   uint32_t tmp;
   asm volatile("ld.global.L1::no_allocate.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
   return uint1{tmp};
+#else
+  return uint1{__builtin_nontemporal_load(&src->x)};
+#endif
 }
 
 SGL_DEVICE uint2 load_nc(const uint2* __restrict__ src) {
+#ifndef USE_ROCM
   uint32_t tmp0, tmp1;
   asm volatile("ld.global.L1::no_allocate.v2.b32 {%0,%1},[%2];" : "=r"(tmp0), "=r"(tmp1) : "l"(src));
   return uint2{tmp0, tmp1};
+#else
+  native_uint2 tmp = __builtin_nontemporal_load(reinterpret_cast<const native_uint2*>(src));
+  return __builtin_bit_cast(uint2, tmp);
+#endif
 }
 
 SGL_DEVICE uint4 load_nc(const uint4* __restrict__ src) {
+#ifndef USE_ROCM
   uint32_t tmp0, tmp1, tmp2, tmp3;
   asm volatile("ld.global.L1::no_allocate.v4.b32 {%0,%1,%2,%3},[%4];"
                : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3)
                : "l"(src));
   return uint4{tmp0, tmp1, tmp2, tmp3};
+#else
+  native_uint4 tmp = __builtin_nontemporal_load(reinterpret_cast<const native_uint4*>(src));
+  return __builtin_bit_cast(uint4, tmp);
+#endif
 }
 
 SGL_DEVICE void store_nc(uint1* __restrict__ dst, const uint1& value) {
+#ifndef USE_ROCM
   uint32_t tmp = value.x;
   asm volatile("st.global.L1::no_allocate.b32 [%0],%1;" ::"l"(dst), "r"(tmp));
+#else
+  __builtin_nontemporal_store(value.x, &dst->x);
+#endif
 }
 
 SGL_DEVICE void store_nc(uint2* __restrict__ dst, const uint2& value) {
+#ifndef USE_ROCM
   uint32_t tmp0 = value.x;
   uint32_t tmp1 = value.y;
   asm volatile("st.global.L1::no_allocate.v2.b32 [%0],{%1,%2};" ::"l"(dst), "r"(tmp0), "r"(tmp1));
+#else
+  __builtin_nontemporal_store(__builtin_bit_cast(native_uint2, value), reinterpret_cast<native_uint2*>(dst));
+#endif
 }
 
 SGL_DEVICE void store_nc(uint4* __restrict__ dst, const uint4& value) {
+#ifndef USE_ROCM
   uint32_t tmp0 = value.x;
   uint32_t tmp1 = value.y;
   uint32_t tmp2 = value.z;
   uint32_t tmp3 = value.w;
   asm volatile(
       "st.global.L1::no_allocate.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(dst), "r"(tmp0), "r"(tmp1), "r"(tmp2), "r"(tmp3));
+#else
+  __builtin_nontemporal_store(__builtin_bit_cast(native_uint4, value), reinterpret_cast<native_uint4*>(dst));
+#endif
 }
 
 }  // namespace details
@@ -256,18 +298,18 @@ struct HiCacheKernel {
     TensorMatcher({-1, D})  //
         .with_strides({N, 1})
         .with_dtype(cache_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLROCM, kDLCUDAHost, kDLROCMHost, kDLCPU>()
         .verify(k_cache_src)
         .verify(v_cache_src);
     TensorMatcher({-1, D})  //
         .with_strides({M, 1})
         .with_dtype(cache_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLROCM, kDLCUDAHost, kDLROCMHost, kDLCPU>()
         .verify(k_cache_dst)
         .verify(v_cache_dst);
     TensorMatcher({L})  //
         .with_dtype<int32_t, int64_t>(indices_dtype)
-        .with_device<kDLCUDA>(indices_device)
+        .with_device<kDLCUDA, kDLROCM>(indices_device)
         .verify(indices_src)
         .verify(indices_dst);
 
@@ -323,14 +365,14 @@ struct HiCacheKernel {
 
     TensorMatcher({N})  //
         .with_dtype<uint64_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .verify(k_ptr_src)
         .verify(v_ptr_src)
         .verify(k_ptr_dst)
         .verify(v_ptr_dst);
     TensorMatcher({L})  //
         .with_dtype<int32_t, int64_t>(dtype_)
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .verify(indices_src)
         .verify(indices_dst);
 
@@ -381,16 +423,16 @@ struct HiCacheKernel {
     TensorMatcher({-1, D})  //
         .with_strides({N, 1})
         .with_dtype(cache_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLROCM, kDLCUDAHost, kDLROCMHost, kDLCPU>()
         .verify(cache_src);
     TensorMatcher({-1, D})  //
         .with_strides({M, 1})
         .with_dtype(cache_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLROCM, kDLCUDAHost, kDLROCMHost, kDLCPU>()
         .verify(cache_dst);
     TensorMatcher({L})  //
         .with_dtype<int32_t, int64_t>(indices_dtype)
-        .with_device<kDLCUDA>(indices_device)
+        .with_device<kDLCUDA, kDLROCM>(indices_device)
         .verify(indices_src)
         .verify(indices_dst);
 
@@ -441,12 +483,12 @@ struct HiCacheKernel {
 
     TensorMatcher({N})  //
         .with_dtype<uint64_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .verify(ptr_src)
         .verify(ptr_dst);
     TensorMatcher({L})  //
         .with_dtype<int32_t, int64_t>(dtype_)
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .verify(indices_src)
         .verify(indices_dst);
 
