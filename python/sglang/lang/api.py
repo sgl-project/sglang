@@ -1,5 +1,6 @@
 """Public APIs of the language."""
 
+import inspect
 import re
 from typing import Callable, List, Optional, Union
 
@@ -7,6 +8,7 @@ from sglang.global_config import global_config
 from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.choices import ChoicesSamplingMethod, token_length_normalized
 from sglang.lang.ir import (
+    AsyncSglFunction,
     SglExpr,
     SglExprList,
     SglFunction,
@@ -23,12 +25,22 @@ from sglang.lang.ir import (
 def function(
     func: Optional[Callable] = None, num_api_spec_tokens: Optional[int] = None
 ):
-    if func:
-        return SglFunction(func, num_api_spec_tokens=num_api_spec_tokens)
+    """Decorator that wraps functions as SglFunction or AsyncSglFunction
+
+    Auto-detects based on async def vs def:
+    - async def -> AsyncSglFunction (all methods are async)
+    - def -> SglFunction (all methods are sync)
+    """
 
     def decorator(func):
-        return SglFunction(func, num_api_spec_tokens=num_api_spec_tokens)
+        # Auto-detect based on async def vs def
+        if inspect.iscoroutinefunction(func):
+            return AsyncSglFunction(func, num_api_spec_tokens=num_api_spec_tokens)
+        else:
+            return SglFunction(func, num_api_spec_tokens=num_api_spec_tokens)
 
+    if func:
+        return decorator(func)
     return decorator
 
 
