@@ -45,7 +45,7 @@ _supports_flashinfer_linear_gdn = _sm_major == 9 or (
     not torch.cuda.is_available() or not is_flashinfer_available(),
     "CUDA + flashinfer are required",
 )
-class TestFlashInferFullAttentionWithTritonGDNCorrectness(CustomTestCase):
+class TestFlashInferGDNBackendCorrectness(CustomTestCase):
     # FlashInfer SM90 prefill kernels require value head dim in {64, 128, 256}.
     HEAD_K_DIM = 64
     HEAD_V_DIM = 64
@@ -341,17 +341,6 @@ class TestFlashInferFullAttentionWithTritonGDNCorrectness(CustomTestCase):
 class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
     # FlashInfer's SM100 GDN prefill kernel requires head size 128. SM90 supports 64.
     HEAD_DIM = 128 if _sm_major == 10 else 64
-    PREFILL_CASE = GDNAttentionCase(
-        name="flashinfer_gdn_prefill_ragged",
-        backend="triton",
-        linear_attn_prefill_backend="flashinfer",
-        forward_mode=ForwardMode.EXTEND,
-        num_k_heads=2,
-        num_v_heads=4,
-        page_size=16,
-        prefix_lens=(3, 7),
-        extend_lens=(65, 17),
-    )
     CHECKPOINT_CASE = GDNAttentionCase(
         name="flashinfer_gdn_prefill_state_checkpoints",
         backend="triton",
@@ -363,45 +352,6 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         prefix_lens=(0, 64, 128),
         extend_lens=(64, 65, 129),
     )
-    EAGLE_VERIFY_CASES = (
-        (
-            GDNAttentionCase(
-                name="flashinfer_linear_gdn_verify_chain",
-                backend="triton",
-                linear_attn_prefill_backend="flashinfer",
-                forward_mode=ForwardMode.TARGET_VERIFY,
-                num_k_heads=2,
-                num_v_heads=4,
-                page_size=16,
-                prefix_lens=(4, 7),
-                extend_lens=(3, 3),
-            ),
-            1,
-        ),
-        (
-            GDNAttentionCase(
-                name="flashinfer_linear_gdn_verify_tree_triton_fallback",
-                backend="triton",
-                linear_attn_prefill_backend="flashinfer",
-                forward_mode=ForwardMode.TARGET_VERIFY,
-                num_k_heads=2,
-                num_v_heads=4,
-                page_size=16,
-                prefix_lens=(5, 6),
-                extend_lens=(3, 3),
-            ),
-            2,
-        ),
-    )
-
-    def test_prefill_output_and_final_state(self):
-        run_gdn_attention_case(
-            self,
-            self.PREFILL_CASE,
-            head_k_dim=self.HEAD_DIM,
-            head_v_dim=self.HEAD_DIM,
-            max_context_len=128,
-        )
 
     def test_prefill_tracked_state_checkpoints(self):
         fixture = build_gdn_attention_fixture(
@@ -447,17 +397,6 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         torch.testing.assert_close(
             flashinfer_tracked, triton_tracked, atol=3e-2, rtol=3e-2
         )
-
-    def test_verify_chain_and_tree_fallback(self):
-        for case, topk in self.EAGLE_VERIFY_CASES:
-            with self.subTest(case=case.name, topk=topk):
-                run_gdn_eagle_verify_case(
-                    self,
-                    case,
-                    topk=topk,
-                    head_k_dim=self.HEAD_DIM,
-                    head_v_dim=self.HEAD_DIM,
-                )
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
+    GDNKernelDispatcher,
     _build_flashinfer_checkpoint_plan,
     maybe_set_default_flashinfer_gdn_prefill,
 )
@@ -163,6 +164,23 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             backend.init_forward_metadata(forward_batch)
 
         torch.testing.assert_close(metadata.conv_states_mask_indices, torch.tensor([7]))
+
+    def test_tree_verify_uses_triton_kernel(self):
+        dispatcher = object.__new__(GDNKernelDispatcher)
+        dispatcher.verify_kernel = MagicMock()
+        dispatcher.tree_verify_kernel = MagicMock()
+
+        tensor = sentinel.tensor
+        dispatcher.target_verify(
+            *([tensor] * 7),
+            ssm_states=tensor,
+            cache_indices=tensor,
+            query_start_loc=tensor,
+            retrieve_parent_token=sentinel.parent_token,
+        )
+
+        dispatcher.tree_verify_kernel.target_verify.assert_called_once()
+        dispatcher.verify_kernel.target_verify.assert_not_called()
 
 
 if __name__ == "__main__":
