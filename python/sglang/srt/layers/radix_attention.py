@@ -73,6 +73,7 @@ class RadixAttention(nn.Module):
         pos_encoding_mode: str = "NONE",
         logit_capping_method: str = "tanh",
         quant_config: Optional[QuantizationConfig] = None,
+        tp_rank: int = 0,
         attn_type: AttentionType = AttentionType.DECODER,
         use_irope: bool = False,
         prefix: str = "",
@@ -90,6 +91,7 @@ class RadixAttention(nn.Module):
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
         self.use_irope = use_irope
+        self.tp_rank = tp_rank
         self.k_scale = None
         self.v_scale = None
         self.k_scale_float = None
@@ -99,7 +101,12 @@ class RadixAttention(nn.Module):
         if quant_config is not None:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
         if self.quant_method is not None:
-            self.quant_method.create_weights(self)
+            self.quant_method.create_weights(
+                self,
+                head_size=self.head_dim,
+                num_kv_heads=self.tp_k_head_num,
+                tp_rank=self.tp_rank,
+            )
         self.attn_type = attn_type
 
         self.pos_encoding_mode = pos_encoding_mode

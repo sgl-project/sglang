@@ -1171,6 +1171,9 @@ class AscendAttnBackend(AttentionBackend):
 
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            if (k_cache.dtype != k.dtype) and (k_cache.dtype == torch.int8):
+                #dequant cache back to bf16 for prefill since FIA does not support pseudo-quant for seq_len > 16
+                k_cache, v_cache = layer.quant_method.anti_quant_int8(k_cache, v_cache, layer)
 
             if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
                 # Use SWA block tables if hybrid SWA is enabled for this layer
@@ -2290,6 +2293,10 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
+                key_antiquant_scale=layer.k_dequant_scale if hasattr(layer, 'k_dequant_scale') else None,
+                key_antiquant_offset=layer.k_quant_offset if hasattr(layer, 'k_quant_offset') else None,
+                value_antiquant_scale=layer.v_dequant_scale if hasattr(layer, 'v_dequant_scale') else None,
+                value_antiquant_offset=layer.v_quant_offset if hasattr(layer, 'v_quant_offset') else None,
                 atten_mask=attn_mask,
                 sparse_mode=0,
             )
@@ -2310,6 +2317,10 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
+                key_antiquant_scale=layer.k_dequant_scale if hasattr(layer, 'k_dequant_scale') else None,
+                key_antiquant_offset=layer.k_quant_offset if hasattr(layer, 'k_quant_offset') else None,
+                value_antiquant_scale=layer.v_dequant_scale if hasattr(layer, 'v_dequant_scale') else None,
+                value_antiquant_offset=layer.v_quant_offset if hasattr(layer, 'v_quant_offset') else None,
                 atten_mask=attn_mask,
                 sparse_mode=0,
                 workspace=workspace,
@@ -2572,6 +2583,10 @@ class AscendAttnBackend(AttentionBackend):
                     block_table=self.forward_metadata.block_tables,
                     actual_seq_lengths_kv=actual_seq_len_kv,
                     scale=layer.scaling,
+                    key_antiquant_scale=layer.k_dequant_scale if hasattr(layer, 'k_dequant_scale') else None,
+                    key_antiquant_offset=layer.k_quant_offset if hasattr(layer, 'k_quant_offset') else None,
+                    value_antiquant_scale=layer.v_dequant_scale if hasattr(layer, 'v_dequant_scale') else None,
+                    value_antiquant_offset=layer.v_quant_offset if hasattr(layer, 'v_quant_offset') else None,
                 )
                 if actual_bs != num_token_padding:
                     attn_output = torch.cat(

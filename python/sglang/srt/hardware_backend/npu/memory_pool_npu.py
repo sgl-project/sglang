@@ -184,17 +184,21 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
-        if cache_k.dtype != self.dtype:
-            if k_scale is not None:
-                cache_k.div_(k_scale)
-            if v_scale is not None:
-                cache_v.div_(v_scale)
-            cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
 
-        if self.store_dtype != self.dtype:
-            cache_k = cache_k.view(self.store_dtype)
-            cache_v = cache_v.view(self.store_dtype)
+        if cache_k.dtype != self.dtype:
+            if layer.quant_method:
+                cache_k, cache_v = layer.quant_method.apply(cache_k, cache_v, layer)
+            else:
+                if k_scale is not None:
+                    cache_k.div_(k_scale)
+                if v_scale is not None:
+                    cache_v.div_(v_scale)
+                cache_k = cache_k.to(self.dtype)
+                cache_v = cache_v.to(self.dtype)
+
+            if self.store_dtype != self.dtype:
+                cache_k = cache_k.view(self.store_dtype)
+                cache_v = cache_v.view(self.store_dtype)
 
         if self.use_fia:
             k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
