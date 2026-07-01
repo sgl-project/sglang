@@ -19,6 +19,9 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
+from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8 import (
+    is_quark_w8a8_fp8_layer,
+)
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.layers.utils.dcp_utils import (
@@ -290,6 +293,7 @@ class DeepseekMLAForwardMixin:
                     if (
                         _use_aiter_gfx95
                         and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
+                        and not is_quark_w8a8_fp8_layer(self.q_b_proj)
                     ):
                         if self.use_dsa:
                             q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
@@ -867,11 +871,17 @@ class DeepseekMLAForwardMixin:
                         self.w_vc.to(torch.bfloat16) * self.w_scale,
                     )
 
+            # quark o_proj quantizes activations itself; skip the group-128 fused
+            # flatten-quant and hand it a plain bf16 tensor.
+            o_proj_is_quark_fp8 = is_quark_w8a8_fp8_layer(self.o_proj)
             if _bmm_buf is not None:
                 # _bmm_buf is already (batch, heads, dim) contiguous
                 if self.o_proj.weight.dtype == torch.uint8:
                     attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)
-                elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+                elif (
+                    self.o_proj.weight.dtype == torch.float8_e4m3fn
+                    and not o_proj_is_quark_fp8
+                ):
                     attn_bmm_output = fused_flatten_fp8_group_quant(
                         _bmm_buf,
                         group_size=128,
@@ -883,7 +893,10 @@ class DeepseekMLAForwardMixin:
             elif self.o_proj.weight.dtype == torch.uint8:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
-            elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+            elif (
+                self.o_proj.weight.dtype == torch.float8_e4m3fn
+                and not o_proj_is_quark_fp8
+            ):
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_fp8_group_quant(
                     attn_bmm_output,

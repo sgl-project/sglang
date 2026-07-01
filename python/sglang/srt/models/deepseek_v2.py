@@ -2162,14 +2162,21 @@ class DeepseekV2DecoderLayer(nn.Module):
     def _detect_gfx95_quant_format(self) -> str:
         if not _is_gfx95_supported:
             return ""
-        weight = getattr(
-            getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None), "weight", None
-        )
+        proj = getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None)
+        weight = getattr(proj, "weight", None)
         if weight is None:
             return ""
         if weight.dtype == torch.uint8:
             return "mxfp4"
         if weight.dtype == getattr(torch, "float8_e4m3fn", None):
+            # quark fp8 quantizes activations itself; the group-128 fused
+            # RMSNorm+quant does not match its scheme, so use bf16 RMSNorm ("").
+            from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8 import (
+                is_quark_w8a8_fp8_layer,
+            )
+
+            if is_quark_w8a8_fp8_layer(proj):
+                return ""
             return "fp8"
         return ""
 
@@ -2940,6 +2947,27 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
 
 class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
     pass
+
+
+@register_custom_op(out_shape="hidden_states")
+def dsv2_flashinfer_moe_dual_stream_graph(
+    hidden_states: torch.Tensor,
+    layer_id: int,
+    should_allreduce_fusion: bool,
+    use_reduce_scatter: bool,
+) -> torch.Tensor:
+    forward_context = get_tc_piecewise_forward_context()
+    assert forward_context is not None
+    assert forward_context.moe_fusions is not None
+
+    moe_fusion = forward_context.moe_fusions[layer_id]
+    assert moe_fusion is not None
+    return moe_fusion.forward_normal_dual_stream(
+        hidden_states,
+        should_allreduce_fusion=should_allreduce_fusion,
+        use_reduce_scatter=use_reduce_scatter,
+        use_flashinfer_trtllm_bypass=True,
+    )
 
 
 @register_custom_op(out_shape="hidden_states")

@@ -517,6 +517,16 @@ class Indexer(MultiPlatformOp):
         enable_dual_stream: bool,
         forward_batch: ForwardBatch,
     ):
+        # fused_rms_fp8_group_quant with output_unquantized_inp1=True produces a
+        # (fp8, scale, bf16) 3-tuple; extract the bf16 for the unquantized wk layer.
+        if isinstance(x, tuple):
+            if len(x) >= 3:
+                x = x[2]
+            else:
+                raise ValueError(
+                    f"_get_q_k_bf16 received a {len(x)}-tuple; expected a plain tensor "
+                    "or a 3-tuple (fp8, scale, bf16) from fused_rms_fp8_group_quant."
+                )
         weights_raw = None
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
@@ -614,6 +624,16 @@ class Indexer(MultiPlatformOp):
         positions: torch.Tensor,
         enable_dual_stream: bool,
     ):
+        # fused_rms_fp8_group_quant with output_unquantized_inp1=True produces a
+        # (fp8, scale, bf16) 3-tuple; extract the bf16 for the unquantized wk layer.
+        if isinstance(x, tuple):
+            if len(x) >= 3:
+                x = x[2]
+            else:
+                raise ValueError(
+                    f"_get_k_bf16 received a {len(x)}-tuple; expected a plain tensor "
+                    "or a 3-tuple (fp8, scale, bf16) from fused_rms_fp8_group_quant."
+                )
         # Non-fusion path only; self.wk does not exist when fusion is on.
         key, _ = self.wk(x)
         key = self.k_norm(key)
