@@ -68,6 +68,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.reasoning_utils import resolve_require_reasoning
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -1762,70 +1763,18 @@ class OpenAIServingChat(OpenAIServingBase):
 
         NOTE: This is predefined based on model's chat template
         """
-        if not self.reasoning_parser:
-            return False
-
-        if self.reasoning_parser == "hunyuan":
-            # Hy3-preview template emits no <think> when reasoning_effort is
-            # "no_think" / "none" / unset; forcing reasoning would route all
-            # output into reasoning_content.
-            return request.reasoning_effort not in (None, "none", "no_think")
-
-        config = self.template_manager.reasoning_config
-        if config is None:
-            # Fallback to parser-level defaults when template toggle config
-            # cannot be inferred (e.g., parser-only <think> templates).
-            mode = (
-                self._reasoning_detector.reasoning_default
-                if self._reasoning_detector is not None
-                else None
-            )
-            if mode is None:
-                return False
-            if mode == "always":
-                return True
-            if mode == "mistral":
-                return (
-                    request.reasoning_effort is not None
-                    and request.reasoning_effort != "none"
-                )
-            if mode in ("thinking", "enable_thinking"):
-                return (
-                    not request.chat_template_kwargs
-                    or request.chat_template_kwargs.get(mode) is not False
-                )
-            if mode in ("explicit_thinking", "explicit_enable_thinking"):
-                toggle = mode.replace("explicit_", "")
-                return (
-                    request.chat_template_kwargs is not None
-                    and request.chat_template_kwargs.get(toggle) is True
-                )
-            logger.warning(
-                "Unknown reasoning_default mode '%s', defaulting to reasoning disabled",
-                mode,
-            )
-            return False
-
-        if config.special_case == "always":
-            return True
-
-        if config.special_case == "mistral":
-            return (
-                request.reasoning_effort is not None
-                and request.reasoning_effort != "none"
-            )
-
-        if config.toggle_param is None or config.default_enabled is None:
-            return False
-
-        if config.default_enabled:
-            return (
-                not request.chat_template_kwargs
-                or request.chat_template_kwargs.get(config.toggle_param) is not False
-            )
-        return (
-            request.chat_template_kwargs is not None
-            and request.chat_template_kwargs.get(config.toggle_param) is True
+        reasoning_default = (
+            self._reasoning_detector.reasoning_default
+            if self.template_manager.reasoning_config is None
+            and self._reasoning_detector is not None
+            else None
+        )
+        return resolve_require_reasoning(
+            self.reasoning_parser,
+            chat_template_kwargs=request.chat_template_kwargs,
+            reasoning_effort=request.reasoning_effort,
+            reasoning_config=self.template_manager.reasoning_config,
+            reasoning_default=reasoning_default,
         )
 
     async def _process_tool_call_stream(

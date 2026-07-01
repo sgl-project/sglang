@@ -2210,6 +2210,21 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(r, reasoning)
         self.assertEqual(t, tool_calls)
 
+    def test_qwen3_reasoning_dispatch_uses_shared_resolver(self):
+        tm = _MockTokenizerManager()
+        tm.server_args.reasoning_parser = "qwen3"
+        chat = OpenAIServingChat(tm, _MockTemplateManager())
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        self.assertFalse(chat._get_reasoning_from_request(req))
+
+        req.chat_template_kwargs = {"enable_thinking": True}
+        self.assertTrue(chat._get_reasoning_from_request(req))
+
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
     """Test _process_tool_calls with tool_choice='required' uses model-specific parser."""
