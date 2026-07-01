@@ -518,6 +518,8 @@ struct SiluAndMulContigPostQuantKernel {
     }
 
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    // Early exit for empty batch
+    if (num_tokens == 0) return;
 
     const auto params = SiluMulQuantContigParams{
         .input = static_cast<const bf16_t*>(input.data_ptr()),
