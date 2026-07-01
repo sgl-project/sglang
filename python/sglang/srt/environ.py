@@ -898,6 +898,11 @@ class Envs:
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
 
+    SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT = EnvBool(True)
+    SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
+    SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
+    SGLANG_DISABLE_MSA = EnvBool(False)
+
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
 
