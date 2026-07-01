@@ -14,6 +14,79 @@ def transform_index_page_table_decode(**kwargs):
 
 
 @triton.jit
+def write_dsa_only_k_topk_paged_kernel(
+    page_table_ptr,
+    lengths_ptr,
+    token_to_batch_idx_ptr,
+    out_ptr,
+    valid_rows,
+    page_table_stride,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col_block_id = tl.program_id(1)
+    col = col_block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    col_mask = col < TOPK
+    row_valid = row < valid_rows
+
+    length = tl.load(lengths_ptr + row, mask=row_valid, other=0)
+    batch_idx = tl.load(token_to_batch_idx_ptr + row, mask=row_valid, other=0)
+    in_range = row_valid & (col < length)
+    values = tl.load(
+        page_table_ptr + batch_idx * page_table_stride + col,
+        mask=col_mask & in_range,
+        other=-1,
+    )
+    tl.store(out_ptr + row * TOPK + col, values, mask=col_mask)
+
+
+def write_dsa_only_k_topk_paged(
+    *,
+    page_table: torch.Tensor,
+    lengths: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    output: torch.Tensor,
+    topk: int,
+) -> torch.Tensor:
+    """Write the DSA only-k paged top-k result directly into ``output``.
+
+    This covers the fast path where every row length is <= topk, so the result is
+    just the first ``length`` entries from the per-batch page table and -1
+    padding. It intentionally bypasses dummy logits and the generic top-k op.
+    """
+    assert topk == output.shape[1]
+    assert page_table.dim() == 2 and page_table.stride(1) == 1
+    assert lengths.dim() == 1 and lengths.is_contiguous()
+    assert token_to_batch_idx.dim() == 1 and token_to_batch_idx.is_contiguous()
+    assert token_to_batch_idx.shape[0] >= lengths.shape[0]
+    assert lengths.shape[0] <= output.shape[0]
+    assert output.dim() == 2 and output.is_contiguous()
+    assert output.dtype == torch.int32
+    assert page_table.dtype == torch.int32
+    assert lengths.dtype == torch.int32
+    assert token_to_batch_idx.dtype == torch.int32
+
+    if output.numel() == 0:
+        return output
+
+    block_size = 1024
+    grid = (output.shape[0], triton.cdiv(topk, block_size))
+    write_dsa_only_k_topk_paged_kernel[grid](
+        page_table,
+        lengths,
+        token_to_batch_idx,
+        output,
+        valid_rows=lengths.shape[0],
+        page_table_stride=page_table.stride(0),
+        TOPK=topk,
+        BLOCK_SIZE=block_size,
+        num_warps=8,
+    )
+    return output
+
+
+@triton.jit
 def transform_index_page_table_decode_kernel(
     page_table_ptr: torch.Tensor,
     topk_indices_ptr: torch.Tensor,

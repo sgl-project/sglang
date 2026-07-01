@@ -14,6 +14,8 @@ from sglang.jit_kernel.fused_store_index_cache import (
 )
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+from sglang.srt.layers.attention.dsa.transform_index import write_dsa_only_k_topk_paged
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     is_dsa_enable_prefill_cp,
@@ -289,10 +291,49 @@ class BaseIndexerMetadata(ABC):
         Return: extend seq lens for each batch.
         """
 
-    def get_token_to_batch_idx(self) -> torch.Tensor:
+    def get_token_to_batch_idx(self) -> Optional[torch.Tensor]:
         """
         Return: batch idx for each token.
         """
+
+    def try_only_k_topk_paged_fused(
+        self,
+        topk: int,
+        *,
+        output: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """
+        Fill the K-only top-k result directly when the metadata/backend supports it.
+
+        Return None to make the caller fall back to the generic dummy-logits path.
+        """
+        if (
+            not _is_cuda
+            or not envs.SGLANG_DSA_FUSE_TOPK.get()
+            or getattr(self, "force_unfused_topk", False)
+            or getattr(self, "topk_transform_method", None) != TopkTransformMethod.PAGED
+        ):
+            return None
+
+        token_to_batch_idx = self.get_token_to_batch_idx()
+        if token_to_batch_idx is None:
+            return None
+
+        seq_lens_expanded = self.get_seqlens_expanded()
+        if output is None:
+            output = torch.empty(
+                (seq_lens_expanded.shape[0], topk),
+                dtype=torch.int32,
+                device=seq_lens_expanded.device,
+            )
+        write_dsa_only_k_topk_paged(
+            page_table=self.get_page_table_1(),
+            lengths=seq_lens_expanded,
+            token_to_batch_idx=token_to_batch_idx,
+            output=output,
+            topk=topk,
+        )
+        return output
 
     @abstractmethod
     def topk_transform(
@@ -1056,6 +1097,14 @@ class Indexer(MultiPlatformOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
+        assert (
+            seq_lens_expanded.shape[0] == q_offset
+        ), f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
+        assert (
+            topk_result.shape[0] >= q_offset
+        ), f"topk_result too short: {topk_result.shape[0]} < {q_offset}"
+        if topk_result.shape[0] > q_offset:
+            topk_result[q_offset:].fill_(-1)
         need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
             q_offset, k_offset, device_index
         )
@@ -1105,9 +1154,6 @@ class Indexer(MultiPlatformOp):
         if global_topk_offset is None:
             cu_seqlens_q_full = torch.ones(q_offset, dtype=torch.int32, device=device)
 
-        assert (
-            seq_lens_expanded.shape[0] == q_offset
-        ), f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
         if global_topk_offset is not None:
             assert (
                 global_topk_offset.shape[0] >= q_offset
@@ -1236,8 +1282,15 @@ class Indexer(MultiPlatformOp):
         if not return_indices:
             return None
 
-        # MLA: use dummy logits with topk kernel's fast path to generate indices
-        # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
+        # MLA K-only: PAGED metadata can write page-table-mapped prefix indices
+        # directly. Other metadata/backend combinations fall back to dummy logits.
+        fast_topk_result = metadata.try_only_k_topk_paged_fused(
+            self.index_topk,
+            output=topk_result,
+        )
+        if fast_topk_result is not None:
+            return fast_topk_result if topk_result is None else None
+
         seq_lens_expanded = metadata.get_seqlens_expanded()
         dummy_logits = torch.zeros(
             seq_lens_expanded.shape[0],
@@ -1249,6 +1302,7 @@ class Indexer(MultiPlatformOp):
         if topk_result is not None:
             # PCG/BCG: fill the valid prefix of the padded static buffer and
             # leave padded rows at the -1 sentinel.
+            topk_result.fill_(-1)
             topk_result[: raw_topk_result.shape[0]] = raw_topk_result
             return None
         return raw_topk_result
@@ -1679,15 +1733,19 @@ class Indexer(MultiPlatformOp):
             if weights_proj_lora:
                 raise RuntimeError(GRAPH_WEIGHTS_PROJ_LORA_ERROR)
             if return_indices:
-                topk_result = torch.full(
-                    (x.shape[0], self.index_topk),
-                    -1,
-                    device=x.device,
+                # The split op decides whether this replay is K-only from the
+                # real forward metadata. Allocate without clearing here so a
+                # capture-time dummy shape cannot force a redundant fill on the
+                # K-only path. The split op must write all valid rows and reset
+                # padded rows to -1 before the downstream graph reads this.
+                topk_result = torch.empty(
+                    (x_meta.shape[0], self.index_topk),
+                    device=x_meta.device,
                     dtype=torch.int32,
                 )
             else:
                 topk_result = torch.empty(
-                    (0, self.index_topk), device=x.device, dtype=torch.int32
+                    (0, self.index_topk), device=x_meta.device, dtype=torch.int32
                 )
             graph_dispatch_fn = (
                 bcg_dsa_indexer_prefill_split
