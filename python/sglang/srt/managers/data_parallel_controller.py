@@ -196,12 +196,18 @@ class DataParallelController:
 
         self.init_dispatcher()
 
-        self.soft_watchdog = Watchdog.create(
-            debug_name="DataParallelController",
-            watchdog_timeout=server_args.soft_watchdog_timeout,
-            soft=True,
-            test_stuck_time=envs.SGLANG_TEST_STUCK_DP_CONTROLLER.get(),
-        )
+        if server_args.node_rank == 0:
+            self.soft_watchdog = Watchdog.create(
+                debug_name="DataParallelController",
+                watchdog_timeout=server_args.soft_watchdog_timeout,
+                soft=True,
+                test_stuck_time=envs.SGLANG_TEST_STUCK_DP_CONTROLLER.get(),
+            )
+        else:
+            self.soft_watchdog = Watchdog.create(
+                debug_name="DataParallelController",
+                watchdog_timeout=None,
+            )
 
         if server_args.enable_metrics:
             start_cpu_monitor_thread("data_parallel_controller")
