@@ -269,6 +269,10 @@ def _is_minimax(ctx):
     return ctx.has_text("<minimax:tool_call>")
 
 
+def _is_minimax_m3(ctx):
+    return ctx.has_text("<mm:think>") or ctx.has_text("]<]minimax[>[")
+
+
 def _is_minicpm5(ctx):
     if ctx.has_vocab("<function") and ctx.has_vocab("<param"):
         return True
@@ -336,6 +340,7 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
     DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
+    DetectionRule(name="minimax_m3", value="minimax-m3", predicate=_is_minimax_m3),
     DetectionRule(name="minimax", value="minimax", predicate=_is_minimax),
     DetectionRule(name="step3p5", value="step3p5", predicate=_is_step3p5),
     DetectionRule(name="step3", value="step3", predicate=_is_step3),
@@ -361,6 +366,7 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="gemma4", value="gemma4", predicate=_is_gemma4),
     DetectionRule(name="gpt_oss", value="gpt-oss", predicate=_is_gpt_oss),
     DetectionRule(name="kimi_k2", value="kimi_k2", predicate=_is_kimi_k2),
+    DetectionRule(name="minimax_m3", value="minimax-m3", predicate=_is_minimax_m3),
     DetectionRule(name="minimax", value="minimax-m2", predicate=_is_minimax),
     DetectionRule(name="interns1", value="interns1", predicate=_is_interns1),
     DetectionRule(name="mistral", value="mistral", predicate=_is_mistral),

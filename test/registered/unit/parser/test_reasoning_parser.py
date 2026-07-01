@@ -1306,6 +1306,96 @@ class TestMiniMaxAppendThinkDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "Second")
 
 
+class TestMiniMaxM3Detector(CustomTestCase):
+    """Test cases for MiniMaxM3Detector multi-turn stray-closer handling."""
+
+    def _detector(self, force_reasoning=False):
+        from sglang.srt.parser.reasoning_parser import MiniMaxM3Detector
+
+        return MiniMaxM3Detector(force_reasoning=force_reasoning)
+
+    def test_drops_leading_stray_close_non_stream(self):
+        """Non-thinking multi-turn reply opening with a stray </mm:think>."""
+        result = self._detector().detect_and_parse("</mm:think>The answer is 42.")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+        self.assertEqual(result.reasoning_text or "", "")
+
+    def test_drops_leading_stray_close_with_whitespace(self):
+        result = self._detector().detect_and_parse("\n</mm:think>Hello")
+        self.assertEqual(result.normal_text, "Hello")
+
+    def test_plain_reply_untouched(self):
+        result = self._detector().detect_and_parse("Just a normal answer.")
+        self.assertEqual(result.normal_text, "Just a normal answer.")
+
+    def test_real_reasoning_block_non_stream(self):
+        result = self._detector().detect_and_parse(
+            "<mm:think>reasoning here</mm:think>final"
+        )
+        self.assertEqual(result.reasoning_text, "reasoning here")
+        self.assertEqual(result.normal_text, "final")
+
+    def test_thinking_mode_close_not_dropped(self):
+        """force_reasoning=True means the closer ends reasoning, not a stray drop."""
+        result = self._detector(force_reasoning=True).detect_and_parse(
+            "reasoning</mm:think>answer"
+        )
+        self.assertEqual(result.reasoning_text, "reasoning")
+        self.assertEqual(result.normal_text, "answer")
+
+    def test_drops_leading_stray_close_stream_single_token(self):
+        detector = self._detector()
+        first = detector.parse_streaming_increment("</mm:think>")
+        self.assertEqual(first.normal_text or "", "")
+        second = detector.parse_streaming_increment("The answer.")
+        self.assertEqual(second.normal_text, "The answer.")
+
+    def test_drops_leading_stray_close_stream_after_whitespace(self):
+        """A leading whitespace token before the atomic </mm:think> is buffered."""
+        detector = self._detector()
+        self.assertEqual(detector.parse_streaming_increment(" ").normal_text or "", "")
+        self.assertEqual(
+            detector.parse_streaming_increment("</mm:think>").normal_text or "", ""
+        )
+        self.assertEqual(
+            detector.parse_streaming_increment("Hello").normal_text, "Hello"
+        )
+
+    def test_plain_reply_stream_untouched(self):
+        detector = self._detector()
+        out = detector.parse_streaming_increment("Hello")
+        self.assertEqual(out.normal_text, "Hello")
+
+    def test_minimax_m3_model_type(self):
+        from sglang.srt.parser.reasoning_parser import MiniMaxM3Detector
+
+        parser = ReasoningParser("minimax-m3")
+        self.assertIsInstance(parser.detector, MiniMaxM3Detector)
+
+    def test_force_nonempty_content_via_chat_template_kwargs(self):
+        """force_nonempty_content must reach the M3 detector without a TypeError."""
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionMessageUserParam,
+            ChatCompletionRequest,
+        )
+
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[ChatCompletionMessageUserParam(role="user", content="Hi")],
+            chat_template_kwargs={"force_nonempty_content": True},
+        )
+        parser = ReasoningParser("minimax-m3", request=request)
+        self.assertTrue(parser.detector._force_nonempty_content)
+
+    def test_force_nonempty_content_swaps_when_no_content(self):
+        from sglang.srt.parser.reasoning_parser import MiniMaxM3Detector
+
+        detector = MiniMaxM3Detector(force_reasoning=True, force_nonempty_content=True)
+        result = detector.detect_and_parse("only reasoning, no closer")
+        self.assertEqual(result.normal_text, "only reasoning, no closer")
+        self.assertEqual(result.reasoning_text or "", "")
+
+
 class TestReasoningParserAdvanced(CustomTestCase):
     """Additional tests for ReasoningParser init edge cases."""
 

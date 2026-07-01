@@ -3690,6 +3690,77 @@ class ServerArgs:
             self.dtype = "bfloat16"
 
         if model_arch in [
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
+        ]:
+            quant_method = get_quantization_config(hf_config)
+            if (
+                self.quantization is None
+                and not self._quantization_explicitly_unset
+                and quant_method is not None
+            ):
+                self.quantization = quant_method
+
+            if is_hip():
+                if self.is_attention_backend_not_set():
+                    self.attention_backend = "triton"
+                if self.moe_runner_backend == "auto" and self.quantization == "mxfp8":
+                    self.moe_runner_backend = "triton"
+                # AITER RoPE is lower precision; M3 sparse attention is accuracy-sensitive, so use native Apex RoPE.
+                os.environ.setdefault("USE_ROCM_AITER_ROPE_BACKEND", "0")
+                if (
+                    self.ep_size > 1
+                    and self.moe_a2a_backend == "none"
+                    and self.enable_aiter_allreduce_fusion
+                ):
+                    logger.warning(
+                        "Disable --enable-aiter-allreduce-fusion for MiniMax-M3 "
+                        "standard EP on ROCm because the deferred fused all-reduce "
+                        "corrupts sparse MoE partial outputs."
+                    )
+                    self.enable_aiter_allreduce_fusion = False
+                if not self.enable_aiter_allreduce_fusion:
+                    self.disable_custom_all_reduce = True
+            elif is_sm100_supported():
+                # fa4 (fmha_sm100) needs page_size == 128 sparse block (trtllm_mha pins 64);
+                # deep_gemm avoids the flashinfer_trtllm n_group != 0 assert on M3's top-k router.
+                if self.is_attention_backend_not_set():
+                    self.attention_backend = "fa4"
+                if self.page_size is None and self.attention_backend == "fa4":
+                    self.page_size = 128
+                if self.moe_runner_backend == "auto" and self.quantization == "mxfp8":
+                    self.moe_runner_backend = "deep_gemm"
+                logger.info(
+                    "MiniMax-M3 on SM100: attention_backend="
+                    f"{self.attention_backend}, page_size={self.page_size}, "
+                    f"moe_runner_backend={self.moe_runner_backend}."
+                )
+            elif is_sm90_supported():
+                # fmha_sm100 is SM100-only, so Hopper runs the sparse step on Triton;
+                # fa3 needs page_size == 128 sparse block (trtllm_mha pins 64).
+                if self.is_attention_backend_not_set():
+                    self.attention_backend = "fa3"
+                if self.page_size is None and self.attention_backend == "fa3":
+                    self.page_size = 128
+                logger.info(
+                    "MiniMax-M3 on Hopper: attention_backend="
+                    f"{self.attention_backend}, page_size={self.page_size} "
+                    "(MSA is SM100-only; sparse attention runs on the Triton path)."
+                )
+
+            # bf16: deep_gemm's grouped-masked GEMM is corrupt for M3 (only mxfp8 is validated), so pin triton.
+            if self.quantization is None and self.moe_runner_backend in (
+                "auto",
+                "deep_gemm",
+            ):
+                if self.moe_runner_backend == "deep_gemm":
+                    logger.warning(
+                        "MiniMax-M3: the deep_gemm MoE runner produces corrupted output "
+                        "on bf16 full weights; overriding --moe-runner-backend to 'triton'."
+                    )
+                self.moe_runner_backend = "triton"
+
+        if model_arch in [
             "DeepseekV4ForCausalLM",
         ]:
             from sglang.srt.arg_groups.deepseek_v4_hook import (
@@ -4063,9 +4134,9 @@ class ServerArgs:
                     )
                 elif is_sm120_supported() and is_mxfp4_quant_format:
                     # trtllm-gen only supports SM100
-                    self.moe_runner_backend = "marlin"
+                    self.moe_runner_backend = "triton_kernel"
                     logger.warning(
-                        "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling Marlin MOE kernel."
+                        "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling triton_kernel MOE kernel."
                     )
                 elif (
                     is_hip() and envs.SGLANG_USE_AITER.get()
@@ -4505,8 +4576,6 @@ class ServerArgs:
                 "Qwen3_5MoeForConditionalGeneration",
                 "InternS2PreviewForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
-                "NemotronHForCausalLM",
-                "NemotronHPuzzleForCausalLM",
             ]
             and (is_sm90_supported() or is_sm100_supported())
             and self.tp_size > 1
@@ -5355,15 +5424,32 @@ class ServerArgs:
                     "flashinfer_trtllm_routed."
                 )
         if self.quantization == "mxfp8":
-            if self.moe_runner_backend == "auto":
+            if is_hip():
+                if self.moe_runner_backend == "auto":
+                    self.moe_runner_backend = "triton"
+                elif self.moe_runner_backend not in [
+                    "triton",
+                    "cutlass",
+                    "deep_gemm",
+                    "flashinfer_trtllm",
+                    "flashinfer_trtllm_routed",
+                ]:
+                    logger.warning(
+                        "mxfp8 quantization on ROCm supports triton, cutlass, "
+                        "deep_gemm, flashinfer_trtllm, or flashinfer_trtllm_routed "
+                        f"backends. Overriding {self.moe_runner_backend!r}."
+                    )
+                    self.moe_runner_backend = "triton"
+            elif self.moe_runner_backend == "auto":
                 self.moe_runner_backend = "flashinfer_trtllm"
             elif self.moe_runner_backend not in [
                 "cutlass",
+                "deep_gemm",
                 "flashinfer_trtllm",
                 "flashinfer_trtllm_routed",
             ]:
                 logger.warning(
-                    "mxfp8 quantization supports only cutlass, flashinfer_trtllm, "
+                    "mxfp8 quantization supports only cutlass, deep_gemm, flashinfer_trtllm, "
                     "or flashinfer_trtllm_routed backends. "
                     f"Overriding {self.moe_runner_backend!r}."
                 )
