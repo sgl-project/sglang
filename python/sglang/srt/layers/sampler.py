@@ -255,6 +255,8 @@ class Sampler(nn.Module):
                     sampling_info.top_ks,
                     sampling_info.top_ps,
                     sampling_info.min_ps,
+                    sampling_info.need_top_k_sampling,
+                    sampling_info.need_top_p_sampling,
                     sampling_info.need_min_p_sampling,
                     sampling_info.sampling_seed,
                     positions,
@@ -484,6 +486,8 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     top_ks: torch.Tensor,
     top_ps: torch.Tensor,
     min_ps: torch.Tensor,
+    need_top_k_sampling: bool,
+    need_top_p_sampling: bool,
     need_min_p_sampling: bool,
     sampling_seed: Optional[torch.Tensor],
     positions: torch.Tensor,
@@ -493,37 +497,47 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     When sampling_seed is not None, deterministic inference will be enabled, it will sample
     with the sampling_seed of each request.
     """
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+    need_top_k_top_p_sampling = need_top_k_sampling or need_top_p_sampling
+    if need_top_k_top_p_sampling:
+        probs, probs_idx = probs.sort(dim=-1, descending=True)
+        probs_sum = torch.cumsum(probs, dim=-1)
+        probs[
+            torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
+            >= top_ks.view(-1, 1)
+        ] = 0.0
+        probs[(probs_sum - probs) > top_ps.view(-1, 1)] = 0.0
+        probs_max = probs[:, 0]
+    else:
+        probs_max = probs.max(dim=-1).values
 
     if need_min_p_sampling:
-        # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed
-        assert (
-            sampling_seed is None
-        ), "With sampling seed, multinomial_with_seed will provide wrong results"
-        min_p_thresholds = probs_sort[:, 0] * min_ps
-        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+        min_p_thresholds = probs_max * min_ps
+        probs[probs < min_p_thresholds.view(-1, 1)] = 0.0
 
     if sampling_seed is None:
-        sampled_index = torch.multinomial(probs_sort, num_samples=1)
+        sampled_index = torch.multinomial(probs, num_samples=1)
+        del probs
     else:
         # NOTE: when using top-k/top-p/min-p sampling, we need to modify probs before we
         # apply log to get logprobs. Therefore, we cannot use log_softmax directly.
         # For now, we use log to the modified probs to get logprobs, but for numerical
         # stability, we'd better come up with a solution to use log_softmax.
-        logprobs = probs_sort.to(torch.float64)  # Using float64 for numerical stability
-        del probs_sort
-        logprobs.log_()
+        probs = probs.to(torch.float64)  # Using float64 for numerical stability
+        logprobs = probs.div_(
+            probs.sum(dim=-1, keepdim=True)
+        ).log_()  # normalize and take log
+        del probs
         sampled_index = multinomial_with_seed(logprobs, sampling_seed, positions)
+        del logprobs
 
     # int32 range is enough to represent the token ids
-    probs_idx = probs_idx.to(torch.int32)
-    batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
+    if need_top_k_top_p_sampling:
+        probs_idx = probs_idx.to(torch.int32)
+        batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(
+            -1
+        )
+    else:
+        batch_next_token_ids = sampled_index.view(-1).to(torch.int32)
     return batch_next_token_ids
 
 
