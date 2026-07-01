@@ -8,6 +8,8 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
+from sglang.srt.server_args import get_global_server_args
+
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
@@ -773,8 +775,8 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
 
         weight_name = f"{weight_prefix}_weight"
-        server_args = get_global_server_args()
-        online_quant = server_args.online_quantization if server_args else None
+        #server_args = get_global_server_args()
+        #online_quant = server_args.online_quantization if server_args else None
         online_quant = "ascend_mxfp8"
         print(online_quant)
 
