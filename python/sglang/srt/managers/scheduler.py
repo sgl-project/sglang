@@ -2293,7 +2293,6 @@ class Scheduler(
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-
                 self.tree_cache.prefetch_from_storage(
                     req.rid,
                     last_host_node,
