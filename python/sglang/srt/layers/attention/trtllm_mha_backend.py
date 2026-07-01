@@ -166,6 +166,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "Use --kv-cache-dtype=nvfp4 or choose another decode backend "
                 "for fp4_mx_block16."
             )
+
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
         """Return the SWAKVPool to translate against, or None for non-SWA models.
@@ -746,7 +747,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         self.forward_metadata = metadata
 
-
     def _reshape_paged_kv_cache(
         self,
         k_cache: torch.Tensor,
@@ -769,9 +769,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def _get_nvfp4_bmm_scales(self, layer: RadixAttention) -> tuple[float, float]:
         return self.kv_cache_quant_method.get_bmm_scales(layer.layer_id)
 
-    def _get_nvfp4_decode_kv_cache(
-        self, layer: RadixAttention
-    ) -> tuple[
+    def _get_nvfp4_decode_kv_cache(self, layer: RadixAttention) -> tuple[
         tuple[torch.Tensor, torch.Tensor],
         tuple[torch.Tensor, torch.Tensor],
     ]:
@@ -820,14 +818,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
                     k,
                     v,
-                    None if self.is_nvfp4_kvcache else layer.k_scale,
-                    None if self.is_nvfp4_kvcache else layer.v_scale,
+                    *self._kv_write_scales(layer),
                 )
 
-        needs_fp8_query = not self.is_xqa_impl and (
-            self.data_type == torch.float8_e4m3fn or self.is_nvfp4_kvcache
-        )
-        if needs_fp8_query:
+        if self.data_type == torch.float8_e4m3fn and not self.is_xqa_impl:
             q = q.to(torch.float8_e4m3fn)
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
 
@@ -843,22 +837,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         q_scale = 1.0
         if self.is_nvfp4_kvcache:
             k_scale, v_scale = self._get_nvfp4_bmm_scales(layer)
+            bmm1_scale = q_scale * k_scale * layer.scaling
+            bmm2_scale = v_scale
         else:
-            k_scale = (
-                layer.k_scale_float
-                if getattr(layer, "k_scale_float", None) is not None
-                else 1.0
-            )
-            v_scale = 1.0
-        bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = v_scale
+            bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
         attention_sink = kwargs.get("sinks", None)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 
-        if self.is_xqa_impl and self.is_nvfp4_kvcache:
-            # The NVFP4 XQA path is validated with fp16 query/output.
-            q = q.to(torch.float16)
         o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q,
             kv_cache=kv_cache,
@@ -871,10 +857,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-            out_dtype=q.dtype if self.is_nvfp4_kvcache else self.q_data_type,
+            out_dtype=self.q_data_type,  # model_runner.dtype
             kv_cache_sf=kv_cache_block_scales,
         )
-        o = o.to(self.q_data_type)
+        if self.is_nvfp4_kvcache and o.dtype != self.q_data_type:
+            o = o.to(self.q_data_type)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

@@ -522,7 +522,6 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
-        self.page_size = model_runner.page_size
 
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[BaseSWAKVPool]:
@@ -857,6 +856,11 @@ class FlashInferAttnBackend(AttentionBackend):
             "cpu", non_blocking=True
         )
 
+    def _kv_write_scales(self, layer: RadixAttention):
+        if self.is_nvfp4_kvcache:
+            return None, None
+        return layer.k_scale, layer.v_scale
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -1145,8 +1149,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
                     k,
                     v,
-                    None if self.is_nvfp4_kvcache else layer.k_scale,
-                    None if self.is_nvfp4_kvcache else layer.v_scale,
+                    *self._kv_write_scales(layer),
                 )
 
             causal = (
@@ -1245,8 +1248,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
                     k,
                     v,
-                    None if self.is_nvfp4_kvcache else layer.k_scale,
-                    None if self.is_nvfp4_kvcache else layer.v_scale,
+                    *self._kv_write_scales(layer),
                 )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -1278,8 +1280,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
                     k,
                     v,
-                    None if self.is_nvfp4_kvcache else layer.k_scale,
-                    None if self.is_nvfp4_kvcache else layer.v_scale,
+                    *self._kv_write_scales(layer),
                 )
 
         # Call the wrapped function
@@ -1511,7 +1512,6 @@ class FlashInferIndicesUpdaterDecode:
 
         if use_sliding_window_kv_pool:
             assert self._swa_kv_pool is not None
-            assert custom_kv_indices is None, "custom_kv_indices incompatible with SWA"
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = (
                 self._swa_kv_pool.translate_loc_from_full_to_swa(

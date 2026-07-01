@@ -12,27 +12,20 @@
 # limitations under the License.
 # ==============================================================================
 """
-Canonical KV cache quantization methods.
+KV cache quantization strategy pattern.
 
-This module owns the public runtime abstraction for quantized KV cache storage:
-
-* ``KVCacheQuantMethodBase`` defines the buffer/quantize/dequantize contract.
-* ``NVFP4KVCacheMethod`` and ``FP4MXBlock16KVCacheMethod`` implement the two FP4 recipes exposed by
-  ``--kv-cache-dtype nvfp4`` and ``--kv-cache-dtype fp4_mx_block16``.
-* ``kvfp4_tensor.py`` contains only low-level tensor/FlashInfer helpers.
-
-Recipe selection is explicit. This file must not infer the FP4 recipe from the
-GPU architecture; hardware only affects per-recipe implementation details such
-as NVFP4 scale conversion.
+Three-player design:
+  quant_method (pure compute)  ►  Pool (buffer + batch dequant)  ►  Backend (view adaptation)
 """
 
 from abc import ABC, abstractmethod
 from typing import Optional
 
 import torch
+from torch import Tensor
+
 from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_MAX
 from sglang.srt.utils.common import is_sm100_supported
-from torch import Tensor
 
 
 class KVCacheQuantMethodBase(ABC):
@@ -155,7 +148,7 @@ class UnquantizedKVCacheMethod(KVCacheQuantMethodBase):
 class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
     """NVFP4 two-level scaling: global FP32 + per-block FP8 E4M3.
 
-    Supported on SM100 (B200) and SM120 (RTX 5090 / RTX PRO 6000 Blackwell).
+    Supported on SM100 and SM120.
     """
 
     name = "nvfp4"
@@ -441,7 +434,9 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
         k_scale=None,
         v_scale=None,
     ) -> None:
-        from sglang.srt.layers.quantization.kvfp4_tensor import FP4MXBlock16KVQuantizeUtil
+        from sglang.srt.layers.quantization.kvfp4_tensor import (
+            FP4MXBlock16KVQuantizeUtil,
+        )
 
         cache_k_fp4, cache_k_sf = FP4MXBlock16KVQuantizeUtil.batched_quantize(cache_k)
         cache_v_fp4, cache_v_sf = FP4MXBlock16KVQuantizeUtil.batched_quantize(cache_v)
@@ -459,7 +454,9 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
         v_scales: Tensor,
         layer_id: int,
     ) -> tuple[Tensor, Tensor]:
-        from sglang.srt.layers.quantization.kvfp4_tensor import FP4MXBlock16KVQuantizeUtil
+        from sglang.srt.layers.quantization.kvfp4_tensor import (
+            FP4MXBlock16KVQuantizeUtil,
+        )
 
         k_bf16 = FP4MXBlock16KVQuantizeUtil.batched_dequantize(k_fp4, k_scales)
         v_bf16 = FP4MXBlock16KVQuantizeUtil.batched_dequantize(v_fp4, v_scales)
