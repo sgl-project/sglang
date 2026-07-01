@@ -73,10 +73,8 @@ def free_swa_out_of_window_slots(
     page_size: int,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-    drop_page_margin: bool = False,
+    is_chunk_cache: bool = False,
 ) -> None:
-    from sglang.srt.environ import envs
-
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
     assert (
         req.cache_protected_len % page_size == 0
@@ -86,16 +84,16 @@ def free_swa_out_of_window_slots(
         evict_floor = -(-evict_floor // page_size) * page_size
     req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, evict_floor)
 
-    # Subtract an extra page_size so the eviction frontier never reaches the
-    # radix tree insert boundary (page_floor(seq_len)). This keeps at least one
-    # page of non-evicted SWA KV for the tree to store as a non-tombstone node,
-    # preserving cache reuse in multi-turn scenarios. Without this, leaf nodes
-    # may become tombstoned, causing SWA memory leak.
-    # See also: _insert_helper case 3 in swa_radix_cache.py (defensive counterpart).
-    if drop_page_margin or envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
+    if is_chunk_cache:
+        # Chunk cache builds no radix tree, so no tombstone-leaf concern; evict
+        # up to the window boundary (the trailing floor keeps it page-aligned).
         evict_threshold = pre_len - sliding_window_size
     else:
-        evict_threshold = pre_len - sliding_window_size - page_size
+        # Radix cache: keep max(window, page). The trailing floor page-aligns the
+        # frontier, and subtracting at least one page keeps it below the insert
+        # boundary (page_floor(seq_len)) so the last leaf is never all-tombstone.
+        # No extra page margin is needed.
+        evict_threshold = pre_len - max(sliding_window_size, page_size)
     new_swa_evicted_seqlen = max(
         req.swa_evicted_seqlen,
         evict_threshold,
