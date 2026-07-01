@@ -84,9 +84,14 @@ class FanOutCommunicator(Generic[T]):
             return await self.watching_call(obj)
 
     def handle_recv(self, recv_obj: T):
-        self._result_values.append(recv_obj)
-        if len(self._result_values) == self._fan_out:
-            self._result_event.set()
+        # Guard against stale late-arriving messages after the active call has
+        # already completed and cleared shared state. Without this, a delayed
+        # response from a previous round would AttributeError on append() and
+        # kill the TokenizerManager event loop.
+        if self._result_values is not None and self._result_event is not None:
+            self._result_values.append(recv_obj)
+            if len(self._result_values) == self._fan_out:
+                self._result_event.set()
 
     @staticmethod
     def merge_results(results):
