@@ -678,53 +678,53 @@
         },
         "zimage_image_t2i_fp8": {
             "stages_ms": {
-                "TextEncodingStage": 129.84,
-                "DenoisingStage": 634.42,
-                "InputValidationStage": 0.03,
-                "LatentPreparationStage": 0.11,
-                "TimestepPreparationStage": 17.42,
-                "DecodingStage": 9.46
+                "InputValidationStage": 0.04,
+                "TextEncodingStage": 131.15,
+                "LatentPreparationStage": 0.18,
+                "TimestepPreparationStage": 26.29,
+                "DenoisingStage": 959.66,
+                "DecodingStage": 125.62
             },
             "denoise_step_ms": {
-                "0": 33.35,
-                "1": 36.43,
-                "2": 66.88,
-                "3": 78.15,
-                "4": 78.0,
-                "5": 78.36,
-                "6": 78.48,
-                "7": 78.32,
-                "8": 73.36
+                "0": 115.4,
+                "1": 56.32,
+                "2": 111.77,
+                "3": 110.02,
+                "4": 111.43,
+                "5": 111.32,
+                "6": 110.77,
+                "7": 110.53,
+                "8": 118.39
             },
-            "expected_e2e_ms": 958.32,
-            "expected_avg_denoise_ms": 70.04,
-            "expected_median_denoise_ms": 81.35,
-            "estimated_full_test_time_s": 121.0
+            "expected_e2e_ms": 1247.73,
+            "expected_avg_denoise_ms": 106.22,
+            "expected_median_denoise_ms": 111.32,
+            "estimated_full_test_time_s": 123.7
         },
         "zimage_image_t2i_multi_lora": {
             "stages_ms": {
-                "TimestepPreparationStage": 24.93,
-                "DenoisingStage": 673.95,
-                "DecodingStage": 8.43,
-                "LatentPreparationStage": 0.1,
-                "TextEncodingStage": 129.4,
-                "InputValidationStage": 0.03
+                "InputValidationStage": 0.04,
+                "TextEncodingStage": 130.25,
+                "LatentPreparationStage": 0.12,
+                "TimestepPreparationStage": 26.5,
+                "DenoisingStage": 841.93,
+                "DecodingStage": 142.78
             },
             "denoise_step_ms": {
-                "0": 25.08,
-                "1": 35.42,
-                "2": 77.56,
-                "3": 83.39,
-                "4": 82.18,
-                "5": 83.1,
-                "6": 82.39,
-                "7": 83.34,
-                "8": 85.82
+                "0": 102.18,
+                "1": 40.06,
+                "2": 99.39,
+                "3": 100.33,
+                "4": 103.95,
+                "5": 93.48,
+                "6": 99.6,
+                "7": 99.38,
+                "8": 99.77
             },
-            "expected_e2e_ms": 1047.82,
-            "expected_avg_denoise_ms": 74.33,
-            "expected_median_denoise_ms": 86.33,
-            "estimated_full_test_time_s": 121.1
+            "expected_e2e_ms": 1145.53,
+            "expected_avg_denoise_ms": 93.12,
+            "expected_median_denoise_ms": 99.6,
+            "estimated_full_test_time_s": 162.1
         },
         "zimage_image_t2i_2_gpus": {
             "stages_ms": {
