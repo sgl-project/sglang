@@ -1355,12 +1355,10 @@ class TestGrpcServerArgs(CustomTestCase):
     def test_defaults_native_grpc_off_legacy_off(self):
         sa = self._args()
         sa._handle_deprecated_args()
-        self.assertIsNone(sa.grpc_port)  # native off
+        self.assertIsNone(sa.grpc_port)
         self.assertFalse(sa.smg_grpc_mode)
 
     def test_http_only_high_port_does_not_derive_grpc_port(self):
-        # JustinTong0323: HTTP-only launches must not derive port + 10000 (out of
-        # range for a high --port) — gRPC is off, so grpc_port stays None.
         sa = self._args(port=56000)
         sa._handle_deprecated_args()
         self.assertIsNone(sa.grpc_port)
@@ -1390,9 +1388,6 @@ class TestGrpcServerArgs(CustomTestCase):
         self.assertTrue(sa.smg_grpc_mode)
 
     def test_legacy_smg_takes_precedence_over_grpc_port(self):
-        # --smg-grpc-mode wins: grpc_port is the SMG port (not a native request),
-        # so the native-only validations do not fire. Keeping this non-erroring
-        # makes __post_init__ idempotent under the Ray path's replace() re-run.
         sa = self._args(grpc_port=50051, smg_grpc_mode=True)
         sa._handle_deprecated_args()
         self.assertTrue(sa.smg_grpc_mode)
