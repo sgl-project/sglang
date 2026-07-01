@@ -342,10 +342,23 @@ inline bool getEnvEnablePDL() {
 #ifndef USE_ROCM
 #define WARP_SIZE 32
 #else
-#if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
+#if defined(__HIP_DEVICE_COMPILE__)
+// Device pass: wave width follows the target arch (CDNA = 64, RDNA = 32).
+#if defined(__GFX9__)
 #define WARP_SIZE 64
 #else
 #define WARP_SIZE 32
+#endif
+#else
+// Host pass: target arch macros are not defined here, so take the wave width
+// from the build system (setup_rocm.py derives it from AMDGPU_TARGET).
+// Hardcoding 64 breaks wave32 targets: __launch_bounds__ is compiled with
+// WARP_SIZE = 32 while host-side dim3 launches use 64, so the launch is
+// rejected with hipErrorLaunchFailure on the first MoE forward pass.
+#ifndef SGL_KERNEL_WAVE_SIZE
+#define SGL_KERNEL_WAVE_SIZE 64
+#endif
+#define WARP_SIZE SGL_KERNEL_WAVE_SIZE
 #endif
 #endif
 

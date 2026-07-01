@@ -74,9 +74,9 @@ if torch.cuda.is_available():
 else:
     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
-if amdgpu_target not in ["gfx942", "gfx950"]:
+if amdgpu_target not in ["gfx942", "gfx950", "gfx1151"]:
     print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
+        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942', 'gfx950', or 'gfx1151'."
     )
     sys.exit(1)
 
@@ -90,6 +90,22 @@ fp8_macro = (
 # - gfx95x (MI350): LDS is larger (e.g. 160KB per CU) -> allow the original 128KB dynamic smem.
 topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 32 * 1024 * 4
 
+# Wavefront width for the target. CDNA (gfx9xx) is wave64; everything else
+# (RDNA gfx10xx/gfx11xx/gfx12xx) is wave32. Passed as a preprocessor define
+# so host and device passes agree on the value, since HIP's WARP_SIZE macro
+# disagrees host vs device on wave32 targets and breaks launch-bounds matching.
+cdna_targets = {
+    "gfx900",
+    "gfx906",
+    "gfx908",
+    "gfx90a",
+    "gfx940",
+    "gfx941",
+    "gfx942",
+    "gfx950",
+}
+sgl_wave_size = 64 if amdgpu_target in cdna_targets else 32
+
 hipcc_flags = [
     "-DNDEBUG",
     f"-DOPERATOR_NAMESPACE={operator_namespace}",
@@ -102,6 +118,7 @@ hipcc_flags = [
     "-DENABLE_FP8",
     fp8_macro,
     f"-DSGL_TOPK_DYNAMIC_SMEM_BYTES={topk_dynamic_smem_bytes}",
+    f"-DSGL_KERNEL_WAVE_SIZE={sgl_wave_size}",
 ]
 
 ext_modules = [
