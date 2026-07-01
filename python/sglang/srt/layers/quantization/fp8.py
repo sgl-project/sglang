@@ -1984,8 +1984,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # router logits directly (no separate apply_with_router_logits needed).
             # FlashInfer TRT-LLM routed backend consumes SGLang-computed
             # top-k ids/weights (packed into int32) instead of router logits.
-            global_num_experts = int(getattr(layer, "num_experts"))
-            num_local_experts = int(getattr(layer, "num_local_experts"))
+            nfse = int(getattr(layer, "num_fused_shared_experts", 0))
+            global_num_experts = int(getattr(layer, "num_experts")) - nfse
+            num_local_experts = int(getattr(layer, "num_local_experts")) - nfse
             moe_ep_rank = int(getattr(layer, "moe_ep_rank"))
 
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
