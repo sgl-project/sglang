@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import numpy as np
 import torch
+import torch_npu
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
@@ -429,8 +430,8 @@ class NPUW8A8Mxfp8MoEMethod(_NPUMoEMethodBase):
         scale_args: Dict[str, Any] = {
             "scale": [weight_scale],
             "per_token_scale": [pertoken_scale],
-            "scale_dtype": torch.float8_e8m0fnu,
-            "per_token_scale_dtype": torch.float8_e8m0fnu,
+            "scale_dtype": getattr(torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None)),
+            "per_token_scale_dtype": getattr(torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None)),
         }
     
         return self.matmul.forward(
