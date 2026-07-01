@@ -319,7 +319,20 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 Lfm2MoeConfig,
                 Lfm2VlConfig,
             )
-            if isinstance(runner.mamba2_config, short_conv_cfgs) and not is_npu():
+            if isinstance(runner.mamba2_config, short_conv_cfgs):
+                if is_npu():
+                    # The model conv layers call
+                    # get_attn_backend().conv_state_metadata() unconditionally,
+                    # but the Ascend hybrid/mamba backend has no such method.
+                    # Fail here (before model execution) with a clear message
+                    # rather than an AttributeError deep in the first conv layer.
+                    raise NotImplementedError(
+                        "Short-conv hybrid models (ZAYA1 CCA, LFM2 / LFM2-MoE) "
+                        "are not yet supported on NPU: the conv-state sidecar "
+                        "(ShortConvAttnBackend.conv_state_metadata) has no Ascend "
+                        "implementation. Add an Ascend conv-state backend before "
+                        "serving these models on NPU."
+                    )
                 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
                     ShortConvHybridAttnBackend,
                 )

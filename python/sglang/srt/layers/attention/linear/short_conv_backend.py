@@ -106,28 +106,46 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         self._slot_ids_cpu = None
         self._has_prefix_cpu = None
 
-    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        super().init_cuda_graph_state(max_bs, max_num_tokens)
-        # Parallel int64 index buffer, refilled in place per step on the decode
-        # graph path (see __init__ / init_forward_metadata_out_graph).
+    def _alloc_cache_indices_buf(self, max_bs: int):
+        # Persistent int64 index buffer, refilled in place per step so the
+        # captured (cuda or cpu) graph reads a stable address.
         self._cache_indices_buf = torch.empty(
             max_bs, dtype=torch.int64, device=self.device
         )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        # Builds self.forward_metadata (mamba_cache_indices, query_start_loc) and
-        # runs the deferred mamba clear/COW ops.
-        super().init_forward_metadata(forward_batch)
-
-        self._reset_step_state()
+    def _refresh_cache_indices(self):
+        # Resolve the int64 slot-index view ONCE per step, shared by every conv
+        # layer. When a graph index buffer is allocated and large enough, refill
+        # it IN PLACE and hand out a view -- the captured graph then reads a
+        # stable address that this (pre-replay) hook keeps current, so it is
+        # cuda- and cpu-graph safe. Otherwise (eager, or bs beyond the buffer)
+        # a fresh cast is fine.
         md = self.forward_metadata
-        # Cache the int64 slot indices ONCE per step. Eager path (no cuda graph),
-        # so a fresh cast is safe; conv_state_metadata reuses it across layers.
-        self._cache_indices = (
-            md.mamba_cache_indices.to(torch.long)
-            if md is not None and md.mamba_cache_indices is not None
-            else None
-        )
+        idx = md.mamba_cache_indices if md is not None else None
+        buf = self._cache_indices_buf
+        if idx is None:
+            self._cache_indices = None
+        elif buf is not None and idx.shape[0] <= buf.shape[0]:
+            n = idx.shape[0]
+            buf[:n].copy_(idx)
+            self._cache_indices = buf[:n]
+        else:
+            self._cache_indices = idx.to(torch.long)
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        super().init_cuda_graph_state(max_bs, max_num_tokens)
+        self._alloc_cache_indices_buf(max_bs)
+
+    def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
+        super().init_cpu_graph_state(max_bs, max_num_tokens)
+        self._alloc_cache_indices_buf(max_bs)
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        # Eager path (also the CPU-graph replay path). Builds
+        # self.forward_metadata and runs the deferred mamba clear/COW ops.
+        super().init_forward_metadata(forward_batch)
+        self._reset_step_state()
+        self._refresh_cache_indices()
         mode = forward_batch.forward_mode
         if (
             mode.is_extend()
@@ -144,27 +162,20 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
-        # Decode / cuda-graph replay path -- no extend prefix state.
+        # Decode cuda-graph capture + replay path -- no extend prefix state.
         super().init_forward_metadata_out_graph(forward_batch, in_capture)
         self._reset_step_state()
-        # Cache the int64 slot indices ONCE per step. This hook runs before every
-        # replay (and at capture), so refilling the persistent int64 buffer IN
-        # PLACE keeps the captured graph pointed at a stable address that always
-        # holds the current step's slots. conv_state_metadata reuses the view
-        # across all conv layers; no per-layer cast, and cuda-graph-safe.
-        md = self.forward_metadata
-        if (
-            md is not None
-            and md.mamba_cache_indices is not None
-            and self._cache_indices_buf is not None
-        ):
-            n = md.mamba_cache_indices.shape[0]
-            self._cache_indices_buf[:n].copy_(md.mamba_cache_indices)
-            self._cache_indices = self._cache_indices_buf[:n]
-        elif md is not None and md.mamba_cache_indices is not None:
-            self._cache_indices = md.mamba_cache_indices.to(torch.long)
-        else:
-            self._cache_indices = None
+        self._refresh_cache_indices()
+
+    def init_forward_metadata_capture_cpu_graph(self, *args, **kwargs):
+        # Decode CPU-graph capture path. The base fills forward_metadata but not
+        # the int64 view; without this the conv layers would capture a ``None``
+        # index (crash / corrupt state). Replay goes through init_forward_metadata
+        # and refills the SAME buffer, so the captured cpu graph reads a stable
+        # address kept current at replay.
+        super().init_forward_metadata_capture_cpu_graph(*args, **kwargs)
+        self._reset_step_state()
+        self._refresh_cache_indices()
 
     def conv_state_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
