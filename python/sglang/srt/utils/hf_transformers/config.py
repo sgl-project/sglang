@@ -13,6 +13,7 @@
 # ==============================================================================
 """Config loading utilities."""
 
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -51,6 +52,36 @@ def _apply_deepseek_ocr_overrides(config, model):
     config._name_or_path = model
 
 
+def _load_local_gfusion_config(model):
+    """Normalize stale local GFusion configs before Transformers v5 validation."""
+    try:
+        config_path = Path(model) / "config.json"
+    except TypeError:
+        return None
+    if not config_path.is_file():
+        return None
+
+    with config_path.open() as f:
+        config_dict = json.load(f)
+
+    if (config_dict.get("architectures") or [None])[0] != "GFusionForDiffusionLM":
+        return None
+
+    routed_scaling_factor = config_dict.get("routed_scaling_factor")
+    if isinstance(routed_scaling_factor, int) and not isinstance(
+        routed_scaling_factor, bool
+    ):
+        config_dict["routed_scaling_factor"] = float(routed_scaling_factor)
+
+    model_type = config_dict.pop("model_type", None)
+    if model_type is None:
+        return None
+
+    config = AutoConfig.for_model(model_type, **config_dict)
+    config._name_or_path = model
+    return config
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -60,12 +91,14 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = AutoConfig.from_pretrained(
-            model,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
+        config = _load_local_gfusion_config(model)
+        if config is None:
+            config = AutoConfig.from_pretrained(
+                model,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
 
         if (
             config.architectures is not None

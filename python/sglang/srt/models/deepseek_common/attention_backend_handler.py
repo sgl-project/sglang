@@ -113,6 +113,8 @@ def handle_attention_flashinfer(attn, forward_batch):
 
 
 def handle_attention_fa3(attn, forward_batch):
+    if forward_batch.forward_mode.is_dllm_extend():
+        return _dispatch_mla_subtype(attn, forward_batch)
     # when deterministic inference is enabled, use MLA
     if get_global_server_args().enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)

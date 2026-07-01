@@ -2604,6 +2604,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             },
         )
         role = "draft" if self.is_draft_worker else "target"
+        dllm_config = None
+        if self.server_args.dllm_algorithm is not None:
+            from sglang.srt.dllm.config import DllmConfig
+
+            dllm_config = DllmConfig.from_server_args(self.server_args)
+
         if self.spec_algorithm.is_speculative():
             capture_name = f"{role} verify"
             num_tokens_per_bs = (
@@ -2612,6 +2618,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     self.is_draft_worker,
                 )
             )
+        elif dllm_config is not None:
+            capture_name = f"{role} dLLM extend"
+            num_tokens_per_bs = dllm_config.block_size
         else:
             capture_name = f"{role} decode"
             num_tokens_per_bs = 1

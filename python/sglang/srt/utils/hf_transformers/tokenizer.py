@@ -488,6 +488,13 @@ def get_tokenizer(
 
     tokenizer_name = _resolve_tokenizer_name(tokenizer_name, kwargs)
 
+    if "config" not in kwargs:
+        from .config import _load_local_gfusion_config
+
+        tokenizer_config = _load_local_gfusion_config(tokenizer_name)
+        if tokenizer_config is not None:
+            kwargs["config"] = tokenizer_config
+
     common_kwargs = dict(
         trust_remote_code=trust_remote_code,
         tokenizer_revision=tokenizer_revision,

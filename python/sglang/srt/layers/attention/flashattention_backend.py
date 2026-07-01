@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.triton_ops.metadata import (
     normal_decode_set_metadata,
@@ -255,6 +256,7 @@ class FlashAttentionBackend(AttentionBackend):
             model_runner.server_args.speculative_algorithm
         ).is_dflash()
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.attn_cp_size
 
@@ -370,6 +372,15 @@ class FlashAttentionBackend(AttentionBackend):
         self._disable_scheduler_metadata_precompute = bool(
             getattr(server_args, "enable_dp_attention", False)
         )
+
+    def _get_dllm_block_size(
+        self, batch_size: Optional[int] = None, num_tokens: Optional[int] = None
+    ) -> int:
+        if num_tokens is not None and batch_size is not None and batch_size > 0:
+            return num_tokens // batch_size
+        if self.dllm_config is not None:
+            return self.dllm_config.block_size
+        raise ValueError("dLLM block size requested for a non-dLLM batch.")
 
     def _compute_scheduler_metadata(
         self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q
@@ -763,6 +774,27 @@ class FlashAttentionBackend(AttentionBackend):
                     self._init_sliding_window_attn_spec_metadata(
                         metadata, metadata_expand
                     )
+
+        elif forward_batch.forward_mode.is_dllm_extend():
+            dllm_block_size = self._get_dllm_block_size(
+                batch_size=batch_size, num_tokens=forward_batch.input_ids.shape[0]
+            )
+            metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+            metadata.max_seq_len_q = dllm_block_size
+            metadata.max_seq_len_k = seq_lens_cpu.max().item()
+            metadata.cu_seqlens_q = torch.arange(
+                0,
+                batch_size * dllm_block_size + 1,
+                dllm_block_size,
+                dtype=torch.int32,
+                device=device,
+            )
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+            )
+            metadata.page_table = self.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, : metadata.max_seq_len_k
+            ]
 
         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
             include_draft_extend_v2=True
@@ -1789,6 +1821,32 @@ class FlashAttentionBackend(AttentionBackend):
                 0, self.max_context_len, self.page_size, device=self.device
             ),
         }
+        if self.dllm_config is not None:
+            self.dllm_extend_metadata = {
+                "cache_seqlens": torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                ),
+                "cu_seqlens_q": torch.arange(
+                    0,
+                    max_bs * self.dllm_config.block_size + 1,
+                    step=self.dllm_config.block_size,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "cu_seqlens_k": torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
+                ),
+                "page_table": torch.zeros(
+                    max_bs,
+                    max_num_pages,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "strided_indices": torch.arange(
+                    0, self.max_context_len, self.page_size, device=self.device
+                ),
+            }
+
         # Pre-allocate scheduler_metadata buffer for CUDA graph
         # Size: 1 (semaphore) + round_up(max_bs, 4) * 4 (causal decode vectors)
         if self._get_scheduler_metadata is not None and not self.use_mla:
@@ -2262,6 +2320,21 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
             self.draft_extend_metadata[bs] = metadata
 
+        elif forward_mode.is_dllm_extend():
+            dllm_block_size = self._get_dllm_block_size(bs, num_tokens)
+            metadata.cache_seqlens_int32 = self.dllm_extend_metadata["cache_seqlens"][
+                :bs
+            ]
+            metadata.max_seq_len_q = dllm_block_size
+            metadata.cu_seqlens_q = self.dllm_extend_metadata["cu_seqlens_q"][
+                : bs + 1
+            ]
+            metadata.cu_seqlens_k = self.dllm_extend_metadata["cu_seqlens_k"][
+                : bs + 1
+            ]
+            metadata.page_table = self.dllm_extend_metadata["page_table"][:bs, :]
+            self.dllm_extend_metadata[bs] = metadata
+
         if encoder_lens is not None:
             encoder_bs = encoder_lens.numel()
             metadata.encoder_lens_int32 = self.encoder_metadata["encoder_lens_int32"][
@@ -2656,11 +2729,35 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
 
+        elif forward_mode.is_dllm_extend():
+            metadata = self.dllm_extend_metadata[bs]
+            metadata.cache_seqlens_int32.copy_(seq_lens)
+            metadata.max_seq_len_q = self._get_dllm_block_size(batch_size=bs)
+            metadata.max_seq_len_k = self._host_max_seq_len(seq_lens_cpu, seq_lens)
+            metadata.cu_seqlens_k[0] = 0
+            metadata.cu_seqlens_k[1:].copy_(
+                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+            )
+            max_seq_pages = (
+                metadata.max_seq_len_k + self.page_size - 1
+            ) // self.page_size
+            strided_indices = self.dllm_extend_metadata["strided_indices"][
+                :max_seq_pages
+            ]
+            page_indices = self.req_to_token[
+                req_pool_indices[:, None],
+                strided_indices[None, :],
+            ]
+            metadata.page_table = self.dllm_extend_metadata["page_table"][
+                :bs, :max_seq_pages
+            ]
+            metadata.page_table.copy_(page_indices // self.page_size)
+
         else:
             raise ValueError(
                 f"FA3 `_apply_cuda_graph_metadata` only supports the modes the "
                 f"full cuda-graph runner captures (decode / idle / target_verify "
-                f"/ draft_extend / draft_extend_v2). Got {forward_mode=}. "
+                f"/ draft_extend / draft_extend_v2 / dllm_extend). Got {forward_mode=}. "
                 f"Piecewise / breakable capture must route through "
                 f"`init_forward_metadata(fb)` (the eager entry) instead of "
                 f"`init_forward_metadata_out_graph(fb, in_capture=True)`."

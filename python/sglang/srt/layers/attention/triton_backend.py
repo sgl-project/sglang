@@ -11,6 +11,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import get_dcp_group
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.triton_ops.kv_indices import (
@@ -204,6 +205,7 @@ class TritonAttnBackend(AttentionBackend):
             ]
             self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len
+        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
         self.static_kv_splits = get_bool_env_var(
@@ -298,6 +300,15 @@ class TritonAttnBackend(AttentionBackend):
         self.forward_metadata: ForwardMetadata = None
 
         self.cuda_graph_custom_mask = None
+
+    def _get_dllm_block_size(
+        self, batch_size: Optional[int] = None, num_tokens: Optional[int] = None
+    ) -> int:
+        if num_tokens is not None and batch_size is not None and batch_size > 0:
+            return num_tokens // batch_size
+        if self.dllm_config is not None:
+            return self.dllm_config.block_size
+        raise ValueError("dLLM block size requested for a non-dLLM batch.")
 
     def get_num_kv_splits(
         self,
@@ -573,6 +584,29 @@ class TritonAttnBackend(AttentionBackend):
         )
         return qo_indptr, kv_indptr, num_tokens_per_bs
 
+    def _update_dllm_extend_buffers(
+        self,
+        bs: int,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ):
+        """Fill QO + prefix-KV cuda-graph buffers for DLLM extend mode."""
+        seq_lens = seq_lens[:bs]
+        dllm_block_size = self._get_dllm_block_size(batch_size=bs)
+        qo_indptr = self.qo_indptr[: bs + 1]
+        qo_indptr[: bs + 1] = torch.arange(
+            0,
+            bs * dllm_block_size + 1,
+            step=dllm_block_size,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        prefix_lens = torch.clamp(seq_lens - dllm_block_size, min=0).to(torch.int32)
+        kv_indptr = self._fill_kv_indptr_and_indices(
+            bs, prefix_lens, req_pool_indices, self.cuda_graph_kv_indices
+        )
+        return qo_indptr, kv_indptr, dllm_block_size
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -746,6 +780,65 @@ class TritonAttnBackend(AttentionBackend):
             custom_mask = None
             mask_indptr = None
             max_extend_len = None
+        elif forward_batch.forward_mode.is_dllm_extend():
+            dllm_block_size = self._get_dllm_block_size(
+                batch_size=bs, num_tokens=forward_batch.input_ids.shape[0]
+            )
+            prefix_lens = torch.clamp(
+                forward_batch.seq_lens - dllm_block_size, min=0
+            ).to(torch.int32)
+            if self.dcp_size > 1:
+                kv_indptr, kv_indices, _ = self._dcp_kv_indices(
+                    forward_batch.req_pool_indices,
+                    prefix_lens,
+                    self.kv_indptr,
+                )
+            else:
+                if forward_batch.seq_lens_cpu is not None:
+                    kv_indices_len = sum(
+                        max(int(seq_len) - dllm_block_size, 0)
+                        for seq_len in forward_batch.seq_lens_cpu[:bs]
+                    )
+                else:
+                    kv_indices_len = bs * self.max_context_len
+                kv_indices = torch.empty(
+                    kv_indices_len, dtype=torch.int64, device=self.device
+                )
+                kv_indptr = self._fill_kv_indptr_and_indices(
+                    bs, prefix_lens, forward_batch.req_pool_indices, kv_indices
+                )
+
+            if self.sliding_window_size is not None and self.sliding_window_size > 0:
+                (
+                    window_kv_indptr,
+                    window_kv_indices,
+                    window_kv_lens,
+                    window_kv_offsets,
+                ) = update_sliding_window_buffer(
+                    self.window_kv_indptr,
+                    self.req_to_token,
+                    self.sliding_window_size,
+                    prefix_lens,
+                    forward_batch.req_pool_indices,
+                    bs,
+                    self.device,
+                    self.token_to_kv_pool,
+                )
+
+            qo_indptr = torch.arange(
+                0,
+                bs * dllm_block_size + 1,
+                step=dllm_block_size,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            custom_mask = None
+            mask_indptr = None
+            attn_logits = None
+            attn_lse = None
+            max_extend_len = dllm_block_size
+            num_kv_splits = None
+
         elif forward_batch.forward_mode.is_target_verify():
             bs = len(forward_batch.req_pool_indices)
             qo_indptr = torch.arange(
@@ -1057,6 +1150,23 @@ class TritonAttnBackend(AttentionBackend):
                 window_kv_offsets=None,
                 swa_out_cache_loc=swa_out_cache_loc,
             )
+        elif forward_mode.is_dllm_extend():
+            return ForwardMetadata(
+                attn_logits=None,
+                attn_lse=None,
+                max_extend_len=self._get_dllm_block_size(batch_size=bs),
+                num_kv_splits=None,
+                kv_indptr=self.kv_indptr[: bs + 1],
+                kv_indices=self.cuda_graph_kv_indices,
+                qo_indptr=self.qo_indptr[: bs + 1],
+                custom_mask=None,
+                mask_indptr=None,
+                window_kv_indptr=self.window_kv_indptr[: bs + 1] if swa else None,
+                window_kv_indices=self.cuda_graph_window_kv_indices if swa else None,
+                window_num_kv_splits=None,
+                window_kv_offsets=self.cuda_graph_window_kv_offsets if swa else None,
+                swa_out_cache_loc=swa_out_cache_loc,
+            )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=} for CUDA Graph.")
 
@@ -1094,6 +1204,8 @@ class TritonAttnBackend(AttentionBackend):
             self._update_draft_extend_buffers(
                 bs, seq_lens, req_pool_indices, forward_mode, spec_info
             )
+        elif forward_mode.is_dllm_extend():
+            self._update_dllm_extend_buffers(bs, seq_lens, req_pool_indices)
         else:
             raise ValueError(
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."

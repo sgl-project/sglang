@@ -1158,6 +1158,9 @@ class Req(ReqDllmMixin):
         # avoiding an O(context) copy per prefill-batch build.
         token_ids_to_match = self.full_untruncated_fill_ids
         key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
+        if self.is_dllm() and key_limit is not None:
+            block_size = self.dllm_config.block_size
+            key_limit = (key_limit // block_size) * block_size
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
@@ -1181,6 +1184,24 @@ class Req(ReqDllmMixin):
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():
                 match_result = zero_match_result(tree_cache, match_result)
+            if self.is_dllm():
+                block_size = self.dllm_config.block_size
+                aligned_len = (len(match_result.device_indices) // block_size) * block_size
+                if aligned_len != len(match_result.device_indices):
+                    if aligned_len == 0:
+                        match_result = zero_match_result(tree_cache, match_result)
+                    else:
+                        match_result = tree_cache.match_prefix(
+                            MatchPrefixParams(
+                                key=RadixKey(
+                                    token_ids=token_ids_to_match,
+                                    extra_key=self.extra_key,
+                                    limit=aligned_len,
+                                ),
+                                req=self,
+                                cow_mamba=cow_mamba,
+                            )
+                        )
             (
                 self.prefix_indices,
                 self.last_node,

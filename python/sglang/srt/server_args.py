@@ -3690,6 +3690,7 @@ class ServerArgs:
         if model_arch in [
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
+            "GFusionForDiffusionLM",
             "KimiK25ForConditionalGeneration",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
@@ -3877,7 +3878,10 @@ class ServerArgs:
                     # models that share the same architecture class (e.g.
                     # Moonlight-16B-A3B) are purely BF16.  Check the actual
                     # safetensors header instead of assuming FP8 by arch name.
-                    if quant_method is None and model_arch in ["DeepseekV3ForCausalLM"]:
+                    if quant_method is None and model_arch in [
+                        "DeepseekV3ForCausalLM",
+                        "GFusionForDiffusionLM",
+                    ]:
                         if has_fp8_weights_in_checkpoint(self.model_path):
                             self.quantization = "fp8"
                             logger.info(
@@ -4482,6 +4486,7 @@ class ServerArgs:
             in [
                 "DeepseekV3ForCausalLM",
                 "DeepseekV32ForCausalLM",
+                "GFusionForDiffusionLM",
                 "GptOssForCausalLM",
                 "GlmMoeDsaForCausalLM",
                 "Glm4MoeForCausalLM",
@@ -6370,7 +6375,43 @@ class ServerArgs:
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
-        # On AMD/HIP, disable cuda graph for DLLM and use triton backend
+
+        if getattr(self, "speculative_algorithm", None) is not None:
+            raise ValueError(
+                "Diffusion LLM inference does not support speculative decoding. "
+                "--dllm-algorithm cannot be used together with --speculative-algorithm."
+            )
+
+        try:
+            model_arch = self.get_model_config().hf_config.architectures[0]
+        except Exception:
+            model_arch = None
+        is_gfusion = model_arch == "GFusionForDiffusionLM"
+
+        if is_gfusion:
+            allowed_backends = {"fa3", "triton"}
+            configured_backends = {
+                self.attention_backend,
+                self.prefill_attention_backend,
+                self.decode_attention_backend,
+            }
+            configured_backends.discard(None)
+
+            if is_npu():
+                raise ValueError(
+                    "GFusion DLLM inference only supports FA3 or Triton backends."
+                )
+            if not configured_backends:
+                self.attention_backend = "triton" if is_hip() else "fa3"
+                configured_backends = {self.attention_backend}
+            unsupported = configured_backends - allowed_backends
+            if unsupported:
+                raise ValueError(
+                    "GFusion DLLM inference only supports FA3 or Triton attention "
+                    f"backends, got {sorted(unsupported)}."
+                )
+
+        # On AMD/HIP, disable cuda graph for DLLM and use triton backend.
         if is_hip():
             if (
                 self.cuda_graph_config.decode.backend != Backend.DISABLED
@@ -6392,27 +6433,34 @@ class ServerArgs:
                     "Attention backend is overridden to 'ascend' when running on NPU for diffusion LLM inference."
                 )
                 self.attention_backend = "ascend"
-        elif self.cuda_graph_config.decode.backend != Backend.DISABLED:
+        elif (
+            not is_gfusion
+            and self.cuda_graph_config.decode.backend != Backend.DISABLED
+        ):
             if self.attention_backend != "flashinfer":
                 logger.warning(
                     "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
                 )
                 self.attention_backend = "flashinfer"
+
         if not self.disable_overlap_schedule:
             logger.warning(
                 "Overlap schedule is disabled because of using diffusion LLM inference"
             )
             self.disable_overlap_schedule = True
 
-        if not self.disable_radix_cache:
-            from sglang.srt.dllm.config import DllmConfig
+        from sglang.srt.dllm.config import DllmConfig
 
-            config = DllmConfig.from_server_args(self)
-            if self.page_size % config.block_size != 0:
-                logger.warning(
-                    f"Setting page size to {config.block_size} for diffusion LLM inference"
-                )
-                self.page_size = config.block_size
+        config = DllmConfig.from_server_args(self)
+        if self.page_size > config.block_size:
+            logger.warning(
+                f"Setting page size to {config.block_size} for diffusion LLM "
+                f"inference because page_size must not exceed the dLLM "
+                f"block size (previous page_size={self.page_size})."
+            )
+            self.page_size = config.block_size
+
+        if not self.disable_radix_cache:
             if self.enable_hierarchical_cache:
                 logger.warning(
                     "Hierarchical cache is disabled because of using diffusion LLM inference"
