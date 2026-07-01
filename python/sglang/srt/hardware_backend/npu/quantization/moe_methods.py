@@ -875,7 +875,8 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
     ) -> torch.Tensor:
         # If we have a hidden_states quantizer (online int8 or MXFP8),
         # dynamically quantise activations and build scale arguments.
-        print(self.hidden_states_quantizer)
+        print('hs_quantizer', self.hidden_states_quantizer)
+        print('pertoken_scale', pertoken_scale)
         if self.hidden_states_quantizer is not None:
             if pertoken_scale is None:
                 hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
