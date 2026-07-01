@@ -751,7 +751,7 @@ class NPUWNA16Int4MoEMethod(_NPUMoEMethodBase):
 # ---------------------------------------------------------------------------
 # NPUUnquantMoEMethod
 # ---------------------------------------------------------------------------
-class NPUUnquantMoEMethod(_NPUFusedMoEMethodBase):
+class NPUUnquantMoEMethod(_NPUMoEMethodBase):
     """
     Unquant / online dynamic quantised MoE.
 
