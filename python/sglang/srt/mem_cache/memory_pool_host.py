@@ -458,7 +458,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         return data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
-        return torch.zeros(
+        return torch.empty(
             (2, self.layer_num, self.page_size, self.head_num, self.head_dim),
             dtype=self.dtype,
             device=self.device,
@@ -890,7 +890,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         return data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
-        return torch.zeros(
+        return torch.empty(
             (self.layer_num, self.page_size, self.head_num, self.head_dim),
             dtype=self.dtype,
             device=self.device,
@@ -1603,7 +1603,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         return data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
-        return torch.zeros(
+        return torch.empty(
             (
                 self.layer_num,
                 self.page_size,
@@ -2192,7 +2192,7 @@ class MambaPoolHost(HostKVCache):
         return data_page.flatten() if flat else data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
-        return torch.zeros(
+        return torch.empty(
             self.page_size * self.size_per_token,
             dtype=torch.uint8,
             device=self.device,
@@ -2690,7 +2690,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         return data_page.flatten() if flat else data_page
 
     def get_dummy_flat_data_page(self):
-        return torch.zeros(
+        return torch.empty(
             (self.layer_num, self.item_bytes),
             dtype=self.dtype,
             device=self.device,
@@ -3053,7 +3053,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         return data_page.flatten() if flat else data_page
 
     def get_dummy_flat_data_page(self):
-        return torch.zeros(
+        return torch.empty(
             (self.layer_num, self.state_page_bytes),
             dtype=self.dtype,
             device=self.device,
@@ -3545,7 +3545,7 @@ class DSAIndexerPoolHost(HostKVCache):
         return data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
-        return torch.zeros(
+        return torch.empty(
             (self.layer_num, self.indexer_page_stride_size),
             dtype=self.indexer_dtype,
             device=self.device,
