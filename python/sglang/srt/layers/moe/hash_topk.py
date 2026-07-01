@@ -19,6 +19,7 @@ from sglang.srt.layers.moe.topk import (
     _mask_topk_ids_padded_region,
     _zero_topk_weights_padded_region,
 )
+from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import is_hip, is_npu
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ class HashTopK(nn.Module):
         self.routed_scaling_factor = routed_scaling_factor
         self.num_fused_shared_experts = num_fused_shared_experts
         self.score_func = scoring_func
+        self.allow_routed_experts_capture = True
         self.tid2eid = nn.Parameter(
             torch.empty(vocab_size, topk - num_fused_shared_experts, dtype=torch.int32),
             requires_grad=False,
@@ -73,6 +75,14 @@ class HashTopK(nn.Module):
                 "HashTopK + apply_routed_scaling_factor_on_output is not supported "
                 "with fused shared experts; pass --disable-shared-experts-fusion."
             )
+
+    def _capture_routed_experts_if_allowed(self, topk_ids: torch.Tensor) -> None:
+        if not self.allow_routed_experts_capture:
+            return
+        if (cap := get_global_experts_capturer()) is not None:
+            if self.layer_id is None:
+                raise RuntimeError("HashTopK routed-experts capture requires layer_id.")
+            cap.capture(layer_id=self.layer_id, topk_indices=topk_ids)
 
     def _init_default_tid2eid(self) -> None:
         topk = self.tid2eid.shape[1]
@@ -197,6 +207,8 @@ class HashTopK(nn.Module):
 
         if self.apply_routed_scaling_factor_on_output:
             topk_weights = topk_weights * self.routed_scaling_factor
+
+        self._capture_routed_experts_if_allowed(topk_ids)
 
         log2phy_prob = None
         if (
