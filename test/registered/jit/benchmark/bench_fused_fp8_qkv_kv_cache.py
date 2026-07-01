@@ -7,7 +7,7 @@ from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=6, suite="base-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
 
 FP8 = torch.float8_e4m3fn
 D = 128
