@@ -896,6 +896,7 @@
                     "pages": [
                       "docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_r1",
                       "docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_v3_2",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/glm_5_2",
                       "docs/hardware-platforms/ascend-npus/model-tutorials/glm_5_1",
                       "docs/hardware-platforms/ascend-npus/model-tutorials/kimi_k2_6",
                       "docs/hardware-platforms/ascend-npus/model-tutorials/minimax_m2_5",
