@@ -70,7 +70,9 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.layers.quantization.fp8_kernel import (
+    sglang_per_token_group_quant_fp8_dsv4_ue8m0,
+)
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -1084,15 +1086,14 @@ class MQALayer(nn.Module):
 
             T, G, D = o.shape
             R = self.o_lora_rank
-            o_fp8, o_s = sglang_per_token_group_quant_fp8(
+            o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_ue8m0(
                 o.reshape(T * G, D).contiguous(),
-                group_size=128,
-                scale_ue8m0=True,
+                num_dsv4_groups=G,
             )
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
-                (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
+                (o_fp8.view(T, G, D), o_s),
                 (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
                 output,
                 recipe=(1, 1, 128),

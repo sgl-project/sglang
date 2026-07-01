@@ -27,6 +27,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (  # noqa: E402
     fp8_max,
     fp8_min,
     sglang_per_token_group_quant_fp8,
+    sglang_per_token_group_quant_fp8_dsv4_ue8m0,
 )
 
 G = 128
@@ -211,6 +212,44 @@ def test_v2_jit_masked_matches_aot(num_experts, hidden, tokens_pad):
         x_q.view(torch.int8), q_ref.view(torch.int8)
     ), "masked fp8 differ"
     assert torch.equal(x_s, s_ref), "masked scales differ"
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    ("num_tokens", "num_dsv4_groups", "hidden"),
+    [(1, 4, 128), (2, 4, 128), (7, 8, 256), (16, 8, 512), (0, 8, 128)],
+)
+def test_v2_jit_dsv4_ue8m0_matches_current_layout_reference(
+    dtype, num_tokens, num_dsv4_groups, hidden
+):
+    torch.manual_seed(7000 + num_tokens * 31 + num_dsv4_groups * 7 + hidden)
+    if num_tokens == 0:
+        x = torch.empty(
+            num_tokens * num_dsv4_groups, hidden, device="cuda", dtype=dtype
+        )
+    else:
+        x = torch.randn(
+            num_tokens * num_dsv4_groups, hidden, device="cuda", dtype=dtype
+        )
+
+    q_ref, s_ref = sglang_per_token_group_quant_fp8(x, G, scale_ue8m0=True)
+    s_ref = (
+        s_ref.view(num_tokens, num_dsv4_groups, hidden // G)
+        .transpose(0, 1)
+        .contiguous()
+        .transpose(0, 1)
+    )
+
+    x_q, x_s = sglang_per_token_group_quant_fp8_dsv4_ue8m0(
+        x, num_dsv4_groups=num_dsv4_groups
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(x_q.view(torch.int8), q_ref.view(torch.int8)), "fp8 differ"
+    assert x_s.shape == s_ref.shape
+    assert x_s.stride() == s_ref.stride()
+    if num_tokens > 0:
+        assert torch.equal(x_s, s_ref), "DSV4 UE8M0 scales differ"
 
 
 if __name__ == "__main__":

@@ -36,6 +36,25 @@ def _jit_module(in_dtype: torch.dtype, out_dtype: torch.dtype, use_pdl: bool) ->
     )
 
 
+@cache_once
+def _jit_dsv4_module(
+    in_dtype: torch.dtype, out_dtype: torch.dtype, use_pdl: bool
+) -> Module:
+    args = make_cpp_args(in_dtype, out_dtype, use_pdl)
+    return load_jit(
+        "per_token_group_quant_8bit_v2_dsv4",
+        *args,
+        cuda_files=["gemm/per_token_group_quant_8bit_v2.cuh"],
+        cuda_wrappers=[
+            (
+                "per_token_group_quant_fp8_dsv4",
+                f"PerTokenGroupQuantFp8Dsv4Kernel<{args}>::run",
+            )
+        ],
+        extra_cuda_cflags=["--use_fast_math"],
+    )
+
+
 @register_custom_op(
     op_name="per_token_group_quant_8bit_v2",
     mutates_args=["output_q", "output_s"],
@@ -98,6 +117,37 @@ def _per_token_group_quant_8bit_v2_custom_op(
     )
 
 
+@register_custom_op(
+    op_name="per_token_group_quant_fp8_dsv4",
+    mutates_args=["output_q", "output_s"],
+)
+def _per_token_group_quant_fp8_dsv4_custom_op(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    group_size: int,
+    num_dsv4_groups: int,
+) -> None:
+    """Quantize FP8 and write rounded FP32 scales in DSV4 fp8-einsum layout."""
+    if input.numel() == 0:
+        return
+
+    hidden_dim_num_groups = output_q.shape[-1] // group_size
+    num_groups = input.numel() // group_size
+    module = _jit_dsv4_module(input.dtype, output_q.dtype, is_arch_support_pdl())
+    module.per_token_group_quant_fp8_dsv4(
+        input,
+        output_q,
+        output_s,
+        int(group_size),
+        int(num_groups),
+        int(hidden_dim_num_groups),
+        int(num_dsv4_groups),
+        int(output_s.stride(0)),
+        int(output_s.stride(1)),
+    )
+
+
 @debug_kernel_api
 def per_token_group_quant_8bit_v2(
     input: torch.Tensor,
@@ -127,4 +177,27 @@ def per_token_group_quant_8bit_v2(
         scale_ue8m0=scale_ue8m0,
         fuse_silu_and_mul=fuse_silu_and_mul,
         masked_m=masked_m,
+    )
+
+
+@debug_kernel_api
+def per_token_group_quant_fp8_dsv4(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    group_size: int,
+    num_dsv4_groups: int,
+) -> None:
+    """DSV4-specific JIT v2 quantization.
+
+    This uses the current v2 UE8M0 behavior: quantize with rounded power-of-two
+    scales and store those FP32 scales directly as ``(token, dsv4_group,
+    hidden_group)`` for ``deep_gemm.fp8_einsum``.
+    """
+    _per_token_group_quant_fp8_dsv4_custom_op(
+        input=input,
+        output_q=output_q,
+        output_s=output_s,
+        group_size=group_size,
+        num_dsv4_groups=num_dsv4_groups,
     )
