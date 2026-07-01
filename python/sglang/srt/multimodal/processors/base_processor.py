@@ -207,8 +207,16 @@ class BaseMultimodalProcessor(ABC):
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(os.environ.get("SGLANG_IO_WORKERS", 4))
         )
+        # ThreadedEngine runs the scheduler as a thread of this process;
+        # fork from a multi-threaded process can deadlock, so opt out of
+        # fork at this single sglang-owned subprocess entry point rather
+        # than monkey-patching ``mp.get_context`` globally.
+        if envs.SGLANG_THREADED_ENGINE.get():
+            cpu_mp_context = mp.get_context("spawn")
+        else:
+            cpu_mp_context = mp.get_context("fork")
         self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
-            mp_context=mp.get_context("fork"),
+            mp_context=cpu_mp_context,
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
         )
 

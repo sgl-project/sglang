@@ -986,6 +986,12 @@ class Envs:
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
     SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
 
+    # ThreadedEngine (free-threaded Python no-GIL path)
+    SGLANG_THREADED_ENGINE = EnvBool(False)
+    SGLANG_THREADED_ENGINE_ALLOW_FALLBACK = EnvBool(False)
+    SGLANG_SCHEDULER_CORES = EnvStr(None)
+    SGLANG_DETOKENIZER_CORES = EnvStr(None)
+
 
 envs = Envs()
 EnvField._allow_set_name = False
