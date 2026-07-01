@@ -27,7 +27,6 @@ dependencies = [
   "datasets",
   "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "distro",
-  "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "einops",
   "fastapi",
   "flash-attn-4==4.0.0b15",
@@ -94,6 +93,10 @@ url = "https://pypi.org/simple"
 default = true
 
 [project.optional-dependencies]
+# easydict is LGPL-3.0. It is not imported by sglang itself; it is only needed at
+# runtime by some trust_remote_code models (e.g. DeepSeek-OCR) so transformers' import
+# validation passes. Kept as an opt-in extra so the default install stays Apache-2.0 clean.
+remote-models = ["easydict"]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 diffusion = [
