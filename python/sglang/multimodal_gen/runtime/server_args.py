@@ -217,7 +217,8 @@ class ServerArgs(DisaggServerArgsMixin):
     layerwise_offload_components: list[str] | None = None
     dit_offload_prefetch_size: float = 0.0
     offload_during_compile: bool = True
-    _dit_offloaded_for_compile: bool = field(default=False, repr=False)
+    _offloaded_for_compile: bool = field(default=False, repr=False)
+    _offload_during_compile_keep: list = field(default_factory=list, repr=False)
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = False
@@ -971,13 +972,18 @@ class ServerArgs(DisaggServerArgsMixin):
         if (
             self.offload_during_compile
             and self.enable_torch_compile
-            and not self.is_dit_layerwise_offload_selected
             and not self.is_arg_explicitly_set("dit_layerwise_offload")
+            and not self.is_arg_explicitly_set("layerwise_offload_components")
             and not self.use_fsdp_inference
             and os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() != "true"
         ):
+            self._offload_during_compile_keep = (
+                normalize_layerwise_offload_components(self.layerwise_offload_components)
+                or []
+            )
             self.dit_layerwise_offload = True
-            self._dit_offloaded_for_compile = True
+            self.layerwise_offload_components = [LAYERWISE_OFFLOAD_ALL_COMPONENTS]
+            self._offloaded_for_compile = True
 
     def _adjust_layerwise_offload_components(self):
         explicitly_set_component_names = normalize_layerwise_offload_components(
@@ -1316,7 +1322,7 @@ class ServerArgs(DisaggServerArgsMixin):
             "--offload-during-compile",
             action=StoreBoolean,
             default=ServerArgs.offload_during_compile,
-            help="Offload the DiT layerwise during torch.compile warmup so max-autotune fits on tighter-memory GPUs, then restore it to resident for fast serving. Only applies when the DiT is not already offloaded by the user.",
+            help="Offload every layerwise-offloadable component during the torch.compile warmup so max-autotune fits on tighter-memory GPUs, then restore the normally-resident ones for fast serving. Skipped when offload is user-configured, or under cache-dit / FSDP.",
         )
 
         parser.add_argument(
