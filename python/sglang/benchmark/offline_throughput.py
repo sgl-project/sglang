@@ -284,7 +284,15 @@ def throughput_test_once(
         dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
         if not profile_steps:
             known_files = set(os.listdir(dir))
+        # With --profile-steps the scheduler auto-stops mid-run after N steps, so
+        # a second stop here raises "not in progress"; a run shorter than N steps
+        # never hit the target and still needs this explicit stop. Either way we
+        # must stop before monitor_trace_file, which loops forever waiting for a
+        # trace that would otherwise never be finalized.
+        try:
             backend.stop_profile()
+        except RuntimeError:
+            pass
         monitor_trace_file(known_files, dir)
 
     if backend_name == "runtime":

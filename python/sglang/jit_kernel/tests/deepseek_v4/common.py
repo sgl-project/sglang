@@ -103,7 +103,7 @@ class PagedContext:
             seq_lens=seq_lens_cpu,
             extend_lens=extend_lens_cpu,
             req_to_token=self.req_to_token,
-            full_to_swa=self.full_to_swa,
+            full_to_state=self.full_to_swa,
             swa_page_size=self.swa_page_size,
             ring_size=self.ring_size,
             num_q_tokens=num_q_tokens,
@@ -114,7 +114,7 @@ class PagedContext:
             compress_ratio=self.compress_ratio,  # type: ignore
             req_pool_indices=self.req_pool_indices,
             req_to_token=self.req_to_token,
-            full_to_swa=self.full_to_swa,
+            full_to_state=self.full_to_swa,
             seq_lens=seq_lens_gpu,
             swa_page_size=self.swa_page_size,
             ring_size=self.ring_size,
