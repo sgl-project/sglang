@@ -269,26 +269,41 @@ def get_processor(
     tokenizer = get_tokenizer_from_processor(processor)
 
     # AutoProcessor may internally create a TokenizersBackend tokenizer
-    # (same issue as get_tokenizer). Replace it with a properly loaded one.
+    # (same issue as get_tokenizer). Reload via get_tokenizer so the class
+    # declared in tokenizer_config.json is used -- but only when that reload
+    # is not a strict regression. For LLaVA-family models the
+    # TokenizersBackend produced by AutoProcessor is already a working fast
+    # Rust-backed tokenizer, while the declared class (e.g. Qwen2Tokenizer)
+    # is slow; swapping would regress tokenization throughput (issue #26650).
     if type(tokenizer).__name__ == _TOKENIZERS_BACKEND:
         from .tokenizer import get_tokenizer
 
-        logger.warning(
-            "Processor tokenizer for %s is TokenizersBackend, "
-            "reloading via get_tokenizer",
-            tokenizer_name,
-        )
-        tokenizer = get_tokenizer(
+        candidate = get_tokenizer(
             tokenizer_name,
             tokenizer_mode=tokenizer_mode,
             trust_remote_code=trust_remote_code,
             tokenizer_revision=revision,
             tokenizer_backend=tokenizer_backend,
         )
-        if isinstance(processor, PreTrainedTokenizerBase):
-            processor = tokenizer
+        if getattr(candidate, "is_fast", False) or not getattr(
+            tokenizer, "is_fast", False
+        ):
+            logger.warning(
+                "Processor tokenizer for %s is TokenizersBackend, "
+                "reloading via get_tokenizer",
+                tokenizer_name,
+            )
+            tokenizer = candidate
+            if isinstance(processor, PreTrainedTokenizerBase):
+                processor = tokenizer
+            else:
+                processor.tokenizer = tokenizer
         else:
-            processor.tokenizer = tokenizer
+            logger.debug(
+                "Keeping AutoProcessor's fast TokenizersBackend tokenizer for "
+                "%s (declared replacement class would regress to slow tokenizer)",
+                tokenizer_name,
+            )
 
     if tokenizer.chat_template is None:
         local_path = download_from_hf(
