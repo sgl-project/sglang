@@ -124,6 +124,12 @@ repos:
         pass_filenames: false
         always_run: true
         stages: [manual]
+      - id: rustfmt-sglang-server
+        name: rustfmt rust/sglang-server
+        entry: bash -c 'cd rust/sglang-server && cargo fmt -- --check'
+        language: system
+        files: ^rust/sglang-server/.*\.rs$
+        pass_filenames: false
   - repo: https://github.com/lycheeverse/lychee.git
     rev: lychee-v0.22.0
     hooks:
