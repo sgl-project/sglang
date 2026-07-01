@@ -869,6 +869,28 @@ class ChatCompletionRequest(BaseModel):
 
         return values
 
+    @model_validator(mode="after")
+    def check_tool_usage(self) -> ChatCompletionRequest:
+        # A named tool_choice with no matching tool yields no schema and crashes
+        # downstream; reject it here (400) instead.
+        if not isinstance(self.tool_choice, ToolChoice):
+            return self
+
+        if not self.tools:
+            raise ValueError("When using `tool_choice`, `tools` must be set.")
+
+        fn_name = self.tool_choice.function.name
+        if not fn_name:
+            raise ValueError("Expected field `name` in `function` of `tool_choice`.")
+
+        if fn_name not in {tool.function.name for tool in self.tools}:
+            raise ValueError(
+                "The tool specified in `tool_choice` does not match any "
+                "of the specified `tools`"
+            )
+
+        return self
+
     def to_sampling_params(
         self,
         stop: List[str],
