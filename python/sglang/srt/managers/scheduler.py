@@ -153,6 +153,9 @@ from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
     resolve_min_free_slots,
 )
+from sglang.srt.managers.mm_utils import (
+    maybe_shard_items_for_dp_encoder,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
     RelayPayload,
@@ -1956,9 +1959,21 @@ class Scheduler(
 
     def _get_multimodal_inputs(self, mm_inputs_dict):
         if self.server_args.enable_broadcast_mm_inputs_process:
-            return self._process_and_broadcast_mm_inputs(mm_inputs_dict)
+            image_inputs = self._process_and_broadcast_mm_inputs(mm_inputs_dict)
         else:
-            return MultimodalInputs.from_processor_output(mm_inputs_dict)
+            image_inputs = MultimodalInputs.from_processor_output(mm_inputs_dict)
+
+        # DP-encoder CPU-side sharding: drop ``item.feature`` for items not
+        # owned by this rank so the subsequent H2D only ships local data.
+        if image_inputs is not None and image_inputs.mm_items:
+            try:
+                maybe_shard_items_for_dp_encoder(image_inputs.mm_items)
+            except Exception as e:
+                logger.warning(
+                    f"DP-encoder scheduler-side mm sharding skipped due to: {e}"
+                )
+
+        return image_inputs
 
     @staticmethod
     def _try_apply_padded_mm_input_ids(recv_req, req, image_inputs) -> bool:

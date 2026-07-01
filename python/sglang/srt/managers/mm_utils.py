@@ -4,6 +4,7 @@ Multi-modality utils
 
 import copy
 import hashlib
+import math
 import pickle
 from abc import abstractmethod
 from collections import defaultdict
@@ -504,6 +505,171 @@ def _move_items_to_device(
     for item in items:
         if isinstance(item.feature, torch.Tensor) and item.feature.device != device:
             item.feature = item.feature.to(device, non_blocking=True)
+
+
+def _item_patches_for_dp_encoder(item: MultimodalDataItem) -> Optional[int]:
+    """Compute the per-item patch count (load metric) for image items.
+
+    Returns the product of the item's ``image_grid_thw`` values when available,
+    or ``None`` when the item does not expose grid metadata suitable for
+    per-item DP-encoder sharding.
+
+    The item MUST have exactly one grid_thw row (shape (1, 3)) to be eligible
+    for per-item sharding. Multi-row items signal that the item-to-row mapping
+    is not 1:1 and would cause index mismatches with
+    `run_dp_sharded_mrope_vision_model`.
+    """
+    grid = getattr(item, "image_grid_thw", None)
+    if grid is None:
+        return None
+    if isinstance(grid, torch.Tensor):
+        if grid.numel() == 0:
+            return None
+        if grid.dim() == 2 and grid.shape[0] != 1:
+            return None
+        return int(grid.prod().item())
+    if isinstance(grid, (list, tuple)):
+        if len(grid) == 1 and isinstance(grid[0], (list, tuple)):
+            return int(math.prod(int(v) for v in grid[0]))
+        elif all(isinstance(v, (int, float)) for v in grid):
+            return int(math.prod(int(v) for v in grid))
+    return None
+
+
+def maybe_shard_items_for_dp_encoder(
+    items: List[MultimodalDataItem],
+) -> Optional[List[int]]:
+    """Drop non-local item features before H2D when DP encoder sharding is on.
+
+    When ``mm_enable_dp_encoder`` is enabled and the attention TP world size is
+    greater than one, partition the given items across attention-TP ranks using
+    the same load-balancing algorithm as
+    :func:`sglang.srt.multimodal.mm_utils.get_dp_encoder_lb_assignment` (load =
+    patches per image). On each rank, set ``item.feature = None`` for items that
+    do not belong to this rank, so the subsequent ``_move_items_to_device`` only
+    ships the local shard to GPU.
+
+    The decision is fully deterministic given the (CPU-resident) ``image_grid_thw``
+    metadata, so every rank computes the same ownership and the downstream
+    all-gather inside ``run_dp_sharded_mrope_vision_model`` stays collective-safe.
+
+    Stage 1 scope: only image items (single-image granularity). Returns ``None``
+    when no sharding was performed; otherwise returns the sorted list of local
+    item indices (the indices of items whose ``feature`` is preserved on this
+    rank).
+    """
+    if not items or len(items) < 2:
+        return None
+
+    try:
+        server_args = get_global_server_args()
+    except Exception:
+        return None
+    if server_args is None or not getattr(server_args, "mm_enable_dp_encoder", False):
+        return None
+
+    # Defer import to avoid a top-level circular dependency with dp_attention.
+    try:
+        from sglang.srt.layers.dp_attention import (
+            get_attention_tp_rank,
+            get_attention_tp_size,
+        )
+
+        tp_size = get_attention_tp_size()
+        tp_rank = get_attention_tp_rank()
+    except Exception:
+        return None
+
+    if tp_size <= 1:
+        return None
+
+    # Stage 1: only shard when every item is an image with image_grid_thw.
+    # Video items, audio items, and items lacking grid metadata fall back to
+    # the legacy full-replication path (handled by the model's get_*_feature).
+    patches_per_item: List[int] = []
+    for item in items:
+        if getattr(item, "modality", None) != Modality.IMAGE:
+            return None
+        p = _item_patches_for_dp_encoder(item)
+        if p is None or p <= 0:
+            return None
+        patches_per_item.append(p)
+
+    from sglang.srt.multimodal.mm_utils import get_dp_encoder_lb_assignment
+
+    image_to_tp_rank, gpu_sample_counts, _ = get_dp_encoder_lb_assignment(
+        patches_per_item, tp_size
+    )
+    # Convert flat assignment into per-rank sets.
+    cursor = 0
+    rank_to_items: List[set] = []
+    for count in gpu_sample_counts:
+        rank_to_items.append(set(image_to_tp_rank[cursor : cursor + count]))
+        cursor += count
+
+    local_set = rank_to_items[tp_rank]
+    # Drop features for items this rank does not own. Metadata (hashes,
+    # image_grid_thw, offsets, pad_value, ...) is intentionally preserved so
+    # downstream code can still compute the global grid_thw_list and assemble
+    # outputs in the original per-item order.
+    for i, item in enumerate(items):
+        if i not in local_set and item.feature is not None:
+            item.feature = None
+
+    return sorted(local_set)
+
+
+def build_local_pixel_values_for_dp_encoder(
+    items: List[MultimodalDataItem],
+    *,
+    dtype: torch.dtype,
+    fallback_device: torch.device,
+    to_device: Optional[torch.device] = None,
+) -> Tuple[torch.Tensor, Optional[List[int]]]:
+    """Concat the locally-owned item features into ``pixel_values``.
+
+    After :func:`maybe_shard_items_for_dp_encoder` has dropped non-local items'
+    ``feature`` to ``None`` on this rank, this helper produces the
+    ``(pixel_values, shard_indices)`` pair expected by
+    :func:`sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model`'s
+    ``local_item_indices`` parameter.
+
+    The second return is ``None`` when no sharding occurred (every item still
+    has a feature locally) so callers can pass it straight through to the DP
+    helper, which will then take its legacy slice path. When sharding did
+    happen, the second return is the sorted list of locally-owned item indices.
+
+    When no items are owned locally (the LB assigned this rank an empty shard),
+    returns a typed ``(0, 0)`` empty tensor on ``fallback_device``. In that case
+    only ``shape[0]`` is read downstream, so the trailing dim and device only
+    matter for type propagation through the DP helper's empty branch.
+
+    Args:
+        items: Per-modality item list as passed to ``get_image_feature``.
+        dtype: Target ViT dtype.
+        fallback_device: Device to use when this rank owns no features (must
+            match the visual model's device so the all-gather is collective-safe).
+        to_device: Optional explicit device for the concatenated tensor. When
+            ``None`` the tensor stays on its current device (post-H2D).
+    """
+    local_item_indices = [i for i, it in enumerate(items) if it.feature is not None]
+    sharded = len(local_item_indices) < len(items)
+    shard_indices = local_item_indices if sharded else None
+    local_features = [items[i].feature for i in local_item_indices]
+    if local_features:
+        pixel = torch.cat(local_features, dim=0)
+        if to_device is not None:
+            pixel = pixel.to(device=to_device, dtype=dtype)
+        else:
+            pixel = pixel.to(dtype)
+        return pixel, shard_indices
+    return (
+        # (0, 0) is intentional: the DP helper only reads ``shape[0]`` on the
+        # pre-shard path; the trailing dim is irrelevant because the per-rank
+        # ViT call is skipped entirely (it branches on ``shape[0] > 0``).
+        torch.empty((0, 0), dtype=dtype, device=fallback_device),
+        shard_indices,
+    )
 
 
 def _get_chunked_embedding_full(
