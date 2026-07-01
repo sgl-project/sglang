@@ -401,6 +401,7 @@ class TestGemma4RequestValidation(unittest.TestCase):
         scheduler.uocr_runtime = None
         scheduler.init_request_retirer()
         recv_req = MagicMock(
+            tokenize_only=False,
             session_params=None,
             session_id=None,
             input_embeds=None,

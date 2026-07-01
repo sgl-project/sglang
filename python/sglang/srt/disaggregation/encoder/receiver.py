@@ -12,7 +12,7 @@ from collections import OrderedDict, defaultdict
 from contextlib import asynccontextmanager
 from enum import IntEnum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 import numpy as np
@@ -32,11 +32,13 @@ from sglang.srt.hf_transformers import (
     resolve_image_processor_backend,
 )
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     EncoderDispatchErrorReq,
     GenerateReqInput,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
 from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.multimodal.modality import Modality
@@ -62,6 +64,7 @@ from sglang.srt.utils.serialization import safe_pickle_loads
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
 
 
@@ -2190,15 +2193,23 @@ class MMReceiverBase(ABC):
     def send_encode_request(
         self, obj, time_stats_json=None, on_dispatch_error=None
     ) -> Optional[threading.Event]:
-        return self._send_encode_request(
-            obj,
-            time_stats_json=time_stats_json,
-            on_dispatch_error=on_dispatch_error,
+        prepared = self.prepare_encode_request(
+            obj, time_stats_json=time_stats_json, on_dispatch_error=on_dispatch_error
         )
+        if prepared is None:
+            return None
+        encode_thread, dispatch_ready = prepared
+        encode_thread.start()
+        return dispatch_ready
 
-    def _send_encode_request(
-        self, obj, time_stats_json=None, on_dispatch_error=None
-    ) -> Optional[threading.Event]:
+    def prepare_encode_request(
+        self,
+        obj: GenerateReqInput,
+        *,
+        time_stats_json: Optional[Dict] = None,
+        on_dispatch_error: Optional[Callable[[EncoderDispatchErrorReq], None]] = None,
+    ) -> Optional[Tuple[threading.Thread, threading.Event]]:
+        """Freeze routing on the request before it is serialized for the scheduler."""
         mm_data = self._extract_url_data(obj)
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex
@@ -2210,7 +2221,7 @@ class MMReceiverBase(ABC):
 
         if mm_data and encode_urls:
             logger.info(
-                f"Dispatching {len(mm_data)} mm items to {len(encode_urls)} "
+                f"Preparing {len(mm_data)} mm items for {len(encode_urls)} "
                 f"encoder(s) {encode_urls} for request {obj.rid}"
             )
             obj.need_wait_for_mm_inputs = True
@@ -2238,8 +2249,7 @@ class MMReceiverBase(ABC):
                 ),
                 daemon=True,
             )
-            encode_thread.start()
-            return scheduler_dispatch_ready
+            return encode_thread, scheduler_dispatch_ready
         else:
             # No encoder URLs available (bootstrap may not have any registered yet);
             # reset the flag so the scheduler does not wait for embeddings that will
@@ -2399,12 +2409,11 @@ class MMReceiverBase(ABC):
                                 waiting_req.rid,
                             )
                         self.waiting_by_rid.pop(waiting_req.rid, None)
-                    abort_reqs.append(
-                        (
-                            self.create_req(recv_req),
-                            error_msg,
-                            HTTPStatus.INTERNAL_SERVER_ERROR,
-                        )
+                    self._reject_waiting_request(
+                        recv_req,
+                        error_msg,
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        abort_reqs,
                     )
                     continue
 
@@ -2449,24 +2458,22 @@ class MMReceiverBase(ABC):
                 # A peer's FAIL can force-abort this locally PENDING/SUCCESS
                 # rank, so release any buffer/slot it still holds.
                 waiting_req.release_resources()
-                abort_reqs.append(
-                    (
-                        self.create_req(waiting_req.recv_req),
-                        waiting_req.error_msg,
-                        waiting_req.error_code,
-                    )
+                self._reject_waiting_request(
+                    waiting_req.recv_req,
+                    waiting_req.error_msg,
+                    waiting_req.error_code,
+                    abort_reqs,
                 )
             elif status_value == WaitingMMRequestStatus.TIMEOUT:
                 logger.error(
                     f"Timed out waiting for image embeddings for request {waiting_req.rid}"
                 )
                 waiting_req.release_resources()
-                abort_reqs.append(
-                    (
-                        self.create_req(waiting_req.recv_req),
-                        f"Timeout waiting for image embedding after {self.wait_timeout}s",
-                        HTTPStatus.REQUEST_TIMEOUT,
-                    )
+                self._reject_waiting_request(
+                    waiting_req.recv_req,
+                    f"Timeout waiting for image embedding after {self.wait_timeout}s",
+                    HTTPStatus.REQUEST_TIMEOUT,
+                    abort_reqs,
                 )
             else:  # status_value == WaitingMMRequestStatus.PENDING
                 new_waiting.append(waiting_req)
@@ -2514,6 +2521,29 @@ class MMReceiverBase(ABC):
         if dispatch_error is not None and on_dispatch_error is not None:
             scheduler_dispatch_ready.wait()
             on_dispatch_error(dispatch_error)
+
+    def _reject_waiting_request(
+        self,
+        recv_req: TokenizedGenerateReqInput,
+        message: Optional[str],
+        status: Optional[int],
+        abort_reqs: List[Tuple["Req", Optional[str], Optional[int]]],
+    ) -> None:
+        if recv_req.tokenize_only:
+            # No generation state exists to retire, and a failed encoder may
+            # never have supplied the input IDs needed to construct a Req.
+            self.scheduler.send_control_output(
+                AbortReq(
+                    rid=recv_req.rid,
+                    finished_reason=FINISH_ABORT(
+                        message=message,
+                        status_code=status or HTTPStatus.INTERNAL_SERVER_ERROR,
+                    ).to_json(),
+                ),
+                recv_req,
+            )
+        else:
+            abort_reqs.append((self.create_req(recv_req), message, status))
 
     def create_req(self, recv_req: TokenizedGenerateReqInput):
         from sglang.srt.managers.schedule_batch import Req

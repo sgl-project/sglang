@@ -332,6 +332,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager = object.__new__(tokenizer_manager.TokenizerManager)
         manager.rid_to_state = {}
         manager.encoder_dispatch_ready = {}
+        manager.mm_processor = None
         transport = MagicMock()
         manager._dispatch_to_scheduler = MagicMock(
             side_effect=RuntimeError("send failed")

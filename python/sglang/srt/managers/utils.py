@@ -464,7 +464,11 @@ class EmbeddingBatchResult:
 
 def is_health_check_generate_req(recv_req):
     rid = getattr(recv_req, "rid", None)
-    return rid is not None and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+    return (
+        rid is not None
+        and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+        and not getattr(recv_req, "tokenize_only", False)
+    )
 
 
 class MsgpackDecodeError(ValueError):

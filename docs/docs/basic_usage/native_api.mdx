@@ -469,3 +469,12 @@ terminate_process(tokenizer_free_server_process)
 ```
 
 `/tokenize` also accepts chat `messages` (with optional `tools` and `chat_template_kwargs`) in place of `prompt`. By default they are rendered as for a chat completion: a final assistant message becomes a user turn and the generation prompt is always added. To format messages exactly as given, pass `add_generation_prompt` (`true` or `false`); the request may then also set `add_special_tokens`, which defaults to `false` because the chat template writes its own special tokens. These options need a Jinja chat template; other templates return HTTP 400.
+
+To tokenize an OpenAI-compatible request, send the same JSON body to
+`POST /v1/chat/tokenize` for chat or `POST /v1/completions/tokenize` for completions.
+Both `/tokenize` and `/v1/tokenize` select the route from `messages` or `prompt`.
+A batch of prompts returns one token list and one count per prompt, even when `n` is greater than one.
+
+For multimodal inputs, `tokens` contains the full sequence the scheduler prepares for prefill.
+Media positions can carry 64-bit padding IDs derived from the media content. These IDs can
+fall outside the tokenizer vocabulary and `/detokenize` accepts only vocabulary IDs.

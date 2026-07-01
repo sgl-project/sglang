@@ -961,7 +961,8 @@ class ChatCompletionRequest(PDRoutingFields):
     _response_parser_json_response_format: bool = PrivateAttr(default=False)
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
     _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
-    _format_add_special_tokens: bool = PrivateAttr(default=False)
+    # An explicit tokenize formatting option keeps the Jinja renderer's token IDs.
+    _format_add_special_tokens: Optional[bool] = PrivateAttr(default=None)
 
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -1832,7 +1833,7 @@ class TokenizeRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     model: str = DEFAULT_MODEL_NAME
-    prompt: Optional[Union[str, List[str]]] = None
+    prompt: Optional[Union[List[int], List[List[int]], str, List[str]]] = None
     messages: Optional[List[ChatCompletionMessageParam]] = None
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
     tool_choice: Optional[Union[ToolChoice, Literal["auto", "required", "none"]]] = (
@@ -1875,13 +1876,19 @@ class TokenizeRequest(BaseModel):
                 "add_special_tokens" in self.model_fields_set
                 and self.add_special_tokens
             )
+        elif "add_special_tokens" in self.model_fields_set:
+            # Generation-style chat templates already insert their own special tokens.
+            request._format_add_special_tokens = False
         return request
 
 
 class TokenizeResponse(BaseModel):
     """Response schema for the /tokenize endpoint."""
 
-    tokens: Union[List[int], List[List[int]]]
+    tokens: Union[List[int], List[List[int]]] = Field(
+        description="Prompt IDs for prefill. Multimodal positions may contain model-specific "
+        "64-bit padding IDs outside the tokenizer vocabulary."
+    )
     count: Union[int, List[int]]
     max_model_len: int
 

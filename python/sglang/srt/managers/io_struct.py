@@ -406,7 +406,7 @@ class GenerateReqInput:
             or has_valid_data(self.audio_data)
         )
 
-    def normalize_batch_and_arguments(self):
+    def normalize_batch_and_arguments(self, *, expand_parallel_samples: bool = True):
         """
         Normalize the batch size and arguments for the request.
 
@@ -435,7 +435,7 @@ class GenerateReqInput:
         self._determine_batch_size()
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")
-        self._handle_parallel_sampling()
+        self._handle_parallel_sampling(expand_parallel_samples)
 
         if self.is_single:
             self._normalize_single_inputs()
@@ -531,7 +531,7 @@ class GenerateReqInput:
             return 1
         return self.parallel_sample_num
 
-    def _handle_parallel_sampling(self):
+    def _handle_parallel_sampling(self, expand_parallel_samples: bool):
         """Handle parallel sampling parameters and adjust batch size if needed."""
         # Determine parallel sample count
         if self.sampling_params is None:
@@ -547,7 +547,12 @@ class GenerateReqInput:
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
 
-        self.parallel_sample_num = self._handle_beam_search_parallel_sampling()
+        # Tokenization needs one request state per input, regardless of n.
+        self.parallel_sample_num = (
+            self._handle_beam_search_parallel_sampling()
+            if expand_parallel_samples
+            else 1
+        )
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:
@@ -1196,6 +1201,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+
+    # Return the scheduler's prepared prompt before admission to a forward batch.
+    tokenize_only: bool = False
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
@@ -2417,6 +2425,10 @@ class AbortReq(BaseReq, kw_only=True):
     def matches(self, rid: str) -> bool:
         """Whether this abort targets the request `rid`."""
         return self.abort_all or rid.startswith(self.rid)
+
+
+class TokenizeReqOutput(BaseReq, kw_only=True):
+    input_ids: array
 
 
 class EncoderDispatchErrorReq(BaseReq, kw_only=True):

@@ -1175,6 +1175,18 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        if request._format_add_generation_prompt is not None:
+            if (
+                self.template_manager.chat_template_name is not None
+                or self.chat_encoding_spec is not None
+            ):
+                return "add_generation_prompt is supported only with a Jinja chat template."
+            if (
+                request.continue_final_message
+                and not request._format_add_generation_prompt
+            ):
+                return "continue_final_message needs add_generation_prompt to open the assistant turn."
+
         if (
             request.chat_template_kwargs
             and "chat_template" in request.chat_template_kwargs
@@ -1327,7 +1339,10 @@ class OpenAIServingChat(OpenAIServingBase):
         return "input_ids", processed_messages.prompt_ids
 
     def _can_reuse_text_only_prompt_ids(
-        self, processed_messages: MessageProcessingResult, is_multimodal: bool
+        self,
+        processed_messages: MessageProcessingResult,
+        is_multimodal: bool,
+        use_template_token_ids: bool = False,
     ) -> bool:
         # Moss-VL invokes its processor for text-only requests, and that processor
         # requires the rendered text rather than pre-tokenized ids.
@@ -1341,7 +1356,7 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.chat_encoding_spec is None
             and self.template_manager.chat_template_name is None
             and not self._prompt_text_round_trip_is_lossy
-            and not self._tokenizer_auto_adds_specials
+            and (use_template_token_ids or not self._tokenizer_auto_adds_specials)
             and isinstance(processed_messages.prompt_ids, list)
             and bool(processed_messages.prompt_ids)
             and not processed_messages.image_data
@@ -1418,7 +1433,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Handle single vs multiple requests
         if request.input_ids is not None or self._can_reuse_text_only_prompt_ids(
-            processed_messages, is_multimodal
+            processed_messages,
+            is_multimodal,
+            use_template_token_ids=request._format_add_special_tokens is not None,
         ):
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
         else:
@@ -2274,7 +2291,7 @@ class OpenAIServingChat(OpenAIServingBase):
             # specials (Kimi-like, OpenAI-chat analogue of #25265). Chat
             # templates already include role/special tokens, so the encode must
             # avoid double BOS on tokenizers that would add it.
-            add_special_tokens = request._format_add_special_tokens
+            add_special_tokens = request._format_add_special_tokens is True
             if add_special_tokens and self._prompt_text_round_trip_is_lossy:
                 raise ValueError(
                     "add_special_tokens is not supported with this tokenizer's "

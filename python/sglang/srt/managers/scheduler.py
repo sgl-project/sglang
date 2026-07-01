@@ -208,6 +208,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    TokenizeReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
@@ -3121,28 +3122,24 @@ class Scheduler(
             requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
         )
 
-    @staticmethod
-    def _try_apply_padded_mm_input_ids(recv_req, req, image_inputs) -> bool:
-        """setup origin_input_ids with trying to reuse existing MultimodalInputs.padded_input_ids first,
-        if absent, call pad_input_ids_func"""
-        padded_input_ids = image_inputs.padded_input_ids
-        if padded_input_ids is None or recv_req.input_ids is None:
-            return False
-
-        recv_input_len = len(recv_req.input_ids)
-        if len(padded_input_ids) != recv_input_len:
-            return False
-
-        prefix_len = len(req.origin_input_ids) - recv_input_len
-        if prefix_len < 0:
-            return False
-
-        padded_input_ids = array("q", padded_input_ids)
-        if prefix_len == 0:
-            req.origin_input_ids = padded_input_ids
-        else:
-            req.origin_input_ids = req.origin_input_ids[:prefix_len] + padded_input_ids
-        return True
+    def _pad_mm_input_ids(
+        self, recv_req, origin_input_ids: array, image_inputs: MultimodalInputs
+    ) -> array:
+        """Use the processor's padded IDs or run the model-specific padding function."""
+        padded_ids = image_inputs.padded_input_ids
+        if padded_ids is not None and recv_req.input_ids is not None:
+            input_len = len(recv_req.input_ids)
+            prefix_len = len(origin_input_ids) - input_len
+            if len(padded_ids) == input_len and prefix_len >= 0:
+                padded_ids = array("q", padded_ids)
+                if prefix_len:
+                    return origin_input_ids[:prefix_len] + padded_ids
+                return padded_ids
+        if self.pad_input_ids_func:
+            return duplicate_pad_mm_input_ids(
+                origin_input_ids, image_inputs, self.pad_input_ids_func
+            )
+        return origin_input_ids
 
     def _maybe_compute_mrope_positions(self, req) -> None:
         """Compute M-RoPE positions when they are missing (e.g. gRPC preprocessed path)."""
@@ -3227,9 +3224,53 @@ class Scheduler(
             ):
                 for item in recv_req.mm_inputs.mm_items:
                     mm_cleanup.callback(item.release_transport_proxies)
+            if recv_req.tokenize_only:
+                self._handle_tokenize_request(recv_req, mm_cleanup, mm_input_error)
+                return
             self._handle_generate_request(
                 recv_req, mm_cleanup, mm_input_error=mm_input_error
             )
+
+    def _handle_tokenize_request(
+        self,
+        recv_req: TokenizedGenerateReqInput,
+        mm_cleanup: ExitStack,
+        mm_input_error: Optional[str],
+    ) -> None:
+        """Finish after EPD reconstruction and model padding, before allocating generation resources."""
+        try:
+            if mm_input_error is not None:
+                raise _MultimodalInputProcessingError(mm_input_error)
+            if recv_req.mm_inputs is None or recv_req.input_ids is None:
+                raise _MultimodalInputProcessingError(
+                    "Missing multimodal prompt after preprocessing"
+                )
+            image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
+            # The materialized inputs own the transport until the reply is built.
+            mm_cleanup.pop_all()
+            mm_cleanup.callback(image_inputs.release_features)
+            ids = self._pad_mm_input_ids(recv_req, recv_req.input_ids, image_inputs)
+            if len(ids) >= self.max_req_input_len:
+                raise ValueError(
+                    f"Multimodal prompt has {len(ids)} tokens after expansion, "
+                    f"exceeding the input limit of {self.max_req_input_len - 1}."
+                )
+            output = TokenizeReqOutput(rid=recv_req.rid, input_ids=ids)
+        except Exception as error:
+            status = (
+                HTTPStatus.BAD_REQUEST
+                if isinstance(error, ValueError)
+                else HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+            if status == HTTPStatus.INTERNAL_SERVER_ERROR:
+                logger.exception(
+                    "Failed to prepare multimodal prompt for rid=%s", recv_req.rid
+                )
+            output = AbortReq(
+                rid=recv_req.rid,
+                finished_reason=FINISH_ABORT(str(error), status).to_json(),
+            )
+        self.send_control_output(output, recv_req)
 
     def _handle_generate_request(
         self,
@@ -3503,13 +3544,9 @@ class Scheduler(
             # The following steps are already fast, execute locally on each rank.
             # Expand a single image token into multiple dummy tokens for receiving image embeddings.
             # The pad function is model-specific and can be None for some backends.
-            if (
-                not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
-                and self.pad_input_ids_func
-            ):
-                req.origin_input_ids = duplicate_pad_mm_input_ids(
-                    req.origin_input_ids, image_inputs, self.pad_input_ids_func
-                )
+            req.origin_input_ids = self._pad_mm_input_ids(
+                recv_req, req.origin_input_ids, image_inputs
+            )
             req.extend_image_inputs(image_inputs)
             # the request now owns cleanup, including rejection after padding
             mm_cleanup.pop_all()
@@ -4003,13 +4040,9 @@ class Scheduler(
             # The `pad_input_ids_func` is model-specific and may be None for
             # embedding models or models not requiring special padding.
             # If None, `req.origin_input_ids` is expected to be correctly populated already.
-            if (
-                not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
-                and self.pad_input_ids_func
-            ):
-                req.origin_input_ids = duplicate_pad_mm_input_ids(
-                    req.origin_input_ids, image_inputs, self.pad_input_ids_func
-                )
+            req.origin_input_ids = self._pad_mm_input_ids(
+                recv_req, req.origin_input_ids, image_inputs
+            )
 
             req.extend_image_inputs(image_inputs)
             mm_cleanup.pop_all()

@@ -3,7 +3,9 @@ import threading
 import unittest
 
 import openai
+import requests
 
+from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.mmmu_vlm_kit import MMMUMixin
@@ -145,32 +147,40 @@ class TestEPDDisaggregationKimiVL(PDDisaggregationServerBase):
 
     def test_multi_image_chat_completion(self):
         client = openai.Client(api_key="sk-123456", base_url=f"{self.lb_url}/v1")
-        response = client.chat.completions.create(
-            model="default",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
-                            "modalities": "multi-images",
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": IMAGE_SGL_LOGO_URL},
-                            "modalities": "multi-images",
-                        },
-                        {
-                            "type": "text",
-                            "text": "Describe each image separately.",
-                        },
-                    ],
-                },
-            ],
-            temperature=0,
-            max_tokens=128,
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                        "modalities": "multi-images",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": IMAGE_SGL_LOGO_URL},
+                        "modalities": "multi-images",
+                    },
+                    {
+                        "type": "text",
+                        "text": "Describe each image separately.",
+                    },
+                ],
+            },
+        ]
+        tokenized = requests.post(
+            f"{self.prefill_url}/v1/chat/tokenize",
+            json={"model": "default", "messages": messages},
+            timeout=120,
         )
+        self.assertEqual(tokenized.status_code, 200, tokenized.text)
+        response = client.chat.completions.create(
+            model="default", messages=messages, temperature=0, max_tokens=128
+        )
+        tokens = tokenized.json()
+        self.assertEqual(len(tokens["tokens"]), response.usage.prompt_tokens)
+        self.assertEqual(tokens["count"], response.usage.prompt_tokens)
+        self.assertTrue(any(token >= MM_PAD_SHIFT_VALUE for token in tokens["tokens"]))
 
         self.assertEqual(response.choices[0].message.role, "assistant")
         text = response.choices[0].message.content
