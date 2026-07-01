@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 __all__ = ["CompressedTensorsMxInt4MoE"]
 
 if TYPE_CHECKING:
+    from compressed_tensors.quantization import QuantizationArgs
+
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
@@ -46,9 +48,15 @@ if is_flashinfer_available():
 
 
 class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
-    def __init__(self, quant_config: CompressedTensorsConfig):
+    def __init__(
+        self, quant_config: CompressedTensorsConfig, weight_quant: QuantizationArgs
+    ):
         self.quant_config = quant_config
-        config = self.quant_config.target_scheme_map["Linear"].get("weights")
+        # weight_quant is this layer's scheme, already resolved by
+        # CompressedTensorsConfig.get_moe_scheme() against the config_groups
+        # targets. Use it directly: mixed-precision / regex-target MoE
+        # checkpoints have no config group literally named "Linear".
+        config = weight_quant
         self.num_bits = config.num_bits
         self.packed_factor = 32 // config.num_bits
         self.strategy = config.strategy

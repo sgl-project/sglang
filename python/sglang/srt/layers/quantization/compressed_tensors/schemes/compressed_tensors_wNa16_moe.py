@@ -28,6 +28,8 @@ from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
+    from compressed_tensors.quantization import QuantizationArgs
+
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
@@ -63,16 +65,17 @@ class GPTQMarlinState(Enum):
 class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
     def __init__(
-        self, quant_config: CompressedTensorsConfig, num_gpu_experts=-1, weight_quant=None
+        self,
+        quant_config: CompressedTensorsConfig,
+        weight_quant: QuantizationArgs,
+        num_gpu_experts: int = -1,
     ):
         self.quant_config = quant_config
-        # get_moe_scheme already resolved this layer's scheme by matching it
-        # against config_groups targets; reuse it. Fall back to a "Linear" group
-        # only for uniform checkpoints — mixed-precision / regex-target MoE
-        # checkpoints have no group literally named "Linear".
+        # weight_quant is this layer's scheme, already resolved by
+        # CompressedTensorsConfig.get_moe_scheme() against the config_groups
+        # targets. Use it directly: mixed-precision / regex-target MoE
+        # checkpoints have no config group literally named "Linear".
         config = weight_quant
-        if config is None:
-            config = self.quant_config.target_scheme_map["Linear"].get("weights")
         self.num_bits = config.num_bits
         self.packed_factor = 32 // config.num_bits
         self.strategy = config.strategy

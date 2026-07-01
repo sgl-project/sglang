@@ -682,10 +682,12 @@ class CompressedTensorsConfig(QuantizationConfig):
                     logger.info_once(
                         "Using CompressedTensorsMxInt4MoE with flashinfer_trtllm backend"
                     )
-                    return CompressedTensorsMxInt4MoE(self)
+                    return CompressedTensorsMxInt4MoE(self, weight_quant=weight_quant)
                 elif _is_hip:
                     logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
-                    return CompressedTensorsWNA16TritonMoE(self)
+                    return CompressedTensorsWNA16TritonMoE(
+                        self, weight_quant=weight_quant
+                    )
                 else:
                     moe_backend = get_moe_runner_backend()
                     if moe_backend.is_triton():
@@ -693,7 +695,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                             "Using CompressedTensorsWNA16TritonMoE "
                             "(moe_runner_backend=triton)"
                         )
-                        return CompressedTensorsWNA16TritonMoE(self)
+                        return CompressedTensorsWNA16TritonMoE(
+                            self, weight_quant=weight_quant
+                        )
                     logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
                     return CompressedTensorsWNA16MoE(self, weight_quant=weight_quant)
             else:
