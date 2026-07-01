@@ -1923,6 +1923,7 @@ class ServerArgs:
                 "dynamic",
                 "eic",
                 "simm",
+                "mori",
             ],
         ),
     ] = None
