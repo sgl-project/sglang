@@ -56,6 +56,7 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_loader import get_model
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
+from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
 from sglang.srt.observability.req_time_stats import EncoderReqTimeStats
 from sglang.srt.observability.trace import (
     process_tracing_init,
@@ -67,11 +68,13 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import (
+    add_prometheus_middleware,
     configure_logger,
     load_audio,
     load_image,
     load_video,
     random_uuid,
+    set_prometheus_multiproc_dir,
 )
 from sglang.srt.utils.common import configure_logger, maybe_reindex_device_id
 from sglang.srt.utils.network import (
@@ -242,6 +245,9 @@ class MMEncoder:
         self.server_args = server_args
         set_global_server_args_for_scheduler(server_args)
         self.rank = rank
+        # DP rank for metric labels; overridden by run_dp_worker in DP mode.
+        # 0 in the single-instance (non-DP) path.
+        self.dp_rank = 0
         self.profiler = EncoderProfiler(rank)
         self._load_mm_processor(server_args)
 
@@ -844,12 +850,17 @@ class MMEncoder:
             else:
                 mm_item.set(k, val)
 
+        forward_start = time.perf_counter()
         with torch.inference_mode():
             new_embeddings = get_feature_fn([mm_item])
             if not keep_on_gpu:
                 new_embeddings = new_embeddings.cpu()
             if new_embeddings.ndim != 2:
                 new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
+        if encoder_metrics_collector is not None:
+            encoder_metrics_collector.observe_model_forward(
+                time.perf_counter() - forward_start, modality=modality.name.lower()
+            )
 
         sub_grids = [grid_thw[i] for i in indices]
         return self.slice_embedding(new_embeddings, sub_grids, modality)
@@ -1430,6 +1441,7 @@ class MMEncoder:
     async def _process_mm_items(self, mm_items, modality):
         model_preprocessor = getattr(self.model, "preprocess_mm_for_encoder", None)
 
+        preprocess_start = time.perf_counter()
         if modality == Modality.IMAGE:
             processor_input = await self._process_image_items(
                 mm_items, model_preprocessor
@@ -1444,6 +1456,10 @@ class MMEncoder:
             )
         else:
             raise ValueError(f"Unsupported modality: {modality}")
+        if encoder_metrics_collector is not None:
+            encoder_metrics_collector.observe_preprocess(
+                time.perf_counter() - preprocess_start, modality=modality.name.lower()
+            )
 
         target = self.model.thinker if hasattr(self.model, "thinker") else self.model
         get_feature_method = getattr(target, f"get_{modality.name.lower()}_feature")
@@ -1556,7 +1572,10 @@ class MMEncoder:
         return processor_input
 
     async def _encode(self, mm_items, modality: Modality) -> torch.Tensor:
+        modality_str = modality.name.lower()
         try:
+            # preprocess latency is observed inside _process_mm_items so all
+            # callers (encode / batch_encode / global-cache) are covered.
             mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
         except NotImplementedError as e:
             raise InternalError(f"Not implemented error: {str(e)}")
@@ -1578,6 +1597,7 @@ class MMEncoder:
                     continue
                 mm_item.set(k, _convert(v))
 
+            cache_hit = False
             if self.server_args.enable_prefix_mm_cache:
                 mm_item.set_pad_value()
                 mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
@@ -1585,17 +1605,52 @@ class MMEncoder:
                     mm_cache = self.mm_cache.get([mm_item.hash])
                     if mm_cache is not None:
                         mm_embedding = mm_cache.embedding
+                        cache_hit = True
 
             if mm_embedding is None:
+                forward_start = time.perf_counter()
                 with torch.inference_mode():
                     mm_embedding: torch.Tensor = get_feature_fn([mm_item])
                     mm_embedding = mm_embedding.cpu()
                 if len(mm_embedding.shape) != 2:
                     mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
+                if encoder_metrics_collector is not None:
+                    encoder_metrics_collector.observe_model_forward(
+                        time.perf_counter() - forward_start, modality=modality_str
+                    )
+
+            # Per-request cache hit metrics: tokens = embedding rows, files = 1 item.
+            if (
+                self.server_args.enable_prefix_mm_cache
+                and encoder_metrics_collector is not None
+            ):
+                total_tokens = int(mm_embedding.shape[0])
+                hit_tokens = total_tokens if cache_hit else 0
+                encoder_metrics_collector.record_cache_tokens(
+                    hit_tokens, total_tokens, modality=modality_str
+                )
+                encoder_metrics_collector.record_cache_files(
+                    1 if cache_hit else 0, 1, modality=modality_str
+                )
 
             if self.server_args.enable_prefix_mm_cache:
                 async with self.mm_cache_lock:
-                    self.mm_cache.set(mm_hash, EmbeddingResult(embedding=mm_embedding))
+                    entries_before = len(self.mm_cache)
+                    already_present = self.mm_cache.has(mm_hash)
+                    inserted = self.mm_cache.set(
+                        mm_hash, EmbeddingResult(embedding=mm_embedding)
+                    )
+                    entries_after = len(self.mm_cache)
+                    if encoder_metrics_collector is not None:
+                        added = 0 if already_present else (1 if inserted else 0)
+                        evictions = max(0, added - (entries_after - entries_before))
+                        if evictions > 0:
+                            encoder_metrics_collector.inc_cache_evictions(
+                                modality=modality_str, count=evictions
+                            )
+                        encoder_metrics_collector.set_cache_state(
+                            self.mm_cache.current_size, entries_after
+                        )
             if self.profiler is not None:
                 self.profiler.step()
 
@@ -1607,7 +1662,12 @@ class MMEncoder:
                 )
                 encode_video_audio_fn = getattr(target, "encode_video_audio", None)
                 if encode_video_audio_fn is not None:
+                    audio_forward_start = time.perf_counter()
                     audio_embedding = encode_video_audio_fn(mm_inputs)
+                    if encoder_metrics_collector is not None:
+                        encoder_metrics_collector.observe_model_forward(
+                            time.perf_counter() - audio_forward_start, modality="audio"
+                        )
                     if audio_embedding is not None:
                         aux_data["video_audio_embedding"] = audio_embedding
                 else:
@@ -1683,6 +1743,10 @@ class MMEncoder:
                 embedding.nbytes,
             )
             xfer_ms = (time.monotonic() - _t_xfer_start) * 1000.0
+            if encoder_metrics_collector is not None:
+                encoder_metrics_collector.observe_transfer(
+                    xfer_ms / 1000.0, backend="mooncake"
+                )
             if not mr_already_registered:
                 self.engine.deregister(embedding.data_ptr())
             # Only emit at INFO when transfer is slow or fell back
@@ -1731,7 +1795,16 @@ class MMEncoder:
             finally:
                 sock.close(linger=5000)
 
+        _zmq_xfer_start = time.perf_counter()
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
+        if (
+            encoder_metrics_collector is not None
+            and self.server_args.encoder_transfer_backend != "mooncake"
+        ):
+            encoder_metrics_collector.observe_transfer(
+                time.perf_counter() - _zmq_xfer_start,
+                backend=self.server_args.encoder_transfer_backend,
+            )
 
     async def encode(
         self, mm_items, modality: Modality, req_id, num_parts, part_idx, hashes=None
@@ -1994,6 +2067,16 @@ class MMEncoder:
             flat_items.extend(leaves)
             items_per_req.append(sum(self._grid_count_per_leaf(leaves, modality)))
         total = sum(items_per_req)
+
+        if encoder_metrics_collector is not None:
+            modality_str = modality.name.lower()
+            for n in items_per_req:
+                encoder_metrics_collector.observe_mm_items_per_request(
+                    n, modality=modality_str
+                )
+            encoder_metrics_collector.observe_mm_items_per_batch(
+                total, modality=modality_str
+            )
 
         try:
             mm_inputs, get_feat = await self._process_mm_items(flat_items, modality)
@@ -2396,6 +2479,12 @@ class EncoderScheduler:
 
         requests = [p.request for p in group]
         start = time.time()
+        modality_str = modality.name.lower()
+        if encoder_metrics_collector is not None:
+            for p in group:
+                encoder_metrics_collector.observe_queue_wait(
+                    max(0.0, start - p.submit_time), modality=modality_str
+                )
         for sock in self.send_sockets:
             sock_send(
                 sock,
@@ -2448,9 +2537,26 @@ class EncoderScheduler:
         group: List[PendingRequest],
         modality: Modality,
     ) -> None:
+        modality_str = modality.name.lower()
         for p in group:
             req = p.request
             try:
+                start = time.time()
+                if encoder_metrics_collector is not None:
+                    encoder_metrics_collector.observe_queue_wait(
+                        max(0.0, start - p.submit_time), modality=modality_str
+                    )
+                    # Count like batch_encode: flatten nested items and expand
+                    # per-leaf grids so {"type": "image", "image": [p1, p2, ...]}
+                    # counts as N, not 1.
+                    leaves = MMEncoder._flatten_nested_items(req.get("mm_items", []))
+                    mm_count = sum(self.encoder._grid_count_per_leaf(leaves, modality))
+                    encoder_metrics_collector.observe_mm_items_per_request(
+                        mm_count, modality=modality_str
+                    )
+                    encoder_metrics_collector.observe_mm_items_per_batch(
+                        mm_count, modality=modality_str
+                    )
                 for sock in self.send_sockets:
                     sock_send(sock, wrap_as_pickle(req))
                 result = await self.encoder.encode_request(req, modality)
@@ -2467,6 +2573,10 @@ class EncoderScheduler:
 encoder: Optional[MMEncoder] = None
 send_sockets: List[zmq.Socket] = []
 encoder_scheduler: Optional[EncoderScheduler] = None
+
+# Per-process encoder metrics collector. Set in launch_server (non-DP) and in
+# run_dp_worker (DP mode, with the worker's dp_rank). None when metrics disabled.
+encoder_metrics_collector: Optional[EncoderMetricsCollector] = None
 
 # DP mode (--dp-size > 1): each rank runs as a subprocess with its own
 # MMEncoder on its own GPU; the main process only routes via ZMQ so the
@@ -2519,6 +2629,8 @@ async def _dp_worker_encode_and_send(
         time_stats.decode_json(time_stats_json)
     request["enter_time"] = time.time()
     modality = Modality.from_str(request["modality"])
+    time_stats.modality = modality.name.lower()
+    time_stats.set_metrics_collector(encoder_metrics_collector)
     backend = enc.server_args.encoder_transfer_backend
 
     # URL state lives in main process module globals; workers don't see it.
@@ -2638,6 +2750,7 @@ class DPDispatcher:
         dispatch_sockets: List,
         result_socket,
         worker_processes: List[mp.Process],
+        enable_metrics: bool = False,
     ):
         self.dp_size = dp_size
         self.dispatch_sockets = dispatch_sockets
@@ -2656,9 +2769,28 @@ class DPDispatcher:
         # Set when _result_listener gives up; makes alive_ranks report empty.
         self._listener_failed = False
 
+        # Prometheus gauge: pending requests per DP rank. Lives in the main
+        # process (the dispatcher), unlike the per-worker EncoderMetricsCollector.
+        self.pending_gauge = None
+        if enable_metrics:
+            from prometheus_client import Gauge
+
+            self.pending_gauge = Gauge(
+                name="sglang:encoder_dp_pending_requests",
+                documentation="Number of pending requests per encoder DP rank.",
+                labelnames=["dp_rank"],
+                multiprocess_mode="mostrecent",
+            )
+
     @property
     def pending_counts(self) -> List[int]:
         return [len(d) for d in self.pending_futures]
+
+    def _update_pending_gauge(self) -> None:
+        """Push current pending counts to the Prometheus gauge (absolute set)."""
+        if self.pending_gauge is not None:
+            for i, c in enumerate(self.pending_counts):
+                self.pending_gauge.labels(dp_rank=str(i)).set(c)
 
     @property
     def alive_ranks(self) -> List[int]:
@@ -2682,6 +2814,7 @@ class DPDispatcher:
         # dispatch / broadcast failure: no follow-up /send expected.
         self.pending_futures[rank].pop(req_id, None)
         self.req_id_to_rank.pop(req_id, None)
+        self._update_pending_gauge()
 
     def _fail_pending_for_rank(self, rank: int, reason: str, error_type: str) -> None:
         # Resolve a rank's outstanding futures with 503 so awaiters don't hang.
@@ -2699,6 +2832,7 @@ class DPDispatcher:
                     }
                 )
             pending.pop(key, None)
+        self._update_pending_gauge()
 
     def _fail_all_pending(self, reason: str, error_type: str) -> None:
         for rank in range(self.dp_size):
@@ -2734,6 +2868,7 @@ class DPDispatcher:
         self.req_id_to_rank[req_id] = rank
         future = asyncio.get_running_loop().create_future()
         self.pending_futures[rank][req_id] = future
+        self._update_pending_gauge()
         logger.info(
             f"MM-Encoder DP dispatch: req_id={req_id}, "
             f"modality={request.get('modality', 'image')}, "
@@ -2944,6 +3079,7 @@ class DPDispatcher:
                 )
                 continue
             future = self.pending_futures[rank].pop(key)
+            self._update_pending_gauge()
             # Only mooncake encode (content=request dict) needs the mapping
             # kept for the follow-up /send.
             keep_mapping = dp_type == "encode" and msg.get("content") is not None
@@ -3011,6 +3147,15 @@ async def _dp_worker_handle_request(
     dp_type: str,
 ) -> None:
     t0 = time.time()
+    modality_str = str(request.get("modality", "image")).lower()
+    is_encode = dp_type not in (
+        "start_profile",
+        "stop_profile",
+        "health_encode",
+        "send",
+    )
+    if is_encode and encoder_metrics_collector is not None:
+        encoder_metrics_collector.inc_requests_received(modality=modality_str)
     try:
         if dp_type in ("start_profile", "stop_profile"):
             content = await _dp_worker_handle_profile(enc, dp_rank, dp_type, request)
@@ -3037,6 +3182,10 @@ async def _dp_worker_handle_request(
             f"modality={request.get('modality', 'image')}, "
             f"cost={(time.time() - t0) * 1000:.1f}ms"
         )
+        if is_encode and encoder_metrics_collector is not None:
+            encoder_metrics_collector.inc_requests_total(
+                modality=modality_str, status="success"
+            )
         envelope = {
             "req_id": request.get("req_id", ""),
             "_dp_type": dp_type,
@@ -3048,6 +3197,10 @@ async def _dp_worker_handle_request(
             f"req_id={request.get('req_id', '?')}: {e}",
             exc_info=True,
         )
+        if is_encode and encoder_metrics_collector is not None:
+            encoder_metrics_collector.inc_requests_total(
+                modality=modality_str, status="error"
+            )
         err_code = int(getattr(e, "code", None) or HTTPStatus.INTERNAL_SERVER_ERROR)
         envelope = {
             "req_id": request.get("req_id", ""),
@@ -3089,6 +3242,19 @@ async def run_dp_worker(
     args.base_gpu_id = gpu_id
     args.tp_size = 1
     enc = MMEncoder(args, dist_init_method=f"tcp://127.0.0.1:{get_free_port()}", rank=0)
+
+    global encoder_metrics_collector
+    if server_args.enable_metrics:
+        set_prometheus_multiproc_dir()
+        labels = {
+            "model_name": server_args.served_model_name,
+            "dp_rank": str(dp_rank),
+        }
+        if server_args.extra_metric_labels:
+            labels.update(server_args.extra_metric_labels)
+        encoder_metrics_collector = EncoderMetricsCollector(labels)
+        enc.dp_rank = dp_rank
+
     sched = EncoderScheduler(
         encoder=enc, send_sockets=[], max_batch_size=ENCODER_MAX_BATCH_SIZE
     )
@@ -3354,7 +3520,20 @@ def launch_server(server_args: ServerArgs):
         _launch_server_dp(server_args)
         return
 
-    global encoder
+    global encoder, encoder_metrics_collector
+
+    # Set up prometheus metrics.
+    if server_args.enable_metrics:
+        set_prometheus_multiproc_dir()
+        labels = {
+            "model_name": server_args.served_model_name,
+            "dp_rank": "0",
+        }
+        if server_args.extra_metric_labels:
+            labels.update(server_args.extra_metric_labels)
+        encoder_metrics_collector = EncoderMetricsCollector(labels)
+        add_prometheus_middleware(app)
+
     ctx = mp.get_context("spawn")
     zmq_ctx = zmq.Context(10)
     ipc_path_prefix = random_uuid()
@@ -3405,6 +3584,12 @@ def _launch_server_dp(server_args: ServerArgs):
         )
     dp_size = server_args.dp_size
     logger.info(f"Launching encoder in DP mode: dp_size={dp_size}")
+
+    # DP mode: workers (subprocesses) write metrics to the shared multiproc dir;
+    # the main process exposes the aggregated /metrics endpoint.
+    if server_args.enable_metrics:
+        set_prometheus_multiproc_dir()
+        add_prometheus_middleware(app)
 
     ctx = mp.get_context("spawn")
     ipc_prefix = random_uuid()
@@ -3462,6 +3647,7 @@ def _launch_server_dp(server_args: ServerArgs):
         dispatch_sockets,
         result_socket,
         worker_processes,
+        enable_metrics=server_args.enable_metrics,
     )
 
     # Register this encoder's URL with prefill server(s) if configured.
@@ -3551,6 +3737,8 @@ async def handle_encode_request(request: dict):
             f"modality={request.get('modality', 'image')}"
         )
         return ORJSONResponse(content=result.get("content"))
+
+    modality_str = str(request.get("modality", "image")).lower()
     try:
         # when multiple decoder TP ranks POST /encode
         # with the same req_id, only the first triggers the VIT forward;
@@ -3603,7 +3791,12 @@ async def handle_encode_request(request: dict):
             if time_stats_json:
                 time_stats.decode_json(time_stats_json)
 
+            modality_str = modality.name.lower()
+            time_stats.modality = modality_str
+            time_stats.set_metrics_collector(encoder_metrics_collector)
             time_stats.set_mm_encode_start_time()
+            if encoder_metrics_collector is not None:
+                encoder_metrics_collector.inc_requests_received(modality=modality_str)
             if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
                 try:
                     nbytes, embedding_len, embedding_dim, error_msg, error_code = (
@@ -3651,6 +3844,10 @@ async def handle_encode_request(request: dict):
                 if evt:
                     evt.set()
                 await encoder._cleanup_inflight_encode_state(req_id)
+            if encoder_metrics_collector is not None:
+                encoder_metrics_collector.inc_requests_total(
+                    modality=modality_str, status="error"
+                )
             return ORJSONResponse(
                 status_code=error_code,
                 content={"status": "error", "message": error_msg, "req_id": req_id},
@@ -3674,6 +3871,10 @@ async def handle_encode_request(request: dict):
                     "embedding_dim": embedding_dim,
                 }
             )
+            if encoder_metrics_collector is not None:
+                encoder_metrics_collector.inc_requests_total(
+                    modality=modality_str, status="success"
+                )
             return ORJSONResponse(content=request)
         elif encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
             logger.info(f"{request['embedding_port'] = }")
@@ -3694,6 +3895,10 @@ async def handle_encode_request(request: dict):
                     )
                 await asyncio.gather(*tasks)
                 encoder.embedding_to_send.pop(request["req_id"], None)
+            if encoder_metrics_collector is not None:
+                encoder_metrics_collector.inc_requests_total(
+                    modality=modality_str, status="success"
+                )
             return ORJSONResponse(content=None)
         elif encoder.server_args.encoder_transfer_backend == "zmq_to_tokenizer":
             await encoder.send(
@@ -3707,6 +3912,10 @@ async def handle_encode_request(request: dict):
                 f"[{req_id}] /encode completed in {elapsed:.3f}s, "
                 f"modality={request['modality']}, tokens={embedding_len}"
             )
+            if encoder_metrics_collector is not None:
+                encoder_metrics_collector.inc_requests_total(
+                    modality=modality_str, status="success"
+                )
             return ORJSONResponse(content=None)
     except Exception as e:
         error_msg = str(e)
@@ -3719,6 +3928,10 @@ async def handle_encode_request(request: dict):
             if evt:
                 evt.set()
             await encoder._cleanup_inflight_encode_state(req_id)
+        if encoder_metrics_collector is not None:
+            encoder_metrics_collector.inc_requests_total(
+                modality=modality_str, status="error"
+            )
         return ORJSONResponse(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             content={
