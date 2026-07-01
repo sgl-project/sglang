@@ -6,7 +6,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/xpu-ci-job-monitor.yml'
-      - 'scripts/ci/utils/query_job_status.py'
+      - 'scripts/ci/utils/xpu_job_monitor.py'
   workflow_dispatch:
     inputs:
       hours:
@@ -54,7 +54,7 @@ jobs:
         run: |
           # PR-trigger is just a script smoke check; scan a 20-minute window
           # (0.34h) to bound API cost. schedule / dispatch run the full report.
-          python scripts/ci/utils/query_job_status.py \
+          python scripts/ci/utils/xpu_job_monitor.py \
             --repo ${{ github.repository }} \
             --workflow "pr-test-xpu.yml" \
             --hours ${{ (github.event_name == 'pull_request' && '0.34') || inputs.hours || '24' }} \
@@ -94,7 +94,7 @@ jobs:
       - name: Generate Custom Job Report
         timeout-minutes: 30
         run: |
-          python scripts/ci/utils/query_job_status.py \
+          python scripts/ci/utils/xpu_job_monitor.py \
             --repo ${{ github.repository }} \
             --job "${{ inputs.job_filter }}" \
             --workflow "pr-test-xpu.yml" \
@@ -155,7 +155,7 @@ jobs:
       - name: Generate Report
         timeout-minutes: 15
         run: |
-          python scripts/ci/utils/query_job_status.py \
+          python scripts/ci/utils/xpu_job_monitor.py \
             --repo ${{ github.repository }} \
             --job "${{ matrix.job_name }}" \
             --workflow "pr-test-xpu.yml" \
@@ -190,7 +190,7 @@ jobs:
       - name: Generate Runner Fleet Report
         timeout-minutes: 30
         run: |
-          python scripts/ci/utils/query_job_status.py \
+          python scripts/ci/utils/xpu_job_monitor.py \
             --repo ${{ github.repository }} \
             --runner-report \
             --workflow "pr-test-xpu.yml" \
