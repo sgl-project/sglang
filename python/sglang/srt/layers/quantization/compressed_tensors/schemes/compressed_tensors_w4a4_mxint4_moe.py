@@ -52,10 +52,8 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         self, quant_config: CompressedTensorsConfig, weight_quant: QuantizationArgs
     ):
         self.quant_config = quant_config
-        # weight_quant is this layer's scheme, already resolved by
-        # CompressedTensorsConfig.get_moe_scheme() against the config_groups
-        # targets. Use it directly: mixed-precision / regex-target MoE
-        # checkpoints have no config group literally named "Linear".
+        # Per-layer scheme already resolved by get_moe_scheme(); reuse it directly
+        # (mixed-precision MoE has no "Linear" config group to fall back on).
         config = weight_quant
         self.num_bits = config.num_bits
         self.packed_factor = 32 // config.num_bits
