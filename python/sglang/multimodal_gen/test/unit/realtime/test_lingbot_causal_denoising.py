@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
     LingBotWorldCausalDMDDenoisingStage,
 )
+from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
 from sglang.multimodal_gen.runtime.realtime.states import RealtimeCausalDiTState
 
 
@@ -298,22 +299,40 @@ def test_lingbot_interactive_kv_window_allocates_expected_cache_size():
     assert cache.attention_window_size == 240
 
 
-def test_lingbot_request_runtime_cache_clears_camera_entries_only():
-    cache_state = SimpleNamespace(
-        runtime_cache={
-            "lingbot_c2ws_plucker_emb": {"stale": object()},
-            "lingbot_cam_conditioner": {"stale": object()},
-            "lingbot_rope": {"keep": object()},
-        }
+def test_lingbot_model_request_cache_prefers_request_scope():
+    forward_batch = SimpleNamespace(
+        request_runtime_cache={},
+        session=object(),
+        extra={},
     )
 
-    LingBotWorldCausalDMDDenoisingStage._clear_lingbot_request_runtime_cache(
-        cache_state
+    cache = CausalLingBotWorldTransformer3DModel._get_request_cache(
+        forward_batch, "lingbot_c2ws_plucker_emb"
+    )
+    cache["value"] = object()
+
+    assert forward_batch.request_runtime_cache["lingbot_c2ws_plucker_emb"] is cache
+    assert forward_batch.extra == {}
+
+
+def test_lingbot_model_session_cache_uses_realtime_state():
+    session = RealtimeSession()
+    forward_batch = SimpleNamespace(
+        request_runtime_cache={},
+        session=session,
+        extra={},
     )
 
-    assert "lingbot_c2ws_plucker_emb" not in cache_state.runtime_cache
-    assert "lingbot_cam_conditioner" not in cache_state.runtime_cache
-    assert "lingbot_rope" in cache_state.runtime_cache
+    cache = CausalLingBotWorldTransformer3DModel._get_session_cache(
+        forward_batch, "lingbot_rope"
+    )
+    cache["value"] = object()
+
+    state = session.get_state(RealtimeCausalDiTState)
+    assert state is not None
+    assert state.runtime_cache["lingbot_rope"] is cache
+    assert forward_batch.request_runtime_cache == {}
+    assert forward_batch.extra == {}
 
 
 def test_lingbot_i2v_model_input_writer_reuses_buffer():
@@ -371,7 +390,11 @@ def test_lingbot_cam_conditioner_cache_reuses_source_tensor(monkeypatch):
         CausalLingBotWorldTransformerBlock
     )
     block.cam_conditioner = _CamConditioner()
-    forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=True)
+    forward_batch = SimpleNamespace(
+        extra={},
+        request_runtime_cache={},
+        enable_sequence_shard=True,
+    )
     monkeypatch.setattr(
         lingbot_world_module, "get_ulysses_parallel_world_size", lambda: 2
     )
@@ -390,7 +413,7 @@ def test_lingbot_cam_conditioner_cache_reuses_source_tensor(monkeypatch):
     assert first is second
     assert third is not first
     assert block.cam_conditioner.calls == 2
-    cache = forward_batch.extra["lingbot_cam_conditioner"]
+    cache = forward_batch.request_runtime_cache["lingbot_cam_conditioner"]
     assert cache["source_key"][0] == next_source.data_ptr()
     assert len(cache["entries"]) == 1
 
@@ -408,7 +431,11 @@ def test_lingbot_cam_conditioner_cache_skips_non_sequence_shard(monkeypatch):
         CausalLingBotWorldTransformerBlock
     )
     block.cam_conditioner = _CamConditioner()
-    forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=False)
+    forward_batch = SimpleNamespace(
+        extra={},
+        request_runtime_cache={},
+        enable_sequence_shard=False,
+    )
     monkeypatch.setattr(
         lingbot_world_module,
         "get_forward_context",
@@ -423,6 +450,7 @@ def test_lingbot_cam_conditioner_cache_skips_non_sequence_shard(monkeypatch):
     assert first[0] is not second[0]
     assert block.cam_conditioner.calls == 2
     assert "lingbot_cam_conditioner" not in forward_batch.extra
+    assert "lingbot_cam_conditioner" not in forward_batch.request_runtime_cache
 
 
 def test_lingbot_cam_conditioner_cache_skips_single_ulysses_world(monkeypatch):
@@ -438,7 +466,11 @@ def test_lingbot_cam_conditioner_cache_skips_single_ulysses_world(monkeypatch):
         CausalLingBotWorldTransformerBlock
     )
     block.cam_conditioner = _CamConditioner()
-    forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=True)
+    forward_batch = SimpleNamespace(
+        extra={},
+        request_runtime_cache={},
+        enable_sequence_shard=True,
+    )
     monkeypatch.setattr(
         lingbot_world_module, "get_ulysses_parallel_world_size", lambda: 1
     )
@@ -455,6 +487,7 @@ def test_lingbot_cam_conditioner_cache_skips_single_ulysses_world(monkeypatch):
     assert first is not second
     assert block.cam_conditioner.calls == 2
     assert "lingbot_cam_conditioner" not in forward_batch.extra
+    assert "lingbot_cam_conditioner" not in forward_batch.request_runtime_cache
 
 
 def test_lingbot_cam_conditioner_cache_reuses_context_update(monkeypatch):
@@ -470,7 +503,11 @@ def test_lingbot_cam_conditioner_cache_reuses_context_update(monkeypatch):
         CausalLingBotWorldTransformerBlock
     )
     block.cam_conditioner = _CamConditioner()
-    forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=True)
+    forward_batch = SimpleNamespace(
+        extra={},
+        request_runtime_cache={},
+        enable_sequence_shard=True,
+    )
     monkeypatch.setattr(
         lingbot_world_module, "get_ulysses_parallel_world_size", lambda: 2
     )
@@ -486,7 +523,7 @@ def test_lingbot_cam_conditioner_cache_reuses_context_update(monkeypatch):
 
     assert first is second
     assert block.cam_conditioner.calls == 1
-    assert "lingbot_cam_conditioner" in forward_batch.extra
+    assert "lingbot_cam_conditioner" in forward_batch.request_runtime_cache
 
 
 def test_lingbot_model_prepares_cam_conditioner_scale_shifts(monkeypatch):
@@ -509,7 +546,11 @@ def test_lingbot_model_prepares_cam_conditioner_scale_shifts(monkeypatch):
         SimpleNamespace(cam_conditioner=_CamConditioner(1)),
         SimpleNamespace(cam_conditioner=_CamConditioner(2)),
     ]
-    forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=True)
+    forward_batch = SimpleNamespace(
+        extra={},
+        request_runtime_cache={},
+        enable_sequence_shard=True,
+    )
     monkeypatch.setattr(
         lingbot_world_module, "get_ulysses_parallel_world_size", lambda: 2
     )

@@ -182,6 +182,7 @@ class Req:
 
     # Extra parameters that might be needed by specific pipeline implementations (e.g., LTX2.3 DenoisingAVStage)
     extra: dict[str, Any] = field(default_factory=dict)
+    request_runtime_cache: dict[str, Any] = field(default_factory=dict)
 
     condition_inputs: dict[str, Any] = field(default_factory=dict)
 

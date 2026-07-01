@@ -227,14 +227,6 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         batch.realtime_causal_kv_sample_tokens = sample_tokens
         return previous
 
-    @staticmethod
-    def _clear_lingbot_request_runtime_cache(cache_state) -> None:
-        runtime_cache = getattr(cache_state, "runtime_cache", None)
-        if runtime_cache is None:
-            return
-        runtime_cache.pop("lingbot_c2ws_plucker_emb", None)
-        runtime_cache.pop("lingbot_cam_conditioner", None)
-
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
         result.add_check(
@@ -481,7 +473,6 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             prepare_model_input=prepare_model_input,
             prepare_context_input=prepare_model_input,
         )
-        self._clear_lingbot_request_runtime_cache(cache_ctx.cache_state)
 
         # Advance cumulative frame position
         self._advance_realtime_causal_cache(cache_ctx, num_frames=ctx.num_frames)
