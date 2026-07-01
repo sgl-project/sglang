@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.laguna import LagunaConfig, normalize_gating
+from sglang.srt.environ import envs
 from sglang.srt.distributed import (
     get_pp_group,
     tensor_model_parallel_all_reduce,
@@ -68,6 +69,8 @@ class LagunaMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         if hidden_act != "silu":
@@ -80,6 +83,8 @@ class LagunaMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
+            tp_rank=tp_rank,
+            tp_size=tp_size,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -88,6 +93,8 @@ class LagunaMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
+            tp_rank=tp_rank,
+            tp_size=tp_size,
         )
         self.act_fn = SiluAndMul()
 
@@ -177,6 +184,11 @@ class LagunaMoE(nn.Module):
 
         # HF safetensors key is singular `shared_expert.…`; mirror so the
         # default loader picks it up without remapping.
+        # SGLANG_SHARED_EXPERT_TP1 replicates the shared expert instead of
+        # TP-sharding it, for checkpoints whose shared-expert quant scales are
+        # not divisible by the global TP size (e.g. block-FP8 [128,128] with
+        # shared_expert_intermediate_size=512 at TP=8 → 64-per-rank shards).
+        self._shared_expert_tp1 = envs.SGLANG_SHARED_EXPERT_TP1.get()
         self.shared_expert = LagunaMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.shared_expert_intermediate_size,
@@ -184,6 +196,7 @@ class LagunaMoE(nn.Module):
             quant_config=quant_config,
             reduce_results=False,
             prefix=add_prefix("shared_expert", prefix),
+            **(dict(tp_rank=0, tp_size=1) if self._shared_expert_tp1 else {}),
         )
 
     def get_moe_weights(self):
@@ -212,7 +225,13 @@ class LagunaMoE(nn.Module):
         # so scale routed manually before adding the unscaled shared expert.
         if self.routed_scaling_factor != 1.0:
             routed_out = routed_out * self.routed_scaling_factor
-        final = routed_out + shared_out
+        # A TP1 (replicated) shared expert already holds the full result on
+        # every rank, so it must be added after the all-reduce — adding before
+        # would sum it once per TP rank.
+        if self._shared_expert_tp1:
+            final = routed_out
+        else:
+            final = routed_out + shared_out
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
@@ -220,6 +239,8 @@ class LagunaMoE(nn.Module):
             should_allreduce_fusion=should_allreduce_fusion,
         ):
             final = tensor_model_parallel_all_reduce(final)
+        if self._shared_expert_tp1:
+            final = final + shared_out
         return final
 
 
