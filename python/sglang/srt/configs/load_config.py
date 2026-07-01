@@ -34,6 +34,7 @@ class LoadFormat(str, enum.Enum):
     FASTSAFETENSORS = "fastsafetensors"
     PRIVATE = "private"
     RUNAI_STREAMER = "runai_streamer"
+    IPC_CACHE = "ipc_cache"
 
 
 @dataclass
@@ -103,6 +104,10 @@ class LoadConfig:
 
     # For multi-layer MTP
     draft_model_idx: Optional[int] = None
+
+    # Weight cache daemon options
+    weight_cache_mode: str = "off"  # "off", "daemon", "client"
+    weight_cache_socket: Optional[str] = None  # Path to daemon socket (for client mode)
 
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}

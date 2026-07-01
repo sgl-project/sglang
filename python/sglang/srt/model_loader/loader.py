@@ -3298,4 +3298,19 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.RUNAI_STREAMER:
         return RunaiModelStreamerLoader(load_config)
 
+    if load_config.load_format == LoadFormat.IPC_CACHE:
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+        from sglang.srt.weight_cache.protocol import get_socket_path
+
+        socket_path = (
+            load_config.weight_cache_socket
+            if load_config.weight_cache_socket
+            else get_socket_path(global_rank=load_config.tp_rank or 0)
+        )
+        return IpcModelLoader(
+            load_config=load_config,
+            socket_path=socket_path,
+            weight_cache_mode=load_config.weight_cache_mode,
+        )
+
     return DefaultModelLoader(load_config)

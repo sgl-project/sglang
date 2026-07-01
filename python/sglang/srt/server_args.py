@@ -135,6 +135,7 @@ LOAD_FORMAT_CHOICES = [
     "fastsafetensors",
     "private",
     "runai_streamer",
+    "ipc_cache",
 ]
 
 # TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
@@ -2540,6 +2541,29 @@ class ServerArgs:
         bool,
         "Keep multimodal feature tensors on device after processing to save D2H copy.",
     ] = False
+
+    weight_cache_mode: A[
+        str,
+        Arg(
+            help="Weight cache mode. 'off': normal disk loading. "
+            "'daemon': launch weight cache daemon (holds weights in GPU memory). "
+            "'client': connect to existing daemon and load via IPC.",
+            choices=["off", "daemon", "client"],
+        ),
+    ] = "off"
+    weight_cache_socket: A[
+        Optional[str],
+        Arg(
+            help="Unix socket path for weight cache daemon (client mode)."
+            "If not set, uses /tmp/sglang_weight_cache_gpu{tp_rank}.sock",
+        ),
+    ] = None
+    weight_cache_timeout: A[
+        int,
+        Arg(
+            help="Timeout in seconds for weight cache daemon readiness (default: 1800).",
+        ),
+    ] = 1800
 
     # -------------------------------------------------------------------------
     # Custom hooks, probe, and plugins

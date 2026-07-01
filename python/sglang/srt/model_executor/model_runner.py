@@ -1434,7 +1434,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
             draft_model_idx=self.draft_model_idx,
+            weight_cache_mode=self.server_args.weight_cache_mode,
+            weight_cache_socket=self.server_args.weight_cache_socket,
         )
+
+        # If weight cache is enabled, override load format to IPC_CACHE
+        if self.server_args.weight_cache_mode != "off":
+            self.load_config.load_format = LoadFormat.IPC_CACHE
+            # Compute socket path using global rank (tp_size * pp_rank + tp_rank)
+            # so each daemon has a unique socket even across PP stages and nodes.
+            if self.load_config.weight_cache_socket is None:
+                from sglang.srt.weight_cache.protocol import get_socket_path
+
+                global_rank = self.tp_size * self.pp_rank + self.tp_rank
+                self.load_config.weight_cache_socket = get_socket_path(
+                    global_rank=global_rank
+                )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
                 self.model_config, self.load_config, self.tp_size
@@ -1465,6 +1480,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
             self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
         )
+
+        # In zero-copy IPC mode, the weights are shared with the daemon via
+        # CUDA IPC and must not be offloaded/reloaded by the memory saver.
+        is_ipc_zero_copy = self.server_args.weight_cache_mode != "off"
+        if is_ipc_zero_copy and enable_cpu_backup:
+            logger.warning(
+                "[ModelRunner] Disabling weights CPU backup in zero-copy IPC mode — "
+                "IPC-mapped weights cannot be offloaded to CPU."
+            )
+            enable_cpu_backup = False
+
         with self.memory_saver_adapter.region(
             GPU_MEMORY_TYPE_WEIGHTS,
             enable_cpu_backup=enable_cpu_backup,
