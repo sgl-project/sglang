@@ -1999,6 +1999,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         else:
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
+            # w13/w2_input_scale are loaded globally (_sglang_require_global_experts);
+            # slice to this rank's local experts so shapes line up with
+            # w13_weight_scale_2 / w2_weight_scale_2 which are already per-local-expert.
+            if layer.moe_ep_size > 1:
+                assert layer.moe_ep_size * layer.num_local_experts == layer.num_experts
+                lo = layer.moe_ep_rank * layer.num_local_experts
+                hi = lo + layer.num_local_experts
+                w13_input_scale = w13_input_scale[lo:hi]
+                w2_input_scale = w2_input_scale[lo:hi]
 
         if self.quant_config.use_per_token_activation:
             # FlashInfer computes activation scales dynamically per token, so
@@ -2217,7 +2226,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # Both flashinfer cutlass and regular cutlass use same processing for w2
 
-            # Set up CUTLASS MoE parameters (reuse to keep CUDA graph stable)
+            # Set up CUTLASS MoE parameters (reuse to keep CUDA graph stable).
+            # Size by `num_local_experts`: the FP4 grouped GEMM iterates
+            # `expert_offsets.size(0)` experts and indexes the (per-rank
+            # local-sized) `w13_weight` / `w2_weight` by `expert_id`.
             device = layer.w13_weight.device
             inter_size = layer.w2_weight.shape[2] * 2
             hidden_size = layer.w13_weight.shape[2] * 2
@@ -2225,7 +2237,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             if (
                 existing_params is None
                 or existing_params.cutlass_moe_type != CutlassMoEType.BlockscaledFP4
-                or existing_params.num_experts != layer.num_experts
+                or existing_params.num_experts != layer.num_local_experts
                 or existing_params.intermediate_size_per_partition != inter_size
                 or existing_params.hidden_size != hidden_size
                 or existing_params.device != device
@@ -2233,7 +2245,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer.cutlass_moe_params = CutlassMoEParams(
                     CutlassMoEType.BlockscaledFP4,
                     device,
-                    num_experts=layer.num_experts,  # global num experts
+                    num_experts=layer.num_local_experts,
                     intermediate_size_per_partition=inter_size,  # n
                     hidden_size=hidden_size,
                 )  # k

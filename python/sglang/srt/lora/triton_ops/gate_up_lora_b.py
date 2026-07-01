@@ -13,6 +13,7 @@ def _gate_up_lora_b_kernel(
     weights,
     output,
     # Parameters of size
+    S,  # total number of rows in x/output (used for OOB clamping)
     K,  # K = R
     output_dim,
     # Strides
@@ -96,43 +97,43 @@ def _gate_up_lora_b_kernel(
     s_physical = _resolve_token_positions(
         sorted_token_ids, seg_start, s_offset, seg_len, SORTED_BY_ADAPTER
     )
-    x_ptrs = (
-        x
-        + (gate_up_id * K) * x_stride_1
-        + (s_physical[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1)
-    )
-    w_ptrs = (weights + w_index * w_stride_0 + n_start * w_stride_1) + (
-        k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
-    )
+    # See sgemm_lora_a for why we clamp masked-lane indices.
+    row_mask = s_offset < seg_len
+    safe_row = tl.minimum(s_physical, S - 1)
+    safe_n = tl.minimum(n_offset, output_dim - 1)
 
     # Iterate to compute the block in output matrix
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
+        cur_k = k * BLOCK_K + k_offset
+        k_mask = cur_k < K
+        safe_k = tl.minimum(cur_k, K - 1)
         x_tile = tl.load(
-            x_ptrs,
-            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
+            x
+            + safe_row[:, None] * x_stride_0
+            + (gate_up_id * K + safe_k[None, :]) * x_stride_1,
+            mask=row_mask[:, None] & k_mask[None, :],
             other=0.0,
         )
         w_tile = tl.load(
-            w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K)
-            & (n_offset[None, :] < output_dim),
+            weights
+            + w_index * w_stride_0
+            + (n_start + safe_n[None, :]) * w_stride_1
+            + safe_k[:, None] * w_stride_2,
+            mask=k_mask[:, None] & (n_offset[None, :] < output_dim),
             other=0.0,
         )
         partial_sum += tl.dot(x_tile, w_tile)
-
-        x_ptrs += BLOCK_K * x_stride_1
-        w_ptrs += BLOCK_K * w_stride_2
 
     # Store result to output matrix
     partial_sum *= scaling
     partial_sum = partial_sum.to(x.dtype.element_ty)
     output_ptr = (
         output
-        + n_start * output_stride_1
-        + (s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1)
+        + safe_row[:, None] * output_stride_0
+        + (n_start + safe_n[None, :]) * output_stride_1
     )
-    output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < output_dim)
+    output_mask = row_mask[:, None] & (n_offset[None, :] < output_dim)
     partial_sum += tl.load(output_ptr, mask=output_mask)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
@@ -180,6 +181,7 @@ def gate_up_lora_b_fwd(
         x,
         gate_up_lora_b,
         output,
+        s,
         r,
         output_dim,
         x.stride(0),
