@@ -37,7 +37,11 @@ import torch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    ScheduleBatch,
+    compute_cache_hit_split,
+)
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -126,6 +130,7 @@ def match_prefix_for_req(
     req.num_matched_prefix_tokens = min(
         len(req.prefix_indices) + req.host_hit_length, max_len
     )
+    req.loaded_host_hit_length = 0
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
@@ -467,8 +472,14 @@ class PrefillAdder:
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
+
         self.log_hit_tokens = 0
+        self.log_hit_tokens_device = 0
+        self.log_hit_tokens_host = 0
+        self.log_hit_tokens_storage = 0
+
         self.reprocessed_log_hit_tokens = 0
+
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
         self.reprocessed_log_input_tokens = 0
@@ -624,6 +635,23 @@ class PrefillAdder:
 
         return AddReqResult.CONTINUE
 
+    def _accumulate_hit_token_split(self, req, prefix_len: int) -> None:
+        """Accumulate per-source cache-hit split alongside log_hit_tokens.
+
+        Must be called exactly once per scheduling decision (not for chunk 2+
+        of chunked prefill, where prefix_len passed to _update_prefill_budget
+        is 0). Called for both retracted and non-retracted requests so that
+        the split always sums to log_hit_tokens.
+        """
+        if prefix_len <= 0:
+            return
+        device, host, storage = compute_cache_hit_split(
+            prefix_len, req.loaded_host_hit_length, req.storage_hit_length
+        )
+        self.log_hit_tokens_device += device
+        self.log_hit_tokens_host += host
+        self.log_hit_tokens_storage += storage
+
     def _update_prefill_budget(
         self,
         prefix_len: int,
@@ -681,7 +709,13 @@ class PrefillAdder:
 
         self.can_run_list.append(req)
 
-        self._update_prefill_budget(prefix_len, trunc_len, 0, req.retracted_stain)
+        self._accumulate_hit_token_split(req, prefix_len)
+        self._update_prefill_budget(
+            prefix_len,
+            trunc_len,
+            0,
+            req.retracted_stain,
+        )
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
@@ -965,9 +999,12 @@ class PrefillAdder:
                         req=req,
                     )
                 )
+                req.loaded_host_hit_length = len(new_indices)
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
+            else:
+                req.loaded_host_hit_length = 0
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
@@ -1001,6 +1038,7 @@ class PrefillAdder:
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
+                self._accumulate_hit_token_split(req, prefix_len)
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
@@ -1044,8 +1082,12 @@ class PrefillAdder:
                 self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
+                self._accumulate_hit_token_split(req, prefix_len)
                 self._update_prefill_budget(
-                    prefix_len, trunc_len, 0, req.retracted_stain
+                    prefix_len,
+                    trunc_len,
+                    0,
+                    req.retracted_stain,
                 )
 
         return self.budget_state()

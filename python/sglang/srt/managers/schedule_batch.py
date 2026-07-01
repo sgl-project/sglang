@@ -146,6 +146,21 @@ def _compute_pad_value(hash: int) -> int:
     return MM_PAD_SHIFT_VALUE + (hash % (1 << 30))
 
 
+def compute_cache_hit_split(
+    prefix_len: int, loaded_host_hit_length: int, storage_hit_length: int
+) -> tuple:
+    """Return (device, host, storage) token counts. Always sums to prefix_len.
+
+    loaded_host_hit_length is the number of KV tokens actually restored from
+    host in this scheduling decision. It intentionally differs from
+    host_hit_length, which can be a load-back trigger sentinel for hybrid
+    caches.
+    """
+    host_total = min(loaded_host_hit_length, prefix_len)
+    storage = min(host_total, storage_hit_length)
+    return prefix_len - host_total, host_total - storage, storage
+
+
 class BaseFinishReason:
     def to_json(self):
         raise NotImplementedError()
@@ -856,6 +871,7 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         self.swa_host_hit_length = 0
         self.mamba_host_hit_length = 0
+        self.loaded_host_hit_length = 0
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -1200,6 +1216,7 @@ class Req(ReqDllmMixin):
                 match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
+            self.loaded_host_hit_length = 0
             if match_result.cache_protected_len is not None:
                 self.cache_protected_len = match_result.cache_protected_len
             else:
@@ -1450,6 +1467,9 @@ class Req(ReqDllmMixin):
         self.last_node = None
         self.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
+        self.host_hit_length = 0
+        self.loaded_host_hit_length = 0
+        self.storage_hit_length = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.extend_range = None
@@ -2120,24 +2140,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # Only compute once on FIRST chunk - subsequent chunks in chunked prefill
                 # would incorrectly count previously computed tokens as cache hits.
                 if not req._cache_breakdown_computed:
-                    # At this point, prefix_indices has been extended with host data
-                    # via init_load_back in schedule_policy, so:
-                    # - len(prefix_indices) = device_original + host_loaded
-                    # - host_hit_length = total tokens from host cache (including storage-prefetched)
-                    # - storage_hit_length = tokens loaded from storage backend (L3 hits)
-                    # - device_portion = len(prefix_indices) - host_hit_length
-                    #
-                    # Storage hits are now tracked via scheduler after prefetch completes.
-                    # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
-                    host_total = req.host_hit_length
-                    # Clamp storage to host_total to handle edge cases
-                    storage_portion = min(host_total, req.storage_hit_length)
-                    host_portion = host_total - storage_portion
-                    device_portion = max(0, len(req.prefix_indices) - host_total)
-
-                    req.cached_tokens_device = device_portion
-                    req.cached_tokens_host = host_portion
-                    req.cached_tokens_storage = storage_portion
+                    (
+                        req.cached_tokens_device,
+                        req.cached_tokens_host,
+                        req.cached_tokens_storage,
+                    ) = compute_cache_hit_split(
+                        len(req.prefix_indices),
+                        req.loaded_host_hit_length,
+                        req.storage_hit_length,
+                    )
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len
