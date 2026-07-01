@@ -444,6 +444,12 @@ def should_skip_post_experts_all_reduce(
       - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
         the flashinfer cutlass FP4 kernel performs an all-gather that absorbs
         the post-experts TP all-reduce. Not relevant to the EP all-reduce.
+      - ``get_moe_a2a_backend().is_flashinfer()``: the flashinfer A2A
+        dispatcher's ``MoeAlltoAll.combine`` already alltoall-reduces partial
+        MoE outputs back to the source rank, so any further EP/TP all-reduce
+        would double-count and overflow BF16. Mirrors TRTLLM's
+        ``not enable_alltoall`` gate
+        (``tensorrt_llm/_torch/modules/fused_moe/interface.py:879``).
 
     The first two args are layer-context flags from ``LayerCommunicator`` and
     default to ``False`` for models that don't use it. Pass ``is_tp_path=True``
@@ -454,6 +460,8 @@ def should_skip_post_experts_all_reduce(
     if should_use_dp_reduce_scatterv():
         return True
     if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
+        return True
+    if get_moe_a2a_backend().is_flashinfer():
         return True
     return False
 
