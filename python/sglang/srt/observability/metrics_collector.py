@@ -328,6 +328,15 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.kv_cache_usage_perc = Gauge(
+            name="sglang:kv_cache_usage_perc",
+            documentation=(
+                "KV cache usage percentage (0.0–1.0). "
+                "Mirrors vLLM's vllm:gpu_cache_usage_perc for compatibility."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
 
         # =================================================================
         # Absolute token counts
@@ -1271,6 +1280,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(self.full_token_usage, stats.full_token_usage)
         self._log_gauge(self.swa_token_usage, stats.swa_token_usage)
         self._log_gauge(self.mamba_usage, stats.mamba_usage)
+        self._log_gauge(self.kv_cache_usage_perc, stats.token_usage)
 
         # Absolute token counts
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
