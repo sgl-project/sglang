@@ -56,7 +56,6 @@ from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
-    launch_dp_attention_schedulers_standalone,
     run_data_parallel_controller_process,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
@@ -658,17 +657,6 @@ class Engine(EngineScoreMixin, EngineBase):
 
                     scheduler_procs.append(proc)
                     scheduler_pipe_readers.append(reader)
-        elif envs.SGLANG_RUST_SERVER.get() and server_args.enable_dp_attention:
-            # Rust server: skip the DataParallelController entirely. The rust
-            # api-server does the request routing and control broadcast the DPC
-            # would, so only its *launch* is needed. Spawn the dp-attention
-            # schedulers directly and collect their info via the normal ready-wait
-            # path below (same as the dp_size == 1 case) — no controller process,
-            # no event loop, no worker ZMQ ports.
-            procs, scheduler_pipe_readers = launch_dp_attention_schedulers_standalone(
-                server_args, port_args, run_scheduler_process_func
-            )
-            scheduler_procs.extend(procs)
         else:
             # Launch the data parallel controller
             reader, writer = mp.Pipe(duplex=False)
@@ -873,45 +861,55 @@ class Engine(EngineScoreMixin, EngineBase):
                 None,
             )
 
-        # The embedded Rust frontend (started inside the rank-0 scheduler) owns
+        # The embedded Rust server (started inside the rank-0 scheduler) owns
         # the API server, tokenization, and detokenization. In that mode we do
         # not start the Python detokenizer subprocess(es) or tokenizer manager.
-        rust_server = envs.SGLANG_RUST_SERVER.get()
-
-        if not rust_server:
-            # Launch detokenizer process(es) — optionally fronted by a router
-            # when detokenizer_worker_num > 1.
-            detoken_procs, detoken_names = cls._launch_detokenizer_subprocesses(
-                server_args=server_args,
-                port_args=port_args,
-                run_detokenizer_process_func=run_detokenizer_process_func,
+        # Do not use RayEngine with the Rust server, as it is not supported.
+        if envs.SGLANG_RUST_SERVER.get():
+            scheduler_init_result.wait_for_ready()
+            # Set up subprocess liveness watchdog to detect crashes
+            processes = list(scheduler_procs or [])
+            names = [f"scheduler_{i}" for i in range(len(processes))]
+            subprocess_watchdog = SubprocessWatchdog(
+                processes=processes, process_names=names
             )
-            for p in detoken_procs:
-                scheduler_init_result.all_child_pids.append(p.pid)
+            subprocess_watchdog.start()
 
-            # Init tokenizer manager first, as the bootstrap server is initialized here
-            if server_args.tokenizer_worker_num == 1:
-                tokenizer_manager, template_manager = init_tokenizer_manager_func(
-                    server_args, port_args
-                )
-            else:
-                # Launch multi-tokenizer router
-                tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
-                template_manager = None
+            return (
+                None,
+                None,
+                port_args,
+                scheduler_init_result,
+                subprocess_watchdog,
+            )
+
+        # Launch detokenizer process(es) — optionally fronted by a router
+        # when detokenizer_worker_num > 1.
+        detoken_procs, detoken_names = cls._launch_detokenizer_subprocesses(
+            server_args=server_args,
+            port_args=port_args,
+            run_detokenizer_process_func=run_detokenizer_process_func,
+        )
+        for p in detoken_procs:
+            scheduler_init_result.all_child_pids.append(p.pid)
+
+        # Init tokenizer manager first, as the bootstrap server is initialized here
+        if server_args.tokenizer_worker_num == 1:
+            tokenizer_manager, template_manager = init_tokenizer_manager_func(
+                server_args, port_args
+            )
         else:
-            tokenizer_manager = None
+            # Launch multi-tokenizer router
+            tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
             template_manager = None
-            detoken_procs = []
-            detoken_names = []
 
         # Wait for the model to finish loading
         scheduler_init_result.wait_for_ready()
 
         # Get back some info from scheduler to tokenizer_manager
-        if tokenizer_manager is not None:
-            tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[
-                0
-            ]["max_req_input_len"]
+        tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[0][
+            "max_req_input_len"
+        ]
 
         # Set up subprocess liveness watchdog to detect crashes
         # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
