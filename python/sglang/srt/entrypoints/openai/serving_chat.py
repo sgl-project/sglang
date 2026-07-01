@@ -466,6 +466,16 @@ class OpenAIServingChat(OpenAIServingBase):
             return "Messages cannot be empty."
 
         if (
+            request.chat_template_kwargs
+            and "chat_template" in request.chat_template_kwargs
+            and not self.tokenizer_manager.server_args.trust_request_chat_template
+        ):
+            return (
+                "Request-supplied chat_template is not allowed. Start the server "
+                "with --trust-request-chat-template to permit it."
+            )
+
+        if (
             isinstance(request.tool_choice, str)
             and request.tool_choice.lower() == "required"
             and not request.tools
@@ -854,7 +864,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(
                     rendered_prompt, **encode_kwargs
                 )
-            except Exception as e:
+            except Exception:
                 # If the first attempt fails, try with flat function-only format.
                 # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
                 tools = (

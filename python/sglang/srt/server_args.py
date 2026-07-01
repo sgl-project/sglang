@@ -1188,6 +1188,10 @@ class ServerArgs:
         Optional[str],
         "The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
     ] = None
+    trust_request_chat_template: A[
+        bool,
+        "Allow a request to override the server chat template via its chat_template_kwargs. Off by default for safety.",
+    ] = False
     hf_chat_template_name: A[
         Optional[str],
         "When the HuggingFace tokenizer has multiple chat templates (e.g., 'default', 'tool_use', 'rag'), specify which named template to use. If not set, the first available template is used.",

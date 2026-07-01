@@ -2320,5 +2320,46 @@ class TestNormalizeToolContent(unittest.TestCase):
         self.assertEqual(result, "plain rich")
 
 
+class TestRequestChatTemplateTrustGate(unittest.TestCase):
+    """A request-supplied chat_template is rejected unless the server opts in."""
+
+    def setUp(self):
+        self.tm = _MockTokenizerManager()
+        # context_length is unset on the mock; None disables the length check so
+        # _validate_request reaches (and returns from) the trust gate cleanly.
+        self.tm.server_args.context_length = None
+        self.chat = OpenAIServingChat(self.tm, _MockTemplateManager())
+
+    def _req(self, **kwargs):
+        return ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "hi"}], **kwargs
+        )
+
+    def test_rejected_by_default(self):
+        self.tm.server_args.trust_request_chat_template = False
+        err = self.chat._validate_request(
+            self._req(chat_template_kwargs={"chat_template": "{{ messages }}"})
+        )
+        self.assertIsNotNone(err)
+        self.assertIn("chat_template", err)
+        self.assertIn("--trust-request-chat-template", err)
+
+    def test_allowed_when_trusted(self):
+        self.tm.server_args.trust_request_chat_template = True
+        self.assertIsNone(
+            self.chat._validate_request(
+                self._req(chat_template_kwargs={"chat_template": "{{ messages }}"})
+            )
+        )
+
+    def test_benign_kwargs_unaffected(self):
+        self.tm.server_args.trust_request_chat_template = False
+        self.assertIsNone(
+            self.chat._validate_request(
+                self._req(chat_template_kwargs={"enable_thinking": False})
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
