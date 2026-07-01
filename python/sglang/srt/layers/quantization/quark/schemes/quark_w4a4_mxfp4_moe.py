@@ -33,8 +33,23 @@ __all__ = ["QuarkW4A4MXFp4MoE"]
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
-    from aiter.ops.shuffle import shuffle_weight
+    from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
     from aiter.utility.fp4_utils import e8m0_shuffle
+
+
+def _detect_is_gfx1250() -> bool:
+    if not _is_hip:
+        return False
+    try:
+        return "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
+
+# gfx1250's grouped MoE GEMM reads weight scales in the n32k4 layout
+# (moe_shuffle_scale -> shuffle_scale_n32k4), not the e8m0_shuffle layout used by
+# gfx950. Using the wrong layout silently corrupts the dequant scales.
+_is_gfx1250 = _detect_is_gfx1250()
 
 if _is_hip:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
@@ -219,16 +234,25 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Pre-shuffle weight scales
-        s0, s1, _ = layer.w13_weight_scale.shape
-        w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
-        w13_weight_scale = e8m0_shuffle(w13_weight_scale)
-        layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
+        if _is_gfx1250:
+            # gfx1250 grouped MoE GEMM consumes B-scales in the n32k4 layout.
+            num_experts = layer.w13_weight_scale.shape[0]
+            layer.w13_weight_scale.data = moe_shuffle_scale(
+                layer.w13_weight_scale.contiguous(), experts_cnt=num_experts
+            )
+            layer.w2_weight_scale.data = moe_shuffle_scale(
+                layer.w2_weight_scale.contiguous(), experts_cnt=num_experts
+            )
+        else:
+            s0, s1, _ = layer.w13_weight_scale.shape
+            w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
+            w13_weight_scale = e8m0_shuffle(w13_weight_scale)
+            layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
 
-        s0, s1, _ = layer.w2_weight_scale.shape
-        w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
-        w2_weight_scale = e8m0_shuffle(w2_weight_scale)
-        layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
-
+            s0, s1, _ = layer.w2_weight_scale.shape
+            w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
+            w2_weight_scale = e8m0_shuffle(w2_weight_scale)
+            layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
         # Pre-shuffle weight
         if _is_shuffle_moe_mxfp4:
             layer.w13_weight.data = shuffle_weight(

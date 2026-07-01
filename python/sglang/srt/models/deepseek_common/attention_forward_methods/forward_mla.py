@@ -61,6 +61,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cublas_ge_129,
     _is_cuda,
     _is_gfx95_supported,
+    _is_gfx1250,
     _is_hip,
     _is_musa,
     _use_aiter,
@@ -555,7 +556,14 @@ class DeepseekMLAForwardMixin:
             and (not fuse_rope_for_trtllm_mla)
             and (not skip_rope_for_dsa_tilelang_fused)
             and (not skip_rope_for_aiter_fused_mla)
-            and (not _use_aiter or not _is_gfx95_supported or self.use_dsa)
+            and (
+                not _use_aiter
+                or not _is_gfx95_supported
+                or self.use_dsa
+                # gfx1250 uses sglang's native rope (no aiter cos_cache/sin_cache
+                # buffers), so apply rope here instead of the fused-rope core path.
+                or _is_gfx1250
+            )
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
@@ -758,7 +766,7 @@ class DeepseekMLAForwardMixin:
                         ),
                     )
         else:
-            if _use_aiter_gfx95:
+            if _use_aiter_gfx95 and not _is_gfx1250:
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
 
@@ -1038,6 +1046,9 @@ class DeepseekMLAForwardMixin:
         """
         return (
             _use_aiter_gfx95
+            # gfx1250 runs sglang's native rope (no aiter cos_cache/sin_cache); it
+            # applies rope in prepare and uses the non-fused core path instead.
+            and not _is_gfx1250
             and self.current_attention_backend
             not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
         )

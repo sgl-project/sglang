@@ -224,6 +224,20 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     exit 1
   fi
 
+  ROCM_VERSION=$(docker exec ci_sglang bash -c 'cat $ROCM_HOME/.info/version 2>/dev/null || echo unknown')
+
+  # Check if ROCm version >= 7.14.0
+  if [[ "${ROCM_VERSION}" != "unknown" ]] && [[ "$(printf '%s\n' "7.14.0" "${ROCM_VERSION}" | sort -V | head -n1)" == "7.14.0" ]]; then
+    echo "[MORI] ROCm version ${ROCM_VERSION} >= 7.14.0 detected"
+    # The reason behind naming the condition LEGACY_EDITABLE_INSTALL
+    #   1. We tend to call `setup.py` directly so far anyway.
+    #   2. The real ROCM_VERSION condition (as above) is too complicated.
+    LEGACY_EDITABLE_INSTALL=0
+  else
+    echo "[MORI] ROCm version ${ROCM_VERSION} < 7.14.0 or unknown"
+    LEGACY_EDITABLE_INSTALL=1
+  fi
+
   if [[ "${GPU_ARCH}" == "mi35x" ]]; then
     MORI_GPU_ARCHS="gfx950"
   else

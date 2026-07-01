@@ -29,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx950-rocm7_14']
+        gpu_arch: ['gfx950-rocm7_14', 'gfx1250-rocm7_14']
         build_type: ['all']
     steps:
       - name: Checkout repository
@@ -83,6 +83,8 @@ jobs:
 
           if [ "${{ matrix.gpu_arch }}" = "gfx950-rocm7_14" ]; then
             rocm_tag="rocm7_14-mi35x"
+          elif [ "${{ matrix.gpu_arch }}" = "gfx1250-rocm7_14" ]; then
+            rocm_tag="rocm7_14-gfx1250"
           else
             echo "Unsupported gfx arch"
             exit 1
@@ -139,7 +141,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx950-rocm7_14']
+        gpu_arch: ['gfx950-rocm7_14', 'gfx1250-rocm7_14']
     steps:
       - name: Download image tag artifact
         uses: actions/download-artifact@v4

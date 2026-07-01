@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import Any, Dict, Optional, Tuple
 
@@ -56,6 +57,19 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
     from aiter.rotary_embedding import get_rope as aiter_get_rope
+
+
+@functools.lru_cache(maxsize=1)
+def _aiter_rope_unsupported_arch() -> bool:
+    """aiter's rope kernels (csrc/kernels/rope/rope_common.h) depend on ck_tile
+    types that do not build on gfx1250; fall back to sglang's native rope there."""
+    if not _is_hip:
+        return False
+    try:
+        return "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
 
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
 
@@ -426,7 +440,8 @@ def get_rope_wrapper(
     device: Optional[str] = None,
 ):
     if device != "cpu":
-        wrapper = aiter_get_rope if _use_aiter else get_rope
+        use_aiter_rope = _use_aiter and not _aiter_rope_unsupported_arch()
+        wrapper = aiter_get_rope if use_aiter_rope else get_rope
         return wrapper(
             head_size,
             rotary_dim,
