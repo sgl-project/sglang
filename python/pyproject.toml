@@ -220,5 +220,10 @@ target = "sglang.srt.grpc._core"
 path = "../rust/sglang-grpc/Cargo.toml"
 binding = "PyO3"
 
+[[tool.setuptools-rust.ext-modules]]
+target = "sglang.srt.mem_cache._mem_cache_core"
+path = "../rust/sglang-mem-cache/Cargo.toml"
+binding = "PyO3"
+
 [tool.kernels.dependencies]
 "kernels-community/sgl-flash-attn3" = 1
