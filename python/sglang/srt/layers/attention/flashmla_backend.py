@@ -89,11 +89,14 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
 
-        self.cuda_graph_kv_indices = None
+        # Keep FlashMLA's 2D block table separate from the parent's flat CG buffer.
+        self.cuda_graph_block_kv_indices = None
         self.cuda_graph_mla_metadata = None
         self.cuda_graph_num_splits = None
         self.cuda_graph_mla_metadata_view = None
         self.cuda_graph_num_splits_view = None
+        self._parent_cuda_graph_state_shape = None
+        self._cuda_graph_state_shape = None
 
         # get dcp info
         self.dcp_world_size = get_attention_dcp_world_size()
@@ -114,6 +117,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 forward_mode=forward_mode,
             )
         else:
+            self._init_parent_cuda_graph_state()
             super().init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
@@ -194,15 +198,18 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         max_num_tokens: int,
         block_kv_indices: Optional[torch.Tensor] = None,
     ):
+        self._cuda_graph_state_shape = (max_bs, max_num_tokens)
+        self._parent_cuda_graph_state_shape = None
+
         if block_kv_indices is None:
-            self.cuda_graph_kv_indices = torch.full(
+            self.cuda_graph_block_kv_indices = torch.full(
                 (max_bs, (self.max_context_len + PAGE_SIZE) // PAGE_SIZE),
                 1,
                 dtype=torch.int32,
                 device="cuda",
             )
         else:
-            self.cuda_graph_kv_indices = block_kv_indices
+            self.cuda_graph_block_kv_indices = block_kv_indices
 
         device_props = torch.cuda.get_device_properties(self.req_to_token.device)
         max_num_sm_parts = device_props.multi_processor_count
@@ -220,6 +227,15 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         self.cuda_graph_mla_metadata_view = None
         self.cuda_graph_num_splits_view = None
+
+    def _init_parent_cuda_graph_state(self):
+        if self._cuda_graph_state_shape is None:
+            raise RuntimeError("init_cuda_graph_state must be called first.")
+
+        if self._parent_cuda_graph_state_shape != self._cuda_graph_state_shape:
+            max_bs, max_num_tokens = self._cuda_graph_state_shape
+            super().init_cuda_graph_state(max_bs, max_num_tokens)
+            self._parent_cuda_graph_state_shape = self._cuda_graph_state_shape
 
     def _apply_decode_target_verify_metadata(
         self,
@@ -255,7 +271,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 (
                     bs,
                     get_num_kv_index_blocks_flashmla(
-                        self.cuda_graph_kv_indices.stride(0), PAGE_SIZE
+                        self.cuda_graph_block_kv_indices.stride(0), PAGE_SIZE
                     ),
                 )
             ](
@@ -263,9 +279,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 req_pool_indices[:bs],
                 seq_lens,
                 None,
-                self.cuda_graph_kv_indices,
+                self.cuda_graph_block_kv_indices,
                 self.req_to_token.stride(0),
-                self.cuda_graph_kv_indices.stride(0),
+                self.cuda_graph_block_kv_indices.stride(0),
             )
 
             q_head_mult = (
@@ -307,7 +323,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.forward_metadata = FlashMLADecodeMetadata(
                 self.cuda_graph_mla_metadata_view,
                 self.cuda_graph_num_splits_view,
-                self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
+                self.cuda_graph_block_kv_indices[:bs, :max_seqlen_pad],
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
