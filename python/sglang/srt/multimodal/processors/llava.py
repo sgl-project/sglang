@@ -109,7 +109,8 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 grid_pinpoints,
                 self._processor,
             )
-            timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
+            # CPU-bound image processing (not HTTP); REQUEST_TIMEOUT's 10s default is too tight for multi-frame video under concurrent load.
+            timeout = int(os.environ.get("SGLANG_MM_IMAGE_PROCESSING_TIMEOUT", "60"))
             return await asyncio.wait_for(fut, timeout=timeout)
         else:
             return self._process_single_image_task(
