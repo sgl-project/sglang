@@ -384,7 +384,10 @@ class Indexer(MultiPlatformOp):
             prefix=add_prefix("weights_proj", prefix),
         )
         self.k_norm = LayerNorm(
-            self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
+            self.head_dim,
+            dtype=torch.bfloat16
+            if (_use_aiter or (_is_cpu and _cpu_amx))
+            else torch.float32,
         )
         self.rotary_emb = get_rope_wrapper(
             rope_head_dim,
@@ -563,6 +566,7 @@ class Indexer(MultiPlatformOp):
     ):
         # Compute only key, skip query
         key, _ = self.wk(x)
+        key = key.to(torch.bfloat16)
         key = self.k_norm(key)
         k_rope, _ = torch.split(
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -2049,7 +2053,6 @@ class Indexer(MultiPlatformOp):
             return None
 
         # Determine if should skip topk based on sequence length
-        # We can only skip the logits computation if cuda graph is not involved
         skip_logits_computation = False
         if forward_batch.forward_mode.is_extend_without_speculative():
             if forward_batch.seq_lens_cpu is not None:
