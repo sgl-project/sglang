@@ -71,6 +71,9 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     freeze_gc,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    maybe_flashinfer_autotune_speculative_draft,
+)
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
@@ -853,15 +856,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             with canary_ctx:
                 shape_key = self._make_graph_key(bs, stream_idx, variant_label)
+                post_warmup_hook = getattr(
+                    self.model_runner.attn_backend,
+                    "on_after_cuda_graph_warmup",
+                    None,
+                )
+                maybe_flashinfer_autotune_speculative_draft(
+                    self,
+                    run_once,
+                    post_warmup_hook=post_warmup_hook,
+                    skip_logits=False,
+                )
                 self.backend.capture_one(
                     shape_key,
                     run_once,
                     dummies=None,
-                    post_warmup_hook=getattr(
-                        self.model_runner.attn_backend,
-                        "on_after_cuda_graph_warmup",
-                        None,
-                    ),
+                    post_warmup_hook=post_warmup_hook,
                 )
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
