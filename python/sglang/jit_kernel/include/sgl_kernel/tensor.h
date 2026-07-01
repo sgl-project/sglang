@@ -97,20 +97,6 @@ struct _device_trait {
   inline static constexpr DLDevice value = {.device_type = Code, .device_id = kAnyDeviceID};
 };
 
-#ifdef USE_ROCM
-// On ROCm builds, PyTorch / tvm-ffi tag GPU tensors with device type
-// kDLROCM, not kDLCUDA. The JIT kernels use kDLCUDA as the portable "GPU"
-// spelling in `with_device<kDLCUDA>()` / `set_options<kDLCUDA>()`, so remap
-// the CUDA device trait to ROCm here. This lets a single kernel source
-// validate HIP tensors on AMD without every launcher having to spell out
-// `with_device<kDLCUDA, kDLROCM>()`. Native CUDA builds are unaffected.
-template <>
-struct _device_trait<DLDeviceType::kDLCUDA> {
-  inline static constexpr DLDevice value = {
-      .device_type = DLDeviceType::kDLROCM, .device_id = kAnyDeviceID};
-};
-#endif  // USE_ROCM
-
 template <typename... Ts>
 inline constexpr auto kDTypeList = std::array<DLDataType, sizeof...(Ts)>{_dtype_trait<Ts>::value...};
 
