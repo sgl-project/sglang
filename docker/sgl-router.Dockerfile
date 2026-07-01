@@ -37,13 +37,18 @@ RUN cargo install cargo-chef --locked --version ^0.1
 WORKDIR /work
 COPY experimental/sgl-router/Cargo.toml ./
 COPY experimental/sgl-router/rust-toolchain.toml ./
-# Stub a minimal src tree so cargo can resolve the workspace, generate
+# Stub a minimal src tree (and the examples/ Cargo.toml declares — cargo
+# validates every [[example]]/[[bin]] path at manifest-parse time regardless
+# of which target is actually being built, so a declared example with no
+# stub here breaks `cargo chef cook`'s later reconstruction, not just a
+# direct build of that example) so cargo can resolve the workspace, generate
 # the lockfile (gitignored upstream), then prepare the chef recipe.
-RUN mkdir -p src && echo "fn main() {}" > src/main.rs \
+RUN mkdir -p src examples && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
+    && echo "fn main() {}" > examples/tokenize_bench.rs \
     && cargo generate-lockfile \
     && cargo chef prepare --recipe-path recipe.json \
-    && rm -rf src
+    && rm -rf src examples
 
 ######################## STAGE 2 — builder ##############################
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
@@ -67,9 +72,13 @@ COPY experimental/sgl-router/rust-toolchain.toml ./
 # invalidate it.
 RUN cargo chef cook --release --recipe-path recipe.json
 
-# Now bring in the real sources and the manifest they need.
+# Now bring in the real sources and the manifest they need. examples/ is
+# needed only so Cargo.toml's [[example]] entry resolves at manifest-parse
+# time — the `--bin sgl-router` build below never compiles it (its pprof
+# dependency isn't even in this default, non-profiling build).
 COPY experimental/sgl-router/Cargo.toml ./
 COPY experimental/sgl-router/src ./src
+COPY experimental/sgl-router/examples ./examples
 
 # --locked is intentionally omitted: the lockfile is generated in-container
 # (gitignored upstream) and `cargo chef cook` may have mutated it during the
