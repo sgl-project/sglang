@@ -229,6 +229,10 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+def _is_bcg_prefill(forward_batch: ForwardBatch) -> bool:
+    return forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph()
+
+
 @register_custom_op(mutates_args=["output"])
 @register_split_op()
 def deepseek_v4_attention_with_output(
@@ -379,6 +383,14 @@ class MQALayer(nn.Module):
         from sglang.srt.utils import is_blackwell_supported
 
         self._multi_stream_bs_limit = 128 if is_blackwell_supported() else 64
+        prefill_multi_stream_max_tokens = (
+            envs.SGLANG_OPT_DSV4_PREFILL_MULTI_STREAM_MAX_TOKENS.get()
+        )
+        if prefill_multi_stream_max_tokens is None:
+            prefill_multi_stream_max_tokens = (
+                get_global_server_args().cuda_graph_config.prefill.max_bs or 4096
+            )
+        self._prefill_multi_stream_max_tokens = prefill_multi_stream_max_tokens
 
         self.compressor = None
         self.indexer = None
@@ -927,6 +939,21 @@ class MQALayer(nn.Module):
 
         return q, kv
 
+    def within_multi_stream_token_limit(
+        self, forward_batch: ForwardBatch, num_tokens: int
+    ) -> bool:
+        if _is_bcg_prefill(forward_batch):
+            return num_tokens <= self._prefill_multi_stream_max_tokens
+        return num_tokens <= self._multi_stream_bs_limit
+
+    def bcg_prefill_multi_stream_limit_exceeded(
+        self, forward_batch: ForwardBatch, num_tokens: int
+    ) -> bool:
+        return (
+            _is_bcg_prefill(forward_batch)
+            and num_tokens > self._prefill_multi_stream_max_tokens
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -948,7 +975,7 @@ class MQALayer(nn.Module):
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
             and get_is_capture_mode()
-            and x.shape[0] <= self._multi_stream_bs_limit
+            and self.within_multi_stream_token_limit(forward_batch, x.shape[0])
             and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
             and not (_is_hip and self.compressor is None)
         )
@@ -1035,7 +1062,7 @@ class MQALayer(nn.Module):
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
-            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            if _is_bcg_prefill(forward_batch):
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                 )
@@ -1654,11 +1681,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = _a2a_scatter_chunks[r].contiguous()
             input_ids = input_ids.tensor_split(s)[r].contiguous()
             input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
+
+        enable_moe_alt_stream = (
+            not self.self_attn.bcg_prefill_multi_stream_limit_exceeded(
+                forward_batch, hidden_states.shape[0]
+            )
+        )
         hidden_states = self.mlp(
             hidden_states,
             forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
+            allow_alt_stream_overlap=enable_moe_alt_stream,
             # Skip the MoE-internal post-experts all_reduce when we will do the
             # reduce via reduce_scatterv/reduce_scatter at the combine below
             # (else double-reduce).

@@ -39,6 +39,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     enable_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
 )
@@ -113,7 +114,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
-            forward_fn()
+            with model_capture_mode():
+                forward_fn()
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
@@ -127,7 +129,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             pool=self._pool,
             stream=self._capture_stream,
         ):
-            out = captured_fn()
+            with model_capture_mode():
+                out = captured_fn()
             if self._shared_output_buffer is not None:
                 self._copy_output_to_buffer(out, self._shared_output_buffer, size)
 
