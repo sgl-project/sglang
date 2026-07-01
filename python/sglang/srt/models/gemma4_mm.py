@@ -59,7 +59,11 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma4_audio import Gemma4AudioEncoder
-from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
+from sglang.srt.models.gemma4_causal import (
+    Gemma4TextModel,
+    get_k_eq_v_layers,
+    pp_filter_load_weight,
+)
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -704,6 +708,17 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         (".gate_up_proj", ".gate_proj", 0),
     ]
 
+    # k_eq_v layers use MergedColumnParallelLinear (qk_proj) instead of
+    # QKVParallelLinear (qkv_proj).  Map checkpoint q_proj / k_proj to
+    # integer shard ids 0 and 1 respectively.
+    k_eq_v_stacked_params_mapping = [
+        # (param_name, shard_name, shard_id)
+        (".qk_proj", ".q_proj", 0),
+        (".qk_proj", ".k_proj", 1),
+        (".gate_up_proj", ".up_proj", 1),
+        (".gate_up_proj", ".gate_proj", 0),
+    ]
+
     # Regex for fused QKV in vision/audio towers.
     # Vision: *.self_attn.{q,k,v}_proj.*  Audio: *.attn.{q,k,v}_proj.*
     _RE_TOWER_QKV = re.compile(
@@ -817,14 +832,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         return name
 
-    def _get_k_eq_v_layers(self) -> set:
+    def _get_k_eq_v_layers(self) -> Set[int]:
         """Return set of layer indices where attention_k_eq_v applies (full-attention layers)."""
-        text_config = self.config.text_config
-        if not getattr(text_config, "attention_k_eq_v", False):
-            return set()
-        return {
-            i for i, lt in enumerate(text_config.layer_types) if lt == "full_attention"
-        }
+        return get_k_eq_v_layers(self.config.text_config)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         k_eq_v_layers = self._get_k_eq_v_layers()
@@ -919,17 +929,12 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             if "vision_tower." in name or "audio_tower." in name:
                 name = self._remap_tower_name(name, params_dict)
 
-            # attention_k_eq_v: full-attention layers have no v_proj in the
-            # checkpoint (K and V share weights).  When we see a k_proj weight
-            # for one of these layers, load it into both the "k" and "v" shards
-            # of the fused QKV so the forward produces v_raw == k_raw.
-            should_dup_k_to_v = (
-                ".k_proj." in name
-                and k_eq_v_layers
-                and "language_model." in name
-                and (m := re.search(r"layers\.(\d+)\.", name)) is not None
-                and int(m.group(1)) in k_eq_v_layers
-            )
+            # Determine whether this weight belongs to a k_eq_v layer.
+            is_k_eq_v_layer = False
+            if k_eq_v_layers and "language_model." in name:
+                m_layer = re.search(r"layers\.(\d+)\.", name)
+                if m_layer is not None:
+                    is_k_eq_v_layer = int(m_layer.group(1)) in k_eq_v_layers
 
             # MoE expert weights checked first (gate_up_proj contains "up_proj"
             # which would false-match the stacked dense MLP mapping).
@@ -984,11 +989,21 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     loaded_params.add(name)
                     break
                 else:
+                    # 3) Stacked dense projection weights.  k_eq_v layers
+                    #    pack only Q+K into qk_proj (V is derived at
+                    #    runtime from K via the K_EQ_V fused norm), so
+                    #    they need a different mapping than the standard
+                    #    qkv_proj layers.
+                    mapping = (
+                        self.k_eq_v_stacked_params_mapping
+                        if is_k_eq_v_layer
+                        else self.stacked_params_mapping
+                    )
                     for (
                         param_name,
                         weight_name,
                         shard_id,
-                    ) in self.stacked_params_mapping:
+                    ) in mapping:
                         name = orig_name
                         if weight_name not in name:
                             continue
@@ -998,8 +1013,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         weight_loader(param, loaded_weight, shard_id)
-                        if should_dup_k_to_v:
-                            weight_loader(param, loaded_weight, "v")
                         loaded_params.add(name)
                         break
                     else:
