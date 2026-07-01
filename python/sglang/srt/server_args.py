@@ -5509,6 +5509,28 @@ class ServerArgs:
             )
 
         if self.moe_a2a_backend == "deepep_v2":
+            if self.moe_runner_backend == "auto":
+                # The generic auto -> runner resolution above only fires for
+                # moe_a2a_backend "none", so deepep_v2 would otherwise reach the
+                # check below with the default "auto" and fail. deep_gemm is the
+                # production FP8 path, triton the BF16 functional path. Key off the
+                # dispatcher output dtype and default to the deep_gemm FP8 path:
+                # self.quantization is not reliably resolved at server-args time
+                # (FP8 is detected from the checkpoint later), so it cannot drive
+                # this; a genuinely BF16 run should set
+                # --deepep-v2-dispatcher-output-dtype bf16 (or --moe-runner-backend
+                # triton).
+                self.moe_runner_backend = (
+                    "triton"
+                    if self.deepep_v2_dispatcher_output_dtype == "bf16"
+                    else "deep_gemm"
+                )
+                logger.warning(
+                    "DeepEP v2 MoE: resolved --moe-runner-backend auto -> %s "
+                    "(--deepep-v2-dispatcher-output-dtype=%s).",
+                    self.moe_runner_backend,
+                    self.deepep_v2_dispatcher_output_dtype,
+                )
             if self.moe_runner_backend not in ["deep_gemm", "triton"]:
                 raise ValueError(
                     "DeepEP v2 MoE currently supports only "
@@ -5548,11 +5570,11 @@ class ServerArgs:
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
             else:
-                # Only the direct-mode decode masked-GEMM path is capture-safe
-                # (static shapes, no host readback). The direct-mode prefill
-                # (extend) path goes through the non-masked contiguous layout with
-                # a host readback and is not capture-validated, so keep the decode
-                # graph but always disable the prefill graph under DeepEP v2.
+                # The decode masked-GEMM path is capture-safe under any comm mode
+                # (static shapes, no host readback). The prefill/extend path goes
+                # through the non-masked contiguous layout with a host readback and
+                # is not capturable, so keep the decode graph but always disable the
+                # prefill graph under DeepEP v2.
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
             logger.warning(
                 f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
@@ -5560,9 +5582,9 @@ class ServerArgs:
             logger.warning(
                 "DeepEP v2 MoE is using deepep_v2_mode=%s. This controls "
                 "ElasticBuffer direct/hybrid mode and is independent from "
-                "--deepep-mode normal/low_latency. DeepEP v2 MoE enables cuda "
-                "graph only on the direct + deep_gemm + fp8 masked decode path "
-                "and disables shared expert fusion. "
+                "--deepep-mode normal/low_latency. DeepEP v2 MoE enables the "
+                "decode CUDA graph on the deep_gemm + fp8 masked decode path "
+                "(any comm mode) and disables shared expert fusion. "
                 "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK is a "
                 "per-rank communication buffer capacity, not a model limit; "
                 "increase it for large prefill/chunked-prefill workloads.",
