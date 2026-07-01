@@ -287,70 +287,83 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         req_to_token = self.req_to_token_pool.req_to_token
         max_req_tokens = req_to_token.shape[1]
 
-        per_request_indices = []
-        per_request_lengths = []
+        req_pool_indices = req_pool_indices.to(device=device, dtype=torch.long)
+        sparse_mask = sparse_mask.to(device=device, dtype=torch.bool)
+        seq_lens = seq_lens.to(dtype=torch.long)
 
-        for i in range(bs):
-            if not sparse_mask[i]:
-                per_request_indices.append(
-                    torch.empty(0, device=device, dtype=torch.int32)
-                )
-                per_request_lengths.append(0)
-                continue
-
-            num_pages = int((seq_lens[i].item() + self.page_size - 1) // self.page_size)
-            if num_pages <= self.num_recent_pages:
-                per_request_indices.append(
-                    torch.empty(0, device=device, dtype=torch.int32)
-                )
-                per_request_lengths.append(0)
-                continue
-
-            page_idx = torch.arange(num_pages, device=device)
-            page_start_token = req_to_token[
-                req_pool_indices[i],
-                (page_idx * self.page_size).clamp(0, max_req_tokens - 1),
-            ]
-            phys_pages = (page_start_token // self.page_size).unsqueeze(0)
-
-            scores = self._retrieve_page_scores(
-                layer_id,
-                phys_pages,
-                req_pool_indices[i : i + 1],
-                queries[i : i + 1],
+        num_pages = (seq_lens + self.page_size - 1) // self.page_size
+        max_num_pages = int(num_pages.max().item()) if bs > 0 else 0
+        if max_num_pages <= self.num_recent_pages:
+            return (
+                torch.full((bs, 1), -1, dtype=torch.int32, device=device),
+                torch.zeros(bs, dtype=torch.int32, device=device),
             )
 
-            recent_start = max(num_pages - self.num_recent_pages, 0)
-            scores = scores.clone()
-            scores[:, recent_start:] = float("-inf")
+        page_idx = torch.arange(max_num_pages, device=device, dtype=torch.long)
+        valid_page_mask = page_idx.unsqueeze(0) < num_pages.unsqueeze(1)
 
-            history_pages = max(recent_start, 1)
-            k = max(int(history_pages * self.sparsity_ratio), 1)
-            k = min(k, history_pages)
-            topk_idx = torch.topk(scores, k=k, dim=1, sorted=False)[1].squeeze(0)
+        page_starts = (page_idx * self.page_size).clamp(0, max_req_tokens - 1)
+        phys_pages = (
+            req_to_token[req_pool_indices[:, None], page_starts[None, :]].to(torch.long)
+            // self.page_size
+        )
 
-            recent_idx = torch.arange(
-                recent_start, recent_start + self.num_recent_pages, device=device
+        scores = self._retrieve_page_scores(
+            layer_id,
+            phys_pages,
+            req_pool_indices,
+            queries,
+        )
+
+        active_mask = sparse_mask & (num_pages > self.num_recent_pages)
+        recent_start = (num_pages - self.num_recent_pages).clamp(min=0)
+        history_page_mask = page_idx.unsqueeze(0) < recent_start.unsqueeze(1)
+        score_mask = active_mask.unsqueeze(1) & valid_page_mask & history_page_mask
+        scores = torch.where(score_mask, scores, torch.full_like(scores, float("-inf")))
+
+        history_pages = recent_start.clamp(min=1)
+        k_per_req = (history_pages.to(torch.float32) * self.sparsity_ratio).to(
+            torch.long
+        )
+        k_per_req = torch.maximum(k_per_req, torch.ones_like(k_per_req))
+        k_per_req = torch.minimum(k_per_req, history_pages)
+        k_per_req = torch.where(active_mask, k_per_req, torch.zeros_like(k_per_req))
+
+        max_k = int(k_per_req.max().item())
+        if max_k <= 0:
+            return (
+                torch.full((bs, 1), -1, dtype=torch.int32, device=device),
+                torch.zeros(bs, dtype=torch.int32, device=device),
             )
-            recent_idx = recent_idx[recent_idx < num_pages]
 
-            combined = (
-                torch.cat([topk_idx, recent_idx], dim=0).sort()[0].to(torch.int32)
-            )
+        topk_idx = torch.topk(scores, k=max_k, dim=1, sorted=True)[1].to(torch.long)
+        topk_rank = torch.arange(max_k, device=device, dtype=torch.long)
+        topk_valid = topk_rank.unsqueeze(0) < k_per_req.unsqueeze(1)
 
-            per_request_indices.append(combined)
-            per_request_lengths.append(int(combined.numel()))
+        recent_offsets = torch.arange(
+            self.num_recent_pages, device=device, dtype=torch.long
+        )
+        recent_idx = recent_start.unsqueeze(1) + recent_offsets.unsqueeze(0)
+        recent_valid = active_mask.unsqueeze(1) & (recent_idx < num_pages.unsqueeze(1))
+        recent_lengths = recent_valid.sum(dim=1).to(torch.long)
 
-        max_len = max(max(per_request_lengths, default=0), 1)
-        out_indices = torch.full((bs, max_len), -1, dtype=torch.int32, device=device)
-        out_lengths = torch.zeros(bs, dtype=torch.int32, device=device)
+        combined_idx = torch.cat([topk_idx, recent_idx], dim=1)
+        combined_valid = torch.cat([topk_valid, recent_valid], dim=1)
+        selected_lengths = k_per_req + recent_lengths
 
-        for i, selected in enumerate(per_request_indices):
-            length = per_request_lengths[i]
-            if length == 0:
-                continue
-            out_indices[i, :length] = selected
-            out_lengths[i] = length
+        max_selected = int(selected_lengths.max().item())
+        out_len = max(max_selected, 1)
+        sentinel = max_num_pages
+        sortable_idx = torch.where(
+            combined_valid, combined_idx, torch.full_like(combined_idx, sentinel)
+        )
+        sorted_idx = torch.sort(sortable_idx, dim=1)[0][:, :out_len].to(torch.int32)
+        out_indices = torch.where(
+            sorted_idx == sentinel,
+            torch.full_like(sorted_idx, -1),
+            sorted_idx,
+        )
+        out_lengths = selected_lengths.to(torch.int32)
 
         return out_indices, out_lengths
 
