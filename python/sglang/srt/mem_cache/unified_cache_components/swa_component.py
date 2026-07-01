@@ -834,6 +834,8 @@ class SWAComponent(TreeComponent):
             cd = x.component_data[ct]
             if x in self.cache.evictable_host_leaves:
                 self.cache._evict_host_leaf(x, tracker)
+                if not host_lru.in_list(x_next):
+                    x_next = host_lru.get_lru_no_host_lock()
             else:
                 assert cd.host_value is not None
                 self.cache._evict_component_and_detach_lru(

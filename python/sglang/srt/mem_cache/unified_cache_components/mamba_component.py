@@ -545,6 +545,8 @@ class MambaComponent(TreeComponent):
             if x in self.cache.evictable_host_leaves:
                 # Host leaf: atomic eviction (all components host + delete)
                 self.cache._evict_host_leaf(x, tracker)
+                if not host_lru.in_list(x_next):
+                    x_next = host_lru.get_lru_no_host_lock()
             else:
                 # Internal: tombstone Mamba + cascade
                 assert cd.host_value is not None

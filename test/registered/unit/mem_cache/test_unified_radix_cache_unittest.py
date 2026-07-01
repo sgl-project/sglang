@@ -1967,11 +1967,7 @@ class UnifiedRadixCacheSuite:
         tree._update_evictable_leaf_sets(parent)
         self.assertIn(parent, tree.evictable_device_leaves)
         self.assertEqual(
-            len(
-                tree.match_prefix(
-                    MatchPrefixParams(key=parent.key)
-                ).device_indices
-            ),
+            len(tree.match_prefix(MatchPrefixParams(key=parent.key)).device_indices),
             0,
         )
 
@@ -1991,11 +1987,7 @@ class UnifiedRadixCacheSuite:
             allocator.swa_attn_allocator.available_size(), swa_available_before
         )
         self.assertEqual(
-            len(
-                tree.match_prefix(
-                    MatchPrefixParams(key=parent.key)
-                ).device_indices
-            ),
+            len(tree.match_prefix(MatchPrefixParams(key=parent.key)).device_indices),
             0,
         )
         tree.sanity_check()
@@ -2180,6 +2172,68 @@ class UnifiedRadixCacheSuite:
         self.assertIsNone(parent.component_data[ComponentType.FULL].host_value)
         tree.sanity_check()
 
+    def test_tombstone_cleanup_host_eviction_recovers_stale_lru_cursor(self):
+        if not self.cfg.has_swa or not self.cfg.has_mamba or self.cfg.page_size != 1:
+            self.skipTest("requires SWA+Mamba with page_size=1")
+
+        for component_type in (ComponentType.SWA, ComponentType.MAMBA):
+            with self.subTest(component_type=component_type):
+                tree, _, _ = build_fixture(self.cfg)
+                missing_component = (
+                    ComponentType.MAMBA
+                    if component_type == ComponentType.SWA
+                    else ComponentType.SWA
+                )
+
+                parent = UnifiedTreeNode(self.cfg.components)
+                child = UnifiedTreeNode(self.cfg.components)
+                remaining = UnifiedTreeNode(self.cfg.components)
+                parent.key = RadixKey(array("q", self._make_seq(1, 1)))
+                child.key = RadixKey(array("q", self._make_seq(1000, 1)))
+                remaining.key = RadixKey(array("q", self._make_seq(2000, 1)))
+                parent.parent = tree.root_node
+                child.parent = parent
+                remaining.parent = tree.root_node
+
+                for node in (child, parent, remaining):
+                    node.component_data[ComponentType.FULL].host_value = torch.arange(
+                        len(node.key), dtype=torch.int64, device=tree.device
+                    )
+                    for ct in (ComponentType.SWA, ComponentType.MAMBA):
+                        if node is parent and ct == missing_component:
+                            continue
+                        node.component_data[ct].host_value = torch.arange(
+                            1, dtype=torch.int64, device=tree.device
+                        )
+
+                parent_key = parent.key.child_key(tree.page_size)
+                child_key = child.key.child_key(tree.page_size)
+                remaining_key = remaining.key.child_key(tree.page_size)
+                tree.root_node.children[parent_key] = parent
+                parent.children[child_key] = child
+                tree.root_node.children[remaining_key] = remaining
+                tree._update_evictable_leaf_sets(parent)
+                tree._update_evictable_leaf_sets(child)
+                tree._update_evictable_leaf_sets(remaining)
+
+                for ct in (ComponentType.SWA, ComponentType.MAMBA):
+                    host_lru = tree.host_lru_lists[ct]
+                    for node in (child, parent, remaining):
+                        if node.component_data[ct].host_value is not None:
+                            host_lru.insert_mru(node)
+
+                host_lru = tree.host_lru_lists[component_type]
+                self.assertIs(host_lru.get_lru_no_host_lock(), child)
+                self.assertIs(host_lru.get_prev_no_host_lock(child), parent)
+
+                evicted = tree.evict_host(3, component_type)
+
+                self.assertEqual(evicted, 3)
+                self.assertEqual(tree.root_node.children, {})
+                self.assertFalse(host_lru.in_list(parent))
+                self.assertFalse(host_lru.in_list(remaining))
+                tree.sanity_check()
+
     def test_tombstone_cleanup_evict_host_frees_real_host_pool(self):
         if not self.cfg.has_swa or self.cfg.has_mamba or self.cfg.page_size != 1:
             self.skipTest("SWA-only page_size=1 keeps HiCache fixture small")
@@ -2262,11 +2316,7 @@ class UnifiedRadixCacheSuite:
             tree.lru_lists[ComponentType.MAMBA].insert_mru(parent)
         tree._update_evictable_leaf_sets(parent)
         self.assertEqual(
-            len(
-                tree.match_prefix(
-                    MatchPrefixParams(key=parent.key)
-                ).device_indices
-            ),
+            len(tree.match_prefix(MatchPrefixParams(key=parent.key)).device_indices),
             len(parent.key),
         )
 
@@ -2278,11 +2328,7 @@ class UnifiedRadixCacheSuite:
         self.assertIs(tree.root_node.children[parent_key], parent)
         self.assertTrue(all(evicted == 0 for evicted in tracker.values()))
         self.assertEqual(
-            len(
-                tree.match_prefix(
-                    MatchPrefixParams(key=parent.key)
-                ).device_indices
-            ),
+            len(tree.match_prefix(MatchPrefixParams(key=parent.key)).device_indices),
             len(parent.key),
         )
         tree.sanity_check()
