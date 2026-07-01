@@ -1787,9 +1787,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_flashinfer_trtllm_routed()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
-        else:
+        elif moe_runner_backend.is_cutlass():
+            # `cutlass` is handled by a dedicated branch in `apply()` and
+            # intentionally does not allocate a `MoeRunner`.
             # TODO(cwan): refactor other backends
             pass
+        else:
+            # Any other backend (e.g. `flashinfer_cutlass`) has no FP8 MoE
+            # implementation here. Fail fast at startup with an actionable message
+            # instead of a later, opaque
+            # `AttributeError: 'Fp8MoEMethod' object has no attribute 'runner'`.
+            raise ValueError(
+                f"MoE runner backend '{moe_runner_backend.value}' is not supported "
+                f"for FP8 MoE models. Supported backends: deep_gemm, triton, aiter, "
+                f"cutlass, flashinfer_trtllm, flashinfer_trtllm_routed. For FP8 "
+                f"expert weights with FlashInfer, use '--moe-runner-backend cutlass' "
+                f"instead."
+            )
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         return TritonMoeQuantInfo(
