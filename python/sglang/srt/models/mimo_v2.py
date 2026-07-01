@@ -52,6 +52,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -260,6 +261,15 @@ class MiMoV2MoE(nn.Module):
             layer_id=self.layer_id,
             quant_config=quant_config,
             routed_scaling_factor=1.0,
+            # MiMo-V2 routes like DeepSeek-V3 (noaux_tc: sigmoid scoring +
+            # e_score_correction_bias + grouped top-k). Backends that bypass
+            # the host-side TopK (e.g. flashinfer_trtllm) route inside the
+            # kernel using this type; without it the kernel falls back to
+            # softmax-style routing and selects the wrong experts.
+            routing_method_type=(
+                getattr(config, "routing_method_type", None)
+                or RoutingMethodType.DeepSeekV3
+            ),
             prefix=add_prefix("experts", prefix),
         )
 
