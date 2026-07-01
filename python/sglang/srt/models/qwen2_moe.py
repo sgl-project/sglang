@@ -207,6 +207,22 @@ class Qwen2MoeMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        # When down_proj runs as online w8a8 FP8 (--enable-dense-fp8), fuse SiluAndMul +
+        # per-token quant into one aiter kernel feeding the (fp8, scale) tuple to
+        # down_proj. Aiter-only; default off.
+        self._fp8_silu_fuse = False
+        if _use_aiter and get_global_server_args().enable_dense_fp8:
+            quant_method = getattr(self.down_proj, "quant_method", None)
+            # Gate on use_aiter_fp8_per_token (set in __init__): it implies the
+            # bpreshuffle per-token path the tuple needs; use_per_token_if_dynamic is
+            # only set later in process_weights_after_loading.
+            qm = getattr(self.down_proj, "quant_method", None)
+            qcfg = getattr(qm, "quant_config", None)
+            self._fp8_silu_fuse = (
+                type(qm).__name__ == "Fp8LinearMethod"
+                and getattr(qm, "use_aiter_fp8_per_token", False)
+                and getattr(qcfg, "activation_scheme", None) == "dynamic"
+            )
 
     def forward(
         self,
@@ -215,6 +231,20 @@ class Qwen2MoeMLP(nn.Module):
         use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
+        if self._fp8_silu_fuse and gate_up.shape[0] > 0:
+            import aiter
+            from aiter import dtypes
+
+            M = gate_up.shape[0]
+            N = gate_up.shape[-1] // 2
+            out_fp8 = torch.empty((M, N), dtype=dtypes.fp8, device=gate_up.device)
+            scale = torch.empty((M, 1), dtype=torch.float32, device=gate_up.device)
+            aiter.silu_and_mul_quant(out_fp8, gate_up, scale, N)
+            x, _ = self.down_proj(
+                (out_fp8, scale),
+                skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+            )
+            return x
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter

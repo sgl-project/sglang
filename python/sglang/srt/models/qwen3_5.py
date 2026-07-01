@@ -128,6 +128,22 @@ _qknorm_use_alt_stream = _is_cuda or (
 )
 _is_amx_available = cpu_has_amx_support()
 
+# Qwen3.5 dense-FP8 policy (applied by quark under --enable-dense-fp8): promote only
+# the big excluded bf16 shared_expert.down_proj; skip tiny/routing/embedding layers and
+# small-N. Aiter-tuned, so it lives with the model.
+_DENSE_FP8_INCLUDE: tuple[str, ...] = (".shared_expert.down_proj",)
+_DENSE_FP8_EXCLUDE: tuple[str, ...] = (
+    "conv1d",
+    "shared_expert_gate",
+    "mlp.gate",
+    "in_proj_a",
+    "in_proj_b",
+    "in_proj_ba",
+    "lm_head",
+    "embed",
+)
+_DENSE_FP8_MIN_N = 2048
+
 cached_get_processor = lru_cache(get_processor)
 
 
@@ -1195,6 +1211,17 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
+
+        if (
+            _use_aiter
+            and quant_config is not None
+            and hasattr(quant_config, "register_dense_fp8_modules")
+        ):
+            quant_config.register_dense_fp8_modules(
+                include=_DENSE_FP8_INCLUDE,
+                exclude=_DENSE_FP8_EXCLUDE,
+                min_output_size=_DENSE_FP8_MIN_N,
+            )
 
         if _is_hip:
             self._maybe_autodisable_shared_experts_fusion(config, quant_config)
