@@ -42,6 +42,7 @@ from sglang.srt.managers.mm_utils import general_mm_embed_routine
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
+    MultimodalInputFormat,
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -803,6 +804,12 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         Returns:
             torch.Tensor: features from image inputs, concatenated
         """
+        if items and items[0].format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
+            return torch.cat(
+                [item.feature.view(-1, item.feature.shape[-1]) for item in items],
+                dim=0,
+            )
+
         features = []
         for item in items:
             # in each item, we assume pixel_values is always batched
