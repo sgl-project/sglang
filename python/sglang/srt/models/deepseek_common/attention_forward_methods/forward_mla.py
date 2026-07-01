@@ -19,6 +19,9 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
+from sglang.srt.layers.quantization.fp8_utils import (
+    materialize_bpreshuffle_fp8_scale_tuple,
+)
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.layers.utils.dcp_utils import (
@@ -303,8 +306,12 @@ class DeepseekMLAForwardMixin:
                                 dtype_quant=torch.float8_e4m3fn,
                                 res1=None,
                                 output_unquantized_inp1=True,
-                                transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                                transpose_scale=False,
                             )
+                            if _use_aiter_bpreshuffle_gfx95:
+                                q_quanted = materialize_bpreshuffle_fp8_scale_tuple(
+                                    q_quanted
+                                )
                             q = q_quanted
                         else:
                             q, _, k_nope, _ = fused_rms_fp8_group_quant(
@@ -318,8 +325,10 @@ class DeepseekMLAForwardMixin:
                                 dtype_quant=torch.float8_e4m3fn,
                                 res1=None,
                                 output_unquantized_inp1=False,
-                                transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                                transpose_scale=False,
                             )
+                            if _use_aiter_bpreshuffle_gfx95:
+                                q = materialize_bpreshuffle_fp8_scale_tuple(q)
 
                     elif _use_aiter:
                         q, k_nope = fused_qk_rmsnorm_bf16(
@@ -876,8 +885,12 @@ class DeepseekMLAForwardMixin:
                         _bmm_buf,
                         group_size=128,
                         dtype_quant=torch.float8_e4m3fn,
-                        transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                        transpose_scale=False,
                     )
+                    if _use_aiter_bpreshuffle_gfx95:
+                        attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
+                            attn_bmm_output
+                        )
                 else:
                     attn_bmm_output = _bmm_buf.flatten(1, 2)
             elif self.o_proj.weight.dtype == torch.uint8:
@@ -889,8 +902,12 @@ class DeepseekMLAForwardMixin:
                     attn_bmm_output,
                     group_size=128,
                     dtype_quant=torch.float8_e4m3fn,
-                    transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                    transpose_scale=False,
                 )
+                if _use_aiter_bpreshuffle_gfx95:
+                    attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
+                        attn_bmm_output
+                    )
             else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
