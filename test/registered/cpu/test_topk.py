@@ -2,13 +2,20 @@ import unittest
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers.moe.topk import (
+    TopKConfig,
+)
 from sglang.srt.layers.moe.topk import (
     biased_grouped_topk_impl as native_biased_grouped_topk,
 )
 from sglang.srt.layers.moe.topk import biased_topk_impl as native_biased_topk
 from sglang.srt.layers.moe.topk import fused_topk_torch_native as native_fused_topk
 from sglang.srt.layers.moe.topk import grouped_topk_gpu as native_grouped_topk
+from sglang.srt.layers.moe.topk import (
+    select_experts,
+)
 from sglang.srt.models.llama4 import Llama4MoE
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -140,11 +147,9 @@ class TestBiasedGroupedTopK(CustomTestCase):
 
 
 class TestBiasedTopK(CustomTestCase):
-    def test_biased_topk_returns_logical_ids_with_eplb_info(self):
-        hidden_states = torch.ones(1, 4)
-        gating_output = torch.tensor([[10.0, 9.0, 1.0, 0.0]])
-        correction_bias = torch.zeros(4)
-        dispatch_info = ExpertLocationDispatchInfo(
+    @staticmethod
+    def _make_static_dispatch_info():
+        return ExpertLocationDispatchInfo(
             ep_dispatch_algorithm="static",
             partial_logical_to_rank_dispatch_physical_map=torch.tensor(
                 [2, 3, 0, 1], dtype=torch.int64
@@ -158,6 +163,12 @@ class TestBiasedTopK(CustomTestCase):
             num_physical_experts=4,
         )
 
+    def test_biased_topk_returns_logical_ids_with_eplb_info(self):
+        hidden_states = torch.ones(1, 4)
+        gating_output = torch.tensor([[10.0, 9.0, 1.0, 0.0]])
+        correction_bias = torch.zeros(4)
+        dispatch_info = self._make_static_dispatch_info()
+
         _, topk_ids = native_biased_topk(
             hidden_states=hidden_states,
             gating_output=gating_output,
@@ -169,6 +180,32 @@ class TestBiasedTopK(CustomTestCase):
         )
 
         torch.testing.assert_close(topk_ids, torch.tensor([[0, 1]], dtype=torch.int32))
+
+    def test_select_experts_maps_eplb_ids_on_cpu(self):
+        hidden_states = torch.ones(1, 4)
+        router_logits = torch.tensor([[10.0, 9.0, 1.0, 0.0]])
+        correction_bias = torch.zeros(4)
+        dispatch_info = self._make_static_dispatch_info()
+        topk_config = TopKConfig(
+            top_k=2,
+            renormalize=False,
+            correction_bias=correction_bias,
+            scoring_func="sqrtsoftplus",
+        )
+
+        with envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.override(False):
+            output = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                topk_config=topk_config,
+                layer_id=0,
+                expert_location_dispatch_info=dispatch_info,
+            )
+
+        torch.testing.assert_close(
+            output.topk_ids,
+            torch.tensor([[2, 3]], dtype=output.topk_ids.dtype),
+        )
 
 
 class TestTopK(CustomTestCase):
