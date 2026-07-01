@@ -60,7 +60,6 @@ class TestQwen36ExtraBufferDonate(CustomTestCase):
     def setUpClass(cls):
         cls.model = MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.port = int(cls.base_url.split(":")[-1])
         other_args = [
             "--trust-remote-code",
             "--attention-backend", "aiter",
@@ -92,7 +91,7 @@ class TestQwen36ExtraBufferDonate(CustomTestCase):
 
     def _post(self, path, payload, timeout=300):
         req = urllib.request.Request(
-            f"http://127.0.0.1:{self.port}{path}",
+            f"{self.base_url}{path}",
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -101,10 +100,7 @@ class TestQwen36ExtraBufferDonate(CustomTestCase):
             return json.loads(r.read())
 
     def _flush(self):
-        try:
-            self._post("/flush_cache", {}, timeout=30)
-        except Exception:
-            pass
+        self._post("/flush_cache", {}, timeout=30)
 
     def _chat(self, question, max_tokens=24):
         payload = {
