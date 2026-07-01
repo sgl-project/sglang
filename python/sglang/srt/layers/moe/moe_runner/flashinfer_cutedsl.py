@@ -473,10 +473,6 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
         not runner_config.apply_router_weight_on_input
     ), "apply_router_weight_on_input is not supported for Flashinfer"
 
-    # CuteDSL FP4 only has a masked grouped-GEMM kernel, so it only handles the
-    # 6-field LL dispatch. DeepEP `auto` feeds the 5-field normal layout during
-    # prefill, which has no handler here; fail with an actionable message
-    # instead of an opaque tuple-unpack error.
     if not dispatch_output.format.is_deepep_ll():
         raise NotImplementedError(
             "flashinfer_cutedsl FP4 MoE only supports DeepEP low_latency dispatch "
