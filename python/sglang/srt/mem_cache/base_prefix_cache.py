@@ -235,6 +235,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
                 time.perf_counter() - start_time
             )
             self.metrics_collector.increment_eviction_num_tokens(num_evicted)
+            self.metrics_collector.increment_eviction_events()
 
     @abstractmethod
     def reset(self):

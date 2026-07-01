@@ -1117,6 +1117,17 @@ class HiRadixCache(RadixCache):
             self._promote_parent(x, heap)
         return num_evicted
 
+    def _observe_l1_eviction_age(self, node: TreeNode) -> None:
+        # L1 (GPU) residency at eviction; L2 end-of-life is recorded in evict_host().
+        if self.metrics_collector is None:
+            return
+        now = time.monotonic()
+        self.metrics_collector.observe_eviction_age(
+            age_seconds=now - node.creation_time,
+            idle_seconds=now - node.last_access_time,
+            hit_count=node.hit_count,
+        )
+
     def _evict_backuped(self, node: TreeNode):
         # GPU -> CPU demotion: block moves from device to host.
         # Emit remove(GPU) so downstream indexers stop scoring it as device-local.
@@ -1130,6 +1141,7 @@ class HiRadixCache(RadixCache):
         self._update_host_leaf_status(node)
         # update leaf status for the parent because the node is evicted
         self._update_leaf_status(node.parent)
+        self._observe_l1_eviction_age(node)
         return num_evicted
 
     def _evict_regular(self, node: TreeNode):
@@ -1140,6 +1152,7 @@ class HiRadixCache(RadixCache):
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
         self._delete_leaf(node)
+        self._observe_l1_eviction_age(node)
         return num_evicted
 
     def _drop_subtree_no_host(self, root: TreeNode) -> int:
@@ -1188,6 +1201,10 @@ class HiRadixCache(RadixCache):
         ]
         heapq.heapify(eviction_heap)
 
+        # L2 (host) eviction observability: record host-tier tokens and entry age.
+        collect_lifetime = self.metrics_collector is not None
+        now = time.monotonic() if collect_lifetime else 0.0
+
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
@@ -1203,7 +1220,11 @@ class HiRadixCache(RadixCache):
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit remove(CPU) so the router drops the host-tier entry.
             self._record_remove_event(x, medium=StorageMedium.CPU)
-            num_evicted += self.cache_controller.evict_host(x.host_value)
+            host_evicted = self.cache_controller.evict_host(x.host_value)
+            num_evicted += host_evicted
+            if collect_lifetime and host_evicted > 0:
+                self.metrics_collector.observe_host_eviction_age(now - x.creation_time)
+                self.metrics_collector.increment_host_eviction_num_tokens(host_evicted)
 
             key = x.key.child_key(self.page_size)
             v = x.parent.children.pop(key, None)

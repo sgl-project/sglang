@@ -1855,6 +1855,39 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
         self.labels = labels
 
+        # Buckets (seconds) for entry age/idle at eviction; the 3600s bucket makes
+        # the "survives 1h?" question directly readable.
+        bucket_cache_age = get_histogram_conf_from_env("SGLANG_BUCKET_CACHE_AGE")
+        if bucket_cache_age is None:
+            bucket_cache_age = [
+                1.0,
+                5.0,
+                10.0,
+                30.0,
+                60.0,
+                120.0,
+                300.0,
+                600.0,
+                900.0,
+                1800.0,
+                3600.0,
+                7200.0,
+            ]
+        # Buckets for entry reuse count before eviction.
+        bucket_cache_reuses = get_histogram_conf_from_env("SGLANG_BUCKET_CACHE_REUSES")
+        if bucket_cache_reuses is None:
+            bucket_cache_reuses = [
+                0.0,
+                1.0,
+                2.0,
+                5.0,
+                10.0,
+                20.0,
+                50.0,
+                100.0,
+                500.0,
+            ]
+
         bucket_eviction_duration = get_histogram_conf_from_env(
             "SGLANG_BUCKET_EVICTION_DURATION"
         )
@@ -1929,6 +1962,56 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        # L1 (GPU) cache lifetime, recorded at eviction.
+        self.cache_eviction_age_seconds = Histogram(
+            name="sglang:cache_eviction_age_seconds",
+            documentation=(
+                "Age (now - creation_time) of an L1 (GPU) cache entry at eviction, "
+                "in seconds."
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_cache_age,
+        )
+        self.cache_eviction_idle_seconds = Histogram(
+            name="sglang:cache_eviction_idle_seconds",
+            documentation=(
+                "Idle time (now - last_access_time) of an L1 (GPU) cache entry at "
+                "eviction, in seconds."
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_cache_age,
+        )
+        # Named "reuses" to avoid the reserved _count histogram suffix.
+        self.cache_eviction_reuses = Histogram(
+            name="sglang:cache_eviction_reuses",
+            documentation=(
+                "Number of times an L1 (GPU) cache entry was reused before eviction."
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_cache_reuses,
+        )
+        self.cache_eviction_events = Counter(
+            name="sglang:cache_eviction_events_total",
+            documentation="Number of eviction passes that freed at least one entry.",
+            labelnames=labels.keys(),
+        )
+
+        # L2 (host) eviction observability.
+        self.host_eviction_num_tokens = Counter(
+            name="sglang:hicache_host_evicted_tokens_total",
+            documentation="The number of tokens evicted from the host (L2) cache.",
+            labelnames=labels.keys(),
+        )
+        self.host_eviction_age_seconds = Histogram(
+            name="sglang:hicache_host_eviction_age_seconds",
+            documentation=(
+                "Age (now - creation_time) of an L2 (host) cache entry at eviction, "
+                "in seconds."
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_cache_age,
+        )
+
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
 
@@ -1940,6 +2023,23 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
     def observe_load_back_duration(self, duration_seconds: float) -> None:
         self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def observe_eviction_age(
+        self, age_seconds: float, idle_seconds: float, hit_count: int
+    ) -> None:
+        """Record lifetime stats for a single evicted L1 (GPU) cache entry."""
+        self.cache_eviction_age_seconds.labels(**self.labels).observe(age_seconds)
+        self.cache_eviction_idle_seconds.labels(**self.labels).observe(idle_seconds)
+        self.cache_eviction_reuses.labels(**self.labels).observe(hit_count)
+
+    def increment_eviction_events(self, num_events: int = 1) -> None:
+        self.cache_eviction_events.labels(**self.labels).inc(num_events)
+
+    def increment_host_eviction_num_tokens(self, num_tokens: int) -> None:
+        self.host_eviction_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def observe_host_eviction_age(self, age_seconds: float) -> None:
+        self.host_eviction_age_seconds.labels(**self.labels).observe(age_seconds)
 
 
 def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:

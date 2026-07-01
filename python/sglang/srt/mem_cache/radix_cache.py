@@ -572,6 +572,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         ]
         heapq.heapify(eviction_heap)
 
+        # Capture lifetime stats per evicted entry (time.monotonic() based).
+        collect_lifetime = self.metrics_collector is not None
+        now = time.monotonic() if collect_lifetime else 0.0
+
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
@@ -579,6 +583,13 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
             self._delete_leaf(x)
+
+            if collect_lifetime:
+                self.metrics_collector.observe_eviction_age(
+                    age_seconds=now - x.creation_time,
+                    idle_seconds=now - x.last_access_time,
+                    hit_count=x.hit_count,
+                )
 
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
