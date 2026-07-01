@@ -24,10 +24,10 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 
 _HAS_CUDA = torch.cuda.is_available()
-# The set_kv_buffer integration test needs SharedMHATokenToKVPool, which only
-# exists once the shared-memory-pool feature lands; skip it where absent.
+# The set_kv_buffer integration test needs UnifiedMHATokenToKVPool, which only
+# exists once the shared-KV-pool feature lands; skip it where absent.
 _HAS_SHARED_POOL = (
-    importlib.util.find_spec("sglang.srt.mem_cache.shared_memory_pool") is not None
+    importlib.util.find_spec("sglang.srt.mem_cache.unified_memory_pool") is not None
 )
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
@@ -72,7 +72,7 @@ class TestStoreCache4D(unittest.TestCase):
         seed: int = 0xC0FFEE,
     ):
         torch.manual_seed(seed)
-        # The shared pool's views are 4-D `(num_pages, page_size, head_num,
+        # The unified memory pool's views are 4-D `(num_pages, page_size, head_num,
         # head_dim)` with the trailing two dims contiguous. We allocate two
         # independent contiguous buffers (one for the kernel-under-test,
         # one as the legacy-path target) so we can compare them.
@@ -154,7 +154,7 @@ class TestStoreCache4D(unittest.TestCase):
     def test_store_cache_4d_ps1_byte_identical(self):
         """At page_size=1 the kernel constexpr-folds to the slot-major
         envelope view. Output must be byte-identical to advanced indexing.
-        This protects the Stage 1/2/3 green eval matrix from regression."""
+        This protects against byte-layout regression."""
         self._check_parity(
             num_pages=64,
             page_size=1,
@@ -228,8 +228,7 @@ class TestStoreCache4D(unittest.TestCase):
 
     def test_store_cache_4d_dtype_fp8_e5m2(self):
         """fp8_e5m2 is used for KV-cache quantization. Caller is responsible
-        for the cast (Phase 1); the kernel sees same-dtype source and
-        destination."""
+        for the cast; the kernel sees same-dtype source and destination."""
         self._check_parity(
             num_pages=16,
             page_size=64,
@@ -317,31 +316,25 @@ class TestStoreCache4DAssertions(unittest.TestCase):
 
 @unittest.skipUnless(
     _HAS_CUDA and _HAS_SHARED_POOL,
-    "Triton kernels require CUDA; SharedMHATokenToKVPool required",
+    "Triton kernels require CUDA; UnifiedMHATokenToKVPool required",
 )
 class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
     """Integration parity test — exercises the kernel through the FULL
-    ``SharedMHATokenToKVPool.set_kv_buffer`` path, including the
-    ``_external_allocator`` v2p translation and the dtype cast. Confirms the
-    production code path produces bit-identical output to a PyTorch
-    advanced-indexing reference write.
+    ``UnifiedMHATokenToKVPool.set_kv_buffer`` path (the direct PHYSICAL write +
+    the dtype cast; the pool no longer translates). Confirms it produces
+    bit-identical output to a PyTorch advanced-indexing reference write.
     """
 
-    def _build_pool_and_stub_alloc(self, page_size: int, v2p=None):
-        """Build a small SharedMHATokenToKVPool wired to a stub allocator.
-
-        By default `virtual_to_physical` is identity (the kernel-vs-legacy
-        parity tests don't exercise virtual-id semantics). Pass an explicit
-        `v2p` tensor (sized `max_slots + 1`) to exercise a NON-identity
-        translation — used by the `set_full_loc` fast-path parity test, which
-        needs virtual != physical so the precomputed-physical fast path is
-        meaningfully different from the per-call gather."""
+    def _build_pool(self, page_size: int):
+        """Build a small UnifiedMHATokenToKVPool. The pool writes PHYSICAL locs
+        directly (no allocator / v2p translate), so `set_kv_buffer` receives the
+        already-physical write location."""
         import torch as _t
 
-        from sglang.srt.mem_cache.shared_memory_pool import (
+        from sglang.srt.mem_cache.unified_memory_pool import (
             MHASubPoolSpec,
-            SharedMemoryPool,
-            SharedMHATokenToKVPool,
+            UnifiedKVPool,
+            UnifiedMHATokenToKVPool,
         )
 
         spec = MHASubPoolSpec(
@@ -362,15 +355,15 @@ class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
             store_dtype=_t.bfloat16,
             grow_direction="down",
         )
-        pool = SharedMemoryPool(
+        pool = UnifiedKVPool(
             total_bytes=total + peer.entry_bytes() * 16,
             sub_pool_specs=[spec, peer],
             device="cuda",
             enable_memory_saver=False,
             page_size=page_size,
         )
-        kv_pool = SharedMHATokenToKVPool(
-            shared_buffer=pool,
+        kv_pool = UnifiedMHATokenToKVPool(
+            unified_buffer=pool,
             sub_pool_name="full",
             page_size=page_size,
             start_layer=0,
@@ -378,21 +371,12 @@ class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
             enable_alt_stream=False,
         )
 
-        # Stub allocator with an identity (default) or caller-supplied v2p.
-        max_slots = pool.max_slots("full")
-        if v2p is None:
-            v2p = _t.arange(max_slots + 1, dtype=_t.int64, device="cuda")
-
-        class _StubAllocator:
-            virtual_to_physical = v2p
-
-        kv_pool.attach_allocator(_StubAllocator())
         return kv_pool
 
     def _run_set_kv_buffer_and_compare(self, page_size: int):
         import torch as _t
 
-        kv_pool = self._build_pool_and_stub_alloc(page_size)
+        kv_pool = self._build_pool(page_size)
 
         # A fake `layer` object with the minimum interface
         # `set_kv_buffer` reads: `.layer_id`.
@@ -415,9 +399,8 @@ class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
         k_kernel = kv_pool.k_buffer[0].clone()
         v_kernel = kv_pool.v_buffer[0].clone()
 
-        # Reference: PyTorch advanced-indexing into a fresh view. The stub
-        # allocator's v2p is identity, so physical loc == virtual loc and no
-        # dtype cast happens (store_dtype == dtype), making this the exact
+        # Reference: PyTorch advanced-indexing into a fresh view at the same
+        # (physical) loc, with no dtype cast (store_dtype == dtype) — the exact
         # write the kernel performs.
         kv_pool.k_buffer[0].zero_()
         kv_pool.v_buffer[0].zero_()
@@ -448,81 +431,6 @@ class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
 
     def test_integration_ps64(self):
         self._run_set_kv_buffer_and_compare(page_size=64)
-
-    def _run_full_loc_fast_path_parity(self, page_size: int):
-        """Stage 3.5 fast-path byte-identity: writing through the precomputed
-        full-physical loc (`set_loc` fast path) must produce a byte-identical
-        KV buffer to writing the virtual loc and letting `set_kv_buffer`
-        translate per call. Uses a NON-identity v2p so the two paths are
-        genuinely different code (fast path skips the gather)."""
-        import torch as _t
-
-        # Non-identity v2p: reverse-map the physical slot space so virtual i
-        # lands on a different physical slot. Keep slot 0 -> 0 (padding sink).
-        # Build the pool once to learn max_slots, then rebuild with the v2p.
-        probe = self._build_pool_and_stub_alloc(page_size)
-        max_slots = probe.k_buffer[0].shape[0] * page_size
-        v2p = _t.arange(max_slots + 1, dtype=_t.int64, device="cuda")
-        # Shuffle the interior [1, max_slots) so virtual != physical, leave
-        # 0 (sink) and the trailing sentinel (max_slots -> itself) alone.
-        interior = _t.randperm(max_slots - 1, device="cuda") + 1
-        v2p[1:max_slots] = interior
-
-        kv_pool = self._build_pool_and_stub_alloc(page_size, v2p=v2p)
-
-        class _FakeLayer:
-            layer_id = 0
-
-        layer = _FakeLayer()
-        head_num, head_dim = 4, 64
-        N = 16
-        num_pages = kv_pool.k_buffer[0].shape[0]
-        total = num_pages * page_size
-        # Draw virtual ids from [1, total) (avoid the padding sink at 0).
-        loc = (_t.randperm(total - 1, device="cuda")[:N] + 1).to(_t.int64)
-        cache_k = _t.randn((N, head_num, head_dim), dtype=_t.bfloat16, device="cuda")
-        cache_v = _t.randn((N, head_num, head_dim), dtype=_t.bfloat16, device="cuda")
-
-        # SLOW path: no precompute pinned -> per-call v2p gather inside
-        # set_kv_buffer translates virtual -> physical.
-        kv_pool.set_loc(None)
-        kv_pool.set_kv_buffer(layer, loc, cache_k.clone(), cache_v.clone())
-        k_slow = kv_pool.k_buffer[0].clone()
-        v_slow = kv_pool.v_buffer[0].clone()
-
-        # FAST path: precompute the full-physical loc exactly as
-        # `set_kv_buffer`'s page math would, pin it via set_loc, and pass
-        # it as `loc` so the data-ptr fast path fires (no gather).
-        if page_size == 1:
-            phys = _t.clamp_min(v2p[loc], 0)
-        else:
-            virt_pages = loc // page_size
-            offsets = loc % page_size
-            phys = _t.clamp_min(v2p[virt_pages] * page_size + offsets, 0)
-        kv_pool.k_buffer[0].zero_()
-        kv_pool.v_buffer[0].zero_()
-        kv_pool.set_loc(phys)
-        try:
-            kv_pool.set_kv_buffer(layer, phys, cache_k.clone(), cache_v.clone())
-            k_fast = kv_pool.k_buffer[0].clone()
-            v_fast = kv_pool.v_buffer[0].clone()
-        finally:
-            kv_pool.set_loc(None)
-
-        self.assertTrue(
-            _t.equal(k_fast, k_slow),
-            f"K mismatch: full_loc fast path != per-call translate at ps={page_size}",
-        )
-        self.assertTrue(
-            _t.equal(v_fast, v_slow),
-            f"V mismatch: full_loc fast path != per-call translate at ps={page_size}",
-        )
-
-    def test_full_loc_fast_path_parity_ps1(self):
-        self._run_full_loc_fast_path_parity(page_size=1)
-
-    def test_full_loc_fast_path_parity_ps64(self):
-        self._run_full_loc_fast_path_parity(page_size=64)
 
 
 if __name__ == "__main__":
