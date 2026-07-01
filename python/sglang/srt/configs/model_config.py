@@ -1156,10 +1156,18 @@ class ModelConfig:
         quant_algo = json_quant_configs.get("quant_algo", None)
 
         if quant_algo == "MIXED_PRECISION":
-            architectures = getattr(self.hf_config, "architectures", []) or []
-            if getattr(self.hf_config, "model_type", None) == "nemotron_h" or any(
-                arch.startswith("NemotronH") for arch in architectures
-            ):
+            # Two distinct checkpoint families use quant_algo=MIXED_PRECISION:
+            #  - ModelOpt per-layer mixed-precision exports (e.g. NVFP4 experts
+            #    + FP8 dense). These always carry a non-empty
+            #    `quantized_layers` map, which ModelOptMixedPrecisionConfig
+            #    requires to dispatch per-layer quant methods.
+            #  - DeepSeek-style W4AFP8 exports, whose hf_quant_config.json is
+            #    bare ({"quant_algo": "MIXED_PRECISION",
+            #    "kv_cache_quant_algo": ...}) with no per-layer map.
+            # Detect by content instead of architecture so any model with a
+            # ModelOpt mixed-precision export (MiMo-V2, NemotronH, ...) loads
+            # without a per-arch allowlist.
+            if json_quant_configs.get("quantized_layers"):
                 return {"quant_method": "modelopt_mixed", "quant_algo": quant_algo}
             return {"quant_method": "w4afp8", "quant_algo": quant_algo}
         elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
