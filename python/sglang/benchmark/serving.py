@@ -39,7 +39,7 @@ import requests
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from sglang.benchmark.datasets import DatasetRow, get_dataset
+from sglang.benchmark.datasets import DATASET_RESULT_ARG_KEYS, DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.utils import (
     get_tokenizer,
@@ -1272,6 +1272,17 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
     return f
 
 
+def _dataset_specific_args(args: argparse.Namespace) -> Dict[str, Any]:
+    """Return dataset-shaping args relevant to ``args.dataset_name``.
+
+    For programmatic/manual namespaces, missing dataset-relevant fields are
+    tolerated and surfaced as ``None`` instead of raising ``AttributeError``.
+    """
+    dataset_name = getattr(args, "dataset_name", None)
+    result_keys = DATASET_RESULT_ARG_KEYS.get(dataset_name, ())
+    return {key: getattr(args, key, None) for key in result_keys}
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -1723,10 +1734,7 @@ async def benchmark(
             "dataset_name": args.dataset_name,
             "request_rate": "trace" if use_trace_timestamps else request_rate,
             "max_concurrency": max_concurrency,
-            "sharegpt_output_len": args.sharegpt_output_len,
-            "random_input_len": args.random_input_len,
-            "random_output_len": args.random_output_len,
-            "random_range_ratio": args.random_range_ratio,
+            **_dataset_specific_args(args),
             # Information
             "server_info": server_info,
             # Results

@@ -1,4 +1,4 @@
-from typing import Dict, Type
+from typing import Dict, Tuple, Type
 
 from sglang.benchmark.datasets.autobench import AutoBenchmarkDataset
 from sglang.benchmark.datasets.common import BaseDataset, DatasetRow
@@ -32,6 +32,28 @@ DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
     "speed-bench": SpeedBenchDataset,
 }
 
+DATASET_RESULT_ARG_KEYS: Dict[str, Tuple[str, ...]] = {
+    "autobench": ("sharegpt_output_len",),
+    "sharegpt": ("sharegpt_output_len",),
+    "custom": ("sharegpt_output_len",),
+    "openai": ("sharegpt_output_len",),
+    "longbench_v2": ("sharegpt_output_len",),
+    "random": ("random_input_len", "random_output_len", "random_range_ratio"),
+    "random-ids": ("random_input_len", "random_output_len", "random_range_ratio"),
+    "generated-shared-prefix": (
+        "gsp_num_groups",
+        "gsp_prompts_per_group",
+        "gsp_system_prompt_len",
+        "gsp_question_len",
+        "gsp_output_len",
+        "gsp_range_ratio",
+        "gsp_group_distribution",
+        "gsp_zipf_alpha",
+    ),
+    "mmmu": ("random_output_len",),
+    "image": ("random_input_len", "random_output_len", "random_range_ratio"),
+}
+
 
 def get_dataset(args, tokenizer, model_id=None):
     dataset_name = args.dataset_name
@@ -48,6 +70,7 @@ def get_dataset(args, tokenizer, model_id=None):
 
 __all__ = [
     "DATASET_MAPPING",
+    "DATASET_RESULT_ARG_KEYS",
     "DatasetRow",
     "get_dataset",
 ]
