@@ -288,6 +288,7 @@ class Envs:
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
+    SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
@@ -854,6 +855,7 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+    # Deprecated: DSV4 compressor V2 is always used.
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
