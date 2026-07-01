@@ -160,7 +160,12 @@ class TestWeightCheckerE2E(CustomTestCase):
         self.assertIn("checksums", first)
         self.assertIn("parallelism_info", first)
 
-        info = first["parallelism_info"]
+        parallelism_info = first["parallelism_info"]
+        self.assertIsInstance(parallelism_info, list)
+        self.assertGreaterEqual(len(parallelism_info), 1)
+
+        info = parallelism_info[0]
+        self.assertEqual(info["role"], "target")
         for key in (
             "tp_rank",
             "tp_size",

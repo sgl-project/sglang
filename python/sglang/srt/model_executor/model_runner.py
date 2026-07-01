@@ -177,7 +177,13 @@ from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    get_model_loader,
+    post_load_weights,
+    postprocess_weight,
+    restore_weight,
+)
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     register_memory_region,
@@ -201,6 +207,7 @@ from sglang.srt.state_capturer.indexer_topk import (
 )
 from sglang.srt.state_capturer.routed_experts import (
     RoutedExpertsCapturer,
+    disable_routed_experts_capture_for_draft,
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
@@ -688,6 +695,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.load_model()
         self._prepare_moe_topk()
 
+        # Must run before backend/graph init so no draft graph records a
+        # routed-experts capture-write kernel.
+        if self.is_draft_worker:
+            disable_routed_experts_capture_for_draft(self.model)
+
         # Load the expert backup client
         self.expert_backup_client = (
             ExpertBackupClient(self.server_args, self)
@@ -916,6 +928,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.model_config.full_attention_layer_ids = full_attention_layer_ids
 
     def init_routed_experts_capturer(self):
+        if self.is_draft_worker:
+            # Capture is target-only. The draft worker runs in the same process
+            # as its target and inits after it, so installing a capturer here
+            # would overwrite the target's process-global one.
+            return
+
         if not self.server_args.disable_shared_experts_fusion and hasattr(
             self.model, "num_fused_shared_experts"
         ):
@@ -1947,6 +1965,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def load_weights(self, weights) -> None:
         """Load an in-memory list of (name, tensor) weights into this runner's model."""
         self.model.load_weights(weights)
+
+    def begin_weight_update(self) -> None:
+        """Begin a weight-update session: restore in-place-packed weights to a
+        loadable state (no-op for schemes that don't repack)."""
+        restore_weight(self.model, torch.device(self.device))
+
+    def end_weight_update(self, run_post_load: bool) -> None:
+        """End the weight-update session: optionally run model.post_load_weights
+        (when load_weights was bypassed this session, e.g. P2P/RDMA), then finalize
+        quantized weights into kernel layout."""
+        if run_post_load:
+            post_load_weights(self.model)
+        postprocess_weight(self.model, torch.device(self.device))
 
     def receive_weights_from_distributed(
         self,
@@ -3797,8 +3828,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
 
-    def check_weights(self, action: str):
-        return self._weight_checker.handle(action=action)
+    def check_weights(
+        self,
+        action: str,
+        allow_quant_error: bool = False,
+        skip_tensor_list: Optional[List[str]] = None,
+    ):
+        return self._weight_checker.handle(
+            action=action,
+            allow_quant_error=allow_quant_error,
+            skip_tensor_list=skip_tensor_list,
+        )
 
     def update_weights_from_ipc(self, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
@@ -3864,51 +3904,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 split_forward_count,
             )
         return output
-
-    def post_process_weights(self, recv_req):
-        """
-        Execute post-processing logic for model weights, such as Marlin quantization format conversion
-        and model-specific post_load_weights hooks (e.g., DeepSeek MLA kv_b_proj decomposition).
-        """
-        from sglang.srt.model_loader.loader import device_loading_context
-
-        target_device = torch.device("cuda", torch.cuda.current_device())
-
-        if recv_req.post_load_weights:
-            # Call model.post_load_weights() if available (e.g., for DeepSeek MLA
-            # models that need to decompose kv_b_proj.weight into w_kc/w_vc tensors
-            # after RDMA weight transfer)
-            if hasattr(self.model, "post_load_weights"):
-                self.model.post_load_weights()
-
-        # LoRA wrappers forward `quant_method` for forward-path dispatch but
-        # don't own the packed params; skip them here so the inner base layer
-        # (yielded separately by `named_modules`) handles post-processing.
-        from sglang.srt.lora.layers import BaseLayerWithLoRA
-
-        if recv_req.restore_weights_before_load:
-            for _, module in self.model.named_modules():
-                if isinstance(module, BaseLayerWithLoRA):
-                    continue
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None and hasattr(
-                    quant_method, "restore_weights_before_loading"
-                ):
-                    with device_loading_context(module, target_device):
-                        quant_method.restore_weights_before_loading(module)
-
-        if recv_req.post_process_quantization:
-            for _, module in self.model.named_modules():
-                if isinstance(module, BaseLayerWithLoRA):
-                    continue
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None and hasattr(
-                    quant_method, "process_weights_after_loading"
-                ):
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
-
-        return True, "Success"
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

@@ -922,7 +922,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def iter_draft_runners(self) -> List[Tuple[str, "ModelRunner"]]:
+    def iter_runners(self) -> List[Tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_worker.draft_runner)]
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):

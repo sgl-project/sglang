@@ -30,7 +30,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromDistributedReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
-    PostProcessWeightsReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -146,11 +145,6 @@ class BaseTpWorker(ABC):
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update weights from IPC for checkpoint-engine integration."""
         success, message = self.model_runner.update_weights_from_ipc(recv_req)
-        return success, message
-
-    def post_process_weights(self, recv_req: PostProcessWeightsReqInput):
-        """Perform optional post-processing on the updated model weights (e.g., Marlin conversion)."""
-        success, message = self.model_runner.post_process_weights(recv_req)
         return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
@@ -403,10 +397,12 @@ class TpModelWorker(BaseTpWorker):
     def model_runner(self) -> "ModelRunner":
         return self._model_runner
 
-    def iter_draft_runners(self) -> List[Tuple[str, "ModelRunner"]]:
-        # The target worker shares this class (is_draft_worker=False) and returns [].
+    def iter_runners(self) -> List[Tuple[str, "ModelRunner"]]:
+        # All (role, ModelRunner) pairs this worker contributes to a weight update.
+        # The target (is_draft_worker=False) yields its own runner under the empty
+        # role; a draft worker yields its draft runner(s).
         if not self.is_draft_worker:
-            return []
+            return [("", self.model_runner)]
         if self.model_runner_list:
             return [
                 (f"draft_step_{i}", r) for i, r in enumerate(self.model_runner_list)

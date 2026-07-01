@@ -1582,18 +1582,26 @@ class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq):
 
 
 @dataclass
-class PostProcessWeightsReqInput(BaseReq):
-    # Whether to restore weights before loading new weights
-    restore_weights_before_load: bool = False
-    # Whether to enable quantization post-processing
-    post_process_quantization: bool = False
-    # Whether to call model.post_load_weights() after weight update
-    # (e.g., DeepSeek MLA kv_b_proj decomposition into w_kc/w_vc tensors)
-    post_load_weights: bool = False
+class BeginWeightUpdateReqInput(BaseReq):
+    # Which model runners this update session covers: "target" (main model only),
+    # "draft" (draft worker(s) only), or "all" (default). The selector is fixed for
+    # the whole begin -> update -> end session; end finalizes the same set.
+    selector: Literal["target", "draft", "all"] = "all"
 
 
 @dataclass
-class PostProcessWeightsReqOutput(BaseReq):
+class BeginWeightUpdateReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
+class EndWeightUpdateReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class EndWeightUpdateReqOutput(BaseReq):
     success: bool
     message: str
 
@@ -1706,6 +1714,14 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
 @dataclass
 class CheckWeightsReqInput(BaseReq):
     action: str = "checksum"
+    allow_quant_error: bool = False
+    # Which runners to check; "all" is target plus any draft workers.
+    # Same convention as UpdateWeightsFrom*ReqInput.
+    selector: Literal["target", "draft", "all"] = "all"
+    # Substring matches against tensor names, skipped on every checked runner.
+    # Use when a job leaves some weights unupdated, e.g. an LLM-only RL job never
+    # touches the vision tower: ["visual.", "vision_tower."].
+    skip_tensor_list: Optional[List[str]] = None
 
 
 @dataclass
