@@ -2733,6 +2733,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     attn_layer = layer.self_attn.attn_mqa
                     if _is_hip and hasattr(layer.self_attn, "attn_mha"):
                         attn_layer._pcg_mha_companion = layer.self_attn.attn_mha
+                    # DeepSeek-V4 PCG: attach compressor / indexer to the attn_mqa
+                    # layer object so the V4 compressor/indexer split-ops can recover
+                    # them by layer_id from the tc_piecewise forward context (the
+                    # attention_layers list only stores attn_mqa). getattr(..., None)
+                    # keeps this a no-op for non-V4 DeepSeek (v2/v3) which lack them.
+                    attn_layer._pcg_compressor = getattr(
+                        layer.self_attn, "compressor", None
+                    )
+                    attn_layer._pcg_indexer = getattr(layer.self_attn, "indexer", None)
             # For hybrid model
             elif hasattr(layer, "attn"):
                 attn_layer = layer.attn

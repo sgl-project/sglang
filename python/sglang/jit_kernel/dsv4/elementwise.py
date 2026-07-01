@@ -8,7 +8,11 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.custom_op import register_custom_op
 
 from .utils import make_name
 
@@ -105,6 +109,36 @@ def _jit_main_q_indexer_rope_hadamard_fp4_quant_module(dtype: torch.dtype):
     )
 
 
+def _fused_rope_inplace_impl(
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    inverse: bool = False,
+) -> None:
+    if _is_hip:
+        from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+
+        apply_rotary_emb_triton(q, freqs_cis, positions=positions, inverse=inverse)
+        if k is not None:
+            apply_rotary_emb_triton(k, freqs_cis, positions=positions, inverse=inverse)
+        return
+
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
+    module = _jit_fused_rope_module()
+    module.forward(q, k, freqs_real, positions, inverse)
+
+
+# Piecewise-CUDA-graph (tc_piecewise) variant: register as an opaque custom op so
+# torch.compile/Dynamo does not trace into the JIT/triton kernel (which it cannot)
+# and the kernel launch is captured into the CUDA graph instead.
+dsv4_pcg_fused_rope_inplace = register_custom_op(
+    _fused_rope_inplace_impl,
+    op_name="dsv4_pcg_fused_rope_inplace",
+    mutates_args=["q", "k"],
+)
+
+
 def fused_rope_inplace(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
@@ -121,20 +155,13 @@ def fused_rope_inplace(
         positions: [batch_size] int32 or int64, indices into freqs_cis
         inverse: if True, apply inverse rotation (conjugate freqs)
     """
-    if _is_hip:
-        from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
-
-        apply_rotary_emb_triton(q, freqs_cis, positions=positions, inverse=inverse)
-        if k is not None:
-            apply_rotary_emb_triton(k, freqs_cis, positions=positions, inverse=inverse)
+    if _is_hip and is_in_tc_piecewise_cuda_graph():
+        dsv4_pcg_fused_rope_inplace(q, k, freqs_cis, positions, inverse)
         return
-
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
-    module = _jit_fused_rope_module()
-    module.forward(q, k, freqs_real, positions, inverse)
+    _fused_rope_inplace_impl(q, k, freqs_cis, positions, inverse)
 
 
-def fused_q_norm_rope(
+def _fused_q_norm_rope_impl(
     q_input: torch.Tensor,
     q_output: torch.Tensor,
     eps: float,
@@ -146,6 +173,26 @@ def fused_q_norm_rope(
     rope_dim = freqs_real.shape[-1]
     module = _jit_main_q_norm_rope_module(q_input.dtype, head_dim, rope_dim)
     module.forward(q_input, q_output, freqs_real, positions, eps)
+
+
+dsv4_pcg_fused_q_norm_rope = register_custom_op(
+    _fused_q_norm_rope_impl,
+    op_name="dsv4_pcg_fused_q_norm_rope",
+    mutates_args=["q_output"],
+)
+
+
+def fused_q_norm_rope(
+    q_input: torch.Tensor,
+    q_output: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    if _is_hip and is_in_tc_piecewise_cuda_graph():
+        dsv4_pcg_fused_q_norm_rope(q_input, q_output, eps, freqs_cis, positions)
+        return
+    _fused_q_norm_rope_impl(q_input, q_output, eps, freqs_cis, positions)
 
 
 def fused_q_indexer_rope_hadamard_quant(

@@ -3,7 +3,6 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import time
-from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
     Iterable,
@@ -272,12 +271,96 @@ def deepseek_v4_attention_with_output(
     ), f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
 
     output[:real_num_tokens].view(ret.shape).copy_(ret)
+
+    if _is_hip and output.shape[0] > real_num_tokens:
+        # PCG replay pads the batch to a captured bucket; the attention kernel
+        # only filled output[:real_num_tokens], leaving the padded tail with
+        # uninitialized garbage from torch.empty. Zero it so NaN/Inf cannot
+        # propagate through inverse-RoPE / wo / MoE routing / allreduce.
+        # Mirrors radix_attention.unified_attention_with_output (PR #22299);
+        # here the slice boundary is real_num_tokens so write/zero stay consistent.
+        first_dim = output.shape[0]
+        elems_per_token = output.numel() // first_dim
+        output.view(first_dim, elems_per_token)[real_num_tokens:].zero_()
     return
 
 
 bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
     deepseek_v4_attention_with_output
 )
+
+
+@register_custom_op(mutates_args=["x"])
+@register_split_op()
+def deepseek_v4_compressor_with_output(
+    x: torch.Tensor,
+    layer_id: int,
+) -> None:
+    """PCG (tc_piecewise) split-op wrapping the compressor.
+
+    The compressor (`attn_backend.forward_core_compressor`) takes a ForwardBatch
+    and the compressor module and contains data-dependent Python (plan
+    generation, JIT kernel dispatch) that Dynamo cannot trace. Wrap the whole
+    call as an opaque split-op: recover forward_batch / compressor / backend
+    from the forward context by layer_id, run eagerly outside the captured
+    sub-graphs. `mutates_args=["x"]` keeps the node alive through DCE (the real
+    effect is a write into the compressed-KV pool, invisible to FX); the
+    declared "mutation" of x is a no-op (compressor reads x read-only)."""
+    context = get_tc_piecewise_forward_context()
+    forward_batch = context.forward_batch
+    attention_layer = context.attention_layers[layer_id]
+    compressor = attention_layer._pcg_compressor
+    real_num_tokens = forward_batch.num_token_non_padded_cpu
+
+    attn_backend = get_attn_backend()
+    original_out_cache_loc = forward_batch.out_cache_loc
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    try:
+        attn_backend.forward_core_compressor(
+            x[:real_num_tokens],
+            forward_batch,
+            layer_id,
+            compressor,
+        )
+    finally:
+        forward_batch.out_cache_loc = original_out_cache_loc
+    return
+
+
+@register_custom_op(mutates_args=["x"])
+@register_split_op()
+def deepseek_v4_indexer_with_output(
+    x: torch.Tensor,
+    q_lora: torch.Tensor,
+    layer_id: int,
+) -> None:
+    """PCG (tc_piecewise) split-op wrapping the C4 lightning indexer.
+
+    `self.indexer(...)` (C4Indexer) takes a ForwardBatch + the attention backend
+    and internally runs data-dependent Python + JIT compress kernels Dynamo
+    cannot trace. Wrap the whole call as an opaque split-op, recovering
+    forward_batch / indexer / backend from the forward context by layer_id. The
+    real effect is a write into the index-k pool (invisible to FX); `x` is
+    declared mutated only to keep the node alive through DCE (no-op mutation)."""
+    context = get_tc_piecewise_forward_context()
+    forward_batch = context.forward_batch
+    attention_layer = context.attention_layers[layer_id]
+    indexer = attention_layer._pcg_indexer
+    real_num_tokens = forward_batch.num_token_non_padded_cpu
+
+    attn_backend = get_attn_backend()
+    original_out_cache_loc = forward_batch.out_cache_loc
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    try:
+        indexer(
+            x=x[:real_num_tokens],
+            q_lora=q_lora[:real_num_tokens],
+            forward_batch=forward_batch,
+            attn_backend=attn_backend,
+        )
+    finally:
+        forward_batch.out_cache_loc = original_out_cache_loc
+    return
 
 
 class MQALayer(nn.Module):
@@ -911,19 +994,31 @@ class MQALayer(nn.Module):
         del qkv_a
 
         if self.indexer is not None:
-            self.indexer(
-                x=x,
-                q_lora=q_lora,
-                forward_batch=forward_batch,
-                attn_backend=attn_backend,
-            )
+            if _is_hip and get_tc_piecewise_forward_context() is not None:
+                # PCG: route through the opaque split-op (recovers forward_batch /
+                # indexer from the forward context); see definition above.
+                # AMD/HIP-only (_is_hip): keeps the NVIDIA path byte-for-byte unchanged.
+                deepseek_v4_indexer_with_output(x, q_lora, self.layer_id)
+            else:
+                self.indexer(
+                    x=x,
+                    q_lora=q_lora,
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
+                )
         if self.compressor is not None:
-            attn_backend.forward_core_compressor(
-                x,
-                forward_batch,
-                self.layer_id,
-                self.compressor,
-            )
+            if _is_hip and get_tc_piecewise_forward_context() is not None:
+                # PCG: route through the opaque split-op (recovers forward_batch /
+                # compressor from the forward context); see definition above.
+                # AMD/HIP-only (_is_hip): keeps the NVIDIA path byte-for-byte unchanged.
+                deepseek_v4_compressor_with_output(x, self.layer_id)
+            else:
+                attn_backend.forward_core_compressor(
+                    x,
+                    forward_batch,
+                    self.layer_id,
+                    self.compressor,
+                )
 
         return q, kv
 
@@ -1022,16 +1117,36 @@ class MQALayer(nn.Module):
         )
 
         if is_unified_kv_triton():
-            o = attn_backend.forward(
-                q=q_out if q_out is not None else q,
-                k=attn_k,
-                v=attn_k,
-                layer=self.attn_mqa,
-                forward_batch=forward_batch,
-                compress_ratio=self.compress_ratio,
-                attn_sink=self.attn_sink,
-                save_kv_cache=kv is not None,
-            )
+            q_in = q_out if q_out is not None else q
+            if (
+                _is_hip
+                and forward_batch.forward_mode.is_extend()
+                and get_tc_piecewise_forward_context() is not None
+            ):
+                # PCG: route the unified-KV attention through the opaque split-op
+                # so attention is the piecewise boundary (recomputed eagerly at
+                # replay) instead of being traced into the captured graph.
+                o = q_in.new_empty((*q_in.shape[:-1], self.attn_mqa.v_head_dim))
+                deepseek_v4_attention_with_output(
+                    q_in,
+                    attn_k,
+                    o,
+                    self.attn_mqa.layer_id,
+                    self.compress_ratio,
+                    self.attn_sink,
+                    kv is not None,
+                )
+            else:
+                o = attn_backend.forward(
+                    q=q_in,
+                    k=attn_k,
+                    v=attn_k,
+                    layer=self.attn_mqa,
+                    forward_batch=forward_batch,
+                    compress_ratio=self.compress_ratio,
+                    attn_sink=self.attn_sink,
+                    save_kv_cache=kv is not None,
+                )
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
@@ -1858,15 +1973,19 @@ class DeepseekV4Model(nn.Module):
         use_fused = self.use_fused_mhc_post_pre
         prev_residual, prev_post, prev_comb = None, None, None
         last_layer = None
+        # PCG (tc_piecewise): the expert-distribution recorder is disabled, so ctx
+        # is always nullcontext. Tracing `with ctx:` makes Dynamo choke on the
+        # context-manager exception handling (gb0089). Call layers directly under
+        # PCG so the compiled region has no Python `with` construct.
+        # AMD/HIP-only: only the HIP V4 PCG path takes the no-`with` branch; NVIDIA
+        # keeps the original `with expert_distribution_recorder` layer loop unchanged.
+        _pcg_prefill = _is_hip and check_cuda_graph_backend(
+            Phase.PREFILL, Backend.TC_PIECEWISE
+        )
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             last_layer = layer
-            ctx = (
-                nullcontext()
-                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                else get_global_expert_distribution_recorder().with_current_layer(i)
-            )
-            with ctx:
+            if _pcg_prefill:
                 hidden_states, prev_residual, prev_post, prev_comb = layer(
                     positions=positions,
                     hidden_states=hidden_states,
@@ -1877,6 +1996,18 @@ class DeepseekV4Model(nn.Module):
                     prev_post=prev_post,
                     prev_comb=prev_comb,
                 )
+            else:
+                with get_global_expert_distribution_recorder().with_current_layer(i):
+                    hidden_states, prev_residual, prev_post, prev_comb = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        forward_batch=forward_batch,
+                        input_ids=input_ids,
+                        input_ids_global=input_ids_global,
+                        prev_residual=prev_residual,
+                        prev_post=prev_post,
+                        prev_comb=prev_comb,
+                    )
         if use_fused and last_layer is not None:
             hidden_states = last_layer.hc_post(
                 hidden_states, prev_residual, prev_post, prev_comb

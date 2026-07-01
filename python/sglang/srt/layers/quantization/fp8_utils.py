@@ -33,6 +33,9 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     ceil_align,
@@ -814,7 +817,7 @@ def _unpack_ue8m0_scale_for_triton(
     return sf_fp32
 
 
-def aiter_w8a8_block_fp8_linear(
+def _aiter_w8a8_block_fp8_linear_impl(
     input: torch.Tensor,
     weight: torch.Tensor,
     block_size: List[int],
@@ -871,6 +874,49 @@ def aiter_w8a8_block_fp8_linear(
     return output.to(
         dtype=torch.bfloat16 if input_scale is not None else input_2d.dtype
     ).view(*output_shape)
+
+
+def _aiter_w8a8_block_fp8_linear_pcg_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    out_dtype = torch.bfloat16 if input_scale is not None else input.dtype
+    output_shape = (*input.shape[:-1], weight.shape[0])
+    return torch.empty(output_shape, dtype=out_dtype, device=input.device)
+
+
+# PCG (tc_piecewise): the aiter block-scale fp8 GEMM does internal JIT config
+# caching (`hasattr(_get_gemm_config_cached, "_config_cache")`, dict lookups)
+# that Dynamo cannot trace. Wrap the whole fp8 linear as one opaque custom op so
+# every fp8 Linear (wq_a/wq_b/wkv/wo_b/MoE gate/...) is captured as a single
+# node instead of breaking the graph. Gated on the PCG flag below so the eager
+# baseline (and all non-PCG models that share this file) is byte-for-byte unchanged.
+dsv4_pcg_aiter_w8a8_block_fp8_linear = register_custom_op(
+    _aiter_w8a8_block_fp8_linear_impl,
+    op_name="dsv4_pcg_aiter_w8a8_block_fp8_linear",
+    fake_impl=_aiter_w8a8_block_fp8_linear_pcg_fake,
+)
+
+
+def aiter_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if is_hip() and is_in_tc_piecewise_cuda_graph():
+        return dsv4_pcg_aiter_w8a8_block_fp8_linear(
+            input, weight, block_size, weight_scale, input_scale, bias
+        )
+    return _aiter_w8a8_block_fp8_linear_impl(
+        input, weight, block_size, weight_scale, input_scale, bias
+    )
 
 
 def triton_w8a8_block_fp8_linear(

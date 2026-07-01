@@ -705,7 +705,22 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # DSV4's hook (which restores forward_metadata to a stale
         # _current_capture_raw left over from decode CG capture) doesn't
         # corrupt warmup iter 2's metadata read.
-        if isinstance(self.backend, BreakableCudaGraphBackend):
+        # DSV4's on_after_cuda_graph_warmup restores forward_metadata to a stale
+        # decode raw metadata (_current_capture_raw, left over from the earlier
+        # decode CG capture). BCG already suppresses the hook for that reason;
+        # TC_PIECEWISE needs the same suppression, otherwise warmup iter 1's
+        # correct EXTEND metadata (with .core_metadata) is clobbered back to a
+        # DSV4RawDecodeMetadata before the iter-2 capture, crashing the prefill
+        # compressor/attention split-ops. Both prefill backends use eager
+        # per-shape init_forward_metadata, so the hook is never needed here.
+        # BCG suppression is unconditional (original behavior, all platforms).
+        # The TcPiecewise suppression is AMD/HIP-only: it exists solely to avoid
+        # DSV4's HIP-radix on_after_cuda_graph_warmup restoring stale decode
+        # metadata. Gate on _is_hip so the NVIDIA TcPiecewise path is unchanged.
+        _suppress_post_warmup_hook = isinstance(
+            self.backend, BreakableCudaGraphBackend
+        ) or (_is_hip and type(self.backend).__name__ == "TcPiecewiseCudaGraphBackend")
+        if _suppress_post_warmup_hook:
             post_warmup_hook = None
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
