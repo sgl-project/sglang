@@ -115,17 +115,39 @@ _MLX_KV_FLOAT_DTYPES = {mx.float16, mx.bfloat16, mx.float32}
 # Memory-safe chunked prefill on Apple Silicon. A long prefill whose activation peak
 # exceeds the Metal working set aborts the scheduler with an uncatchable command-buffer
 # OOM, so the chunk is sized to keep that peak below the limit.
+#
+# These are conservative startup estimates, not tuned constants: the in-server probe
+# (_calibrate_prefill_chunk) measures the real per-token transient at runtime and revises
+# the chunk down before serving, so they only have to over-estimate safely. Baselines come
+# from the original repro -- M5 Pro 24GB, Qwen3-30B-A3B-4bit, radix off: 17.76 GiB working
+# set, ~17.12 GiB steady-state baseline after the first prefill; a 256-token chunk peaked
+# at 17.43 GiB and held while a 398-token chunk peaked at 17.58 GiB and crashed (the limit
+# is soft, so a sub-limit peak can still abort). How the chunk-sizing values below feed
+# _safe_prefill_chunk_tokens (chunk = headroom * SAFETY / (ACT_BYTES * n_q_heads * ctx)):
+#   ACT_BYTES_PER_QHEAD -- conservative estimate of the (chunk x ctx) attention
+#     scores/softmax bytes per q-head; the probe overwrites it with the measured cost.
+#   SAFETY -- commit only 60% of headroom to the transient; in the repro ~0.72 of headroom
+#     crashed while ~0.48 held, so 0.6 stays in the stable band with margin.
+#   MIN_PREFILL_CHUNK -- chunk floor: below this prefill is too slow to serve, so fail
+#     loudly. Also inverted in _memory_safe_max_running so the cap and chunk stay aligned.
 _MLX_PREFILL_ACT_BYTES_PER_QHEAD = 32  # conservative per-(token x ctx) cost per q-head
 _MLX_PREFILL_SAFETY = 0.6  # fraction of headroom the chunk's transient may use
-_MLX_MIN_PREFILL_CHUNK = 256
-_MLX_POOL_SLOTS_SLACK = (
-    1.25  # cap the KV pool at context x running x this, not greedily
-)
+_MLX_MIN_PREFILL_CHUNK = 256  # chunk floor (tokens); see block comment above
+# Minimum KV-pool size in tokens, so the pool never collapses to something unusable (the
+# radix-off no-context-length branch and the radix-on auto-sizer). A pool floor, distinct
+# from the equal-valued _MLX_MIN_PREFILL_CHUNK (a chunk floor).
+_MLX_MIN_POOL_SLOTS = 256
+# Cap the KV pool at context x running x this (25% slack), not greedily.
+_MLX_POOL_SLOTS_SLACK = 1.25
 # Startup probe (_calibrate_prefill_chunk): replay a small prefill to measure the real
-# resident baseline + transient. Probe at a small chunk/context so it never nears the
-# edge; floor is the chunk below which prefill is impractical (fail loudly); headroom is
-# the live margin kept below the limit while probing; slack is the extra private caches
-# the overlap pipeline / pool keep resident beyond the running set.
+# resident baseline + transient, then revise the chunk down. PROBE_CHUNK / PROBE_MAX_CONTEXT
+# keep the replay small so it never nears the edge yet still shows the linear-in-ctx trend.
+# PROBE_FLOOR_CHUNK is the post-measurement floor: having measured the true cost the probe
+# may trust a chunk below the conservative MIN_PREFILL_CHUNK, but below this prefill is
+# impractical (fail loudly). PROBE_HEADROOM_BYTES is the live margin kept below the limit
+# while probing, so the probe never triggers the OOM it measures for. PIPELINE_CACHE_SLACK
+# is the extra private caches the overlap pipeline / pool keep resident beyond the running
+# set (in-flight next step + pooled finished).
 _MLX_PROBE_CHUNK = 128
 _MLX_PROBE_MAX_CONTEXT = 2048
 _MLX_PROBE_FLOOR_CHUNK = 32
@@ -664,10 +686,12 @@ class MlxModelRunner:
             pool_size = explicit_size
         else:
             pool_size = kv_budget // bytes_per_slot if bytes_per_slot else 0
+            # need_slots is set iff context_length is, so these are mutually exclusive:
+            # a known context caps the pool at its slot need, an unknown one only floors it.
             if need_slots is not None:
                 pool_size = min(pool_size, need_slots)
-            if context_length is None:
-                pool_size = max(pool_size, 256)
+            else:
+                pool_size = max(pool_size, _MLX_MIN_POOL_SLOTS)
 
         # Resident KV the prefill coexists with: span x running private caches (see
         # per_cache_bytes above). Using pool_size here would undercount the baseline and
@@ -769,7 +793,7 @@ class MlxModelRunner:
             int(sys_available * self._mem_fraction_static),
         )
         bytes_per_slot = 2 * num_layers * n_kv_heads * head_dim * dtype.size
-        pool_size = max(kv_budget // bytes_per_slot, 256)
+        pool_size = max(kv_budget // bytes_per_slot, _MLX_MIN_POOL_SLOTS)
         logger.info(
             f"Auto-sized attention KV pool (radix on): "
             f"sys_available={sys_available / (1024**3):.2f} GB, "
