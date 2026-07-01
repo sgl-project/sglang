@@ -3,6 +3,14 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
+#
+# For local/fork builds: pin to a specific commit so Docker layer caching
+# correctly invalidates the clone layer when the branch HEAD moves.
+# (Official release builds use --no-cache and don't need this.)
+#   docker build --build-arg SGL_BRANCH=main \
+#     --build-arg SGL_COMMIT=$(git ls-remote https://github.com/sgl-project/sglang.git refs/heads/main | cut -f1) \
+#     --build-arg GPU_ARCH=gfx942 -t sglang-rocm-pinned -f rocm.Dockerfile .
+# Note: passing SGL_COMMIT pins to a detached HEAD; this is expected for reproducible builds.
 
 # Usage (to build SGLang ROCm + Mori docker image):
 # remove --build-arg NIC_BACKEND=ainic since new MoRI JIT will do NIC auto detection on target
@@ -81,6 +89,9 @@ ENV PYTORCH_ROCM_ARCH=gfx942;gfx950
 ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
 ARG SGL_DEFAULT="main"
 ARG SGL_BRANCH=${SGL_DEFAULT}
+# Optional: pin to an exact commit SHA to invalidate Docker cache when a
+# branch's HEAD moves.  When empty (default), only SGL_BRANCH is checked out.
+ARG SGL_COMMIT=""
 
 # Version override for setuptools_scm (used in nightly builds)
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
@@ -291,6 +302,10 @@ RUN git clone ${SGL_REPO} \
        else \
          echo "Using ${SGL_BRANCH} branch."; \
          git checkout ${SGL_BRANCH}; \
+       fi \
+    && if [ -n "${SGL_COMMIT}" ]; then \
+         echo "Pinning to commit ${SGL_COMMIT}."; \
+         git checkout ${SGL_COMMIT}; \
        fi \
     && cd sgl-kernel \
     && rm -f pyproject.toml \
