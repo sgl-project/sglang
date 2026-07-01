@@ -28,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
@@ -197,7 +198,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
-        )
+        ) and get_tensor_model_parallel_rank() == 0
         self.enable_pdmux = model_runner.server_args.enable_pdmux
 
         self.attn_tp_size = get_attention_tp_size()
@@ -470,9 +471,33 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def _init_profile_context_and_memory_record(self):
+        rank = get_tensor_model_parallel_rank()
+        trace_dir = os.path.join(
+            os.environ.get("SGLANG_TORCH_PROFILER_DIR", "traces"), "capture_traces"
+        )
+        os.makedirs(trace_dir, exist_ok=True)
+
+        # Track which BS is currently being captured for trace file naming
+        self._profile_bs_list = list(reversed(self.capture_bs))
+        self._profile_bs_idx = 0
+
+        def on_trace_ready(prof):
+            bs = self._profile_bs_list[self._profile_bs_idx]
+            trace_file = os.path.join(trace_dir, f"bs_{bs}_rank{rank}.json.gz")
+            prof.export_chrome_trace(trace_file)
+            logger.info(f"Saved trace for bs={bs} to {trace_file}")
+            self._profile_bs_idx += 1
+
+        # Schedule: wait=2 (skip 2 dummy runs), warmup=0, active=1 (capture run)
+        # repeat=0 means repeat indefinitely for each batch size
         profile_context = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=2, warmup=0, active=1, repeat=0),
             record_shapes=True,
+            with_stack=True,
+            with_flops=True,
+            profile_memory=True,
+            on_trace_ready=on_trace_ready,
         )
         torch.cuda.memory._record_memory_history()
         return profile_context
@@ -670,8 +695,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner, self.num_tokens_per_bs
             )
         profile_context = empty_context()
+        # Holds the active torch profiler during capture so capture_one_shape
+        # can advance its schedule; None when profiling is disabled.
+        self._profiler = None
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
+            self._profiler = profile_context
 
         # share_buffers() coalesces seq_lens / seq_lens_cpu through the process-
         # wide pool, so they may alias a buffer seeded by an earlier runner (the
@@ -704,6 +733,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
+        self._profiler = None
 
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
         avail_mem = get_available_gpu_memory(

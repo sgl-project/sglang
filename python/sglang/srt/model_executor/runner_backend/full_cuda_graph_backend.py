@@ -58,6 +58,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
+        self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
@@ -84,12 +85,26 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         dummies: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
+        # When --enable-profile-cuda-graph is set, the runner created a torch
+        # profiler (schedule wait=2, active=1) and exposed it as _profiler. We
+        # step() past the two warmup runs so only the capture run is recorded,
+        # and wrap the capture in a record_function so each batch size produces
+        # its own trace via the profiler's on_trace_ready.
+        runner = self._cuda_graph_runner
+        profiler = (
+            getattr(runner, "_profiler", None)
+            if getattr(runner, "enable_profile_cuda_graph", False)
+            else None
+        )
+
         # Two warmups so kernels are loaded and one-time setup is paid before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
             forward_fn()
+            if profiler is not None:
+                profiler.step()
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
@@ -108,7 +123,17 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             graph_ctx = self._device_module.graph
 
         with graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream):
-            out = forward_fn()
+            if profiler is not None:
+                num_tokens = shape_key.size * runner.num_tokens_per_bs
+                with torch.profiler.record_function(
+                    f"capture_{num_tokens}_{runner.capture_forward_mode.name}"
+                ):
+                    out = forward_fn()
+            else:
+                out = forward_fn()
+
+        if profiler is not None:
+            profiler.step()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
