@@ -630,6 +630,40 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertCountEqual([e.block_hashes[0] for e in restored_gpu], stored_hashes)
 
 
+class TestUnifiedRadixCacheLoadBackEvents(CustomTestCase):
+    def test_is_load_back_event_done_waits_for_pending_event(self):
+        tree = object.__new__(UnifiedRadixCache)
+        finish_event = mock.Mock()
+        finish_event.query.return_value = False
+        tree.cache_controller = mock.Mock()
+        tree.cache_controller.layer_done_counter.events = [
+            mock.Mock(finish_event=finish_event)
+        ]
+        tree.loading_check = mock.Mock()
+
+        self.assertFalse(tree.is_load_back_event_done(0))
+        tree.loading_check.assert_not_called()
+
+    def test_is_load_back_event_done_polls_completed_loads(self):
+        tree = object.__new__(UnifiedRadixCache)
+        finish_event = mock.Mock()
+        finish_event.query.return_value = True
+        tree.cache_controller = mock.Mock()
+        tree.cache_controller.layer_done_counter.events = [
+            mock.Mock(finish_event=finish_event)
+        ]
+        tree.loading_check = mock.Mock()
+
+        self.assertTrue(tree.is_load_back_event_done(0))
+        tree.loading_check.assert_called_once_with()
+
+    def test_is_load_back_event_done_treats_no_consumer_as_done(self):
+        tree = object.__new__(UnifiedRadixCache)
+        tree.cache_controller = None
+
+        self.assertTrue(tree.is_load_back_event_done(-1))
+
+
 class UnifiedRadixCacheSuite:
 
     cfg: CacheConfig
