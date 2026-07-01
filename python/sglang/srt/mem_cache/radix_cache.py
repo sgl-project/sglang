@@ -578,11 +578,31 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         ]
         heapq.heapify(eviction_heap)
 
+        # Eviction must not synchronize with the device. The paged allocator's
+        # free() runs `torch.unique` on a CUDA tensor; its data-dependent
+        # output shape forces the CPU to wait for the GPU stream. Eviction
+        # runs on the scheduler critical path *before* the next batch is
+        # launched, so during that wait the other TP ranks spin inside a
+        # collective that needs this rank's next launch — a circular wait
+        # observed to stall all ranks for tens of seconds once the KV pool is
+        # full (eviction then precedes nearly every allocation). Radix-tree
+        # node values are whole page-aligned page runs, so the page indices
+        # can be derived with a fixed-shape strided slice instead: no sync,
+        # pure async kernels.
+        # self.page_size (not the allocator's) is the contract that node
+        # values are page-aligned: the tree is built with it.
+        allocator = self.token_to_kv_pool_allocator
+        page_size = self.page_size
+        freed_values = []
+
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
-            self.token_to_kv_pool_allocator.free(x.value)
+            if page_size > 1 and len(x.value) % page_size == 0:
+                freed_values.append(x.value)
+            else:
+                allocator.free(x.value)
             num_evicted += len(x.value)
             self._delete_leaf(x)
 
@@ -591,6 +611,23 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
+
+        if freed_values:
+            cat = freed_values[0] if len(freed_values) == 1 else torch.cat(freed_values)
+            # Every page in a node value is a contiguous, page-aligned run of
+            # token slots, so sampling one slot per page yields each freed
+            # page exactly once — equivalent to unique(cat // page_size)
+            # without the device sync.
+            pages = cat[::page_size] // page_size
+            if allocator.is_not_in_free_group:
+                if allocator.need_sort:
+                    allocator.release_pages = torch.cat(
+                        (pages, allocator.release_pages)
+                    )
+                else:
+                    allocator.free_pages = torch.cat((pages, allocator.free_pages))
+            else:
+                allocator.free_group.append(cat)
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
