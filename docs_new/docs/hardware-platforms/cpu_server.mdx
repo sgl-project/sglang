@@ -5,82 +5,30 @@ The document addresses how to set up the [SGLang](https://github.com/sgl-project
 SGLang is enabled and optimized on the CPUs equipped with Intel® AMX® Instructions,
 which are 4th generation or newer Intel® Xeon® Scalable Processors.
 
-## Optimized Model List
-
-A list of popular LLMs are optimized and run efficiently on CPU,
+A number of popular LLMs are optimized and run efficiently on CPU,
 including the most notable open-source models like Llama series, Qwen series,
 and DeepSeek series like DeepSeek-R1 and DeepSeek-V3.1-Terminus.
-
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <colgroup>
-    <col style={{width: "22%"}} />
-    <col style={{width: "26%"}} />
-    <col style={{width: "30%"}} />
-    <col style={{width: "22%"}} />
-  </colgroup>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model Name</th>
-      <th style={{textAlign: "center", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16</th>
-      <th style={{textAlign: "center", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8_INT8</th>
-      <th style={{textAlign: "center", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>FP8</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td style={{padding: "9px 12px", whiteSpace: "nowrap", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DeepSeek-R1</td>
-      <td style={{padding: "9px 12px", textAlign: "center", color: "gray", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
-      <td style={{padding: "9px 12px", textAlign: "center", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/meituan/DeepSeek-R1-Channel-INT8">meituan/DeepSeek-R1-Channel-INT8</a></td>
-      <td style={{padding: "9px 12px", textAlign: "center", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://huggingface.co/deepseek-ai/DeepSeek-R1">deepseek-ai/DeepSeek-R1</a></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", whiteSpace: "nowrap", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DeepSeek-V3.1-Terminus</td>
-      <td style={{padding: "9px 12px", textAlign: "center", color: "gray", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
-      <td style={{padding: "9px 12px", textAlign: "center", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/IntervitensInc/DeepSeek-V3.1-Terminus-Channel-int8">IntervitensInc/DeepSeek-V3.1-Terminus-Channel-int8</a></td>
-      <td style={{padding: "9px 12px", textAlign: "center", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://huggingface.co/deepseek-ai/DeepSeek-V3.1-Terminus">deepseek-ai/DeepSeek-V3.1-Terminus</a></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", whiteSpace: "nowrap", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Llama-3.2-3B</td>
-      <td style={{padding: "9px 12px", textAlign: "center", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct">meta-llama/Llama-3.2-3B-Instruct</a></td>
-      <td style={{padding: "9px 12px", textAlign: "center", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/RedHatAI/Llama-3.2-3B-Instruct-quantized.w8a8">RedHatAI/Llama-3.2-3B-quantized.w8a8</a></td>
-      <td style={{padding: "9px 12px", textAlign: "center", color: "gray", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", whiteSpace: "nowrap", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Llama-3.1-8B</td>
-      <td style={{padding: "9px 12px", textAlign: "center", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct">meta-llama/Llama-3.1-8B-Instruct</a></td>
-      <td style={{padding: "9px 12px", textAlign: "center", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/RedHatAI/Meta-Llama-3.1-8B-quantized.w8a8">RedHatAI/Meta-Llama-3.1-8B-quantized.w8a8</a></td>
-      <td style={{padding: "9px 12px", textAlign: "center", color: "gray", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", whiteSpace: "nowrap", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>QwQ-32B</td>
-      <td style={{padding: "9px 12px", textAlign: "center", color: "gray", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
-      <td style={{padding: "9px 12px", textAlign: "center", color: "gray", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/RedHatAI/QwQ-32B-quantized.w8a8">RedHatAI/QwQ-32B-quantized.w8a8</a></td>
-      <td style={{padding: "9px 12px", textAlign: "center", color: "gray", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", whiteSpace: "nowrap", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DeepSeek-Distilled-Llama</td>
-      <td style={{padding: "9px 12px", textAlign: "center", color: "gray", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
-      <td style={{padding: "9px 12px", textAlign: "center", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/RedHatAI/DeepSeek-R1-Distill-Llama-70B-quantized.w8a8">RedHatAI/DeepSeek-R1-Distill-Llama-70B-quantized.w8a8</a></td>
-      <td style={{padding: "9px 12px", textAlign: "center", color: "gray", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", whiteSpace: "nowrap", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3-235B</td>
-      <td style={{padding: "9px 12px", textAlign: "center", color: "gray", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
-      <td style={{padding: "9px 12px", textAlign: "center", color: "gray", backgroundColor: "rgba(255,255,255,0.02)"}}></td>
-      <td style={{padding: "9px 12px", textAlign: "center", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://huggingface.co/Qwen/Qwen3-235B-A22B-FP8">Qwen/Qwen3-235B-A22B-FP8</a></td>
-    </tr>
-  </tbody>
-</table>
-
-**Note:** The model identifiers listed in the table above
-have been verified on 6th Gen Intel® Xeon® P-core platforms.
+Please check the [SGLang Cookbook pages](https://docs.sglang.io/cookbook/intro)
+in which the support status and example commands can be found.
 
 ## Installation
 
 ### Install Using Docker
 
 It is recommended to use Docker for setting up the SGLang environment.
-A [Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/xeon.Dockerfile) is provided to facilitate the installation.
+
+#### Pull from Docker Hub
+
+Pull the prebuilt docker image of SGLang package releases from `lmsysorg/sglang` repository.
+The CPU image tags end with `xeon` suffix. The image pulling command is like:
+
+```bash Command
+docker pull lmsysorg/sglang:v0.5.13-xeon
+```
+
+#### Build from Dockerfile
+
+A [Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/xeon.Dockerfile) is provided to facilitate the installation from latest source code.
 Replace `<secret>` below with your [HuggingFace access token](https://huggingface.co/docs/hub/en/security-tokens).
 
 ```bash Command
@@ -112,7 +60,7 @@ the setup process is as follows:
 Please install the required packages and libraries beforehand if
 they are not already present on your system.
 You can refer to the Ubuntu-based installation commands in
-[the Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/xeon.Dockerfile#L11)
+[the Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/xeon.Dockerfile#L7)
 for guidance.
 
 1. Install `uv` package manager, then create and activate a virtual environment:
