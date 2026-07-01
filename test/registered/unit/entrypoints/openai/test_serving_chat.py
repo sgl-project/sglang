@@ -1647,6 +1647,85 @@ class ServingChatTestCase(unittest.TestCase):
             "empty-delta logprobs chunk emitted without a parser; would break client chunk-shape assumptions",
         )
 
+    def test_streaming_tool_calls_do_not_emit_empty_content_only_delta(self):
+        """Tool-call streams should not emit content="" chunks with no payload.
+
+        Some OpenAI-compatible clients treat a content-only empty delta as an
+        empty text turn and stop before the following tool_call deltas arrive.
+        """
+        self.chat.reasoning_parser = "qwen3"
+        self.chat.tool_call_parser = "qwen3_coder"
+
+        async def _mock_generate_tool_call():
+            for text, finish_reason in [
+                ("", None),
+                (
+                    "<tool_call><function=bash><parameter=cmd>ls /tmp"
+                    "</parameter></function></tool_call>",
+                    {"type": "stop", "matched": None},
+                ),
+            ]:
+                yield {
+                    "text": text,
+                    "meta_info": {
+                        "id": "chatcmpl-tool-empty-content",
+                        "prompt_tokens": 5,
+                        "completion_tokens": 2,
+                        "cached_tokens": 0,
+                        "finish_reason": finish_reason,
+                        "output_token_logprobs": None,
+                        "output_top_logprobs": None,
+                    },
+                    "index": 0,
+                }
+
+        self.tm.generate_request.return_value = _mock_generate_tool_call()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "List /tmp"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"cmd": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            tool_choice="auto",
+            stream=True,
+        )
+
+        chunks = self._run_chat_stream(None, req)
+        parsed = self._parse_chunks(chunks)
+
+        self.assertEqual(parsed[0]["choices"][0]["delta"].get("role"), "assistant")
+        self.assertIsNone(parsed[0]["choices"][0]["delta"].get("content"))
+
+        tool_call_chunks = [
+            c
+            for c in parsed
+            if c["choices"] and c["choices"][0]["delta"].get("tool_calls") is not None
+        ]
+        self.assertTrue(tool_call_chunks, "tool_calls were not streamed")
+
+        empty_content_only_chunks = [
+            c
+            for c in parsed
+            if c["choices"]
+            and c["choices"][0]["delta"].get("content") == ""
+            and c["choices"][0]["delta"].get("tool_calls") is None
+            and c["choices"][0].get("finish_reason") is None
+        ]
+        self.assertFalse(
+            empty_content_only_chunks,
+            "content-only empty delta emitted before tool_calls",
+        )
+
     def test_non_streaming_cached_tokens_details_emits_sglext(self):
         """Test that non-streaming chat responses emit cached token details in sglext."""
 
