@@ -413,6 +413,7 @@ class Envs:
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+    SGLANG_TOOL_JSON_ERROR_AUTOMATIC_RETRY = EnvBool(False)
 
     # Native web search (Exa). EXA_API_KEY is the vendor BYOK credential
     # (kept as-is, not renamed to SGLANG_*); the SGLANG_EXA_* knobs tune the

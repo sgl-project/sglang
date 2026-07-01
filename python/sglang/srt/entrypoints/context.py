@@ -21,6 +21,7 @@ from sglang.srt.entrypoints.harmony_utils import (
     render_for_completion,
 )
 from sglang.srt.entrypoints.tool import Tool
+from sglang.srt.environ import envs
 
 
 class ConversationContext(ABC):
@@ -58,6 +59,24 @@ class SimpleContext(ConversationContext):
 
     def render_for_completion(self) -> list[int]:
         raise NotImplementedError("Should not be called.")
+
+
+def _create_json_parse_error_messages(last_msg: Message, e: Exception) -> list[Message]:
+    """Create a tool error message when JSON parsing of tool args failed."""
+    error_msg = (
+        f"Error parsing tool arguments as JSON: {str(e)}. "
+        "Please ensure the tool call arguments are valid JSON and try again."
+    )
+    content = TextContent(text=error_msg)
+    author = Author(role=Role.TOOL, name=last_msg.recipient)
+    return [
+        Message(
+            author=author,
+            content=[content],
+            recipient=Role.ASSISTANT,
+            channel=last_msg.channel,
+        )
+    ]
 
 
 class HarmonyContext(ConversationContext):
@@ -141,7 +160,15 @@ class HarmonyContext(ConversationContext):
         if isinstance(tool_session, Tool):
             return await tool_session.get_result(self)
         tool_name = last_msg.recipient.split(".")[1]
-        args = orjson.loads(last_msg.content[0].text)
+        if envs.SGLANG_TOOL_JSON_ERROR_AUTOMATIC_RETRY.get():
+            try:
+                args = orjson.loads(last_msg.content[0].text)
+                if not isinstance(args, dict):
+                    raise ValueError("Tool arguments must be a JSON object")
+            except (orjson.JSONDecodeError, ValueError) as e:
+                return _create_json_parse_error_messages(last_msg, e)
+        else:
+            args = orjson.loads(last_msg.content[0].text)
         result = await tool_session.call_tool(tool_name, args)
         result_str = result.content[0].text
         content = TextContent(text=result_str)
