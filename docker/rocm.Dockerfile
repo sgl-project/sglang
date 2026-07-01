@@ -22,9 +22,9 @@
 
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
-ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
-ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
