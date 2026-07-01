@@ -78,6 +78,30 @@ def _batch_invariant_expected_m(expected_m: int, actual_m: int) -> int:
     return min(aligned_m, actual_m)
 
 
+def _batch_invariant_deepep_normal_expert_m(
+    num_recv_tokens_per_expert: List[int], runner_config: MoeRunnerConfig
+) -> Optional[int]:
+    if not num_recv_tokens_per_expert or not is_batch_invariant_mode_enabled():
+        return None
+
+    num_experts = runner_config.num_experts
+    num_local_experts = runner_config.num_local_experts
+    if not num_experts or not num_local_experts:
+        return None
+
+    expert_alignment = 128
+    ep_size = max(1, ceil_div(num_experts, num_local_experts))
+    max_dispatch_tokens_per_rank = (
+        envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+    )
+    max_expert_tokens = max_dispatch_tokens_per_rank * ep_size
+    max_actual_tokens = max(num_recv_tokens_per_expert)
+    return max(
+        ceil_div(max_expert_tokens, expert_alignment) * expert_alignment,
+        ceil_div(max_actual_tokens, expert_alignment) * expert_alignment,
+    )
+
+
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
 @torch.compile(disable=_is_hip or _is_npu)
@@ -741,7 +765,17 @@ def pre_permute_deepep_normal_to_deep_gemm(
     ) = dispatch_output
     assert runner_config.activation == "silu"
 
-    all_tokens = sum(num_recv_tokens_per_expert)
+    expert_m = _batch_invariant_deepep_normal_expert_m(
+        num_recv_tokens_per_expert, runner_config
+    )
+    if expert_m is None:
+        scatter_num_recv_tokens_per_expert = num_recv_tokens_per_expert
+        all_tokens = sum(num_recv_tokens_per_expert)
+    else:
+        scatter_num_recv_tokens_per_expert = [
+            expert_m for _ in num_recv_tokens_per_expert
+        ]
+        all_tokens = expert_m * len(num_recv_tokens_per_expert)
     running_state["all_tokens"] = all_tokens
 
     K = hidden_states.shape[1]
@@ -761,6 +795,8 @@ def pre_permute_deepep_normal_to_deep_gemm(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
+    if is_batch_invariant_mode_enabled():
+        input_tensor.zero_()
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
         # TODO check whether need `zeros`
         input_tensor_scale = torch.zeros(
@@ -774,16 +810,20 @@ def pre_permute_deepep_normal_to_deep_gemm(
             device=hidden_states.device,
             dtype=torch.float32,
         )
+        if is_batch_invariant_mode_enabled():
+            input_tensor_scale.zero_()
     m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
+    if is_batch_invariant_mode_enabled():
+        m_indices.zero_()
     output_index = torch.empty_like(topk_ids)
 
     if get_offloader().forbid_copy_engine_usage:
         num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
-            num_recv_tokens_per_expert
+            scatter_num_recv_tokens_per_expert
         )
     else:
         num_recv_tokens_per_expert_gpu = torch.tensor(
-            num_recv_tokens_per_expert,
+            scatter_num_recv_tokens_per_expert,
             dtype=torch.int32,
             pin_memory=True,
             device="cpu",

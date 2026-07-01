@@ -14,6 +14,7 @@
 """A controller that dispatches requests to multiple data parallel workers."""
 
 import faulthandler
+import hashlib
 import logging
 import multiprocessing as mp
 import signal
@@ -603,11 +604,36 @@ class DataParallelController:
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
     def maybe_external_dp_rank_routing(self, req: Req):
-        if req.routed_dp_rank is not None:
-            logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
-            sock_send(self.workers[req.routed_dp_rank], req)
+        routed_dp_rank = req.routed_dp_rank
+        if (
+            routed_dp_rank is None
+            and self.server_args.enable_deterministic_inference
+            and self.server_args.dp_size > 1
+        ):
+            routed_dp_rank = self._deterministic_default_dp_rank(req)
+            req.routed_dp_rank = routed_dp_rank
+
+        if routed_dp_rank is not None:
+            logger.debug(f"Direct routing to DP rank {routed_dp_rank}")
+            sock_send(self.workers[routed_dp_rank], req)
             return True
         return False
+
+    def _deterministic_default_dp_rank(self, req: Req) -> int:
+        routing_key = getattr(req, "routing_key", None)
+        hasher = hashlib.blake2s(digest_size=8)
+        if routing_key is not None:
+            hasher.update(str(routing_key).encode())
+        else:
+            input_ids = getattr(req, "input_ids", None)
+            if input_ids is None:
+                input_ids = getattr(req, "origin_input_ids", None)
+            if input_ids is None:
+                return 0
+            for token_id in input_ids:
+                hasher.update(int(token_id).to_bytes(8, "little", signed=True))
+
+        return int.from_bytes(hasher.digest(), "little") % self.server_args.dp_size
 
     def round_robin_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
