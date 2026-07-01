@@ -393,6 +393,20 @@ class CompletionRequest(BaseModel):
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_null_max_tokens(cls, values):
+        # Treat an explicit ``max_tokens: null`` like an omitted field (OpenAI
+        # behavior); an omitted field skips the copy below.
+        if (
+            isinstance(values, dict)
+            and "max_tokens" in values
+            and values["max_tokens"] is None
+        ):
+            values = values.copy()
+            values["max_tokens"] = cls.model_fields["max_tokens"].default
+        return values
+
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
