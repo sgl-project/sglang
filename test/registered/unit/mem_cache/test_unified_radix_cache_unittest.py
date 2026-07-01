@@ -1287,6 +1287,110 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(m.device_indices), len(seq))
         tree.sanity_check()
 
+    def test_swa_unfinished_recovery_preserves_locked_full_value(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        tokens = self._make_seq(1, 4)
+        self._insert(tree, allocator, req_to_token_pool, tokens)
+        self._insert(
+            tree, allocator, req_to_token_pool, tokens + self._make_seq(100, 1)
+        )
+
+        node = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        old_full_value = node.component_data[ComponentType.FULL].value.clone()
+        swa_component = tree.components[ComponentType.SWA]
+        tracker = {ct: 0 for ct in tree.tree_components}
+        tree._evict_component_and_detach_lru(node, swa_component, tracker=tracker)
+        self.assertIsNone(node.component_data[ComponentType.SWA].value)
+
+        lock_result = tree.inc_lock_ref(node)
+        req = self._make_req(req_to_token_pool)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        kv_len = len(tokens)
+        fresh_value = self._alloc(allocator, kv_len)
+        req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), fresh_value)
+        req.kv_committed_len = kv_len
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.swa_evicted_seqlen = 0
+
+        full_available_before_insert = allocator.full_attn_allocator.available_size()
+
+        tree.cache_unfinished_req(req)
+
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(),
+            full_available_before_insert + len(tokens),
+        )
+        self.assertTrue(
+            torch.equal(
+                node.component_data[ComponentType.FULL].value,
+                old_full_value,
+            )
+        )
+        swa_value = node.component_data[ComponentType.SWA].value
+        self.assertIsNotNone(swa_value)
+        self.assertTrue(
+            torch.equal(
+                allocator.translate_loc_from_full_to_swa(old_full_value),
+                swa_value,
+            )
+        )
+        self.assertEqual(req.cache_protected_len, len(tokens))
+
+        tree.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        )
+        tree.dec_lock_ref(node, lock_result.to_dec_params())
+        tree.sanity_check()
+
+    def test_swa_insert_keeps_full_leaf_when_entire_span_is_outside_window(self):
+        # A leaf survives on its Full value alone: even when the whole span is
+        # past the SWA window (swa_evicted_seqlen >= total), the Full leaf must
+        # be materialized (and the Full KV kept) so the prefix stays cacheable.
+        # Runs across all SWA configs, including page_size > sliding_window_size
+        # (the dsv4-style edge case).
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        tree, allocator, _ = build_fixture(self.cfg)
+
+        tokens = self._make_seq(1, 2)
+        value = self._alloc(allocator, len(tokens))
+        if value is None:
+            self.skipTest("insufficient pool for this config")
+        full_available_before = allocator.full_attn_allocator.available_size()
+
+        tree.insert(
+            InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=value,
+                prev_prefix_len=0,
+                swa_evicted_seqlen=len(tokens),
+            )
+        )
+
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(), full_available_before
+        )
+        node = next(iter(tree.root_node.children.values()))
+        self.assertTrue(
+            torch.equal(node.component_data[ComponentType.FULL].value, value)
+        )
+        self.assertIsNone(node.component_data[ComponentType.SWA].value)
+        tree.sanity_check()
+
     def test_swa_evict_cascades(self):
         """Evict SWA tokens via swa_num_tokens — cascades to lower-priority components."""
         if not self.cfg.has_swa:

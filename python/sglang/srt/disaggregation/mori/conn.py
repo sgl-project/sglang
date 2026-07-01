@@ -1092,7 +1092,7 @@ class MoriKVManager(CommonKVManager):
                         dst_dims,
                     )
                 )
-            elif st in ("swa", "dsa", "swa_ring"):
+            elif st in ("swa", "dsa", "swa_ring", "c128_state"):
                 statuses.extend(
                     self._send_swa_dsa_state(
                         peer_info,
@@ -1221,17 +1221,24 @@ class MoriKVManager(CommonKVManager):
             )
 
         common_len = min(src_state_indices.size, dst_state_indices.size)
+        if (
+            state_type == "c128_state"
+            and common_len == 0
+            and src_state_indices.size == 0
+            and dst_state_indices.size == 0
+        ):
+            return []
         if common_len == 0 and max(src_state_indices.size, dst_state_indices.size) > 0:
             raise RuntimeError(
                 f"No overlapping state indices for state_type={state_type}"
             )
         if src_state_indices.size != dst_state_indices.size:
-            # SWA_RING is positional: truncating silently misaligns rows and
-            # corrupts KV, so fail loud. Paged swa/dsa tolerate a 1-page drift
-            # -> keep truncation.
-            if state_type == "swa_ring":
+            # These components are position- or request-indexed: truncating
+            # silently misaligns rows and corrupts KV. Paged swa/dsa tolerate
+            # a 1-page drift -> keep truncation.
+            if state_type in ("swa_ring", "c128_state"):
                 raise RuntimeError(
-                    "SWA_RING state index length mismatch: "
+                    f"{state_type.upper()} state index length mismatch: "
                     f"src={src_state_indices.size}, dst={dst_state_indices.size}"
                 )
             logger.warning(
