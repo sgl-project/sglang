@@ -16,6 +16,7 @@ import triton.language as tl
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.base import _moe_output_buf
 from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -485,7 +486,16 @@ def _fused_moe_kernel_sequence(
     elif inplace:
         out_hidden_states = hidden_states
     else:
-        out_hidden_states = torch.empty_like(hidden_states)
+        _provided = _moe_output_buf.get()
+        if (
+            _provided is not None
+            and _provided.shape == hidden_states.shape
+            and _provided.dtype == hidden_states.dtype
+            and _provided.device == hidden_states.device
+        ):
+            out_hidden_states = _provided
+        else:
+            out_hidden_states = torch.empty_like(hidden_states)
 
     use_fused_moe_sum_all_reduce = (
         get_global_server_args().enable_fused_moe_sum_all_reduce

@@ -32,6 +32,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
     create_kt_config_from_server_args,
 )
+from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
@@ -1119,13 +1120,26 @@ class FusedMoE(torch.nn.Module):
             hidden_states=hidden_states, topk_output=topk_output
         )
 
-        combine_input = self.run_moe_core(
-            dispatch_output=dispatch_output,
-        )
+        if is_allocation_symmetric():
+            with use_symmetric_memory(get_tp_group()):
+                symm_output = torch.empty(
+                    hidden_states.shape[0],
+                    origin_hidden_states_dim,
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
 
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
+            with moe_output_buffer_ctx(symm_output):
+                combine_input = self.run_moe_core(
+                    dispatch_output=dispatch_output,
+                )
+
+            with use_symmetric_memory(get_tp_group()):
+                final_hidden_states = self.dispatcher.combine(
+                    combine_input=combine_input
+                )
+        else:
+            combine_input = self.run_moe_core(dispatch_output=dispatch_output)
             final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
 
             # TODO: should we add some conditions here?
