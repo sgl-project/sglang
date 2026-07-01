@@ -54,6 +54,137 @@ def test_remote_video_gt_candidates_survive_inconclusive_probe(monkeypatch):
     ]
 
 
+def test_remote_image_gt_prefers_official_when_present(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+    official_prefix = test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE + "/"
+    expected_filename = f"unit_image_1gpu.{test_utils.output_format_to_ext(None)}"
+    monkeypatch.setattr(
+        test_utils,
+        "_remote_file_exists",
+        lambda url: url.startswith(official_prefix),
+    )
+
+    files = test_utils._find_remote_consistency_gt_files(
+        "unit_image",
+        1,
+        is_video=False,
+    )
+
+    assert files == [
+        (
+            expected_filename,
+            (
+                f"{test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE}"
+                f"/{expected_filename}"
+            ),
+        )
+    ]
+
+
+def test_remote_image_gt_falls_back_to_sglang_when_official_missing(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+    sglang_prefix = test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE + "/"
+    expected_filename = f"unit_image_1gpu.{test_utils.output_format_to_ext(None)}"
+    monkeypatch.setattr(
+        test_utils,
+        "_remote_file_exists",
+        lambda url: url.startswith(sglang_prefix),
+    )
+
+    files = test_utils._find_remote_consistency_gt_files(
+        "unit_image",
+        1,
+        is_video=False,
+    )
+
+    assert files == [
+        (
+            expected_filename,
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                f"/{expected_filename}"
+            ),
+        )
+    ]
+
+
+def test_remote_platform_video_gt_prefers_platform_sglang_before_default_official(
+    monkeypatch,
+):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "5090")
+    sglang_platform_prefix = (
+        f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}/5090/"
+    )
+    official_default_prefix = (
+        f"{test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE}/unit_video_1gpu_"
+    )
+    monkeypatch.setattr(
+        test_utils,
+        "_remote_file_exists",
+        lambda url: url.startswith(sglang_platform_prefix)
+        or url.startswith(official_default_prefix),
+    )
+
+    files = test_utils._find_remote_consistency_gt_files(
+        "unit_video",
+        1,
+        is_video=True,
+    )
+
+    assert files == [
+        (
+            "5090/unit_video_1gpu_frame_0.png",
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                "/5090/unit_video_1gpu_frame_0.png"
+            ),
+        ),
+        (
+            "5090/unit_video_1gpu_frame_mid.png",
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                "/5090/unit_video_1gpu_frame_mid.png"
+            ),
+        ),
+        (
+            "5090/unit_video_1gpu_frame_last.png",
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                "/5090/unit_video_1gpu_frame_last.png"
+            ),
+        ),
+    ]
+
+
+def test_remote_npu_image_gt_prefers_official_ascend_when_present(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+    official_ascend_prefix = (
+        test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE_ASCEND + "/"
+    )
+    expected_filename = f"unit_npu_image_1gpu.{test_utils.output_format_to_ext(None)}"
+    monkeypatch.setattr(
+        test_utils,
+        "_remote_file_exists",
+        lambda url: url.startswith(official_ascend_prefix),
+    )
+
+    files = test_utils._find_remote_consistency_gt_files(
+        "unit_npu_image",
+        1,
+        is_video=False,
+    )
+
+    assert files == [
+        (
+            expected_filename,
+            (
+                f"{test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE_ASCEND}"
+                f"/{expected_filename}"
+            ),
+        )
+    ]
+
+
 def test_platform_gt_candidates_prefer_platform_then_default(monkeypatch):
     monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "5090")
 
