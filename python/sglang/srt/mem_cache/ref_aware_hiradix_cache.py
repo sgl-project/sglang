@@ -17,7 +17,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import (
-    RadixKey,
     TreeNode,
 )
 from sglang.srt.mem_cache.ref_aware_cache_mixin import (
@@ -436,9 +435,7 @@ class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
     # Insert (HiCache-specific: host leaf status, write_back policy)
     # ------------------------------------------------------------------
 
-    def _insert_with_last_node(
-        self, params: InsertParams
-    ) -> tuple[InsertResult, Optional[TreeNode]]:
+    def insert(self, params: InsertParams) -> InsertResult:
         key = params.key
         value = params.value
         chunked = params.chunked
@@ -453,7 +450,7 @@ class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
             value = value[: len(key)]
 
         if len(key) == 0:
-            return InsertResult(prefix_len=0), self.root_node
+            return InsertResult(prefix_len=0, last_device_node=self.root_node)
 
         node = self.root_node
         child_key = key.child_key(self.page_size)
@@ -525,56 +522,7 @@ class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
                 self._inc_hit_count(new_node, chunked)
             last_node = new_node
 
-        return InsertResult(prefix_len=total_prefix_length), last_node
-
-    def insert(self, params: InsertParams) -> InsertResult:
-        result, last_node = self._insert_with_last_node(params)
-        result.last_device_node = last_node
-        return result
-
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
-        # In deterministic mode, disable finished request insertion to radix cache.
-        if self.disable_finished_insert:
-            is_insert = False
-
-        kv_committed_len = req.pop_committed_kv_cache()
-        if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_committed_len
-            ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
-            return
-
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
-        ]
-
-        radix_key = RadixKey(
-            token_ids, req.extra_key, is_bigram=self.is_eagle
-        ).page_aligned(self.page_size)
-        key_len = len(radix_key)
-        values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
-
-        old_last_node = req.last_node
-        new_last_node = old_last_node
-
-        if is_insert:
-            priority = getattr(req, "priority", 0) or 0
-            result, new_last_node = self._insert_with_last_node(
-                InsertParams(key=radix_key, value=values, priority=priority)
-            )
-            new_prefix_len = result.prefix_len
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : new_prefix_len]
-            )
-            req.last_node = new_last_node
-        else:
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : key_len]
-            )
-
-        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
-        # Remove req slot release the cache lock
-        if old_last_node is not None:
-            self.dec_lock_ref(old_last_node)
+        return InsertResult(
+            prefix_len=total_prefix_length,
+            last_device_node=last_node,
+        )

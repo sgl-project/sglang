@@ -2803,6 +2803,8 @@ class Scheduler(
         ):
             # LP chunk was not admitted due to insufficient token budget.
             # Retract it so the slot is free for high-priority requests.
+            # Note: if add.can_run_list is empty, the LP chunked request will not
+            # be retracted since there are no HP requests.
             release_kv_cache(req, self.tree_cache, is_insert=False)
             req.reset_for_retract()
             self._add_request_to_queue(req)
