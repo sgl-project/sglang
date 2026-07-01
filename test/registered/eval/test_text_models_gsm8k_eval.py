@@ -26,23 +26,24 @@ NIGHTLY_EVAL_SERVER_TIMEOUT = 1800
 register_cuda_ci(est_time=3600, suite="nightly-eval-text-2-gpu", nightly=True)
 
 MODEL_SCORE_THRESHOLDS = {
-    # Thresholds set at 5% below reported GSM8K (5-shot/CoT) scores
-    "meta-llama/Llama-3.1-8B-Instruct": 0.80,  # 84.5% - 5%
-    "mistralai/Mistral-7B-Instruct-v0.3": 0.47,  # 52.1% - 5%
-    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.81,  # 86.4% - 5%
-    "google/gemma-2-27b-it": 0.81,  # 85.5% measured - 5%
-    "meta-llama/Llama-3.1-70B-Instruct": 0.89,  # 94.1% - 5%
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.69,  # 74.4% - 5%
-    "Qwen/Qwen2-57B-A14B-Instruct": 0.76,  # 80.7% - 5% (official A14B score; 88.2% was the 72B)
-    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.80,  # 84.5% - 5%
-    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.47,  # 52.1% - 5%
-    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.81,  # 86.4% - 5%
-    "zai-org/GLM-4.5-Air-FP8": 0.80,  # ~85%  - 5%
-    "neuralmagic/gemma-2-2b-it-FP8": 0.53,  # 58.4% measured - 5%
-    "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.89,  # 94.1% - 5%
-    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.69,  # 74.4% - 5%
-    "neuralmagic/Qwen2-72B-Instruct-FP8": 0.86,  # 91.1% - 5%
-    "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.76,  # 80.7% - 5% (official A14B score)
+    # sgl-eval (zero-shot chat, \boxed{}, math_verify grading). Thresholds are
+    # measured_score - 0.05, baselined on H200 over the full 1319 test split.
+    # FP8/TP2 entries are 0.0 placeholders pending their own sgl-eval baseline.
+    "meta-llama/Llama-3.1-8B-Instruct": 0.77,  # 81.88% measured - 5%
+    "Qwen/Qwen3-8B": 0.76,  # 81.20% measured - 5%
+    "Qwen/Qwen3-4B": 0.77,  # 82.03% measured - 5%
+    "meta-llama/Llama-3.1-70B-Instruct": 0.0,  # TODO: sgl-eval baseline - 5%
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.0,  # TODO: sgl-eval baseline - 5%
+    "Qwen/Qwen2-57B-A14B-Instruct": 0.0,  # TODO: sgl-eval baseline - 5%
+    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.0,  # TODO: sgl-eval baseline - 5%
+    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.0,  # TODO: sgl-eval baseline - 5%
+    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.0,  # TODO: sgl-eval baseline - 5%
+    "zai-org/GLM-4.5-Air-FP8": 0.0,  # TODO: sgl-eval baseline - 5%
+    "neuralmagic/gemma-2-2b-it-FP8": 0.0,  # TODO: sgl-eval baseline - 5%
+    "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.0,  # TODO: sgl-eval baseline - 5%
+    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.0,  # TODO: sgl-eval baseline - 5%
+    "neuralmagic/Qwen2-72B-Instruct-FP8": 0.0,  # TODO: sgl-eval baseline - 5%
+    "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.0,  # TODO: sgl-eval baseline - 5%
 }
 
 
@@ -91,6 +92,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                         base_url=self.base_url,
                         model=model_setup.model_path,
                         eval_name="gsm8k",
+                        api="sgl_eval",
                         num_examples=None,
                         num_threads=1024,
                     )

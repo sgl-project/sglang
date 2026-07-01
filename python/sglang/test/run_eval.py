@@ -6,7 +6,10 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name mmlu --num-examples 10
 import argparse
 import json
 import os
+import subprocess
 import time
+import uuid
+from pathlib import Path
 
 from sglang.test.simple_eval_common import (
     ChatCompletionSampler,
@@ -92,6 +95,105 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
     return result, latency, sampler
 
 
+def _run_sgl_eval(eval_name, args) -> dict:
+    # Returns a metrics dict (score, latency, output_throughput) so the
+    # existing write_results_to_json + threshold gate keep working.
+    from sglang.test.test_utils import dump_metric
+
+    base_url = (
+        f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
+    )
+    out_parent = Path(
+        getattr(args, "sgl_eval_out_dir", None)
+        or (Path.home() / ".sgl_eval" / "sglang_run_eval" / uuid.uuid4().hex)
+    ).expanduser()
+    out_parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "sgl-eval",
+        "run",
+        eval_name,
+        "--base-url",
+        base_url,
+        "--num-threads",
+        str(getattr(args, "num_threads", 64)),
+        "--temperature",
+        str(getattr(args, "temperature", 0.0)),
+        "--out-dir",
+        str(out_parent),
+    ]
+    if getattr(args, "model", None):
+        cmd += ["--model", args.model]
+    if getattr(args, "num_examples", None) is not None:
+        cmd += ["--num-examples", str(args.num_examples)]
+    # Bound generation length so long-reasoning models don't stall the eval.
+    if getattr(args, "max_tokens", None) is not None:
+        cmd += ["--max-tokens", str(args.max_tokens)]
+    else:
+        cmd += ["--max-tokens", "2048"]
+    # Reasoning models (e.g. Qwen3.5) put their answer in the reasoning channel;
+    # without --thinking their message.content is empty and sgl-eval scores 0.
+    if getattr(args, "sgl_eval_thinking", None) is None:
+        model_l = (getattr(args, "model", None) or "").lower()
+        if "qwen3.5" in model_l or "qwen3-thinking" in model_l:
+            cmd += ["--thinking"]
+    elif args.sgl_eval_thinking:
+        cmd += ["--thinking"]
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=getattr(args, "sgl_eval_timeout", None),
+        )
+    except subprocess.TimeoutExpired as e:
+        raise TimeoutError(
+            f"sgl-eval timed out after {e.timeout}s: {' '.join(cmd)}\n"
+            f"stdout:\n{e.stdout or ''}\nstderr:\n{e.stderr or ''}"
+        ) from e
+
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"sgl-eval failed with exit code {completed.returncode}: "
+            f"{' '.join(cmd)}\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+        )
+
+    metrics_files = sorted(out_parent.glob(f"sgl_eval_{eval_name}_*/metrics.json"))
+    if len(metrics_files) != 1:
+        raise FileNotFoundError(
+            f"Expected exactly one metrics.json under {out_parent}, "
+            f"found {len(metrics_files)}"
+        )
+    payload = json.loads(metrics_files[0].read_text())
+    aggregate = payload.get("aggregate")
+    if not isinstance(aggregate, dict) or "score" not in aggregate:
+        raise KeyError(f"{metrics_files[0]} missing aggregate.score")
+
+    metrics = dict(aggregate)
+    metrics["latency"] = payload.get("latency_seconds", 0.0)
+    metrics["output_throughput"] = payload.get("output_throughput_tps", 0.0)
+    metrics["sgl_eval_metrics_path"] = str(metrics_files[0])
+
+    model = payload.get("model") or getattr(args, "model", None)
+    dump_metric(
+        f"{eval_name}_score",
+        metrics["score"],
+        labels={"model": model, "eval": eval_name},
+    )
+    dump_metric(
+        f"{eval_name}_latency",
+        metrics["latency"],
+        labels={"model": model, "eval": eval_name},
+    )
+    print(f"Score: {metrics['score']:.3f}")
+    print(f"Total latency: {metrics['latency']:.3f} s")
+    print(f"Output throughput: {metrics['output_throughput']:.3f} token/s")
+    print(f"sgl-eval metrics: {metrics_files[0]}")
+    return metrics
+
+
 def run_eval(args):
     # Lazy import to avoid circular dependency with test_utils
     from sglang.test.test_utils import dump_metric
@@ -170,7 +272,14 @@ def run_eval(args):
 
         eval_obj = AIME25Eval(args.num_examples, args.num_threads)
     elif args.eval_name == "gsm8k":
-        from sglang.test.simple_eval_gsm8k import GSM8KEval
+        if getattr(args, "api", None) == "sgl_eval":
+            # Only the nightly correctness eval opts into sgl-eval (zero-shot
+            # chat, \boxed{}, math_verify). Every other gsm8k caller — spec
+            # decoding perf/accuracy, disaggregation, quant, model e2e — uses
+            # the 5-shot completion last-number scorer and relies on
+            # max_tokens/throughput behavior sgl-eval cannot provide.
+            return _run_sgl_eval("gsm8k", args)
+        from sglang.test.simple_eval_mixed_prefix_gsm8k import GSM8KEval
 
         eval_obj = GSM8KEval(
             num_examples=args.num_examples,
