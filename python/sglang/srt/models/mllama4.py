@@ -165,7 +165,11 @@ class Llama4VisionEncoderLayer(nn.Module):
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.num_attention_heads = config.original_num_attention_heads if hasattr(config, "original_num_attention_heads") else config.num_attention_heads
+        self.num_attention_heads = (
+            config.original_num_attention_heads
+            if hasattr(config, "original_num_attention_heads")
+            else config.num_attention_heads
+        )
         self.intermediate_size = config.intermediate_size
         num_dummy_heads = 0
         if hasattr(config, "original_num_attention_heads"):
@@ -282,7 +286,9 @@ class Llama4UnfoldConvolution(nn.Module):
             kernel_size = (kernel_size, kernel_size)
         self.unfold = torch.nn.Unfold(kernel_size=kernel_size, stride=config.patch_size)
         output_size = (
-            config.hidden_size // config.original_num_attention_heads * config.num_attention_heads
+            config.hidden_size
+            // config.original_num_attention_heads
+            * config.num_attention_heads
             if hasattr(config, "original_num_attention_heads")
             else config.hidden_size
         )
@@ -316,7 +322,11 @@ class Llama4VisionRotaryEmbedding(nn.Module):
         img_idx[-1, -1] = -2  # ID_CLS_TOKEN
         frequencies_x = img_idx % idx  # get the coordinates of the 2d matrix along x
         frequencies_y = img_idx // idx  # get the coordinates of the 2d matrix along y
-        num_attention_heads = config.original_num_attention_heads if hasattr(config, "original_num_attention_heads") else config.num_attention_heads
+        num_attention_heads = (
+            config.original_num_attention_heads
+            if hasattr(config, "original_num_attention_heads")
+            else config.num_attention_heads
+        )
         freq_dim = config.hidden_size // num_attention_heads // 2
         rope_freq = 1.0 / (
             config.rope_parameters["rope_theta"]
@@ -393,7 +403,11 @@ class Llama4VisionModel(nn.Module):
         # Patch embedding
         hidden_state = self.patch_embedding(pixel_values)
         # If padded in patch embedding linear part, only retrieve valid slice
-        if hasattr(self.config, "original_num_attention_heads") and self.config.num_attention_heads > self.config.original_num_attention_heads:
+        if (
+            hasattr(self.config, "original_num_attention_heads")
+            and self.config.num_attention_heads
+            > self.config.original_num_attention_heads
+        ):
             hidden_state = hidden_state[:, :, : self.config.hidden_size]
 
         num_tiles, num_patches, hidden_dim = hidden_state.shape

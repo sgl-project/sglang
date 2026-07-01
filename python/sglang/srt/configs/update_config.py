@@ -166,7 +166,9 @@ def update_intermediate_size(model_config, attr_name, intermediate_padding_size)
                 update_config(model_config.hf_text_config, origin_name, origin_value)
             if hasattr(model_config.hf_config, "text_config"):
                 update_config(model_config.hf_config.text_config, attr_name, attr_value)
-                update_config(model_config.hf_config.text_config, origin_name, origin_value)
+                update_config(
+                    model_config.hf_config.text_config, origin_name, origin_value
+                )
         else:
             update_config(model_config, attr_name, attr_value)
             update_config(model_config, origin_name, origin_value)
@@ -273,7 +275,12 @@ def adjust_config_with_unaligned_cpu_tp(
         [model_config.hf_config, "vision_config", "qwen3_5_moe", "num_heads"],
         [model_config.hf_config, "vision_config", "qwen3_5", "num_heads"],
         [model_config.hf_config, "vision_config", "mllama", "attention_heads"],
-        [model_config.hf_config, "vision_config", "llama4_vision_model", "num_attention_heads"],
+        [
+            model_config.hf_config,
+            "vision_config",
+            "llama4_vision_model",
+            "num_attention_heads",
+        ],
     ]
     if hasattr(model_config.hf_config, "thinker_config"):
         multimodal_config.append(
@@ -294,9 +301,9 @@ def adjust_config_with_unaligned_cpu_tp(
         )
 
     for m_config, config_name, model_type, num_head_str in multimodal_config:
-        if (
-            hasattr(m_config, config_name)
-            and (m_config.model_type == model_type or getattr(m_config, config_name).model_type == model_type)
+        if hasattr(m_config, config_name) and (
+            m_config.model_type == model_type
+            or getattr(m_config, config_name).model_type == model_type
         ):
             num_heads = getattr(getattr(m_config, config_name), num_head_str)
 
@@ -330,7 +337,14 @@ def adjust_config_with_unaligned_cpu_tp(
             if model_type == "llama4_vision_model":
                 proj_inp_dim = getattr(m_config, config_name).projector_input_dim
                 if proj_inp_dim % tp_size != 0:
-                    from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
-                    update_config(getattr(m_config, config_name), "projector_input_dim", pad_vocab_size(proj_inp_dim, tp_size))
+                    from sglang.srt.layers.vocab_parallel_embedding import (
+                        pad_vocab_size,
+                    )
+
+                    update_config(
+                        getattr(m_config, config_name),
+                        "projector_input_dim",
+                        pad_vocab_size(proj_inp_dim, tp_size),
+                    )
 
     return model_config

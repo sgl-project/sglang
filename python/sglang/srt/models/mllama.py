@@ -198,7 +198,11 @@ class MllamaVisionEncoderLayer(nn.Module):
         super().__init__()
 
         self.hidden_size = config.hidden_size
-        self.num_attention_heads = config.original_attention_heads if hasattr(config, "original_attention_heads") else config.attention_heads
+        self.num_attention_heads = (
+            config.original_attention_heads
+            if hasattr(config, "original_attention_heads")
+            else config.attention_heads
+        )
         self.is_gated = is_gated
         self.intermediate_size = config.intermediate_size
         num_dummy_heads = 0
@@ -315,7 +319,9 @@ class MllamaVisionModel(nn.Module):
         self.num_patches = (self.image_size // self.patch_size) ** 2 + 1
         self.scale = config.hidden_size**-0.5
         out_channels = (
-            config.hidden_size // config.original_attention_heads * config.attention_heads
+            config.hidden_size
+            // config.original_attention_heads
+            * config.attention_heads
             if hasattr(config, "original_attention_heads")
             else config.hidden_size
         )
