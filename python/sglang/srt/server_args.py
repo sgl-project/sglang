@@ -1472,6 +1472,10 @@ class ServerArgs:
             choices=DSA_CHOICES,
         ),
     ] = None
+    dsa_use_cute_dsl_paged_mqa_logits: A[
+        bool,
+        "Use the CuTe DSL FP8 paged MQA logits kernel inside the DSA indexer instead of DeepGEMM. SM 100 (Blackwell) only.",
+    ] = False
     dsa_topk_backend: A[
         str,
         Arg(

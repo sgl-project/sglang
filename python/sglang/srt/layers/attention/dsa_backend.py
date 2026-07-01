@@ -14,7 +14,11 @@ from typing import (
 
 import torch
 
-from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    get_dsa_index_n_heads,
+    get_dsa_index_topk,
+    is_deepseek_dsa,
+)
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -202,6 +206,14 @@ class DSAMetadata:
     # 2D context_lens used to build the schedule above; the indexer reuses it
     # as DG's `context_lens` arg so the broadcast doesn't rebuild per layer.
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
+    # Wave-aware atom-split decision for the CuTe DSL FP8 paged MQA logits
+    # kernel. Decided once per forward batch from (batch, next_n, max_seq_len_k,
+    # num_sms); both the indexer's forward and any per-layer expand reuse it.
+    # `factor == atom == 1` means no atom-split (kernel-native next_n).
+    # `factor > 1`: indexer reshapes Q to [B*factor, atom, H, D] and rebuilds
+    # ctx_lens / block_table / schedule_metadata to match.
+    dsl_expand_factor: int = 1
+    dsl_atom: int = 1
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
     # The flattened 1D page table with shape (seq_lens_sum,), prefill only
@@ -249,6 +261,10 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
+    # DSL atom-split decision propagated from the underlying DSAMetadata.
+    # See DSAMetadata for semantics (factor == atom == 1 means no split).
+    dsl_expand_factor: int = 1
+    dsl_atom: int = 1
     force_unfused_topk: bool = False
 
     def get_seqlens_int32(self) -> torch.Tensor:
@@ -357,6 +373,12 @@ class DeepseekSparseAttnBackend(
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
         self.dsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
+        try:
+            self.dsa_index_n_heads = get_dsa_index_n_heads(
+                model_runner.model_config.hf_config
+            )
+        except Exception:
+            self.dsa_index_n_heads = 0
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -377,6 +399,14 @@ class DeepseekSparseAttnBackend(
             model_runner.server_args.dsa_prefill_backend
         )
         self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
+        self.use_cute_dsl_paged_mqa_logits = bool(
+            is_cuda()
+            and getattr(
+                model_runner.server_args,
+                "dsa_use_cute_dsl_paged_mqa_logits",
+                False,
+            )
+        )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
@@ -599,21 +629,54 @@ class DeepseekSparseAttnBackend(
         seqlens_expanded: torch.Tensor,
         batch_size: int,
     ) -> torch.Tensor:
-        # target_verify with next_n>=2 uses DG-native q=[B,next_n,H,D] which
-        # needs a [B, next_n] schedule; everything else stays per-token.
+        # cute_dsl target_verify: 1 atom per batch (kernel handles full next_n
+        #   natively in one launch) -> [B, 1] schedule.
+        # DG-native target_verify with next_n>=2: [B, next_n] schedule matching
+        #   DG's ceil-div atom iteration over `q=[B,next_n,H,D]` (SM100+ only).
+        # Everything else: per-token [N_total, 1].
         # TODO: SM90 supports DG-native next_n in {1,2} too — enable once
         # validated; for now DG-native is SM100+ only.
         next_n = self.speculative_num_draft_tokens
-        if (
-            forward_mode.is_target_verify()
-            and next_n
-            and next_n >= 2
-            and is_sm100_supported()
-        ):
-            return cache_seqlens_int32.view(-1, 1).expand(-1, next_n).contiguous()
+        if forward_mode.is_target_verify():
+            if self.use_cute_dsl_paged_mqa_logits:
+                return _to_2d_context_lens(cache_seqlens_int32, batch_size)
+            if next_n is not None and next_n >= 2 and is_sm100_supported():
+                return (
+                    cache_seqlens_int32.contiguous()
+                    .view(-1, 1)
+                    .expand(-1, next_n)
+                    .contiguous()
+                )
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             return _to_2d_context_lens(seqlens_expanded, batch_size)
         return _to_2d_context_lens(cache_seqlens_int32, batch_size)
+
+    def _pick_dsl_atom_split(
+        self,
+        forward_mode: ForwardMode,
+        batch_size: int,
+        max_seq_len_k: int,
+    ) -> Tuple[int, int]:
+        next_n = self.speculative_num_draft_tokens
+        if (
+            not self.use_cute_dsl_paged_mqa_logits
+            or not forward_mode.is_target_verify()
+            or next_n is None
+            or next_n < 2
+        ):
+            return 1, 1
+        from sglang.srt.layers.attention.dsa.cute_dsl_paged_mqa_logits import (
+            _pick_dsl_expand,
+        )
+
+        return _pick_dsl_expand(
+            next_n,
+            batch_size=batch_size,
+            max_ctx=max_seq_len_k,
+            num_sms=deep_gemm.get_num_sms(),
+            kernel_atoms=(1, 2, 3, 4),
+            num_heads=self.dsa_index_n_heads,
+        )
 
     def _refresh_paged_mqa_schedule_metadata(
         self,
@@ -906,6 +969,8 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
+        # DeepGEMM paged MQA logits path needs a schedule metadata tensor.
+        # Compute it once per forward batch and reuse it across layers.
         if is_cuda() and (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
@@ -923,6 +988,14 @@ class DeepseekSparseAttnBackend(
             paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
+
+        # Wave-aware atom-split decision for the DSL kernel; constant across
+        # indexer layers, so decide once here.
+        dsl_factor, dsl_atom = self._pick_dsl_atom_split(
+            forward_batch.forward_mode,
+            forward_batch.batch_size,
+            max_seqlen_k,
+        )
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,
@@ -944,6 +1017,8 @@ class DeepseekSparseAttnBackend(
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
+            dsl_expand_factor=dsl_factor,
+            dsl_atom=dsl_atom,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
@@ -1201,6 +1276,11 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
+        # Wave-aware atom-split decision (DSL). Constant across captured replays
+        # of this graph: captured for the worst-case `max_seqlen_k`, so the
+        # picker bias is conservative (closer to factor=1) — safe.
+        dsl_factor, dsl_atom = self._pick_dsl_atom_split(forward_mode, bs, max_seqlen_k)
+
         metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1212,6 +1292,8 @@ class DeepseekSparseAttnBackend(
             flashmla_metadata=flashmla_metadata,
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
+            dsl_expand_factor=dsl_factor,
+            dsl_atom=dsl_atom,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
@@ -2739,6 +2821,8 @@ class DeepseekSparseAttnBackend(
             topk_backend=self.dsa_topk_backend,
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
+            dsl_expand_factor=self.forward_metadata.dsl_expand_factor,
+            dsl_atom=self.forward_metadata.dsl_atom,
             force_unfused_topk=force_unfused,
         )
 

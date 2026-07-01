@@ -46,6 +46,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_sm100_supported,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -426,6 +427,11 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+
+        self.use_cute_dsl_paged_mqa_logits = (
+            get_global_server_args().dsa_use_cute_dsl_paged_mqa_logits
+            and is_sm100_supported()
+        )
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -815,22 +821,21 @@ class Indexer(MultiPlatformOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
-
         assert len(q_fp8.shape) == 3
         # attn_tp_size > 1 or MAX_LEN padding mode can leave padding in the
         # hidden states; q_offset is the real (unpadded) q length.
         q_offset = sum(metadata.get_dsa_extend_len_cpu())
 
-        # DG-native q=[B,next_n,H,D] is faster than expanded q=[B*next_n,1,H,D]
-        # for target_verify with next_n>=2 (bigger MMA tile, fewer atoms). The
-        # precomputed ctx_lens_2d's shape is the single source of truth — if
-        # dsa_backend chose the per-token layout (e.g. non-SM100), fall through
-        # to the expanded path.
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
+        use_cute_dsl = (
+            self.use_cute_dsl_paged_mqa_logits
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        )
         ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
         use_dg_native = (
-            _is_cuda
+            not use_cute_dsl
+            and _is_cuda
             and forward_batch.forward_mode.is_target_verify()
             and next_n >= 2
             and ctx_2d is not None
@@ -879,6 +884,43 @@ class Indexer(MultiPlatformOp):
                 max_seq_len,
                 Preshuffle=_use_aiter_preshuffle,
                 KVBlockSize=block_kv,
+            )
+        elif use_cute_dsl:
+            from sglang.srt.layers.attention.dsa.cute_dsl_paged_mqa_logits import (
+                CuteDSLPagedMQALogitsRunner,
+            )
+
+            ctx_lens_1d = metadata.get_seqlens_int32()
+            schedule_metadata_dsl = schedule_metadata
+            factor = getattr(metadata, "dsl_expand_factor", 1)
+            atom = getattr(metadata, "dsl_atom", 1)
+            dsl_atom_split = factor > 1 and next_n == factor * atom
+            if forward_batch.forward_mode.is_target_verify() and dsl_atom_split:
+                exp_B = B * factor
+                q_dsl = q_fp8[:q_offset].view(
+                    exp_B, atom, q_fp8.shape[1], q_fp8.shape[2]
+                )
+                ctx_lens_1d = ctx_lens_1d.repeat_interleave(factor)
+                block_tables_dsl = block_tables[::next_n].repeat_interleave(
+                    factor, dim=0
+                )
+                schedule_metadata_dsl = deep_gemm.get_paged_mqa_logits_metadata(
+                    ctx_lens_1d.unsqueeze(-1), blocksize, self.sm_count
+                )
+            elif forward_batch.forward_mode.is_target_verify() and next_n >= 2:
+                q_dsl = q_fp8[:q_offset].view(B, next_n, q_fp8.shape[1], q_fp8.shape[2])
+                block_tables_dsl = block_tables[::next_n]
+            else:
+                q_dsl = q_fp8[:q_offset].unsqueeze(1)
+                block_tables_dsl = block_tables[:B]
+            logits = CuteDSLPagedMQALogitsRunner.forward(
+                q_dsl,
+                kv_cache_fp8.view(torch.uint8),
+                weights[:q_offset],
+                ctx_lens_1d,
+                block_tables_dsl,
+                schedule_metadata_dsl,
+                max_seq_len,
             )
         elif use_dg_native:
             # block_tables[::next_n] de-expands dsa_backend's repeat_interleave
