@@ -164,6 +164,14 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
 
 
+def _should_defer_dsa_cp_kv_gather(
+    *,
+    dsa_prefill_cp: bool,
+    fuse_rope_for_trtllm_mla: bool,
+) -> bool:
+    return dsa_prefill_cp and fuse_rope_for_trtllm_mla
+
+
 class DeepseekMLAForwardMixin:
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
@@ -522,18 +530,25 @@ class DeepseekMLAForwardMixin:
             elif is_kv_b_lora_active(self):
                 q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
+        fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
         skip_rope_for_dsa_tilelang_fused = self._skip_rope_for_dsa_tilelang_fused()
         skip_rope_for_aiter_fused_mla = self._skip_rope_for_aiter_fused_mla()
         if (
             self.rotary_emb is not None
-            and (not self._fuse_rope_for_trtllm_mla(forward_batch))
+            and (not fuse_rope_for_trtllm_mla)
             and (not skip_rope_for_dsa_tilelang_fused)
             and (not skip_rope_for_aiter_fused_mla)
             and (not _use_aiter or not _is_gfx95_supported or self.use_dsa)
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+        dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
+        mla_prefill_cp = mla_use_prefill_cp(forward_batch)
+        defer_kv_gather_until_after_rope = _should_defer_dsa_cp_kv_gather(
+            dsa_prefill_cp=dsa_prefill_cp,
+            fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
+        )
+        if (dsa_prefill_cp or mla_prefill_cp) and not defer_kv_gather_until_after_rope:
             # support allgather+rerrange
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
