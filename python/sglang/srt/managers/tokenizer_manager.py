@@ -2746,6 +2746,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         }
         del self.rid_to_state[recv_obj.rid]
 
+        # Waiting-queue aborts do not go through _handle_batch_output, so release
+        # the LoRA usage acquired before dispatch once the scheduler confirms
+        # this request is no longer pending.
+        lora_id = getattr(state.obj, "lora_id", None)
+        lora_path = getattr(state.obj, "lora_path", None)
+        if self.server_args.enable_lora and lora_path and lora_id is not None:
+            asyncio.create_task(self.lora_registry.release(lora_id))
+
         state.out_list.append(out)
         state.event.set()
 
@@ -2904,7 +2912,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             rids = obj.rid
         for rid in rids:
-            self.rid_to_state.pop(rid, None)
+            state = self.rid_to_state.pop(rid, None)
+            if state is None:
+                continue
+            lora_id = getattr(state.obj, "lora_id", None)
+            lora_path = getattr(state.obj, "lora_path", None)
+            if self.server_args.enable_lora and lora_path and lora_id is not None:
+                asyncio.create_task(self.lora_registry.release(lora_id))
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
