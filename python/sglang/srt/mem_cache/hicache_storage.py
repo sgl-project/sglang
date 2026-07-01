@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -52,6 +53,30 @@ class PrefetchTimeoutConfig:
     base: float = 2.0  # seconds, fixed overhead unrelated to token count
     per_ki_token: float = 0.1  # seconds per 1024 tokens
     max: float = 30.0  # seconds, upper bound for the linear timeout
+
+
+def parse_hicache_storage_backend_extra_config(
+    storage_backend_extra_config: Optional[str],
+) -> dict:
+    """Parse HiCache storage extra config from JSON or @path (json/toml/yaml)."""
+    if not storage_backend_extra_config:
+        return {}
+    if storage_backend_extra_config.startswith("@"):
+        path = storage_backend_extra_config[1:]
+        ext = os.path.splitext(path)[1].lower()
+        with open(path, "rb" if ext == ".toml" else "r") as f:
+            if ext == ".json":
+                return json.load(f)
+            if ext == ".toml":
+                import tomllib
+
+                return tomllib.load(f)
+            if ext in (".yaml", ".yml"):
+                import yaml
+
+                return yaml.safe_load(f)
+            raise ValueError(f"Unsupported config file {path} (config format: {ext})")
+    return json.loads(storage_backend_extra_config)
 
 
 class PoolName(str, Enum):

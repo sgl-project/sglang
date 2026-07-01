@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import atexit
 import heapq
-import json
 import logging
-import os
 import threading
 import time
 from queue import Empty
@@ -28,6 +26,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PrefetchTimeoutConfig,
+    parse_hicache_storage_backend_extra_config,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
@@ -1528,32 +1527,13 @@ class HiMambaRadixCache(MambaRadixCache):
     def _parse_storage_backend_extra_config(
         self, storage_backend_extra_config: Optional[str]
     ):
-        extra_config = {}
-        if storage_backend_extra_config:
-            try:
-                if storage_backend_extra_config.startswith("@"):
-                    path = storage_backend_extra_config[1:]
-                    ext = os.path.splitext(path)[1].lower()
-                    with open(path, "rb" if ext == ".toml" else "r") as f:
-                        if ext == ".json":
-                            extra_config = json.load(f)
-                        elif ext == ".toml":
-                            import tomllib
-
-                            extra_config = tomllib.load(f)
-                        elif ext in (".yaml", ".yml"):
-                            import yaml
-
-                            extra_config = yaml.safe_load(f)
-                        else:
-                            raise ValueError(
-                                f"Unsupported config file {path} (config format: {ext})"
-                            )
-                else:
-                    extra_config = json.loads(storage_backend_extra_config)
-            except Exception as e:
-                logger.error(f"Invalid backend extra config JSON: {e}")
-                raise e
+        try:
+            extra_config = parse_hicache_storage_backend_extra_config(
+                storage_backend_extra_config
+            )
+        except Exception as e:
+            logger.error(f"Invalid backend extra config: {e}")
+            raise
 
         defaults = PrefetchTimeoutConfig()
         prefetch_threshold = extra_config.pop("prefetch_threshold", 256)
