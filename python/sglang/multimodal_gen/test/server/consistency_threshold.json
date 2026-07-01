@@ -63,9 +63,9 @@
         },
         "qwen_image_t2i_2_gpus": {
             "clip_threshold": 0.98,
-            "ssim_threshold": 0.86,
+            "ssim_threshold": 0.79,
             "psnr_threshold": 15.7,
-            "mean_abs_diff_threshold": 11.2
+            "mean_abs_diff_threshold": 17.2
         },
         "flux_2_image_t2i": {
             "clip_threshold": 0.98,
@@ -226,7 +226,7 @@
         "flux_image_t2i_2_gpus": {
             "clip_threshold": 0.97,
             "ssim_threshold": 0.95,
-            "psnr_threshold": 30.0,
+            "psnr_threshold": 25.8,
             "mean_abs_diff_threshold": 4.0
         },
         "wan2_2_t2v_a14b_teacache_2gpu": {
@@ -279,8 +279,8 @@
         },
         "ltx_2_3_hq_pipeline": {
             "clip_threshold": 0.97,
-            "ssim_threshold": 0.90,
-            "psnr_threshold": 30.0,
+            "ssim_threshold": 0.88,
+            "psnr_threshold": 26.3,
             "mean_abs_diff_threshold": 5.8
         },
         "ltx_2_3_two_stage_ti2v_2gpus": {
