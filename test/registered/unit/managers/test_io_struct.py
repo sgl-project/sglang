@@ -587,6 +587,8 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             lora_path=["path1", "path2"],
             custom_logit_processor=["processor1", "processor2"],
             return_hidden_states=True,
+            require_reasoning=True,
+            routing_key="rk-1",
         )
         req.normalize_batch_and_arguments()
 
@@ -607,6 +609,95 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(item0.lora_path, "path1")
         self.assertEqual(item0.custom_logit_processor, "processor1")
         self.assertEqual(item0.return_hidden_states, True)
+        # request-scoped reasoning metadata must survive slicing for every sample
+        self.assertEqual(item0.require_reasoning, True)
+        self.assertEqual(item0.routing_key, "rk-1")
+        item1 = req[1]
+        self.assertEqual(item1.require_reasoning, True)
+        self.assertEqual(item1.routing_key, "rk-1")
+
+    def test_getitem_preserves_require_reasoning_parallel_sampling(self):
+        """require_reasoning must survive __getitem__ for parallel sampling (n>1).
+
+        This is the exact shape from the original report: a single prompt with
+        sampling_params={"n": 2}. normalize_batch_and_arguments expands it into a
+        non-single batch and every parallel sample is produced via __getitem__, so
+        each one must retain require_reasoning. Without the fix the slice resets it
+        to the default False, constrained decoding is applied before </think>, and
+        message.content comes back None.
+        """
+        # require_reasoning=True is propagated to every parallel sample
+        req = GenerateReqInput(text="What is 2+2?", sampling_params={"n": 2})
+        req.require_reasoning = True
+        req.routing_key = "rk-1"
+        req.normalize_batch_and_arguments()
+        self.assertFalse(req.is_single)
+        for i in range(len(req.text)):
+            self.assertTrue(
+                req[i].require_reasoning,
+                f"require_reasoning dropped for parallel sample {i}",
+            )
+            self.assertEqual(req[i].routing_key, "rk-1")
+
+        # The default (False / None) is propagated as-is, not hard-coded
+        req_default = GenerateReqInput(text="What is 2+2?", sampling_params={"n": 2})
+        req_default.normalize_batch_and_arguments()
+        for i in range(len(req_default.text)):
+            self.assertFalse(req_default[i].require_reasoning)
+            self.assertIsNone(req_default[i].routing_key)
+
+    def test_getitem_propagates_all_request_scoped_fields(self):
+        """__getitem__ must propagate every declared field except a known set.
+
+        This guards the whole class of "scalar request field silently dropped when
+        slicing an n>1 batch" bug (the root cause behind require_reasoning /
+        routing_key loss) instead of rediscovering it one field at a time. When a
+        new field is added to GenerateReqInput, either propagate it in __getitem__
+        or add it to KNOWN_UNPROPAGATED below with a reason.
+        """
+        import ast
+        import dataclasses
+        import inspect
+        import textwrap
+
+        declared = {f.name for f in dataclasses.fields(GenerateReqInput)}
+
+        source = textwrap.dedent(inspect.getsource(GenerateReqInput.__getitem__))
+        construction = next(
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "GenerateReqInput"
+        )
+        propagated = {kw.arg for kw in construction.keywords if kw.arg}
+
+        # Fields intentionally not forwarded by __getitem__. Each is tracked as a
+        # follow-up issue; do not silently extend this set.
+        KNOWN_UNPROPAGATED = {
+            # deprecated; normalize() migrates it into routed_dp_rank (propagated)
+            "data_parallel_rank",
+            # background-generation disconnect handling (#27231)
+            "background",
+            # multimodal dynamic tiling / audio, dropped on n>1 multimodal (#27216)
+            "max_dynamic_patch",
+            "min_dynamic_patch",
+            "image_max_dynamic_patch",
+            "video_max_dynamic_patch",
+            "use_audio_in_video",
+            "mm_hashes",
+            # EPD/disaggregation fields populated after tokenization (#27217)
+            "need_wait_for_mm_inputs",
+            "num_items_assigned",
+            "mm_data_mooncake",
+        }
+
+        dropped = declared - propagated - KNOWN_UNPROPAGATED
+        self.assertEqual(
+            dropped,
+            set(),
+            f"__getitem__ drops request-scoped fields {sorted(dropped)}; "
+            "propagate them in __getitem__ or add to KNOWN_UNPROPAGATED with a reason.",
+        )
 
     def test_getitem_preserves_return_prompt_token_ids(self):
         """Batch subrequests must keep the prompt-token-id return flag."""
