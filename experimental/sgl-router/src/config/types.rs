@@ -21,12 +21,15 @@ pub struct Config {
 /// Outbound proxy tuning. Default mirrors SGLang's typical prefill /
 /// decode latency budget; e2e tests lower it so per-request failures
 /// trip the circuit breaker within the test's wall-time.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ProxyConfig {
     /// Maximum time to wait for a single upstream HTTP request to
     /// return headers + body. Default 300 s. The circuit breaker
     /// records a failure when this fires.
     pub request_timeout_secs: u64,
+    /// Extra request header names to forward to upstream workers (from
+    /// `--forward-headers`).  Always lowercased.
+    pub forward_headers: Vec<String>,
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
@@ -37,6 +40,7 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_proxy_request_timeout_secs(),
+            forward_headers: Vec::new(),
         }
     }
 }
