@@ -1718,14 +1718,8 @@ class MambaPoolHost(HostKVCache):
         self.device_pool = device_pool
         self.page_size = 1
 
-        # TODO: Mamba pool is currently incompatible with write-back staging
-        # kernel; only allow 'page_first_direct' + 'direct' for now.
-        # Relax this restriction once the staging bug is fixed.
-        if layout != "page_first_direct":
-            raise ValueError(
-                f"MambaPoolHost only supports layout='page_first_direct', "
-                f"got '{layout}'."
-            )
+        if layout not in ("layer_first", "page_first", "page_first_direct"):
+            raise ValueError(f"Unsupported layout: {layout}")
 
         self.layout = layout
         self.pin_memory = pin_memory
@@ -2090,11 +2084,6 @@ class MambaPoolHost(HostKVCache):
         layer_id,
         io_backend="kernel",
     ):
-        if io_backend != "direct":
-            raise ValueError(
-                f"MambaPoolHost only supports io_backend='direct', "
-                f"got '{io_backend}'."
-            )
         if self.layout in ["page_first", "page_first_direct"]:
             self._copy_tensor_pf_lf(
                 src=self.temporal_buffer,
@@ -2135,11 +2124,6 @@ class MambaPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
-        if io_backend != "direct":
-            raise ValueError(
-                f"MambaPoolHost only supports io_backend='direct', "
-                f"got '{io_backend}'."
-            )
         if self.layout in ["page_first", "page_first_direct"]:
             self._copy_tensor_all_layers_lf_pf(
                 src_layers=device_pool.mamba_cache.temporal,
