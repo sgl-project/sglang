@@ -16,9 +16,9 @@ Canonical KV cache quantization methods.
 
 This module owns the public runtime abstraction for quantized KV cache storage:
 
-* ``KVCacheQuantMethod`` defines the buffer/quantize/dequantize contract.
-* ``NVFP4Method`` and ``BlockFP4Method`` implement the two FP4 recipes exposed by
-  ``--kv-cache-dtype nvfp4`` and ``--kv-cache-dtype fp4_e2m1_block16``.
+* ``KVCacheQuantMethodBase`` defines the buffer/quantize/dequantize contract.
+* ``NVFP4KVCacheMethod`` and ``FP4MXBlock16KVCacheMethod`` implement the two FP4 recipes exposed by
+  ``--kv-cache-dtype nvfp4`` and ``--kv-cache-dtype fp4_mx_block16``.
 * ``kvfp4_tensor.py`` contains only low-level tensor/FlashInfer helpers.
 
 Recipe selection is explicit. This file must not infer the FP4 recipe from the
@@ -33,7 +33,7 @@ import torch
 from torch import Tensor
 
 
-class KVCacheQuantMethod(ABC):
+class KVCacheQuantMethodBase(ABC):
     """Abstract base for KV cache quantization strategies.
 
     Owns the quantize/dequantize computation.  The Pool owns the buffers and
@@ -84,7 +84,6 @@ class KVCacheQuantMethod(ABC):
     ) -> None:
         """Quantize cache_k / cache_v and write into buffers at loc."""
 
-    @abstractmethod
     def dequantize_prev_kv(
         self,
         k_fp4: Tensor,
@@ -93,11 +92,10 @@ class KVCacheQuantMethod(ABC):
         v_scales: Tensor,
         layer_id: int,
     ) -> tuple[Tensor, Tensor]:
-        """Dequantize stored FP4 KV (selected token indices already applied).
-
-        Returns (k_fp8, v_fp8) in torch.float8_e4m3fn, ready to be written
-        into the dequant workspace buffer.
-        """
+        """Dequantize stored FP4 KV into the FP8 extend workspace."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support FP4 KV dequantization."
+        )
 
     def compute_cell_size(
         self, head_num: int, head_dim: int, num_layers: int, kv_size: int
@@ -110,7 +108,7 @@ class KVCacheQuantMethod(ABC):
         pass
 
 
-class UnquantizedKVCacheMethod(KVCacheQuantMethod):
+class UnquantizedKVCacheMethod(KVCacheQuantMethodBase):
     """Identity method for BF16 / FP8 KV cache: no extra quantization."""
 
     name = "unquantized"
@@ -134,13 +132,12 @@ class UnquantizedKVCacheMethod(KVCacheQuantMethod):
         device_module=None,
         alt_stream=None,
     ) -> None:
-        pass  # base class set_kv_buffer handles this
+        raise RuntimeError(
+            "Unquantized KV cache writes are handled by MHATokenToKVPool.set_kv_buffer."
+        )
 
-    def dequantize_prev_kv(self, k_fp4, k_scales, v_fp4, v_scales, layer_id):
-        return k_fp4, v_fp4  # identity
 
-
-class NVFP4Method(KVCacheQuantMethod):
+class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
     """NVFP4 two-level scaling: global FP32 + per-block FP8 E4M3.
 
     Supported on SM100 (B200) and SM120 (RTX 5090 / RTX PRO 6000 Blackwell).
@@ -156,6 +153,8 @@ class NVFP4Method(KVCacheQuantMethod):
         # Per-layer global FP32 scales; filled by load_scales_from_model()
         self.k_scales_gpu = torch.ones(num_layers, dtype=torch.float32, device=device)
         self.v_scales_gpu = torch.ones(num_layers, dtype=torch.float32, device=device)
+        self.k_scales_float = [1.0] * num_layers
+        self.v_scales_float = [1.0] * num_layers
 
     def needs_dequant_workspace(self) -> bool:
         return (
@@ -194,12 +193,16 @@ class NVFP4Method(KVCacheQuantMethod):
         max_global_id = max(layer.layer_id for layer in attention_layers)
         required_size = max_global_id + 1
         if required_size > len(self.k_scales_gpu):
+            old_size = len(self.k_scales_gpu)
             self.k_scales_gpu = torch.ones(
                 required_size, dtype=torch.float32, device=self.device
             )
             self.v_scales_gpu = torch.ones(
                 required_size, dtype=torch.float32, device=self.device
             )
+            extra_layers = required_size - old_size
+            self.k_scales_float.extend([1.0] * extra_layers)
+            self.v_scales_float.extend([1.0] * extra_layers)
 
         k_scales_cpu = self.k_scales_gpu.cpu().clone()
         v_scales_cpu = self.v_scales_gpu.cpu().clone()
@@ -222,9 +225,14 @@ class NVFP4Method(KVCacheQuantMethod):
                 v_scale *= 6.0
             k_scales_cpu[layer_id] = k_scale
             v_scales_cpu[layer_id] = v_scale
+            self.k_scales_float[layer_id] = k_scale
+            self.v_scales_float[layer_id] = v_scale
 
         self.k_scales_gpu.copy_(k_scales_cpu, non_blocking=True)
         self.v_scales_gpu.copy_(v_scales_cpu, non_blocking=True)
+
+    def get_bmm_scales(self, layer_id: int) -> tuple[float, float]:
+        return self.k_scales_float[layer_id], self.v_scales_float[layer_id]
 
     def create_buffers(
         self, size: int, head_num: int, head_dim: int, layer_num: int, device: str
@@ -283,12 +291,12 @@ class NVFP4Method(KVCacheQuantMethod):
         device_module=None,
         alt_stream=None,
     ) -> None:
-        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4QuantizeUtil
+        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
 
-        cache_k, cache_k_fp4_sf, _ = NVFP4QuantizeUtil.fi_nvfp4_quantize(
+        cache_k, cache_k_fp4_sf, _ = NVFP4KVQuantizeUtil.fi_nvfp4_quantize(
             cache_k.contiguous(), k_scale
         )
-        cache_v, cache_v_fp4_sf, _ = NVFP4QuantizeUtil.fi_nvfp4_quantize(
+        cache_v, cache_v_fp4_sf, _ = NVFP4KVQuantizeUtil.fi_nvfp4_quantize(
             cache_v.contiguous(), v_scale
         )
 
@@ -323,14 +331,14 @@ class NVFP4Method(KVCacheQuantMethod):
         layer_id: int,
     ) -> tuple[Tensor, Tensor]:
         """Dequantize FP4 KV (indexed tokens) → FP8 E4M3."""
-        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4QuantizeUtil
+        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
 
         cur_k_scale = self.k_scales_gpu[layer_id : layer_id + 1]
         cur_v_scale = self.v_scales_gpu[layer_id : layer_id + 1]
-        k_bf16 = NVFP4QuantizeUtil.cuda_nvfp4_dequantize(
+        k_bf16 = NVFP4KVQuantizeUtil.cuda_nvfp4_dequantize(
             k_fp4.view(torch.uint8), k_scales, cur_k_scale
         )
-        v_bf16 = NVFP4QuantizeUtil.cuda_nvfp4_dequantize(
+        v_bf16 = NVFP4KVQuantizeUtil.cuda_nvfp4_dequantize(
             v_fp4.view(torch.uint8), v_scales, cur_v_scale
         )
         return k_bf16.to(torch.float8_e4m3fn), v_bf16.to(torch.float8_e4m3fn)
@@ -349,14 +357,14 @@ class NVFP4Method(KVCacheQuantMethod):
         return fp4_size + scale_size + dq_size
 
 
-class BlockFP4Method(KVCacheQuantMethod):
+class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
     """Block-16 FP4 E2M1 single-level scaling.
 
     This is intentionally not called MXFP4: standard MXFP4 uses a block size of
     32, while this KV cache recipe stores one scale per 16 FP4 values.
     """
 
-    name = "fp4_e2m1_block16"
+    name = "fp4_mx_block16"
     scale_block_size = 16
 
     def __init__(
@@ -433,10 +441,10 @@ class BlockFP4Method(KVCacheQuantMethod):
         device_module=None,
         alt_stream=None,
     ) -> None:
-        from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+        from sglang.srt.layers.quantization.kvfp4_tensor import FP4MXBlock16KVQuantizeUtil
 
-        cache_k_fp4, cache_k_sf = KVFP4QuantizeUtil.batched_quantize(cache_k)
-        cache_v_fp4, cache_v_sf = KVFP4QuantizeUtil.batched_quantize(cache_v)
+        cache_k_fp4, cache_k_sf = FP4MXBlock16KVQuantizeUtil.batched_quantize(cache_k)
+        cache_v_fp4, cache_v_sf = FP4MXBlock16KVQuantizeUtil.batched_quantize(cache_v)
 
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
@@ -463,10 +471,10 @@ class BlockFP4Method(KVCacheQuantMethod):
         v_scales: Tensor,
         layer_id: int,
     ) -> tuple[Tensor, Tensor]:
-        from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+        from sglang.srt.layers.quantization.kvfp4_tensor import FP4MXBlock16KVQuantizeUtil
 
-        k_bf16 = KVFP4QuantizeUtil.batched_dequantize(k_fp4, k_scales)
-        v_bf16 = KVFP4QuantizeUtil.batched_dequantize(v_fp4, v_scales)
+        k_bf16 = FP4MXBlock16KVQuantizeUtil.batched_dequantize(k_fp4, k_scales)
+        v_bf16 = FP4MXBlock16KVQuantizeUtil.batched_dequantize(v_fp4, v_scales)
         return k_bf16.to(torch.float8_e4m3fn), v_bf16.to(torch.float8_e4m3fn)
 
     def compute_cell_size(
@@ -481,17 +489,14 @@ class BlockFP4Method(KVCacheQuantMethod):
 
 
 # Registry: explicit --kv-cache-dtype value -> method class.
-KV_CACHE_QUANT_REGISTRY: dict[str, type[KVCacheQuantMethod]] = {
-    "nvfp4": NVFP4Method,
-    "fp4_e2m1_block16": BlockFP4Method,
+KV_CACHE_QUANT_REGISTRY: dict[str, type[KVCacheQuantMethodBase]] = {
+    "nvfp4": NVFP4KVCacheMethod,
+    "fp4_mx_block16": FP4MXBlock16KVCacheMethod,
 }
 
 
-def resolve_kv_cache_quant(
-    kv_cache_dtype, sm_version: Optional[int] = None
-) -> Optional[str]:
+def resolve_kv_cache_quant(kv_cache_dtype) -> Optional[str]:
     """Resolve the explicit FP4 KV cache recipe from ``--kv-cache-dtype``."""
-    del sm_version  # Kept for older call sites; recipe selection is not hardware based.
 
     if not isinstance(kv_cache_dtype, str):
         if (
@@ -500,19 +505,19 @@ def resolve_kv_cache_quant(
         ):
             raise ValueError(
                 "FP4 KV cache storage dtype does not identify the recipe. "
-                "Pass the explicit --kv-cache-dtype value: 'nvfp4' or 'fp4_e2m1_block16'."
+                "Pass the explicit --kv-cache-dtype value: 'nvfp4' or 'fp4_mx_block16'."
             )
         return None
 
     if kv_cache_dtype == "fp4_e2m1":
         raise ValueError(
             "--kv-cache-dtype=fp4_e2m1 no longer auto-selects an FP4 KV recipe. "
-            "Use --kv-cache-dtype=nvfp4 or --kv-cache-dtype=fp4_e2m1_block16."
+            "Use --kv-cache-dtype=nvfp4 or --kv-cache-dtype=fp4_mx_block16."
         )
     if kv_cache_dtype == "mxfp4":
         raise ValueError(
             "--kv-cache-dtype=mxfp4 is reserved for true MXFP4 block-size-32 "
-            "semantics. Use --kv-cache-dtype=fp4_e2m1_block16 for the current "
+            "semantics. Use --kv-cache-dtype=fp4_mx_block16 for the current "
             "block-size-16 FP4 KV recipe."
         )
     if kv_cache_dtype in KV_CACHE_QUANT_REGISTRY:
@@ -520,8 +525,8 @@ def resolve_kv_cache_quant(
     return None
 
 
-def get_kv_cache_quant_method(name: str, **kwargs) -> KVCacheQuantMethod:
-    """Instantiate a KVCacheQuantMethod by internal method name."""
+def get_kv_cache_quant_method(name: str, **kwargs) -> KVCacheQuantMethodBase:
+    """Instantiate a KVCacheQuantMethodBase by internal method name."""
     if name not in KV_CACHE_QUANT_REGISTRY:
         raise ValueError(
             f"Unknown KV cache quantization method: '{name}'. "

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.fp4_kv_adapter import TRTLLMMHANVFP4KVAdapter
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
@@ -164,8 +165,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             raise ValueError(
                 "trtllm_mha FP4 KV cache decode supports nvfp4 only. "
                 "Use --kv-cache-dtype=nvfp4 or choose another decode backend "
-                "for fp4_e2m1_block16."
+                "for fp4_mx_block16."
             )
+        self.nvfp4_decode_adapter = (
+            TRTLLMMHANVFP4KVAdapter(self.token_to_kv_pool)
+            if self.is_nvfp4_kvcache
+            else None
+        )
 
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
@@ -768,20 +774,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         return k_cache, v_cache
 
     def _get_nvfp4_bmm_scales(self, layer: RadixAttention) -> tuple[float, float]:
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
-        v_scale = (
-            layer.v_scale_float
-            if getattr(layer, "v_scale_float", None) is not None
-            else 1.0
-        )
-        if getattr(self.kv_cache_quant_method, "sm_version", None) == 100:
-            k_scale *= 6.0
-            v_scale *= 6.0
-        return k_scale, v_scale
+        return self.nvfp4_decode_adapter.bmm_scales(layer)
 
     def forward_decode(
         self,
@@ -829,12 +822,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
 
         if self.is_nvfp4_kvcache:
-            raw = pool.get_raw_kv_buffer(layer.layer_id)
-            kv_cache = self._reshape_paged_kv_cache(
-                raw["k"], raw["v"], layer, layer.head_dim // 2
-            )
-            kv_cache_block_scales = self._reshape_paged_kv_cache(
-                raw["k_scale"], raw["v_scale"], layer, layer.head_dim // 16
+            kv_cache, kv_cache_block_scales = (
+                self.nvfp4_decode_adapter.prepare_decode_kv_cache(
+                    layer, self._reshape_paged_kv_cache
+                )
             )
         else:
             k_cache, v_cache = pool.get_kv_buffer(layer.layer_id)
@@ -946,8 +937,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         kv_cache = (k_cache, v_cache)
 
+        # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
-
         bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
@@ -968,7 +959,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 window_left=layer.sliding_window_size,
                 sinks=attention_sink,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-                out_dtype=self.q_data_type,
+                out_dtype=self.q_data_type,  # model_runner.dtype
                 q_len_per_req=self.forward_metadata.max_seq_len_q,
             )
         else:
@@ -982,11 +973,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 max_kv_len=self.max_context_len,
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
+                batch_size=self.forward_metadata.cu_seqlens_q.shape[0] - 1,
+                cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
+                cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
                 window_left=layer.sliding_window_size,
                 sinks=attention_sink,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
-                out_dtype=self.q_data_type,
-                is_causal=True,
+                out_dtype=self.q_data_type,  # model_runner.dtype
             )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)

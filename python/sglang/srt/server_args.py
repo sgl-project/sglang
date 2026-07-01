@@ -557,8 +557,6 @@ class ServerArgs:
 
     # -------------------------------------------------------------------------
     # Quantization and data type
-
-
     # -------------------------------------------------------------------------
     dtype: A[
         str,
@@ -596,12 +594,22 @@ class ServerArgs:
         str,
         Arg(
             help=(
-                'Data type for kv cache storage. "auto" will use model data type. '
-                '"bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and '
-                '"fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only '
-                "mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+"
+                "Data type for kv cache storage. \"auto\" will use model data type. "
+                "\"bf16\" or \"bfloat16\" for BF16 KV cache. \"fp8_e5m2\" and "
+                "\"fp8_e4m3\" are supported for CUDA 11.8+. \"nvfp4\" selects "
+                "the NVFP4 FP4 E2M1 KV cache recipe; \"fp4_mx_block16\" "
+                "selects the MX-style block-size-16 FP4 E2M1 KV cache "
+                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
             ),
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
+            choices=[
+                "auto",
+                "fp8_e5m2",
+                "fp8_e4m3",
+                "bf16",
+                "bfloat16",
+                "nvfp4",
+                "fp4_mx_block16",
+            ],
         ),
     ] = "auto"
     enable_fp32_lm_head: A[
@@ -3237,9 +3245,6 @@ class ServerArgs:
             "DeepseekV3ForCausalLM"
             not in self.get_model_config().hf_config.architectures
         ):
-
-
-
             return
         prefill_attention_backend, _ = self.get_attention_backends()
         if prefill_attention_backend != "trtllm_mla":
@@ -4742,12 +4747,12 @@ class ServerArgs:
             if self.kv_cache_dtype not in [
                 "fp8_e4m3",
                 "nvfp4",
-                "fp4_e2m1_block16",
+                "fp4_mx_block16",
                 "bf16",
                 "auto",
             ]:
                 raise ValueError(
-                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, nvfp4, fp4_e2m1_block16, bf16, or auto."
+                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, nvfp4, fp4_mx_block16, bf16, or auto."
                 )
 
         if (
@@ -4926,7 +4931,7 @@ class ServerArgs:
 
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""
-        if self.kv_cache_dtype not in ("nvfp4", "fp4_e2m1_block16"):
+        if self.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16"):
             return
 
         use_mla_backend = self.use_mla_backend()
@@ -4941,7 +4946,7 @@ class ServerArgs:
             ):
                 raise RuntimeError(
                     "--kv-cache-dtype=nvfp4 requires Blackwell SM100 or SM120. "
-                    "Use --kv-cache-dtype=fp4_e2m1_block16 for the block-size-16 FP4 recipe."
+                    "Use --kv-cache-dtype=fp4_mx_block16 for the block-size-16 FP4 recipe."
                 )
             if (
                 self.prefill_attention_backend_str != self.decode_attention_backend_str
@@ -5738,10 +5743,10 @@ class ServerArgs:
                 "Other prefill-only workloads may be supported in a future change once "
                 "their attention paths stop reading or writing the paged KV cache."
             )
-        if self.kv_cache_dtype in ("nvfp4", "fp4_e2m1_block16"):
+        if self.kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
             raise ValueError(
                 "--prefill-only-disable-kv-cache does not currently support "
-                "--kv-cache-dtype=nvfp4 or --kv-cache-dtype=fp4_e2m1_block16 because "
+                "--kv-cache-dtype=nvfp4 or --kv-cache-dtype=fp4_mx_block16 because "
                 "the FP4 pool uses a separate allocation path."
             )
 
@@ -6586,11 +6591,6 @@ class ServerArgs:
 
         # Auto-derived from Annotated[..., Arg(...)] field metadata.
         add_cli_args_from_dataclass(parser, ServerArgs)
-
-
-
-
-
 
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
         reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())

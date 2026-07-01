@@ -22,6 +22,7 @@ from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.fp4_kv_adapter import FlashInferNVFP4KVAdapter
 from sglang.srt.layers.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
@@ -336,16 +337,25 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.kv_cache_quant_method = _get_kv_cache_quant_method(self.token_to_kv_pool)
         kv_cache_quant_method_name = getattr(self.kv_cache_quant_method, "name", None)
-        if (
-            kv_cache_quant_method_name == "fp4_e2m1_block16"
-            and self.__class__ is FlashInferAttnBackend
-        ):
+        unsupported_fp4_recipe = kv_cache_quant_method_name not in (
+            None,
+            "unquantized",
+            "nvfp4",
+        )
+        if unsupported_fp4_recipe and self.__class__ is FlashInferAttnBackend:
             raise ValueError(
                 "flashinfer MHA FP4 KV cache path supports nvfp4 only. "
                 "Use --kv-cache-dtype=nvfp4 or choose another attention backend "
-                "for fp4_e2m1_block16."
+                "for fp4_mx_block16."
             )
         self.is_nvfp4_kvcache = kv_cache_quant_method_name == "nvfp4"
+        self.fp4_kv_adapter = (
+            FlashInferNVFP4KVAdapter(
+                self.token_to_kv_pool, self.req_to_token_pool, model_runner.page_size
+            )
+            if self.is_nvfp4_kvcache
+            else None
+        )
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
         self.cpu_req_pool_indices = None
@@ -751,7 +761,6 @@ class FlashInferAttnBackend(AttentionBackend):
             for w in self.decode_cuda_graph_metadata[bs]:
                 w.begin_forward = partial(fast_decode_plan, w)
 
-
         if (
             in_capture
             and forward_mode.is_draft_extend_v2()
@@ -934,7 +943,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
-
                 extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
                 custom_kv_indices=self.dq_page_table,
             )
@@ -1097,34 +1105,15 @@ class FlashInferAttnBackend(AttentionBackend):
         # We perform dequant for chunk prefill/cache reuse.
         pool = self.token_to_kv_pool
         if self.is_nvfp4_kvcache:
-            if self.dq_page_table is not None:
-                # For paged path, attention reads prefix + current chunk from the
-                # dequant workspace. Ragged path handles current chunk with raw k/v.
-                transfer_cur_kv = not self.forward_metadata.use_ragged
-                k_cur_fp8 = (
-                    k.to(torch.float8_e4m3fn)
-                    if (k is not None and transfer_cur_kv)
-                    else None
-                )
-                v_cur_fp8 = (
-                    v.to(torch.float8_e4m3fn)
-                    if (v is not None and transfer_cur_kv)
-                    else None
-                )
-                pool.dequant_kv_for_extend(
-                    layer.layer_id,
-                    self.req_to_token_pool.req_to_token,
-                    self.cpu_req_pool_indices,
-                    forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.extend_seq_lens_cpu,
-                    self.page_size,
-                    k_cur_fp8=k_cur_fp8,
-                    v_cur_fp8=v_cur_fp8,
-                )
-            k_buffer_dq, v_buffer_dq = pool.get_dq_kv_buffer()
-            k_paged = k_buffer_dq.view(-1, layer.tp_k_head_num, layer.head_dim)
-            v_paged = v_buffer_dq.view(-1, layer.tp_v_head_num, layer.head_dim)
-            kv_cache = (k_paged, v_paged)
+            kv_cache = self.fp4_kv_adapter.prepare_extend_kv_cache(
+                layer,
+                forward_batch,
+                use_ragged=self.forward_metadata.use_ragged,
+                dq_page_table=self.dq_page_table,
+                cpu_req_pool_indices=self.cpu_req_pool_indices,
+                k=k,
+                v=v,
+            )
         else:
             kv_cache = pool.get_kv_buffer(layer.layer_id)
 
@@ -1613,7 +1602,6 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
-
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
     ):
@@ -1634,7 +1622,6 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
-
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
     ):
@@ -1665,7 +1652,6 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info,
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
-
             seq_lens_cpu=seq_lens_cpu,
             custom_kv_indices=custom_kv_indices,
         )
@@ -1810,7 +1796,6 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
-
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
     ):
@@ -1868,7 +1853,6 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
-
         seq_lens_cpu: Optional[torch.Tensor] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
     ):

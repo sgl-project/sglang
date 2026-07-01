@@ -22,8 +22,7 @@ concrete quantization methods.
 import torch
 
 E2M1_MAX = 6.0
-# Put constants directly on CUDA if available
-_device = "cuda" if torch.cuda.is_available() else "cpu"
+# Constants stay on CPU and move to the input tensor device in compiled helpers.
 # E2M1 format: 1 sign bit + 2 exponent bits + 1 mantissa bit = 4 bits
 # 16 possible values: 0x0-0xF
 # Negative values: 0x8-0xF (sign bit = 1)
@@ -48,14 +47,13 @@ E2M1_VALUES = torch.tensor(
         -6,
     ],  # 0x8-0xF: negative values
     dtype=torch.float32,
-    device=_device,
 )
 E2M1_BOUNDS = torch.tensor(
-    [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5], dtype=torch.float32, device=_device
+    [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5], dtype=torch.float32
 )
 
 
-class KVFP4QuantizeUtil:
+class FP4MXBlock16KVQuantizeUtil:
     """Utility class for block-16 FP4 quantization and dequantization operations."""
 
     @staticmethod
@@ -89,7 +87,8 @@ class KVFP4QuantizeUtil:
         abs_vals = scaled.abs()
 
         # Pure tensor version (CUDA Graph safe)
-        magnitude_bits = torch.sum(abs_vals.unsqueeze(-1) >= E2M1_BOUNDS, dim=-1)
+        bounds = E2M1_BOUNDS.to(device=tensor.device)
+        magnitude_bits = torch.sum(abs_vals.unsqueeze(-1) >= bounds, dim=-1)
 
         # Combine sign and magnitude
         fp4_vals = sign_bits + magnitude_bits.to(torch.uint8)
@@ -130,7 +129,8 @@ class KVFP4QuantizeUtil:
         magnitude_idx = fp4_vals & 0x07
 
         # Convert to float values
-        float_vals = E2M1_VALUES[magnitude_idx.long()]
+        values = E2M1_VALUES.to(device=quant_tensor.device)
+        float_vals = values[magnitude_idx.long()]
         float_vals = torch.where(sign_mask, -float_vals, float_vals)
 
         # Reshape for block-wise scaling
@@ -143,7 +143,7 @@ class KVFP4QuantizeUtil:
         return scaled.view(b, m, n).to(dtype)
 
 
-class NVFP4QuantizeUtil:
+class NVFP4KVQuantizeUtil:
     """Utility wrapper for flashinfer NVFP4 KV quantization APIs."""
 
     @staticmethod
@@ -166,7 +166,7 @@ class NVFP4QuantizeUtil:
             ) from exc
 
         b, m, n = tensor.shape
-        global_scale = NVFP4QuantizeUtil._as_global_scale_tensor(
+        global_scale = NVFP4KVQuantizeUtil._as_global_scale_tensor(
             global_scale, tensor.device
         )
         tensor_2d = tensor.reshape(b * m, n).contiguous()
@@ -197,7 +197,7 @@ class NVFP4QuantizeUtil:
             )
 
         b, m, n_half = quant_tensor.shape
-        global_scale = NVFP4QuantizeUtil._as_global_scale_tensor(
+        global_scale = NVFP4KVQuantizeUtil._as_global_scale_tensor(
             global_scale, quant_tensor.device
         )
         quant_2d = quant_tensor.view(torch.uint8).reshape(b * m, n_half).contiguous()

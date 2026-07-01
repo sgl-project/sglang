@@ -56,6 +56,8 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
+    is_sm100_supported,
+    is_sm120_supported,
     is_hip,
     is_npu,
 )
@@ -72,6 +74,14 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 logger = logging.getLogger(__name__)
+
+
+def _get_fp4_kv_sm_version() -> int:
+    if is_sm100_supported():
+        return 100
+    if is_sm120_supported():
+        return 120
+    return 0
 
 
 def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
@@ -341,7 +351,7 @@ class ModelRunnerKVCacheMixin:
                 f"{unsupported_pool_family}. Supported configurations today: plain MHA "
                 "models on CUDA with the FA (fa3/fa4) prefill backend, --is-embedding, "
                 "--chunked-prefill-size=-1, --disable-radix-cache, no context-parallel "
-                "attention, no HiSparse, and --kv-cache-dtype not in {nvfp4, fp4_e2m1_block16}."
+                "attention, no HiSparse, and --kv-cache-dtype not in {nvfp4, fp4_mx_block16}."
             )
 
     def _init_pools(self: ModelRunner):
@@ -792,19 +802,9 @@ class ModelRunnerKVCacheMixin:
                 )
                 hybrid_quant_method = None
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                    from sglang.srt.utils.common import (
-                        is_sm100_supported,
-                        is_sm120_supported,
-                    )
-
-                    if is_sm100_supported():
-                        sm_version = 100
-                    elif is_sm120_supported():
-                        sm_version = 120
-                    else:
-                        sm_version = 0
+                    sm_version = _get_fp4_kv_sm_version()
                     quant_name = resolve_kv_cache_quant(
-                        self.server_args.kv_cache_dtype, sm_version
+                        self.server_args.kv_cache_dtype
                     )
                     if quant_name is not None:
                         hybrid_quant_method = get_kv_cache_quant_method(
@@ -842,19 +842,9 @@ class ModelRunnerKVCacheMixin:
                     assert (
                         not enable_page_major
                     ), "page-major KV layout is not supported with fp4 KV cache"
-                    from sglang.srt.utils.common import (
-                        is_sm100_supported,
-                        is_sm120_supported,
-                    )
-
-                    if is_sm100_supported():
-                        sm_version = 100
-                    elif is_sm120_supported():
-                        sm_version = 120
-                    else:
-                        sm_version = 0
+                    sm_version = _get_fp4_kv_sm_version()
                     quant_name = resolve_kv_cache_quant(
-                        self.server_args.kv_cache_dtype, sm_version
+                        self.server_args.kv_cache_dtype
                     )
                     if quant_name is not None:
                         quant_method = get_kv_cache_quant_method(
@@ -1042,7 +1032,7 @@ class ModelRunnerKVCacheMixin:
                 "Supported configurations today: plain MHA models on CUDA with the FA "
                 "(fa3/fa4) prefill backend, --is-embedding, --chunked-prefill-size=-1, "
                 "--disable-radix-cache, no context-parallel attention, no HiSparse, "
-                "and --kv-cache-dtype not in {nvfp4, fp4_e2m1_block16}."
+                "and --kv-cache-dtype not in {nvfp4, fp4_mx_block16}."
             )
 
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:

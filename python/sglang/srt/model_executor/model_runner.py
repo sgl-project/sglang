@@ -2424,7 +2424,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.kv_cache_dtype = torch.float8_e4m3fn
         elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
-        elif self.server_args.kv_cache_dtype in ("nvfp4", "fp4_e2m1_block16"):
+        elif self.server_args.kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
             if hasattr(torch, "float4_e2m1fn_x2"):
                 self.kv_cache_dtype = torch.float4_e2m1fn_x2
                 logger.warning(

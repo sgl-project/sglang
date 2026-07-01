@@ -61,6 +61,10 @@ from sglang.srt.mem_cache.layout.page_major import (
     mamba_entry_bytes,
     mha_entry_bytes,
 )
+from sglang.srt.mem_cache.quantized_kv import (
+    LayerMappedQuantizedKVCacheAccess,
+    QuantizedKVCacheAccess,
+)
 from sglang.srt.mem_cache.triton_ops.cache_move import (
     copy_all_layer_kv_cache_tiled,
     set_kv_buffer_prefix_valid_tiled,
@@ -1426,9 +1430,14 @@ class MHATokenToKVPool(KVCache):
             num_stages=2,
         )
 
+
+    @property
+    def is_quantized_kv_cache(self) -> bool:
+        return not isinstance(self.quant_method, UnquantizedKVCacheMethod)
+
     def _create_buffers(self):
         if not isinstance(self.quant_method, UnquantizedKVCacheMethod):
-            # Delegate buffer creation to quant_method (e.g. NVFP4Method, BlockFP4Method).
+            # Delegate buffer creation to quant_method (e.g. NVFP4KVCacheMethod, FP4MXBlock16KVCacheMethod).
             with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
                 with (
                     torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -1569,10 +1578,16 @@ class MHATokenToKVPool(KVCache):
 
         self._init_data_ptrs_and_strides()
 
-    def _cache_move_buffers(self):
-        buffers = self.k_buffer + self.v_buffer
+    def _slot_move_buffers(self):
+        """Buffers that must move together when KV slots are remapped.
+
+        FP4 KV cache stores data and per-block scales separately, so slot moves
+        must update both. This list feeds data_ptrs/data_strides; it does not
+        copy tensor contents by itself.
+        """
+        buffers = [*self.k_buffer, *self.v_buffer]
         if getattr(self, "k_scale_buffer", None) is not None:
-            buffers += self.k_scale_buffer + self.v_scale_buffer
+            buffers.extend([*self.k_scale_buffer, *self.v_scale_buffer])
         return buffers
 
     def _init_data_ptrs_and_strides(self):
@@ -1586,14 +1601,14 @@ class MHATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
-        copy_buffers = self._cache_move_buffers()
+        slot_move_buffers = self._slot_move_buffers()
         self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in copy_buffers],
+            [x.data_ptr() for x in slot_move_buffers],
             dtype=torch.uint64,
             device=self.device,
         )
         self.data_strides = torch.tensor(
-            [np.prod(x.shape[1:]) * x.dtype.itemsize for x in copy_buffers],
+            [np.prod(x.shape[1:]) * x.dtype.itemsize for x in slot_move_buffers],
             device=self.device,
         )
 
@@ -1756,22 +1771,12 @@ class MHATokenToKVPool(KVCache):
             global_layer_id = global_layer_id_override
             layer_id = layer_id_override
 
-        if not isinstance(self.quant_method, UnquantizedKVCacheMethod):
-            # Delegate quantization + write to quant_method.
-            # Always use global_layer_id for scale lookup (scales are indexed by global layer id).
-            idx = layer_id - self.start_layer
-            if k_scale is None and hasattr(self.quant_method, "k_scales_gpu"):
-                k_scale = self.quant_method.k_scales_gpu[
-                    global_layer_id : global_layer_id + 1
-                ]
-                v_scale = self.quant_method.v_scales_gpu[
-                    global_layer_id : global_layer_id + 1
-                ]
-            self.quant_method.quantize_and_store(
-                self.k_buffer[idx],
-                self.v_buffer[idx],
-                self.k_scale_buffer[idx] if self.k_scale_buffer else None,
-                self.v_scale_buffer[idx] if self.v_scale_buffer else None,
+        if self.is_quantized_kv_cache:
+            if dcp_kv_mask is not None:
+                raise RuntimeError("dcp_kv_mask is not supported for FP4 KV cache.")
+            self.get_quantized_kv_access().write(
+                layer_id,
+                global_layer_id,
                 loc,
                 cache_k,
                 cache_v,
@@ -1876,6 +1881,55 @@ class MHATokenToKVPool(KVCache):
         )
 
 
+    def get_quantized_kv_access(self) -> QuantizedKVCacheAccess:
+        if not self.is_quantized_kv_cache:
+            raise RuntimeError("Quantized KV access requested from a non-FP4 KV pool.")
+        access = getattr(self, "_quantized_kv_access", None)
+        if access is None:
+            access = QuantizedKVCacheAccess(self)
+            self._quantized_kv_access = access
+        return access
+
+    def get_raw_kv_buffer(self, layer_id: int) -> dict:
+        return self.get_quantized_kv_access().raw_fp4_view(layer_id).as_dict()
+
+    def get_fp4_key_buffer(self, layer_id: int):
+        raw = self.get_quantized_kv_access().raw_fp4_view(layer_id)
+        return raw.k, raw.k_scale
+
+    def get_fp4_value_buffer(self, layer_id: int):
+        raw = self.get_quantized_kv_access().raw_fp4_view(layer_id)
+        return raw.v, raw.v_scale
+
+    def get_dq_kv_buffer(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.get_quantized_kv_access().fp8_workspace()
+
+    def dequant_kv_for_extend(
+        self,
+        layer_id: int,
+        req_to_token: torch.Tensor,
+        req_pool_indices_cpu,
+        extend_prefix_lens_cpu,
+        extend_seq_lens_cpu,
+        page_size: int,
+        k_cur_fp8: Optional[torch.Tensor] = None,
+        v_cur_fp8: Optional[torch.Tensor] = None,
+        global_layer_id: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if global_layer_id is None:
+            global_layer_id = layer_id
+        return self.get_quantized_kv_access().prepare_fp8_extend_workspace(
+            layer_id,
+            global_layer_id,
+            req_to_token,
+            req_pool_indices_cpu,
+            extend_prefix_lens_cpu,
+            extend_seq_lens_cpu,
+            page_size,
+            k_cur_fp8=k_cur_fp8,
+            v_cur_fp8=v_cur_fp8,
+        )
+
     def set_kv_buffer_prefix_valid(
         self,
         layer: RadixAttention,
@@ -1960,132 +2014,6 @@ class MHATokenToKVPool(KVCache):
             row_dim=self.row_dim,
             store_dtype=self.store_dtype,
         )
-
-    def get_raw_kv_buffer(self, layer_id: int) -> dict:
-        """Return the raw quantized KV buffers for a layer (for native FP4 kernels).
-
-        Returns dict with keys: "k", "v", "k_scale", "v_scale"
-        For NVFP4: k/v are uint8 (packed FP4), k_scale/v_scale are FP8 E4M3.
-        """
-        idx = layer_id - self.start_layer
-        result = {"k": self.k_buffer[idx], "v": self.v_buffer[idx]}
-        if hasattr(self, "k_scale_buffer") and self.k_scale_buffer is not None:
-            result["k_scale"] = self.k_scale_buffer[idx].view(torch.float8_e4m3fn)
-            result["v_scale"] = self.v_scale_buffer[idx].view(torch.float8_e4m3fn)
-        return result
-
-    # Backward-compatible accessors for attention backends
-    def get_fp4_key_buffer(self, layer_id: int):
-        raw = self.get_raw_kv_buffer(layer_id)
-        if "k_scale" not in raw:
-            raise RuntimeError("FP4 key buffer requested from a non-FP4 KV pool.")
-        return raw["k"], raw["k_scale"]
-
-    def get_fp4_value_buffer(self, layer_id: int):
-        raw = self.get_raw_kv_buffer(layer_id)
-        if "v_scale" not in raw:
-            raise RuntimeError("FP4 value buffer requested from a non-FP4 KV pool.")
-        return raw["v"], raw["v_scale"]
-
-    def get_dq_kv_buffer(self) -> tuple:
-        """Return the shared dequant workspace (dq_k_buffer, dq_v_buffer)."""
-        if (
-            getattr(self, "dq_k_buffer", None) is None
-            or getattr(self, "dq_v_buffer", None) is None
-        ):
-            raise RuntimeError(
-                "Dequant workspace requested from a KV pool without FP4 dequant buffers."
-            )
-        return self.dq_k_buffer, self.dq_v_buffer
-
-    def dequant_kv_for_extend(
-        self,
-        layer_id: int,
-        req_to_token: torch.Tensor,
-        req_pool_indices_cpu,
-        extend_prefix_lens_cpu,
-        extend_seq_lens_cpu,
-        page_size: int,
-        k_cur_fp8: Optional[torch.Tensor] = None,
-        v_cur_fp8: Optional[torch.Tensor] = None,
-        global_layer_id: Optional[int] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Batch dequant FP4 KV into the shared dq_buffer for prefill/extend.
-
-        Extracts the common dequant loop shared by flashinfer and trtllm backends.
-        The actual dequantize computation is delegated to self.quant_method.
-
-        Args:
-            layer_id: Local (0-based) layer index used for buffer indexing.
-            req_to_token: req_to_token_pool.req_to_token tensor.
-            req_pool_indices_cpu: CPU list/tensor of request pool indices.
-            extend_prefix_lens_cpu: CPU list of prefix lengths per request.
-            extend_seq_lens_cpu: CPU list of extend (new chunk) lengths per request.
-            page_size: Page size used for page-aligned dq_buffer layout.
-            k_cur_fp8: Current chunk K cast to FP8, shape [total_extend, heads, dim].
-                       If None, current chunk is not written (flashinfer with
-                       transfer_cur_chunk_kv=False).
-            v_cur_fp8: Same for V.
-            global_layer_id: Global (absolute) layer index for scale lookup.
-                             Defaults to layer_id when not provided (non-hybrid path).
-
-        Returns:
-            (dq_k_buffer, dq_v_buffer) — the shared workspace tensors.
-        """
-        if global_layer_id is None:
-            global_layer_id = layer_id
-        raw = self.get_raw_kv_buffer(layer_id)
-        k_fp4 = raw["k"]
-        k_scales = raw["k_scale"]
-        v_fp4 = raw["v"]
-        v_scales = raw["v_scale"]
-        dq_k, dq_v = self.dq_k_buffer, self.dq_v_buffer
-
-        batch_size = len(req_pool_indices_cpu)
-        cur_batch_start_loc_cpu = 0
-        cur_token_idx_dq = page_size  # skip page 0 (dummy output slot)
-
-        for i in range(batch_size):
-            req_idx = int(req_pool_indices_cpu[i])
-            prev_len = int(extend_prefix_lens_cpu[i])
-            extend_len = int(extend_seq_lens_cpu[i])
-
-            if prev_len > 0:
-                prev_indices = req_to_token[req_idx, :prev_len]
-                k_prev_fp8, v_prev_fp8 = self.quant_method.dequantize_prev_kv(
-                    k_fp4[prev_indices],
-                    k_scales[prev_indices],
-                    v_fp4[prev_indices],
-                    v_scales[prev_indices],
-                    global_layer_id,
-                )
-                dq_k[cur_token_idx_dq : cur_token_idx_dq + prev_len] = k_prev_fp8
-                dq_v[cur_token_idx_dq : cur_token_idx_dq + prev_len] = v_prev_fp8
-
-            if k_cur_fp8 is not None:
-                cur_end = cur_batch_start_loc_cpu + extend_len
-                dq_k[
-                    cur_token_idx_dq
-                    + prev_len : cur_token_idx_dq
-                    + prev_len
-                    + extend_len
-                ] = k_cur_fp8[cur_batch_start_loc_cpu:cur_end]
-                dq_v[
-                    cur_token_idx_dq
-                    + prev_len : cur_token_idx_dq
-                    + prev_len
-                    + extend_len
-                ] = v_cur_fp8[cur_batch_start_loc_cpu:cur_end]
-                cur_batch_start_loc_cpu = cur_end
-
-            # Advance to next page-aligned position
-            cur_token_idx_dq = (
-                (cur_token_idx_dq + prev_len + extend_len + page_size - 1)
-                // page_size
-                * page_size
-            )
-
-        return dq_k, dq_v
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
@@ -2741,30 +2669,35 @@ class HybridLinearKVPool(KVCache):
         return self.full_kv_pool.get_kv_buffer(layer_id)
 
 
+    def get_quantized_kv_access(self) -> LayerMappedQuantizedKVCacheAccess:
+        access = getattr(self, "_quantized_kv_access", None)
+        if access is None:
+            access = LayerMappedQuantizedKVCacheAccess(
+                self.full_kv_pool.get_quantized_kv_access(),
+                self._transfer_full_attention_id,
+                self._wait_for_layer,
+            )
+            self._quantized_kv_access = access
+        return access
+
     def get_raw_kv_buffer(self, layer_id: int) -> dict:
-        self._wait_for_layer(layer_id)
-        local_layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool.get_raw_kv_buffer(local_layer_id)
+        return self.get_quantized_kv_access().raw_fp4_view(layer_id).as_dict()
 
     def get_fp4_key_buffer(self, layer_id: int):
-        self._wait_for_layer(layer_id)
-        local_layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool.get_fp4_key_buffer(local_layer_id)
+        raw = self.get_quantized_kv_access().raw_fp4_view(layer_id)
+        return raw.k, raw.k_scale
 
     def get_fp4_value_buffer(self, layer_id: int):
-        self._wait_for_layer(layer_id)
-        local_layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool.get_fp4_value_buffer(local_layer_id)
+        raw = self.get_quantized_kv_access().raw_fp4_view(layer_id)
+        return raw.v, raw.v_scale
 
     def get_dq_kv_buffer(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.full_kv_pool.get_dq_kv_buffer()
+        return self.get_quantized_kv_access().fp8_workspace()
 
     def dequant_kv_for_extend(self, layer_id: int, *args, **kwargs):
-        self._wait_for_layer(layer_id)
-        local_layer_id = self._transfer_full_attention_id(layer_id)
-        kwargs.setdefault("global_layer_id", layer_id)
-        return self.full_kv_pool.dequant_kv_for_extend(
-            local_layer_id, *args, **kwargs
+        global_layer_id = kwargs.pop("global_layer_id", layer_id)
+        return self.get_quantized_kv_access().prepare_fp8_extend_workspace(
+            layer_id, global_layer_id, *args, **kwargs
         )
 
     @contextmanager
@@ -2791,10 +2724,12 @@ class HybridLinearKVPool(KVCache):
         v_scale: float = 1.0,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
-        global_layer_id = layer.layer_id  # absolute global id for scale lookup
+        # Hybrid pools store full-attention layers densely, but FP4 global scales
+        # remain indexed by the model's absolute layer id.
+        global_layer_id = layer.layer_id
         layer_id = self._transfer_full_attention_id(
             layer.layer_id
-        )  # local id for buffer indexing
+        )
         if not self.use_mla:
             self.full_kv_pool.set_kv_buffer(
                 None,

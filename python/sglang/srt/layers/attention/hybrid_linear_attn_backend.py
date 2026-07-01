@@ -1149,7 +1149,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_track_indices: Optional[torch.Tensor],
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
-        req_pool_indices: Optional[torch.Tensor] = None,
     ):
         """
         Update mamba states after MTP verify using fully fused Triton kernel.
@@ -1162,21 +1161,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         """
         request_number = last_correct_step_indices.shape[0]
 
-        if req_pool_indices is not None:
-            # Compute mamba cache indices directly from req_pool_indices.
-            # This is needed when speculative_attention_mode=decode, where the
-            # linear_attn_backend's forward_metadata may not be updated for target_verify.
-            state_indices_tensor = (
-                self.linear_attn_backend.req_to_token_pool.get_mamba_indices(
-                    req_pool_indices[:request_number]
-                )
-            )
-        else:
-            state_indices_tensor = (
-                self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                    :request_number
-                ]
-            )
+        state_indices_tensor = (
+            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
+                :request_number
+            ]
+        )
 
         mamba_caches = (
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
