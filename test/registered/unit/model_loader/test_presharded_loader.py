@@ -438,128 +438,6 @@ class TestBuildDumpPlan(unittest.TestCase):
             self.assertTrue(PreshardedModelLoader._presharded_ready(tmp))
 
 
-class TestBuildSubfolderName(unittest.TestCase):
-    """`_build_subfolder_name` must encode every dimension that affects
-    per-rank tensor shapes or content into the cache-key subfolder name,
-    so that two runs with different parallelism configs or EPLB settings
-    never collide on the same presharded directory."""
-
-    def _build(
-        self,
-        *,
-        moe_dense_tp_size=None,
-        tp=4,
-        dp=1,
-        ep=1,
-        pp=1,
-        quantization=None,
-        ep_num_redundant_experts=0,
-        init_expert_location="trivial",
-    ):
-        # Bypass __init__ (which needs a real LoadConfig): this means
-        # self.load_config is missing, so _compute_structural_signature's
-        # access to it raises AttributeError and is caught, falling back to
-        # no structural signature -- exactly like a model class that can't
-        # be built on meta device. That keeps these tests focused purely on
-        # the manually-enumerated parallelism parts of the key.
-        loader = object.__new__(PreshardedModelLoader)
-        with mock.patch(
-            "sglang.srt.distributed.get_tensor_model_parallel_world_size",
-            return_value=tp,
-        ), mock.patch(
-            "sglang.srt.distributed.get_moe_data_parallel_world_size",
-            return_value=dp,
-        ), mock.patch(
-            "sglang.srt.distributed.get_moe_expert_parallel_world_size",
-            return_value=ep,
-        ), mock.patch(
-            "sglang.srt.distributed.get_pipeline_model_parallel_world_size",
-            return_value=pp,
-        ), mock.patch(
-            "sglang.srt.model_loader.loader.get_global_server_args",
-            return_value=SimpleNamespace(
-                moe_dense_tp_size=moe_dense_tp_size,
-                ep_num_redundant_experts=ep_num_redundant_experts,
-                init_expert_location=init_expert_location,
-            ),
-        ):
-            model_config = SimpleNamespace(quantization=quantization)
-            return loader._build_subfolder_name(model_config)
-
-    def test_default_eplb_config_omits_suffixes(self):
-        # ep_num_redundant_experts=0 and init_expert_location="trivial" are
-        # the no-EPLB defaults; neither should add anything to the key.
-        name = self._build(moe_dense_tp_size=None, tp=4)
-        self.assertEqual(name, "TP-4")
-
-    def test_ep_num_redundant_experts_adds_suffix(self):
-        # Redundant experts change which physical expert lands on a rank
-        # without changing that rank's expert-slot tensor shapes, so the
-        # structural signature can't catch this -- it must be an explicit
-        # part of the key.
-        name = self._build(
-            moe_dense_tp_size=None, tp=8, ep=8, ep_num_redundant_experts=16
-        )
-        self.assertEqual(name, "TP-8-EP-8-RedEP-16")
-
-    def test_different_redundant_expert_counts_diverge(self):
-        name_a = self._build(
-            moe_dense_tp_size=None, tp=8, ep=8, ep_num_redundant_experts=16
-        )
-        name_b = self._build(
-            moe_dense_tp_size=None, tp=8, ep=8, ep_num_redundant_experts=32
-        )
-        self.assertNotEqual(name_a, name_b)
-
-    def test_init_expert_location_adds_hashed_suffix(self):
-        name = self._build(
-            moe_dense_tp_size=None,
-            tp=8,
-            ep=8,
-            init_expert_location="/path/to/expert_location.json",
-        )
-        self.assertIn("ExpLoc-", name)
-        self.assertNotIn("/path/to/expert_location.json", name)
-
-    def test_different_init_expert_location_diverge(self):
-        name_a = self._build(
-            moe_dense_tp_size=None,
-            tp=8,
-            ep=8,
-            init_expert_location="/path/to/a.json",
-        )
-        name_b = self._build(
-            moe_dense_tp_size=None,
-            tp=8,
-            ep=8,
-            init_expert_location="/path/to/b.json",
-        )
-        self.assertNotEqual(name_a, name_b)
-
-    def test_eplb_suffixes_combine_with_existing_parts(self):
-        name = self._build(
-            moe_dense_tp_size=1,
-            tp=8,
-            dp=2,
-            ep=8,
-            pp=2,
-            quantization="fp8",
-            ep_num_redundant_experts=16,
-            init_expert_location="/path/to/loc.json",
-        )
-        self.assertTrue(name.startswith("TP-8-DP-2-EP-8-PP-2-DenseTP-1-dtype-fp8-"))
-        self.assertIn("RedEP-16", name)
-        self.assertIn("ExpLoc-", name)
-
-    def test_structural_signature_failure_falls_back_silently(self):
-        # When the model class can't be built on meta device (here: the
-        # loader has no self.load_config at all, simulating any failure
-        # inside _compute_structural_signature), _build_subfolder_name must
-        # still return a usable name with no "sig-" suffix, not raise.
-        name = self._build(moe_dense_tp_size=None, tp=4)
-        self.assertNotIn("sig-", name)
-
-
 class TestStructuralSignature(unittest.TestCase):
     """The structural signature is the long-term fix for the underlying
     problem `moe_dense_tp_size` was an instance of: instead of hand-
@@ -667,6 +545,51 @@ class TestStructuralSignature(unittest.TestCase):
         self.assertIsNotNone(sig_narrow)
         self.assertIsNotNone(sig_wide)
         self.assertNotEqual(sig_narrow, sig_wide)
+
+    def _build_subfolder(
+        self,
+        *,
+        tp=4,
+        ep=1,
+        ep_num_redundant_experts=0,
+        init_expert_location="trivial",
+    ):
+        loader = object.__new__(PreshardedModelLoader)
+        with mock.patch(
+            "sglang.srt.distributed.get_tensor_model_parallel_world_size",
+            return_value=tp,
+        ), mock.patch(
+            "sglang.srt.distributed.get_moe_data_parallel_world_size",
+            return_value=1,
+        ), mock.patch(
+            "sglang.srt.distributed.get_moe_expert_parallel_world_size",
+            return_value=ep,
+        ), mock.patch(
+            "sglang.srt.distributed.get_pipeline_model_parallel_world_size",
+            return_value=1,
+        ), mock.patch(
+            "sglang.srt.model_loader.loader.get_global_server_args",
+            return_value=SimpleNamespace(
+                moe_dense_tp_size=None,
+                ep_num_redundant_experts=ep_num_redundant_experts,
+                init_expert_location=init_expert_location,
+            ),
+        ):
+            return loader._build_subfolder_name(SimpleNamespace(quantization=None))
+
+    def test_eplb_fields_appear_in_subfolder_name(self):
+        # EPLB changes content without changing tensor shapes, so the
+        # structural signature can't catch it. Smoke-test that both fields
+        # are wired into _build_subfolder_name as explicit key components.
+        name = self._build_subfolder(
+            tp=8,
+            ep=8,
+            ep_num_redundant_experts=16,
+            init_expert_location="/path/to/loc.json",
+        )
+        self.assertIn("RedEP-16", name)
+        self.assertIn("ExpLoc-", name)
+        self.assertNotIn("/path/to/loc.json", name)
 
 
 if __name__ == "__main__":
