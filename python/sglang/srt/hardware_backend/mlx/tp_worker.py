@@ -225,7 +225,7 @@ class MlxTpModelWorker(TpModelWorker):
             )
 
         next_token_ids = torch.tensor(
-            next_token_ids_list, dtype=torch.long, device="cpu"
+            next_token_ids_list, dtype=torch.long, device=self.device
         )
 
         return GenerationBatchResult(
@@ -497,7 +497,7 @@ class MlxTpModelWorker(TpModelWorker):
         else:
             raise ValueError(f"Unknown MLX async mode: {mode}")
 
-        next_token_ids = torch.tensor(next_tokens_list, dtype=torch.long, device="cpu")
+        next_token_ids = torch.tensor(next_tokens_list, dtype=torch.long, device=self.device)
         return GenerationBatchResult(
             logits_output=LogitsProcessorOutput(next_token_logits=None),
             next_token_ids=next_token_ids,

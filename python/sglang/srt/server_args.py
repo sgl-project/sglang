@@ -4563,6 +4563,12 @@ class ServerArgs:
             return
 
         self.uses_mamba_radix_cache = True
+        # Apple Silicon MLX backend manages mamba state outside the CUDA
+        # extra-buffer FLA path; force the no_buffer strategy so the
+        # downstream CUDA-only assert doesn't fire.
+        if is_mps():
+            self.mamba_radix_cache_strategy = "no_buffer"
+            self.disable_overlap_schedule = True
         if self.mamba_radix_cache_strategy == "auto":
             wants_overlap = not self.disable_overlap_schedule
             wants_paging = self.page_size is not None and self.page_size > 1
