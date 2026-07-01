@@ -763,28 +763,24 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
-                if obj.override_existing:
-                    # In-place update: reuse the already-registered adapter's
-                    # lora_id and skip register/eviction. The caller guarantees
-                    # the adapter was previously registered (fixed LoRA pool).
+                if obj.upsert:
+                    # Upsert: if the adapter is already registered, refresh its
+                    # weights in place reusing the existing lora_id (no
+                    # register/eviction). If not registered, fall through to the
+                    # normal register path below to insert it.
                     existing_id = await self.lora_registry.get_lora_id(obj.lora_name)
-                    if existing_id is None:
-                        raise ValueError(
-                            f"override_existing=True but LoRA adapter "
-                            f"'{obj.lora_name}' is not registered. Ensure all "
-                            f"adapters are registered at init before updating "
-                            f"in place."
-                        )
-                    obj.lora_id = existing_id
-                    result = (await self.update_lora_adapter_communicator(obj))[0]
-                    if result.success:
-                        self.lora_ref_cache[obj.lora_name] = LoRARef(
-                            lora_id=existing_id,
-                            lora_name=obj.lora_name,
-                            lora_path="__distributed__",
-                            pinned=obj.pinned,
-                        )
-                    return result
+                    if existing_id is not None:
+                        obj.lora_id = existing_id
+                        result = (await self.update_lora_adapter_communicator(obj))[0]
+                        if result.success:
+                            self.lora_ref_cache[obj.lora_name] = LoRARef(
+                                lora_id=existing_id,
+                                lora_name=obj.lora_name,
+                                lora_path="__distributed__",
+                                pinned=obj.pinned,
+                            )
+                        return result
+                    # Not registered yet: fall through to the register path.
 
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,

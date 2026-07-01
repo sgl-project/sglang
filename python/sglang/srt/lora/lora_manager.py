@@ -200,7 +200,7 @@ class LoRAManager:
         return self.create_lora_update_result(success=True)
 
     def validate_new_adapter(
-        self, lora_config: LoRAConfig, lora_ref: LoRARef, override_existing: bool = False
+        self, lora_config: LoRAConfig, lora_ref: LoRARef, is_update: bool = False
     ):
         """
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
@@ -215,9 +215,9 @@ class LoRAManager:
                 f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support DoRA adapters"
             )
 
-        # Check if this LoRA adapter is already loaded. Skip when updating an
-        # already-registered adapter in place (fixed LoRA pool design).
-        if not override_existing:
+        # Check if this LoRA adapter is already loaded. Skip when refreshing an
+        # already-registered adapter in place (upsert update case).
+        if not is_update:
             for existing_lora_ref in self.lora_refs.values():
                 if lora_ref.lora_name == existing_lora_ref.lora_name:
                     raise ValueError(
@@ -744,24 +744,25 @@ class LoRAManager:
         tensors: Dict[str, torch.Tensor],
         config_dict: Dict,
         added_tokens_config: Optional[Dict] = None,
-        override_existing: bool = False,
+        upsert: bool = False,
     ) -> LoRAUpdateOutput:
         """
         Load a single LoRA adapter from tensors and config dict.
 
-        When ``override_existing`` is True, the adapter must already be loaded
-        and only its weights are refreshed in place (no register/eviction
-        checks are performed). This mirrors ``update_weights_from_distributed``
-        for the base model and avoids the unload -> wait_for_unload cycle.
+        When ``upsert`` is True, this behaves as an upsert: if the adapter is
+        already loaded, only its weights are refreshed in place (reusing the
+        existing id, no register/eviction/name-duplicate checks, no pinned-slot
+        recount); if it is not loaded, it is registered via the normal path.
+        When ``upsert`` is False (default), the adapter must not already be
+        loaded (original strict-register behavior). This mirrors
+        ``update_weights_from_distributed`` for the base model and avoids the
+        unload -> wait_for_unload cycle.
         """
         assert (
             lora_ref.lora_name is not None and lora_ref.lora_path is not None
         ), "LoRARef must have both lora_name and lora_path set for loading."
-        if override_existing:
-            assert (
-                lora_ref.lora_id in self.loras
-            ), f"LoRA adapter with ID {lora_ref.lora_id} is not loaded; override_existing requires an already-loaded adapter."
-        else:
+        is_update = upsert and (lora_ref.lora_id in self.loras)
+        if not is_update:
             assert (
                 lora_ref.lora_id not in self.loras
             ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
@@ -772,13 +773,13 @@ class LoRAManager:
                 added_tokens_config,
                 base_vocab_size=self.base_hf_config.vocab_size,
             )
-            self.validate_new_adapter(new_adapter, lora_ref, override_existing=override_existing)
+            self.validate_new_adapter(new_adapter, lora_ref, is_update=is_update)
             self.configs[lora_ref.lora_id] = new_adapter
 
             self.load_lora_weights_from_tensors(lora_ref, tensors)
 
             self.lora_refs[lora_ref.lora_id] = lora_ref
-            if not override_existing:
+            if not is_update:
                 self.num_pinned_loras += int(lora_ref.pinned)
         except Exception as e:
             return self.create_lora_update_result(

@@ -125,7 +125,7 @@ class LoRARegistry:
     async def get_lora_id(self, lora_name: str) -> Optional[str]:
         """Return the ``lora_id`` for an already-registered adapter, or ``None``.
 
-        Used by the in-place (``override_existing``) LoRA update path to reuse
+        Used by the in-place (``upsert``) LoRA update path to reuse
         the existing adapter slot instead of registering a new one.
         """
         async with self._registry_lock.reader_lock:
