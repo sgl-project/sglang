@@ -48,7 +48,7 @@ use crate::{
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::V1RerankReqInput,
         responses::{ResponsesGetParams, ResponsesRequest},
-        tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
+        tokenize::{AddTokenizerRequest, DetokenizeRequest},
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
@@ -469,11 +469,8 @@ async fn update_worker(
 // Tokenize / Detokenize Handlers
 // ============================================================================
 
-async fn v1_tokenize(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<TokenizeRequest>,
-) -> Response {
-    tokenize::tokenize(&state.context.tokenizer_registry, request).await
+async fn v1_tokenize(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    tokenize::tokenize(&state.context.tokenizer_registry, body).await
 }
 
 async fn v1_detokenize(

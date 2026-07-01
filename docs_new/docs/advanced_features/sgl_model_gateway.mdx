@@ -339,7 +339,7 @@ curl -X POST http://localhost:30000/workers \
 
 ### Tokenization Endpoints
 
-The gateway provides HTTP endpoints for text tokenization with batch support, designed to mirror the SGLang Python tokenization API.
+The gateway provides HTTP endpoints for text and chat tokenization with batch support, designed to mirror the SGLang Python tokenization API.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -358,7 +358,7 @@ The gateway provides HTTP endpoints for text tokenization with batch support, de
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/tokenize`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Tokenize text to token IDs (single or batch)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Tokenize text or chat messages to token IDs (single or batch)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
@@ -410,6 +410,22 @@ The gateway provides HTTP endpoints for text tokenization with batch support, de
   "prompt": ["Hello", "World", "How are you?"]
 }
 ```
+
+#### Chat Tokenize Request
+
+Provide `messages` instead of `prompt` to tokenize a chat conversation. The gateway applies the model's chat template (the same rendering used by chat completions) and returns a single (non-batch) token list. Exactly one of `prompt` or `messages` must be provided.
+
+```json Config
+{
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Hello, world!"}
+  ]
+}
+```
+
+The optional chat fields `tools`, `tool_choice`, `reasoning_effort`, `continue_final_message`, and `chat_template_kwargs` are also accepted and forwarded to the template. Chat tokenization requires a HuggingFace tokenizer that has a chat template; other tokenizers return `400`.
 
 #### Tokenize Response
 
