@@ -884,7 +884,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             }
             # For MXFP8, the scale dtypes must be specified.
             if isinstance(self.hidden_states_quantizer, HiddenStatesMXFP8DynamicQuant):
-                print('MXFP8_QUANT!!!")
+                print("MXFP8_QUANT!!!")
                 scale_args["scale_dtype"] = torch_npu.float8_e8m0fnu
                 scale_args["per_token_scale_dtype"] = torch_npu.float8_e8m0fnu
             return self.matmul.forward(
