@@ -1,5 +1,6 @@
 import random
 import unittest
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -27,17 +28,47 @@ register_cuda_ci(est_time=19, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 
 
+def softmax_with_sink(
+    logits: torch.Tensor,  # [..., H, L], head dim at -2
+    sinks: Optional[torch.Tensor],  # [H] or None
+) -> torch.Tensor:
+    """Softmax over keys with an optional per-head learned attention sink.
+
+    Reference for the sink semantics implemented by the triton kernels: the
+    sink only adds a per-head term ``exp(sink[h])`` to the softmax denominator
+    and contributes nothing to the numerator (no value vector). See:
+    - decode: ``_fwd_kernel_stage2`` in
+      sglang/srt/layers/attention/triton_ops/decode_attention.py:586-588
+      (``e_sum += tl.exp(cur_sink - e_max)``)
+    - extend: ``_fwd_kernel`` in
+      sglang/srt/layers/attention/triton_ops/extend_attention.py:537-539
+      (``deno += tl.exp(cur_sink - e_max)``)
+
+    This is equivalent to appending one virtual key per head with logit
+    ``sinks[h]`` and an all-zero value vector, then dropping its weight.
+    The sink logit is NOT scaled by sm_scale.
+    """
+    if sinks is None:
+        return F.softmax(logits, dim=-1)
+    assert sinks.dim() == 1 and sinks.shape[0] == logits.shape[-2]
+    sink_shape = [1] * (logits.dim() - 2) + [logits.shape[-2], 1]
+    sink_col = sinks.to(logits.dtype).view(sink_shape).expand(*logits.shape[:-1], 1)
+    p = F.softmax(torch.cat([logits, sink_col], dim=-1), dim=-1)
+    return p[..., :-1]
+
+
 def extend_attention_fwd_torch(
     q: torch.Tensor,  # [extend_tokens, H_Q, D]
     k: torch.Tensor,  # [extend_tokens, H_KV, D]
-    v: torch.Tensor,  # [extend_tokens, H_KV, D]
-    o: torch.Tensor,  # [extend_tokens, H_Q, D]
+    v: torch.Tensor,  # [extend_tokens, H_KV, D_V]
+    o: torch.Tensor,  # [extend_tokens, H_Q, D_V]
     k_cache: torch.Tensor,  # [total_tokens, H_KV, D]
-    v_cache: torch.Tensor,  # [total_tokens, H_KV, D]
+    v_cache: torch.Tensor,  # [total_tokens, H_KV, D_V]
     qo_indptr: torch.Tensor,  # [B+1]
     kv_indptr: torch.Tensor,  # [B+1]
     kv_indices: torch.Tensor,  # [prefix_tokens]
     sliding_window_size: int,
+    sinks: Optional[torch.Tensor] = None,  # [H_Q]
 ):
     B = qo_indptr.size(0) - 1
     _, H_Q, D = q.shape
@@ -97,30 +128,31 @@ def extend_attention_fwd_torch(
         )  # [extend_len, H_Q, total_len]
         attn_scores = attn_scores.masked_fill(~final_mask.unsqueeze(1), float("-inf"))
 
-        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = softmax_with_sink(attn_scores, sinks)
         o[q_start:q_end] = torch.einsum("qhk,khd->qhd", attn_weights, v_full_hq)
 
 
 def decode_attention_fwd_torch(
     q: torch.Tensor,  # [B, H_Q, D]
     k_buffer: torch.Tensor,  # [total_tokens, H_KV, D]
-    v_buffer: torch.Tensor,  # [total_tokens, H_KV, D]
+    v_buffer: torch.Tensor,  # [total_tokens, H_KV, D_V]
     kv_indptr: torch.Tensor,  # [B+1]
     kv_indices: torch.Tensor,  # [prefix_tokens]
     sm_scale: float,
+    sinks: Optional[torch.Tensor] = None,  # [H_Q]
 ):
     """
     Torch reference implementation for decode attention with stable softmax.
-    Supports both MHA and GQA configurations.
+    Supports MHA and GQA, asymmetric head dims (D != D_V), and attention sinks.
     """
     B = kv_indptr.size(0) - 1
     _, H_Q, D = q.shape
-    _, H_KV, _ = k_buffer.shape
+    _, H_KV, D_V = v_buffer.shape
 
     assert H_Q % H_KV == 0, "H_Q must be divisible by H_KV for GQA"
     group_size = H_Q // H_KV
 
-    o_ref = torch.empty((B, H_Q, D), dtype=torch.float32, device=q.device)
+    o_ref = torch.empty((B, H_Q, D_V), dtype=torch.float32, device=q.device)
 
     for b in range(B):
         start = int(kv_indptr[b].item())
@@ -128,22 +160,21 @@ def decode_attention_fwd_torch(
         idx = kv_indices[start:end]
 
         k_seq = k_buffer.index_select(0, idx)  # [L, H_KV, D]
-        v_seq = v_buffer.index_select(0, idx)  # [L, H_KV, D]
+        v_seq = v_buffer.index_select(0, idx)  # [L, H_KV, D_V]
 
         if H_KV != H_Q:
             k_seq = k_seq.repeat_interleave(group_size, dim=1)  # [L, H_Q, D]
-            v_seq = v_seq.repeat_interleave(group_size, dim=1)  # [L, H_Q, D]
+            v_seq = v_seq.repeat_interleave(group_size, dim=1)  # [L, H_Q, D_V]
 
         q_f32 = q[b].to(torch.float32)  # [H_Q, D]
         k_f32 = k_seq.to(torch.float32)  # [L, H_Q, D]
-        v_f32 = v_seq.to(torch.float32)  # [L, H_Q, D]
+        v_f32 = v_seq.to(torch.float32)  # [L, H_Q, D_V]
 
         # logits: [H_Q, L]
         logits = torch.einsum("hd,lhd->hl", q_f32, k_f32) * float(sm_scale)
-        logits = logits - logits.max(dim=-1, keepdim=True).values
-        p = torch.softmax(logits, dim=-1)  # [H_Q, L]
+        p = softmax_with_sink(logits, sinks)  # [H_Q, L]
 
-        # out: [H_Q, D]
+        # out: [H_Q, D_V]
         o_ref[b] = torch.einsum("hl,lhd->hd", p, v_f32)
 
     return o_ref
@@ -669,11 +700,242 @@ class TestTritonAttention(CustomTestCase):
             (2, 128, 1, 80, 80),
             (2, 128, 2, 512, 512),
             (2, 128, 1, 576, 512),
+            # MiMo-V2 diffkv geometry (qk=192, v=128), see issue #24321
+            (2, 16, 4, 192, 128),
         ]
 
         for S in seq_lens:
             for B, H_Q, H_KV, D, D_V in configs:
                 self._test_grouped_decode_attention_once(B, S, H_Q, H_KV, D, D_V)
+
+    def _test_decode_attention_diffkv_sink_once(
+        self, B, S, H_Q, H_KV, D, D_V, use_sinks
+    ):
+        """Decode attention with asymmetric head dims and optional sinks vs torch.
+
+        Covers the MiMo-V2 SWA-layer geometry (qk_head_dim=192, v_head_dim=128,
+        per-head learned attention-sink bias) on the triton decode path, which
+        is the default attention backend for this model family on SM120
+        (issue #24321). Related asymmetric-dim (BLOCK_DV != BLOCK_DMODEL)
+        kernel-class bug: issue #27367 / PR #27369.
+        """
+        dtype = torch.bfloat16
+        device = get_device()
+        total_tokens = B * S
+        sm_scale = 1.0 / (D**0.5)
+        max_kv_splits = 8
+        num_kv_splits = torch.full((B,), 4, dtype=torch.int32, device=device)
+
+        q = torch.randn(B, H_Q, D, dtype=dtype, device=device)
+        k_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=device)
+        v_buffer = torch.randn(total_tokens, H_KV, D_V, dtype=dtype, device=device)
+        o = torch.zeros(B, H_Q, D_V, dtype=dtype, device=device)
+
+        # MiMo-V2 stores the sink bias as a per-q-head model-dtype parameter
+        # (models/mimo_v2.py, attention_sink_bias); the kernels read one scalar
+        # per q head.
+        sinks = torch.randn(H_Q, dtype=dtype, device=device) if use_sinks else None
+
+        b_seq_len = torch.full((B,), S, device=device)
+        kv_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device)
+        kv_indptr[1 : B + 1] = torch.cumsum(b_seq_len[:B], dim=0)
+        kv_indices = torch.arange(total_tokens, device=device)
+
+        attn_logits = torch.empty(
+            (B, H_Q, max_kv_splits, D_V), dtype=torch.float32, device=device
+        )
+        attn_lse = torch.empty(
+            (B, H_Q, max_kv_splits), dtype=torch.float32, device=device
+        )
+
+        # decode_attention_fwd dispatches to the MHA kernel when
+        # H_Q == H_KV and to the grouped kernel otherwise.
+        decode_attention_fwd(
+            q,
+            k_buffer,
+            v_buffer,
+            o,
+            kv_indptr,
+            kv_indices,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale,
+            1.0,
+            1.0,
+            sinks=sinks,
+        )
+
+        o_ref = decode_attention_fwd_torch(
+            q, k_buffer, v_buffer, kv_indptr, kv_indices, sm_scale, sinks=sinks
+        )
+
+        max_abs_err = (o.to(torch.float32) - o_ref).abs().max().item()
+        self.assertTrue(
+            torch.allclose(o.to(torch.float32), o_ref, atol=1e-2, rtol=1e-2),
+            msg=(
+                f"decode diffkv/sink mismatch: B={B} S={S} H_Q={H_Q} H_KV={H_KV} "
+                f"D={D} D_V={D_V} sinks={use_sinks} max_abs_err={max_abs_err}"
+            ),
+        )
+
+    def test_decode_attention_diffkv_sink(self):
+        # (D, D_V) = (192, 128) is the MiMo-V2 qk/v head-dim split.
+        D, D_V = 192, 128
+        head_configs = [
+            (4, 4),  # MHA -> decode_attention_fwd_normal
+            (16, 4),  # GQA -> decode_attention_fwd_grouped
+        ]
+        for S in [37, 500]:
+            for H_Q, H_KV in head_configs:
+                for use_sinks in [False, True]:
+                    with self.subTest(S=S, H_Q=H_Q, H_KV=H_KV, sinks=use_sinks):
+                        self._test_decode_attention_diffkv_sink_once(
+                            3, S, H_Q, H_KV, D, D_V, use_sinks
+                        )
+
+    def _test_extend_attention_diffkv_sink_once(
+        self, B, N_CTX, H_Q, H_KV, D, D_V, window_size, use_sinks
+    ):
+        """Extend (prefill) attention with asymmetric head dims, sliding window,
+        and optional sinks vs a float32 torch reference.
+
+        MiMo-V2's SWA layers combine qk_head_dim=192 / v_head_dim=128 with a
+        sliding window and a learned per-head attention sink; on SM120 the
+        triton backend is the default for this model (issue #24321).
+        """
+        dtype = torch.bfloat16
+        device = get_device()
+
+        b_seq_len_prefix = torch.randint(
+            1, N_CTX // 2, (B,), dtype=torch.int32, device=device
+        )
+        b_seq_len_extend = torch.randint(
+            1, N_CTX // 2, (B,), dtype=torch.int32, device=device
+        )
+        b_seq_len = b_seq_len_prefix + b_seq_len_extend
+
+        b_start_loc = torch.zeros((B,), dtype=torch.int32, device=device)
+        b_start_loc[1:] = torch.cumsum(b_seq_len[:-1], 0)
+        b_start_loc_extend = torch.zeros((B,), dtype=torch.int32, device=device)
+        b_start_loc_extend[1:] = torch.cumsum(b_seq_len_extend[:-1], 0)
+
+        kv_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device)
+        kv_indptr[1 : B + 1] = torch.cumsum(b_seq_len_prefix[:B], dim=0)
+        kv_indices = torch.zeros(
+            (b_seq_len_prefix.sum().item(),), dtype=torch.int32, device=device
+        )
+        for i in range(B):
+            kv_indices[kv_indptr[i] : kv_indptr[i + 1]] = torch.arange(
+                b_start_loc[i], b_start_loc[i] + b_seq_len_prefix[i]
+            )
+
+        total_token_num = torch.sum(b_seq_len).item()
+        extend_token_num = torch.sum(b_seq_len_extend).item()
+        k_buffer = torch.empty(
+            (total_token_num, H_KV, D), dtype=dtype, device=device
+        ).normal_(mean=0.1, std=0.2)
+        v_buffer = torch.empty(
+            (total_token_num, H_KV, D_V), dtype=dtype, device=device
+        ).normal_(mean=0.1, std=0.2)
+
+        k_extend = torch.empty((extend_token_num, H_KV, D), dtype=dtype, device=device)
+        v_extend = torch.empty(
+            (extend_token_num, H_KV, D_V), dtype=dtype, device=device
+        )
+        q_extend = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device=device)
+        for i in range(B):
+            extend_start_in_buffer = b_start_loc[i] + b_seq_len_prefix[i]
+            extend_end_in_buffer = b_start_loc[i] + b_seq_len[i]
+            extend_start = b_start_loc_extend[i]
+            extend_end = b_start_loc_extend[i] + b_seq_len_extend[i]
+            k_extend[extend_start:extend_end] = k_buffer[
+                extend_start_in_buffer:extend_end_in_buffer
+            ]
+            v_extend[extend_start:extend_end] = v_buffer[
+                extend_start_in_buffer:extend_end_in_buffer
+            ]
+            q_extend[extend_start:extend_end] = torch.empty(
+                (b_seq_len_extend[i], H_Q, D), dtype=dtype, device=device
+            ).normal_(mean=0.1, std=0.2)
+
+        sinks = torch.randn(H_Q, dtype=dtype, device=device) if use_sinks else None
+
+        o_extend_triton = torch.empty(
+            (extend_token_num, H_Q, D_V), dtype=dtype, device=device
+        )
+        o_extend_torch = torch.empty(
+            (extend_token_num, H_Q, D_V), dtype=torch.float32, device=device
+        )
+
+        max_len_extend = torch.max(b_seq_len_extend, 0)[0].item()
+        qo_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device)
+        qo_indptr[1 : B + 1] = torch.cumsum(b_seq_len_extend[:B], dim=0)
+
+        extend_attention_fwd(
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend_triton,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            custom_mask=None,
+            is_causal=True,
+            mask_indptr=None,
+            max_len_extend=max_len_extend,
+            k_scale=1.0,
+            v_scale=1.0,
+            sliding_window_size=window_size,
+            sinks=sinks,
+        )
+
+        # Float32 reference (the helper is dtype-agnostic).
+        extend_attention_fwd_torch(
+            q_extend.float(),
+            k_extend.float(),
+            v_extend.float(),
+            o_extend_torch,
+            k_buffer.float(),
+            v_buffer.float(),
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            window_size,
+            sinks=sinks,
+        )
+
+        o_triton_f32 = o_extend_triton.to(torch.float32)
+        max_abs_err = (o_triton_f32 - o_extend_torch).abs().max().item()
+        self.assertTrue(
+            torch.allclose(o_triton_f32, o_extend_torch, atol=1e-2, rtol=1e-2),
+            msg=(
+                f"extend diffkv/sink mismatch: B={B} N_CTX={N_CTX} H_Q={H_Q} "
+                f"H_KV={H_KV} D={D} D_V={D_V} window={window_size} "
+                f"sinks={use_sinks} max_abs_err={max_abs_err}"
+            ),
+        )
+
+    def test_extend_attention_diffkv_sink(self):
+        # (D, D_V) = (192, 128) is the MiMo-V2 qk/v head-dim split; window=127
+        # mirrors the production SWA+sink combination on the SWA layers.
+        D, D_V = 192, 128
+        head_configs = [
+            (4, 4),  # MHA
+            (16, 4),  # GQA
+        ]
+        for H_Q, H_KV in head_configs:
+            for window_size in [-1, 127]:
+                for use_sinks in [False, True]:
+                    with self.subTest(
+                        H_Q=H_Q, H_KV=H_KV, window=window_size, sinks=use_sinks
+                    ):
+                        self._test_extend_attention_diffkv_sink_once(
+                            4, 512, H_Q, H_KV, D, D_V, window_size, use_sinks
+                        )
 
     def _test_extend_attention_unified_vs_regular_once(self, B, N_CTX, H_Q, H_KV, D):
         """Test that unified kernel produces same results as 2-stage kernel."""
