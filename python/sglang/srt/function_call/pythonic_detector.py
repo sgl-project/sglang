@@ -207,6 +207,12 @@ class PythonicDetector(BaseFormatDetector):
     def _get_parameter_value(self, val):
         if isinstance(val, ast.Constant):
             return val.value
+        elif isinstance(val, ast.UnaryOp) and isinstance(val.op, (ast.USub, ast.UAdd)):
+            # e.g. -5 parses as UnaryOp(USub, Constant(5)), not Constant
+            operand = self._get_parameter_value(val.operand)
+            if not isinstance(operand, (int, float)) or isinstance(operand, bool):
+                raise ValueError("Unary operator operand must be a non-boolean numeric literal")
+            return -operand if isinstance(val.op, ast.USub) else +operand
         elif isinstance(val, ast.Dict):
             return {
                 k.value: self._get_parameter_value(v)
