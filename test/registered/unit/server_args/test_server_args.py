@@ -1379,9 +1379,7 @@ class TestDeepEPV2Args(CustomTestCase):
             args._handle_a2a_moe()
 
     def test_two_batch_overlap_rejected(self):
-        args = self._args(
-            moe_runner_backend="deep_gemm", enable_two_batch_overlap=True
-        )
+        args = self._args(moe_runner_backend="deep_gemm", enable_two_batch_overlap=True)
         with self.assertRaises(ValueError):
             args._handle_a2a_moe()
 

@@ -329,7 +329,9 @@ class _DeepEPV2Impl:
                 )
                 use_tma_aligned_col_major_sf = False
             else:
-                dispatch_x = _quantize_for_deepep_v2_dispatch(hidden_states, self.capability)
+                dispatch_x = _quantize_for_deepep_v2_dispatch(
+                    hidden_states, self.capability
+                )
                 use_tma_aligned_col_major_sf = self.capability.fp8_scale_tma_aligned
         else:
             dispatch_x = hidden_states

@@ -2442,7 +2442,8 @@ class DeepseekV2Model(nn.Module):
                     # Keep the original deepep-class scope here and only add DeepEP v2,
                     # so unrelated backends' allocator sizing is unchanged.
                     is_a2a_moe = (
-                        is_deepep_class_backend() or get_moe_a2a_backend().is_deepep_v2()
+                        is_deepep_class_backend()
+                        or get_moe_a2a_backend().is_deepep_v2()
                     )
                     tp_size = 1 if is_a2a_moe else get_parallel().tp_size
                     intermediate_size = (
