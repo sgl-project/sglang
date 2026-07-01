@@ -51,6 +51,29 @@ class LoRALayer(nn.Module):
         self.pinned_weights: Dict[str, torch.Tensor] = {}
 
 
+def _zero_fill_kv_branch(weight_name, q_weight, base_hf_config):
+    """Build a zero tensor for a missing K/V LoRA branch when both are absent.
+
+    A lora_A shares q_proj's input width, but a lora_B's output width is the KV
+    projection size, which is smaller than q_proj under GQA. Derive it from the
+    base attention config; fall back to q_proj's shape when unavailable.
+    """
+    if "lora_B" not in weight_name:
+        return torch.zeros_like(q_weight)
+    if base_hf_config is not None and hasattr(base_hf_config, "get_text_config"):
+        base_hf_config = base_hf_config.get_text_config()
+    num_heads = getattr(base_hf_config, "num_attention_heads", None)
+    num_kv_heads = getattr(base_hf_config, "num_key_value_heads", num_heads)
+    if not num_heads or not num_kv_heads or num_heads == num_kv_heads:
+        return torch.zeros_like(q_weight)
+    kv_out = q_weight.shape[0] // num_heads * num_kv_heads
+    return torch.zeros(
+        (kv_out, *q_weight.shape[1:]),
+        dtype=q_weight.dtype,
+        device=q_weight.device,
+    )
+
+
 class LoRAAdapter(nn.Module):
     def __init__(
         self,
@@ -238,24 +261,39 @@ class LoRAAdapter(nn.Module):
                 v_name = weight_name.replace("q_proj", "v_proj")
                 qkv_name = weight_name.replace("q_proj", "qkv_proj")
 
-                # If k_proj doesn't have lora, initialize it to zero
-                k_proj_weight = (
-                    weights[k_name]
-                    if "k_proj" in target_module
-                    else torch.zeros_like(weights[v_name])
+                # Zero-fill any missing K/V branch so the stacked qkv tensor
+                # still matches the base layer. When one KV branch is present we
+                # reuse its shape; when both are missing a lora_B's output width
+                # is the (smaller, under GQA) KV projection size and cannot be
+                # inferred from q_proj, so derive it from the base config.
+                if "k_proj" in target_module:
+                    k_proj_weight = weights[k_name]
+                elif "v_proj" in target_module:
+                    k_proj_weight = torch.zeros_like(weights[v_name])
+                else:
+                    k_proj_weight = _zero_fill_kv_branch(
+                        weight_name,
+                        weights[q_name],
+                        getattr(self, "base_hf_config", None),
+                    )
+                v_proj_weight = (
+                    weights[v_name]
+                    if "v_proj" in target_module
+                    else torch.zeros_like(k_proj_weight)
                 )
                 weights[qkv_name] = torch.cat(
                     (
                         weights[q_name],
                         k_proj_weight,
-                        weights[v_name],
+                        v_proj_weight,
                     ),
                     0,
                 )
                 weights.pop(q_name)
                 if "k_proj" in target_module:
                     weights.pop(k_name)
-                weights.pop(v_name)
+                if "v_proj" in target_module:
+                    weights.pop(v_name)
             elif "qkv_proj" in weight_name:
                 # If qkv_proj is already stacked, we normalize it following the SGL convention.
                 qkv_name = weight_name
