@@ -76,6 +76,10 @@ QWEN3_6_35B_A3B_128K_PREFIX_OTHER_ARGS = [
     1,
     "--speculative-num-draft-tokens",
     4,
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen3_coder",
 ]
 
 
@@ -91,7 +95,7 @@ class TestNPUQwen3_6_35BA3B_1P_In128k_Out1k_Prefix90_50ms(
     dataset_name = "generated-shared-prefix"
     max_concurrency = 103
     num_prompts = 412
-    input_len = 64000
+    input_len = 128000
     output_len = 1000
     random_range_ratio = 1
     repeat_rate = 0.9
