@@ -906,11 +906,10 @@ class SchedulerBatchResultProcessor:
 
         Returns (at_boundary, track_seqlen).  The boundary condition
         matches what the forward's tracking mask used:
-        ``prepare_for_decode`` increments both ``seq_lens_cpu`` and
-        ``kv_committed_len`` by 1, then checks
-        ``seq_lens_cpu % interval == 0``.  Using ``kv_committed_len``
-        here reproduces that check exactly, and the value is always a
-        multiple of ``interval`` (hence page-aligned).
+        ``prepare_for_decode`` increments ``batch.seq_lens_cpu`` by 1 and checks
+        ``seq_lens_cpu % interval == 0``.  Use the batch snapshot instead of the
+        shared ``req.kv_committed_len`` because overlap scheduling can launch the
+        next decode and advance the req before this result is processed.
 
         For spec decode, the boundary is detected by comparing the
         accepted seq_len range against interval boundaries.
@@ -918,8 +917,9 @@ class SchedulerBatchResultProcessor:
         interval = get_global_server_args().mamba_track_interval
 
         if batch.spec_algorithm.is_none():
-            if req.kv_committed_len % interval == 0:
-                return True, req.kv_committed_len
+            committed_len = int(batch.seq_lens_cpu[i].item())
+            if committed_len % interval == 0:
+                return True, committed_len
         elif result.num_correct_drafts_per_req_cpu is not None:
             cur = req.seqlen - 1
             prev = cur - result.num_correct_drafts_per_req_cpu[i] - 1

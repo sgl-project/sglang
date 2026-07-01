@@ -192,7 +192,6 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
         )
-        self.write_back_producer_stream = None
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
         if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
@@ -208,17 +207,12 @@ class HybridCacheController(BaseHiCacheController):
                 host_pools=getattr(mem_pool_host, "entries", None),
             )
 
-    def set_write_back_producer_stream(self, stream) -> None:
-        self.write_back_producer_stream = stream
-
-    def _wait_for_write_back_producer_if_needed(
-        self, pool_transfers: Optional[list[PoolTransfer]]
-    ) -> None:
-        producer_stream = getattr(self, "write_back_producer_stream", None)
-        if producer_stream is None:
-            return
-        if any(transfer.name == PoolName.MAMBA for transfer in pool_transfers or []):
-            self.write_stream.wait_stream(producer_stream)
+    def _can_keep_write_back_indices(self) -> bool:
+        return (
+            self.io_backend == "kernel"
+            and self.mem_pool_host.layout == "page_first"
+            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+        )
 
     def _start_storage_threads(self):
         super()._start_storage_threads()
@@ -408,11 +402,7 @@ class HybridCacheController(BaseHiCacheController):
             return
         op = CacheOperation.merge_ops(self.write_queue)
         # Page-first write-back JIT kernels can keep destination host indices on CPU.
-        if (
-            self.io_backend == "kernel"
-            and self.mem_pool_host.layout == "page_first"
-            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
-        ):
+        if self._can_keep_write_back_indices():
             host_indices = op.host_indices
             device_indices = op.device_indices
             resolved_pool_transfers = op.pool_transfers
@@ -426,7 +416,6 @@ class HybridCacheController(BaseHiCacheController):
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
-            self._wait_for_write_back_producer_if_needed(resolved_pool_transfers)
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device,
                 host_indices,

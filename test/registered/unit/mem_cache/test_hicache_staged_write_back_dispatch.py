@@ -144,21 +144,6 @@ class _FakeDeviceModule:
         yield
 
 
-class _FakePageFirstJitHostGroup:
-    layout = "page_first"
-    can_use_write_back_jit = True
-
-    def backup_from_device_all_layer(
-        self,
-        device_pool,
-        host_indices,
-        device_indices,
-        io_backend,
-        pool_transfers=None,
-    ):
-        pass
-
-
 class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
     def _patched_transfers(self, src_registry=None):
         staged_side_effect = None
@@ -746,52 +731,6 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         controller.move_hybrid_indices.assert_not_called()
         self.assertEqual(captured["host_indices"].device.type, "cpu")
         self.assertEqual(captured["pool_transfers"][0].host_indices.device.type, "cpu")
-
-    def test_hybrid_write_waits_for_producer_stream_only_for_mamba(self):
-        producer_stream = object()
-        cases = [(PoolName.MAMBA, True), (PoolName.DEEPSEEK_V4_C4, False)]
-
-        for pool_name, should_wait in cases:
-            with self.subTest(pool_name=pool_name):
-                write_stream = mock.Mock()
-                controller = HybridCacheController.__new__(HybridCacheController)
-                controller.write_queue = [
-                    CacheOperation(
-                        host_indices=_indices(0, 1),
-                        device_indices=_indices(1, 2),
-                        node_id=1,
-                        pool_transfers=[
-                            PoolTransfer(
-                                name=pool_name,
-                                host_indices=_indices(0, 1),
-                                device_indices=_indices(1, 2),
-                            )
-                        ],
-                    )
-                ]
-                controller.io_backend = "kernel"
-                controller.mem_pool_host = _FakePageFirstJitHostGroup()
-                controller.mem_pool_device = None
-                controller.has_draft = False
-                controller.write_stream = write_stream
-                controller.ack_write_queue = []
-                controller.set_write_back_producer_stream(producer_stream)
-                controller._record_transfer_indices_on_stream = lambda *args: None
-                controller.move_hybrid_indices = mock.Mock(
-                    side_effect=AssertionError(
-                        "write-back JIT kernel write should not move indices"
-                    )
-                )
-
-                with mock.patch.object(
-                    hybrid_cache_controller, "device_module", _FakeDeviceModule
-                ):
-                    controller.start_writing()
-
-                if should_wait:
-                    write_stream.wait_stream.assert_called_once_with(producer_stream)
-                else:
-                    write_stream.wait_stream.assert_not_called()
 
     def test_hybrid_write_moves_indices_without_write_back_jit(self):
         captured = {}
