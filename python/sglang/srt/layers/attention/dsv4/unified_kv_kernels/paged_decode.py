@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+# The following kernel is imported from ATOM.
+# Source: atom/model_ops/v4_kernels/paged_decode.py
+
 """Sparse decode attention over a unified KV pool with per-token paged indices.
 
 Designed for V4 decode + CUDAGraph: replaces the per-fwd `kv_flat_sa`

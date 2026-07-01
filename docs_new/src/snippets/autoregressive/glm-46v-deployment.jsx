@@ -6,6 +6,7 @@ export const GLM46VDeployment = () => {
       title: 'Hardware Platform',
       items: [
         { id: 'b200', label: 'B200', default: true },
+        { id: 'b300', label: 'B300', default: false },
         { id: 'h100', label: 'H100', default: false },
         { id: 'h200', label: 'H200', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
@@ -94,6 +95,7 @@ export const GLM46VDeployment = () => {
         h100: { tp: 8 },
         h200: { tp: 8 },
         b200: { tp: 8 },
+        b300: { tp: 8 },
         mi300x: { tp: 8 },
         mi325x: { tp: 8 },
         mi355x: { tp: 8 }
@@ -103,6 +105,7 @@ export const GLM46VDeployment = () => {
         h100: { tp: 1 },
         h200: { tp: 1 },
         b200: { tp: 1 },
+        b300: { tp: 1 },
         mi300x: { tp: 1 },
         mi325x: { tp: 1 },
         mi355x: { tp: 1 }
@@ -122,6 +125,10 @@ export const GLM46VDeployment = () => {
     const quantSuffix = quantization === 'fp8' ? '-FP8' : '';
     const modelName = `zai-org/${config.baseName}${quantSuffix}`;
 
+    if (hardware === 'b300' && modelsize === '9b' && quantization === 'fp8') {
+      return '# Error: GLM-4.6V-Flash-FP8 is not available on B300 in this cookbook configuration\n# Please use BF16 for GLM-4.6V-Flash or select the 106B model';
+    }
+
     let cmd = 'python -m sglang.launch_server \\\n';
     cmd += `  --model ${modelName}`;
 
@@ -140,6 +147,12 @@ export const GLM46VDeployment = () => {
     // Add tool call parser if enabled
     if (toolcall === 'enabled') {
       cmd += ` \\\n  --tool-call-parser glm45`;
+    }
+
+    if (hardware === 'b300') {
+      cmd += ` \\\n  --attention-backend flashinfer`;
+      cmd += ` \\\n  --enforce-disable-flashinfer-allreduce-fusion`;
+      cmd += ` \\\n  --cuda-graph-backend-decode disabled`;
     }
 
     return cmd;
