@@ -288,6 +288,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
 
         check_environments()
         initialize_linear_attn_config(runner.server_args)
+        hybrid_backend_cls = HybridLinearAttnBackend
         if runner.hybrid_gdn_config is not None:
             if is_blackwell():
                 assert (
@@ -303,7 +304,35 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
             linear_attn_backend = GDNAttnBackend(runner)
         elif runner.mamba2_config is not None:
-            linear_attn_backend = Mamba2AttnBackend(runner)
+            from sglang.srt.configs.lfm2 import (
+                Lfm2Config,
+                Lfm2MoeConfig,
+                Lfm2VlConfig,
+            )
+            from sglang.srt.configs.zaya import ZayaConfig
+
+            # Short-conv hybrids (ZAYA1 CCA, LFM2 short conv) share a conv-state
+            # sidecar that owns the per-request state plumbing and is invoked by
+            # the model via conv_state_metadata (never as a full-vs-linear
+            # alternative). Other mamba2 models keep the full Mamba2 SSM backend.
+            short_conv_cfgs = (
+                ZayaConfig,
+                Lfm2Config,
+                Lfm2MoeConfig,
+                Lfm2VlConfig,
+            )
+            if isinstance(runner.mamba2_config, short_conv_cfgs) and not is_npu():
+                from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+                    ShortConvHybridAttnBackend,
+                )
+                from sglang.srt.layers.attention.linear.short_conv_backend import (
+                    ShortConvAttnBackend,
+                )
+
+                linear_attn_backend = ShortConvAttnBackend(runner)
+                hybrid_backend_cls = ShortConvHybridAttnBackend
+            else:
+                linear_attn_backend = Mamba2AttnBackend(runner)
         elif runner.kimi_linear_config is not None:
             linear_attn_backend = KDAAttnBackend(runner)
         elif runner.hybrid_lightning_config is not None:
@@ -325,7 +354,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             full_attn_layers = [0]
         else:
             full_attn_layers = cfg.full_attention_layer_ids
-        return HybridLinearAttnBackend(
+        return hybrid_backend_cls(
             full_attn_backend, linear_attn_backend, full_attn_layers
         )
 
