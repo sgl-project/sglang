@@ -44,6 +44,8 @@ def _make_model_runner(
     num_layers=32,
     use_mla_backend=False,
     is_hybrid_swa=False,
+    kv_lora_rank=512,
+    qk_rope_head_dim=64,
     full_attention_layer_ids=None,
     swa_attention_layer_ids=None,
     swa_num_kv_heads=None,
@@ -69,6 +71,7 @@ def _make_model_runner(
     mr = MagicMock()
 
     mr.use_mla_backend = use_mla_backend
+    mr.enable_hisparse = False
     mr.is_draft_worker = False
     mr.num_effective_layers = num_layers
     mr.start_layer = 0
@@ -82,6 +85,8 @@ def _make_model_runner(
     mc = SimpleNamespace()
     mc.head_dim = head_dim
     mc.v_head_dim = v_head_dim
+    mc.kv_lora_rank = kv_lora_rank
+    mc.qk_rope_head_dim = qk_rope_head_dim
     mc.is_hybrid_swa = is_hybrid_swa
     mc.full_attention_layer_ids = (
         full_attention_layer_ids
@@ -116,6 +121,7 @@ def _make_model_runner(
     sa.disaggregation_mode = disaggregation_mode
     sa.max_running_requests = max_running_requests
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
+    sa.enable_dsa_cp_shared_kv_cache = False
     mr.server_args = sa
 
     spec = MagicMock()
@@ -201,6 +207,110 @@ class TestDefaultConfigurator(unittest.TestCase):
         _, _, config = self._run(10_000_000)
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
+
+    def test_dsa_cp_shared_counts_only_local_main_kv(self):
+        """DSA shared KV sizing should divide MLA main KV by CP size, not indexer KV."""
+        page_size = 64
+        num_layers = 4
+        kv_lora_rank = 512
+        qk_rope_head_dim = 64
+        cp_size = 8
+        index_head_dim = 128
+
+        main_cell_size = (kv_lora_rank + qk_rope_head_dim) * num_layers * KV_SIZE
+        indexer_cell_size = (
+            (index_head_dim + index_head_dim // 128 * 4) * num_layers * KV_SIZE
+        )
+        shared_cell_size = main_cell_size // cp_size + indexer_cell_size
+        available = shared_cell_size * 10_000
+
+        mr = _make_model_runner(
+            use_mla_backend=True,
+            num_layers=num_layers,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            page_size=page_size,
+        )
+
+        with (
+            mock_cpu_env(kv_size=KV_SIZE),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.is_deepseek_dsa",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.get_dsa_index_head_dim",
+                return_value=index_head_dim,
+            ),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.get_attention_cp_size",
+                return_value=cp_size,
+                create=True,
+            ),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.should_enable_dsa_cp_shared_kvcache",
+                return_value=True,
+                create=True,
+            ),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size)
+
+        self.assertEqual(config.max_total_num_tokens, 9984)
+
+    def test_dsa_cp_shared_server_arg_enables_capacity_sizing(self):
+        """The official server arg should enable shared sizing without the env var."""
+        page_size = 64
+        num_layers = 4
+        kv_lora_rank = 512
+        qk_rope_head_dim = 64
+        cp_size = 8
+        index_head_dim = 128
+
+        main_cell_size = (kv_lora_rank + qk_rope_head_dim) * num_layers * KV_SIZE
+        indexer_cell_size = (
+            (index_head_dim + index_head_dim // 128 * 4) * num_layers * KV_SIZE
+        )
+        shared_cell_size = main_cell_size // cp_size + indexer_cell_size
+        available = shared_cell_size * 10_000
+
+        mr = _make_model_runner(
+            use_mla_backend=True,
+            num_layers=num_layers,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            page_size=page_size,
+        )
+        mr.server_args.enable_dsa_cp_shared_kv_cache = True
+
+        with (
+            mock_cpu_env(kv_size=KV_SIZE),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.is_deepseek_dsa",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.get_dsa_index_head_dim",
+                return_value=index_head_dim,
+            ),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.get_attention_cp_size",
+                return_value=cp_size,
+                create=True,
+            ),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size)
+
+        self.assertEqual(config.max_total_num_tokens, 9984)
 
 
 class TestHybridSWAConfigurator(unittest.TestCase):

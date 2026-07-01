@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections import defaultdict
+from multiprocessing import shared_memory
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
+from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +27,102 @@ class HostTensorAllocator:
         self.dtype = dtype
         self.dims = dims
         return alloc_mmap(dims, dtype)
+
+
+class CpSharedHostTensorAllocator(HostTensorAllocator):
+    def __init__(self, cpu_group, owner_rank: int = 0, kind: str = "dsa_l2"):
+        super().__init__()
+        self.cpu_group = cpu_group
+        self.owner_rank = owner_rank
+        self.kind = kind
+        self.rank = torch.distributed.get_rank(group=cpu_group)
+        self.group_ranks = torch.distributed.get_process_group_ranks(cpu_group)
+        self.is_owner = self.rank == owner_rank
+        self._segments = []
+
+    @property
+    def shared_group_key(self) -> str:
+        return f"{self.kind}:{self.owner_rank}:{','.join(map(str, self.group_ranks))}"
+
+    def log_host_allocation(
+        self,
+        requested_bytes: int,
+        logger: logging.Logger,
+        *,
+        pool_name: str,
+        token_capacity: int,
+        page_num: int,
+        page_size: int,
+    ) -> None:
+        action = "create" if self.is_owner else "attach"
+        logger.info(
+            "DSA CP shared L2 host memory: %s %.2f GB host memory for %s "
+            "(cp_rank=%s owner_rank=%s is_owner=%s token_capacity=%s "
+            "page_num=%s page_size=%s kind=%s shared_group_key=%s)",
+            action,
+            requested_bytes / 1e9,
+            pool_name,
+            self.rank,
+            self.owner_rank,
+            self.is_owner,
+            token_capacity,
+            page_num,
+            page_size,
+            self.kind,
+            self.shared_group_key,
+        )
+
+    def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
+        assert (
+            device == "cpu"
+        ), f"CpSharedHostTensorAllocator only supports CPU allocations; got device={device!r}"
+        self.dtype = dtype
+        self.dims = dims
+        numel = math.prod(dims)
+        nbytes = numel * torch.empty([], dtype=dtype).element_size()
+        payload = [None]
+        if self.is_owner:
+            segment = shared_memory.SharedMemory(
+                create=True, size=nbytes, name=make_shm_name(self.kind)
+            )
+            payload[0] = {"name": segment.name, "nbytes": nbytes}
+
+        torch.distributed.broadcast_object_list(
+            payload, src=self.group_ranks[self.owner_rank], group=self.cpu_group
+        )
+
+        if not self.is_owner:
+            with patch(
+                "multiprocessing.resource_tracker.register",
+                lambda *args, **kwargs: None,
+            ):
+                segment = shared_memory.SharedMemory(name=payload[0]["name"])
+
+        self._segments.append(segment)
+        tensor = torch.frombuffer(segment.buf, dtype=dtype, count=numel).reshape(dims)
+        action = "create" if self.is_owner else "attach"
+        logger.info(
+            "DSA CP shared L2 host memory segment: %s shm_name=%s nbytes=%s "
+            "data_ptr=%#x (cp_rank=%s owner_rank=%s is_owner=%s kind=%s "
+            "shared_group_key=%s)",
+            action,
+            segment.name,
+            payload[0]["nbytes"],
+            tensor.data_ptr(),
+            self.rank,
+            self.owner_rank,
+            self.is_owner,
+            self.kind,
+            self.shared_group_key,
+        )
+        return tensor
+
+    def destroy(self) -> None:
+        for segment in self._segments:
+            segment.close()
+            if self.is_owner:
+                segment.unlink()
+        self._segments.clear()
 
 
 def get_allocator_from_storage(allocator_type):

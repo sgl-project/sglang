@@ -99,6 +99,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        allocator=None,
     ):
         super().__init__(
             device_pool,
@@ -109,6 +110,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            allocator,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
@@ -647,13 +649,14 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        allocator=None,
     ):
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.allocator = allocator or get_allocator_from_storage(allocator_type)
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
@@ -1270,6 +1273,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        allocator=None,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -1281,6 +1285,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            allocator,
         )
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize
@@ -1422,8 +1427,28 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        pool_transfers: Optional[list] = None,
+        load_shared_l2: bool = False,
     ):
+        cp_shared = getattr(device_pool, "enable_cp_shared_kvcache", False)
+        if cp_shared:
+            host_indices, device_indices = (
+                device_pool.get_cp_shared_hicache_transfer_indices(
+                    host_indices,
+                    device_indices,
+                    load_shared_l2=load_shared_l2,
+                )
+            )
+            if host_indices.numel() == 0:
+                device_pool.synchronize_cp_shared_hicache_transfer()
+                return
+
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -1504,9 +1529,29 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+        if cp_shared:
+            device_pool.synchronize_cp_shared_hicache_transfer()
+
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+        pool_transfers: Optional[list] = None,
     ):
+        cp_shared = getattr(device_pool, "enable_cp_shared_kvcache", False)
+        if cp_shared:
+            device_pool.synchronize_cp_shared_hicache_transfer()
+            host_indices, device_indices = (
+                device_pool.get_cp_shared_hicache_transfer_indices(
+                    host_indices, device_indices
+                )
+            )
+            if host_indices.numel() == 0:
+                device_pool.synchronize_cp_shared_hicache_transfer()
+                return
+
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -1587,6 +1632,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+        if cp_shared:
+            device_pool.synchronize_cp_shared_hicache_transfer()
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         if self.layout == "layer_first":
@@ -3127,7 +3175,14 @@ class PoolEntry:
 
 
 class HostPoolGroup:
-    def __init__(self, entries: list[PoolEntry]):
+    def __init__(
+        self,
+        entries: list[PoolEntry],
+        *,
+        enable_cp_shared_dsa_l2: bool = False,
+        owner_rank: int = 0,
+        cp_rank: int = 0,
+    ):
         if not entries:
             raise ValueError("HostPoolGroup requires at least one pool entry.")
         self.entries = entries
@@ -3145,6 +3200,12 @@ class HostPoolGroup:
             getattr(entry.host_pool, "can_use_write_back_jit", False)
             for entry in entries
         )
+        self.enable_cp_shared_dsa_l2 = enable_cp_shared_dsa_l2
+        self.cp_shared_l2_owner_rank = owner_rank
+        self.cp_shared_l2_cp_rank = cp_rank
+
+    def cp_shared_l2_is_owner(self) -> bool:
+        return self.cp_shared_l2_cp_rank == self.cp_shared_l2_owner_rank
 
     @property
     def kv_buffer(self):
@@ -3220,6 +3281,7 @@ class HostPoolGroup:
                 device_indices,
                 local_layer_id,
                 io_backend,
+                load_shared_l2=self.enable_cp_shared_dsa_l2,
             )
 
         # 2. Extra pool transfers
@@ -3246,6 +3308,20 @@ class HostPoolGroup:
         io_backend,
         pool_transfers: Optional[list] = None,
     ) -> None:
+        if self.enable_cp_shared_dsa_l2 and not self.cp_shared_l2_is_owner():
+            # The owner reads from CP-shared HBM before writing shared L2. Followers
+            # do not write payloads, but must participate in the owner's transfer
+            # barriers to keep collective ordering identical across CP ranks.
+            sync = getattr(
+                self.anchor_entry.device_pool,
+                "synchronize_cp_shared_hicache_transfer",
+                None,
+            )
+            if sync is not None:
+                sync()
+                sync()
+            return
+
         # 1. Anchor (KV) backup
         self.anchor_entry.host_pool.backup_from_device_all_layer(
             self.anchor_entry.device_pool,
@@ -3279,13 +3355,14 @@ class DSAIndexerPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        allocator=None,
     ):
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.allocator = allocator or get_allocator_from_storage(allocator_type)
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
@@ -3320,11 +3397,22 @@ class DSAIndexerPoolHost(HostKVCache):
                 f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free."
             )
-        logger.info(
-            "Allocating %.2f GB host memory for DSA indexer (layout=%s).",
-            requested_bytes / 1e9,
-            layout,
-        )
+        log_host_allocation = getattr(self.allocator, "log_host_allocation", None)
+        if log_host_allocation is not None:
+            log_host_allocation(
+                requested_bytes,
+                logger,
+                pool_name="DSA indexer",
+                token_capacity=self.size,
+                page_num=self.page_num,
+                page_size=self.page_size,
+            )
+        else:
+            logger.info(
+                "Allocating %.2f GB host memory for DSA indexer (layout=%s).",
+                requested_bytes / 1e9,
+                layout,
+            )
         self.init_kv_buffer()
         self.can_use_jit = False
         self.can_use_write_back_jit = False
