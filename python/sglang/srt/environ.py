@@ -378,6 +378,7 @@ class Envs:
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
+    SGLANG_SWA_CACHE_CHECKPOINT_MIN_TOKEN_INTERVAL = EnvInt(0)
     # For non-streaming requests, the scheduler still flushes intermediate
     # output batches to the tokenizer manager every N decoded tokens so that
     # `first_token_time`/TTFT can be recorded. Lower this (e.g. to 1) to get

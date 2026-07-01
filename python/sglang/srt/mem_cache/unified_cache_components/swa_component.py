@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -307,8 +308,7 @@ class SWAComponent(TreeComponent):
             return
 
         page_size = self.cache.page_size
-        # Smallest page-aligned size that still covers the sliding window.
-        tail_size = (self.sliding_window_size + page_size - 1) // page_size * page_size
+        tail_size = self._page_aligned_sliding_window_size()
         leaf_len = len(leaf.key)
         if leaf_len <= tail_size:
             return
@@ -406,30 +406,151 @@ class SWAComponent(TreeComponent):
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 1
 
+    def _page_aligned_sliding_window_size(self) -> int:
+        """Smallest page-aligned size that still covers the sliding window."""
+        page_size = self.cache.page_size
+        return ((self.sliding_window_size + page_size - 1) // page_size) * page_size
+
+    def _is_swa_checkpoint(self, node: UnifiedTreeNode, retain_len: int) -> bool:
+        cd = node.component_data[self.component_type]
+        return cd.value is not None and len(cd.value) >= retain_len
+
+    def _has_checkpoint_or_boundary_within_ancestors(
+        self, node: UnifiedTreeNode, retain_len: int, interval: int
+    ) -> bool:
+        distance = len(node.key)
+        cur = node.parent
+        while distance < interval:
+            if cur is None or cur is self.cache.root_node:
+                return True
+            if self._is_swa_checkpoint(cur, retain_len):
+                return True
+            distance += len(cur.key)
+            cur = cur.parent
+        return False
+
+    def _has_checkpoint_or_boundary_within_descendants(
+        self, node: UnifiedTreeNode, retain_len: int, interval: int
+    ) -> bool:
+        distance = 0
+        cur = node
+        while distance < interval:
+            if len(cur.children) != 1:
+                return True
+            child = next(iter(cur.children.values()))
+            distance += len(child.key)
+            if distance >= interval:
+                return False
+            if self._is_swa_checkpoint(child, retain_len):
+                return True
+            cur = child
+        return False
+
+    def _swa_evict_target(
+        self,
+        node: UnifiedTreeNode,
+        retain_len: int,
+        protect_window: bool,
+        checkpoint_interval: int,
+    ) -> Optional[UnifiedTreeNode]:
+        if not protect_window:
+            return node
+
+        is_device_leaf = node in self.cache.evictable_device_leaves
+        is_structural_checkpoint = is_device_leaf or len(node.children) > 1
+        if checkpoint_interval == -1:
+            retain_checkpoint = is_structural_checkpoint
+        elif checkpoint_interval > 0:
+            if is_structural_checkpoint:
+                retain_checkpoint = True
+            else:
+                prev_covered = self._has_checkpoint_or_boundary_within_ancestors(
+                    node, retain_len, checkpoint_interval
+                )
+                next_covered = self._has_checkpoint_or_boundary_within_descendants(
+                    node, retain_len, checkpoint_interval
+                )
+                retain_checkpoint = not (prev_covered and next_covered)
+        else:
+            retain_checkpoint = False
+
+        if not retain_checkpoint:
+            if is_device_leaf:
+                return None
+            return node
+
+        value_len = len(node.component_data[self.component_type].value)
+        if value_len <= retain_len:
+            return None
+
+        split_len = value_len - retain_len
+        assert split_len % self.cache.page_size == 0
+        # Preserve device LRU order so splitting under memory pressure does not
+        # promote either side as a new cache hit.
+        return self.cache._split_node(
+            node.key, node, split_len, preserve_lru_position=True
+        )
+
+    def _drive_eviction_pass(
+        self,
+        request: int,
+        tracker: dict[ComponentType, int],
+        protect_window: bool,
+    ) -> None:
+        ct = self.component_type
+        lru = self.cache.lru_lists[ct]
+        retain_len = self._page_aligned_sliding_window_size()
+        checkpoint_interval = envs.SGLANG_SWA_CACHE_CHECKPOINT_MIN_TOKEN_INTERVAL.get()
+        x = lru.get_lru_no_lock()
+        while tracker[ct] < request and x is not None:
+            if not lru.in_list(x):
+                x = lru.get_lru_no_lock()
+                continue
+            x_next = lru.get_prev_no_lock(x)
+            cd = x.component_data[ct]
+            assert cd.value is not None
+
+            evict_node = self._swa_evict_target(
+                x,
+                retain_len=retain_len,
+                protect_window=protect_window,
+                checkpoint_interval=checkpoint_interval,
+            )
+            if evict_node is None:
+                x = x_next
+                continue
+
+            if evict_node in self.cache.evictable_device_leaves:
+                # D-leaf: atomic eviction of all components.
+                self.cache._evict_device_leaf(evict_node, tracker)
+            else:
+                # Internal SWA is path data. First pass keeps a trailing
+                # sliding-window suffix so descendants can still reuse SWA.
+                self.cache._evict_component_and_detach_lru(
+                    evict_node,
+                    self,
+                    target=EvictLayer.DEVICE,
+                    tracker=tracker,
+                )
+                self.cache._cascade_evict(evict_node, self, tracker)
+            if not lru.in_list(x_next):
+                x_next = lru.get_lru_no_lock()
+            x = x_next
+
     def drive_eviction(
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
         request = params.swa_num_tokens
         ct = self.component_type
-        lru = self.cache.lru_lists[ct]
-        x = lru.get_lru_no_lock()
-        while tracker[ct] < request and x is not None and lru.in_list(x):
-            assert x.component_data[ct].value is not None
-            if x in self.cache.evictable_device_leaves:
-                # D-leaf: atomic eviction of all components
-                x_next = lru.get_prev_no_lock(x)
-                self.cache._evict_device_leaf(x, tracker)
-                if not lru.in_list(x_next):
-                    x_next = lru.get_lru_no_lock()
-                x = x_next
-            else:
-                # Internal: tombstone SWA + cascade
-                x_next = lru.get_prev_no_lock(x)
-                self.cache._evict_component_and_detach_lru(
-                    x, self, target=EvictLayer.DEVICE, tracker=tracker
-                )
-                self.cache._cascade_evict(x, self, tracker)
-                x = x_next
+        checkpoint_interval = envs.SGLANG_SWA_CACHE_CHECKPOINT_MIN_TOKEN_INTERVAL.get()
+        if checkpoint_interval != 0:
+            self._drive_eviction_pass(
+                request=request, tracker=tracker, protect_window=True
+            )
+        if tracker[ct] < request:
+            self._drive_eviction_pass(
+                request=request, tracker=tracker, protect_window=False
+            )
 
     def acquire_component_lock(
         self,

@@ -690,6 +690,28 @@ class UnifiedRadixCacheSuite:
             params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
         return tree.insert(params)
 
+    def _evict_with_dense_swa_checkpoints(
+        self, tree, params: EvictParams
+    ) -> EvictResult:
+        # Node keys are page-aligned and at least one token, so interval=1
+        # disables nearby-checkpoint suppression.
+        with envs.SGLANG_SWA_CACHE_CHECKPOINT_MIN_TOKEN_INTERVAL.override(1):
+            return tree.evict(params)
+
+    def _skip_unless_swa_checkpoint_config(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("covered by the dedicated SWA+Mamba test")
+        if self.cfg.page_size != 64 or self.cfg.sliding_window_size != 64:
+            self.skipTest("covered by representative SWA checkpoint config")
+
+    def _skip_unless_swa_mamba_checkpoint_config(self):
+        if not (self.cfg.has_swa and self.cfg.has_mamba):
+            self.skipTest("requires SWA and Mamba components")
+        if self.cfg.page_size != 64 or self.cfg.sliding_window_size != 64:
+            self.skipTest("covered by representative SWA+Mamba checkpoint config")
+
     def test_insert_and_match_basic(self):
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
 
@@ -2435,6 +2457,271 @@ class UnifiedRadixCacheSuite:
         swa_before = tree.swa_evictable_size()
         result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=swa_before * 2))
         self.assertEqual(tree.swa_evictable_size(), 0)
+        tree.sanity_check()
+
+    def test_swa_evict_internal_keeps_window_suffix(self):
+        self._skip_unless_swa_checkpoint_config()
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
+        base = self._make_seq(1, retain_len // ps + 2)
+        leaf = base + self._make_seq(5000, 1)
+        self._insert(tree, allocator, req_to_token_pool, base)
+        self._insert(tree, allocator, req_to_token_pool, leaf)
+
+        # Insert-time SWA leaf capping may have already split base; assert the
+        # eviction-time split against the actual LRU target.
+        evict_target = tree.lru_lists[ComponentType.SWA].get_lru_no_lock()
+        evicted_len = (
+            len(evict_target.component_data[ComponentType.SWA].value) - retain_len
+        )
+        self.assertGreater(evicted_len, 0)
+
+        before = tree.swa_evictable_size()
+        result = self._evict_with_dense_swa_checkpoints(
+            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
+        )
+        self.assertEqual(result.swa_num_tokens_evicted, evicted_len)
+        self.assertEqual(tree.swa_evictable_size(), before - evicted_len)
+
+        split_parent = next(iter(tree.root_node.children.values()))
+        self.assertEqual(len(split_parent.key), evicted_len)
+        self.assertIsNone(split_parent.component_data[ComponentType.SWA].value)
+        suffix = next(iter(split_parent.children.values()))
+        self.assertEqual(len(suffix.key), retain_len)
+        self.assertIsNotNone(suffix.component_data[ComponentType.SWA].value)
+
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", leaf))))
+        self.assertEqual(len(match.device_indices), len(leaf))
+        tree.sanity_check()
+
+    def test_swa_retention_split_preserves_lru_position(self):
+        self._skip_unless_swa_checkpoint_config()
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
+        base = self._make_seq(1, retain_len // ps + 2)
+        leaf = base + self._make_seq(5000, 1)
+        other_base = self._make_seq(9000, retain_len // ps + 1)
+        other_leaf = other_base + self._make_seq(12000, 1)
+        self._insert(tree, allocator, req_to_token_pool, base)
+        self._insert(tree, allocator, req_to_token_pool, leaf)
+        self._insert(tree, allocator, req_to_token_pool, other_base)
+        self._insert(tree, allocator, req_to_token_pool, other_leaf)
+
+        swa_lru = tree.lru_lists[ComponentType.SWA]
+        old_lru = swa_lru.get_lru_no_lock()
+        old_next = old_lru.lru_next[swa_lru._pt]
+        old_access_time = old_lru.last_access_time
+        self._evict_with_dense_swa_checkpoints(
+            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
+        )
+
+        suffix = swa_lru.get_lru_no_lock()
+        self.assertIsNotNone(suffix.component_data[ComponentType.SWA].value)
+        self.assertIs(suffix.lru_next[swa_lru._pt], old_next)
+        self.assertEqual(suffix.last_access_time, old_access_time)
+        tree.sanity_check()
+
+    def test_swa_checkpoint_interval_default_zero_skips_soft_pass(self):
+        self._skip_unless_swa_checkpoint_config()
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
+        base = self._make_seq(1, retain_len // ps)
+        leaf = base + self._make_seq(5000, 1)
+        self._insert(tree, allocator, req_to_token_pool, base)
+        self._insert(tree, allocator, req_to_token_pool, leaf)
+
+        before = tree.swa_evictable_size()
+        self.assertEqual(envs.SGLANG_SWA_CACHE_CHECKPOINT_MIN_TOKEN_INTERVAL.default, 0)
+        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=before))
+
+        self.assertEqual(result.swa_num_tokens_evicted, before)
+        self.assertEqual(tree.swa_evictable_size(), 0)
+        tree.sanity_check()
+
+    def test_swa_checkpoint_structural_only_candidates(self):
+        self._skip_unless_swa_checkpoint_config()
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
+        seq = self._make_seq(1, 2 * (retain_len // ps) + 2)
+        extended = seq + self._make_seq(9000, 1)
+        branch = seq + self._make_seq(12000, 1)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        self._insert(tree, allocator, req_to_token_pool, extended)
+
+        comp = tree.components[ComponentType.SWA]
+        prefix = next(iter(tree.root_node.children.values()))
+        suffix = next(iter(prefix.children.values()))
+        leaf = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", extended)))
+        ).last_device_node
+
+        self.assertEqual(len(prefix.children), 1)
+        self.assertNotIn(prefix, tree.evictable_device_leaves)
+        self.assertIs(comp._swa_evict_target(prefix, retain_len, True, -1), prefix)
+        self.assertIsNone(comp._swa_evict_target(leaf, retain_len, True, -1))
+
+        self._insert(tree, allocator, req_to_token_pool, branch)
+        self.assertGreater(len(suffix.children), 1)
+        self.assertIsNone(comp._swa_evict_target(suffix, retain_len, True, -1))
+        self.assertIsNone(
+            comp._swa_evict_target(suffix, retain_len, True, retain_len + ps)
+        )
+        tree.sanity_check()
+
+    def test_swa_checkpoint_interval_retains_when_only_next_side_is_covered(self):
+        self._skip_unless_swa_checkpoint_config()
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
+        seq = self._make_seq(1, 2 * (retain_len // ps) + 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        comp = tree.components[ComponentType.SWA]
+        prefix = next(iter(tree.root_node.children.values()))
+        suffix = next(iter(prefix.children.values()))
+        self.assertEqual(
+            len(suffix.component_data[ComponentType.SWA].value), retain_len
+        )
+
+        self.assertIs(
+            comp._swa_evict_target(prefix, retain_len, True, len(prefix.key) + ps),
+            prefix,
+        )
+        target = comp._swa_evict_target(prefix, retain_len, True, retain_len + ps)
+        self.assertIsNot(target, prefix)
+        self.assertIs(next(iter(tree.root_node.children.values())), target)
+        self.assertIsNotNone(target.component_data[ComponentType.SWA].value)
+        self.assertEqual(
+            len(prefix.component_data[ComponentType.SWA].value), retain_len
+        )
+        tree.sanity_check()
+
+    def test_swa_evict_second_pass_clears_retained_window(self):
+        self._skip_unless_swa_checkpoint_config()
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
+        base = self._make_seq(1, retain_len // ps)
+        leaf = base + self._make_seq(5000, 1)
+        self._insert(tree, allocator, req_to_token_pool, base)
+        self._insert(tree, allocator, req_to_token_pool, leaf)
+
+        # First eviction can satisfy the small request from the leaf while
+        # deferring the window-sized internal node.
+        result = self._evict_with_dense_swa_checkpoints(
+            tree, EvictParams(num_tokens=0, swa_num_tokens=ps)
+        )
+        self.assertEqual(result.swa_num_tokens_evicted, ps)
+        self.assertEqual(tree.swa_evictable_size(), retain_len)
+
+        # When pressure remains, the second pass is allowed to evict the
+        # retained window.
+        result = self._evict_with_dense_swa_checkpoints(
+            tree, EvictParams(num_tokens=0, swa_num_tokens=retain_len)
+        )
+        self.assertEqual(result.swa_num_tokens_evicted, retain_len)
+        self.assertEqual(tree.swa_evictable_size(), 0)
+        tree.sanity_check()
+
+    def test_swa_evict_mamba_keeps_retained_suffix_state(self):
+        self._skip_unless_swa_mamba_checkpoint_config()
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
+        base = self._make_seq(1, retain_len // ps + 2)
+        leaf = base + self._make_seq(5000, 1)
+        self._insert(tree, allocator, req_to_token_pool, base)
+        self._insert(tree, allocator, req_to_token_pool, leaf)
+
+        result = self._evict_with_dense_swa_checkpoints(
+            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
+        )
+        self.assertGreater(result.swa_num_tokens_evicted, 0)
+
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", base))))
+        suffix = match.best_match_node
+        self.assertIsNot(suffix, tree.root_node)
+        self.assertIsNotNone(suffix.component_data[ComponentType.SWA].value)
+        self.assertGreaterEqual(
+            len(suffix.component_data[ComponentType.SWA].value), retain_len
+        )
+        self.assertIsNotNone(suffix.component_data[ComponentType.MAMBA].value)
+        tree.sanity_check()
+
+    def test_swa_evict_retention_split_preserves_host_state(self):
+        self._skip_unless_swa_checkpoint_config()
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
+        base = self._make_seq(1, retain_len // ps + 2)
+        leaf = base + self._make_seq(5000, 1)
+        self._insert(tree, allocator, req_to_token_pool, base)
+        self._insert(tree, allocator, req_to_token_pool, leaf)
+        self._simulate_backup_tree(tree)
+
+        # Insert-time SWA leaf capping may have already split base; assert the
+        # eviction-time split against the actual LRU target.
+        evict_target = tree.lru_lists[ComponentType.SWA].get_lru_no_lock()
+        evicted_len = (
+            len(evict_target.component_data[ComponentType.SWA].value) - retain_len
+        )
+        self.assertGreater(evicted_len, 0)
+
+        result = self._evict_with_dense_swa_checkpoints(
+            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
+        )
+        self.assertEqual(result.swa_num_tokens_evicted, evicted_len)
+
+        split_parent = next(iter(tree.root_node.children.values()))
+        suffix = next(iter(split_parent.children.values()))
+        parent_swa = split_parent.component_data[ComponentType.SWA]
+        suffix_swa = suffix.component_data[ComponentType.SWA]
+        self.assertIsNone(parent_swa.value)
+        self.assertIsNotNone(parent_swa.host_value)
+        self.assertEqual(len(parent_swa.host_value), evicted_len)
+        self.assertTrue(tree.host_lru_lists[ComponentType.SWA].in_list(split_parent))
+        self.assertIsNotNone(suffix_swa.value)
+        self.assertIsNotNone(suffix_swa.host_value)
+        self.assertEqual(len(suffix_swa.value), retain_len)
+        self.assertEqual(len(suffix_swa.host_value), retain_len)
+        self.assertFalse(tree.host_lru_lists[ComponentType.SWA].in_list(suffix))
+        tree.sanity_check()
+
+    def test_swa_evict_skips_locked_internal_node(self):
+        self._skip_unless_swa_checkpoint_config()
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
+        base = self._make_seq(1, retain_len // ps + 2)
+        leaf = base + self._make_seq(5000, 1)
+        self._insert(tree, allocator, req_to_token_pool, base)
+        self._insert(tree, allocator, req_to_token_pool, leaf)
+
+        locked = next(iter(tree.root_node.children.values()))
+        locked_len = len(locked.key)
+        lock_result = tree.inc_lock_ref(locked)
+        try:
+            self._evict_with_dense_swa_checkpoints(
+                tree, EvictParams(num_tokens=0, swa_num_tokens=1)
+            )
+            self.assertIn(locked.key.child_key(ps), tree.root_node.children)
+            self.assertEqual(len(locked.key), locked_len)
+            self.assertIsNotNone(locked.component_data[ComponentType.SWA].value)
+        finally:
+            tree.dec_lock_ref(locked, lock_result.to_dec_params())
         tree.sanity_check()
 
     def test_evict_d_leaf_set_consistency(self):
