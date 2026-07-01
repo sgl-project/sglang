@@ -1650,28 +1650,24 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
 
         # Report cached tokens with detailed source breakdown
         if cached_tokens > 0:
-            if cached_tokens_details:
-                # Report by cache source (device/host, and storage if L3 enabled)
-                def report_cache_source(source: str, value: int):
-                    if value > 0:
-                        source_labels = {**labels, "cache_source": source}
-                        self.cached_tokens_total.labels(**source_labels).inc(value)
+            # Report by cache source (device/host, and storage if L3 enabled)
+            def report_cache_source(source: str, value: int):
+                source_labels = {**labels, "cache_source": source}
+                self.cached_tokens_total.labels(**source_labels).inc(value)
 
+            if cached_tokens_details:
                 report_cache_source("device", cached_tokens_details.get("device", 0))
                 report_cache_source("host", cached_tokens_details.get("host", 0))
 
                 # Storage fields are only present when L3 storage backend is enabled
                 if "storage" in cached_tokens_details:
-                    storage_tokens = cached_tokens_details.get("storage", 0)
-                    if storage_tokens > 0:
-                        backend = (
-                            cached_tokens_details.get("storage_backend") or "unknown"
-                        )
-                        report_cache_source(f"storage_{backend}", storage_tokens)
+                    backend = cached_tokens_details.get("storage_backend") or "unknown"
+                    report_cache_source(
+                        f"storage_{backend}", cached_tokens_details["storage"]
+                    )
             else:
                 # Fallback for backward compatibility
-                labels_total = {**labels, "cache_source": "total"}
-                self.cached_tokens_total.labels(**labels_total).inc(cached_tokens)
+                report_cache_source("total", cached_tokens)
 
         self.num_requests_total.labels(**labels).inc(1)
         if has_grammar:
