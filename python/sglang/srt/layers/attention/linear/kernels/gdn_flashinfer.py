@@ -194,7 +194,14 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         else:
             # TODO: Once FlashInfer PR#2521 is merged for SM90, gather/scatter
             # will no longer be needed here.
-            state_batch = ssm_states[cache_indices]
+            # Remap -1 (dummy padding during CUDA graph) to last pool slot.
+            # Gather: reading garbage from sentinel slot is harmless.
+            safe_indices = torch.where(
+                cache_indices >= 0,
+                cache_indices,
+                ssm_states.shape[0] - 1,
+            )
+            state_batch = ssm_states[safe_indices]
             output_fi, new_state = self._decode_fn(
                 q=query_fi,
                 k=key_fi,
@@ -208,7 +215,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 output=None,
                 use_qk_l2norm=True,
             )
-            ssm_states[cache_indices] = new_state
+            # For dummy requests (cache_indices=-1), write back the original
+            # state_batch instead of garbage new_state.  CUDA-graph safe.
+            valid = (cache_indices >= 0).view(-1, 1, 1, 1)
+            ssm_states[safe_indices] = torch.where(valid, new_state, state_batch)
 
         return output_fi.view(1, batch_size, num_v_heads, head_v_dim)
 
@@ -286,12 +296,17 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 use_qk_l2norm_in_kernel=False,
             )
 
-        # Write back state to pool
-        ssm_states.index_copy_(
-            0,
-            ssm_cache_indices,
-            output_state_fi.to(ssm_states.dtype),
-        )
+        # Write back state to pool — only for valid (non-dummy) sequences.
+        # During CUDA graph capture, dummy requests have cache_indices=-1
+        # (remapped to pool_size-1 above for gather). We must NOT scatter
+        # their garbage results back, as that would corrupt the last pool slot.
+        valid_mask = cache_indices >= 0
+        if valid_mask.any():
+            ssm_states.index_copy_(
+                0,
+                ssm_cache_indices[valid_mask],
+                output_state_fi[valid_mask].to(ssm_states.dtype),
+            )
 
         # Output: [seq, HV, V] -> [1, seq, HV, V]
         core_attn_out = output_fi.view(1, total_seq_len, num_v_heads, head_v_dim)
