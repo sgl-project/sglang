@@ -1,8 +1,9 @@
-"""Unit tests for the fused append + DeepEP-remap shared-experts Triton kernel.
+"""Unit tests for fused append + per-rank shared-slot remap.
 
 Covers ``fused_append_remap_shared_experts_deepep``, which collapses
-``fused_append_shared_experts()`` followed by ``_remap_topk_for_deepep()`` into a
-single Triton launch on the aiter/DeepEP-class path. The kernel is GPU-only
+``fused_append_shared_experts()`` followed by
+``remap_topk_for_per_rank_shared_slots()`` into a
+single Triton launch on the per-rank shared-slot path. The kernel is GPU-only
 (Triton), so these tests are skipped when no accelerator is present.
 """
 
@@ -14,7 +15,11 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels impo
     fused_append_remap_shared_experts_deepep,
     fused_append_shared_experts,
 )
-from sglang.srt.layers.moe.topk import TopKConfig, _remap_topk_for_deepep, _use_aiter
+from sglang.srt.layers.moe.topk import (
+    TopKConfig,
+    _use_aiter,
+    remap_topk_for_per_rank_shared_slots,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -50,7 +55,7 @@ def _reference_append_remap(
 @unittest.skipUnless(
     torch.cuda.is_available(), "fused append+remap kernel requires a GPU"
 )
-class TestFusedAppendRemapDeepEP(CustomTestCase):
+class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
     # (m, k, num_physical_routed, ep_size, ep_rank, num_fused_shared_experts).
     # k and num_fused_shared_experts are kept powers of two (tl.arange constraint).
     CASES = [
@@ -107,7 +112,7 @@ class TestFusedAppendRemapDeepEP(CustomTestCase):
                 self.assertTrue(torch.allclose(got_w, exp_w))
 
     def test_equivalence_with_eager_append_then_remap(self):
-        """Fused kernel == fused_append_shared_experts() + _remap_topk_for_deepep().
+        """Fused kernel == append shared experts + per-rank shared-slot remap.
 
         The eager remap overwrites the shared weight: 1.0 on the aiter/HIP path
         (routed_scaling_factor is pre-folded into the routed topk weights), else
@@ -140,7 +145,7 @@ class TestFusedAppendRemapDeepEP(CustomTestCase):
                         scale_factor,
                         npr,  # shared-expert base id (overwritten by the remap)
                     )
-                    eager_ids, eager_w = _remap_topk_for_deepep(
+                    eager_ids, eager_w = remap_topk_for_per_rank_shared_slots(
                         eager_ids,
                         eager_w,
                         s,
