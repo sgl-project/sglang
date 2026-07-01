@@ -311,6 +311,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
                     dim=hidden_size,
                     intermediate_dim=mlp_hidden_size,
                     num_heads=num_heads,
+                    head_size=head_dim,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
                     quant_config=quant_config,
@@ -323,6 +324,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         self.merger = Qwen2_5_VisionPatchMerger(
             dim=vision_config.out_hidden_size,
             context_dim=hidden_size,
+            padded_context_dim=num_heads * head_dim,
             spatial_merge_size=spatial_merge_size,
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),
