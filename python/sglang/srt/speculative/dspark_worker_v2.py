@@ -826,7 +826,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         block_ids = torch.full(
             (bs, block_size), self.noise_token_id, dtype=torch.int64, device=device
         )
-        block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
+        if draft_input.bonus_tokens.numel() == bs:
+            block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
 
         positions_2d = prefix_lens.unsqueeze(1) + self._block_pos_offsets
         positions = positions_2d.reshape(-1).to(torch.int64)
