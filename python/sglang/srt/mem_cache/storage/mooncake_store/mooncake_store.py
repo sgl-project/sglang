@@ -434,7 +434,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     raise RuntimeError(
                         "MooncakeStore with standalone_storage=True requires MooncakeHostTensorAllocator. "
                         "Please set standalone_storage=False "
-                        "or upgrade Mooncake by 'pip install mooncake --upgrade'."
+                        "or upgrade Mooncake by 'pip install mooncake-transfer-engine --upgrade'."
                     )
                 required_bytes = self._standalone_required_bytes(mem_pool)
                 ret_code = self.store.setup_dummy(
