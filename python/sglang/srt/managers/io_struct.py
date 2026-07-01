@@ -769,6 +769,14 @@ class GenerateReqInput:
                 if self.multi_item_delimiter_indices is not None
                 else None
             ),
+            # EPD-disaggregation fields (issue #27217)
+            need_wait_for_mm_inputs=self.need_wait_for_mm_inputs,
+            num_items_assigned=self.num_items_assigned,
+            mm_data_mooncake=(
+                self.mm_data_mooncake[i] if self.mm_data_mooncake is not None else None
+            ),
+            # Responses API background flag (issue #27231)
+            background=self.background,
         )
         cache[i] = sub
         return sub
