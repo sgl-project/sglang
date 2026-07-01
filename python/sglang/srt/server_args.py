@@ -2541,6 +2541,12 @@ class ServerArgs:
             "If not set, uses /tmp/sglang_weight_cache_gpu{tp_rank}.sock",
         ),
     ] = None
+    weight_cache_timeout: A[
+        int,
+        Arg(
+            help="Timeout in seconds for weight cache daemon readiness (default: 1800).",
+        ),
+    ] = 1800
 
     # -------------------------------------------------------------------------
     # Custom hooks, probe, and plugins

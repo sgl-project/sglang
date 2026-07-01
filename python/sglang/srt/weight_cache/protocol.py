@@ -12,6 +12,8 @@ import struct
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Optional
 
+from sglang.srt.utils.common import safe_pickle_loads
+
 logger = logging.getLogger(__name__)
 
 # Socket path template for weight cache daemons (keyed by global rank
@@ -34,6 +36,8 @@ class CacheConfig:
     model_arch: str
     tp_size: int
     tp_rank: int
+    pp_size: int
+    pp_rank: int
     dp_size: int
     ep_size: int
     quant_method: str  # e.g. "fp8", "gptq_marlin", "" for unquantized
@@ -47,6 +51,8 @@ class CacheConfig:
             and self.model_arch == other.model_arch
             and self.tp_size == other.tp_size
             and self.tp_rank == other.tp_rank
+            and self.pp_size == other.pp_size
+            and self.pp_rank == other.pp_rank
             and self.dp_size == other.dp_size
             and self.ep_size == other.ep_size
             and self.quant_method == other.quant_method
@@ -112,7 +118,7 @@ def recv_msg(sock) -> Any:
     data = _recv_exact(sock, length)
     if data is None:
         raise ConnectionError("Connection closed while reading message body")
-    return pickle.loads(data)
+    return safe_pickle_loads(data)
 
 
 def _recv_exact(sock, n: int) -> Optional[bytes]:

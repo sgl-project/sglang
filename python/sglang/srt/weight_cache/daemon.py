@@ -230,6 +230,8 @@ class WeightCacheDaemon:
             ),
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
+            pp_size=self.pp_size,
+            pp_rank=self.pp_rank,
             dp_size=self.dp_size,
             ep_size=self.ep_size,
             quant_method=quant_method,
@@ -335,6 +337,7 @@ class WeightCacheDaemon:
 
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.bind(self.socket_path)
+        os.chmod(self.socket_path, 0o600)
         sock.listen(8)
         sock.settimeout(1.0)  # Allow periodic shutdown check
 

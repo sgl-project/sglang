@@ -594,6 +594,12 @@ class Engine(EngineScoreMixin, EngineBase):
         TP-sharded model loading works correctly. Each daemon holds its
         rank's weight shard in GPU memory and serves IPC handles.
         """
+        if server_args.dp_size > 1:
+            raise ValueError(
+                "Weight cache daemon mode does not support dp_size > 1. "
+                "Please set --dp-size 1 when using --weight-cache-mode daemon."
+            )
+
         tp_size = server_args.tp_size
 
         pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
@@ -657,7 +663,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 daemon_procs.append(proc)
 
         # Wait for all daemons to be ready (ready file exists)
-        timeout = 1800  # 30 min timeout for large model loading
+        timeout = server_args.weight_cache_timeout
         check_interval = 2
         elapsed = 0
         for pp_rank in pp_rank_range:
@@ -677,8 +683,7 @@ class Engine(EngineScoreMixin, EngineBase):
                     for p in daemon_procs:
                         if not p.is_alive():
                             raise RuntimeError(
-                                f"Weight cache daemon for pp_rank={pp_rank} "
-                                f"tp_rank={tp_rank} exited prematurely "
+                                f"Weight cache daemon {p.name} exited prematurely "
                                 f"with code {p.exitcode}"
                             )
                 logger.info(

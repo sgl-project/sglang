@@ -378,6 +378,8 @@ class IpcModelLoader(BaseModelLoader):
             )
             from sglang.srt.distributed.parallel_state import (
                 get_moe_expert_parallel_world_size,
+                get_pipeline_model_parallel_rank,
+                get_pipeline_model_parallel_world_size,
             )
 
             try:
@@ -386,6 +388,13 @@ class IpcModelLoader(BaseModelLoader):
             except Exception:
                 tp_size = 1
                 tp_rank = 0
+
+            try:
+                pp_size = get_pipeline_model_parallel_world_size()
+                pp_rank = get_pipeline_model_parallel_rank()
+            except Exception:
+                pp_size = 1
+                pp_rank = 0
 
             try:
                 ep_size = get_moe_expert_parallel_world_size()
@@ -410,6 +419,8 @@ class IpcModelLoader(BaseModelLoader):
                 ),
                 tp_size=tp_size,
                 tp_rank=tp_rank,
+                pp_size=pp_size,
+                pp_rank=pp_rank,
                 dp_size=1,  # TODO: get actual dp_size
                 ep_size=ep_size,
                 quant_method=quant_method,
