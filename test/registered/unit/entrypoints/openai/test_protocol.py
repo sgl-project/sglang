@@ -16,7 +16,7 @@
 import unittest
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -472,6 +472,70 @@ class TestFunctionDeferLoading(unittest.TestCase):
         self.assertEqual(parts[0].type, "tool_reference")
         self.assertEqual(parts[0].name, "search_db")
         self.assertEqual(parts[1].type, "text")
+
+
+class TestToolPromptSerialization(unittest.TestCase):
+    """Tools rendered into the prompt via apply_chat_template must preserve the
+    client-provided schema and not leak Pydantic defaults (strict=False,
+    defer_loading=None), which would change the prompt. See #29061.
+
+    The serving path dumps tools with model_dump(exclude_unset=True); these
+    tests pin that contract on the validated Tool model.
+    """
+
+    def _dump(self, raw):
+        tools = TypeAdapter(List[Tool]).validate_python(raw)
+        return [t.model_dump(exclude_unset=True) for t in tools]
+
+    def test_unset_defaults_not_leaked_into_prompt(self):
+        """A minimal tool must round-trip without injected strict/defer_loading."""
+        raw = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "add",
+                    "description": "Add two numbers.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        dumped = self._dump(raw)
+        self.assertEqual(dumped, raw)
+        self.assertNotIn("strict", dumped[0]["function"])
+        self.assertNotIn("defer_loading", dumped[0]["function"])
+        self.assertNotIn("defer_loading", dumped[0])
+
+    def test_tool_level_defer_loading_propagation_preserved(self):
+        """exclude_unset must keep the value propagated to Function by the
+        validator, so defer_loading support (#22702) does not regress."""
+        raw = [
+            {
+                "type": "function",
+                "defer_loading": True,
+                "function": {"name": "add", "parameters": {"type": "object"}},
+            }
+        ]
+        dumped = self._dump(raw)
+        self.assertTrue(dumped[0]["function"]["defer_loading"])
+
+    def test_explicit_values_preserved(self):
+        """Values the client explicitly sets must survive, even when equal to
+        the field default (strict=False, defer_loading=False)."""
+        raw = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "add",
+                    "parameters": {"type": "object"},
+                    "strict": True,
+                    "defer_loading": False,
+                },
+            }
+        ]
+        dumped = self._dump(raw)
+        self.assertTrue(dumped[0]["function"]["strict"])
+        self.assertIn("defer_loading", dumped[0]["function"])
+        self.assertFalse(dumped[0]["function"]["defer_loading"])
 
 
 class TestValidationEdgeCases(unittest.TestCase):
