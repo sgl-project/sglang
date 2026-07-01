@@ -39,6 +39,10 @@ from sglang.srt.debug_utils.comparator.per_token_visualizer import (
 )
 from sglang.srt.debug_utils.comparator.preset import PRESETS, expand_preset
 from sglang.srt.debug_utils.comparator.report_sink import report_sink
+from sglang.srt.debug_utils.comparator.threshold_dsl import (
+    DiffThresholdRule,
+    parse_diff_threshold_rules,
+)
 from sglang.srt.debug_utils.comparator.utils import (
     Pair,
     auto_descend_dir,
@@ -63,6 +67,14 @@ def main() -> None:
 
 
 def run(args: argparse.Namespace) -> int:
+    # Per-run reset of the failing-tensor diagnostic-detail budget (the
+    # comparator emits full percentile detail only for the first N failures).
+    from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
+        reset_failure_detail_budget,
+    )
+
+    reset_failure_detail_budget()
+
     report_sink.configure(
         output_format=args.output_format,
         report_path=None,
@@ -140,7 +152,7 @@ def run(args: argparse.Namespace) -> int:
             dir_pair=dir_pair,
             token_aligner_mode=ta_result.mode,
             token_aligner_plan=ta_result.plan,
-            diff_threshold=args.diff_threshold,
+            diff_threshold_rules=parse_diff_threshold_rules(args.diff_threshold),
             thd_seq_lens_by_step_pair=ta_result.thd_seq_lens_by_step_pair,
             viz_output_dir=viz_output_dir,
             compute_per_token=visualize_per_token is not None,
@@ -220,7 +232,7 @@ def _compare_bundle_pairs(
     dir_pair: Pair[Path],
     token_aligner_mode: Optional[str],
     token_aligner_plan: Optional[TokenAlignerPlan],
-    diff_threshold: float,
+    diff_threshold_rules: Optional[list[DiffThresholdRule]] = None,
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]],
     viz_output_dir: Optional[Path] = None,
     compute_per_token: bool = False,
@@ -255,7 +267,7 @@ def _compare_bundle_pairs(
                 dir_pair=dir_pair,
                 token_aligner_mode=token_aligner_mode,
                 token_aligner_plan=token_aligner_plan,
-                diff_threshold=diff_threshold,
+                diff_threshold_rules=diff_threshold_rules,
                 thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
                 viz_output_dir=viz_output_dir,
                 compute_per_token=compute_per_token,
@@ -331,7 +343,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--target-path", type=str)
     parser.add_argument("--start-step", type=int, default=0)
     parser.add_argument("--end-step", type=int, default=1000000)
-    parser.add_argument("--diff-threshold", type=float, default=1e-3)
+    parser.add_argument(
+        "--diff-threshold",
+        nargs="*",
+        default=None,
+        metavar="REGEX PREDICATE",
+        help="Per-tensor pass criterion. Either a single float shorthand "
+        "(0.0085 == '.*' 'rel <= 0.0085'), or (regex predicate) pairs, e.g. "
+        "--diff-threshold '.*expert.*' 'rel <= 0.0085 or max_abs <= 1e-3' '.*' 'rel <= 0.0085'. "
+        "A tensor uses the first fullmatching regex's predicate -- a boolean expression "
+        "over rel/max_abs/mean_abs with < <= > >= and and/or. A tensor matching no "
+        "pattern is an error. Default: 'rel <= 1e-3' for every tensor.",
+    )
     parser.add_argument(
         "--filter", type=str, default=None, help="Regex to filter filenames (include)"
     )
