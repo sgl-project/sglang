@@ -95,7 +95,6 @@ def fused_topk_npu(
             renormalize
             and topk_config.apply_routed_scaling_factor_on_output
             and topk_config.routed_scaling_factor is not None
-            and topk_config.routed_scaling_factor != 1.0
         ):
             topk_weights = topk_weights * topk_config.routed_scaling_factor
 
