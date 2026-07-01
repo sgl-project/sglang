@@ -54,6 +54,83 @@ def test_remote_video_gt_candidates_survive_inconclusive_probe(monkeypatch):
     ]
 
 
+def test_remote_image_gt_prefers_official_when_present(monkeypatch):
+    official_prefix = test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE + "/"
+    monkeypatch.setattr(
+        test_utils,
+        "_remote_file_exists",
+        lambda url: url.startswith(official_prefix),
+    )
+
+    files = test_utils._find_remote_consistency_gt_files(
+        "unit_image",
+        1,
+        is_video=False,
+    )
+
+    assert files == [
+        (
+            "unit_image_1gpu.png",
+            (
+                f"{test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE}"
+                "/unit_image_1gpu.png"
+            ),
+        )
+    ]
+
+
+def test_remote_image_gt_falls_back_to_sglang_when_official_missing(monkeypatch):
+    sglang_prefix = test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE + "/"
+    monkeypatch.setattr(
+        test_utils,
+        "_remote_file_exists",
+        lambda url: url.startswith(sglang_prefix),
+    )
+
+    files = test_utils._find_remote_consistency_gt_files(
+        "unit_image",
+        1,
+        is_video=False,
+    )
+
+    assert files == [
+        (
+            "unit_image_1gpu.png",
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                "/unit_image_1gpu.png"
+            ),
+        )
+    ]
+
+
+def test_remote_npu_image_gt_prefers_official_ascend_when_present(monkeypatch):
+    official_ascend_prefix = (
+        test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE_ASCEND + "/"
+    )
+    monkeypatch.setattr(
+        test_utils,
+        "_remote_file_exists",
+        lambda url: url.startswith(official_ascend_prefix),
+    )
+
+    files = test_utils._find_remote_consistency_gt_files(
+        "unit_npu_image",
+        1,
+        is_video=False,
+    )
+
+    assert files == [
+        (
+            "unit_npu_image_1gpu.png",
+            (
+                f"{test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE_ASCEND}"
+                "/unit_npu_image_1gpu.png"
+            ),
+        )
+    ]
+
+
 def test_pixel_metrics_identical_image():
     image = _solid_image(128)
 
