@@ -851,6 +851,16 @@ class SchedulerBatchResultProcessor:
                     if get_global_server_args().enable_mamba_extra_buffer_lazy()
                     else True
                 )
+                # Ensure decode output tokens' KV is included in radix cache.
+                # During decode, kv_committed_len may lag behind the actual
+                # number of committed KV entries. Sync it to the full decode
+                # length (excluding the just-sampled last token which has no
+                # KV entry). Use max() to avoid lowering the value when overlap
+                # scheduling has already pre-incremented it for the next step.
+                req.kv_committed_len = max(
+                    req.kv_committed_len,
+                    len(req.origin_input_ids) + len(req.output_ids) - 1,
+                )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
             req.time_stats.set_completion_time()
