@@ -657,7 +657,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     query_start_loc=query_start_loc,
                 )
 
-            if (is_npu() or is_cpu()) and last_recurrent_state is not None:
+            # Persist the SSM recurrent state so decode can continue the recurrence.
+            # The non-BI CUDA extend kernel writes ssm_states in place (it receives
+            # ssm_states as initial_state with cache_indices), but torch_chunk_gated_delta_rule
+            # only READS ssm_states and returns the final state, so in batch-invariant
+            # mode on CUDA it must be written back explicitly. Without this the first
+            # decode tokens start from a stale SSM state (layer 0 decode core_attn_out
+            # diverged ~1.5, decaying over steps as the gated decay washed out the error).
+            write_back = (
+                is_npu() or is_cpu() or is_batch_invariant_mode_enabled()
+            )
+            if write_back and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )
