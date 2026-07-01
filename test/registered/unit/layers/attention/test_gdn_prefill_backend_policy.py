@@ -9,6 +9,8 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNKernelDispatcher,
     maybe_set_default_flashinfer_gdn_prefill,
 )
+from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -140,21 +142,36 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
         self.assertIsNone(self.apply_policy(make_runner(multimodal=True)))
 
     def test_tree_verify_uses_triton_kernel(self):
-        dispatcher = object.__new__(GDNKernelDispatcher)
-        dispatcher.verify_kernel = MagicMock()
-        dispatcher.tree_verify_kernel = MagicMock()
+        flashinfer_kernel = MagicMock(supports_target_verify=True)
+        with (
+            patch.object(gdn_backend, "is_cuda", return_value=True),
+            patch(
+                "sglang.srt.layers.attention.linear.kernels.gdn_flashinfer."
+                "FlashInferGDNKernel",
+                return_value=flashinfer_kernel,
+            ),
+        ):
+            dispatcher = GDNKernelDispatcher(
+                LinearAttnKernelBackend.TRITON,
+                LinearAttnKernelBackend.FLASHINFER,
+            )
+
+        self.assertIsInstance(dispatcher.tree_verify_kernel, TritonGDNKernel)
 
         tensor = sentinel.tensor
-        dispatcher.target_verify(
-            *([tensor] * 7),
-            ssm_states=tensor,
-            cache_indices=tensor,
-            query_start_loc=tensor,
-            retrieve_parent_token=sentinel.parent_token,
-        )
+        with patch.object(
+            dispatcher.tree_verify_kernel, "target_verify"
+        ) as tree_verify:
+            dispatcher.target_verify(
+                *([tensor] * 7),
+                ssm_states=tensor,
+                cache_indices=tensor,
+                query_start_loc=tensor,
+                retrieve_parent_token=sentinel.parent_token,
+            )
 
-        dispatcher.tree_verify_kernel.target_verify.assert_called_once()
-        dispatcher.verify_kernel.target_verify.assert_not_called()
+        tree_verify.assert_called_once()
+        flashinfer_kernel.target_verify.assert_not_called()
 
 
 if __name__ == "__main__":
