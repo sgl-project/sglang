@@ -50,6 +50,7 @@ class TestDraftPoolGracefulDegradation:
         mock_draft_pool = Mock()
         mock_draft_pool.size = 1024
         mock_draft_pool.page_size = 64
+        mock_draft_pool.is_mooncake_registerable = True
         cache_controller.mem_pool_host_draft = mock_draft_pool
 
         mock_backend = Mock()
@@ -62,8 +63,8 @@ class TestDraftPoolGracefulDegradation:
         assert cache_controller.draft_page_get_func == cache_controller._draft_page_get_v2
         assert cache_controller.draft_page_set_func == cache_controller._draft_page_set_v2
 
-    def test_maybe_register_draft_mooncake_registration_failure(self, cache_controller, caplog):
-        """Test graceful degradation when Mooncake registration fails (EAGLE + mmap)."""
+    def test_maybe_register_draft_mooncake_non_registerable(self, cache_controller, caplog):
+        """Test graceful degradation when draft pool is not Mooncake-registerable (EAGLE + mmap)."""
         cache_controller.enable_storage = True
         cache_controller.has_draft = True
         cache_controller.storage_backend_type = "mooncake"
@@ -71,21 +72,24 @@ class TestDraftPoolGracefulDegradation:
         mock_draft_pool = Mock()
         mock_draft_pool.size = 1024
         mock_draft_pool.page_size = 64
+        mock_draft_pool.is_mooncake_registerable = False
+        mock_draft_pool.allocator = Mock()
+        mock_draft_pool.allocator.__class__.__name__ = "HostTensorAllocator"
         cache_controller.mem_pool_host_draft = mock_draft_pool
 
         mock_backend = Mock()
-        mock_backend.register_mem_host_pool_v2 = Mock(
-            side_effect=RuntimeError("Buffer outside shared memory segment")
-        )
         cache_controller.storage_backend = mock_backend
 
         with caplog.at_level(logging.WARNING):
             cache_controller._maybe_register_draft_with_storage()
 
+        # Registration should not be attempted
+        mock_backend.register_mem_host_pool_v2.assert_not_called()
         assert cache_controller.draft_page_get_func is None
         assert cache_controller.draft_page_set_func is None
+        # Should log warning about non-Mooncake-compatible allocator
         assert any(
-            "Draft L3 (storage backend) operations will be skipped" in record.message
+            "not Mooncake-compatible" in record.message
             for record in caplog.records
         )
 
@@ -97,6 +101,7 @@ class TestDraftPoolGracefulDegradation:
         cache_controller.storage_config.should_split_heads = True
 
         mock_draft_pool = Mock()
+        mock_draft_pool.is_mooncake_registerable = True
         cache_controller.mem_pool_host_draft = mock_draft_pool
         cache_controller.storage_backend = Mock()
 
@@ -114,6 +119,7 @@ class TestDraftPoolGracefulDegradation:
         cache_controller.storage_backend_type = "hf3fs"
 
         mock_draft_pool = Mock()
+        mock_draft_pool.is_mooncake_registerable = True
         cache_controller.mem_pool_host_draft = mock_draft_pool
         cache_controller.storage_backend = Mock()
 
@@ -130,6 +136,7 @@ class TestDraftPoolGracefulDegradation:
         cache_controller.storage_backend_type = "some_new_backend"
 
         mock_draft_pool = Mock()
+        mock_draft_pool.is_mooncake_registerable = True
         cache_controller.mem_pool_host_draft = mock_draft_pool
         cache_controller.storage_backend = Mock()
 

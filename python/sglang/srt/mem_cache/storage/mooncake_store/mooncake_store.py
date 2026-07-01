@@ -39,6 +39,11 @@ class MooncakeHostTensorAllocator(HostTensorAllocator):
         self.allocator = MooncakeHostMemAllocator()
         self.ptr = None
 
+    @property
+    def is_mooncake_compatible(self) -> bool:
+        """Mooncake allocator is compatible with Mooncake registration."""
+        return True
+
     def allocate(
         self, dims: tuple, dtype: torch.dtype, device: str = "cpu"
     ) -> torch.Tensor:

@@ -837,10 +837,10 @@ class HiCacheController:
     def _maybe_register_draft_with_storage(self) -> None:
         """Pick the draft L3 IO implementation.
 
-        For Mooncake (v2 path), wraps register_mem_host_pool_v2 in try/except
-        for graceful degradation: EAGLE + Mooncake L3 standalone mode may use
-        a non-Mooncake allocator (mmap) for draft pools, causing registration
-        to fail. When that happens, L3 is skipped but L2 (host DRAM) continues.
+        For Mooncake (v2 path), checks is_mooncake_registerable first to avoid
+        registration failures when draft pools use non-Mooncake allocators
+        (e.g., EAGLE + mmap). When non-registerable, L3 is skipped but L2
+        (host DRAM) continues.
         """
         self.draft_page_get_func = None
         self.draft_page_set_func = None
@@ -857,18 +857,16 @@ class HiCacheController:
                     "supported on the mooncake v2 path."
                 )
                 return
-            try:
-                self.storage_backend.register_mem_host_pool_v2(
-                    self.mem_pool_host_draft, PoolName.DRAFT
-                )
-            except Exception as e:
+            if not self.mem_pool_host_draft.is_mooncake_registerable:
                 logger.warning(
-                    "Failed to register draft host pool with storage backend: %s. "
-                    "Draft L3 (storage backend) operations will be skipped, "
-                    "but L2 (host DRAM) operations will continue.",
-                    str(e),
+                    "Draft L3 disabled: draft pool allocator (%s) is not "
+                    "Mooncake-compatible. L2 (host DRAM) still works.",
+                    type(self.mem_pool_host_draft.allocator).__name__,
                 )
                 return
+            self.storage_backend.register_mem_host_pool_v2(
+                self.mem_pool_host_draft, PoolName.DRAFT
+            )
             self.draft_page_get_func = self._draft_page_get_v2
             self.draft_page_set_func = self._draft_page_set_v2
             return

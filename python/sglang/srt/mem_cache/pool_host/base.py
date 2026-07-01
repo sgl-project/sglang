@@ -90,12 +90,12 @@ class HostKVCache(abc.ABC):
     def is_mooncake_registerable(self) -> bool:
         """Whether this pool's buffer can be zero-copy registered with Mooncake.
 
-        Returns True for pools with physical buffers allocated by Mooncake-compatible
-        allocators. Returns False for:
+        Returns True if the allocator produces Mooncake-compatible tensors.
+        Returns False for:
         - Logical anchors (no physical buffer, only page indices)
         - Pools using non-Mooncake allocators (e.g., mmap for draft pools)
         """
-        return True
+        return self.allocator.is_mooncake_compatible
 
     def __init__(
         self,
