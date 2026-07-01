@@ -946,7 +946,13 @@ def _load_image(
             logger.warning(
                 f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
             )
-    return Image.open(BytesIO(image_bytes))
+    try:
+        image = Image.open(BytesIO(image_bytes))
+        # Force decode so corrupt/truncated bytes fail here as a client error
+        image.load()
+        return image
+    except (OSError, SyntaxError) as e:
+        raise ValueError(f"Failed to load image: {e}") from e
 
 
 def load_image(

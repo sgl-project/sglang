@@ -917,6 +917,8 @@ class BaseMultimodalProcessor(ABC):
         for modality, idx, future in futures:
             try:
                 result = await asyncio.wrap_future(future)
+            except ValueError:
+                raise
             except Exception as e:
                 logger.exception(
                     "[load_mm_data(simple)] error loading %s data at index=%d",
@@ -1058,6 +1060,8 @@ class BaseMultimodalProcessor(ABC):
                 raise RuntimeError(
                     f"An exception occurred while loading multimodal data: {e}"
                 )
+            except ValueError:
+                raise
             except Exception as e:
                 raise RuntimeError(
                     f"An exception occurred while loading multimodal data: {e}"
