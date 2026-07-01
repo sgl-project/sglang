@@ -126,6 +126,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             cuda_graph=graph,
             pool=self._pool,
             stream=self._capture_stream,
+            debug=get_bool_env_var("SGLANG_BCG_DEBUG"),
         ):
             out = captured_fn()
             if self._shared_output_buffer is not None:

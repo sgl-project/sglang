@@ -301,5 +301,246 @@ class TestBreakableCudaGraph(CustomTestCase):
         self.assertGreaterEqual(score, 0.80)
 
 
+class TestBcgNonExplicitOutputs(CustomTestCase):
+    """debug=True raises on eager-break outputs that survive but are not explicitly
+    returned."""
+
+    # Distinctive size so a freed block is reused cleanly by an equally-sized alloc.
+    N = 1_000_003
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA not available")
+        try:
+            from cuda.bindings import runtime  # noqa: F401
+        except ImportError:
+            raise unittest.SkipTest("cuda-python not installed")
+
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+            BreakableCUDAGraph,
+            BreakableCUDAGraphCapture,
+            eager_on_graph,
+        )
+
+        cls.BreakableCUDAGraph = BreakableCUDAGraph
+        cls.BreakableCUDAGraphCapture = BreakableCUDAGraphCapture
+        cls.eager_on_graph = staticmethod(eager_on_graph)
+        cls.device = torch.device("cuda:0")
+
+        # State the registered test ops read/write; reset per test in setUp.
+        cls.op_sink = []  # non-explicit outputs
+        cls.op_holder = {}  # holds a tensor the reuse_custom_op ops free mid-break
+
+        # Register custom ops for the tests
+
+        from sglang.srt.utils.custom_op import register_custom_op
+
+        # A custom op registered via the old/legacy PyTorch API that
+        # leaks an output without explicitly returning it.
+        def leak_custom_op_old_api(src):
+            cls.op_sink.append(src * 3.0)
+            return src.clone()
+
+        cls._raw_lib = torch.library.Library("bcg_test_raw", "DEF")
+        cls._raw_lib.define("leak_custom_op_old_api(Tensor src) -> Tensor")
+        cls._raw_lib.impl("leak_custom_op_old_api", leak_custom_op_old_api, "CUDA")
+
+        # A custom op registered via the PyTorch API that reuses a memory block
+        @torch.library.custom_op("bcg_test::reuse_custom_op", mutates_args=["x"])
+        def reuse_custom_op(x: torch.Tensor) -> None:
+            cls.op_holder.pop("a", None)
+            cls.op_sink.append(torch.empty(cls.N, device=x.device))
+            x.add_(1.0)
+
+        # The inner custom op for the nested custom ops test
+        @torch.library.custom_op("bcg_test::inner_custom_op", mutates_args=["x"])
+        def inner_custom_op(x: torch.Tensor) -> None:
+            cls.op_sink.append(x * 5.0)
+            x.add_(1.0)
+
+        # The outer custom op for the nested custom ops test
+        @torch.library.custom_op("bcg_test::outer_custom_op", mutates_args=["x"])
+        def outer_custom_op(x: torch.Tensor) -> None:
+            torch.ops.bcg_test.inner_custom_op(x)
+
+        # Registers a custom op via SGL API (which in turn uses the old PyTorch API)
+        @register_custom_op(op_name="reuse_custom_op_sgl_api", mutates_args=["x"])
+        def reuse_custom_op_sgl_api(x: torch.Tensor) -> None:
+            cls.op_holder.pop("a", None)
+            cls.op_sink.append(torch.empty(cls.N, device=x.device))
+            x.add_(1.0)
+
+    def setUp(self):
+        self.op_sink.clear()
+        self.op_holder.clear()
+
+    def _run(self, body, debug):
+        graph = self.BreakableCUDAGraph()
+        stream = torch.cuda.Stream(self.device)
+        with self.BreakableCUDAGraphCapture(graph, stream=stream, debug=debug):
+            body()
+
+    def test_good_inplace_mutation(self):
+        out = torch.zeros(1024, device=self.device)
+        y = torch.zeros(1024, device=self.device)
+
+        @self.eager_on_graph(enable=True)
+        def clean(src, dst):
+            dst.copy_(src * 2.0)
+            return None
+
+        x = torch.ones(1024, device=self.device)
+        self._run(lambda: (clean(x, out), y.copy_(out + 1.0)), debug=True)
+
+    def test_good_new_alloc(self):
+        y = torch.zeros(1024, device=self.device)
+
+        @self.eager_on_graph(enable=True)
+        def returns_new(src):
+            return src * 2.0
+
+        x = torch.ones(1024, device=self.device)
+        self._run(lambda: y.copy_(returns_new(x) + 1.0), debug=True)
+
+    def test_non_explicit_output_raises(self):
+        sink = []
+        out = torch.zeros(1024, device=self.device)
+        y = torch.zeros(1024, device=self.device)
+
+        @self.eager_on_graph(enable=True)
+        def leaky(src, dst):
+            dst.copy_(src * 2.0)
+            sink.append(src * 3.0)
+            return None
+
+        x = torch.ones(1024, device=self.device)
+        with self.assertRaisesRegex(RuntimeError, "eager break"):
+            self._run(lambda: (leaky(x, out), y.copy_(out + 1.0)), debug=True)
+
+    def test_non_explicit_output_not_flagged_when_debug_off(self):
+        sink = []
+
+        @self.eager_on_graph(enable=True)
+        def leaky(src):
+            sink.append(src * 3.0)
+            return None
+
+        x = torch.ones(1024, device=self.device)
+        y = torch.zeros(1024, device=self.device)
+        self._run(lambda: (leaky(x), y.add_(1.0)), debug=False)
+
+    def test_non_explicit_output_reused_address_raises(self):
+        # A non-explicit output that reuses a freed address
+        sink = []
+        holder = {"a": torch.empty(self.N, device=self.device)}
+        torch.cuda.synchronize()
+
+        @self.eager_on_graph(enable=True)
+        def reuse_custom_op(src):
+            del holder["a"]
+            b = torch.empty(self.N, device=self.device)
+            sink.append(b)
+            return None
+
+        x = torch.ones(8, device=self.device)
+        with self.assertRaisesRegex(RuntimeError, "eager break"):
+            self._run(lambda: reuse_custom_op(x), debug=True)
+
+    def test_non_explicit_output_custom_op_raises(self):
+        # A non-explicit output allocated inside an op with no recoverable python body
+        # (old-style Library.impl, proxy for a C++/fused kernel).
+
+        @self.eager_on_graph(enable=True)
+        def via_opaque(src):
+            return torch.ops.bcg_test_raw.leak_custom_op_old_api(src)
+
+        x = torch.ones(4096, device=self.device)
+        with self.assertRaisesRegex(RuntimeError, "eager break"):
+            self._run(lambda: via_opaque(x), debug=True)
+
+    def test_non_explicit_output_custom_op_address_reuse_raises(self):
+        # A non-explicit output inside a torch.library.custom_op
+        self.op_holder["a"] = torch.empty(self.N, device=self.device)
+        torch.cuda.synchronize()
+
+        @self.eager_on_graph(enable=True)
+        def via_opaque(src):
+            torch.ops.bcg_test.reuse_custom_op(src)
+            return None
+
+        x = torch.ones(8, device=self.device)
+        with self.assertRaisesRegex(RuntimeError, "eager break"):
+            self._run(lambda: via_opaque(x), debug=True)
+
+    def test_non_explicit_output_sgl_custom_op_raises(self):
+        # Same reuse_custom_op case but for an op registered via the SGL API
+        # (old-style ``Library.impl``)
+        self.op_holder["a"] = torch.empty(self.N, device=self.device)
+        torch.cuda.synchronize()
+
+        @self.eager_on_graph(enable=True)
+        def via_opaque(src):
+            torch.ops.sglang.reuse_custom_op_sgl_api(src)
+            return None
+
+        x = torch.ones(8, device=self.device)
+        with self.assertRaisesRegex(RuntimeError, "eager break"):
+            self._run(lambda: via_opaque(x), debug=True)
+
+    def test_good_marked_non_explicit_output(self):
+        # mark_bcg_output lets the author exempt a known-safe non-explicit output
+        # so it is not reported.
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph_debug import (
+            mark_bcg_output,
+        )
+
+        sink = []
+
+        @self.eager_on_graph(enable=True)
+        def leaky_but_safe(src):
+            out = src * 3.0
+            sink.append(out)
+            mark_bcg_output(out)
+            return None
+
+        x = torch.ones(1024, device=self.device)
+        self._run(lambda: leaky_but_safe(x), debug=True)
+
+    def test_non_explicit_output_marked_output_reused_address_raises(self):
+        # if a marked tensor is freed mid-break and a real
+        # non-explicit output reuses its address, the dead weakref stops exempting that
+        # address so it is still caught.
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph_debug import (
+            mark_bcg_output,
+        )
+
+        sink = []
+
+        @self.eager_on_graph(enable=True)
+        def break_fn(src):
+            tmp = src * 2.0
+            mark_bcg_output(tmp)
+            del tmp
+            sink.append(torch.empty(self.N, device=self.device))
+            return None
+
+        x = torch.ones(self.N, device=self.device)
+        with self.assertRaisesRegex(RuntimeError, "eager break"):
+            self._run(lambda: break_fn(x), debug=True)
+
+    def test_non_explicit_output_nested_custom_op_raises(self):
+        # A non-explicit output allocated inside a nested custom op
+
+        @self.eager_on_graph(enable=True)
+        def via_opaque(src):
+            torch.ops.bcg_test.outer_custom_op(src)
+            return None
+
+        x = torch.ones(4096, device=self.device)
+        with self.assertRaisesRegex(RuntimeError, "eager break"):
+            self._run(lambda: via_opaque(x), debug=True)
+
+
 if __name__ == "__main__":
     unittest.main()
