@@ -1140,7 +1140,18 @@ jobs:
           > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-tp4 --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 registered/amd/accuracy/mi35x/test_deepseek_r1_mxfp4_tp4_mi35x.py || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Accuracy Test MI35x (DeepSeek-R1-MXFP4 TP4 MTP)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 180
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 registered/amd/accuracy/mi35x/test_deepseek_r1_mxfp4_tp4_mtp_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
