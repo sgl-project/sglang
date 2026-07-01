@@ -328,12 +328,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if full_indices.numel() == 0:
             return
         assert full_indices.numel() == swa_indices.numel()
-        if _is_npu:
-            self.full_to_swa_index_mapping[full_indices.to(torch.int64)] = (
-                swa_indices.to(torch.int64)
-            )
-        else:
-            self.full_to_swa_index_mapping[full_indices] = swa_indices
+        full_indices = full_indices.to(torch.int64)
+        swa_indices = swa_indices.to(self.full_to_swa_index_mapping.dtype)
+        self.full_to_swa_index_mapping[full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
