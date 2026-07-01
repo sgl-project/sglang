@@ -1096,7 +1096,8 @@ jobs:
           echo ""
           echo "=== 5. Detect RDMA Devices for test environment ==="
           if [ -d "/sys/class/infiniband" ]; then
-            RDMA_DEVS=$(ls /sys/class/infiniband | paste -sd "," -)
+            # RDMA_DEVS=$(ls /sys/class/infiniband | paste -sd "," -)
+            RDMA_DEVS=rdma0
             echo "Detected RDMA Devices: $RDMA_DEVS"
             echo "SGLANG_TEST_RDMA_DEVICE=$RDMA_DEVS" >> $GITHUB_ENV
           else
