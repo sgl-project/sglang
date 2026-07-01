@@ -621,6 +621,19 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertTrue(req[0].return_prompt_token_ids)
         self.assertTrue(req[1].return_prompt_token_ids)
 
+    def test_getitem_preserves_background(self):
+        """Batch subrequests must keep the background response flag."""
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            background=True,
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertTrue(req[0].background)
+        self.assertTrue(req[1].background)
+
     def test_regenerate_rid(self):
         """Test the regenerate_rid method."""
         req = GenerateReqInput(text="Hello")

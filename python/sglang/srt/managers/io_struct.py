@@ -762,6 +762,7 @@ class GenerateReqInput:
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
             return_prompt_token_ids=self.return_prompt_token_ids,
+            background=self.background,
             external_trace_header=self.external_trace_header,
             received_time=self.received_time,
             multi_item_delimiter_indices=(
