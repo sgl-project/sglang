@@ -8,10 +8,11 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_cuda, is_hip
 
 from .utils import make_name
 
+_is_cuda = is_cuda()
 _is_hip = is_hip()
 
 
@@ -170,9 +171,23 @@ def fused_q_indexer_rope_hadamard_quant(
             freqs_real,
             positions,
         )
-    else:
+    elif _is_cuda:
         module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
         module.forward(
+            q_input,
+            q_fp8,
+            weight,
+            weights_out,
+            float(weight_scale),
+            freqs_real,
+            positions,
+        )
+    else:
+        from .fused_q_indexer_rope_hadamard_quant_torch import (
+            fused_q_indexer_rope_hadamard_quant_torch,
+        )
+
+        fused_q_indexer_rope_hadamard_quant_torch(
             q_input,
             q_fp8,
             weight,
