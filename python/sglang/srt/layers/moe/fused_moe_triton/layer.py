@@ -81,6 +81,20 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
+def _maybe_make_loaded_weight_contiguous(loaded_weight: torch.Tensor) -> torch.Tensor:
+    if (
+        envs.SGLANG_MOE_CONTIGUOUS_WEIGHT_LOAD.get()
+        and loaded_weight.device.type == "cpu"
+        and not loaded_weight.is_contiguous()
+    ):
+        print_info_once(
+            "SGLANG_MOE_CONTIGUOUS_WEIGHT_LOAD=1: materializing non-contiguous "
+            "CPU MoE weights before copy_."
+        )
+        return loaded_weight.contiguous()
+    return loaded_weight
+
+
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if (
@@ -500,6 +514,7 @@ class FusedMoE(torch.nn.Module):
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
+        loaded_weight = _maybe_make_loaded_weight_contiguous(loaded_weight)
         expert_data.copy_(loaded_weight)
 
     def _load_w2(
@@ -570,6 +585,7 @@ class FusedMoE(torch.nn.Module):
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
+        loaded_weight = _maybe_make_loaded_weight_contiguous(loaded_weight)
         expert_data.copy_(loaded_weight)
 
     def _load_single_value(

@@ -970,6 +970,7 @@ class Envs:
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(False)
+    SGLANG_MOE_CONTIGUOUS_WEIGHT_LOAD = EnvBool(False)
 
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
