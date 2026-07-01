@@ -586,6 +586,7 @@ class MooncakeKVManager(CommonKVManager):
         prefill_data_indices: npt.NDArray[np.int32],
         dst_data_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        state_type: Optional[StateType] = None,
         force_flat: bool = False,
     ) -> int:
         """
@@ -606,7 +607,7 @@ class MooncakeKVManager(CommonKVManager):
         # Decode pp size should be equal to prefill pp size or 1
         if self.is_mla_backend or force_flat:
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs, state_type)
             )
             layers_params = [
                 (
@@ -1001,7 +1002,12 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         or rc
                     )
-            elif st in (StateType.SWA, StateType.DSA, StateType.SWA_RING):
+            elif st in (
+                StateType.SWA,
+                StateType.DSA,
+                StateType.SWA_RING,
+                StateType.C128_STATE,
+            ):
                 if (
                     target_rank_registration_info is not None
                     and not self.is_mla_backend
@@ -1013,13 +1019,20 @@ class MooncakeKVManager(CommonKVManager):
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
+                if (
+                    st == StateType.C128_STATE
+                    and len(src_indices) == 0
+                    and len(dst_indices_local) == 0
+                ):
+                    continue
                 if len(src_indices) != len(dst_indices_local):
-                    # SWA_RING is positional: truncating silently misaligns rows
-                    # and corrupts KV, so fail loud. Paged SWA/DSA tolerate a
-                    # 1-page drift -> keep the lenient truncation below.
-                    if st == StateType.SWA_RING:
+                    # These components are position- or request-indexed:
+                    # truncating silently misaligns rows and corrupts KV.
+                    # Paged SWA/DSA tolerate a 1-page drift -> keep the
+                    # lenient truncation below.
+                    if st in (StateType.SWA_RING, StateType.C128_STATE):
                         raise RuntimeError(
-                            "SWA_RING state index length mismatch: "
+                            f"{st.upper()} state index length mismatch: "
                             f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
                         )
                     logger.warning(
@@ -1038,6 +1051,7 @@ class MooncakeKVManager(CommonKVManager):
                         prefill_data_indices=np.array(src_indices, dtype=np.int32),
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
+                        state_type=st,
                     )
                     or rc
                 )

@@ -1041,7 +1041,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from mooncake.engine import TransferEngine
         except ImportError as e:
             logger.warning(
-                "Please install mooncake for using remote instance transfer engine: pip install mooncake"
+                "Please install mooncake for using remote instance transfer engine: pip install mooncake-transfer-engine"
             )
             return
         self.remote_instance_transfer_engine = TransferEngine()
@@ -1104,6 +1104,39 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def model_specific_adjustment(self):
         server_args = self.server_args
+
+        # HRM-Text needs bidirectional prompt attention (prefill), which only the
+        # Triton backend honors and only with cuda graph / chunked prefill off
+        # (TritonAttnBackend.allow_bidirectional_attention_in_extend). Radix cache
+        # is also unsafe: the recurrent forward writes direction-dependent KV
+        # across many slots.
+        hf_config = self.model_config.hf_config
+        is_hrm_text = getattr(
+            hf_config, "model_type", None
+        ) == "hrm_text" or "HrmTextForCausalLM" in getattr(
+            hf_config, "architectures", []
+        )
+        # prefix_lm defaults to True upstream; defaulting False would skip the
+        # bidirectional-attention forcing and silently produce junk output.
+        is_prefix_lm_recurrent = is_hrm_text and getattr(hf_config, "prefix_lm", True)
+        if is_prefix_lm_recurrent:
+            if server_args.attention_backend not in (None, "triton"):
+                logger.warning(
+                    f"Overriding --attention-backend "
+                    f"{server_args.attention_backend!r} -> 'triton': only the "
+                    "Triton backend supports HRM-Text's bidirectional prefix "
+                    "attention."
+                )
+            server_args.attention_backend = "triton"
+            server_args.chunked_prefill_size = -1
+            server_args.disable_radix_cache = True
+            server_args.disable_cuda_graph = True
+            logger.warning(
+                "HRM-Text (prefix_lm) detected: forcing --attention-backend "
+                "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
+                "--disable-cuda-graph for correctness of the bidirectional "
+                "prompt attention."
+            )
 
         if self.is_multimodal:
             if not self.is_multimodal_chunked_prefill_supported:
@@ -3210,8 +3243,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
 
-    def check_weights(self, action: str):
-        return self._weight_checker.handle(action=action)
+    def check_weights(self, action: str, allow_quant_error: bool = False):
+        return self._weight_checker.handle(
+            action=action, allow_quant_error=allow_quant_error
+        )
 
     def update_weights_from_ipc(self, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""

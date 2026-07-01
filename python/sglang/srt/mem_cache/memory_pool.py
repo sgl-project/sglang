@@ -52,9 +52,16 @@ from sglang.srt.layers.utils.dcp_utils import (
     get_attention_dcp_world_size,
 )
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from sglang.srt.mem_cache.layout.page_major import (
+    build_page_major_mamba_views,
+    build_page_major_mha_views,
+    mamba_entry_bytes,
+    mha_entry_bytes,
+)
 from sglang.srt.mem_cache.triton_ops.cache_move import (
     copy_all_layer_kv_cache_tiled,
     set_kv_buffer_prefix_valid_tiled,
+    store_cache_4d,
 )
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
@@ -361,6 +368,7 @@ class MambaPool:
         speculative_eagle_topk: Optional[int] = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
+        envelope_layout: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -389,35 +397,64 @@ class MambaPool:
                 else nullcontext()
             ),
         ):
-            conv_state = [
-                torch.zeros(
-                    size=(num_mamba_layers, size + 1) + conv_shape,
-                    dtype=conv_dtype,
+            if envelope_layout:
+                # Page-granularity envelope layout (page_size==1 for state): all
+                # mamba layers/slots share one contiguous byte buffer; conv and
+                # temporal are strided views into it (see mem_cache/layout/
+                # page_major.py). Only the standard CUDA Triton path is supported.
+                assert not _is_npu and not (
+                    _is_cpu and _cpu_has_amx_support
+                ), "envelope_layout mamba is only supported on the CUDA path"
+                max_slots = size + 1
+                entry_bytes = mamba_entry_bytes(
+                    layer_num=num_mamba_layers,
+                    conv_state_shapes=conv_state_shape,
+                    conv_dtype=conv_dtype,
+                    temporal_state_shape=temporal_state_shape,
+                    temporal_dtype=ssm_dtype,
+                )
+                self._raw = torch.zeros(
+                    max_slots * entry_bytes, dtype=torch.uint8, device=device
+                )
+                conv_state, temporal_state = build_page_major_mamba_views(
+                    self._raw,
+                    layer_num=num_mamba_layers,
+                    conv_state_shapes=conv_state_shape,
+                    conv_dtype=conv_dtype,
+                    temporal_state_shape=temporal_state_shape,
+                    temporal_dtype=ssm_dtype,
+                    max_slots=max_slots,
+                )
+            else:
+                conv_state = [
+                    torch.zeros(
+                        size=(num_mamba_layers, size + 1) + conv_shape,
+                        dtype=conv_dtype,
+                        device=device,
+                    )
+                    for conv_shape in conv_state_shape
+                ]
+
+                if _is_npu:
+                    from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                        _init_npu_conv_state,
+                    )
+
+                    conv_state = _init_npu_conv_state(
+                        conv_state[0], conv_state_shape, speculative_num_draft_tokens
+                    )
+
+                if _is_cpu and _cpu_has_amx_support:
+                    from sglang.srt.layers.amx_utils import _init_amx_conv_state
+
+                    # CPU uses a different layout of conv_state for kernel optimization
+                    conv_state = _init_amx_conv_state(conv_state)
+
+                temporal_state = torch.zeros(
+                    size=(num_mamba_layers, size + 1) + temporal_state_shape,
+                    dtype=ssm_dtype,
                     device=device,
                 )
-                for conv_shape in conv_state_shape
-            ]
-
-            if _is_npu:
-                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-                    _init_npu_conv_state,
-                )
-
-                conv_state = _init_npu_conv_state(
-                    conv_state[0], conv_state_shape, speculative_num_draft_tokens
-                )
-
-            if _is_cpu and _cpu_has_amx_support:
-                from sglang.srt.layers.amx_utils import _init_amx_conv_state
-
-                # CPU uses a different layout of conv_state for kernel optimization
-                conv_state = _init_amx_conv_state(conv_state)
-
-            temporal_state = torch.zeros(
-                size=(num_mamba_layers, size + 1) + temporal_state_shape,
-                dtype=ssm_dtype,
-                device=device,
-            )
 
             # GDN ReplaySSM ring buffers (slice 1a). Allocated only when the
             # flag is on; otherwise left as None so the legacy State is
@@ -795,6 +832,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         start_layer: Optional[int] = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
+        mamba_envelope_layout: bool = False,
     ):
         super().__init__(
             size=size,
@@ -820,6 +858,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             speculative_eagle_topk=speculative_eagle_topk,
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
+            mamba_envelope_layout=mamba_envelope_layout,
         )
 
     def _init_mamba_pool(
@@ -834,6 +873,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         speculative_eagle_topk: Optional[int] = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
+        mamba_envelope_layout: bool = False,
     ):
         self.mamba_pool = MambaPool(
             size=mamba_size,
@@ -846,6 +886,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             speculative_eagle_topk=speculative_eagle_topk,
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
+            envelope_layout=mamba_envelope_layout,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
@@ -1237,6 +1278,7 @@ class MHATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        kv_cache_layout: Optional[str] = None,
     ):
         super().__init__(
             size,
@@ -1263,7 +1305,14 @@ class MHATokenToKVPool(KVCache):
         #   X = 16 / dtype_bytes — AITER-only (ignored elsewhere, no consumer kernel).
         # HND and vectorized_5d are mutually exclusive; HND takes precedence.
         self.use_hnd = envs.SGLANG_USE_HND_KVCACHE.get()
-        if self.use_hnd:
+        if kv_cache_layout is not None:
+            # Explicit physical-layout selector wins over the platform default.
+            # This is a label only; layouts that change buffer identity (e.g. the
+            # page-granularity envelope) live in a dedicated pool subclass
+            # (PageMajorMHATokenToKVPool) rather than in branches here.
+            self.use_hnd = False
+            self.kv_cache_layout = kv_cache_layout
+        elif self.use_hnd:
             total_slots = self.size + self.page_size
             assert total_slots % self.page_size == 0, (
                 f"HND KV cache needs (size+page_size) divisible by page_size, got "
@@ -1653,6 +1702,19 @@ class MHATokenToKVPool(KVCache):
             v_buf[pages, :, offs, :] = cache_v
             return
 
+        self._store_kv_layer(layer_id - self.start_layer, loc, cache_k, cache_v)
+
+    def _store_kv_layer(
+        self,
+        layer_idx: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        # Per-layer physical write into K/V buffer ``layer_idx``. Override for
+        # layouts that change buffer identity (e.g. PageMajorMHATokenToKVPool's
+        # 4-D strided views). ``loc`` and the cache tensors are already dtype-cast
+        # and viewed as ``store_dtype`` by ``set_kv_buffer``.
         if self.kv_cache_layout == "vectorized_5d":
             # Late-import to keep the NHD path import-clean.
             from sglang.srt.layers.attention.utils import (
@@ -1669,8 +1731,8 @@ class MHATokenToKVPool(KVCache):
             launch_reshape_and_cache_shuffle_5d(
                 cache_k,
                 cache_v,
-                self.k_buffer[layer_id - self.start_layer],
-                self.v_buffer[layer_id - self.start_layer],
+                self.k_buffer[layer_idx],
+                self.v_buffer[layer_idx],
                 loc,
             )
             return
@@ -1678,8 +1740,8 @@ class MHATokenToKVPool(KVCache):
         _set_kv_buffer_impl(
             cache_k,
             cache_v,
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
+            self.k_buffer[layer_idx],
+            self.v_buffer[layer_idx],
             loc,
             row_dim=self.row_dim,
             store_dtype=self.store_dtype,
@@ -1794,6 +1856,12 @@ class MHATokenToKVPool(KVCache):
                 vb[pages_t, :, offs_t, :] = vb[pages_s, :, offs_s, :]
             return
 
+        self._move_kv_cache_impl(tgt_loc, src_loc)
+
+    def _move_kv_cache_impl(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # Physical move strategy. Override for layouts that change buffer identity
+        # (e.g. PageMajorMHATokenToKVPool always uses the native move). The 3-D
+        # per-layer buffers here ignore page_size in move_kv_cache_native.
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
             return
@@ -2111,6 +2179,160 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
 
 
+class PageMajorMHATokenToKVPool(MHATokenToKVPool):
+    """MHA pool with the page-major (layer-major within a page) page-granularity envelope layout.
+
+    All layers/slots share one contiguous ``uint8`` ``_raw`` buffer; per-layer K/V
+    are 4-D strided views ``(num_pages, page_size, head_num, head_dim*)`` built by
+    ``mem_cache/layout/page_major.py``. Token id ``t`` -> page ``t // page_size``,
+    slot ``t % page_size``; the reserved padding slot 0 lives in page 0. At
+    ``page_size == 1`` a page is a single slot (token-granularity envelope).
+
+    Supported: the standard CUDA Triton attention + native move path. The tiled KV
+    copy kernel, CPU offloading, and the spec-decode prefix-commit kernel all assume
+    the per-layer contiguous 3-D layout; here they fail loudly rather than silently
+    mis-indexing the strided views.
+    """
+
+    def __init__(
+        self,
+        *args,
+        kv_cache_layout: Optional[str] = None,
+        enable_kv_cache_copy: bool = False,
+        **kwargs,
+    ):
+        assert kv_cache_layout in (
+            None,
+            "page_major_layer_major",
+        ), f"PageMajorMHATokenToKVPool fixes its layout; got {kv_cache_layout!r}"
+        # The tiled copy kernel assumes stride == row bytes, which the strided 4-D
+        # views violate, so the copy path is never available here regardless of
+        # what the caller requested (the spec-decode call sites pass
+        # enable_kv_cache_copy=True). Always fall back to the native move.
+        super().__init__(
+            *args,
+            kv_cache_layout="page_major_layer_major",
+            enable_kv_cache_copy=False,
+            **kwargs,
+        )
+
+    def _create_buffers(self):
+        # One contiguous byte buffer holds all layers/slots; per-layer K/V are
+        # 4-D strided views in the page-granularity envelope layout (see
+        # mem_cache/layout/page_major.py).
+        total_slots = self.size + self.page_size
+        assert total_slots % self.page_size == 0, (
+            f"page_major_layer_major needs (size + page_size) divisible by "
+            f"page_size; got size={self.size}, page_size={self.page_size}"
+        )
+        num_pages = total_slots // self.page_size
+        entry_bytes = mha_entry_bytes(
+            layer_num=self.layer_num,
+            head_num=self.head_num,
+            head_dim=self.head_dim,
+            v_head_dim=self.v_head_dim,
+            itemsize=self.store_dtype.itemsize,
+        )
+        total_bytes = num_pages * self.page_size * entry_bytes
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                # Unset slots read as zeros (matches the per-layer pool).
+                self._raw = torch.zeros(
+                    total_bytes, dtype=torch.uint8, device=self.device
+                )
+        self.k_buffer, self.v_buffer = build_page_major_mha_views(
+            self._raw,
+            layer_num=self.layer_num,
+            head_num=self.head_num,
+            head_dim=self.head_dim,
+            v_head_dim=self.v_head_dim,
+            store_dtype=self.store_dtype,
+            page_size=self.page_size,
+            num_pages=num_pages,
+        )
+        # stride(0) * itemsize is the per-page byte stride; for these strided
+        # views np.prod(shape[1:]) would not equal it, so compute it directly.
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        self.data_strides = torch.tensor(
+            [x.stride(0) * x.dtype.itemsize for x in (self.k_buffer + self.v_buffer)],
+            device=self.device,
+        )
+
+    def _store_kv_layer(
+        self,
+        layer_idx: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        # Single-launch Triton write into the 4-D envelope view. The parent's
+        # view(-1, row_dim) path can't merge the strided 4-D dims.
+        store_cache_4d(
+            self.k_buffer[layer_idx],
+            self.v_buffer[layer_idx],
+            cache_k,
+            cache_v,
+            loc,
+            page_size=self.page_size,
+        )
+
+    def _move_kv_cache_impl(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # Strided 4-D views: the tiled copy kernel assumes stride == row bytes, so
+        # always take the native move (it splits token ids into
+        # (page_id, slot_in_page) for the 4-D advanced index).
+        move_kv_cache_native(
+            self.k_buffer,
+            self.v_buffer,
+            tgt_loc,
+            src_loc,
+            page_size=self.page_size,
+        )
+
+    # The methods below assume the per-layer contiguous 3-D layout. The 4-D
+    # strided envelope views have no per-layer contiguous region (their bytes are
+    # interleaved layer-major within each page) and index page-major, not
+    # token-major. Inheriting them would silently mis-index; fail loudly instead.
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "page-major layout has no per-layer contiguous regions; KV transfer / "
+            "disaggregation is unsupported (TODO: expose the single _raw buffer "
+            "with a page-aware transfer scheme)."
+        )
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        raise NotImplementedError(
+            "CPU offloading is unsupported under the page-major layout "
+            "(TODO: split token ids into page/slot for the 4-D index)."
+        )
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        raise NotImplementedError(
+            "CPU offloading is unsupported under the page-major layout "
+            "(TODO: split token ids into page/slot for the 4-D index)."
+        )
+
+    def set_kv_buffer_prefix_valid(self, *args, **kwargs):
+        raise NotImplementedError(
+            "prefix-valid commit is unsupported under the page-major layout "
+            "(_set_kv_buffer_prefix_valid_impl assumes 3-D contiguous + row_dim)."
+        )
+
+
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
 
@@ -2122,7 +2344,6 @@ class HybridLinearKVPool(KVCache):
         head_num: int,
         head_dim: int,
         full_attention_layer_ids: List[int],
-        enable_kvcache_transpose: bool,
         device: str,
         mamba_pool: MambaPool,
         enable_memory_saver: bool = False,
@@ -2132,6 +2353,7 @@ class HybridLinearKVPool(KVCache):
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
         start_layer: Optional[int] = None,
+        full_kv_pool_class: Optional[type] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -2143,8 +2365,6 @@ class HybridLinearKVPool(KVCache):
         self.head_num = head_num
         self.head_dim = head_dim
         self.mamba_pool = mamba_pool
-        # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
-        assert not enable_kvcache_transpose
         self.use_mla = use_mla
         if not use_mla:
             TokenToKVPoolClass = MHATokenToKVPool
@@ -2157,6 +2377,11 @@ class HybridLinearKVPool(KVCache):
                 )
 
                 TokenToKVPoolClass = NPUMHATokenToKVPool
+            elif full_kv_pool_class is not None:
+                # Caller-selected MHA layout variant (e.g. the page-major
+                # PageMajorMHATokenToKVPool). NPU / out-of-tree classes keep
+                # priority since they don't understand alternate layouts.
+                TokenToKVPoolClass = full_kv_pool_class
 
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,
@@ -2983,15 +3208,39 @@ def move_kv_cache_native(
     v_buffer: List[torch.Tensor],
     tgt_loc: torch.Tensor,
     src_loc: torch.Tensor,
+    page_size: int = 1,
 ):
+    """Move token-granular K/V rows from ``src_loc`` to ``tgt_loc``.
+
+    Supports two buffer shapes:
+
+    - 3-D ``[max_slots, head_num, head_dim]`` (per-layer pool): direct advanced
+      indexing on dim 0; ``page_size`` is ignored.
+    - 4-D ``[num_pages, page_size, head_num, head_dim]`` (envelope layout): split
+      each token id into ``(page_id, slot_in_page)`` and use 2-D advanced
+      indexing. PyTorch resolves the strided byte address via the view's strides.
+    """
     if tgt_loc.numel() == 0:
         return
 
     tgt_loc_flat = tgt_loc.view(-1).long()
     src_loc_flat = src_loc.view(-1).long()
     for k_cache, v_cache in zip(k_buffer, v_buffer):
-        k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
-        v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
+        if k_cache.ndim == 4:
+            if page_size == 1:
+                # Degenerate (num_pages, 1, head, dim): token id == page id.
+                k_cache[tgt_loc_flat, 0] = k_cache[src_loc_flat, 0]
+                v_cache[tgt_loc_flat, 0] = v_cache[src_loc_flat, 0]
+            else:
+                tgt_page = tgt_loc_flat // page_size
+                tgt_tok = tgt_loc_flat % page_size
+                src_page = src_loc_flat // page_size
+                src_tok = src_loc_flat % page_size
+                k_cache[tgt_page, tgt_tok] = k_cache[src_page, src_tok]
+                v_cache[tgt_page, tgt_tok] = v_cache[src_page, src_tok]
+        else:
+            k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
+            v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
 
 
 @triton.jit

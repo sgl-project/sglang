@@ -427,15 +427,6 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
-        # freqs_cis is built from the fp32 cos/sin cache before any forward casts it to bf16.
-        self._indexer_freqs_cis: Optional[torch.Tensor] = None
-        if _use_dsa_indexer_fusion:
-            c = self.rotary_emb.cos_sin_cache.to(torch.float32)
-            half = c.shape[-1] // 2
-            self._indexer_freqs_cis = torch.complex(
-                c[:, :half].contiguous(), c[:, half:].contiguous()
-            )
-
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
@@ -450,6 +441,10 @@ class Indexer(MultiPlatformOp):
                 yield
         else:
             yield
+
+    @property
+    def _indexer_cos_sin_cache(self) -> torch.Tensor:
+        return self.rotary_emb.cos_sin_cache
 
     def _weights_proj_bf16_in_fp32_out(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
@@ -657,7 +652,7 @@ class Indexer(MultiPlatformOp):
                 self.k_norm.weight,
                 self.k_norm.bias,
                 self.k_norm.variance_epsilon,
-                self._indexer_freqs_cis,
+                self._indexer_cos_sin_cache,
                 positions,
                 page_size,
             )
@@ -669,7 +664,7 @@ class Indexer(MultiPlatformOp):
             self.k_norm.weight,
             self.k_norm.bias,
             self.k_norm.variance_epsilon,
-            self._indexer_freqs_cis,
+            self._indexer_cos_sin_cache,
             positions,
         )
         self._store_index_k_cache(
@@ -721,7 +716,7 @@ class Indexer(MultiPlatformOp):
                 q.contiguous(),
                 weights_raw,
                 q_scale_gate,
-                self._indexer_freqs_cis,
+                self._indexer_cos_sin_cache,
                 positions,
             )
 
@@ -758,7 +753,7 @@ class Indexer(MultiPlatformOp):
             q.contiguous(),
             weights_raw,
             q_scale_gate,
-            self._indexer_freqs_cis,
+            self._indexer_cos_sin_cache,
             positions,
         )
 

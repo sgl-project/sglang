@@ -708,6 +708,7 @@ class Req(ReqDllmMixin):
         ] = None,
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
+        session_id: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -740,6 +741,7 @@ class Req(ReqDllmMixin):
         self.dllm_initialized: bool = False
 
         self.session = session
+        self.session_id = session_id
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices

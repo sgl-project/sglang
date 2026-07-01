@@ -563,6 +563,30 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
+# Optional ai-dynamo nightly for Dynamo + SGLang integration testing. Gated by
+# INSTALL_DYNAMO so it lands only in the dev image (release-docker-dev.yml sets
+# it), not the version-tagged release/runtime images. Empty DYNAMO_VERSION
+# resolves the latest (highest-version) nightly, matching `pip install --pre`;
+# set it to pin an exact version for a reproducible build.
+ARG INSTALL_DYNAMO=0
+ARG DYNAMO_VERSION=
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -eu; \
+    if [ "$INSTALL_DYNAMO" = "1" ]; then \
+        if [ -z "$DYNAMO_VERSION" ]; then \
+            index="$(curl -fsSL --retry 3 --retry-delay 2 https://pypi.nvidia.com/ai-dynamo/)" \
+                || { echo "ERROR: failed to fetch the ai-dynamo index from pypi.nvidia.com"; exit 1; }; \
+            DYNAMO_VERSION="$(printf '%s\n' "$index" \
+                | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}' | sort -Vu | tail -1)"; \
+            case "$DYNAMO_VERSION" in \
+                *.*.*.dev????????) : ;; \
+                *) echo "ERROR: no X.Y.Z.devYYYYMMDD nightly found in the index (format may have changed)"; exit 1 ;; \
+            esac; \
+        fi; \
+        echo "Installing ai-dynamo==${DYNAMO_VERSION}"; \
+        python3 -m pip install --extra-index-url https://pypi.nvidia.com "ai-dynamo==${DYNAMO_VERSION}"; \
+    fi
+
 # Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
 # the `nixl` import path) but unconditionally requires nixl-cu12, so we install
 # it with --no-deps and pair it with the matching nixl-cu12 / nixl-cu13 binary
@@ -620,6 +644,7 @@ ARG BUILD_TYPE
 ARG CUDA_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
+ARG INSTALL_DYNAMO=0
 
 WORKDIR /sgl-workspace
 
@@ -671,8 +696,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Install pre-built gateway artifacts from parallel builder
 COPY --from=gateway_builder /build/sgl-model-gateway-bin /usr/local/bin/sgl-model-gateway
 COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
+# When ai-dynamo is installed (dev image), reinstall the gateway wheel with
+# --no-deps so it cannot re-resolve and replace Dynamo's shared dependencies.
+# Otherwise resolve the gateway's own dependencies normally.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl \
+    if [ "$INSTALL_DYNAMO" = "1" ]; then \
+        python3 -m pip install --force-reinstall --no-deps /tmp/gateway_wheels/*.whl; \
+    else \
+        python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl; \
+    fi \
     && rm -rf /tmp/gateway_wheels
 
 # Set workspace directory
