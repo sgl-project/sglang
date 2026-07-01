@@ -412,6 +412,7 @@ class TransferBackend(Enum):
     NIXL = "nixl"
     ASCEND = "ascend"
     FAKE = "fake"
+    P2P = "p2p"
 
 
 class KVClassType(Enum):
@@ -517,6 +518,25 @@ def get_kv_class(
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
         }
         return class_mapping.get(class_type)
+
+    elif transfer_backend == TransferBackend.P2P:
+        from sglang.srt.disaggregation.base import KVArgs
+        from sglang.srt.disaggregation.p2p import (
+            P2PKVBootstrapServer,
+            P2PKVManager,
+            P2PKVReceiver,
+            P2PKVSender,
+        )
+
+        class_mapping = {
+            KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: P2PKVManager,
+            KVClassType.SENDER: P2PKVSender,
+            KVClassType.RECEIVER: (P2PKVReceiver),
+            KVClassType.BOOTSTRAP_SERVER: P2PKVBootstrapServer,
+        }
+        return class_mapping.get(class_type)
+
     elif transfer_backend == TransferBackend.FAKE:
         from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.fake import (

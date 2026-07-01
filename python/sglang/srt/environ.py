@@ -346,6 +346,11 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
 
+    # P2P Transfer
+    SGLANG_P2P_BATCH_LIMIT = EnvInt(512)
+    SGLANG_P2P_TRANSFER_TIMEOUT = EnvFloat(60.0)
+    SGLANG_KVCACHE_LOG = EnvBool(False)
+
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
