@@ -1777,6 +1777,7 @@ def is_audio_model(model_architectures: List[str]):
     models = [
         "WhisperForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",
+        "MossTranscribeDiarizeForConditionalGeneration",
     ]
     return any(model in model_architectures for model in models)
 
