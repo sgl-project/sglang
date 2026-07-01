@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
+from sglang.srt.mem_cache.memory_pool_host import KVTCHostMemoryRequest, NPUMHATokenToKVPoolHybrid
 from sglang.srt.distributed import (
     get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
@@ -1248,3 +1249,390 @@ class HiCacheController:
 
             except Empty:
                 continue
+
+
+class KVTCCacheOperation:
+
+        counter = 0
+
+        def __init__(
+                self,
+                host_indices_compressed: torch.Tensor,
+                device_indices_compressed: torch.Tensor,
+                token_indices_compressed: torch.Tensor,
+                host_indices_sink: torch.Tensor,
+                device_indices_sink: torch.Tensor,
+                node_id: int,
+                priority: Optional[int] = None,
+                ):
+            self.host_indices_compressed = host_indices_compressed
+            self.device_indices_compressed = device_indices_compressed
+            self.token_indices_compressed = token_indices_compressed
+
+            self.host_indices_sink = host_indices_sink
+            self.device_indices_sink = device_indices_sink
+
+            self.node_ids = [node_id]
+            self.data = None
+
+            self.id = KVTCCacheOperation.counter
+            KVTCCacheOperation.counter += 1
+            #default priority is the order of creation
+            self.priority=priority if priority is not None else self.id
+
+        @staticmethod
+        def merge_ops(ops: List[KVTCCacheOperation]) -> KVTCCacheOperation:
+            assert len(ops) > 0
+            if len(ops) == 1:
+                if ops[0].node_ids[0] == -1:
+                    ops[0].node_ids = []
+                return ops[0]
+
+            host_indices_compressed = torch.cat([op.host_indices_compressed for op in ops])
+            device_indices_compressed = torch.cat([op.device_indices_compressed for op in ops])
+            token_indices_compressed = torch.cat([op.token_indices_compressed for op in ops])
+
+            host_indices_sink = torch.cat([op.host_indices_sink for op in ops])
+            device_indices_sink = torch.cat([op.device_indices_sink for op in ops])
+
+            node_ids = []
+            priority = min(op.priority for op in ops)
+            for op in ops:
+                node_ids.extend(op.node_ids)
+
+            merged_op = KVTCCacheOperation(
+                    host_indices_compressed,
+                    device_indices_compressed,
+                    token_indices_compressed,
+                    host_indices_sink,
+                    device_indices_sink,
+                    -1,
+                    priority,
+                    )
+            merged_op.node_ids = node_ids
+            return merged_op
+
+        def __lt__(self, other: KVTCCacheOperation):
+            return self.priority < other.priority
+
+
+class KVTCHiCacheController:
+
+    def __init__(
+        self,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        mem_pool_host: NPUMHATokenToKVPoolHybrid,
+        page_size: int,
+        tp_group: torch.distributed.ProcessGroup,
+        load_cache_event: threading.Event,
+        write_policy: str = "write_through_selective",
+        io_backend: str = "",
+        storage_backend: Optional[str] = None,
+        prefetch_threshold: int = 256,
+        model_name: Optional[str] = None,
+        storage_backend_extra_config: Optional[dict] = None,
+        pp_rank: int = 0,
+        pp_size: int = 1,
+        enable_storage_metrics: bool = False,
+    ):
+        if storage_backend is not None:
+            raise ValueError("KVTC doesn't support storage tier")
+
+        self.tp_group = tp_group
+        self.mem_pool_device_allocator = token_to_kv_pool_allocator
+        mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        if isinstance(mem_pool_device, HybridLinearKVPool):
+            mem_pool_device = mem_pool_device.full_kv_pool
+        self.mem_pool_device = mem_pool_device
+        assert isinstance(mem_pool_host, NPUMHATokenToKVPoolHybrid)
+        self.mem_pool_host = mem_pool_host
+        self.write_policy = write_policy
+        self.page_size = page_size
+        self.io_backend = io_backend
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
+
+        self.device = self.mem_pool_device.device
+        self.layer_num = self.mem_pool_device.layer_num
+        self.layer_done_counter = LayerDoneCounter(self.layer_num)
+        self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
+
+        if write_policy not in [
+            "write_through",
+            "write_through_selective",
+            "write_back",
+        ]:
+            raise ValueError(f"Invalid write policy: {write_policy}")
+
+        self.load_queue: List[KVTCCacheOperation] = []
+        self.write_queue: List[KVTCCacheOperation] = []
+        self.ack_load_queue: List[HiCacheAck] = []
+        self.ack_write_queue: List[HiCacheAck] = []
+
+        self.stop_event = threading.Event()
+        self.write_buffer = TransferBuffer(self.stop_event)
+        self.load_buffer = TransferBuffer(
+            self.stop_event, buffer_count=10,
+        )
+
+        self.write_stream = device_module.Stream()
+        self.load_stream = device_module.Stream()
+
+    def reset(self):
+        self.stop_event.set()
+
+        self.load_queue.clear()
+        self.write_queue.clear()
+        self.write_buffer.clear()
+        self.load_buffer.clear()
+        self.ack_write_queue.clear()
+        self.ack_load_queue.clear()
+
+        self.stop_event.clear()
+
+    def _sink_and_compressed_indices(
+            self,
+            memory_indices,
+            token_indices,
+            ):
+        sink_tokens = torch.arange(start=0, end=128, device=self.device)
+        sink_tokens_range = 0
+
+        if torch.all(token_indices[:128] == sink_tokens):
+            sink_tokens_range = 128
+
+        sink_memory_indices = memory_indices[:sink_tokens_range]
+        compressed_memory_indices = memory_indices[sink_tokens_range:]
+
+        sink_token_indices = token_indices[:sink_tokens_range]
+        compressed_token_indices = token_indices[sink_tokens_range:]
+
+        return sink_memory_indices, sink_token_indices, compressed_memory_indices, compressed_token_indices
+
+    def move_indices(self, host_indices: torch.Tensor, device_indices: torch.Tensor):
+        # move indices to GPU if using kernels, to host if using direct indexing
+        if self.io_backend == "kernel":
+            if not host_indices.is_cuda:
+                host_indices = host_indices.to(self.device, non_blocking=True)
+            return host_indices, device_indices
+        elif self.io_backend == "direct":
+            if self.mem_pool_host.layout == "layer_first":
+                device_indices = device_indices.cpu()
+                host_indices, idx = host_indices.sort()
+                return host_indices, device_indices.index_select(0, idx)
+            elif self.mem_pool_host.layout == "page_first_direct":
+                return host_indices, device_indices.cpu()
+            else:
+                raise ValueError(
+                    f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
+                )
+        elif self.io_backend == "kernel_ascend":
+            return host_indices, device_indices.cpu()
+        else:
+            raise ValueError(f"Unsupported io backend")
+
+    def write(
+        self,
+        device_indices: torch.Tensor,
+        token_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = -1,
+    ) -> Optional[torch.Tensor]:
+        """
+        Back up KV caches from device memory to host memory.
+        """
+
+        (
+            sink_device_indices,
+            sink_token_indices,
+            compressed_device_indices,
+            compressed_token_indices
+        ) = self._sink_and_compressed_indices(device_indices, token_indices)
+
+        sink_host_indices, compressed_host_indices = self.mem_pool_host.alloc(
+                sink_token_indices.numel(),
+                compressed_token_indices.numel(),
+        )
+        if sink_host_indices is None or compressed_host_indices is None:
+            # TODO rethink this assert
+            assert sink_host_indices is None and compressed_host_indices is None
+            return None
+
+
+        write_op = KVTCCacheOperation(
+                compressed_host_indices,
+                compressed_device_indices,
+                compressed_token_indices,
+                sink_host_indices,
+                sink_device_indices,
+                node_id,
+                )
+
+        self.write_queue.append(write_op)
+
+        self.start_writing()
+
+        host_indices = torch.cat((sink_host_indices, compressed_host_indices))
+
+        return host_indices
+
+    def start_writing(self) -> None:
+        if len(self.write_queue) == 0:
+            return
+
+        op = KVTCCacheOperation.merge_ops(self.write_queue)
+
+        host_indices_sink, device_indices_sink = self.move_indices(
+                op.host_indices_sink,
+                op.device_indices_sink
+                )
+        host_indices_compressed, device_indices_compressed = self.move_indices(
+                op.host_indices_compressed,
+                op.device_indices_compressed,
+                )
+        self.write_queue.clear()
+
+        start_event = device_module.Event()
+        finish_event = device_module.Event()
+
+        start_event.record()
+        with device_module.stream(self.write_stream):
+            start_event.wait(self.write_stream)
+
+            write_req = KVTCHostMemoryRequest(
+                self.mem_pool_device,
+                host_indices_compressed,
+                device_indices_compressed,
+                op.token_indices_compressed,
+                host_indices_sink,
+                device_indices_sink,
+                self.io_backend,
+                None,
+            )
+
+            self.mem_pool_host.backup_from_device_all_layer(write_req)
+            # TODO I don't think we need to call record_stream. Is there sth ascend specific for streams?
+            finish_event.record()
+            # NOTE: We must save the host indices and device indices here,
+            # this is because we need to guarantee that these tensors are
+            # still alive when the write stream is executing.
+            if host_indices_sink.is_cuda:
+                host_indices_sink.record_stream(self.write_stream)
+            if device_indices_sink.is_cuda:
+                device_indices_sink.record_stream(self.write_stream)
+            if host_indices_compressed.is_cuda:
+                host_indices_compressed.record_stream(self.write_stream)
+            if device_indices_compressed.is_cuda:
+                device_indices_compressed.record_stream(self.write_stream)
+
+        self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+
+    def load(
+        self,
+        host_indices: torch.Tensor,
+        token_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = -1,
+    ) -> Optional[torch.Tensor]:
+
+        device_indices = self.mem_pool_device_allocator.alloc(host_indices.numel())
+        if device_indices is None:
+            return None
+
+        (
+            sink_host_indices,
+            sink_token_indices,
+            compressed_host_indices,
+            compressed_token_indices
+        ) = self._sink_and_compressed_indices(host_indices, token_indices)
+
+        sink_device_indices = device_indices[:len(sink_token_indices)]
+        compressed_device_indices = device_indices[len(sink_token_indices):]
+
+        self.load_queue.append(
+            KVTCCacheOperation(
+                compressed_host_indices,
+                compressed_device_indices,
+                compressed_token_indices,
+                sink_host_indices,
+                sink_device_indices,
+                node_id,
+                None,
+            )
+        )
+
+        return device_indices
+
+    def start_loading(self) -> int:
+        if len(self.load_queue) == 0:
+            return -1
+
+        producer_id = self.layer_done_counter.update_producer()
+
+        op = KVTCCacheOperation.merge_ops(self.load_queue)
+
+        sink_host_indices, sink_device_indices = self.move_indices(op.host_indices_sink, op.device_indices_sink)
+        compressed_host_indices, compressed_device_indices = self.move_indices(op.host_indices_compressed, op.device_indices_compressed)
+
+        self.load_queue.clear()
+
+        producer_event = self.layer_done_counter.events[producer_id]
+        producer_event.start_event.record()
+
+        with device_module.stream(self.load_stream):
+            producer_event.start_event.wait(self.load_stream)
+            for i in range(self.layer_num):
+                load_req = KVTCHostMemoryRequest(
+                       self.mem_pool_device,
+                       compressed_host_indices,
+                       compressed_device_indices,
+                       op.token_indices_compressed,
+                       sink_host_indices,
+                       sink_device_indices,
+                       self.io_backend,
+                       i,
+                )
+
+                self.mem_pool_host.load_to_device_per_layer(load_req)
+
+                producer_event.complete(i)
+            # NOTE: We must save the host indices and device indices here,
+            # this is because we need to guarantee that these tensors are
+            # still alive when the load stream is executing.
+            if sink_host_indices.is_cuda:
+                sink_host_indices.record_stream(self.load_stream)
+            if sink_device_indices.is_cuda:
+                sink_device_indices.record_stream(self.load_stream)
+            if compressed_host_indices.is_cuda:
+                compressed_host_indices.record_stream(self.load_stream)
+            if compressed_device_indices.is_cuda:
+                compressed_device_indices.record_stream(self.load_stream)
+
+        self.ack_load_queue.append(
+            HiCacheAck(
+                start_event=producer_event.start_event,
+                finish_event=producer_event.finish_event,
+                node_ids=op.node_ids,
+            )
+        )
+        return producer_id
+
+    def evict_device(self, device_indices: torch.Tensor) -> int:
+        self.mem_pool_device_allocator.free(device_indices)
+        return len(device_indices)
+
+    def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
+        if not backup_only:
+            raise ValueError("Other eviction policies are not supported yet.")
+
+        self.mem_pool_host.free(host_indices)
+        return len(host_indices)
+
+    def append_host_mem_release(self, host_indices: torch.Tensor):
+        if host_indices.numel() == 0:
+            return
+        pages = host_indices.split(self.mem_pool_host.page_size)
+        for page in pages:
+            self.host_mem_release_queue.put(page)

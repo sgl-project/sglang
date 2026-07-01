@@ -82,6 +82,18 @@ def synchronized(func):
     return wrapper
 
 
+@dataclass
+class KVTCHostMemoryRequest:
+    device_memory_pool: KVCache
+    host_indices_compressed: torch.Tensor
+    device_indices_compressed: torch.Tensor
+    token_indices_compressed: torch.Tensor
+    host_indices_sink: torch.Tensor
+    device_indices_sink: torch.Tensor
+    io_backend: str
+    layer_id: int | None
+
+
 class HostTensorAllocator:
     def __init__(self):
         """Initialize the HostTensorAllocator."""
