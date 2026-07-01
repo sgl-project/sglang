@@ -897,7 +897,10 @@ class LoRAMemoryPool:
             self.eviction_policy.remove(uid)
         except Exception:
             pass
-        if 0 <= buffer_id < len(self.buffer_id_to_uid) and self.buffer_id_to_uid[buffer_id] == uid:
+        if (
+            0 <= buffer_id < len(self.buffer_id_to_uid)
+            and self.buffer_id_to_uid[buffer_id] == uid
+        ):
             self.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
 
     def load_lora_weight_to_buffer(

@@ -210,7 +210,9 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         max_moe_tokens = max_bs * dp_size
 
         block_size_m = 64
-        max_num_tokens_padded = max_moe_tokens * top_k + num_experts * (block_size_m - 1)
+        max_num_tokens_padded = max_moe_tokens * top_k + num_experts * (
+            block_size_m - 1
+        )
         max_num_tokens_padded = (
             (max_num_tokens_padded + block_size_m - 1) // block_size_m
         ) * block_size_m
@@ -491,7 +493,10 @@ def _compute_moe_lora_info(
 
     # Fill only the per-rank prefix [0, num_tokens); the gathered tail keeps the -1 set above.
     torch.index_select(
-        weight_indices.to(torch.int32), 0, req_indices, out=token_lora_mapping[:num_tokens]
+        weight_indices.to(torch.int32),
+        0,
+        req_indices,
+        out=token_lora_mapping[:num_tokens],
     )
 
     return adapter_enabled, token_lora_mapping
