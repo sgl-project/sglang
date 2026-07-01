@@ -7,7 +7,6 @@ scheduler holds an `Optional[RustServer]` and delegates to it.
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import logging
 import os
@@ -17,7 +16,6 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
 
-from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import msgpack_decode
 
 if TYPE_CHECKING:
@@ -32,87 +30,42 @@ logger = logging.getLogger(__name__)
 class RustServer:
     """Owns the embedded multi-threaded Rust server (``sglang_server.Server``).
 
-    Started on the rank-0 scheduler when ``SGLANG_RUST_SERVER`` is set. The
-    server owns the API server, TokenizerManager, Tokenizer, and Detokenizer
-    (all Rust threads in this process) and produces ingress requests into an
-    in-process ring drained via :attr:`recv_from_tokenizer`. Stages 1-5 never
-    touch a ``PyObject``, so they run concurrently with the scheduler without
-    contending for the GIL.
+    The server owns the api-server, tokenizermanager, tokenizer, and detokenizer
+    all implemented as Rust threads in scheduler process.
     """
 
     def __init__(self, server: Server, max_per_poll: int = 256):
-        # The underlying `sglang_server.Server`.
         self.server = server
-        # Cap for an unbounded (`<= 0`) drain limit.
         self._max_per_poll = max_per_poll
-        # Per-rid egress chunk sequence counter (rust-server-specific state).
         self._seq_id: dict = {}
 
     @classmethod
     def maybe_create(cls, scheduler: Scheduler) -> RustServer:
         """Start the Rust server on the rank-0 scheduler if enabled, else ``None``."""
 
-        # Lazy import: only required when the rust server is actually enabled, so
-        # plain (non-rust) builds without the extension don't need it installed.
+        # Lazy import: only required when the rust server is actually enabled.
         from sglang_server import Server
 
-        server_args = scheduler.server_args
-
-        # Partition this rank's allowed CPU cores (already NUMA-local when
-        # SGLANG_SET_CPU_AFFINITY / NUMA bind is on): reserve a few cores for
-        # this scheduler's CUDA-launch / event-loop thread and hand the rest to
-        # the Rust pools, so tokenize/detok never share cores with the
-        # latency-critical launch thread.
-        cores = cls._partition_cores()
-
-        # Keep HF tokenizers (used by the Rust dynamo-tokenizers backend) off
-        # rayon's unpinned global thread pool. The Rust pool parallelizes
-        # tokenization *across* requests (one sequential encode per pinned core),
-        # not *within* a call via encode_batch — so forcing sequential per-call
-        # keeps rayon from spawning floating threads that would defeat core
-        # pinning / NUMA isolation. setdefault so an explicit choice still wins.
+        # Force turn off HF tokenizers rayon's unpinned global thread pool.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-        # `maybe_create` runs once per DP group (gated on the group's first TP
-        # rank). With dp_size>1 the frontends would otherwise all bind the same
-        # `host:port`, so the address is per-DP-rank:
-        #   * Mode B (standalone api-server): the rank runs **headless** on a TCP
-        #     listener (`headless_server_bind`); a separate api-server process connects in.
-        #   * Mode A (embedded): the rank serves HTTP on `port + dp_rank`; an
-        #     external router / client LB fans out.
-        #   * dp_size==1: embedded HTTP on the base port (`bind=None` → the Rust
-        #     side resolves `host:port` from server_args).
-        dp_rank = scheduler.ps.attn_dp_rank
-        bind = None
-        headless_server_bind = None
-        if server_args.dp_size > 1 and envs.SGLANG_RUST_STANDALONE_API_SERVER.get():
-            headless_server_bind = rust_headless_tcp_bind(server_args, dp_rank)
-        elif server_args.dp_size > 1:
-            bind = f"{server_args.host}:{server_args.port + dp_rank}"
+        server_args = scheduler.server_args
+        bind = f"{server_args.host}:{server_args.port}"
+        cores = cls._partition_cores()
 
-        # The bind address, tokenizer source/revision, and tokenizer/detok worker
-        # counts live in the dumped `server_args` blob, so the Rust side resolves
-        # them itself. Only the Python-computed core partition and the per-DP-rank
-        # `bind` / `tcp_bind` override (none part of server_args) pass here.
         server = Server(
             pin_cores=cores is not None,
             cores=cores,
             bind=bind,
-            headless_server_bind=headless_server_bind,
+            headless_server_bind=None,
             server_args_json=cls._build_server_args(scheduler),
         )
+
         logger.info(
-            "SGLANG_RUST_SERVER enabled: Rust server (dp_rank=%s, %s) on %s",
-            dp_rank,
-            "headless TCP" if headless_server_bind else "embedded HTTP",
-            headless_server_bind or bind or f"{server_args.host}:{server_args.port}",
+            "SGLANG_RUST_SERVER enabled, Rust server listen on %s",
+            bind,
         )
-        # Mode B: the rank's headless listener is up (the `Server` above bound it),
-        # so report the address the api-server should dial. Registration drives the
-        # api-server's deferred pool connect (it has no deterministic endpoint
-        # list); done on a daemon thread so scheduler startup isn't blocked.
-        if headless_server_bind is not None:
-            _register_headless_rank(server_args, dp_rank)
+
         return cls(server)
 
     def drain(self, max_recv: int) -> List[Any]:
@@ -215,67 +168,13 @@ class RustServer:
     def _build_server_args(scheduler: Scheduler) -> str:
         """JSON blob of the scheduler's ``server_args`` for its embedded Rust
         server (carries the already-resolved ``model_config``)."""
-        return RustServer._dump_server_args_json(
-            scheduler.server_args, scheduler.model_config
-        )
 
-    @staticmethod
-    def _dump_server_args_json(server_args, model_config) -> str:
-        """JSON blob of ``server_args`` handed to the Rust server.
+        server_args = dict(vars(scheduler.server_args))
+        model_config = dict(vars(scheduler.model_config))
+        model_config["hf_config"] = None  # HF config is not JSON-serializable
+        server_args["model_config"] = model_config
 
-        Recursively dumps the JSON-safe fields of ``server_args``, drilling into
-        nested dataclasses, dicts, lists, and generic objects (via ``__dict__``).
-        Binary, tensors, and non-serializable leaves (torch dtypes, callables)
-        are dropped; cycles are guarded by an identity set. Read-only static
-        config; live state goes through the request pipeline.
-
-        ``model_config`` is attached to ``server_args`` first so the dump carries
-        model-derived values (e.g. ``model_config.context_len``). Shared by the
-        embedded scheduler path and the standalone api-server process, which
-        resolves its own ``ModelConfig`` (it has no scheduler).
-        """
-        # Make the resolved model_config part of server_args so the recursive
-        # dump includes it (context_len, architecture config, …).
-        server_args.model_config = model_config
-
-        drop = object()
-
-        def to_json_safe(obj, seen):
-            if obj is None or isinstance(obj, (str, int, float, bool)):
-                return obj
-            if isinstance(obj, (bytes, bytearray, memoryview)):
-                return drop
-            if isinstance(obj, (list, tuple)):
-                return [
-                    s for s in (to_json_safe(v, seen) for v in obj) if s is not drop
-                ]
-            if isinstance(obj, dict):
-                items = obj.items()
-            elif hasattr(obj, "__dict__") and not callable(obj):
-                # vars() captures declared dataclass fields *and* dynamically-set
-                # attributes (e.g. the model_config attached to server_args, and
-                # model_config.context_len set in __init__).
-                items = ((k, v) for k, v in vars(obj).items() if not k.startswith("_"))
-            elif dataclasses.is_dataclass(obj):  # slotted dataclass (no __dict__)
-                items = (
-                    (f.name, getattr(obj, f.name)) for f in dataclasses.fields(obj)
-                )
-            else:
-                return drop  # opaque leaf (torch dtype, callable, …)
-            oid = id(obj)
-            if oid in seen:
-                return drop
-            seen.add(oid)
-            out = {
-                str(k): s
-                for k, v in items
-                for s in (to_json_safe(v, seen),)
-                if s is not drop
-            }
-            seen.discard(oid)
-            return out
-
-        return json.dumps(to_json_safe(server_args, set()))
+        return msgspec.json.encode(server_args, enc_hook=str).decode("utf-8")
 
     @staticmethod
     def _partition_cores() -> Optional[List[int]]:

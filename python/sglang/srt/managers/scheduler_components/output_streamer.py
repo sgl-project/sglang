@@ -31,7 +31,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler_components.rust_scheduler import RustServer
+    from sglang.srt.managers.scheduler_components.rust_server import RustServer
 
 
 logger = logging.getLogger(__name__)
