@@ -1089,6 +1089,50 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         cow_mamba = params.cow_mamba
         req = params.req
 
+        # FIX: tail<2 retreat. A radix HIT that leaves a 1-token recompute (extend_input_len==1) issues a
+        # single-token (M=1) MoE forward. On gfx950 that selects MoE tile block_m=16, whose aiter ck_moe_stage1
+        # GEMM returns NaN for a finite fp8 input (32/64/128 tiles are correct) -> flat logits -> wrong first
+        # token. The GDN/mamba recurrence is bit-exact correct (verified). Retreat to the previous checkpoint
+        # so the recompute is always >=2 tokens (never M=1); the COW restore source and the KV prefix move to
+        # the same earlier boundary in lock-step. Gated on cow_mamba (same condition as the COW stamp below),
+        # so no_buffer/int8 strategies that share this COW path are covered too. Root fix: upstream aiter.
+        MIN_SAFE_GDN_EXTEND = 2  # tail==1 is the degenerate single-token (M=1) extend
+        if (
+            cow_mamba
+            and req is not None
+            and best_value_len > 0
+            and last_node.mamba_value is not None
+        ):
+            fill = getattr(req, "full_untruncated_fill_ids", None)
+            # NOTE empty array("q") (e.g. a PD-disagg decode match before fill_ids is populated) is falsy ->
+            # input_len=None -> we cannot determine the tail -> do NOT retreat (else we'd discard real hits).
+            input_len = len(fill) if fill else None
+            if input_len is None and hasattr(req, "get_fill_ids"):
+                gf = req.get_fill_ids()
+                input_len = len(gf) if gf else None
+            if input_len is not None and (
+                0
+                < input_len - sum(len(v) for v in value[:best_value_len])
+                < MIN_SAFE_GDN_EXTEND
+            ):
+                retreat_node, retreat_len = last_node, best_value_len
+                while retreat_len > 0:
+                    retreat_node = retreat_node.parent
+                    retreat_len -= 1
+                    if (
+                        retreat_node is not None
+                        and retreat_node.mamba_value is not None
+                    ):
+                        break
+                if (
+                    retreat_len > 0
+                    and retreat_node is not None
+                    and retreat_node.mamba_value is not None
+                ):
+                    last_node, best_value_len = retreat_node, retreat_len
+                else:
+                    last_node, best_value_len = self.root_node, 0
+
         # update time for matched nodes, and make nodes closer to root to be least recently used
         # this allows mamba to evict nodes closer to root first
         node_update = last_node
