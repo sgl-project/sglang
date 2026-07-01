@@ -727,11 +727,37 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             )
         )
 
-    def test_mixed_precision_uses_nvfp4_min_capability(self):
+    def test_mixed_precision_uses_nvfp4_min_capability_without_mxfp8_linears(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.mlp.experts.0.down_proj": {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                    },
+                },
+            }
+        )
+
         self.assertEqual(
-            ModelOptMixedPrecisionConfig.get_min_capability(),
+            quant_config.get_min_capability(),
             ModelOptFp4Config.get_min_capability(),
         )
+
+    def test_mixed_precision_requires_sm100_for_mxfp8_linear_layers(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.mlp.shared_experts.down_proj": {
+                        "quant_algo": "MXFP8",
+                    },
+                },
+            }
+        )
+
+        self.assertEqual(quant_config.get_min_capability(), 100)
 
     def test_mixed_precision_quant_layer_resolution_after_mapping(self):
         quant_config = ModelOptMixedPrecisionConfig.from_config(
@@ -813,6 +839,28 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
                 quant_config=quant_config,
                 prefix="model.layers.0.mlp.down_proj",
             )
+
+    def test_mixed_precision_rejects_mxfp8_routed_fused_moe(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.mlp.experts.0.down_proj": {
+                        "quant_algo": "MXFP8",
+                    },
+                },
+            }
+        )
+
+        class DummyFusedMoE:
+            pass
+
+        with patch("sglang.srt.layers.moe.fused_moe_triton.FusedMoE", DummyFusedMoE):
+            with self.assertRaisesRegex(NotImplementedError, "MXFP8 routed FusedMoE"):
+                quant_config.get_quant_method(
+                    DummyFusedMoE(),
+                    "model.layers.0.mlp.experts",
+                )
 
     def test_mxfp8_linear_uses_v2_weight_loader(self):
         self.assertIn("ModelOptMxfp8LinearMethod", WEIGHT_LOADER_V2_SUPPORTED)

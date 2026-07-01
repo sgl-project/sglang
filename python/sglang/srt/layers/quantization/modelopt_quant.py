@@ -626,8 +626,25 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
         return [torch.bfloat16, torch.half]
 
-    @classmethod
-    def get_min_capability(cls) -> int:
+    @staticmethod
+    def _is_routed_expert_key(prefix: str) -> bool:
+        parts = prefix.split(".")
+        return (
+            "experts" in parts
+            and "shared_expert" not in parts
+            and "shared_experts" not in parts
+        )
+
+    def _has_mxfp8_linear_layers(self) -> bool:
+        return any(
+            str(info.get("quant_algo", "")).upper() == "MXFP8"
+            and not self._is_routed_expert_key(prefix)
+            for prefix, info in self.quantized_layers.items()
+        )
+
+    def get_min_capability(self) -> int:
+        if self._has_mxfp8_linear_layers():
+            return 100
         return ModelOptFp4Config.get_min_capability()
 
     @classmethod
@@ -767,6 +784,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp8MoEMethod(self.fp8_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
+            if quant_algo == "MXFP8":
+                raise NotImplementedError(
+                    "ModelOpt MIXED_PRECISION does not support MXFP8 routed "
+                    f"FusedMoE experts at {prefix}. MXFP8 is supported for "
+                    "shared-expert linear layers; routed FusedMoE experts must "
+                    "use a supported MoE quantization such as NVFP4."
+                )
             return None
 
         return None
