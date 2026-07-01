@@ -2,7 +2,7 @@
 
 Covers ``SchedulerProfilerManager._build_profile_annotation`` (the per-iteration
 sq/sk/sqsq/sqsk aggregation + ``torch.profiler.record_function`` marker) and the
-``roofline_annotations`` plumbing through ``ProfileReqInput`` / ``ProfileReq``.
+``roofline_annotations`` plumbing through ``ProfileReq``.
 """
 
 import json
@@ -15,7 +15,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import ProfileReqInput
+from sglang.srt.managers.io_struct import ProfileReq
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
@@ -139,14 +139,14 @@ class TestRooflineAnnotationGating(CustomTestCase):
 
 class TestRooflineAnnotationPlumbing(CustomTestCase):
     def test_default_is_false(self):
-        self.assertFalse(ProfileReqInput().roofline_annotations)
+        self.assertFalse(ProfileReq().roofline_annotations)
 
     def test_json_round_trip(self):
-        req = ProfileReqInput(output_dir="/tmp/x", roofline_annotations=True)
+        req = ProfileReq(output_dir="/tmp/x", roofline_annotations=True)
         payload = {"roofline_annotations": req.roofline_annotations}
         parsed = json.loads(json.dumps(payload))
         self.assertTrue(parsed["roofline_annotations"])
-        self.assertTrue(ProfileReqInput(**parsed).roofline_annotations)
+        self.assertTrue(ProfileReq(**parsed).roofline_annotations)
 
 
 if __name__ == "__main__":
