@@ -1406,6 +1406,14 @@ class ModelConfig:
                     "DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0. This might cause accuracy degradation on Blackwell."
                 )
 
+        # An unquantized draft/MTP checkpoint must not inherit the target's
+        # quantization, or draft weight loading fails on a quantized verifier.
+        if self.is_draft_model and quant_cfg is None and self.quantization is not None:
+            logger.info(
+                f"Draft model has no quantization config in its checkpoint; "
+                f"loading it unquantized instead of '{self.quantization}'."
+            )
+            self.quantization = None
         if self.quantization is not None:
             if self.quantization not in supported_quantization:
                 raise ValueError(
