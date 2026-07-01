@@ -217,6 +217,7 @@ def build_kv_cache(
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
+        rotary_embeddings=tp_worker.model_runner.model.model.layers[0].self_attn.rotary_emb
     )
 
     tree_cache = create_tree_cache(

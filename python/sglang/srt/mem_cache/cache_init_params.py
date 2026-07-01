@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache_components.tree_component import (
         TreeComponent,
     )
+    from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 
 
 @dataclasses.dataclass
@@ -52,3 +53,5 @@ class CacheInitParams:
     component_registry_override: Optional[dict[ComponentType, type[TreeComponent]]] = (
         None
     )
+
+    rotary_embeddings: Optional[RotaryEmbedding] = None
