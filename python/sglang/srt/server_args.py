@@ -515,10 +515,24 @@ class ServerArgs:
                 'Which model-config parser to use. "auto" picks "mistral" '
                 'via the is_mistral_model name heuristic, else "hf" '
                 "(AutoConfig over config.json). Plugins can register additional "
-                "parsers via @register_model_config_parser."
+                "parsers via @register_model_config_parser. See also "
+                "--config-format (vLLM-style alias)."
             )
         ),
     ] = "auto"
+    config_format: A[
+        Optional[str],
+        Arg(
+            help=(
+                "vLLM-style alias for --model-config-parser. Accepts the same "
+                'values ("auto", "hf", "mistral", or any plugin-registered '
+                "parser name). When set, this takes precedence over "
+                "--model-config-parser. Provided so vLLM-style Mistral "
+                "invocations (--config-format mistral --load-format mistral) "
+                "work verbatim on SGLang."
+            )
+        ),
+    ] = None
     json_model_override_args: A[
         str,
         "A dictionary in JSON string format used to override default model configurations.",
@@ -2698,6 +2712,11 @@ class ServerArgs:
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
         self._validate_cutedsl_a2a_token_budget()
+
+        # Reconcile the vLLM-style --config-format alias with
+        # --model-config-parser before load-format handling, which relies on
+        # model_config_parser being finalized.
+        self._handle_config_format()
 
         # Handle model loading format.
         self._handle_load_format()
@@ -5888,6 +5907,24 @@ class ServerArgs:
             f"Mooncake storage backend does not support layer_first layout, "
             f"switching to {new_layout} layout for {self.hicache_io_backend} io backend"
         )
+
+    def _handle_config_format(self):
+        # --config-format is the vLLM-style alias for --model-config-parser.
+        # If the user passed the alias, it takes precedence. Erroring on
+        # simultaneous conflicting values is more useful than silently
+        # picking a winner.
+        if self.config_format is None:
+            return
+        if (
+            self.model_config_parser != "auto"
+            and self.model_config_parser != self.config_format
+        ):
+            raise ValueError(
+                f"--config-format={self.config_format!r} conflicts with "
+                f"--model-config-parser={self.model_config_parser!r}. "
+                "Pass only one."
+            )
+        self.model_config_parser = self.config_format
 
     def _handle_load_format(self):
         if (

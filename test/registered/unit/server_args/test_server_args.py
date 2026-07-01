@@ -1336,5 +1336,45 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         self.assertEqual(parsed.sampling_backend, "token_oracle")
 
 
+class TestConfigFormatAlias(CustomTestCase):
+    """--config-format is a vLLM-parity alias for --model-config-parser.
+
+    Tests the reconciliation function _handle_config_format directly on a
+    minimal SimpleNamespace stand-in for ServerArgs -- this isolates the four
+    reconciliation states without going through prepare_server_args, which
+    would try to actually load a model config (and would rightly fail for a
+    non-Mistral model when config_format='mistral' is set).
+    """
+
+    @staticmethod
+    def _reconcile(config_format, model_config_parser):
+        from sglang.srt.server_args import ServerArgs
+
+        ns = SimpleNamespace(
+            config_format=config_format,
+            model_config_parser=model_config_parser,
+        )
+        ServerArgs._handle_config_format(ns)
+        return ns
+
+    def test_neither_flag_leaves_default(self):
+        ns = self._reconcile(config_format=None, model_config_parser="auto")
+        self.assertEqual(ns.model_config_parser, "auto")
+        self.assertIsNone(ns.config_format)
+
+    def test_config_format_propagates_to_parser(self):
+        ns = self._reconcile(config_format="mistral", model_config_parser="auto")
+        self.assertEqual(ns.model_config_parser, "mistral")
+        self.assertEqual(ns.config_format, "mistral")
+
+    def test_conflicting_flags_error(self):
+        with self.assertRaisesRegex(ValueError, "conflicts with"):
+            self._reconcile(config_format="mistral", model_config_parser="hf")
+
+    def test_matching_flags_accepted(self):
+        ns = self._reconcile(config_format="mistral", model_config_parser="mistral")
+        self.assertEqual(ns.model_config_parser, "mistral")
+
+
 if __name__ == "__main__":
     unittest.main()
