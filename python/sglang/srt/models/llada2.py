@@ -370,6 +370,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             self.alt_stream is not None
             and hidden_states.shape[0] > 0
             and get_is_capture_mode()
+            and not torch.compiler.is_compiling()
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
                 hidden_states

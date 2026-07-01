@@ -168,6 +168,7 @@ class HYV3MoEFused(nn.Module):
             and self.shared_mlp is not None
             and hidden_states.shape[0] > 0
             and get_is_capture_mode()
+            and not torch.compiler.is_compiling()
         ):
             return self._forward_dual_stream(hidden_states)
         return self._forward_single_stream(hidden_states)

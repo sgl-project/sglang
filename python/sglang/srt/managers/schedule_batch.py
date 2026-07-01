@@ -712,12 +712,22 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
-        self.origin_input_ids = origin_input_ids
-        self.origin_input_ids_unpadded = (
-            origin_input_ids_unpadded
-            if origin_input_ids_unpadded
-            else self.origin_input_ids
-        )  # Before image padding
+        # Keep Req token-id storage homogeneous even when non-tokenizer ingress
+        # paths (e.g. gRPC bridge) pass Python lists.
+        self.origin_input_ids = (
+            origin_input_ids
+            if isinstance(origin_input_ids, array)
+            else array("q", origin_input_ids)
+        )
+        if origin_input_ids_unpadded:
+            self.origin_input_ids_unpadded = (
+                origin_input_ids_unpadded
+                if isinstance(origin_input_ids_unpadded, array)
+                else array("q", origin_input_ids_unpadded)
+            )
+        else:
+            self.origin_input_ids_unpadded = self.origin_input_ids
+        # Before image padding
         # Each decode stage's output ids. Append-only by contract:
         # _refresh_fill_ids infers how many output tokens are already in
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites

@@ -387,6 +387,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         if (
             self.alt_stream is not None
             and get_is_capture_mode()
+            and not torch.compiler.is_compiling()
             and seq_len < DUAL_STREAM_TOKEN_THRESHOLD
         ):
             current_stream = torch.cuda.current_stream()
@@ -745,7 +746,11 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # overlap qk norm
-        if self.alt_stream is not None and get_is_capture_mode():
+        if (
+            self.alt_stream is not None
+            and get_is_capture_mode()
+            and not torch.compiler.is_compiling()
+        ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             q_by_head = q.reshape(-1, self.head_dim)

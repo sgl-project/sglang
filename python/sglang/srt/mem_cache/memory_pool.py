@@ -166,7 +166,11 @@ def _set_kv_buffer_impl(
 
     from sglang.srt.model_executor.runner import get_is_capture_mode
 
-    if get_is_capture_mode() and alt_stream is not None:
+    if (
+        get_is_capture_mode()
+        and alt_stream is not None
+        and not torch.compiler.is_compiling()
+    ):
         current_stream = device_module.current_stream()
         alt_stream.wait_stream(current_stream)
         k_cache[indices] = k
@@ -2151,7 +2155,11 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             cache_k_fp4_sf = cache_k_fp4_sf.view(self.store_dtype)
             cache_v_fp4_sf = cache_v_fp4_sf.view(self.store_dtype)
 
-        if get_is_capture_mode() and self.alt_stream is not None:
+        if (
+            get_is_capture_mode()
+            and self.alt_stream is not None
+            and not torch.compiler.is_compiling()
+        ):
             # Overlap the copy of K and V cache for small batch size
             current_stream = self.device_module.current_stream()
             self.alt_stream.wait_stream(current_stream)

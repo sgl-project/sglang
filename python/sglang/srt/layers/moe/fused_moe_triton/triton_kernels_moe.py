@@ -7,15 +7,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from triton_kernels.matmul_ogs import (
+from triton_kernels.matmul import (
     FlexCtx,
     FnSpecs,
     FusedActivation,
-    GatherIndx,
     PrecisionConfig,
-    RoutingData,
-    ScatterIndx,
-    matmul_ogs,
+    matmul,
 )
 from triton_kernels.numerics import InFlexData
 from triton_kernels.swiglu import swiglu_fn
@@ -29,6 +26,8 @@ else:
     from sgl_kernel import gelu_and_mul, silu_and_mul
 
 if TYPE_CHECKING:
+    from triton_kernels.tensor_details.ragged_tensor import RaggedTensorMetadata
+
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
 
@@ -80,15 +79,17 @@ def triton_kernel_moe_forward(
 
     assert TopKOutputChecker.format_is_triton_kernels(topk_output)
 
-    routing_data, gather_idx, scatter_idx = topk_output
+    a_ragged_metadata, gather_idx, scatter_idx, gate_scal, n_expts_act = topk_output
 
     return triton_kernel_fused_experts(
         hidden_states,
         w1,
         w2,
-        routing_data,
+        a_ragged_metadata,
         gather_idx,
         scatter_idx,
+        gate_scal,
+        n_expts_act,
         inplace=False,  # triton kernel doesn't support inplace
         activation=moe_runner_config.activation,
         apply_router_weight_on_input=apply_router_weight_on_input,
@@ -109,9 +110,11 @@ def triton_kernel_fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    routing_data: RoutingData,
-    gather_indx: GatherIndx,
-    scatter_indx: ScatterIndx,
+    a_ragged_metadata: RaggedTensorMetadata,
+    gather_indx: torch.Tensor,
+    scatter_indx: Optional[torch.Tensor],
+    gate_scal: torch.Tensor,
+    n_expts_act: int,
     inplace: bool = False,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
@@ -156,7 +159,6 @@ def triton_kernel_fused_experts(
 
     M, K = hidden_states.shape
     E, _, N = w1.shape
-    n_expts_act = routing_data.n_expts_act
     dtype = hidden_states.dtype
 
     if global_num_experts == -1:
@@ -164,16 +166,16 @@ def triton_kernel_fused_experts(
 
     # consistent with default implementation
     intermediate_cache2 = torch.empty(
-        (M * n_expts_act, N // 2), device="cuda", dtype=dtype
+        (M * n_expts_act, N // 2), device=hidden_states.device, dtype=dtype
     )
 
-    intermediate_cache1 = matmul_ogs(
+    intermediate_cache1 = matmul(
         hidden_states,
         w1,
         None,
-        routing_data,
+        a_ragged_metadata=a_ragged_metadata,
         gather_indx=gather_indx,
-        gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
+        gammas=gate_scal if apply_router_weight_on_input else None,
     )
 
     if activation == "silu":
@@ -183,13 +185,13 @@ def triton_kernel_fused_experts(
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
-    intermediate_cache3 = matmul_ogs(
+    intermediate_cache3 = matmul(
         intermediate_cache2,
         w2,
         None,
-        routing_data,
+        a_ragged_metadata=a_ragged_metadata,
         scatter_indx=scatter_indx,
-        gammas=None if apply_router_weight_on_input else routing_data.gate_scal,
+        gammas=None if apply_router_weight_on_input else gate_scal,
     )
 
     return intermediate_cache3
@@ -220,7 +222,7 @@ def triton_kernel_moe_with_bias_forward(
 
     assert TopKOutputChecker.format_is_triton_kernels(topk_output)
 
-    routing_data, gather_idx, scatter_idx = topk_output
+    a_ragged_metadata, gather_idx, scatter_idx, gate_scal, n_expts_act = topk_output
 
     return triton_kernel_fused_experts_with_bias(
         hidden_states,
@@ -230,9 +232,11 @@ def triton_kernel_moe_with_bias_forward(
         w2=w2,
         w2_pcg=w2_pcg,
         b2=b2,
-        routing_data=routing_data,
+        a_ragged_metadata=a_ragged_metadata,
         gather_indx=gather_idx,
         scatter_indx=scatter_idx,
+        gate_scal=gate_scal,
+        n_expts_act=n_expts_act,
         inplace=False,  # triton kernel doesn't support inplace
         activation=moe_runner_config.activation,
         apply_router_weight_on_input=apply_router_weight_on_input,
@@ -258,9 +262,11 @@ def triton_kernel_fused_experts_with_bias(
     w2: torch.Tensor,
     w2_pcg,
     b2: torch.Tensor,
-    routing_data: RoutingData,
-    gather_indx: GatherIndx,
-    scatter_indx: ScatterIndx,
+    a_ragged_metadata: RaggedTensorMetadata,
+    gather_indx: torch.Tensor,
+    scatter_indx: Optional[torch.Tensor],
+    gate_scal: torch.Tensor,
+    n_expts_act: int,
     inplace: bool = False,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
@@ -309,7 +315,6 @@ def triton_kernel_fused_experts_with_bias(
 
     M, K = hidden_states.shape
     E, _, N = w1.shape
-    n_expts_act = routing_data.n_expts_act
 
     if global_num_experts == -1:
         global_num_experts = E
@@ -329,35 +334,24 @@ def triton_kernel_fused_experts_with_bias(
         (gemm1_alpha, gemm1_clamp_limit),
     )
 
-    intermediate_cache = torch.empty(
-        (1, M * n_expts_act, N // 2),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    output = torch.empty(
-        (1, M, K), device=hidden_states.device, dtype=hidden_states.dtype
-    )
-
-    matmul_ogs(
+    intermediate_cache = matmul(
         hidden_states,
         w1,
         b1,
-        routing_data,
+        a_ragged_metadata=a_ragged_metadata,
         gather_indx=gather_indx,
         precision_config=w1_pcg,
-        gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
+        gammas=gate_scal if apply_router_weight_on_input else None,
         fused_activation=act,
-        y=intermediate_cache,
     )
 
-    matmul_ogs(
+    output = matmul(
         intermediate_cache.view(M * n_expts_act, N // 2),
         w2,
         b2,
-        routing_data,
+        a_ragged_metadata=a_ragged_metadata,
         scatter_indx=scatter_indx,
         precision_config=w2_pcg,
-        gammas=None if apply_router_weight_on_input else routing_data.gate_scal,
-        y=output,
+        gammas=None if apply_router_weight_on_input else gate_scal,
     )
-    return output.view(M, K)
+    return output.view(-1, K)

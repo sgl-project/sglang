@@ -237,6 +237,22 @@ uninstall_stale_flashinfer() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+install_pytorch_stack() {
+    PYTORCH_SPECS=()
+    for package in torch torchaudio torchvision torchao torchcodec; do
+        spec=$(grep -Po -m1 "\"${package}([<>=!~ ;][^\"]*)?\"" python/pyproject.toml | tr -d '"' || true)
+        if [ -n "$spec" ]; then
+            PYTORCH_SPECS+=("$spec")
+        fi
+    done
+
+    $PIP_CMD install \
+        "${PYTORCH_SPECS[@]}" \
+        --index-url "https://download.pytorch.org/whl/${CU_VERSION}"
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 install_sglang() {
     EXTRAS="dev,runai,tracing"
     if [ -n "$OPTIONAL_DEPS" ]; then
@@ -285,43 +301,6 @@ install_sglang_kernel() {
             echo "Please re-run the full workflow using /tag-and-rerun-ci to rebuild the kernel."
             exit 1
         fi
-    fi
-
-    # Reinstall torch with matching CUDA version if needed
-    # TODO: Remove after torch 2.11 where cu13 is enabled by default
-    REINSTALL_TORCH=false
-    if TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')" 2>&1); then
-        echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
-    else
-        TORCH_IMPORT_ERROR="${TORCH_CUDA_VER}"
-        TORCH_CUDA_VER=""
-        echo "WARNING: importing torch failed while probing CUDA version; force-reinstalling torch packages."
-        printf '%s\n' "${TORCH_IMPORT_ERROR}"
-        REINSTALL_TORCH=true
-    fi
-    TORCHAUDIO_CUDA_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
-    TORCHVISION_CUDA_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
-    if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
-        REINSTALL_TORCH=true
-    else
-        for cuda_ver in "${TORCHAUDIO_CUDA_VER}" "${TORCHVISION_CUDA_VER}"; do
-            if [ -n "${cuda_ver}" ] && [ "${cuda_ver}" != "${CU_VERSION}" ]; then
-                REINSTALL_TORCH=true
-                break
-            fi
-        done
-    fi
-    if [ "${REINSTALL_TORCH}" = true ]; then
-        TORCH_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-        TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-        TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-        if [ -z "${TORCH_VER}" ] || [ -z "${TORCHAUDIO_VER}" ] || [ -z "${TORCHVISION_VER}" ]; then
-            echo "ERROR: could not determine installed torch package versions before reinstall."
-            pip show torch torchaudio torchvision || true
-            exit 1
-        fi
-        echo "Reinstalling torch==${TORCH_VER} torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${CU_VERSION} index to match torch..."
-        $PIP_CMD install "torch==${TORCH_VER}" "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${CU_VERSION}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
 
     if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" != "true" ]; then
@@ -553,6 +532,7 @@ main() {
     clean_site_packages
     setup_pip_toolchain
     uninstall_stale_flashinfer
+    install_pytorch_stack
     install_sglang
     install_sglang_kernel
     install_sglang_router

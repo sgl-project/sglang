@@ -885,6 +885,7 @@ class DeepseekV2MoE(nn.Module):
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
+                and not torch.compiler.is_compiling()
                 and not (
                     server_args.enable_torch_compile
                     and hidden_states.shape[0]
@@ -1205,7 +1206,11 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
-        sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
+        sbo_enabled_flag = (
+            self._fuse_shared_experts_inside_sbo
+            and not self.is_nextn
+            and not torch.compiler.is_compiling()
+        )
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
         )
@@ -1217,7 +1222,7 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
-                if self.alt_stream is not None:
+                if self.alt_stream is not None and not torch.compiler.is_compiling():
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
                         shared_output = self._forward_shared_experts(hidden_states)
@@ -1355,7 +1360,10 @@ class DeepseekV2MoE(nn.Module):
             post_combine_hook_handle = (
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
-        elif envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get():
+        elif (
+            envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get()
+            and not torch.compiler.is_compiling()
+        ):
             # On GB200: Shared experts overlapped on alt_stream, down gemm overlapped with DeepEP Combine
 
             def _post_dispatch_hook(
@@ -1412,6 +1420,7 @@ class DeepseekV2MoE(nn.Module):
             and not sbo_enabled_flag
             and self.num_fused_shared_experts == 0
             and self.alt_stream is not None
+            and not torch.compiler.is_compiling()
         ):
             torch.cuda.current_stream().wait_event(shared_event)
 

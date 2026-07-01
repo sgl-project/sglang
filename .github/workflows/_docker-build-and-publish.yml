@@ -120,7 +120,7 @@ jobs:
             --platform linux/amd64 \
             --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=12.9.1 \
+            --build-arg CUDA_VERSION=12.9.2 \
             --build-arg BUILD_TYPE=all \
             --build-arg GRACE_BLACKWELL=0 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
@@ -149,7 +149,7 @@ jobs:
             --platform linux/amd64 \
             --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg CUDA_VERSION=13.0.3 \
             --build-arg BUILD_TYPE=all \
             --build-arg GRACE_BLACKWELL=0 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
@@ -232,7 +232,7 @@ jobs:
             --platform linux/arm64 \
             --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=12.9.1 \
+            --build-arg CUDA_VERSION=12.9.2 \
             --build-arg BUILD_TYPE=all \
             --build-arg GRACE_BLACKWELL=1 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
@@ -261,7 +261,7 @@ jobs:
             --platform linux/arm64 \
             --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg CUDA_VERSION=13.0.3 \
             --build-arg BUILD_TYPE=all \
             --build-arg GRACE_BLACKWELL=1 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \

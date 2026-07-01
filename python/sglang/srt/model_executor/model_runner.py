@@ -1221,6 +1221,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     ib_device_for_gpu.split(",") if ib_device_for_gpu else []
                 )
                 try:
+                    from sglang.srt.distributed.mooncake_loader import (
+                        preload_mooncake_engine_global,
+                    )
+
+                    preload_mooncake_engine_global()
                     from mooncake import ep as mooncake_ep
 
                     mooncake_ep.set_device_filter(mooncake_ib_device)

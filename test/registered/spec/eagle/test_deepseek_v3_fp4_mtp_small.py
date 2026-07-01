@@ -35,6 +35,7 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
             "flashinfer_trtllm",
             "--quantization",
             "modelopt_fp4",
+            "--disable-flashinfer-autotune",
             "--speculative-algorithm",
             "EAGLE",
             "--speculative-num-steps",

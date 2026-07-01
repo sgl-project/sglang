@@ -356,7 +356,14 @@ def run_component_accuracy_files(files, filter_expr=None, continue_on_error=Fals
     for file_path in files:
         file_name = Path(file_path).name
         num_gpus = COMPONENT_ACCURACY_FILE_NUM_GPUS.get(file_name, 1)
+        env = None
         if num_gpus > 1:
+            env = os.environ.copy()
+            # Torch 2.12 bundles NCCL 2.29, which hard-fails NVLS multicast
+            # bind errors that NCCL 2.28 used to handle by disabling NVLS and
+            # continuing. Component accuracy launches torchrun directly before
+            # the diffusion launcher applies its runtime default.
+            env.setdefault("NCCL_NVLS_ENABLE", "0")
             cmd = [
                 sys.executable,
                 "-m",
@@ -375,7 +382,7 @@ def run_component_accuracy_files(files, filter_expr=None, continue_on_error=Fals
         cmd.append(file_path)
 
         print(f"Running command: {' '.join(cmd)}")
-        file_exit_code = subprocess.call(cmd)
+        file_exit_code = subprocess.call(cmd, env=env)
         if file_exit_code == 5:
             print(
                 "No tests collected (exit code 5). This is expected when filters "

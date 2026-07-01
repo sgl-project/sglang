@@ -555,7 +555,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
             final_hidden_states = self.experts(hidden_states, topk_output)
-        elif self.alt_stream is not None and get_is_capture_mode():
+        elif (
+            self.alt_stream is not None
+            and get_is_capture_mode()
+            and not torch.compiler.is_compiling()
+        ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
                 hidden_states, use_fused_gate=use_fused_gate
             )

@@ -30,6 +30,7 @@ class FP4GemmBase:
             "--trust-remote-code",
             "--quantization",
             "modelopt_fp4",
+            "--disable-flashinfer-autotune",
             "--fp4-gemm-backend",
             cls.backend,
         ]

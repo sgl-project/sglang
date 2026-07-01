@@ -145,6 +145,9 @@ def _refresh_ep_members() -> None:
 
 
 def try_recover_ranks(global_ranks: List[int]) -> bool:
+    from sglang.srt.distributed.mooncake_loader import preload_mooncake_engine_global
+
+    preload_mooncake_engine_global()
     from mooncake import ep as mooncake_ep
 
     world_backend = _get_process_group_backend(torch.distributed.group.WORLD, "cuda")
@@ -175,6 +178,9 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
 
 
 def join_process_groups():
+    from sglang.srt.distributed.mooncake_loader import preload_mooncake_engine_global
+
+    preload_mooncake_engine_global()
     from mooncake import ep as mooncake_ep
 
     def join_backend(label: str, backend) -> None:

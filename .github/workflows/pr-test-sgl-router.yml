@@ -282,6 +282,16 @@ jobs:
           echo "## Tier-2 results" >> "$GITHUB_STEP_SUMMARY"
           echo "- Build duration: \`${tier_2_build_duration_seconds:-(not recorded)}\` s" >> "$GITHUB_STEP_SUMMARY"
 
+  sgl-router-sgl-kernel-build-wheels:
+    name: Build sgl-kernel wheel
+    needs: sgl-router-gate
+    if: needs.sgl-router-gate.outputs.should_run == 'true'
+    uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
+    with:
+      runs_on: x64-kernel-build-node
+      job_display_name: Build sgl-router sgl-kernel Wheel
+    secrets: inherit
+
   sgl-router-docker-build-test:
     name: tier-3 — docker (placeholder)
     needs: [sgl-router-gate, sgl-router-build-and-test]
@@ -349,7 +359,10 @@ jobs:
 
   sgl-router-e2e:
     name: tier-3 — e2e
-    needs: [sgl-router-gate, sgl-router-build-and-test]
+    needs:
+      - sgl-router-gate
+      - sgl-router-build-and-test
+      - sgl-router-sgl-kernel-build-wheels
     if: needs.sgl-router-gate.outputs.should_run == 'true'
     runs-on: 2-gpu-h100
     timeout-minutes: 45
@@ -375,7 +388,21 @@ jobs:
       # e2e to test against a stale wheel and would silently miss any
       # new ServerArgs field (e.g. `disaggregation_mode` /
       # `disaggregation_bootstrap_port`) added in the branch.
+      - name: Prepare sgl-kernel/dist for prebuilt wheel
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download sgl-kernel wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          name: wheel-python3.10-cuda13.0
+
       - name: Install SGLang dependencies
+        env:
+          CUSTOM_BUILD_SGL_KERNEL: "true"
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh
 
@@ -413,6 +440,7 @@ jobs:
       - sgl-router-gate
       - sgl-router-lint
       - sgl-router-build-and-test
+      - sgl-router-sgl-kernel-build-wheels
       - sgl-router-docker-build-test
       - sgl-router-k8s-integration
       - sgl-router-e2e
