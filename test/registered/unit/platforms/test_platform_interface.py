@@ -19,6 +19,7 @@ from sglang.srt.platforms.device_mixin import (
     PlatformEnum,
 )
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -194,6 +195,11 @@ class TestDeviceMixin(CustomTestCase):
         cuda = _make_device_mixin(PlatformEnum.CUDA, "cuda", "cuda")
         self.assertFalse(cuda.is_out_of_tree())
 
+    def test_pin_memory_default_is_conservative(self):
+        mixin = _make_device_mixin(PlatformEnum.OOT, "custom", "custom")
+        self.assertFalse(mixin.is_pin_memory_available())
+        self.assertFalse(mixin.is_pin_memory_available(device="cpu"))
+
     @patch("platform.machine")
     def test_get_cpu_architecture(self, mock_machine):
         """get_cpu_architecture maps common strings to CpuArchEnum."""
@@ -231,6 +237,11 @@ class TestSRTPlatform(CustomTestCase):
         base = SRTPlatform()
         self.assertFalse(base.is_cuda())
         self.assertFalse(base.is_cuda_alike())
+
+    def test_base_pin_memory_default_is_conservative(self):
+        base = SRTPlatform()
+        self.assertFalse(base.is_pin_memory_available())
+        self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
 
 class TestCudaDeviceMixin(CustomTestCase):
@@ -307,6 +318,19 @@ class TestCudaDeviceMixin(CustomTestCase):
         base = CudaSRTPlatform()
         self.assertEqual(base.get_available_memory(1), (123, 456))
         mock_mem_get_info.assert_called_once_with(1)
+
+    def test_pin_memory_available_for_cuda_targets(self):
+        base = CudaSRTPlatform()
+        self.assertTrue(base.is_pin_memory_available())
+        self.assertTrue(base.is_pin_memory_available(device="cuda"))
+        self.assertTrue(base.is_pin_memory_available(device=torch.device("cuda", 0)))
+        self.assertFalse(base.is_pin_memory_available(device="cpu"))
+
+    def test_rocm_inherits_cuda_pin_memory_behavior(self):
+        base = RocmSRTPlatform()
+        self.assertTrue(base.is_pin_memory_available())
+        self.assertTrue(base.is_pin_memory_available(device="cuda"))
+        self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
     def test_default_distributed_backend_is_nccl(self):
         base = CudaSRTPlatform()
@@ -445,8 +469,9 @@ class TestCpuDeviceMixin(CustomTestCase):
         self.assertFalse(base.supports_fp8())
         self.assertFalse(base.support_cuda_graph())
         self.assertFalse(base.support_piecewise_cuda_graph())
-        # Override of the SRTPlatform default (True) — no GPU to pin to.
+        # CPU has no GPU to pin host memory to.
         self.assertFalse(base.is_pin_memory_available())
+        self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
 
 class TestSRTPlatformOverrides(CustomTestCase):
@@ -473,6 +498,96 @@ class TestSRTPlatformOverrides(CustomTestCase):
                 return "inductor"
 
         self.assertEqual(P().get_compile_backend(mode="npugraph_ex"), "inductor")
+
+    def test_srt_platform_does_not_shadow_device_mixin_pin_memory_override(self):
+        class M(DeviceMixin):
+            def is_pin_memory_available(self, device=None):
+                return device == "custom"
+
+        class P(SRTPlatform, M):
+            pass
+
+        self.assertTrue(P().is_pin_memory_available(device="custom"))
+
+    def test_device_mixin_can_precede_srt_platform_for_pin_memory_override(self):
+        class M(DeviceMixin):
+            def is_pin_memory_available(self, device=None):
+                return device == "custom"
+
+        class P(M, SRTPlatform):
+            pass
+
+        self.assertTrue(P().is_pin_memory_available(device="custom"))
+
+
+class TestPinMemoryAvailability(CustomTestCase):
+    """Tests for common pin-memory helper dispatch through platforms."""
+
+    def test_common_wrapper_dispatches_to_current_platform_with_device(self):
+        from sglang.srt.utils import common
+
+        class P(_StubPlatform):
+            _enum = PlatformEnum.OOT
+            device_name = "custom"
+            device_type = "custom"
+
+            def __init__(self):
+                self.calls = []
+
+            def is_pin_memory_available(self, device=None):
+                self.calls.append(device)
+                return True
+
+        platform = P()
+        device = torch.device("cuda", 0)
+        with patch.object(common, "current_platform", platform):
+            self.assertTrue(common.is_pin_memory_available(device))
+
+        self.assertEqual(platform.calls, [device])
+
+    def test_oot_platform_override_true_is_used(self):
+        from sglang.srt.utils import common
+
+        class P(_StubPlatform):
+            _enum = PlatformEnum.OOT
+            device_name = "custom"
+            device_type = "custom"
+
+            def is_pin_memory_available(self, device=None):
+                return True
+
+        with patch.object(common, "current_platform", P()):
+            self.assertTrue(common.is_pin_memory_available())
+
+    def test_oot_platform_override_false_is_used(self):
+        from sglang.srt.utils import common
+
+        class P(_StubPlatform):
+            _enum = PlatformEnum.OOT
+            device_name = "custom"
+            device_type = "custom"
+
+            def is_pin_memory_available(self, device=None):
+                return False
+
+        with patch.object(common, "current_platform", P()):
+            self.assertFalse(common.is_pin_memory_available())
+
+    def test_oot_platform_without_override_uses_conservative_default(self):
+        from sglang.srt.utils import common
+
+        class P(_StubPlatform):
+            _enum = PlatformEnum.OOT
+            device_name = "custom"
+            device_type = "custom"
+
+        with (
+            patch.object(common, "current_platform", P()),
+            patch("torch.cuda.is_available", return_value=True) as mock_cuda_available,
+        ):
+            self.assertFalse(common.is_pin_memory_available())
+
+        mock_cuda_available.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
