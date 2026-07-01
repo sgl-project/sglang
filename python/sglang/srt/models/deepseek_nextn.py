@@ -245,6 +245,16 @@ class DeepseekModelNextN(nn.Module):
                 if forward_batch.reuse_mtp_topk_indices:
                     forward_batch.spec_info.mtp_topk_indices = topk_indices
 
+                # MTP IndexShare: during draft-extend (spec_info is always an
+                # EagleDraftExtendInput here), publish the indexer topk (optionally
+                # only the selected rows) to seed the next draft-decode loop.
+                if forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+                    seed_buf = forward_batch.spec_info.mtp_seed_topk_capture
+                    if seed_buf is not None and topk_indices is not None:
+                        sel = forward_batch.spec_info.mtp_seed_topk_select
+                        src = topk_indices if sel is None else topk_indices[sel]
+                        seed_buf[: src.shape[0]].copy_(src)
+
             if not forward_batch.forward_mode.is_idle():
                 if residual is not None:
                     hidden_states, _ = self.shared_head.norm(hidden_states, residual)
