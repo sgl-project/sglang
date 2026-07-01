@@ -249,6 +249,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
 MOE_A2A_BACKEND_CHOICES = [
     "none",
     "deepep",
+    "deepep_v2",
     "mooncake",
     "nixl",
     "mori",
@@ -1679,6 +1680,7 @@ class ServerArgs:
         Literal[
             "none",
             "deepep",
+            "deepep_v2",
             "mooncake",
             "nixl",
             "mori",
@@ -5564,6 +5566,26 @@ class ServerArgs:
                 self.enforce_shared_experts_fusion = True
                 logger.info(
                     "DeepEP Waterfill is enabled. Shared expert will be dispatched through DeepEP for load balancing."
+                )
+
+        if self.moe_a2a_backend == "deepep_v2":
+            if self.deepep_mode != "normal":
+                logger.warning(
+                    "deepep_v2 currently uses ElasticBuffer normal dispatch; "
+                    "deepep_mode is set to `normal`."
+                )
+                self.deepep_mode = "normal"
+            logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self.ep_size = self.tp_size
+            logger.warning(
+                f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+            if self.enable_single_batch_overlap:
+                raise ValueError(
+                    "deepep_v2 currently returns the normal DeepEP layout and does "
+                    "not support --enable-single-batch-overlap."
                 )
 
         if self.moe_a2a_backend == "mooncake":

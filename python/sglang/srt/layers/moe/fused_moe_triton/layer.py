@@ -94,6 +94,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         return StandardDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_deepep()
+        or a2a_backend.is_deepep_v2()
         or a2a_backend.is_mooncake()
         or a2a_backend.is_mori()
         or a2a_backend.is_nixl()

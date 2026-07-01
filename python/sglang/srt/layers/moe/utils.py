@@ -29,6 +29,7 @@ class MoeA2ABackend(Enum):
 
     NONE = "none"
     DEEPEP = "deepep"
+    DEEPEP_V2 = "deepep_v2"
     MOONCAKE = "mooncake"
     NIXL = "nixl"
     MORI = "mori"
@@ -51,6 +52,9 @@ class MoeA2ABackend(Enum):
 
     def is_deepep(self):
         return self == MoeA2ABackend.DEEPEP
+
+    def is_deepep_v2(self):
+        return self == MoeA2ABackend.DEEPEP_V2
 
     def is_mooncake(self):
         return self == MoeA2ABackend.MOONCAKE
@@ -77,6 +81,7 @@ class MoeA2ABackend(Enum):
         return self in (
             MoeA2ABackend.NONE,
             MoeA2ABackend.DEEPEP,
+            MoeA2ABackend.DEEPEP_V2,
             MoeA2ABackend.MOONCAKE,
             MoeA2ABackend.NIXL,
             MoeA2ABackend.MORI,
@@ -366,7 +371,7 @@ def is_sbo_enabled() -> bool:
 def is_deepep_class_backend() -> bool:
     """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
     b = get_moe_a2a_backend()
-    return b.is_deepep() or b.is_mooncake() or b.is_mori()
+    return b.is_deepep() or b.is_deepep_v2() or b.is_mooncake() or b.is_mori()
 
 
 def is_flashinfer_cutedsl_v1_path() -> bool:
