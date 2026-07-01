@@ -213,7 +213,10 @@ async fn chat_completions_inner(
     // reaches here — including those about to be shed at admission below — so a
     // shed request's pre-admission time (the latency the access log shows on a
     // 503) is attributable to tokenize vs. the rest.
-    if PHASE_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % PHASE_LOG_SAMPLE == 0 {
+    if PHASE_LOG_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(PHASE_LOG_SAMPLE)
+    {
         tracing::debug!(
             tokenize_ms = at_post_tokenize.saturating_sub(at_pre_tokenize).as_millis() as u64,
             pre_admit_total_ms = at_post_tokenize.as_millis() as u64,
@@ -703,7 +706,10 @@ async fn chat_completions_inner(
     // before the SSE pump takes over. The pump's own first-byte/drain/exit timing
     // is logged separately as `sse_pump_timing`.
     let at_post_dispatch = start.elapsed();
-    if PHASE_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % PHASE_LOG_SAMPLE == 0 {
+    if PHASE_LOG_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(PHASE_LOG_SAMPLE)
+    {
         let (handler_inflight, in_send, pump_inflight) = crate::diag::snapshot();
         tracing::debug!(
             tokenize_ms = at_post_tokenize.saturating_sub(at_pre_tokenize).as_millis() as u64,

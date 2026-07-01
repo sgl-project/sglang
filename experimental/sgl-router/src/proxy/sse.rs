@@ -303,7 +303,10 @@ where
             // exits) was occupied by the pump; compare to the engine's own
             // per-request latency to spot slots lingering long after the engine
             // finished. `first_byte_ms` is headers→first token.
-            if PUMP_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % PUMP_LOG_SAMPLE == 0 {
+            if PUMP_LOG_COUNTER
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(PUMP_LOG_SAMPLE)
+            {
                 let first_byte_ms =
                     first_byte_at.map(|t| t.duration_since(task_start).as_millis() as u64);
                 tracing::debug!(

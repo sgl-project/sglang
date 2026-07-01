@@ -225,7 +225,7 @@ mod tests {
         t.set("http://w:30000", 0, load(9, 9), old);
         // A read far in the future sees the entry as stale -> worker absent.
         let later = old + Duration::from_secs(60);
-        assert!(t.snapshot_fresh(later).get("http://w:30000").is_none());
+        assert!(!t.snapshot_fresh(later).contains_key("http://w:30000"));
     }
 
     #[test]
@@ -237,8 +237,8 @@ mod tests {
         t.set("http://other:30000", 0, load(1, 0), now);
         t.forget_worker("http://w:30000");
         assert_eq!(t.entry_count(), 1);
-        assert!(t.snapshot_fresh(now).get("http://w:30000").is_none());
-        assert!(t.snapshot_fresh(now).get("http://other:30000").is_some());
+        assert!(!t.snapshot_fresh(now).contains_key("http://w:30000"));
+        assert!(t.snapshot_fresh(now).contains_key("http://other:30000"));
     }
 
     /// A worker with any stale rank is omitted entirely (not summed over only
@@ -252,7 +252,7 @@ mod tests {
         t.set("http://w:30000", 0, load(5, 1), now); // fresh
         t.set("http://w:30000", 1, load(9, 9), stale); // stale
         assert!(
-            t.snapshot_fresh(now).get("http://w:30000").is_none(),
+            !t.snapshot_fresh(now).contains_key("http://w:30000"),
             "any stale rank must drop the whole worker from the snapshot"
         );
     }

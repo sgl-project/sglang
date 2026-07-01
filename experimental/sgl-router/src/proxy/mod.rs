@@ -186,7 +186,7 @@ impl AbortOnDrop {
             && self
                 .reached_end
                 .as_ref()
-                .map_or(true, |f| !f.load(Ordering::SeqCst))
+                .is_none_or(|f| !f.load(Ordering::SeqCst))
     }
 }
 

@@ -41,7 +41,6 @@
 
 use crate::config::CacheAwareConfig;
 
-use crate::discovery::ModelId;
 use crate::policies::engine_load::EngineLoadTable;
 use crate::policies::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,

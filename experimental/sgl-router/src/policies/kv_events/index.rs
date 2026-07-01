@@ -825,11 +825,10 @@ mod tests {
 
         index.remove_worker(url).await;
         assert!(
-            index
+            !index
                 .engine_load()
                 .snapshot_fresh(Instant::now())
-                .get(url)
-                .is_none(),
+                .contains_key(url),
             "remove_worker must clear engine load"
         );
         assert_eq!(index.engine_load().expected_count(), 0);
