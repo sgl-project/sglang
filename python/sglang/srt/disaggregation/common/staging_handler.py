@@ -81,6 +81,12 @@ class DecodeStagingHandler:
         self._room_to_decode_req: dict = {}
         self._wm_subscribers: dict = {}
 
+        # Initialize device module once for all Event/Stream creation
+        k_buffers = kv_buffer_info["k_buffers"]
+        self.device = k_buffers[0].device
+        self.device_module = torch.get_device_module(self.device)
+        self.gpu_id = self.device.index if self.device.index is not None else 0
+
     def register_wm_subscriber(self, receiver, session_id: str) -> None:
         """Register a prefill's bootstrap connection for watermark broadcasts."""
         if receiver is None or not getattr(receiver, "bootstrap_infos", None):
@@ -169,8 +175,9 @@ class DecodeStagingHandler:
 
         ok = self._scatter_region(staging_offset, page_start, num_pages, decode_req)
         if ok:
-            event = torch.cuda.Event()
+            event = self.device_module.Event()
             event.record(self.staging_allocator._scatter_stream)
+
             if not hasattr(decode_req, "_chunk_events"):
                 decode_req._chunk_events = []
             decode_req._chunk_events.append((event, alloc_id))
@@ -238,7 +245,7 @@ class DecodeStagingHandler:
             return False
         alloc_id = self._submit_last_scatter(decode_req)
         if alloc_id >= 0:
-            event = torch.cuda.Event()
+            event = self.device_module.Event()
             event.record(self.staging_allocator._scatter_stream)
             decode_req._scatter_event = event
             decode_req._scatter_alloc_id = alloc_id
@@ -309,11 +316,15 @@ class DecodeStagingHandler:
         page_size = self.kv_buffer_info["page_size"]
         dst_tp_rank = self.kv_manager.kv_args.engine_rank % self.decode_tp
 
-        device = k_buffers[0].device
-        torch.cuda.set_device(device)
+        # Use device.index for set_device (expects int, not device object)
+        device_idx = self.device.index if self.device.index is not None else self.gpu_id
+        if hasattr(self.device_module, "set_device"):
+            self.device_module.set_device(device_idx)
 
         if not hasattr(self.staging_allocator, "_scatter_stream"):
-            self.staging_allocator._scatter_stream = torch.cuda.Stream(device=device)
+            self.staging_allocator._scatter_stream = self.device_module.Stream(
+                device=self.device
+            )
 
         scatter_stream = self.staging_allocator._scatter_stream
 
@@ -324,7 +335,7 @@ class DecodeStagingHandler:
         token_end = token_start + num_pages * page_size
         prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
 
-        with torch.cuda.stream(scatter_stream):
+        with self.device_module.stream(scatter_stream):
             kv_indices = self.scheduler.req_to_token_pool.req_to_token[
                 req_pool_idx, token_start:token_end
             ]
@@ -601,7 +612,9 @@ def _get_custom_mem_pool(device: str):
     return custom_mem_pool, pool_type
 
 
-def init_staging_buffers(register_fn, kv_args, count: int) -> list:
+def init_staging_buffers(
+    register_fn, kv_args, count: int, device_type: str = "cuda"
+) -> list:
     """Create prefill-side staging buffers and register them with the transport.
 
     Args:
@@ -609,6 +622,7 @@ def init_staging_buffers(register_fn, kv_args, count: int) -> list:
             region with the transport backend.
         kv_args: KVArgs with gpu_id.
         count: number of staging buffers to create.
+        device_type: device type string (e.g., "cuda", "xpu", "npu").
 
     Returns list of StagingBuffer instances.
     """
@@ -618,7 +632,7 @@ def init_staging_buffers(register_fn, kv_args, count: int) -> list:
     size_mb = envs.SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB.get()
     size_bytes = size_mb * 1024 * 1024
     gpu_id = kv_args.gpu_id
-    device = f"cuda:{gpu_id}"
+    device = f"{device_type}:{gpu_id}"
 
     custom_mem_pool, _ = _get_custom_mem_pool(device)
 
@@ -630,13 +644,14 @@ def init_staging_buffers(register_fn, kv_args, count: int) -> list:
     return buffers
 
 
-def init_staging_allocator(register_fn, kv_args):
+def init_staging_allocator(register_fn, kv_args, device_type: str = "cuda"):
     """Create decode-side staging ring-buffer allocator and register with transport.
 
     Args:
         register_fn: callable(ptr: int, size: int) that registers a memory
             region with the transport backend.
         kv_args: KVArgs with gpu_id.
+        device_type: device type string (e.g., "cuda", "xpu", "npu").
 
     Returns a StagingAllocator instance.
     """
@@ -646,7 +661,7 @@ def init_staging_allocator(register_fn, kv_args):
     pool_size_mb = envs.SGLANG_DISAGG_STAGING_POOL_SIZE_MB.get()
     pool_size_bytes = pool_size_mb * 1024 * 1024
     gpu_id = kv_args.gpu_id
-    device = f"cuda:{gpu_id}"
+    device = f"{device_type}:{gpu_id}"
 
     custom_mem_pool, _ = _get_custom_mem_pool(device)
     allocator = StagingAllocator(pool_size_bytes, device, gpu_id, custom_mem_pool)

@@ -13,7 +13,7 @@ import torch.distributed as dist
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -211,14 +211,28 @@ class MetadataBuffers:
             device = "npu"
             # TODO: Fix me when npu backend supports torch.uint64
             bootstrap_room_dtype = torch.int64
+        elif is_xpu():
+            # TODO: Fix me to pass the correct device when nixl issues are fixed
+            device = "cpu"
         elif self.custom_mem_pool:
             # TODO(shangming): Fix me (use 'cuda') when nvlink_transport of Mooncake is bug-free
             device = "cpu"
         elif envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() == "INTRA_NODE_NVLINK":
             device = "cuda"
+
+        device_module = None
+
+        if self.custom_mem_pool:
+            device_obj = torch.device(device)
+            device_module = torch.get_device_module(device_obj)
+
         with (
-            torch.cuda.use_mem_pool(self.custom_mem_pool)
-            if self.custom_mem_pool
+            device_module.use_mem_pool(self.custom_mem_pool)
+            if (
+                self.custom_mem_pool
+                and device_module
+                and hasattr(device_module, "use_mem_pool")
+            )
             else nullcontext()
         ):
             # TODO: abort top_logprobs_num > 128 in PD

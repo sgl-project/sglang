@@ -296,6 +296,7 @@ class MooncakeKVManager(CommonKVManager):
             lambda ptr, size: self.engine.batch_register([ptr], [size]),
             self.kv_args,
             count,
+            self.server_args.device,
         )
         self.kv_buffer_tensors = None
 
@@ -307,6 +308,7 @@ class MooncakeKVManager(CommonKVManager):
         self._staging_ctx.allocator = init_staging_allocator(
             lambda ptr, size: self.engine.batch_register([ptr], [size]),
             self.kv_args,
+            self.server_args.device,
         )
         self.kv_buffer_tensors = None
 

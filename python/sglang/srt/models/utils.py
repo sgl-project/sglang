@@ -446,7 +446,7 @@ def apply_qk_norm(
     q_norm: RMSNorm,
     k_norm: RMSNorm,
     head_dim: int,
-    alt_stream: Optional[torch.cuda.Stream] = None,
+    alt_stream: Optional[torch.Stream] = None,
     allow_inplace: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -494,7 +494,9 @@ def apply_qk_norm(
         alt_stream.wait_stream(current_stream)
         q_by_head = _reshape_for_qk_norm(q, head_dim)
         q_by_head = q_norm(q_by_head)
-        with torch.cuda.stream(alt_stream):
+        # Use device-agnostic stream context manager
+        device_module = torch.get_device_module(q.device)
+        with device_module.stream(alt_stream):
             k_by_head = _reshape_for_qk_norm(k, head_dim)
             k_by_head = k_norm(k_by_head)
         current_stream.wait_stream(alt_stream)

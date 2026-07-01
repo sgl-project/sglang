@@ -491,6 +491,7 @@ class NixlKVManager(CommonKVManager):
             lambda ptr, size: self._register_staging_memory(ptr, size, gpu_id),
             self.kv_args,
             count,
+            self.server_args.device,
         )
 
     def _init_staging_allocator(self):
@@ -502,6 +503,7 @@ class NixlKVManager(CommonKVManager):
         self._staging_ctx.allocator = init_staging_allocator(
             lambda ptr, size: self._register_staging_memory(ptr, size, gpu_id),
             self.kv_args,
+            self.server_args.device,
         )
 
     def _register_staging_memory(self, ptr: int, size: int, gpu_id: int):
@@ -513,6 +515,10 @@ class NixlKVManager(CommonKVManager):
                 f"NIXL memory registration failed for staging buffer "
                 f"(ptr=0x{ptr:x}, size={size})"
             )
+        logger.info(
+            f"Registering staging memory with NIXL: "
+            f"ptr=0x{ptr:x}, size={size // (1024 * 1024):.1f} MB, gpu_id={gpu_id}"
+        )
 
     def set_kv_buffer_tensors(self, k_buffers: list, v_buffers: list, page_size: int):
         # NOTE: matches mooncake behavior -- staging buffers are now
@@ -1632,10 +1638,10 @@ class NixlKVManager(CommonKVManager):
         dst_write_ptr = dst_staging_ptr + rank_offset
         src_reqs = np.array(
             [[staging_buffer.get_ptr(), per_rank_bytes, self.kv_args.gpu_id]],
-            dtype=np.int64,
+            dtype=np.uint64,
         )
         dst_reqs = np.array(
-            [[dst_write_ptr, per_rank_bytes, dst_gpu_id]], dtype=np.int64
+            [[dst_write_ptr, per_rank_bytes, dst_gpu_id]], dtype=np.uint64
         )
 
         src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")

@@ -1398,13 +1398,19 @@ def _view_pool_buffer_by_modality(raw_buffer, embedding_data, dtype):
 
 
 def _determine_tensor_transport_mode(server_args):
-    is_cross_node = server_args.dist_init_addr
 
-    if is_cross_node:
-        # Fallback to default CPU transport for multi-node
+    if server_args.dist_init_addr:
+        return "default"
+
+    device = server_args.device
+
+    if device == "cuda":
+        return "cuda_ipc"
+    elif device == "xpu":
+        # TODO: Implement xpu_ipc transport mode
         return "default"
     else:
-        return "cuda_ipc"
+        return "default"
 
 
 class MMReceiverBase(ABC):
