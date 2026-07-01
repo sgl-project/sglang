@@ -155,6 +155,30 @@ class DeepseekVL2MlpProjector(nn.Module):
         return x
 
 
+def _init_vision_module(
+    vision_config, quant_config: Optional[QuantizationConfig]
+) -> nn.Module:
+    # Module-level helper so the vision tower can be constructed standalone
+    # (outside an Engine). Useful for tests + workflows that pre-compute image
+    # features and feed them via the PRECOMPUTED_EMBEDDING input format.
+    # TODO: refactor vision model through timm wrapper from transformers
+    try:
+        import timm
+    except ImportError:
+        raise ImportError("Please install timm") from ImportError
+
+    model = timm.create_model(
+        "vit_so400m_patch14_siglip_384.webli",
+        pretrained=False,
+        num_classes=0,
+        dynamic_img_size=True,
+        dynamic_img_pad=True,
+    )
+
+    model = model.to(dtype=torch.get_default_dtype())
+    return model
+
+
 class DeepseekVL2ForCausalLM(nn.Module):
 
     def __init__(
@@ -166,7 +190,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
 
         # ----------- vision encoder ------------
         vision_config = config.vision_config
-        self.vision = self._init_vision_module(vision_config, quant_config)
+        self.vision = _init_vision_module(vision_config, quant_config)
 
         # ----------- vl projector ------------
         projector_config = config.projector_config
@@ -195,26 +219,6 @@ class DeepseekVL2ForCausalLM(nn.Module):
         else:
             # deepseek-vl2-tiny forbids mla
             self.language_model = DeepseekForCausalLM(language_config)
-
-    def _init_vision_module(
-        self, vision_config, quant_config: Optional[QuantizationConfig]
-    ) -> nn.Module:
-        # TODO: refactor vision model through timm wrapper from transformers
-        try:
-            import timm
-        except ImportError:
-            raise ImportError("Please install timm") from ImportError
-
-        model = timm.create_model(
-            "vit_so400m_patch14_siglip_384.webli",
-            pretrained=False,
-            num_classes=0,
-            dynamic_img_size=True,
-            dynamic_img_pad=True,
-        )
-
-        model = model.to(dtype=torch.get_default_dtype())
-        return model
 
     def forward(
         self,
@@ -257,22 +261,31 @@ class DeepseekVL2ForCausalLM(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
-    def get_image_feature(self, items: List[MultimodalDataItem]):
+    @staticmethod
+    def build_image_features(
+        items: List[MultimodalDataItem],
+        vision: nn.Module,
+        projector: nn.Module,
+        image_newline: torch.Tensor,
+        view_seperator: torch.Tensor,
+        global_view_pos: str = "head",
+    ) -> torch.Tensor:
+        """Build per-tile image features for the language model.
 
-        images_spatial_crop = torch.cat(
-            [item.images_spatial_crop for item in items], dim=0
-        )
-
-        assert images_spatial_crop.dim() == 3
-
+        Factored out of ``get_image_feature`` so callers that need to pre-compute
+        image embeddings outside the engine — e.g. RL workflows, KV-cache reuse,
+        and standalone tests — can produce the exact embeddings the engine
+        produces and feed them back via the ``PRECOMPUTED_EMBEDDING`` input
+        format.
+        """
         # TODO: can it be batched ?
         images_in_this_batch = []
         for item in items:
             assert item.feature.dim() == 4
-            image_feature = self.vision.forward_features(
-                item.feature.type(next(self.vision.parameters()).dtype)
+            image_feature = vision.forward_features(
+                item.feature.type(next(vision.parameters()).dtype)
             )
-            images_embeds = self.projector(image_feature)
+            images_embeds = projector(image_feature)
             _, hw, n_dim = images_embeds.shape
             h = w = int(hw**0.5)
             tile_index = 0
@@ -297,7 +310,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 global_features = global_features.view(h, w, n_dim)
 
                 # [D]     -> [h, 1, D]
-                new_lines_in_global = repeat(self.image_newline, "d -> h 1 d", h=h)
+                new_lines_in_global = repeat(image_newline, "d -> h 1 d", h=h)
 
                 # cat([h, w, D], [h, 1, D], dim=1) -> [h, w + 1, D]
                 global_features = torch.cat(
@@ -321,7 +334,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
 
                 # [D] -> [num_height_tiles * h, 1, D]
                 new_lines_in_local = repeat(
-                    self.image_newline,
+                    image_newline,
                     "d -> (th h) 1 d",
                     th=num_height_tiles,
                     h=h,
@@ -335,11 +348,11 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 local_features = local_features.view(-1, n_dim)
 
                 # merge global and local tiles
-                if self.global_view_pos == "head":
+                if global_view_pos == "head":
                     global_local_features = torch.cat(
                         [
                             global_features,
-                            self.view_seperator[None, :],
+                            view_seperator[None, :],
                             local_features,
                         ]
                     )
@@ -347,7 +360,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
                     global_local_features = torch.cat(
                         [
                             local_features,
-                            self.view_seperator[None, :],
+                            view_seperator[None, :],
                             global_features,
                         ]
                     )
@@ -355,6 +368,23 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 images_in_this_batch.append(global_local_features)
 
         return torch.cat(images_in_this_batch, dim=0)
+
+    def get_image_feature(self, items: List[MultimodalDataItem]):
+
+        images_spatial_crop = torch.cat(
+            [item.images_spatial_crop for item in items], dim=0
+        )
+
+        assert images_spatial_crop.dim() == 3
+
+        return self.build_image_features(
+            items,
+            self.vision,
+            self.projector,
+            self.image_newline,
+            self.view_seperator,
+            self.global_view_pos,
+        )
 
 
 EntryClass = DeepseekVL2ForCausalLM
