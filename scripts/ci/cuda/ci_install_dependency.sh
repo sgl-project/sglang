@@ -196,6 +196,27 @@ setup_pip_toolchain() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+remove_stale_cuda12_nvidia_wheels() {
+    if [ "$CU_MAJOR" != "13" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    mapfile -t STALE_CUDA12_NVIDIA_WHEELS < <(
+        python3 -m pip list --format=freeze | sed -n 's/^\(nvidia-.*-cu12\)==.*/\1/p'
+    )
+    if [ ${#STALE_CUDA12_NVIDIA_WHEELS[@]} -eq 0 ]; then
+        echo "No stale CUDA 12 NVIDIA wheels found for ${CU_VERSION} job"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    echo "Removing stale CUDA 12 NVIDIA wheels from ${CU_VERSION} job: ${STALE_CUDA12_NVIDIA_WHEELS[*]}"
+    $PIP_UNINSTALL_CMD "${STALE_CUDA12_NVIDIA_WHEELS[@]}" $PIP_UNINSTALL_SUFFIX
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 uninstall_stale_flashinfer() {
     # Keep flashinfer packages if version matches to avoid re-downloading:
     # - flashinfer-cubin: 150+ MB
@@ -552,6 +573,7 @@ main() {
     install_apt_packages
     clean_site_packages
     setup_pip_toolchain
+    remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer
     install_sglang
     install_sglang_kernel
