@@ -83,10 +83,16 @@ fn parse_bootstrap_host(url: &str) -> String {
 /// Tracks each in-flight slot with an acquisition timestamp so leaked slots —
 /// guards that are never dropped because their request hung (e.g. a half-open
 /// upstream after a worker restart) — can be reclaimed by a TTL sweep
-/// ([`reclaim_stale`](SlotRegistry::reclaim_stale)). The shared `count` is the
-/// same `Arc<AtomicUsize>` exposed as [`Worker::active_requests`], so the
-/// admission cap reads it lock-free; the per-slot map is only touched on
-/// claim / release / sweep, all off the read path.
+/// ([`reclaim_stale`](SlotRegistry::reclaim_stale)), or so a routing policy
+/// can ask how many slots were claimed recently
+/// ([`count_acquired_since`](SlotRegistry::count_acquired_since)). The
+/// shared `count` is the same `Arc<AtomicUsize>` exposed as
+/// [`Worker::active_requests`], so the admission cap reads it lock-free;
+/// `count` and `slots` are independently-timed reads of related but
+/// separate state (an atomic load vs. a mutex-guarded map iteration under
+/// its own lock), so a caller reading both should not assume they observe
+/// the exact same instant — each is internally consistent on its own, not
+/// jointly atomic with the other.
 #[derive(Debug)]
 pub struct SlotRegistry {
     count: Arc<AtomicUsize>,
@@ -155,6 +161,28 @@ impl SlotRegistry {
         if let Some(t) = self.slots.lock().get_mut(&id) {
             *t = Instant::now();
         }
+    }
+
+    /// Count of currently-claimed slots acquired at or after `since` — the
+    /// mirror query to [`reclaim_stale`](Self::reclaim_stale) (which counts
+    /// slots OLDER than a cutoff; this counts slots NEWER than one). Used to
+    /// bound how many of this worker's in-flight requests are dispatches the
+    /// engine hasn't reported back on yet (see
+    /// `crate::policies::cache_aware_zmq::WorkerLoads::load_of`), rather than
+    /// adding the full in-flight count — which would also include long-held
+    /// slots from slow-draining streaming responses (see
+    /// `crate::proxy::Proxy::forward_streaming_to`'s `stream_guards` doc)
+    /// that the engine's own last report likely already accounts for.
+    ///
+    /// "Acquired" here means the slot's last-touch time, not necessarily its
+    /// original claim time: a FIFO admission hand-off calls
+    /// [`LoadGuard::touch`] on the reused slot when it's handed to a
+    /// different, not-yet-dispatched waiter, which re-ages it. That's
+    /// correct for this method's purpose (the hand-off IS a fresh, unreported
+    /// dispatch at that instant), but means "acquired" isn't literally "the
+    /// slot object's first claim."
+    pub fn count_acquired_since(&self, since: Instant) -> usize {
+        self.slots.lock().values().filter(|&&t| t >= since).count()
     }
 
     /// Force-release every slot older than `ttl` (defense-in-depth backstop for
@@ -348,6 +376,12 @@ impl Worker {
 
     pub fn active_load(&self) -> usize {
         self.active_requests.load(Ordering::Relaxed)
+    }
+
+    /// Number of this worker's currently in-flight requests dispatched at or
+    /// after `since`. See [`SlotRegistry::count_acquired_since`].
+    pub fn slots_acquired_since(&self, since: Instant) -> usize {
+        self.slots.count_acquired_since(since)
     }
 
     /// Returns a RAII guard that increments `active_requests` now and
@@ -643,5 +677,44 @@ mod tests {
         let reclaimed = w.reclaim_stale_load(Duration::from_secs(3600), Instant::now());
         assert_eq!(reclaimed, 0);
         assert_eq!(w.active_load(), 1);
+    }
+
+    #[test]
+    fn slots_acquired_since_excludes_earlier_slots() {
+        let w = test_worker();
+        let _g_old = w.load_guard();
+        // A real (small) sleep, not a synthetic `Instant` offset: the slot's
+        // acquisition time is captured internally by `register()`, not
+        // injectable, so the ordering guarantee has to come from wall-clock
+        // separation wide enough to beat any platform's monotonic-clock
+        // resolution.
+        std::thread::sleep(Duration::from_millis(5));
+        let cutoff = Instant::now();
+        let _g_new1 = w.load_guard();
+        let _g_new2 = w.load_guard();
+        assert_eq!(w.active_load(), 3);
+        assert_eq!(
+            w.slots_acquired_since(cutoff),
+            2,
+            "only slots claimed at/after cutoff should count"
+        );
+    }
+
+    #[test]
+    fn slots_acquired_since_counts_all_slots_for_a_cutoff_before_every_claim() {
+        let w = test_worker();
+        let long_ago = Instant::now() - Duration::from_secs(3600);
+        let _g1 = w.load_guard();
+        let _g2 = w.load_guard();
+        assert_eq!(w.slots_acquired_since(long_ago), 2);
+    }
+
+    #[test]
+    fn slots_acquired_since_is_zero_for_a_cutoff_after_every_claim() {
+        let w = test_worker();
+        let _g = w.load_guard();
+        std::thread::sleep(Duration::from_millis(5));
+        let cutoff = Instant::now();
+        assert_eq!(w.slots_acquired_since(cutoff), 0);
     }
 }

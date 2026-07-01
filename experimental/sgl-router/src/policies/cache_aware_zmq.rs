@@ -13,10 +13,23 @@
 //! caller) and a `SelectionContext` carrying the JSON request body and the
 //! ingress-precomputed routing tokens:
 //!
-//! Every load comparison below uses [`WorkerLoads::load_of`]: the
-//! engine-reported queue depth (`num_running + num_waiting`) where a fresh
-//! [`super::engine_load::EngineLoadTable`] snapshot exists, otherwise the
-//! router-side in-flight counter `Worker::active_load()`.
+//! Every load comparison below uses [`WorkerLoads::load_of`]: where a fresh
+//! [`super::engine_load::EngineLoadTable`] snapshot exists, the
+//! engine-reported queue depth (`num_running + num_waiting`) PLUS this
+//! worker's dispatches since that snapshot was taken (the engine hasn't had
+//! a chance to report them yet); otherwise the router-side in-flight
+//! counter `Worker::active_load()`. The "since that snapshot" bound matters:
+//! the engine only refreshes its gauge every few seconds
+//! ([`super::engine_load::EngineLoadTable`]'s freshness window), which at
+//! sustained request rates is several selections' worth of staleness, and
+//! using it unadjusted lets a burst of back-to-back decisions all read the
+//! same "worker looks idle" number and all pile onto it before the gauge
+//! catches up. Adding back only the
+//! not-yet-reported dispatches (not the worker's full `active_load`, which
+//! can include long-held slots from slow-draining streaming responses)
+//! self-corrects within the same burst without overcorrecting away from
+//! workers that are idle on the engine side but still draining a finished
+//! stream to a slow client.
 //!
 //! 1. **Load-imbalance fast-path.** If `max_load - min_load >
 //!    balance_abs_threshold` AND `max_load > min_load *
@@ -106,30 +119,58 @@ struct BalanceCheck {
 }
 
 /// Per-selection load lookup. Built once per `select` from a single
-/// [`EngineLoadTable::snapshot_fresh`] pass: a worker with a fresh
+/// [`EngineLoadTable::fresh_worker_state`] pass: a worker with a fresh
 /// engine-reported snapshot uses its queue depth (`num_running +
-/// num_waiting`); otherwise it falls back to the router-side in-flight
-/// counter (`Worker::active_load`). Holding the snapshot keeps every
-/// per-worker `load_of` an O(1) map lookup.
+/// num_waiting`) plus its own dispatches acquired since that snapshot's
+/// timestamp (see [`Self::load_of`]); otherwise it falls back to the
+/// router-side in-flight counter (`Worker::active_load`). Holding the
+/// snapshot keeps every per-worker `load_of` an O(1) map lookup.
 struct WorkerLoads {
-    fresh: HashMap<String, usize>,
+    /// url -> (engine-reported depth, that snapshot's oldest-rank timestamp).
+    fresh: HashMap<String, (usize, Instant)>,
 }
 
 impl WorkerLoads {
-    /// Build the per-selection snapshot from one `snapshot_fresh` pass. The
-    /// single construction chokepoint guarantees every comparison in a given
-    /// `select` sees one consistent view of load.
+    /// Build the per-selection snapshot from one `fresh_worker_state` pass.
+    /// The single construction chokepoint guarantees every comparison in a
+    /// given `select` sees one consistent view of load.
     fn from_engine(table: &EngineLoadTable, now: Instant) -> Self {
         Self {
-            fresh: table.snapshot_fresh(now),
+            fresh: table.fresh_worker_state(now),
         }
     }
 
+    /// A worker's current load: the engine-reported queue depth as of the
+    /// last fresh snapshot, plus this worker's own dispatches made *since*
+    /// that snapshot's timestamp — i.e. exactly the requests the engine
+    /// hasn't had a chance to report back on yet. This is deliberately not
+    /// the worker's full `active_load()`: that counter also includes
+    /// long-held slots from slow-draining streaming responses (see
+    /// `crate::proxy::Proxy::forward_streaming_to`'s `stream_guards` doc)
+    /// that the engine's own last report has likely already accounted for —
+    /// adding the full counter on top would bias selection away from workers
+    /// that are idle on the engine side but still slowly draining a finished
+    /// stream to a client.
+    ///
+    /// This correction is per-router-process: it only sees dispatches THIS
+    /// router pod made. It closes the single-pod stale-gauge herd, but does
+    /// not coordinate with other router replicas — two pods can still both
+    /// read the same stale engine number and independently pile onto the
+    /// same worker within one gauge-refresh window. Closing that would need
+    /// cross-replica state sharing, which this fix does not attempt.
     fn load_of(&self, w: &Worker) -> usize {
-        self.fresh
-            .get(w.url.as_str())
-            .copied()
-            .unwrap_or_else(|| w.active_load())
+        match self.fresh.get(w.url.as_str()) {
+            // `saturating_add`, not an assertable invariant: both operands
+            // are bounded by real admission/concurrency limits (a worker's
+            // in-flight count is capped well below `usize::MAX` by
+            // `SlotRegistry::try_claim`'s admission cap), so overflow here
+            // is unreachable from real traffic — reaching it would mean a
+            // problem (memory exhaustion, a corrupt engine payload) that is
+            // already symptomatic elsewhere, not something worth a panic on
+            // this per-request hot path.
+            Some(&(engine_load, at)) => engine_load.saturating_add(w.slots_acquired_since(at)),
+            None => w.active_load(),
+        }
     }
 
     /// Number of workers whose load came from the engine (vs the router-side
@@ -182,6 +223,13 @@ impl CacheAwareZmqPolicy {
     /// and min load is large enough that cache-aware routing would dump
     /// even more on the hot worker. The caller logs these numbers so every
     /// rebalance decision is visible in the logs.
+    ///
+    /// `min_load`/`max_load` are [`WorkerLoads::load_of`] values, i.e. for a
+    /// worker with a fresh engine snapshot this is the engine-reported depth
+    /// PLUS this router's own not-yet-reported dispatches — not the raw
+    /// engine number alone. An on-call reader comparing this log's
+    /// `max_load` against the engine's own `/metrics` queue depth during an
+    /// incident should expect them to differ by that correction.
     fn balance_check(&self, workers: &[Arc<Worker>], loads: &WorkerLoads) -> BalanceCheck {
         let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(mn, mx), w| {
             let l = loads.load_of(w);
@@ -1189,6 +1237,119 @@ mod tests {
         assert_eq!(
             chosen.url, "http://w1:30000",
             "matched-set tiebreak must use engine load",
+        );
+    }
+
+    /// Recent dispatches made AFTER the engine's last snapshot are added on
+    /// top of the reported load. Without this, repeated `select` calls in
+    /// the same burst would all read the same "worker looks idle" engine
+    /// number and all pile onto it before the gauge catches up. w0 looks
+    /// lighter by the raw engine numbers alone (1 vs 3), but three slots
+    /// claimed on w0 after the snapshot flip the effective load in w1's
+    /// favor (1+3=4 > 3+0=3).
+    #[test]
+    fn recent_dispatches_are_added_on_top_of_engine_load() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let hashes = compute_block_hashes(&ids, 4);
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+        tree.insert(&KvWorkerId::new("http://w1:30000".into(), 0), None, &hashes);
+
+        let engine_load = EngineLoadTable::new();
+        let snapshot_at = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(1, 0), snapshot_at);
+        engine_load.set("http://w1:30000", 0, load_stat(3, 0), snapshot_at);
+
+        let policy = new_policy_with_load(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                // High thresholds so the imbalance fast-path never fires on
+                // the raw engine numbers (1 vs 3) and selection reaches the
+                // matched-set tiebreak, which also uses `load_of`.
+                balance_abs_threshold: 100,
+                balance_rel_threshold: 100.0,
+            },
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        // Three requests dispatched to w0 AFTER the engine's snapshot —
+        // exactly the "burst the engine hasn't reported back on yet" shape.
+        let _g1 = w0.load_guard();
+        let _g2 = w0.load_guard();
+        let _g3 = w0.load_guard();
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            chosen.url, "http://w1:30000",
+            "w0's effective load (1 engine + 3 recent = 4) must exceed w1's \
+             (3 engine + 0 recent = 3), even though the raw engine numbers \
+             alone favor w0",
+        );
+    }
+
+    /// `load_of` must use the OLDEST rank's timestamp as the "since" cutoff
+    /// for a multi-rank worker, not the newest — this pins the end-to-end
+    /// wiring of the choice `EngineLoadTable::fresh_worker_state` makes (see
+    /// its doc comment). A regression to "newest" would silently treat the
+    /// dispatch below as already covered by rank1's later snapshot, even
+    /// though rank0's older snapshot doesn't reflect it.
+    #[test]
+    fn load_of_uses_oldest_rank_timestamp_for_multi_rank_worker() {
+        let engine_load = EngineLoadTable::new();
+        let earlier = Instant::now();
+        let w = worker("http://w:30000", "tiny");
+        // Real sleeps, not synthetic `Instant` offsets: the dispatch's
+        // timestamp is captured internally by `load_guard()` and isn't
+        // injectable (see `worker.rs`'s `slots_acquired_since` tests for the
+        // same reasoning).
+        std::thread::sleep(Duration::from_millis(5));
+        let _g = w.load_guard(); // dispatched strictly between earlier/later
+        std::thread::sleep(Duration::from_millis(5));
+        let later = Instant::now();
+        engine_load.set("http://w:30000", 0, load_stat(1, 0), earlier);
+        engine_load.set("http://w:30000", 1, load_stat(1, 0), later);
+
+        let loads = WorkerLoads::from_engine(&engine_load, later);
+        assert_eq!(
+            loads.load_of(&w),
+            3,
+            "depth (1+1=2) plus the one dispatch made after the OLDEST \
+             rank's timestamp = 3; using the newest rank's timestamp \
+             instead would exclude that dispatch and wrongly give 2",
+        );
+    }
+
+    /// A stale engine snapshot falls back to PURE `active_load()` — the
+    /// recent-dispatch correction only applies alongside a fresh snapshot
+    /// (see `load_of`'s `Some` branch). A regression that added
+    /// `slots_acquired_since` to the fallback branch too would double-count
+    /// this worker's own in-flight guards.
+    #[test]
+    fn load_of_fallback_does_not_add_recent_dispatches_on_top_of_active_load() {
+        let engine_load = EngineLoadTable::new();
+        let stale = Instant::now() - Duration::from_secs(3600);
+        engine_load.set("http://w:30000", 0, load_stat(50, 0), stale);
+        let w = worker("http://w:30000", "tiny");
+        let _g1 = w.load_guard();
+        let _g2 = w.load_guard();
+
+        let loads = WorkerLoads::from_engine(&engine_load, Instant::now());
+        assert_eq!(
+            loads.load_of(&w),
+            2,
+            "must equal active_load() exactly (2) — not the stale depth \
+             (50) plus anything, and not active_load() plus a second \
+             correction",
         );
     }
 
