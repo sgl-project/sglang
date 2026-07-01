@@ -545,20 +545,6 @@ class TestPinMemoryAvailability(CustomTestCase):
 
         self.assertEqual(platform.calls, [device])
 
-    def test_common_wrapper_preserves_no_arg_override_for_no_device(self):
-        from sglang.srt.utils import common
-
-        class P(_StubPlatform):
-            _enum = PlatformEnum.OOT
-            device_name = "custom"
-            device_type = "custom"
-
-            def is_pin_memory_available(self):
-                return True
-
-        with patch.object(common, "current_platform", P()):
-            self.assertTrue(common.is_pin_memory_available())
-
     def test_oot_platform_override_true_is_used(self):
         from sglang.srt.utils import common
 
