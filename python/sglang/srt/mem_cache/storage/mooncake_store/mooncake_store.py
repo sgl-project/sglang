@@ -1077,6 +1077,34 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
 
+    @staticmethod
+    def _logical_anchor_key(key: str) -> str:
+        """Generate marker key for logical anchor existence tracking."""
+        return f"{key}_logical_kv"
+
+    def _batch_set_logical_anchor(self, keys: List[str]) -> List[bool]:
+        """Set marker keys for logical anchor pages.
+
+        Uses 1-byte markers since Mooncake put() rejects zero-length payloads.
+        Only writes keys that don't already exist to avoid redundant writes.
+        """
+        key_strs = [self._logical_anchor_key(key) for key in keys]
+        exist_result = self._batch_exist(key_strs)
+        results = [state == 1 for state in exist_result]
+
+        # Mooncake put() rejects zero-length payloads, so use one byte
+        marker = b"1"
+        for i, key in enumerate(key_strs):
+            if results[i]:
+                continue
+            results[i] = self.store.put(key, marker) == 0
+        return results
+
+    def _batch_get_logical_anchor(self, keys: List[str]) -> List[bool]:
+        """Check marker key existence for logical anchor pages."""
+        key_strs = [self._logical_anchor_key(key) for key in keys]
+        return [state == 1 for state in self._batch_exist(key_strs)]
+
     def get_stats(self):
         storage_metrics = StorageMetrics()
         storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)
