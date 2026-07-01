@@ -793,16 +793,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "--enable-strict-thinking"
             )
 
-        if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
-            dp_size = self.elastic_worker_count
-            if dp_size <= 1 and obj.routed_dp_rank == 0:
-                logger.debug(
-                    f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
-                )
-            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
-                raise ValueError(
-                    f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
-                )
+        self._validate_routed_dp_rank(obj)
 
         self._init_req_state(obj, request)
         request_rids = {obj.rid} if obj.is_single else set(obj.rid)
@@ -843,6 +834,81 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # cleanup.
             self._release_req_states_on_failure(request_rids)
             raise
+
+    def _validate_routed_dp_rank(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
+        if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
+            dp_size = self.elastic_worker_count
+            if dp_size <= 1 and obj.routed_dp_rank == 0:
+                logger.debug(
+                    f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
+                )
+            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
+                raise ValueError(
+                    f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
+                )
+
+    async def tokenize_request(
+        self,
+        obj: GenerateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Union[List[int], List[List[int]]]:
+        """Tokenize a generation request without dispatching it to the scheduler."""
+        self.auto_create_handle_loop()
+
+        obj.normalize_batch_and_arguments()
+        self._set_default_priority(obj)
+        if (
+            obj.max_thinking_tokens is not None
+            and not get_serving().enable_strict_thinking
+        ):
+            raise ValueError(
+                "max_thinking_tokens requires the server to be launched with "
+                "--enable-strict-thinking"
+            )
+        self._validate_routed_dp_rank(obj)
+
+        state_initialized = False
+        lora_acquired = False
+        self._init_req_state(obj, request)
+        state_initialized = True
+        request_rids = {obj.rid} if obj.is_single else set(obj.rid)
+        try:
+            if get_disagg().language_only:
+                self._handle_epd_disaggregation_encode_request(obj)
+
+            self.request_logger.log_received_request(obj, self.tokenizer, request)
+
+            async with self.is_pause_cond:
+                await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+
+            async with self.model_update_lock.reader_lock:
+                await self._validate_and_resolve_lora(obj)
+                lora_acquired = self.enable_lora and bool(obj.lora_path)
+
+                if obj.is_single:
+                    tokenized_obj = await self._tokenize_one_request(obj)
+                    return list(tokenized_obj.input_ids)
+
+                batch_size = obj.batch_size
+                if getattr(obj, "parallel_sample_num", 1) == 1 and (
+                    self._should_use_batch_tokenization(batch_size, obj)
+                ):
+                    tokenized_objs = await self._batch_tokenize_and_process(
+                        batch_size, obj
+                    )
+                else:
+                    tokenized_objs = await asyncio.gather(
+                        *(self._tokenize_one_request(obj[i]) for i in range(batch_size))
+                    )
+
+                return [
+                    list(tokenized_obj.input_ids) for tokenized_obj in tokenized_objs
+                ]
+        finally:
+            if state_initialized:
+                self._release_req_states_on_failure(request_rids)
+            if lora_acquired:
+                await self.lora_registry.release(obj.lora_id)
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
