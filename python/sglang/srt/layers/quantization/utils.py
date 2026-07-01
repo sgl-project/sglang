@@ -84,6 +84,12 @@ def is_layer_skipped(
         fused_mapping if proj_name in fused_mapping else _FALLBACK_FUSED_SHARDS
     )
     if proj_name in effective_fused:
+        # Check if the fused prefix itself is in the ignored list.
+        # modules_to_not_convert may use fused names (e.g. gate_up_proj,
+        # qkv_proj) directly, so check prefix as-is before unfusing.
+        if any(_module_path_match(ignored, prefix) for ignored in ignored_layers):
+            return True
+
         shard_prefixes = [
             prefix.replace(proj_name, shard_proj_name)
             for shard_proj_name in effective_fused[proj_name]
