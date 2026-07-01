@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Any, Dict, Optional
 
@@ -192,7 +193,16 @@ class WhisperProcessor(BaseMultimodalProcessor):
             request_obj, "timestamp_granularities"
         )
 
-        audios = [load_audio(audio) for audio in audio_data]
+        # ``load_audio`` performs blocking I/O (file read / HTTP fetch /
+        # ffmpeg decode) plus a synchronous numpy resample. Offload each
+        # audio to a worker thread so the event loop stays free for
+        # other concurrent requests; matches the unblock pattern in
+        # ``base_processor.load_mm_data`` (sgl-project/sglang#24751).
+        audios = list(
+            await asyncio.gather(
+                *(asyncio.to_thread(load_audio, audio) for audio in audio_data)
+            )
+        )
 
         # Whisper expects input features padded to max_length (3000 frames = 30 seconds)
         # This is the standard context length for Whisper
