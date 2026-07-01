@@ -1076,8 +1076,11 @@ jobs:
       - name: Run test_disaggregation
         timeout-minutes: 60
         run: |
+          docker exec ci_sglang rocm-smi --showtopotype || true
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
+            -e MC_LOG_LEVEL=TRACE \
+            -e GLOG_logtostderr=1 \
             -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   pr-test-amd-rocm720-finish:
