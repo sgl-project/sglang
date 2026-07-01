@@ -500,6 +500,7 @@ class DeepseekV4AttnBackend(
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
+        self._dspark_block_full_attn = 0
         self.forward_metadata: Union[
             DSV4Metadata,
             DSV4RawVerifyMetadata,
@@ -929,6 +930,10 @@ class DeepseekV4AttnBackend(
         in_capture: bool = False,
     ) -> None:
         bucket = _GraphBucket.of(forward_batch.forward_mode)
+        self._dspark_block_full_attn = int(
+            getattr(getattr(forward_batch, "spec_info", None), "block_full_attn", 0)
+            or 0
+        )
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
@@ -1093,6 +1098,10 @@ class DeepseekV4AttnBackend(
         use_prefill_cuda_graph: bool = False,
     ):
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
+        self._dspark_block_full_attn = int(
+            getattr(getattr(forward_batch, "spec_info", None), "block_full_attn", 0)
+            or 0
+        )
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         seq_lens_cpu = forward_batch.seq_lens_cpu
@@ -1682,6 +1691,19 @@ class DeepseekV4AttnBackend(
 
         raw_positions = seq_lens_casual - 1
         swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
+
+        block_full = self._dspark_block_full_attn
+        n_qo = seq_lens_casual.size(0)
+        if block_full and n_qo % block_full == 0:
+            bs_blk = n_qo // block_full
+            last_row = (
+                torch.arange(
+                    bs_blk, device=seq_lens_casual.device, dtype=torch.long
+                ).repeat_interleave(block_full)
+                + 1
+            ) * block_full - 1
+            swa_page_indices = swa_page_indices[last_row]
+            swa_topk_lengths = swa_topk_lengths[last_row]
 
         page_table = req_to_token[
             req_pool_indices_repeated, : max_seq_len : self.page_size
