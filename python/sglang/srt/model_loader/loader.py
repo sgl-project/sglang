@@ -577,6 +577,8 @@ class DefaultModelLoader(BaseModelLoader):
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
+                    bbuf_size_kb=server_args.weight_loader_fastsafetensors_bbuf_size_kb,
+                    max_threads=server_args.weight_loader_fastsafetensors_max_threads,
                 )
             elif use_multithread:
                 weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
