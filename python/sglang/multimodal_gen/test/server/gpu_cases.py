@@ -857,9 +857,7 @@ def _select_5090_canary_cases(case_ids: tuple[str, ...]) -> list[DiffusionTestCa
 
     # 5090 is a 32GB consumer Blackwell runner, so reuse lightweight H100
     # 1-GPU cases but skip H100-specific perf baseline validation.
-    return [
-        replace(cases_by_id[case_id], run_perf_check=False) for case_id in case_ids
-    ]
+    return [replace(cases_by_id[case_id], run_perf_check=False) for case_id in case_ids]
 
 
 ONE_GPU_5090_CASES = _select_5090_canary_cases(
