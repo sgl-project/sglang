@@ -496,7 +496,6 @@ def load_model_from_full_model_state_dict(
                     )
 
         if not hasattr(meta_sharded_param, "device_mesh"):
-            full_tensor = full_tensor.to(device=device, dtype=target_dtype)
             actual_param = _get_param_for_weight_loading(
                 model, param_dict, target_param_name
             )
@@ -505,7 +504,8 @@ def load_model_from_full_model_state_dict(
                 if actual_param is not None
                 else None
             )
-            if weight_loader is not None:
+            if weight_loader is not None and not is_fsdp_model:
+                full_tensor = full_tensor.to(dtype=target_dtype)
                 assert actual_param is not None
                 sharded_tensor = torch.empty_like(
                     meta_sharded_param, device=device, dtype=target_dtype
@@ -530,8 +530,35 @@ def load_model_from_full_model_state_dict(
                     ) from exc
                 sharded_tensor = temp_param.data
             else:
-                # In cases where parts of the model aren't sharded, some parameters will be plain tensors
-                sharded_tensor = full_tensor
+                full_tensor = full_tensor.to(device=device, dtype=target_dtype)
+                if weight_loader is not None:
+                    assert actual_param is not None
+                    sharded_tensor = torch.empty_like(
+                        meta_sharded_param, device=device, dtype=target_dtype
+                    )
+                    # Preserve requires_grad flag to avoid errors with non-floating dtypes
+                    requires_grad = getattr(meta_sharded_param, "requires_grad", False)
+                    temp_param = _make_param_like(actual_param, sharded_tensor)
+                    if not (
+                        sharded_tensor.is_floating_point()
+                        or sharded_tensor.is_complex()
+                    ):
+                        requires_grad = False
+                    temp_param.requires_grad = requires_grad
+                    try:
+                        weight_loader(temp_param, full_tensor)
+                    except AssertionError as exc:
+                        raise AssertionError(
+                            "Failed to shard/load parameter "
+                            f"{target_param_name}: full_tensor.shape={tuple(full_tensor.shape)}, "
+                            f"meta_sharded_param.shape={tuple(meta_sharded_param.shape)}, "
+                            f"temp_param.shape={tuple(temp_param.shape)}, "
+                            f"param_cls={type(actual_param).__name__}"
+                        ) from exc
+                    sharded_tensor = temp_param.data
+                else:
+                    # In cases where parts of the model aren't sharded, some parameters will be plain tensors
+                    sharded_tensor = full_tensor
 
             # Important: `cpu_offload` is intended for FSDP-managed parameter movement.
             # If a parameter is not sharded into a DTensor (i.e., no `device_mesh`), FSDP
