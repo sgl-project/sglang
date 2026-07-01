@@ -60,6 +60,27 @@ if _use_aiter:
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
 
 
+def _get_runtime_model_config():
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+    except ValueError:
+        return None
+
+    model_config = getattr(server_args, "model_config", None)
+    if model_config is None:
+        get_model_config = getattr(server_args, "get_model_config", None)
+        if get_model_config is None:
+            return None
+        try:
+            model_config = get_model_config()
+        except Exception:
+            return None
+
+    return model_config
+
+
 def get_rope(
     head_size: int,
     rotary_dim: int,
@@ -93,6 +114,40 @@ def get_rope(
 
     if partial_rotary_factor < 1.0:
         rotary_dim = int(rotary_dim * partial_rotary_factor)
+
+    max_position_before_clamp = max_position
+    if dual_chunk_attention_config is not None:
+        scaling_type = "default"
+    elif rope_scaling is None:
+        scaling_type = "default"
+    elif "rope_type" in rope_scaling:
+        scaling_type = rope_scaling["rope_type"]
+    elif "type" in rope_scaling:
+        scaling_type = rope_scaling["type"]
+    else:
+        raise ValueError(f"Unknown RoPE scaling type, rope_scaling is {rope_scaling}")
+
+    runtime_model_config = _get_runtime_model_config()
+    runtime_context_len = (
+        int(runtime_model_config.context_len)
+        if runtime_model_config is not None
+        and getattr(runtime_model_config, "context_len", None) is not None
+        else None
+    )
+    is_multimodal_model = bool(getattr(runtime_model_config, "is_multimodal", False))
+    rope_scaling_dict = rope_scaling or {}
+    can_clamp_max_position = scaling_type in ("default", "llama3", "proportional")
+    if (
+        runtime_context_len is not None
+        and dual_chunk_attention_config is None
+        and can_clamp_max_position
+        and not (is_multimodal_model and rope_scaling is None)
+        and "mrope_section" not in rope_scaling_dict
+        and not rope_scaling_dict.get("use_fope", False)
+        and max_position > runtime_context_len
+    ):
+        max_position = runtime_context_len
+
     key = (
         head_size,
         rotary_dim,
@@ -126,15 +181,6 @@ def get_rope(
             head_size, rotary_dim, max_position, base, is_neox_style, dtype
         )
     else:
-        if "rope_type" in rope_scaling:
-            scaling_type = rope_scaling["rope_type"]
-        elif "type" in rope_scaling:
-            scaling_type = rope_scaling["type"]
-        else:
-            raise ValueError(
-                f"Unknown RoPE scaling type, rope_scaling is {rope_scaling}"
-            )
-
         if scaling_type == "llama3":
             scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
             low_freq_factor = _get_rope_param(
@@ -146,7 +192,7 @@ def get_rope(
             original_max_position = _get_rope_param(
                 rope_scaling,
                 "original_max_position_embeddings",
-                max_position,
+                max_position_before_clamp,
                 scaling_type,
             )
             rotary_emb = Llama3RotaryEmbedding(
@@ -236,7 +282,7 @@ def get_rope(
             original_max_position = _get_rope_param(
                 rope_scaling,
                 "original_max_position_embeddings",
-                max_position,
+                max_position_before_clamp,
                 scaling_type,
             )
             extra_kwargs = {
@@ -275,7 +321,7 @@ def get_rope(
             original_max_position = _get_rope_param(
                 rope_scaling,
                 "original_max_position_embeddings",
-                max_position,
+                max_position_before_clamp,
                 scaling_type,
             )
             extra_kwargs = {
@@ -307,7 +353,7 @@ def get_rope(
             original_max_position = _get_rope_param(
                 rope_scaling,
                 "original_max_position_embeddings",
-                max_position,
+                max_position_before_clamp,
                 scaling_type,
             )
             extra_kwargs = {
@@ -364,6 +410,7 @@ def get_rope_cpu(
         rope_scaling_args = None
     if partial_rotary_factor < 1.0:
         rotary_dim = int(rotary_dim * partial_rotary_factor)
+    max_position_before_clamp = max_position
     key = (
         head_size,
         rotary_dim,
@@ -384,7 +431,10 @@ def get_rope_cpu(
 
     scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
     original_max_position = _get_rope_param(
-        rope_scaling, "original_max_position_embeddings", max_position, scaling_type
+        rope_scaling,
+        "original_max_position_embeddings",
+        max_position_before_clamp,
+        scaling_type,
     )
     extra_kwargs = {
         k: v
