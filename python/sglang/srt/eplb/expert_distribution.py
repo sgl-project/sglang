@@ -339,9 +339,10 @@ class _SinglePassGatherer(ABC):
     def __init__(self, expert_location_metadata: ExpertLocationMetadata, rank: int):
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
+        self._rids: Optional[List[str]] = None
 
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
-        pass
+        self._rids = forward_batch.rids
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         pass
@@ -397,10 +398,10 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         # TODO assert shared experts fusion is disabled, o/w data is wrong
 
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
+        super().on_forward_pass_start(forward_batch)
         assert self._metadata is None
         self._metadata = dict(
-            # TODO pr-chain
-            # rids=forward_batch.rids,
+            rids=self._rids,
             input_ids=forward_batch.input_ids.cpu().tolist(),
             positions=forward_batch.positions.cpu().tolist(),
             extend_seq_lens=forward_batch.extend_seq_lens_cpu,
@@ -437,6 +438,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         self._topk_ids_of_layer[...] = -1
         self._misc_objects.clear()
         self._metadata = None
+        self._rids = None
 
     def collect(self) -> Dict:
         num_tokens = len(self._metadata["input_ids"])
@@ -472,6 +474,7 @@ class _LayerBasedCpuSinglePassGatherer(_SinglePassGatherer):
 
     def reset(self):
         self._objects_of_layer.clear()
+        self._rids = None
 
     def _collect_objects(self, pad_len: int) -> torch.Tensor:
         data = [
@@ -507,6 +510,7 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
 
     def reset(self):
         self._data[...] = 0
+        self._rids = None
 
     def collect(self) -> Dict:
         if self._enable_global_physical_experts:
@@ -520,7 +524,7 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
                 num_physical_experts=self._expert_location_metadata.num_physical_experts,
             )
 
-        return dict(global_physical_count=global_physical_count)
+        return dict(global_physical_count=global_physical_count, rids=self._rids)
 
 
 class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
@@ -566,7 +570,7 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
             num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
             num_physical_experts=self._expert_location_metadata.num_physical_experts,
         )
-        return dict(global_physical_count=global_physical_count)
+        return dict(global_physical_count=global_physical_count, rids=self._rids)
 
 
 class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
@@ -704,8 +708,12 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
     ):
         super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
         if self._enable:
+            rids = single_pass_data.get("rids")
             return self._append_utilization_rate(
-                forward_pass_id, single_pass_data["global_physical_count"], outputs
+                forward_pass_id,
+                single_pass_data["global_physical_count"],
+                outputs,
+                rids=rids,
             )
 
     def reset(self):
@@ -718,6 +726,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         forward_pass_id: int,
         single_pass_global_physical_count: torch.Tensor,
         outputs: Dict[str, Any],
+        rids: Optional[List[str]] = None,
     ):
         gpu_physical_count = compute_gpu_physical_count(
             single_pass_global_physical_count,
@@ -749,6 +758,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 logger.info(
                     f"[Expert Balancedness] "
                     f"forward_pass_id={forward_pass_id} "
+                    f"rids={rids} "
                     f"current_pass_balancedness={utilization_rate_cpu:.03f} "
                     f"{''.join(f'last_{size}_average_balancedness={value:.03f} ' for size, value in self._history.mean().items())} "
                     f"gpu_physical_count_sum={gpu_physical_count_sum}"
