@@ -444,6 +444,93 @@ class XPUAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
 
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        """Allocate fixed-shape decode metadata buffers for XPU graph capture.
+
+        Decode-only path: speculative decoding, target-verify, draft-decode,
+        chunked/local attention, and SWA-pool index translation are out of
+        scope (XPUGraphRunner already asserts spec=NONE; chunked/local are
+        only used during prefill, which is run eagerly).
+        """
+        max_num_pages = (
+            self.max_context_len + self.page_size - 1
+        ) // self.page_size
+
+        self.decode_cuda_graph_metadata = {
+            "cache_seqlens": torch.zeros(
+                max_bs, dtype=torch.int32, device=self.device
+            ),
+            "cu_seqlens_q": torch.arange(
+                0, max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "cu_seqlens_k": torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "page_table": torch.zeros(
+                max_bs,
+                max_num_pages,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "strided_indices": torch.arange(
+                0, self.max_context_len, self.page_size, device=self.device
+            ),
+        }
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        """Cuda-graph capture/replay metadata path for decode.
+
+        Capture and replay use the same body — both fill the pre-allocated
+        buffers from the current forward_batch and bind them onto a fresh
+        FlashAttentionMetadata object that flash_attn_with_kvcache will read
+        through stable device pointers.
+        """
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            # Mixed/extend never enters cuda-graph replay on this backend
+            # (prefill graphs are disabled). Fall back to the eager path.
+            self.init_forward_metadata(forward_batch)
+            return
+
+        bs = forward_batch.batch_size
+        seq_lens = forward_batch.seq_lens[:bs]
+        req_pool_indices = forward_batch.req_pool_indices[:bs]
+        seq_lens_cpu = (
+            forward_batch.seq_lens_cpu[:bs]
+            if forward_batch.seq_lens_cpu is not None
+            else seq_lens.cpu()
+        )
+
+        cache_seqlens_buf = self.decode_cuda_graph_metadata["cache_seqlens"]
+        cu_seqlens_q_buf = self.decode_cuda_graph_metadata["cu_seqlens_q"]
+        cu_seqlens_k_buf = self.decode_cuda_graph_metadata["cu_seqlens_k"]
+        page_table_buf = self.decode_cuda_graph_metadata["page_table"]
+        strided_indices = self.decode_cuda_graph_metadata["strided_indices"]
+
+        cache_seqlens_buf[:bs].copy_(seq_lens.to(torch.int32))
+        cu_seqlens_k_buf[1 : bs + 1].copy_(
+            torch.cumsum(cache_seqlens_buf[:bs], dim=0, dtype=torch.int32)
+        )
+
+        max_len = int(seq_lens_cpu.max().item())
+        max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+        page_indices = self.req_to_token[
+            req_pool_indices[:, None],
+            strided_indices[:max_seq_pages],
+        ]
+        page_table_buf[:bs, :max_seq_pages].copy_(page_indices // self.page_size)
+
+        metadata = FlashAttentionMetadata()
+        metadata.cache_seqlens_int32 = cache_seqlens_buf[:bs]
+        metadata.max_seq_len_k = max_len
+        metadata.cu_seqlens_q = cu_seqlens_q_buf[: bs + 1]
+        metadata.cu_seqlens_k = cu_seqlens_k_buf[: bs + 1]
+        metadata.page_table = page_table_buf[:bs]
+        self.forward_metadata = metadata
+
     def forward_extend(
         self,
         q: torch.Tensor,

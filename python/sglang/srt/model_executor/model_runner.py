@@ -168,6 +168,7 @@ from sglang.srt.model_executor.runner import (
     PrefillCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -311,6 +312,8 @@ def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
         return model.thinker.model
+    if hasattr(model, "get_language_model"):
+        return model.get_language_model()
     if hasattr(model, "model"):
         return model.model
     if hasattr(model, "language_model"):
@@ -879,7 +882,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
-        elif self.device == "cpu":
+        elif self.device in ["cpu", "xpu"]:
             self.init_attention_backend()
         elif self.device == "npu":
             self.init_attention_backend()
@@ -922,7 +925,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.graph_mem_usage = 0
 
         if capture_decode_cuda_graph:
-            if self.device in ("cuda", "musa", "cpu", "npu"):
+            if self.device in ("cuda", "musa", "cpu", "npu", "xpu"):
                 self.init_decode_cuda_graph()
             elif (
                 current_platform.is_out_of_tree()
@@ -2597,10 +2600,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         graph_backend = defaultdict(
             lambda: f"{current_platform.device_name} graph",
             {
-                "cuda": "CUDA graph",
-                "musa": "CUDA graph",
-                "cpu": "CPU graph",
-                "npu": "NPU graph",
+                "cuda": "cuda graph",
+                "musa": "cuda graph",
+                "cpu": "cpu graph",
+                "npu": "npu graph",
+                "xpu": "xpu graph",
             },
         )
         role = "draft" if self.is_draft_worker else "target"
@@ -2636,6 +2640,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 {
                     "cpu": CPUGraphRunner,
                     "npu": NPUGraphRunner,
+                    "xpu": XPUGraphRunner,
                 },
             )
             self.decode_cuda_graph_runner = graph_runners[self.device](self)
@@ -2706,7 +2711,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Collect attention layers and moe layers from the model
         self.model.model = resolve_language_model(self.model)
-        language_model = getattr(self.model, "language_model", self.model)
+        language_model = getattr(self.model, "language_model", self.model.model)
 
         # Resolve model with layers: handle CausalLM wrapper (.model.layers) and direct TextModel (.layers)
         if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):

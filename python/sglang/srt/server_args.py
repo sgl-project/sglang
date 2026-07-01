@@ -3042,13 +3042,7 @@ class ServerArgs:
                 self.disable_overlap_schedule = True
 
     def _handle_xpu_backends(self):
-        if self.device == "xpu":
-            if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
-                logger.warning(
-                    "XPU platform does not support piecewise CUDA graph, "
-                    "disabling prefill cuda graph."
-                )
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+        pass
 
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
@@ -3151,8 +3145,8 @@ class ServerArgs:
             ("full torch.compile mode", lambda: self.enable_torch_compile),
             ("pipeline parallelism (pp_size > 1)", lambda: self.pp_size > 1),
             (
-                "non-CUDA hardware (HIP/NPU/CPU/MPS/XPU)",
-                lambda: is_hip() or is_npu() or is_cpu() or is_mps() or is_xpu(),
+                "non-CUDA hardware (HIP/NPU/CPU/MPS)",
+                lambda: is_hip() or is_npu() or is_cpu() or is_mps(),
             ),
             (
                 "OOT platform without piecewise support",
@@ -3164,7 +3158,8 @@ class ServerArgs:
             (
                 "multimodal model",
                 lambda: self.get_model_config().is_multimodal
-                and not self.get_model_config().is_multimodal_piecewise_cuda_graph_supported,
+                and not self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
+                and not is_xpu(),
             ),
             (
                 "GGUF quantization",
