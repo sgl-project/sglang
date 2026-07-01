@@ -56,8 +56,6 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
-    is_sm100_supported,
-    is_sm120_supported,
     is_hip,
     is_npu,
 )
@@ -74,14 +72,6 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 logger = logging.getLogger(__name__)
-
-
-def _get_fp4_kv_sm_version() -> int:
-    if is_sm100_supported():
-        return 100
-    if is_sm120_supported():
-        return 120
-    return 0
 
 
 def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
@@ -802,7 +792,6 @@ class ModelRunnerKVCacheMixin:
                 )
                 hybrid_quant_method = None
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                    sm_version = _get_fp4_kv_sm_version()
                     quant_name = resolve_kv_cache_quant(
                         self.server_args.kv_cache_dtype
                     )
@@ -811,7 +800,6 @@ class ModelRunnerKVCacheMixin:
                             quant_name,
                             num_layers=len(hybrid_full_layer_ids),
                             device=self.device,
-                            sm_version=sm_version,
                         )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
@@ -835,14 +823,13 @@ class ModelRunnerKVCacheMixin:
                     **extra_args,
                 )
                 if hybrid_quant_method is not None:
-                    hybrid_quant_method.load_scales_from_model(self, sm_version)
+                    hybrid_quant_method.load_scales_from_model(self)
             else:
                 quant_method = None
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     assert (
                         not enable_page_major
                     ), "page-major KV layout is not supported with fp4 KV cache"
-                    sm_version = _get_fp4_kv_sm_version()
                     quant_name = resolve_kv_cache_quant(
                         self.server_args.kv_cache_dtype
                     )
@@ -851,7 +838,6 @@ class ModelRunnerKVCacheMixin:
                             quant_name,
                             num_layers=self.num_effective_layers,
                             device=self.device,
-                            sm_version=sm_version,
                         )
 
                 pool_cls = (
@@ -880,7 +866,7 @@ class ModelRunnerKVCacheMixin:
                     quant_method=quant_method,
                 )
                 if quant_method is not None:
-                    quant_method.load_scales_from_model(self, sm_version)
+                    quant_method.load_scales_from_model(self)
 
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")

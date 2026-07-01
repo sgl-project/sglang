@@ -30,6 +30,7 @@ from abc import ABC, abstractmethod
 from typing import Optional
 
 import torch
+from sglang.srt.utils.common import is_sm100_supported
 from torch import Tensor
 
 
@@ -41,7 +42,7 @@ class KVCacheQuantMethodBase(ABC):
     """
 
     name: str
-    scale_block_size: int = 1
+    SCALE_BLOCK_SIZE: int = 1
 
     def needs_dequant_workspace(self) -> bool:
         """Whether the pool should allocate dq_k_buffer / dq_v_buffer for prefill."""
@@ -103,7 +104,7 @@ class KVCacheQuantMethodBase(ABC):
         """Per-token memory footprint in bytes (for capacity estimation)."""
         raise NotImplementedError
 
-    def load_scales_from_model(self, model_runner, sm_version: int = None) -> None:
+    def load_scales_from_model(self, model_runner) -> None:
         """Load per-layer global scales from model weights (no-op by default)."""
         pass
 
@@ -112,11 +113,10 @@ class UnquantizedKVCacheMethod(KVCacheQuantMethodBase):
     """Identity method for BF16 / FP8 KV cache: no extra quantization."""
 
     name = "unquantized"
-    scale_block_size = 1
+    SCALE_BLOCK_SIZE = 1
 
     def create_buffers(self, size, head_num, head_dim, layer_num, device) -> dict:
-        # Not used: base MHATokenToKVPool handles BF16/FP8 buffer creation itself.
-        return {}
+        pass
 
     def quantize_and_store(
         self,
@@ -144,12 +144,11 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
     """
 
     name = "nvfp4"
-    scale_block_size = 16
+    SCALE_BLOCK_SIZE = 16
 
-    def __init__(self, num_layers: int, device: str, sm_version: int = 120):
+    def __init__(self, num_layers: int, device: str):
         self.num_layers = num_layers
         self.device = device
-        self.sm_version = sm_version
         # Per-layer global FP32 scales; filled by load_scales_from_model()
         self.k_scales_gpu = torch.ones(num_layers, dtype=torch.float32, device=device)
         self.v_scales_gpu = torch.ones(num_layers, dtype=torch.float32, device=device)
@@ -164,10 +163,7 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
     def needs_global_scale(self) -> bool:
         return True
 
-    def load_scales_from_model(self, model_runner, sm_version: int = None) -> None:
-        if sm_version is not None:
-            self.sm_version = sm_version
-
+    def load_scales_from_model(self, model_runner) -> None:
         from sglang.srt.model_executor.model_runner import resolve_language_model
 
         language_model = resolve_language_model(model_runner.model)
@@ -220,7 +216,7 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
                 else 1.0
             )
             # SM100 requires a 6× adjustment to align FP4 range with hardware expectations
-            if self.sm_version == 100:
+            if is_sm100_supported():
                 k_scale *= 6.0
                 v_scale *= 6.0
             k_scales_cpu[layer_id] = k_scale
@@ -253,13 +249,13 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         ]
         k_scale_buffer = [
             torch.zeros(
-                (m, n, k // self.scale_block_size), dtype=store_dtype, device=device
+                (m, n, k // self.SCALE_BLOCK_SIZE), dtype=store_dtype, device=device
             )
             for _ in range(layer_num)
         ]
         v_scale_buffer = [
             torch.zeros(
-                (m, n, k // self.scale_block_size), dtype=store_dtype, device=device
+                (m, n, k // self.SCALE_BLOCK_SIZE), dtype=store_dtype, device=device
             )
             for _ in range(layer_num)
         ]
@@ -350,7 +346,7 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         fp4_size = head_num * (head_dim // 2) * num_layers * 2 * kv_size
         # Block scales: per-layer, K+V (uint8)
         scale_size = (
-            head_num * (head_dim // self.scale_block_size) * num_layers * 2 * kv_size
+            head_num * (head_dim // self.SCALE_BLOCK_SIZE) * num_layers * 2 * kv_size
         )
         # Dequant workspace: shared across layers (not multiplied by num_layers), FP8
         dq_size = head_num * head_dim * 2 * kv_size
@@ -365,13 +361,12 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
     """
 
     name = "fp4_mx_block16"
-    scale_block_size = 16
+    SCALE_BLOCK_SIZE = 16
 
     def __init__(
         self,
         num_layers: Optional[int] = None,
         device: Optional[str] = None,
-        sm_version: Optional[int] = None,
     ):
         pass
 
@@ -396,7 +391,7 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
         # Block-16 FP4 flattens head dimensions for scale storage
         k_scale_buffer = [
             torch.zeros(
-                (m, (head_num * head_dim) // self.scale_block_size),
+                (m, (head_num * head_dim) // self.SCALE_BLOCK_SIZE),
                 dtype=store_dtype,
                 device=device,
             )
@@ -404,7 +399,7 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
         ]
         v_scale_buffer = [
             torch.zeros(
-                (m, (head_num * head_dim) // self.scale_block_size),
+                (m, (head_num * head_dim) // self.SCALE_BLOCK_SIZE),
                 dtype=store_dtype,
                 device=device,
             )
@@ -482,7 +477,7 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
     ) -> int:
         fp4_size = head_num * (head_dim // 2) * num_layers * 2 * kv_size
         scale_size = (
-            (head_num * head_dim // self.scale_block_size) * num_layers * 2 * kv_size
+            (head_num * head_dim // self.SCALE_BLOCK_SIZE) * num_layers * 2 * kv_size
         )
         dq_size = head_num * head_dim * 2 * kv_size
         return fp4_size + scale_size + dq_size

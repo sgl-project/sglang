@@ -1303,9 +1303,6 @@ class MHATokenToKVPool(KVCache):
             else v_head_dim if v_head_dim is not None else head_dim
         )
 
-
-
-
         # Layout: NHD (default) | HND (SGLANG_USE_HND_KVCACHE) | vectorized_5d (ROCm AITER).
         # HND folds (page, head) into one paged index for per-kv-head sparse page tables
         # (paged backends like trtllm_mha consume directly). vectorized_5d SHUFFLE 5D:
@@ -1430,23 +1427,25 @@ class MHATokenToKVPool(KVCache):
             num_stages=2,
         )
 
-
     @property
     def is_quantized_kv_cache(self) -> bool:
         return not isinstance(self.quant_method, UnquantizedKVCacheMethod)
 
     def _create_buffers(self):
         if not isinstance(self.quant_method, UnquantizedKVCacheMethod):
-            # Delegate buffer creation to quant_method (e.g. NVFP4KVCacheMethod, FP4MXBlock16KVCacheMethod).
+            # Quantized recipes own packed-data, scale, and workspace shapes.
             with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
                 with (
                     torch.cuda.use_mem_pool(self.custom_mem_pool)
                     if self.enable_custom_mem_pool
                     else nullcontext()
                 ):
-                    m = self.size + self.page_size
                     buf = self.quant_method.create_buffers(
-                        m, self.head_num, self.head_dim, self.layer_num, self.device
+                        self.size + self.page_size,
+                        self.head_num,
+                        self.head_dim,
+                        self.layer_num,
+                        self.device,
                     )
             self.k_buffer = buf["k_buffer"]
             self.v_buffer = buf["v_buffer"]
@@ -1466,115 +1465,93 @@ class MHATokenToKVPool(KVCache):
                     if self.enable_custom_mem_pool
                     else nullcontext()
                 ):
-                    # [size, head_num, head_dim] for each layer
-                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                    self.k_buffer = [
-                        torch.zeros(
-                            (self.size + self.page_size, self.head_num, self.head_dim),
-                            dtype=self.store_dtype,
-                            device=self.device,
+                    # The padded page (slot 0's page) absorbs dummy padded-token writes.
+                    if self.use_hnd:
+                        k_shape = (
+                            self.num_pages,
+                            self.head_num,
+                            self.page_size,
+                            self.head_dim,
                         )
-                        for _ in range(self.layer_num)
-                    ]
-                    self.v_buffer = [
-                        torch.zeros(
-                            (
-                                self.size + self.page_size,
-                                self.head_num,
-                                self.v_head_dim,
-                            ),
-                            dtype=self.store_dtype,
-                            device=self.device,
+                        v_shape = (
+                            self.num_pages,
+                            self.head_num,
+                            self.page_size,
+                            self.v_head_dim,
                         )
-                        for _ in range(self.layer_num)
-                    ]
-
-
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            with (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.enable_custom_mem_pool
-                else nullcontext()
-            ):
-                # The padded page (slot 0's page) absorbs dummy padded-token writes.
-                if self.use_hnd:
-                    k_shape = (
-                        self.num_pages,
-                        self.head_num,
-                        self.page_size,
-                        self.head_dim,
-                    )
-                    v_shape = (
-                        self.num_pages,
-                        self.head_num,
-                        self.page_size,
-                        self.v_head_dim,
-                    )
-                    self.k_buffer = [
-                        torch.zeros(k_shape, dtype=self.store_dtype, device=self.device)
-                        for _ in range(self.layer_num)
-                    ]
-                    self.v_buffer = [
-                        torch.zeros(v_shape, dtype=self.store_dtype, device=self.device)
-                        for _ in range(self.layer_num)
-                    ]
-                elif self.kv_cache_layout == "vectorized_5d":
-                    total_slots = self.size + self.page_size
-                    num_blocks = total_slots // self.page_size
-                    x = self._kv_vector_x
-                    # K: (num_blocks, H, D_k // X, page, X)
-                    self.k_buffer = [
-                        torch.zeros(
-                            (
-                                num_blocks,
-                                self.head_num,
-                                self.head_dim // x,
-                                self.page_size,
-                                x,
-                            ),
-                            dtype=self.store_dtype,
-                            device=self.device,
-                        )
-                        for _ in range(self.layer_num)
-                    ]
-                    # V: (num_blocks, H, page // X, D_v, X)
-                    self.v_buffer = [
-                        torch.zeros(
-                            (
-                                num_blocks,
-                                self.head_num,
-                                self.page_size // x,
-                                self.v_head_dim,
-                                x,
-                            ),
-                            dtype=self.store_dtype,
-                            device=self.device,
-                        )
-                        for _ in range(self.layer_num)
-                    ]
-                else:
-                    # [size, head_num, head_dim] for each layer
-                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                    self.k_buffer = [
-                        torch.zeros(
-                            (self.size + self.page_size, self.head_num, self.head_dim),
-                            dtype=self.store_dtype,
-                            device=self.device,
-                        )
-                        for _ in range(self.layer_num)
-                    ]
-                    self.v_buffer = [
-                        torch.zeros(
-                            (
-                                self.size + self.page_size,
-                                self.head_num,
-                                self.v_head_dim,
-                            ),
-                            dtype=self.store_dtype,
-                            device=self.device,
-                        )
-                        for _ in range(self.layer_num)
-                    ]
+                        self.k_buffer = [
+                            torch.zeros(
+                                k_shape, dtype=self.store_dtype, device=self.device
+                            )
+                            for _ in range(self.layer_num)
+                        ]
+                        self.v_buffer = [
+                            torch.zeros(
+                                v_shape, dtype=self.store_dtype, device=self.device
+                            )
+                            for _ in range(self.layer_num)
+                        ]
+                    elif self.kv_cache_layout == "vectorized_5d":
+                        total_slots = self.size + self.page_size
+                        num_blocks = total_slots // self.page_size
+                        x = self._kv_vector_x
+                        # K: (num_blocks, H, D_k // X, page, X)
+                        self.k_buffer = [
+                            torch.zeros(
+                                (
+                                    num_blocks,
+                                    self.head_num,
+                                    self.head_dim // x,
+                                    self.page_size,
+                                    x,
+                                ),
+                                dtype=self.store_dtype,
+                                device=self.device,
+                            )
+                            for _ in range(self.layer_num)
+                        ]
+                        # V: (num_blocks, H, page // X, D_v, X)
+                        self.v_buffer = [
+                            torch.zeros(
+                                (
+                                    num_blocks,
+                                    self.head_num,
+                                    self.page_size // x,
+                                    self.v_head_dim,
+                                    x,
+                                ),
+                                dtype=self.store_dtype,
+                                device=self.device,
+                            )
+                            for _ in range(self.layer_num)
+                        ]
+                    else:
+                        # [size, head_num, head_dim] for each layer
+                        # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                        self.k_buffer = [
+                            torch.zeros(
+                                (
+                                    self.size + self.page_size,
+                                    self.head_num,
+                                    self.head_dim,
+                                ),
+                                dtype=self.store_dtype,
+                                device=self.device,
+                            )
+                            for _ in range(self.layer_num)
+                        ]
+                        self.v_buffer = [
+                            torch.zeros(
+                                (
+                                    self.size + self.page_size,
+                                    self.head_num,
+                                    self.v_head_dim,
+                                ),
+                                dtype=self.store_dtype,
+                                device=self.device,
+                            )
+                            for _ in range(self.layer_num)
+                        ]
 
         self._init_data_ptrs_and_strides()
 
@@ -1880,7 +1857,6 @@ class MHATokenToKVPool(KVCache):
             same_kv_dim=self.same_kv_dim,
         )
 
-
     def get_quantized_kv_access(self) -> QuantizedKVCacheAccess:
         if not self.is_quantized_kv_cache:
             raise RuntimeError("Quantized KV access requested from a non-FP4 KV pool.")
@@ -1890,45 +1866,6 @@ class MHATokenToKVPool(KVCache):
             self._quantized_kv_access = access
         return access
 
-    def get_raw_kv_buffer(self, layer_id: int) -> dict:
-        return self.get_quantized_kv_access().raw_fp4_view(layer_id).as_dict()
-
-    def get_fp4_key_buffer(self, layer_id: int):
-        raw = self.get_quantized_kv_access().raw_fp4_view(layer_id)
-        return raw.k, raw.k_scale
-
-    def get_fp4_value_buffer(self, layer_id: int):
-        raw = self.get_quantized_kv_access().raw_fp4_view(layer_id)
-        return raw.v, raw.v_scale
-
-    def get_dq_kv_buffer(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.get_quantized_kv_access().fp8_workspace()
-
-    def dequant_kv_for_extend(
-        self,
-        layer_id: int,
-        req_to_token: torch.Tensor,
-        req_pool_indices_cpu,
-        extend_prefix_lens_cpu,
-        extend_seq_lens_cpu,
-        page_size: int,
-        k_cur_fp8: Optional[torch.Tensor] = None,
-        v_cur_fp8: Optional[torch.Tensor] = None,
-        global_layer_id: Optional[int] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if global_layer_id is None:
-            global_layer_id = layer_id
-        return self.get_quantized_kv_access().prepare_fp8_extend_workspace(
-            layer_id,
-            global_layer_id,
-            req_to_token,
-            req_pool_indices_cpu,
-            extend_prefix_lens_cpu,
-            extend_seq_lens_cpu,
-            page_size,
-            k_cur_fp8=k_cur_fp8,
-            v_cur_fp8=v_cur_fp8,
-        )
 
     def set_kv_buffer_prefix_valid(
         self,
@@ -2668,7 +2605,6 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id)
 
-
     def get_quantized_kv_access(self) -> LayerMappedQuantizedKVCacheAccess:
         access = getattr(self, "_quantized_kv_access", None)
         if access is None:
@@ -2680,25 +2616,6 @@ class HybridLinearKVPool(KVCache):
             self._quantized_kv_access = access
         return access
 
-    def get_raw_kv_buffer(self, layer_id: int) -> dict:
-        return self.get_quantized_kv_access().raw_fp4_view(layer_id).as_dict()
-
-    def get_fp4_key_buffer(self, layer_id: int):
-        raw = self.get_quantized_kv_access().raw_fp4_view(layer_id)
-        return raw.k, raw.k_scale
-
-    def get_fp4_value_buffer(self, layer_id: int):
-        raw = self.get_quantized_kv_access().raw_fp4_view(layer_id)
-        return raw.v, raw.v_scale
-
-    def get_dq_kv_buffer(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.get_quantized_kv_access().fp8_workspace()
-
-    def dequant_kv_for_extend(self, layer_id: int, *args, **kwargs):
-        global_layer_id = kwargs.pop("global_layer_id", layer_id)
-        return self.get_quantized_kv_access().prepare_fp8_extend_workspace(
-            layer_id, global_layer_id, *args, **kwargs
-        )
 
     @contextmanager
     def _transfer_id_context(self, layer: RadixAttention):

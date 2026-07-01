@@ -14,7 +14,7 @@
 
 """Low-level tensor helpers for FP4 KV cache quantization.
 
-Recipe selection and buffer ownership live in ``kv_cache_quant_method.py``. This
+Recipe selection and buffer ownership live in ``fp4_kv_cache_quant_method.py``. This
 module only implements the packing, unpacking, and FlashInfer calls used by the
 concrete quantization methods.
 """
@@ -22,35 +22,11 @@ concrete quantization methods.
 import torch
 
 E2M1_MAX = 6.0
-# Constants stay on CPU and move to the input tensor device in compiled helpers.
-# E2M1 format: 1 sign bit + 2 exponent bits + 1 mantissa bit = 4 bits
-# 16 possible values: 0x0-0xF
-# Negative values: 0x8-0xF (sign bit = 1)
-# Positive values: 0x0-0x7 (sign bit = 0)
-E2M1_VALUES = torch.tensor(
-    [
-        0,
-        0.5,
-        1,
-        1.5,
-        2,
-        3,
-        4,
-        6,  # 0x0-0x7: positive values
-        -0,
-        -0.5,
-        -1,
-        -1.5,
-        -2,
-        -3,
-        -4,
-        -6,
-    ],  # 0x8-0xF: negative values
-    dtype=torch.float32,
-)
-E2M1_BOUNDS = torch.tensor(
-    [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5], dtype=torch.float32
-)
+# Keep constants as Python literals. The compiled helpers materialize them with
+# input.new_tensor(), so they follow the caller device without a global GPU tensor
+# or a CPU tensor .to(device) in the hot path.
+E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+E2M1_BOUNDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 
 
 class FP4MXBlock16KVQuantizeUtil:
@@ -87,7 +63,7 @@ class FP4MXBlock16KVQuantizeUtil:
         abs_vals = scaled.abs()
 
         # Pure tensor version (CUDA Graph safe)
-        bounds = E2M1_BOUNDS.to(device=tensor.device)
+        bounds = tensor.new_tensor(E2M1_BOUNDS, dtype=torch.float32)
         magnitude_bits = torch.sum(abs_vals.unsqueeze(-1) >= bounds, dim=-1)
 
         # Combine sign and magnitude
@@ -129,7 +105,7 @@ class FP4MXBlock16KVQuantizeUtil:
         magnitude_idx = fp4_vals & 0x07
 
         # Convert to float values
-        values = E2M1_VALUES.to(device=quant_tensor.device)
+        values = quant_tensor.new_tensor(E2M1_VALUES, dtype=torch.float32)
         float_vals = values[magnitude_idx.long()]
         float_vals = torch.where(sign_mask, -float_vals, float_vals)
 

@@ -38,7 +38,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         )
 
         method = get_kv_cache_quant_method(
-            "nvfp4", num_layers=4, device="cpu", sm_version=120
+            "nvfp4", num_layers=4, device="cpu"
         )
         self.assertIsInstance(method, NVFP4KVCacheMethod)
         self.assertEqual(method.name, "nvfp4")
@@ -95,9 +95,9 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
             NVFP4KVCacheMethod,
         )
 
-        m = NVFP4KVCacheMethod(num_layers=4, device="cpu", sm_version=120)
+        m = NVFP4KVCacheMethod(num_layers=4, device="cpu")
         self.assertEqual(m.name, "nvfp4")
-        self.assertEqual(m.scale_block_size, 16)
+        self.assertEqual(m.SCALE_BLOCK_SIZE, 16)
         self.assertTrue(m.needs_dequant_workspace())
         self.assertTrue(m.needs_global_scale())
 
@@ -106,7 +106,7 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
             NVFP4KVCacheMethod,
         )
 
-        m = NVFP4KVCacheMethod(num_layers=4, device="cpu", sm_version=120)
+        m = NVFP4KVCacheMethod(num_layers=4, device="cpu")
         size, heads, dim, layers = 64, 8, 128, 4
         bufs = m.create_buffers(size, heads, dim, layers, "cpu")
 
@@ -153,7 +153,7 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
         )
 
         major, minor = torch.cuda.get_device_capability()
-        m = NVFP4KVCacheMethod(num_layers=1, device="cuda", sm_version=major * 10 + minor)
+        m = NVFP4KVCacheMethod(num_layers=1, device="cuda")
 
         size, heads, dim = 32, 8, 128
         bufs = m.create_buffers(size, heads, dim, 1, "cuda")

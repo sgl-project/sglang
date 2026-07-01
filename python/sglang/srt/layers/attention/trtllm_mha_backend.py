@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fp4_kv_adapter import TRTLLMMHANVFP4KVAdapter
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
@@ -167,8 +166,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "Use --kv-cache-dtype=nvfp4 or choose another decode backend "
                 "for fp4_mx_block16."
             )
-        self.nvfp4_decode_adapter = (
-            TRTLLMMHANVFP4KVAdapter(self.token_to_kv_pool)
+        self.nvfp4_kv_access = (
+            self.token_to_kv_pool.get_quantized_kv_access()
             if self.is_nvfp4_kvcache
             else None
         )
@@ -774,7 +773,24 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         return k_cache, v_cache
 
     def _get_nvfp4_bmm_scales(self, layer: RadixAttention) -> tuple[float, float]:
-        return self.nvfp4_decode_adapter.bmm_scales(layer)
+        assert self.nvfp4_kv_access is not None
+        return self.nvfp4_kv_access.quant_method.get_bmm_scales(layer.layer_id)
+
+    def _get_nvfp4_decode_kv_cache(
+        self, layer: RadixAttention
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+    ]:
+        assert self.nvfp4_kv_access is not None
+        raw = self.nvfp4_kv_access.raw_fp4_view(layer.layer_id)
+        kv_cache = self._reshape_paged_kv_cache(
+            raw.k, raw.v, layer, layer.head_dim // 2
+        )
+        kv_cache_block_scales = self._reshape_paged_kv_cache(
+            raw.k_scale, raw.v_scale, layer, layer.head_dim // 16
+        )
+        return kv_cache, kv_cache_block_scales
 
     def forward_decode(
         self,
@@ -822,11 +838,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
 
         if self.is_nvfp4_kvcache:
-            kv_cache, kv_cache_block_scales = (
-                self.nvfp4_decode_adapter.prepare_decode_kv_cache(
-                    layer, self._reshape_paged_kv_cache
-                )
-            )
+            kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
         else:
             k_cache, v_cache = pool.get_kv_buffer(layer.layer_id)
             kv_cache = self._reshape_paged_kv_cache(
