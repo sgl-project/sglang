@@ -148,6 +148,34 @@ jobs:
           SLURM_EXCLUDE: mia1-p01-g20
         run: bash scripts/ci/slurm/launch_mi355x.sh
 
+      - name: Pack logs
+        if: always()
+        run: |
+          LOG_DIR="$HOME/.mi355x_ci/${MATRIX_CONFIG_NAME}"
+          LOG_BUNDLE="${GITHUB_WORKSPACE}/${RESULT_FILENAME}_logs.tar.gz"
+          if [ ! -d "$LOG_DIR" ]; then
+            echo "WARN: log directory not found: $LOG_DIR"
+            exit 0
+          fi
+
+          mapfile -d '' LOG_FILES < <(
+            find "$LOG_DIR" -maxdepth 1 -type f \
+              \( -name '*.log' -o -name 'server_exit_*' -o -name 'bench_exit' \) \
+              -printf '%P\0' | sort -z
+          )
+          if [ "${#LOG_FILES[@]}" -eq 0 ]; then
+            echo "WARN: no log files found in $LOG_DIR"
+            exit 0
+          fi
+
+          STAGING_DIR="$(mktemp -d)"
+          trap 'rm -rf "$STAGING_DIR"' EXIT
+          for log_file in "${LOG_FILES[@]}"; do
+            cp -a "$LOG_DIR/$log_file" "$STAGING_DIR/$log_file" || true
+          done
+          tar czf "$LOG_BUNDLE" -C "$STAGING_DIR" .
+          echo "Packed ${#LOG_FILES[@]} log file(s) -> $LOG_BUNDLE"
+
       - name: Process results
         if: always()
         run: |
@@ -168,7 +196,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mi355x-${{ matrix.config.name }}-${{ github.run_id }}
-          path: ${{ github.workspace }}/*.json
+          path: |
+            ${{ github.workspace }}/*.json
+            ${{ github.workspace }}/*_logs.tar.gz
           retention-days: 30
           if-no-files-found: warn
 
