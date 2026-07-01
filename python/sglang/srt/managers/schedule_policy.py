@@ -41,7 +41,10 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import (
+    PureSWATokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     InitLoadBackParams,
@@ -182,7 +185,7 @@ class SchedulePolicy:
             and get_global_server_args().disaggregation_mode != "decode"
         ):
             for r in waiting_queue:
-                match_prefix_for_req(self.tree_cache, r)
+                match_prefix_for_req(self.tree_cache, r, include_req=True)
 
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
@@ -257,7 +260,9 @@ class SchedulePolicy:
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
-            match_result = match_prefix_for_req(self.tree_cache, r, prefix_ids)
+            match_result = match_prefix_for_req(
+                self.tree_cache, r, prefix_ids, include_req=True
+            )
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -483,6 +488,9 @@ class PrefillAdder:
             self.token_to_kv_pool_allocator,
             (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
         )
+        self.is_all_swa = isinstance(
+            self.token_to_kv_pool_allocator, PureSWATokenToKVPoolAllocator
+        )
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
 
         self.rem_swa_token_offset = 0
@@ -517,7 +525,12 @@ class PrefillAdder:
 
     @property
     def rem_total_tokens(self):
-        if self.is_hybrid_swa:
+        if self.is_all_swa:
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.swa_available_size()
+                + self.tree_cache.swa_evictable_size()
+            )
+        elif self.is_hybrid_swa:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.full_available_size()
                 + self.tree_cache.full_evictable_size()
@@ -544,7 +557,12 @@ class PrefillAdder:
 
     @property
     def cur_rem_tokens(self):
-        if self.is_hybrid_swa:
+        if self.is_all_swa:
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.swa_available_size()
+                + self.tree_cache.swa_evictable_size()
+            )
+        elif self.is_hybrid_swa:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.full_available_size()
                 + self.tree_cache.full_evictable_size()
