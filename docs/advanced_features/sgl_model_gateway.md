@@ -1406,6 +1406,7 @@ python -m sglang_router.launch_router \
 | Parameter | Recommendation | Reason |
 |-----------|---------------|--------|
 | `--policy` | `cache_aware` | Best for repeated prompts, ~30% latency reduction |
+| `--cache-balance-weight` | `0.0` | Trade some cache reuse for more even shadow-cache distribution |
 | `--max-concurrent-requests` | 2-4x worker count | Prevent overload while maximizing throughput |
 | `--queue-size` | 2x max-concurrent | Buffer for burst traffic |
 | `--request-timeout-secs` | Based on max generation length | Prevent stuck requests |

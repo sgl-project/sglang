@@ -384,6 +384,7 @@ class TestRouterFromArgsKitchenSink:
             worker_startup_timeout_secs=60,
             worker_startup_check_interval=5,
             cache_threshold=0.5,
+            cache_balance_weight=0.25,
             balance_abs_threshold=32,
             balance_rel_threshold=1.2,
             eviction_interval_secs=30,

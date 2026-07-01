@@ -161,8 +161,10 @@ class Router:
         worker_startup_timeout_secs: Timeout in seconds for worker startup and registration. Large models can take significant time to load into GPU memory. Default: 1800 (30 minutes)
         worker_startup_check_interval: Interval in seconds between checks for worker initialization. Default: 10
         cache_threshold: Cache threshold (0.0-1.0) for cache-aware routing. Routes to cached worker
-            if the match rate exceeds threshold, otherwise routes to the worker with the smallest
-            tree. Default: 0.5
+            if the match rate exceeds threshold, otherwise routes to the worker with the shortest
+            queue. Default: 0.5
+        cache_balance_weight: Penalty weight for trading cache reuse against shadow-cache balance
+            in cache-aware routing. 0.0 preserves strict best-prefix routing. Default: 0.0
         balance_abs_threshold: Load balancing is triggered when (max_load - min_load) > abs_threshold
             AND max_load > min_load * rel_threshold. Otherwise, use cache aware. Default: 32
         balance_rel_threshold: Load balancing is triggered when (max_load - min_load) > abs_threshold

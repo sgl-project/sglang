@@ -9,6 +9,7 @@ use smg::{
 async fn test_backward_compatibility_with_empty_model_id() {
     let config = CacheAwareConfig {
         cache_threshold: 0.5,
+        cache_balance_weight: 0.0,
         balance_abs_threshold: 2,
         balance_rel_threshold: 1.5,
         eviction_interval_secs: 0, // Disable background eviction for testing
@@ -60,6 +61,7 @@ async fn test_backward_compatibility_with_empty_model_id() {
 async fn test_mixed_model_ids() {
     let config = CacheAwareConfig {
         cache_threshold: 0.5,
+        cache_balance_weight: 0.0,
         balance_abs_threshold: 2,
         balance_rel_threshold: 1.5,
         eviction_interval_secs: 0,

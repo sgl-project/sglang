@@ -153,6 +153,7 @@ impl ConfigValidator {
             | PolicyConfig::ConsistentHashing => {}
             PolicyConfig::CacheAware {
                 cache_threshold,
+                cache_balance_weight,
                 balance_abs_threshold: _,
                 balance_rel_threshold,
                 eviction_interval_secs,
@@ -163,6 +164,14 @@ impl ConfigValidator {
                         field: "cache_threshold".to_string(),
                         value: cache_threshold.to_string(),
                         reason: "Must be between 0.0 and 1.0".to_string(),
+                    });
+                }
+
+                if !cache_balance_weight.is_finite() || *cache_balance_weight < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cache_balance_weight".to_string(),
+                        value: cache_balance_weight.to_string(),
+                        reason: "Must be finite and >= 0.0".to_string(),
                     });
                 }
 
@@ -725,6 +734,29 @@ mod tests {
             },
             PolicyConfig::CacheAware {
                 cache_threshold: 1.5, // Invalid: > 1.0
+                cache_balance_weight: 0.0,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 60,
+                max_tree_size: 1000,
+            },
+        );
+
+        assert!(ConfigValidator::validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_cache_aware_balance_weight() {
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec![
+                    "http://worker1:8000".to_string(),
+                    "http://worker2:8000".to_string(),
+                ],
+            },
+            PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                cache_balance_weight: -0.1,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
@@ -744,6 +776,7 @@ mod tests {
             },
             PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
+                cache_balance_weight: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
@@ -798,6 +831,7 @@ mod tests {
             },
             PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
+                cache_balance_weight: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
@@ -842,6 +876,7 @@ mod tests {
                 ],
                 prefill_policy: Some(PolicyConfig::CacheAware {
                     cache_threshold: 0.5,
+                    cache_balance_weight: 0.0,
                     balance_abs_threshold: 32,
                     balance_rel_threshold: 1.1,
                     eviction_interval_secs: 60,

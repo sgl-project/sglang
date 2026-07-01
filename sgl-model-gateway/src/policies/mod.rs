@@ -97,6 +97,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
 #[derive(Debug, Clone)]
 pub struct CacheAwareConfig {
     pub cache_threshold: f32,
+    pub cache_balance_weight: f32,
     pub balance_abs_threshold: usize,
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
@@ -107,6 +108,7 @@ impl Default for CacheAwareConfig {
     fn default() -> Self {
         Self {
             cache_threshold: 0.5,
+            cache_balance_weight: 0.0,
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 30,
