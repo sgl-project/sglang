@@ -199,7 +199,7 @@ export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
 export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
 
-MODEL_PATH={"weights path"}
+MODEL_PATH=/path/to/model-weights
 
 python3 -m sglang.launch_server \
         --model-path $MODEL_PATH \
@@ -255,7 +255,7 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
 export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 
-MODEL_PATH={"weights path"}
+MODEL_PATH=/path/to/model-weights
 
 python3 -m sglang.launch_server \
         --model-path $MODEL_PATH \
@@ -333,10 +333,10 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
 export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
 
 
-IPS=('your ip1' 'your ip2')
-IP_MASTER="${IPS[0]}:your port"
+IPS=('<your node1 ip>' '<your node2 ip>')
+IP_MASTER="${IPS[0]}:5000"
 
-MODEL_PATH={"weights path"}
+MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -402,13 +402,13 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 # pd transfer, prefill master IP
-export ASCEND_MF_STORE_URL="tcp://x.x.x.x:24707"
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24707"
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 
-P_IP=('your ip1')
-D_IP=('your ip2')
+P_IP=('<your prefill ip>')
+D_IP=('<your decode ip>')
 
-MODEL_PATH={"weights path"}
+MODEL_PATH=/path/to/model-weights
 
 export TRANSFORMERS_VERBOSITY=error
 
@@ -492,17 +492,22 @@ Launch the router after the prefill and decode services are ready.
 
 ```shell
 # ============================================================
-# Before running, replace the following placeholders:
-#   {P_MASTER_IP}: prefill master IP address
-#   {D_MASTER_IP}: decode master IP address
+# Before running, update the following variables:
+#   P_MASTER_IP: prefill master IP address
+#   D_MASTER_IP: decode master IP address
+#   ROUTER_HOST_IP: router node IP address
 # ============================================================
+
+P_MASTER_IP="<your prefill ip>"
+D_MASTER_IP="<your decode ip>"
+ROUTER_HOST_IP="<your router ip>"
 
 python3 -m sglang_router.launch_router \
 --pd-disaggregation \
 --policy round_robin \
---prefill http://{P_MASTER_IP}:8000 8998 \
---decode http://{D_MASTER_IP}:8003 \
---host {ROUTER_HOST_IP} \
+--prefill http://${P_MASTER_IP}:8000 8998 \
+--decode http://${D_MASTER_IP}:8003 \
+--host ${ROUTER_HOST_IP} \
 --port 6688
 ```
 
