@@ -327,16 +327,6 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
-def _shared_indexer_freqs_cis(rotary_emb: torch.nn.Module) -> torch.Tensor:
-    cached = getattr(rotary_emb, "_dsa_indexer_freqs_cis", None)
-    if cached is None:
-        c = rotary_emb.cos_sin_cache.to(torch.float32)
-        half = c.shape[-1] // 2
-        cached = torch.complex(c[:, :half].contiguous(), c[:, half:].contiguous())
-        rotary_emb._dsa_indexer_freqs_cis = cached
-    return cached
-
-
 class Indexer(MultiPlatformOp):
     _MQA_LOGITS_BYTES_PER_ELEM = 4
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
@@ -437,10 +427,6 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
-        self._indexer_freqs_cis: Optional[torch.Tensor] = None
-        if _use_dsa_indexer_fusion:
-            self._indexer_freqs_cis = _shared_indexer_freqs_cis(self.rotary_emb)
-
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
@@ -455,6 +441,10 @@ class Indexer(MultiPlatformOp):
                 yield
         else:
             yield
+
+    @property
+    def _indexer_cos_sin_cache(self) -> torch.Tensor:
+        return self.rotary_emb.cos_sin_cache
 
     def _weights_proj_bf16_in_fp32_out(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
@@ -682,7 +672,7 @@ class Indexer(MultiPlatformOp):
                 self.k_norm.weight,
                 self.k_norm.bias,
                 self.k_norm.variance_epsilon,
-                self._indexer_freqs_cis,
+                self._indexer_cos_sin_cache,
                 positions,
                 page_size,
             )
@@ -694,7 +684,7 @@ class Indexer(MultiPlatformOp):
             self.k_norm.weight,
             self.k_norm.bias,
             self.k_norm.variance_epsilon,
-            self._indexer_freqs_cis,
+            self._indexer_cos_sin_cache,
             positions,
         )
         self._store_index_k_cache(
@@ -746,7 +736,7 @@ class Indexer(MultiPlatformOp):
                 q.contiguous(),
                 weights_raw,
                 q_scale_gate,
-                self._indexer_freqs_cis,
+                self._indexer_cos_sin_cache,
                 positions,
             )
 
@@ -783,7 +773,7 @@ class Indexer(MultiPlatformOp):
             q.contiguous(),
             weights_raw,
             q_scale_gate,
-            self._indexer_freqs_cis,
+            self._indexer_cos_sin_cache,
             positions,
         )
 

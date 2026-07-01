@@ -1923,6 +1923,7 @@ class ServerArgs:
                 "dynamic",
                 "eic",
                 "simm",
+                "mori",
             ],
         ),
     ] = None
@@ -2645,6 +2646,9 @@ class ServerArgs:
         # deterministic backend is set before auto-detection fills it in.
         self._handle_deterministic_inference()
         self._handle_attention_backend_compatibility()
+        # Must run after the attention backend is resolved so the trtllm_mla
+        # default (auto-selected for DeepseekV3ForCausalLM on sm100) is visible.
+        self._disable_prefill_cuda_graph_for_deepseek_trtllm_mla()
         self._handle_mamba_backend()
         self._handle_int8_mamba_checkpoint()
         self._handle_linear_attn_backend()
@@ -3216,6 +3220,34 @@ class ServerArgs:
                 )
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
                 return
+
+    def _disable_prefill_cuda_graph_for_deepseek_trtllm_mla(self):
+        """Disable prefill CUDA graph for dsr1 by default when using the trtllm_mla
+        attention backend. Under any captured prefill CUDA graph (tc_piecewise or
+        breakable) trtllm_mla falls back to FlashAttention for prefill and regresses
+        performance, so disable whichever prefill graph backend is in effect.
+        """
+
+        if (Phase.PREFILL, "backend") in self._cuda_graph_config_locked:
+            return
+        if self.cuda_graph_config.prefill.backend == Backend.DISABLED:
+            return
+        if (
+            "DeepseekV3ForCausalLM"
+            not in self.get_model_config().hf_config.architectures
+        ):
+            return
+        prefill_attention_backend, _ = self.get_attention_backends()
+        if prefill_attention_backend != "trtllm_mla":
+            return
+        logger.warning(
+            "Disabling prefill CUDA graph (%s) by default for the DeepSeek-V3 arch on "
+            "the trtllm_mla attention backend (a captured prefill graph forces a "
+            "FlashAttention fallback that regresses prefill). Set the prefill cuda graph "
+            "backend explicitly (e.g. --cuda-graph-backend-prefill tc_piecewise) to override.",
+            self.cuda_graph_config.prefill.backend,
+        )
+        self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _validate_cuda_graph_config(self):
         if self.cuda_graph_config is None:
