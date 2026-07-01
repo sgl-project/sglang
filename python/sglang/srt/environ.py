@@ -231,6 +231,9 @@ class Envs:
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
+    # When enabled, migrated models use AutoWeightsLoader instead of
+    # their legacy hand-written load_weights loop.  Default off.
+    SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
 
     # HTTP server
     # Decompress request bodies tagged with `x-body-compressed`.
