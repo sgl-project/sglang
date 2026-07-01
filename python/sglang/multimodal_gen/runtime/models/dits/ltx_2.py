@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.low_precision_linear import (
     TeNvfp4LinearRunner,
     maybe_get_te_nvfp4_linear_runner,
+    te_nvfp4_linear_target_enabled,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -55,6 +56,12 @@ ADALN_NUM_CROSS_ATTN_PARAMS = 3
 
 _LTX2_TE_NVFP4_VIDEO_FFN_TARGET = "ltx2.video_ffn"
 _LTX2_FUSED_ADA_VALUES_RUNTIME_DISABLED = False
+
+
+def _ltx2_te_nvfp4_video_ffn_target() -> str | None:
+    if te_nvfp4_linear_target_enabled(_LTX2_TE_NVFP4_VIDEO_FFN_TARGET):
+        return _LTX2_TE_NVFP4_VIDEO_FFN_TARGET
+    return None
 
 
 def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
@@ -1044,7 +1051,7 @@ class LTX2TransformerBlock(nn.Module):
             dim,
             dim_out=dim,
             quant_config=quant_config,
-            te_nvfp4_target=_LTX2_TE_NVFP4_VIDEO_FFN_TARGET,
+            te_nvfp4_target=_ltx2_te_nvfp4_video_ffn_target(),
         )
         self.audio_ff = LTX2FeedForward(
             audio_dim,

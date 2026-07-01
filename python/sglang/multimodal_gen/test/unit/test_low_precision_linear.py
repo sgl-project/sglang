@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.layers.low_precision_linear import (
     maybe_get_te_nvfp4_linear_runner,
     te_nvfp4_linear_target_enabled,
 )
+from sglang.multimodal_gen.runtime.models.dits import ltx_2
 
 
 class UnquantizedLinearMethod:
@@ -91,6 +92,21 @@ class TestTeNvfp4LinearTargetPolicy(unittest.TestCase):
         ):
             self.assertTrue(te_nvfp4_linear_target_enabled("ltx2.video_ffn"))
             self.assertTrue(te_nvfp4_linear_target_enabled("wan.video_ffn"))
+
+    def test_ltx2_video_ffn_target_default_disabled(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertIsNone(ltx_2._ltx2_te_nvfp4_video_ffn_target())
+
+    def test_ltx2_video_ffn_target_requires_env(self):
+        with patch.dict(
+            "os.environ",
+            {TE_NVFP4_LINEAR_TARGETS_ENV: "ltx2.video_ffn"},
+            clear=True,
+        ):
+            self.assertEqual(
+                ltx_2._ltx2_te_nvfp4_video_ffn_target(),
+                "ltx2.video_ffn",
+            )
 
     def test_cpu_input_short_circuits_before_te_or_distributed_setup(self):
         runner = TeNvfp4LinearRunner(target="unit.test")
