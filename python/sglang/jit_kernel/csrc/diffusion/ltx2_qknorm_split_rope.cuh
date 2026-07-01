@@ -9,30 +9,30 @@
 
 #pragma once
 
-#include <tvm/ffi/container/tensor.h>
+#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
+#include <sgl_kernel/utils.h>   // For RuntimeCheck
+
+#include <sgl_kernel/utils.cuh>  // For LaunchKernel and CUDA dtype aliases
 
 #include <cstdint>
 #include <cuda_bf16.h>
-#include <cuda_runtime.h>
 
 namespace sglang_ltx2_qknorm_split_rope {
-
-namespace ffi = tvm::ffi;
 
 namespace {
 
 constexpr int kThreads = 128;
 
-inline const char* data_ptr(const ffi::TensorView& t) {
+inline const char* data_ptr(const tvm::ffi::TensorView& t) {
   return static_cast<const char*>(t.data_ptr()) + t.byte_offset();
 }
 
-inline char* mutable_data_ptr(const ffi::TensorView& t) {
+inline char* mutable_data_ptr(const tvm::ffi::TensorView& t) {
   return static_cast<char*>(t.data_ptr()) + t.byte_offset();
 }
 
-__device__ inline float compute_rstd(
-    const __nv_bfloat16* __restrict__ xrow,
+SGL_DEVICE float compute_rstd(
+    const bf16_t* __restrict__ xrow,
     int64_t hidden_size,
     float eps,
     int tid,
@@ -71,11 +71,11 @@ __device__ inline float compute_rstd(
   return *s_rstd;
 }
 
-__device__ inline float norm_value(float x, float weight, float rstd) {
+SGL_DEVICE float norm_value(float x, float weight, float rstd) {
   return weight * (rstd * x);
 }
 
-__device__ inline void rope_pair(float x0, float x1, float cos, float sin, float& y0, float& y1) {
+SGL_DEVICE void rope_pair(float x0, float x1, float cos, float sin, float& y0, float& y1) {
   const float p0 = x0 * cos;
   const float p1 = x1 * cos;
   y0 = fmaf(-sin, x1, p0);
@@ -83,11 +83,11 @@ __device__ inline void rope_pair(float x0, float x1, float cos, float sin, float
 }
 
 __global__ void ltx2_qknorm_split_rope_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const __nv_bfloat16* __restrict__ cos,
-    const __nv_bfloat16* __restrict__ sin,
-    const __nv_bfloat16* __restrict__ weight,
-    __nv_bfloat16* __restrict__ out,
+    const bf16_t* __restrict__ x,
+    const bf16_t* __restrict__ cos,
+    const bf16_t* __restrict__ sin,
+    const bf16_t* __restrict__ weight,
+    bf16_t* __restrict__ out,
     float eps,
     int64_t seq_len,
     int64_t num_heads,
@@ -133,11 +133,11 @@ __global__ void ltx2_qknorm_split_rope_kernel(
 }
 
 inline void launch_one(
-    const ffi::TensorView& x,
-    const ffi::TensorView& cos,
-    const ffi::TensorView& sin,
-    const ffi::TensorView& weight,
-    const ffi::TensorView& out,
+    const tvm::ffi::TensorView& x,
+    const tvm::ffi::TensorView& cos,
+    const tvm::ffi::TensorView& sin,
+    const tvm::ffi::TensorView& weight,
+    const tvm::ffi::TensorView& out,
     float eps,
     int64_t num_rows,
     int64_t seq_len,
@@ -149,13 +149,18 @@ inline void launch_one(
     int64_t stride_sin_b,
     int64_t stride_sin_h,
     int64_t stride_sin_t,
-    cudaStream_t stream) {
-  ltx2_qknorm_split_rope_kernel<<<dim3(static_cast<unsigned>(num_rows)), dim3(32, 4), 0, stream>>>(
-      reinterpret_cast<const __nv_bfloat16*>(data_ptr(x)),
-      reinterpret_cast<const __nv_bfloat16*>(data_ptr(cos)),
-      reinterpret_cast<const __nv_bfloat16*>(data_ptr(sin)),
-      reinterpret_cast<const __nv_bfloat16*>(data_ptr(weight)),
-      reinterpret_cast<__nv_bfloat16*>(mutable_data_ptr(out)),
+    DLDevice device) {
+  if (num_rows == 0) {
+    return;
+  }
+  host::RuntimeCheck(num_rows <= static_cast<int64_t>(UINT32_MAX), "LTX2 QKNorm split-RoPE grid is too large");
+  host::LaunchKernel(dim3(static_cast<uint32_t>(num_rows)), dim3(32, 4), device)(
+      ltx2_qknorm_split_rope_kernel,
+      reinterpret_cast<const bf16_t*>(data_ptr(x)),
+      reinterpret_cast<const bf16_t*>(data_ptr(cos)),
+      reinterpret_cast<const bf16_t*>(data_ptr(sin)),
+      reinterpret_cast<const bf16_t*>(data_ptr(weight)),
+      reinterpret_cast<bf16_t*>(mutable_data_ptr(out)),
       eps,
       seq_len,
       num_heads,
@@ -170,74 +175,103 @@ inline void launch_one(
 
 }  // namespace
 
-void ltx2_qknorm_split_rope_pair(
-    ffi::TensorView q,
-    ffi::TensorView q_cos,
-    ffi::TensorView q_sin,
-    ffi::TensorView q_weight,
-    ffi::TensorView q_out,
-    ffi::TensorView k,
-    ffi::TensorView k_cos,
-    ffi::TensorView k_sin,
-    ffi::TensorView k_weight,
-    ffi::TensorView k_out,
-    double eps,
-    int64_t q_num_rows,
-    int64_t q_seq_len,
-    int64_t k_num_rows,
-    int64_t k_seq_len,
-    int64_t num_heads,
-    int64_t head_dim,
-    int64_t q_stride_cos_b,
-    int64_t q_stride_cos_h,
-    int64_t q_stride_cos_t,
-    int64_t q_stride_sin_b,
-    int64_t q_stride_sin_h,
-    int64_t q_stride_sin_t,
-    int64_t k_stride_cos_b,
-    int64_t k_stride_cos_h,
-    int64_t k_stride_cos_t,
-    int64_t k_stride_sin_b,
-    int64_t k_stride_sin_h,
-    int64_t k_stride_sin_t,
-    int64_t stream_ptr) {
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-  launch_one(
-      q,
-      q_cos,
-      q_sin,
-      q_weight,
-      q_out,
-      static_cast<float>(eps),
-      q_num_rows,
-      q_seq_len,
-      num_heads,
-      head_dim,
-      q_stride_cos_b,
-      q_stride_cos_h,
-      q_stride_cos_t,
-      q_stride_sin_b,
-      q_stride_sin_h,
-      q_stride_sin_t,
-      stream);
-  launch_one(
-      k,
-      k_cos,
-      k_sin,
-      k_weight,
-      k_out,
-      static_cast<float>(eps),
-      k_num_rows,
-      k_seq_len,
-      num_heads,
-      head_dim,
-      k_stride_cos_b,
-      k_stride_cos_h,
-      k_stride_cos_t,
-      k_stride_sin_b,
-      k_stride_sin_h,
-      k_stride_sin_t,
-      stream);
-}
+struct LTX2QKNormSplitRopeKernel {
+  static void
+  run(tvm::ffi::TensorView q_out,
+      tvm::ffi::TensorView k_out,
+      tvm::ffi::TensorView q,
+      tvm::ffi::TensorView q_cos,
+      tvm::ffi::TensorView q_sin,
+      tvm::ffi::TensorView q_weight,
+      tvm::ffi::TensorView k,
+      tvm::ffi::TensorView k_cos,
+      tvm::ffi::TensorView k_sin,
+      tvm::ffi::TensorView k_weight,
+      double eps,
+      int64_t num_heads,
+      int64_t head_dim) {
+    using namespace host;
+
+    RuntimeCheck(num_heads > 0, "num_heads must be positive");
+    RuntimeCheck(head_dim > 0, "head_dim must be positive");
+    RuntimeCheck(head_dim % 2 == 0, "head_dim must be even");
+    const int64_t hidden_size = num_heads * head_dim;
+    RuntimeCheck(hidden_size % 4 == 0, "hidden size must be divisible by 4");
+
+    auto batch = SymbolicSize{"batch"};
+    auto q_seq_len = SymbolicSize{"q_seq_len"};
+    auto k_seq_len = SymbolicSize{"k_seq_len"};
+    auto heads = SymbolicSize{"num_heads"};
+    auto half_dim = SymbolicSize{"half_dim"};
+    auto device = SymbolicDevice{};
+    heads.set_value(num_heads);
+    half_dim.set_value(head_dim / 2);
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({batch, q_seq_len, hidden_size}).with_dtype<bf16_t>().with_device(device).verify(q).verify(q_out);
+    TensorMatcher({batch, k_seq_len, hidden_size}).with_dtype<bf16_t>().with_device(device).verify(k).verify(k_out);
+    TensorMatcher({hidden_size}).with_dtype<bf16_t>().with_device(device).verify(q_weight);
+    TensorMatcher({hidden_size}).with_dtype<bf16_t>().with_device(device).verify(k_weight);
+    TensorMatcher({batch, heads, q_seq_len, half_dim})
+        .with_strides({-1, -1, -1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(q_cos);
+    TensorMatcher({batch, heads, q_seq_len, half_dim})
+        .with_strides({-1, -1, -1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(q_sin);
+    TensorMatcher({batch, heads, k_seq_len, half_dim})
+        .with_strides({-1, -1, -1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(k_cos);
+    TensorMatcher({batch, heads, k_seq_len, half_dim})
+        .with_strides({-1, -1, -1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(k_sin);
+
+    const int64_t batch_size = batch.unwrap();
+    const DLDevice dl_device = device.unwrap();
+    launch_one(
+        q,
+        q_cos,
+        q_sin,
+        q_weight,
+        q_out,
+        static_cast<float>(eps),
+        batch_size * q_seq_len.unwrap(),
+        q_seq_len.unwrap(),
+        num_heads,
+        head_dim,
+        q_cos.stride(0),
+        q_cos.stride(1),
+        q_cos.stride(2),
+        q_sin.stride(0),
+        q_sin.stride(1),
+        q_sin.stride(2),
+        dl_device);
+    launch_one(
+        k,
+        k_cos,
+        k_sin,
+        k_weight,
+        k_out,
+        static_cast<float>(eps),
+        batch_size * k_seq_len.unwrap(),
+        k_seq_len.unwrap(),
+        num_heads,
+        head_dim,
+        k_cos.stride(0),
+        k_cos.stride(1),
+        k_cos.stride(2),
+        k_sin.stride(0),
+        k_sin.stride(1),
+        k_sin.stride(2),
+        dl_device);
+  }
+};
 
 }  // namespace sglang_ltx2_qknorm_split_rope

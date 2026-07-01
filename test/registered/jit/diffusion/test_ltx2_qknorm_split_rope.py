@@ -16,7 +16,7 @@ def _require_cuda_b200() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("LTX2 QKNorm split-RoPE bitwise path is validated on B200")
+        pytest.skip("LTX2 QKNorm split-RoPE CUDA path is validated on B200")
 
 
 @pytest.fixture(autouse=True)
@@ -94,7 +94,7 @@ def _reference(
         (2, 4, 3, 32, 64),
     ],
 )
-def test_ltx2_qknorm_split_rope_matches_torch_bitwise(
+def test_ltx2_qknorm_split_rope_matches_torch_exactly(
     batch: int, q_seq: int, k_seq: int, num_heads: int, head_dim: int
 ) -> None:
     hidden = num_heads * head_dim

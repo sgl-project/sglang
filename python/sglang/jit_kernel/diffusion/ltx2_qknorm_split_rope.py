@@ -19,7 +19,7 @@ def _jit_ltx2_qknorm_split_rope_module() -> Module:
         cuda_wrappers=[
             (
                 "ltx2_qknorm_split_rope_pair",
-                "sglang_ltx2_qknorm_split_rope::ltx2_qknorm_split_rope_pair",
+                "sglang_ltx2_qknorm_split_rope::LTX2QKNormSplitRopeKernel::run",
             )
         ],
     )
@@ -64,38 +64,20 @@ def _ltx2_qknorm_split_rope_custom_op(
     q_out = torch.empty_like(q, dtype=torch.bfloat16)
     k_out = torch.empty_like(k, dtype=torch.bfloat16)
     module = _jit_ltx2_qknorm_split_rope_module()
-    stream = torch.cuda.current_stream().cuda_stream
     module.ltx2_qknorm_split_rope_pair(
+        q_out,
+        k_out,
         q,
         q_cos,
         q_sin,
         q_weight,
-        q_out,
         k,
         k_cos,
         k_sin,
         k_weight,
-        k_out,
         float(eps),
-        q.shape[0] * q.shape[1],
-        q.shape[1],
-        k.shape[0] * k.shape[1],
-        k.shape[1],
-        num_heads,
-        head_dim,
-        q_cos.stride(0),
-        q_cos.stride(1),
-        q_cos.stride(2),
-        q_sin.stride(0),
-        q_sin.stride(1),
-        q_sin.stride(2),
-        k_cos.stride(0),
-        k_cos.stride(1),
-        k_cos.stride(2),
-        k_sin.stride(0),
-        k_sin.stride(1),
-        k_sin.stride(2),
-        int(stream),
+        int(num_heads),
+        int(head_dim),
     )
     return q_out, k_out
 
