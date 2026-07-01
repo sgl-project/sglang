@@ -1336,5 +1336,35 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         self.assertEqual(parsed.sampling_backend, "token_oracle")
 
 
+class TestMultiTokenizerApiKeyRejected(CustomTestCase):
+    """Multi-tokenizer mode cannot enforce API-key auth (the auth middleware
+    is only installed in single-tokenizer mode), so `check_server_args` must
+    reject a configured `api_key` / `admin_api_key` rather than silently
+    serving management routes without credentials.
+    """
+
+    def test_admin_api_key_rejected_with_multiple_tokenizer_workers(self):
+        args = ServerArgs(
+            model_path="dummy", tokenizer_worker_num=2, admin_api_key="admin"
+        )
+        with self.assertRaisesRegex(AssertionError, "multi-tokenizer mode"):
+            args.check_server_args()
+
+    def test_api_key_rejected_with_multiple_tokenizer_workers(self):
+        args = ServerArgs(model_path="dummy", tokenizer_worker_num=2, api_key="user")
+        with self.assertRaisesRegex(AssertionError, "multi-tokenizer mode"):
+            args.check_server_args()
+
+    def test_keys_allowed_with_single_tokenizer_worker(self):
+        # tokenizer_worker_num == 1 is the supported path for API-key auth.
+        args = ServerArgs(
+            model_path="dummy",
+            tokenizer_worker_num=1,
+            api_key="user",
+            admin_api_key="admin",
+        )
+        args.check_server_args()  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()
