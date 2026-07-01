@@ -16,6 +16,7 @@ from sglang.srt.distributed.device_communicators.vmm_utils import (
     VmmGraphInputManager,
     is_vmm_pointer,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -62,6 +63,7 @@ class CustomAllReduceV2:
         self.max_size = max(max_pull_size, max_push_size)
         self.override_shot(None)  # set default config based on world size
         self.override_algo: Optional[AllReduceAlgo] = None
+        self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         self.obj = get_custom_all_reduce_cls()(
             rank=self.rank,
             world_size=self.world_size,
@@ -102,7 +104,7 @@ class CustomAllReduceV2:
             yield
             return
         try:
-            self.obj.set_cuda_graph_capture(True)
+            self.obj.set_cuda_graph_capture(not self.tms_cudagraph)
             yield
         finally:
             self.obj.set_cuda_graph_capture(False)
@@ -147,7 +149,7 @@ class CustomAllReduceV2:
                 self.obj.set_cuda_graph_capture(False)
                 return self._all_reduce(input)
             finally:
-                self.obj.set_cuda_graph_capture(True)
+                self.obj.set_cuda_graph_capture(not self.tms_cudagraph)
         return self._all_reduce(input)
 
     def close(self):
