@@ -9,11 +9,10 @@
 // excluded). B300 / GB300
 // rows are the earlier 2026-06-11 tp4 MSA numbers (pre-piecewise),
 // pending a #27944 re-measure on their own boxes. GB200 is a bare-match
-// stub (inferred-supported, not benchmarked). AMD: MI355X at 8-GPU tp8 (native
-// MXFP8) carries a bench_serving speed row; MI300X (MXFP8 -> block-fp8) was
-// accuracy-only. MI350X / MI325X inherit their same-arch sibling's recipe
-// (stubs). (sgl-eval does NOT measure serving throughput — TTFT/TPOT/tok-s come
-// from sglang.bench_serving.)
+// stub (inferred-supported, not benchmarked). AMD: MI350X / MI355X (native
+// MXFP8) and MI300X (MXFP8 -> block-fp8) carry bench_serving speed rows.
+// (sgl-eval does NOT measure serving throughput — TTFT/TPOT/tok-s come from
+// sglang.bench_serving.)
 //
 // GSM8K / GPQA — unified on a SINGLE harness: sgl-eval (github.com/sgl-project/sgl-eval)
 // `run gsm8k` (full 1319) / `run gpqa` (GPQA Diamond 198, n-repeats 4), chat
@@ -77,26 +76,58 @@ export const benchmarks = [
     ],
     accuracy: { gsm8k_pct: null }, // TODO: pending sgl-eval re-measure on GB300 (legacy few_shot 200: 87.5)
   },
-  // MI355X (gfx950): native MXFP8. Speed: bench_serving 1024/1024 @ conc 64, tp8
-  // -> 1678 output tok/s (3355 total incl. input); 1678 / 8 = ~210 tokens/sec/GPU.
-  // No TTFT/TPOT reported for this run.
+  // MI355X (gfx950): native MXFP8. Measured on 8xMI355X with the public
+  // MiniMaxAI/MiniMax-M3-MXFP8 model id and
+  // aigmkt/minimax-m3-sglang-rocm720-mi35x:latest. Speed uses the config's
+  // Reproduce command with fixed random-range-ratio=1.0:
+  // 2016.75 output tok/s (4033.50 total incl. input); 2016.75 / 8 = 252.09
+  // tokens/sec/GPU. GSM8K uses sgl-eval with the config's Reproduce command.
   {
     match: { hw: "mi355x", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
     sglang_version: "PR #27944",
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 64, num_prompts: 640 },
-        ttft_ms: null, tpot_ms: null, tokens_per_sec_per_gpu: 210 },
+        ttft_ms: 1616.84, tpot_ms: 30.17, tokens_per_sec_per_gpu: 252.09 },
     ],
-    accuracy: { gsm8k_pct: null }, // TODO: pending sgl-eval re-measure on MI355X (legacy run_eval 1319: 92.2)
+    accuracy: { gsm8k_pct: 97.2 }, // sgl-eval: 97.19%, 1319 examples, stop_rate=100%, truncated_rate=0%.
   },
-  // MI350X (gfx950): inferred-supported from MI355X, not separately benchmarked.
-  { match: { hw: "mi350x", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" } },
-  // MI300X (gfx942): MXFP8 -> block-fp8 [128,128].
+  // MI350X (gfx950): native MXFP8. Measured on 8xMI350X with the public
+  // MiniMaxAI/MiniMax-M3-MXFP8 model id and
+  // aigmkt/minimax-m3-sglang-rocm720-mi35x:latest. Speed uses the config's
+  // Reproduce command with fixed random-range-ratio=1.0:
+  // 2012.54 output tok/s (4025.09 total incl. input); 2012.54 / 8 = 251.57
+  // tokens/sec/GPU. GSM8K uses sgl-eval.
+  {
+    match: { hw: "mi350x", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
+    sglang_version: "PR #27944",
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 64, num_prompts: 640 },
+        ttft_ms: 902.30, tpot_ms: 30.94, tokens_per_sec_per_gpu: 251.57 },
+    ],
+    accuracy: { gsm8k_pct: 97.0 }, // sgl-eval: 97.04%, 1319 examples, stop_rate=100%, truncated_rate=0%.
+  },
+  // MI300X (gfx942): MXFP8 -> block-fp8 [128,128]. Fresh run on 8xMI300X with
+  // aigmkt/minimax-m3-sglang-rocm700-mi30x:latest: bench_serving 1024/1024
+  // @ conc 64, tp8 -> 1431.04 output tok/s (2862.08 total incl. input);
+  // 1431.04 / 8 = 178.88 tokens/sec/GPU. GSM8K uses sgl-eval with the
+  // config's Reproduce command.
   {
     match: { hw: "mi300x", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
     sglang_version: "PR #27944",
-    accuracy: { gsm8k_pct: null }, // TODO: pending sgl-eval re-measure on MI300X (legacy run_eval 1319: 92.0, triton 0.917-0.929 / aiter ~0.929)
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 64, num_prompts: 640 },
+        ttft_ms: 2714.17, tpot_ms: 42.08, tokens_per_sec_per_gpu: 178.88 },
+    ],
+    accuracy: { gsm8k_pct: 97.0 }, // sgl-eval: 97.04%, 1319 examples, stop_rate=100%, truncated_rate=0%.
   },
-  // MI325X (gfx942): inferred-supported from MI300X, not separately benchmarked.
-  { match: { hw: "mi325x", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" } },
+  // MI325X (gfx942): same-arch sibling of MI300X; use the MI300X measured row.
+  {
+    match: { hw: "mi325x", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
+    sglang_version: "PR #27944",
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 64, num_prompts: 640 },
+        ttft_ms: 2714.17, tpot_ms: 42.08, tokens_per_sec_per_gpu: 178.88 },
+    ],
+    accuracy: { gsm8k_pct: 97.0 }, // Same values as the MI300X row.
+  },
 ];
