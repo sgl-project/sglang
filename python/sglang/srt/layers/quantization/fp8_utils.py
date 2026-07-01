@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers import deep_gemm_wrapper, tilelang_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     sglang_per_token_group_quant_fp8_row_padded,
@@ -206,6 +206,7 @@ class Fp8GemmRunnerBackend(Enum):
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
     AITER = "aiter"
+    TILELANG = "tilelang"
 
     def is_auto(self) -> bool:
         return self == Fp8GemmRunnerBackend.AUTO
@@ -230,6 +231,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_aiter(self) -> bool:
         return self == Fp8GemmRunnerBackend.AITER
+
+    def is_tilelang(self) -> bool:
+        return self == Fp8GemmRunnerBackend.TILELANG
 
 
 FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
@@ -474,6 +478,10 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 
     elif backend.is_triton():
         return triton_w8a8_block_fp8_linear
+
+    elif backend.is_tilelang():
+        tilelang_gemm_wrapper.assert_available()
+        return tilelang_w8a8_block_fp8_linear
 
     else:
         raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
@@ -751,6 +759,85 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
+
+
+def tilelang_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """TileLang FP8 blockwise linear.
+
+    This path is explicitly fail-fast. If callers select
+    `--fp8-gemm-backend tilelang`, unsupported inputs should be fixed by the
+    caller or handled before dispatching here.
+    """
+
+    if input_scale is not None:
+        raise RuntimeError("TileLang FP8 GEMM only supports dynamic activation scales.")
+
+    if block_size != [128, 128]:
+        raise RuntimeError(
+            f"TileLang FP8 GEMM only supports block_size=[128, 128], got {block_size}."
+        )
+
+    if input.dtype != torch.bfloat16:
+        raise RuntimeError(
+            f"TileLang FP8 GEMM only supports bfloat16 input, got {input.dtype}."
+        )
+
+    if weight.dtype != torch.float8_e4m3fn:
+        raise RuntimeError(
+            f"TileLang FP8 GEMM only supports float8_e4m3fn weights, got {weight.dtype}."
+        )
+
+    if weight_scale.dtype != torch.float32:
+        raise RuntimeError(
+            "TileLang FP8 GEMM requires FP32 block scales with layout "
+            "(ceil(N / 128), ceil(K / 128)); "
+            f"got dtype={weight_scale.dtype}."
+        )
+
+    input_2d = input.view(-1, input.shape[-1])
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+    M, K = input_2d.shape
+    N, weight_k = weight.shape
+
+    if K != weight_k:
+        raise RuntimeError(
+            f"TileLang FP8 GEMM got mismatched K dimensions: input K={K}, weight K={weight_k}."
+        )
+    if K % 128 != 0 or N % 128 != 0:
+        raise RuntimeError(
+            f"TileLang FP8 GEMM requires N and K to be multiples of 128; got N={N}, K={K}."
+        )
+
+    expected_scale_shape = (ceil_div(N, 128), ceil_div(K, 128))
+    if tuple(weight_scale.shape) != expected_scale_shape:
+        raise RuntimeError(
+            "TileLang FP8 GEMM requires weight_scale shape "
+            f"{expected_scale_shape}, got {tuple(weight_scale.shape)}."
+        )
+
+    if M == 0:
+        return input.new_empty(output_shape)
+
+    tilelang_gemm_wrapper.assert_available()
+
+    q_input, x_scale = per_token_group_quant_fp8(
+        input_2d, block_size[1], column_major_scales=False
+    )
+    output = torch.empty((M, N), dtype=torch.bfloat16, device=input.device)
+    tilelang_gemm_wrapper.gemm_nt_f8f8bf16(
+        (q_input, x_scale), (weight, weight_scale), output
+    )
+
+    if bias is not None:
+        output += bias
+    return output.view(*output_shape)
 
 
 def _unpack_ue8m0_scale_for_triton(
