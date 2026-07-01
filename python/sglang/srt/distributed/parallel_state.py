@@ -387,6 +387,7 @@ class GroupCoordinator:
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
+                is_symmetric_memory_enabled=self.is_symmetric_memory_enabled(),
             )
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
