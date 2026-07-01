@@ -1336,5 +1336,55 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         self.assertEqual(parsed.sampling_backend, "token_oracle")
 
 
+class TestAscendPageSizeAlignment(CustomTestCase):
+    """Ascend FIA attention backend requires page_size aligned to 16.
+
+    check_server_args() should raise ValueError when device=npu,
+    attention_backend=ascend, and page_size is not divisible by 16.
+    """
+
+    def _make_args(self, device="npu", attention_backend="ascend", page_size=1):
+        args = ServerArgs(model_path="dummy")
+        args.device = device
+        args.attention_backend = attention_backend
+        args.page_size = page_size
+        return args
+
+    def test_page_size_1_raises(self):
+        args = self._make_args(page_size=1)
+        with self.assertRaisesRegex(ValueError, "aligned to 16"):
+            args.check_server_args()
+
+    def test_page_size_8_raises(self):
+        args = self._make_args(page_size=8)
+        with self.assertRaisesRegex(ValueError, "aligned to 16"):
+            args.check_server_args()
+
+    def test_page_size_15_raises(self):
+        args = self._make_args(page_size=15)
+        with self.assertRaisesRegex(ValueError, "aligned to 16"):
+            args.check_server_args()
+
+    def test_page_size_16_passes(self):
+        args = self._make_args(page_size=16)
+        args.check_server_args()
+
+    def test_page_size_128_passes(self):
+        args = self._make_args(page_size=128)
+        args.check_server_args()
+
+    def test_page_size_256_passes(self):
+        args = self._make_args(page_size=256)
+        args.check_server_args()
+
+    def test_non_npu_device_skips_validation(self):
+        args = self._make_args(device="cuda", page_size=1)
+        args.check_server_args()
+
+    def test_non_ascend_backend_skips_validation(self):
+        args = self._make_args(attention_backend="flashinfer", page_size=1)
+        args.check_server_args()
+
+
 if __name__ == "__main__":
     unittest.main()
