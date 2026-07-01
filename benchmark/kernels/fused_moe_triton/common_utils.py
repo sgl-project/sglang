@@ -56,8 +56,12 @@ def get_model_config(
         first_group = next(iter(config_groups.values()), {})
         weights_config = first_group.get("weights", {})
         group_size = weights_config.get("group_size")
-        block_shape = [0, group_size]
-        assert len(block_shape) == 2
+        # group_size is None for per-tensor / per-channel compressed-tensors
+        # checkpoints (e.g. *-FP8-Dynamic); only group quantization implies a
+        # block shape.
+        if group_size is not None:
+            block_shape = [0, group_size]
+            assert len(block_shape) == 2
     # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
     if hasattr(config, "text_config"):
         text_config = config.get_text_config()
