@@ -42,6 +42,9 @@ from sglang.srt.layers.attention.dsv4.metadata_kernel import (
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
+from sglang.srt.layers.attention.dsv4.sparse_prefill_gate import (
+    can_use_sparse_prefill,
+)
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
 )
@@ -61,6 +64,11 @@ if TYPE_CHECKING:
 _is_sm120 = is_sm120_supported()
 
 logger = logging.getLogger(__name__)
+
+# Warn-once diagnostics for the sparse-prefill CP gate (per compress_ratio for
+# the enabled path; once for the skip path).
+_SPARSE_PREFILL_ENABLED_LOGGED_RATIOS: set[int] = set()
+_SPARSE_PREFILL_SKIPPED_LOGGED = False
 
 SWA_WINDOW = 128
 C4_TOPK = 512
@@ -1389,10 +1397,62 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            if forward_batch.forward_mode.is_extend_without_speculative() and (
-                q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
-            ):
+            sparse_prefill_requested = (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                and (
+                    q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
+                    or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+                )
+            )
+            use_sparse_prefill = sparse_prefill_requested
+            if use_sparse_prefill:
+                from sglang.srt.layers.attention.dsa.utils import (
+                    is_dsa_prefill_cp_round_robin_split,
+                )
+
+                # Under DSA round-robin CP each rank holds a strided 1/cp_size
+                # subset of the chunk's tokens. The sparse path is only correct
+                # when the chunk is a single request whose local row count
+                # matches the reindexed positions; otherwise fall back to the
+                # (already CP-correct) dense flash_mla path.
+                is_cp_round_robin = is_dsa_prefill_cp_round_robin_split()
+                use_sparse_prefill = can_use_sparse_prefill(
+                    q_num_rows=q.shape[0],
+                    batch_size=forward_batch.batch_size,
+                    extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                    is_cp_round_robin=is_cp_round_robin,
+                    cp_num_rows=(
+                        core_attn_metadata.positions_casual.shape[0]
+                        if is_cp_round_robin
+                        else None
+                    ),
+                    cp_size=get_attention_cp_size() if is_cp_round_robin else 1,
+                )
+                global _SPARSE_PREFILL_SKIPPED_LOGGED
+                max_extend_seq_len = max(forward_batch.extend_seq_lens_cpu or [0])
+                if (
+                    not use_sparse_prefill
+                    and max_extend_seq_len > SWA_WINDOW
+                    and not _SPARSE_PREFILL_SKIPPED_LOGGED
+                ):
+                    logger.warning(
+                        "DSV4 sparse prefill requested but skipped (dense "
+                        "fallback): q_rows=%s batch_size=%s "
+                        "extend_seq_lens_cpu=%s is_cp_round_robin=%s "
+                        "cp_num_rows=%s",
+                        q.shape[0],
+                        forward_batch.batch_size,
+                        forward_batch.extend_seq_lens_cpu,
+                        is_cp_round_robin,
+                        (
+                            core_attn_metadata.positions_casual.shape[0]
+                            if is_cp_round_robin
+                            else None
+                        ),
+                    )
+                    _SPARSE_PREFILL_SKIPPED_LOGGED = True
+
+            if use_sparse_prefill:
                 return self._forward_prefill_sparse(
                     q=q,
                     layer_id=layer_id,
@@ -1468,19 +1528,57 @@ class DeepseekV4AttnBackend(
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
 
+        global _SPARSE_PREFILL_ENABLED_LOGGED_RATIOS
+        if compress_ratio not in _SPARSE_PREFILL_ENABLED_LOGGED_RATIOS:
+            logger.warning(
+                "DSV4 sparse prefill enabled: q_rows=%s compress_ratio=%s "
+                "cp_rank=%s cp_size=%s positions=%s",
+                q_flat.shape[0],
+                compress_ratio,
+                get_attention_cp_rank(),
+                get_attention_cp_size(),
+                core_attn_metadata.positions_casual.shape[0],
+            )
+            _SPARSE_PREFILL_ENABLED_LOGGED_RATIOS.add(compress_ratio)
+
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
             # ``swa_window_size`` on the pool is its storage page size, not
             # the model's SWA window — pass both explicitly.
+            seq_lens = forward_batch.seq_lens.to(torch.int32)
+            extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
+            req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
+
+            # Under DSA round-robin CP this rank holds a strided subset of the
+            # (single, gate-guaranteed) request's tokens. The chunk cache must
+            # build query_start_loc from the local row count and use the
+            # reindexed causal positions for the SWA-window math, not the
+            # implicit contiguous-prefix assumption that holds without CP.
+            local_extend_seq_lens = None
+            positions = None
+            from sglang.srt.layers.attention.dsa.utils import (
+                is_dsa_prefill_cp_round_robin_split,
+            )
+
+            if is_dsa_prefill_cp_round_robin_split():
+                assert seq_lens.numel() == 1
+                assert (
+                    core_attn_metadata.positions_casual.shape[0] == q_flat.shape[0]
+                )
+                local_extend_seq_lens = seq_lens.new_tensor([q_flat.shape[0]])
+                positions = core_attn_metadata.positions_casual.to(torch.int32)
+
             cache = SparsePrefillChunkCache.build(
-                seq_lens=forward_batch.seq_lens.to(torch.int32),
-                extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
-                req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
+                seq_lens=seq_lens,
+                extend_seq_lens=extend_seq_lens,
+                req_pool_indices=req_pool_indices,
                 req_to_token=self.req_to_token,
                 full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
                 swa_window_size=SWA_WINDOW,
                 swa_page_size=token_to_kv_pool.swa_window_size,
                 num_qo_tokens=q_flat.shape[0],
+                local_extend_seq_lens=local_extend_seq_lens,
+                positions=positions,
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
