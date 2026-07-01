@@ -51,6 +51,7 @@ from sglang.multimodal_gen.test.test_utils import (
     extract_key_frames_from_video,
     get_consistency_gt_candidates,
     get_consistency_gt_remote_files,
+    get_consistency_threshold_path,
     get_consistency_thresholds,
     get_dynamic_server_port,
     gt_exists,
@@ -623,10 +624,10 @@ Add the expected file(s) to sgl-project/ci-data in diffusion-ci/consistency_gt/s
 
 For this case, expected file(s): {names}
 
-Repository: https://github.com/sgl-project/ci-data (path: diffusion-ci/consistency_gt/sglang_generated/)
+Repository: https://github.com/sgl-project/ci-data (path: diffusion-ci/consistency_gt/sglang_generated/, with optional platform subdirectories such as 5090/)
 Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
-(Optional) Per-case override in consistency_threshold.json:
+(Optional) Per-case override in {get_consistency_threshold_path()}:
   "cases": {{
     "{case.id}": {{
       "clip_threshold": 0.92,
