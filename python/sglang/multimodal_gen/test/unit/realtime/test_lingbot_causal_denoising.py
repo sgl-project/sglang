@@ -244,6 +244,8 @@ def test_lingbot_interactive_kv_window_samples_base_moving_and_still():
     previous = stage._set_lingbot_kv_sample_tokens(cache_state, batch, server_args)
     assert previous is None
     assert batch.realtime_causal_kv_sample_tokens == 60
+    policy = stage._build_realtime_causal_cache_policy(batch, server_args)
+    assert policy.expected_cache_tokens == 240
 
     batch.condition_inputs = {"camera_actions": [["w"], [], []]}
     cache_state.chunk_idx = 0

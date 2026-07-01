@@ -105,11 +105,20 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> bool:
-        pipeline_config = server_args.pipeline_config
-        if not bool(getattr(pipeline_config, "interactive_kv_window_enable", False)):
+        if not self._interactive_kv_window_enabled(server_args):
             return False
         condition_inputs = getattr(batch, "condition_inputs", None) or {}
         return "camera_actions" in condition_inputs
+
+    @staticmethod
+    def _interactive_kv_window_enabled(server_args: ServerArgs) -> bool:
+        return bool(
+            getattr(
+                server_args.pipeline_config,
+                "interactive_kv_window_enable",
+                False,
+            )
+        )
 
     def _effective_interactive_kv_cache_num_frames(
         self,
@@ -139,7 +148,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         server_args: ServerArgs,
     ) -> CausalDMDCachePolicy:
         policy = super()._build_realtime_causal_cache_policy(batch, server_args)
-        if self._uses_interactive_kv_window(batch, server_args):
+        if self._interactive_kv_window_enabled(server_args):
             policy.expected_cache_tokens = (
                 self._effective_interactive_kv_cache_num_frames(server_args)
                 * self.num_token_per_frame
@@ -161,7 +170,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         server_args: ServerArgs,
     ) -> int | None:
         pipeline_config = server_args.pipeline_config
-        if not bool(getattr(pipeline_config, "interactive_kv_window_enable", False)):
+        if not self._interactive_kv_window_enabled(server_args):
             return None
         if not self._uses_interactive_kv_window(batch, server_args):
             return self._base_kv_sample_num_frames()
