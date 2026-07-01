@@ -751,12 +751,16 @@ class GenerateReqInput:
             decode_tp_size=(
                 self.decode_tp_size[i] if self.decode_tp_size is not None else None
             ),
+            # Keep this slice path aligned with request-scoped fields tracked in
+            # PR #22043 review: https://github.com/sgl-project/sglang/pull/22043#discussion_r3104450483
+            require_reasoning=self.require_reasoning,
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
+            routing_key=self.routing_key,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
