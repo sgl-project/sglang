@@ -298,6 +298,24 @@ def test_lingbot_interactive_kv_window_allocates_expected_cache_size():
     assert cache.attention_window_size == 240
 
 
+def test_lingbot_request_runtime_cache_clears_camera_entries_only():
+    cache_state = SimpleNamespace(
+        runtime_cache={
+            "lingbot_c2ws_plucker_emb": {"stale": object()},
+            "lingbot_cam_conditioner": {"stale": object()},
+            "lingbot_rope": {"keep": object()},
+        }
+    )
+
+    LingBotWorldCausalDMDDenoisingStage._clear_lingbot_request_runtime_cache(
+        cache_state
+    )
+
+    assert "lingbot_c2ws_plucker_emb" not in cache_state.runtime_cache
+    assert "lingbot_cam_conditioner" not in cache_state.runtime_cache
+    assert "lingbot_rope" in cache_state.runtime_cache
+
+
 def test_lingbot_i2v_model_input_writer_reuses_buffer():
     latents = torch.ones(1, 16, 3, 2, 2)
     condition = torch.full((1, 20, 3, 2, 2), 2.0)
