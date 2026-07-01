@@ -1,0 +1,7 @@
+# LMCache config for XPU unit tests
+# save_unfull_chunk enables storing sequences shorter than chunk_size
+chunk_size: 256
+local_cpu: true
+use_layerwise: true
+max_local_cpu_size: 1
+save_unfull_chunk: true
