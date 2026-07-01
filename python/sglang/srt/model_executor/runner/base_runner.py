@@ -15,13 +15,9 @@
 
 from __future__ import annotations
 
-import contextlib
-import datetime
-import hashlib
 import inspect
 import logging
 from abc import ABC, abstractmethod
-from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
@@ -44,6 +40,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    run_flashinfer_autotune_forward,
+    should_run_flashinfer_autotune,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
 from sglang.srt.utils import (
@@ -214,7 +214,7 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
 
-        if self._should_run_flashinfer_autotune():
+        if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
             assert (
                 buffers is not None
@@ -251,99 +251,6 @@ class BaseRunner(ABC):
             dtype=mr.dtype,
         )
 
-    def _should_run_flashinfer_autotune(
-        self, *, for_speculative_draft: bool = False
-    ) -> bool:
-        """Return whether this runner should run FlashInfer autotune.
-
-        In speculative mode, the default call is for target-worker warmup and
-        returns True only for target workers. Draft graph-capture paths pass
-        for_speculative_draft=True, which returns True only for draft workers.
-        """
-        mr = self.model_runner
-        if str(mr.device).split(":")[0] != "cuda":
-            return False
-        if mr.server_args.disable_flashinfer_autotune:
-            return False
-
-        # CuteDSL v1 (cutedsl runner + deepep a2a) bypasses MoeRunner and must not
-        # be autotuned -- its _dummy_run would dispatch more tokens per rank than
-        # SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK, tripping a DeepEP assert.
-        # Read server_args directly to avoid depending on initialize_moe_config()
-        # having already populated the MoE backend globals.
-        if (
-            mr.server_args.moe_runner_backend == "flashinfer_cutedsl"
-            and mr.server_args.moe_a2a_backend == "deepep"
-        ):
-            return False
-
-        backend_str = mr.server_args.moe_runner_backend
-
-        # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
-
-        moe_needs_autotune = backend_str in [
-            "flashinfer_trtllm",
-            "flashinfer_trtllm_routed",
-            "flashinfer_mxfp4",
-            "flashinfer_cutedsl",
-            "flashinfer_cutlass",
-        ]
-
-        from sglang.srt.layers.quantization.fp4_utils import (
-            get_fp4_gemm_runner_backend,
-        )
-
-        if hasattr(mr.model_config, "quantization"):
-            model_quantization = mr.model_config.quantization
-        elif getattr(mr, "is_draft_worker", False):
-            model_quantization = mr.server_args.speculative_draft_model_quantization
-        else:
-            model_quantization = mr.server_args.quantization
-        model_uses_fp4 = model_quantization in (
-            "modelopt_fp4",
-            "modelopt_mixed",
-        )
-        fp4_gemm_needs_autotune = model_uses_fp4 and (
-            get_fp4_gemm_runner_backend().is_flashinfer_cutlass()
-            or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
-        )
-
-        from sglang.srt.layers.quantization.fp8_utils import (
-            get_fp8_gemm_runner_backend,
-        )
-        from sglang.srt.utils import is_sm100_supported
-
-        model_uses_modelopt_fp8 = model_quantization in (
-            "modelopt",
-            "modelopt_fp8",
-            "modelopt_mixed",
-        )
-        # Online MXFP8 (microscaling) linears dispatch to flashinfer's
-        # ``mm_mxfp8``, which the flashinfer fp8 autotune dummy run does not
-        # exercise correctly -- it triggers an illegal memory access inside the
-        # mxfp8 cutlass cubin. The mxfp8 gemm is fixed-config and needs no
-        # tuning, so skip autotune for these models.
-        model_uses_mxfp8 = "mxfp8" in (model_quantization or "")
-        fp8_gemm_needs_autotune = not model_uses_mxfp8 and (
-            get_fp8_gemm_runner_backend().is_flashinfer_cutlass()
-            or (model_uses_modelopt_fp8 and is_sm100_supported())
-        )
-
-        if not (
-            moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune
-        ):
-            return False
-
-        if torch.cuda.get_device_capability()[0] < 9:
-            return False
-
-        if mr.spec_algorithm.is_speculative():
-            return (
-                mr.is_draft_worker if for_speculative_draft else not mr.is_draft_worker
-            )
-
-        return True
-
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.
 
@@ -356,124 +263,7 @@ class BaseRunner(ABC):
         def forward_fn():
             self._dummy_run(batch_size=batch_size, buffers=buffers)
 
-        self._run_flashinfer_autotune_forward(forward_fn, skip_logits=True)
-
-    @contextlib.contextmanager
-    def _flashinfer_autotune_context(self, *, skip_logits: bool):
-        from flashinfer.autotuner import autotune
-
-        mr = self.model_runner
-        cache_path = self._flashinfer_autotune_cache_path()
-        if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
-            autotune_cache = cache_path
-            logger.info("Running FlashInfer autotune with cache: %s", autotune_cache)
-        else:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            runs_dir = cache_path.parent / "runs"
-            runs_dir.mkdir(parents=True, exist_ok=True)
-            autotune_cache = (
-                runs_dir / f"{cache_path.stem}.{timestamp}{cache_path.suffix}"
-            )
-            logger.info(
-                "Running FlashInfer autotune (cache reuse DISABLED via "
-                "SGLANG_FLASHINFER_AUTOTUNE_CACHE=0); writing fresh result to: %s",
-                autotune_cache,
-            )
-
-        # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
-        # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
-        mr.forward_stream.wait_stream(torch.cuda.current_stream())
-        with torch.get_device_module(mr.device).stream(mr.forward_stream):
-            maybe_skip_logits = contextlib.nullcontext()
-            if skip_logits:
-                from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
-
-                maybe_skip_logits = autotune_dummy_run_mode()
-            with torch.inference_mode(), autotune(
-                True, cache=str(autotune_cache)
-            ), maybe_skip_logits:
-                yield
-        torch.cuda.current_stream().wait_stream(mr.forward_stream)
-        logger.info("FlashInfer autotune completed.")
-
-    def _run_flashinfer_autotune_forward(self, forward_fn, *, skip_logits: bool):
-        with self._flashinfer_autotune_context(skip_logits=skip_logits):
-            forward_fn()
-
-    def _maybe_flashinfer_autotune_speculative_draft(
-        self,
-        forward_fn,
-        *,
-        post_warmup_hook=None,
-        skip_logits: bool = False,
-    ) -> None:
-        """Run one concrete speculative-draft forward under FlashInfer autotune.
-
-        Speculative draft graph runners have algorithm-specific inputs that the
-        generic target-verify dummy forward cannot represent, so they call this
-        after building their real capture-time ForwardBatch and before graph
-        capture. The per-runner-phase flag keeps autotune one-shot for repeated
-        graph shapes while still allowing draft and draft-extend to tune their
-        different token shapes.
-        """
-        mr = self.model_runner
-        phase_key = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
-        tuned_phases = getattr(mr, "_flashinfer_spec_draft_autotuned_phases", None)
-        if tuned_phases is None:
-            tuned_phases = set()
-            mr._flashinfer_spec_draft_autotuned_phases = tuned_phases
-        if phase_key in tuned_phases:
-            return
-        if (
-            not mr.spec_algorithm.is_speculative()
-            or not mr.is_draft_worker
-            or not self._should_run_flashinfer_autotune(for_speculative_draft=True)
-        ):
-            return
-
-        def run_and_reset():
-            forward_fn()
-            if post_warmup_hook is not None:
-                post_warmup_hook()
-
-        self._run_flashinfer_autotune_forward(run_and_reset, skip_logits=skip_logits)
-        tuned_phases.add(phase_key)
-
-    def _flashinfer_autotune_cache_path(self) -> Path:
-        import flashinfer
-
-        mr = self.model_runner
-        major, minor = torch.cuda.get_device_capability(mr.device)
-        arch = f"sm{major}{minor}"
-        flashinfer_version = getattr(flashinfer, "__version__", "unknown")
-
-        server_args = mr.server_args
-        model_key = "|".join(
-            [
-                str(server_args.model_path),
-                str(mr.dtype),
-                str(server_args.quantization),
-                str(server_args.moe_runner_backend),
-                str(mr.tp_size),
-                str(mr.pp_size),
-                str(mr.dp_size),
-                str(mr.moe_ep_size),
-                str(mr.model_config.hf_config.__class__.__name__),
-            ]
-        )
-        cache_key = hashlib.sha256(model_key.encode()).hexdigest()[:16]
-        cache_dir = (
-            Path(envs.SGLANG_CACHE_DIR.get())
-            / "flashinfer"
-            / "autotune"
-            / flashinfer_version
-            / arch
-            / cache_key
-        )
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        return (
-            cache_dir / f"rank_tp{mr.tp_rank}_pp{mr.pp_rank}_dp{mr.dp_rank or 0}.json"
-        )
+        run_flashinfer_autotune_forward(self.model_runner, forward_fn, skip_logits=True)
 
     def _alloc_dummy_decode_buffers(self, max_bs: int, *, num_tokens_per_bs: int = 1):
         """Allocate one static decode-buffer set for a dummy forward, sized to

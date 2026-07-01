@@ -71,6 +71,9 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     freeze_gc,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    maybe_flashinfer_autotune_speculative_draft,
+)
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
@@ -840,7 +843,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     "on_after_cuda_graph_warmup",
                     None,
                 )
-                self._maybe_flashinfer_autotune_speculative_draft(
+                maybe_flashinfer_autotune_speculative_draft(
+                    self,
                     run_once,
                     post_warmup_hook=post_warmup_hook,
                     skip_logits=False,

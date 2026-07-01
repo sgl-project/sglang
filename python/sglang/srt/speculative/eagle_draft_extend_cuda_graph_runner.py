@@ -28,6 +28,9 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
+from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    maybe_flashinfer_autotune_speculative_draft,
+)
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -437,7 +440,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     "on_after_cuda_graph_warmup",
                     None,
                 )
-                self._maybe_flashinfer_autotune_speculative_draft(
+                maybe_flashinfer_autotune_speculative_draft(
+                    self,
                     run_once,
                     post_warmup_hook=post_warmup_hook,
                     skip_logits=False,
