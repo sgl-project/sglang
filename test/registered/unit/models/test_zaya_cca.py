@@ -538,15 +538,19 @@ class TestZayaCCA(CustomTestCase):
 
         pool = _MockReqToTokenPool(pool_size=8, cca_config=config)
         with _mock_pool_context(pool) as backend:
+            # Keep a reference to the extend batch so its id() cannot be recycled
+            # by the later decode batch (the mock keys its per-step memo on
+            # id(forward_batch); a GC'd-then-reused address would false-collide).
+            fb_extend = _make_forward_batch(
+                is_decode=False,
+                extend_seq_lens_cpu=[3],
+                extend_prefix_lens_cpu=[0],
+                req_pool_indices=[0],
+                input_ids=torch.arange(3, dtype=torch.int64),
+            )
             cca.forward(
                 torch.randn(3, config.hidden_size, dtype=torch.float32) * 0.1,
-                _make_forward_batch(
-                    is_decode=False,
-                    extend_seq_lens_cpu=[3],
-                    extend_prefix_lens_cpu=[0],
-                    req_pool_indices=[0],
-                    input_ids=torch.arange(3, dtype=torch.int64),
-                ),
+                fb_extend,
             )
             fb_decode = _make_forward_batch(
                 is_decode=True,
