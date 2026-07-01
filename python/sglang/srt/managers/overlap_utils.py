@@ -353,7 +353,10 @@ class FutureMap:
             )
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
             self.draft_probs_buf[indices] = payload.draft_probs
-        if self.mtp_topk_indices_buf is not None and payload.mtp_topk_indices is not None:
+        if (
+            self.mtp_topk_indices_buf is not None
+            and payload.mtp_topk_indices is not None
+        ):
             self.mtp_topk_indices_buf[indices] = payload.mtp_topk_indices.to(
                 self.mtp_topk_indices_buf.dtype
             )
