@@ -4,11 +4,13 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/runtime.cuh>
+#include <sgl_kernel/type.cuh>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace {
 
@@ -17,7 +19,7 @@ SGL_DEVICE int64_t clamp_accept_len(int64_t delta, int64_t max_accept) {
   return delta < max_accept ? delta : max_accept;
 }
 
-template <typename TSeq, typename TReq>
+template <typename TSeq, typename TReq, typename BufferFloat>
 struct OnlineC128MTPWritePrefixParams {
   const float* __restrict__ kv_score_input;
   const TSeq* __restrict__ seq_lens;
@@ -25,7 +27,7 @@ struct OnlineC128MTPWritePrefixParams {
   const int32_t* __restrict__ req_to_token;
   const int64_t* __restrict__ full_to_swa;
   const float* __restrict__ ape;
-  float* __restrict__ state;
+  BufferFloat* __restrict__ state;
   int64_t kv_score_stride_b;
   int64_t req_to_token_stride_b;
   int64_t ape_stride_r;
@@ -45,14 +47,14 @@ struct OnlineC128MTPMarkPendingParams {
   int64_t max_num_reqs;
 };
 
-template <typename TSeq, typename TReq>
+template <typename TSeq, typename TReq, typename BufferFloat>
 struct OnlineC128MTPCommitPendingParams {
   const TSeq* __restrict__ cur_seq_lens;
   const TReq* __restrict__ cur_req_pool_indices;
   const int32_t* __restrict__ req_to_token;
   const int64_t* __restrict__ full_to_swa;
   const int64_t* __restrict__ pending_seq_lens;
-  float* __restrict__ state;
+  BufferFloat* __restrict__ state;
   int64_t cur_bs;
   int64_t req_to_token_stride_b;
   int64_t state_stride_b;
@@ -77,8 +79,9 @@ __global__ void online_c128_mtp_mark_pending_kernel(const OnlineC128MTPMarkPendi
   }
 }
 
-template <int64_t kHeadDim, typename TSeq, typename TReq>
-__global__ void online_c128_mtp_commit_pending_kernel(const OnlineC128MTPCommitPendingParams<TSeq, TReq> params) {
+template <int64_t kHeadDim, typename TSeq, typename TReq, typename BufferFloat>
+__global__ void
+online_c128_mtp_commit_pending_kernel(const OnlineC128MTPCommitPendingParams<TSeq, TReq, BufferFloat> params) {
   const int64_t bid = static_cast<int64_t>(blockIdx.x);
   if (bid >= params.cur_bs) return;
 
@@ -98,16 +101,17 @@ __global__ void online_c128_mtp_commit_pending_kernel(const OnlineC128MTPCommitP
   const int64_t full_loc = static_cast<int64_t>(params.req_to_token[req * params.req_to_token_stride_b + chunk_start]);
   const int64_t swa_loc = params.full_to_swa[full_loc];
   const int64_t slot = swa_loc / params.swa_page_size;
-  const float* const src = params.state + (slot + accept * params.state_slot_stride) * params.state_stride_b;
-  float* const dst = params.state + slot * params.state_stride_b;
+  const BufferFloat* const src = params.state + (slot + accept * params.state_slot_stride) * params.state_stride_b;
+  BufferFloat* const dst = params.state + slot * params.state_stride_b;
 
   for (int64_t d = static_cast<int64_t>(threadIdx.x); d < kHeadDim * 3; d += blockDim.x) {
     dst[d] = src[d];
   }
 }
 
-template <int64_t kHeadDim, typename TSeq, typename TReq>
-__global__ void online_c128_mtp_write_prefix_kernel(const OnlineC128MTPWritePrefixParams<TSeq, TReq> params) {
+template <int64_t kHeadDim, typename TSeq, typename TReq, typename BufferFloat>
+__global__ void
+online_c128_mtp_write_prefix_kernel(const OnlineC128MTPWritePrefixParams<TSeq, TReq, BufferFloat> params) {
   const int64_t bid = static_cast<int64_t>(blockIdx.x);
   if (bid >= params.layer_bs) return;
 
@@ -130,10 +134,17 @@ __global__ void online_c128_mtp_write_prefix_kernel(const OnlineC128MTPWritePref
   float run_sum = 0.0f;
   float run_kv = 0.0f;
   if (has_partial) {
-    const float* const init = params.state + init_slot * params.state_stride_b;
-    run_max = init[d];
-    run_sum = init[kHeadDim + d];
-    run_kv = init[kHeadDim * 2 + d];
+    if constexpr (std::is_same_v<BufferFloat, float>) {
+      const float* const init = params.state + init_slot * params.state_stride_b;
+      run_max = init[d];
+      run_sum = init[kHeadDim + d];
+      run_kv = init[kHeadDim * 2 + d];
+    } else {
+      const BufferFloat* const init = params.state + init_slot * params.state_stride_b;
+      run_max = device::cast<float>(init[d]);
+      run_sum = device::cast<float>(init[kHeadDim + d]);
+      run_kv = device::cast<float>(init[kHeadDim * 2 + d]);
+    }
   }
 
   constexpr int kMaxVerifyTokens = 8;
@@ -178,10 +189,17 @@ __global__ void online_c128_mtp_write_prefix_kernel(const OnlineC128MTPWritePref
           static_cast<int64_t>(params.req_to_token[req_idx * params.req_to_token_stride_b + chunk_start]);
       const int64_t swa_loc = params.full_to_swa[full_loc];
       const int64_t slot = swa_loc / params.swa_page_size + (step + 1) * params.state_slot_stride;
-      float* const out = params.state + slot * params.state_stride_b;
-      out[d] = run_max;
-      out[kHeadDim + d] = run_sum;
-      out[kHeadDim * 2 + d] = run_kv;
+      if constexpr (std::is_same_v<BufferFloat, float>) {
+        float* const out = params.state + slot * params.state_stride_b;
+        out[d] = run_max;
+        out[kHeadDim + d] = run_sum;
+        out[kHeadDim * 2 + d] = run_kv;
+      } else {
+        BufferFloat* const out = params.state + slot * params.state_stride_b;
+        out[d] = device::cast<BufferFloat>(run_max);
+        out[kHeadDim + d] = device::cast<BufferFloat>(run_sum);
+        out[kHeadDim * 2 + d] = device::cast<BufferFloat>(run_kv);
+      }
     }
 
     if (pos == 127) {
@@ -192,7 +210,7 @@ __global__ void online_c128_mtp_write_prefix_kernel(const OnlineC128MTPWritePref
   }
 }
 
-template <int64_t kHeadDim>
+template <int64_t kHeadDim, typename BufferFloat>
 struct OnlineC128MTPWritePrefixKernel {
   template <typename TSeq, typename TReq>
   static void launch(
@@ -210,14 +228,14 @@ struct OnlineC128MTPWritePrefixKernel {
       DLDevice device) {
     using namespace host;
 
-    const auto params = OnlineC128MTPWritePrefixParams<TSeq, TReq>{
+    const auto params = OnlineC128MTPWritePrefixParams<TSeq, TReq, BufferFloat>{
         .kv_score_input = static_cast<const float*>(kv_score_input.data_ptr()),
         .seq_lens = static_cast<const TSeq*>(seq_lens.data_ptr()),
         .req_pool_indices = static_cast<const TReq*>(req_pool_indices.data_ptr()),
         .req_to_token = static_cast<const int32_t*>(req_to_token.data_ptr()),
         .full_to_swa = static_cast<const int64_t*>(full_to_swa.data_ptr()),
         .ape = static_cast<const float*>(ape.data_ptr()),
-        .state = static_cast<float*>(state.data_ptr()),
+        .state = static_cast<BufferFloat*>(state.data_ptr()),
         .kv_score_stride_b = kv_score_input.stride(0),
         .req_to_token_stride_b = req_to_token.stride(0),
         .ape_stride_r = ape.stride(0),
@@ -231,7 +249,7 @@ struct OnlineC128MTPWritePrefixKernel {
     static_assert(kHeadDim == 512, "online c128 MTP write-prefix only supports head_dim=512");
     constexpr uint32_t kThreads = static_cast<uint32_t>(kHeadDim);
     LaunchKernel(static_cast<uint32_t>(layer_bs), kThreads, device)(
-        online_c128_mtp_write_prefix_kernel<kHeadDim, TSeq, TReq>, params);
+        online_c128_mtp_write_prefix_kernel<kHeadDim, TSeq, TReq, BufferFloat>, params);
   }
 
   static void
@@ -259,7 +277,7 @@ struct OnlineC128MTPWritePrefixKernel {
     TensorMatcher({-1, -1}).with_dtype<int32_t>().with_device(device).verify(req_to_token);
     TensorMatcher({-1}).with_dtype<int64_t>().with_device(device).verify(full_to_swa);
     TensorMatcher({128, kHeadDim}).with_dtype<float>().with_device(device).verify(ape);
-    TensorMatcher({-1, kHeadDim * 3}).with_dtype<float>().with_device(device).verify(state);
+    TensorMatcher({-1, kHeadDim * 3}).with_dtype<BufferFloat>().with_device(device).verify(state);
 
     if (layer_bs <= 0) return;
     RuntimeCheck(num_verify_tokens > 0 && num_verify_tokens <= 8, "unsupported num_verify_tokens=", num_verify_tokens);
@@ -332,7 +350,7 @@ struct OnlineC128MTPWritePrefixKernel {
   }
 };
 
-template <int64_t kHeadDim>
+template <int64_t kHeadDim, typename BufferFloat>
 struct OnlineC128MTPMarkPendingKernel {
   template <typename TSeq, typename TReq>
   static void launch(
@@ -398,7 +416,7 @@ struct OnlineC128MTPMarkPendingKernel {
   }
 };
 
-template <int64_t kHeadDim>
+template <int64_t kHeadDim, typename BufferFloat>
 struct OnlineC128MTPCommitPendingKernel {
   template <typename TSeq, typename TReq>
   static void launch(
@@ -416,13 +434,13 @@ struct OnlineC128MTPCommitPendingKernel {
       DLDevice device) {
     using namespace host;
 
-    const auto params = OnlineC128MTPCommitPendingParams<TSeq, TReq>{
+    const auto params = OnlineC128MTPCommitPendingParams<TSeq, TReq, BufferFloat>{
         .cur_seq_lens = static_cast<const TSeq*>(cur_seq_lens.data_ptr()),
         .cur_req_pool_indices = static_cast<const TReq*>(cur_req_pool_indices.data_ptr()),
         .req_to_token = static_cast<const int32_t*>(req_to_token.data_ptr()),
         .full_to_swa = static_cast<const int64_t*>(full_to_swa.data_ptr()),
         .pending_seq_lens = static_cast<const int64_t*>(pending_seq_lens.data_ptr()),
-        .state = static_cast<float*>(state.data_ptr()),
+        .state = static_cast<BufferFloat*>(state.data_ptr()),
         .cur_bs = cur_bs,
         .req_to_token_stride_b = req_to_token.stride(0),
         .state_stride_b = state.stride(0),
@@ -434,7 +452,7 @@ struct OnlineC128MTPCommitPendingKernel {
 
     constexpr uint32_t kThreads = 256;
     LaunchKernel(static_cast<uint32_t>(cur_bs), kThreads, device)(
-        online_c128_mtp_commit_pending_kernel<kHeadDim, TSeq, TReq>, params);
+        online_c128_mtp_commit_pending_kernel<kHeadDim, TSeq, TReq, BufferFloat>, params);
   }
 
   static void
@@ -461,7 +479,7 @@ struct OnlineC128MTPCommitPendingKernel {
     TensorMatcher({-1, -1}).with_dtype<int32_t>().with_device(device).verify(req_to_token);
     TensorMatcher({-1}).with_dtype<int64_t>().with_device(device).verify(full_to_swa);
     TensorMatcher({-1}).with_dtype<int64_t>().with_device(device).verify(pending_seq_lens);
-    TensorMatcher({-1, kHeadDim * 3}).with_dtype<float>().with_device(device).verify(state);
+    TensorMatcher({-1, kHeadDim * 3}).with_dtype<BufferFloat>().with_device(device).verify(state);
 
     if (cur_bs <= 0) return;
     RuntimeCheck(num_verify_tokens > 0 && num_verify_tokens <= 8, "unsupported num_verify_tokens=", num_verify_tokens);
