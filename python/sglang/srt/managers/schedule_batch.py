@@ -54,10 +54,11 @@ from typing import (
     Optional,
     Set,
     Tuple,
+    TypeAlias,
     Union,
 )
 
-import numpy as np
+import msgspec
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
@@ -240,8 +241,12 @@ class MultimodalInputFormat(Enum):
     PRECOMPUTED_EMBEDDING = auto()
 
 
-@dataclasses.dataclass
-class MultimodalDataItem:
+# Msgpack-native containers and Ext-decoded tensor/transport leaves. Tuple
+# containers intentionally decode as lists, matching msgpack's native model.
+MultimodalDataValue: TypeAlias = object
+
+
+class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=True):
     """
     One MultimodalDataItem represents a single multimodal input (one image, one video, or one audio).
     For example, if there are 3 images and 1 audio, there will be 4 MultimodalDataItems.
@@ -252,39 +257,40 @@ class MultimodalDataItem:
     """
 
     modality: Modality
-    hash: int = None
-    pad_value: int = None
+    hash: Optional[int] = None
+    pad_value: Optional[int] = None
     offsets: Optional[list] = None
 
     format: MultimodalInputFormat = MultimodalInputFormat.NORMAL
 
     # the raw features returned by processor, e.g. pixel_values or audio_features
-    feature: Union[torch.Tensor, np.ndarray] = None
+    feature: Optional[MultimodalDataValue] = None
     # the precomputed embeddings, passed as final encoder embeddings
     # One and only one of the feature and precomputed_embeddings will be empty
-    precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
+    precomputed_embeddings: Optional[MultimodalDataValue] = None
 
-    # Model-specific data stored in a dictionary
-    model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # Processor-owned tensors/arrays/scalars/transports. msgspec rejects a
+    # precise union with multiple custom types, but accepts Ext-decoded values
+    # under object.
+    model_specific_data: Dict[str, MultimodalDataValue] = msgspec.field(
+        default_factory=dict
+    )
 
     def __getattr__(self, name: str):
-        if (
-            "model_specific_data" in self.__dict__
-            and name in self.__dict__["model_specific_data"]
-        ):
-            return self.__dict__["model_specific_data"][name]
+        if name in self.model_specific_data:
+            return self.model_specific_data[name]
         else:
             raise AttributeError(
                 f"'{self.__class__.__name__}' object has no attribute '{name}'"
             )
 
-    def __setitem__(self, key: str, value: Any):
-        if key in self.__dict__:
-            self.__dict__[key] = value
+    def __setitem__(self, key: str, value: MultimodalDataValue):
+        if key in self.__struct_fields__:
+            setattr(self, key, value)
         else:
             self.model_specific_data[key] = value
 
-    def set(self, key: str, value: Any):
+    def set(self, key: str, value: MultimodalDataValue):
         self.__setitem__(key, value)
 
     @staticmethod
@@ -377,8 +383,9 @@ class MultimodalDataItem:
                 self.model_specific_data[extra_key] = extra_data
 
 
-@dataclasses.dataclass
-class MultimodalProcessorOutput:
+class MultimodalProcessorOutput(
+    msgspec.Struct, kw_only=True, dict=True, array_like=True
+):
     """Raw output from multimodal processors before scheduler-side preparation (pad, hash).
 
     This is the typed replacement for the dict previously returned by
