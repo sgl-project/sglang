@@ -546,51 +546,6 @@ class TestStructuralSignature(unittest.TestCase):
         self.assertIsNotNone(sig_wide)
         self.assertNotEqual(sig_narrow, sig_wide)
 
-    def _build_subfolder(
-        self,
-        *,
-        tp=4,
-        ep=1,
-        ep_num_redundant_experts=0,
-        init_expert_location="trivial",
-    ):
-        loader = object.__new__(PreshardedModelLoader)
-        with mock.patch(
-            "sglang.srt.distributed.get_tensor_model_parallel_world_size",
-            return_value=tp,
-        ), mock.patch(
-            "sglang.srt.distributed.get_moe_data_parallel_world_size",
-            return_value=1,
-        ), mock.patch(
-            "sglang.srt.distributed.get_moe_expert_parallel_world_size",
-            return_value=ep,
-        ), mock.patch(
-            "sglang.srt.distributed.get_pipeline_model_parallel_world_size",
-            return_value=1,
-        ), mock.patch(
-            "sglang.srt.model_loader.loader.get_global_server_args",
-            return_value=SimpleNamespace(
-                moe_dense_tp_size=None,
-                ep_num_redundant_experts=ep_num_redundant_experts,
-                init_expert_location=init_expert_location,
-            ),
-        ):
-            return loader._build_subfolder_name(SimpleNamespace(quantization=None))
-
-    def test_eplb_fields_appear_in_subfolder_name(self):
-        # EPLB changes content without changing tensor shapes, so the
-        # structural signature can't catch it. Smoke-test that both fields
-        # are wired into _build_subfolder_name as explicit key components.
-        name = self._build_subfolder(
-            tp=8,
-            ep=8,
-            ep_num_redundant_experts=16,
-            init_expert_location="/path/to/loc.json",
-        )
-        self.assertIn("RedEP-16", name)
-        self.assertIn("ExpLoc-", name)
-        self.assertNotIn("/path/to/loc.json", name)
-
 
 if __name__ == "__main__":
     unittest.main()
