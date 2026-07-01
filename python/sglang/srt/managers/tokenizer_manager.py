@@ -148,6 +148,45 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_ids_logprobs",
 )
 
+_DISAGG_BOOTSTRAP_FIELDS = (
+    "bootstrap_host",
+    "bootstrap_port",
+    "bootstrap_room",
+    "bootstrap_pair_key",
+    "decode_tp_size",
+)
+
+
+def _parallel_sample_input_index(
+    batch_index: int, sample_index: int, batch_size: int
+) -> int:
+    return batch_index + sample_index * batch_size
+
+
+def _parallel_sample_prefix_bootstrap_room(
+    bootstrap_room: Optional[int],
+    used_bootstrap_rooms: Optional[List[Optional[int]]],
+) -> Optional[int]:
+    if bootstrap_room is None:
+        return None
+
+    if not used_bootstrap_rooms:
+        return bootstrap_room
+
+    prefix_room = bootstrap_room
+    used_rooms = {room for room in used_bootstrap_rooms if room is not None}
+    step = max(len(used_bootstrap_rooms), 1)
+    while prefix_room in used_rooms:
+        prefix_room += step
+    return prefix_room
+
+
+def _copy_disagg_bootstrap_fields(dst: Any, src: Any) -> None:
+    for field in _DISAGG_BOOTSTRAP_FIELDS:
+        value = getattr(src, field, None)
+        if value is not None:
+            setattr(dst, field, value)
+
 
 @dataclasses.dataclass
 class ReqState:
@@ -1619,6 +1658,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                     ]
                 tokenized_obj.rid = tmp_obj.regenerate_rid()
+                prefix_bootstrap_room = _parallel_sample_prefix_bootstrap_room(
+                    tmp_obj.bootstrap_room, getattr(obj, "bootstrap_room", None)
+                )
+                if prefix_bootstrap_room is not None:
+                    tmp_obj.bootstrap_room = prefix_bootstrap_room
+                    tokenized_obj.bootstrap_room = prefix_bootstrap_room
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
@@ -1628,8 +1673,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
-                    tmp_obj = copy.copy(objs[i])
+                for sample_idx in range(obj.parallel_sample_num):
+                    expanded_idx = _parallel_sample_input_index(
+                        i, sample_idx, batch_size
+                    )
+                    tmp_obj = copy.copy(obj[expanded_idx])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
                     if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
@@ -1638,6 +1686,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                         ]
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
+                    _copy_disagg_bootstrap_fields(tokenized_obj, tmp_obj)
                     self._init_req_state(tmp_obj)
                     state = self.rid_to_state[tmp_obj.rid]
                     tokenized_obj.time_stats = state.time_stats

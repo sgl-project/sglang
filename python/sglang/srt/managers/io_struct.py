@@ -662,7 +662,24 @@ class GenerateReqInput:
         elif not isinstance(self.bootstrap_room, list):
             self.bootstrap_room = [self.bootstrap_room + i for i in range(num)]
         elif isinstance(self.bootstrap_room, list):
-            self.bootstrap_room = self.bootstrap_room * self.parallel_sample_num
+            if self.parallel_sample_num == 1:
+                self.bootstrap_room = self.bootstrap_room
+            else:
+                bootstrap_rooms = []
+                used_bootstrap_rooms = set()
+                step = max(self.batch_size, 1)
+                for sample_idx in range(self.parallel_sample_num):
+                    for room in self.bootstrap_room:
+                        if room is None:
+                            bootstrap_rooms.append(None)
+                            continue
+
+                        candidate_room = room + sample_idx * step
+                        while candidate_room in used_bootstrap_rooms:
+                            candidate_room += step
+                        bootstrap_rooms.append(candidate_room)
+                        used_bootstrap_rooms.add(candidate_room)
+                self.bootstrap_room = bootstrap_rooms
 
         # Normalize bootstrap_pair_key
         if self.bootstrap_pair_key is None:
