@@ -980,6 +980,12 @@ class TestNgramExternalSamArgs(CustomTestCase):
             setattr(args, key, value)
         return args
 
+    def test_ngram_allows_dp_attention(self):
+        # NGRAM + dp attention must NOT raise after support is added.
+        args = self._make_dummy_ngram_args(enable_dp_attention=True)
+        handle_speculative_decoding(args)  # should not raise
+        self.assertEqual(args.speculative_algorithm, "NGRAM")
+
     def test_external_sam_budget_must_fit_draft_budget(self):
         args = self._make_dummy_ngram_args(
             speculative_num_draft_tokens=4,

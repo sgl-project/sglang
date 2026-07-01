@@ -463,11 +463,6 @@ def _handle_ngram(server_args: ServerArgs) -> None:
             "and produces incorrect results for paged attention backends. "
             "This combination is only supported for the 'flashinfer' backend."
         )
-    if server_args.enable_dp_attention:
-        # TODO: support dp attention for ngram speculative decoding
-        raise ValueError(
-            "Currently ngram speculative decoding does not support dp attention."
-        )
 
 
 def _maybe_disable_adaptive(server_args: ServerArgs) -> None:

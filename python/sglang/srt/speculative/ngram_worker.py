@@ -265,10 +265,41 @@ class NGRAMWorker(BaseSpecWorker):
         return req_drafts, mask
 
     def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
-        # Decode-only: extend goes through the plain target forward, and an
-        # IDLE batch must keep its forward_mode instead of being rewritten to
-        # TARGET_VERIFY below (relevant once DP attention support lands).
-        if not batch.forward_mode.is_decode():
+        # DP attention: an idle rank (no requests) must mirror the GLOBAL step so its
+        # collectives line up with the active ranks. EAGLE gates this on the
+        # DP-gathered ``is_extend_in_batch`` flag (see
+        # eagle_worker_v2.forward_batch_generation):
+        #   * global verify/decode step (no rank extending) -> attach a verify-shaped
+        #     zero-row ``spec_info`` (create_idle_input) so the draft-token coefficient
+        #     is applied in ForwardBatch.init_new and ``global_num_tokens`` scaling
+        #     agrees with the verifying ranks;
+        #   * global extend/prefill step -> stay plain idle (spec_info=None), matching
+        #     the active extend ranks (no coefficient).
+        # We key off ``is_extend_in_batch`` rather than ``global_forward_mode`` because
+        # the latter is only populated when two-batch overlap is active.
+        #
+        # In BOTH cases the batch stays in IDLE mode; forward_batch_generation runs a
+        # plain target forward for it (the dedicated is_idle() branch) and returns an
+        # empty result. We must NOT convert it to TARGET_VERIFY: an idle batch only
+        # keeps its collectives aligned via init_new's idle path, which skips
+        # attention. A bs=0 TARGET_VERIFY forward would instead launch the triton
+        # extend-attention kernel with degenerate args and hit an illegal memory
+        # access. EAGLE likewise leaves idle verify batches in IDLE mode.
+        if batch.forward_mode.is_idle():
+            if not batch.is_extend_in_batch:
+                batch.spec_info = NgramVerifyInput.create_idle_input(
+                    self.draft_token_num, self.device
+                )
+            return
+
+        # Extend goes through the plain target forward (the caller's else branch).
+        # Also skip speculation on a global extend step even when this rank is locally
+        # decode: with --speculative-skip-dp-mlp-sync the scheduler can leave a decode
+        # rank running alongside a rank that is extending (``is_extend_in_batch`` is the
+        # DP-gathered flag). Speculating here would scale ``global_num_tokens`` only on
+        # this rank and desync the MLP-sync collectives. Mirrors EAGLE's dispatch
+        # (eagle_worker_v2.forward_batch_generation: ``is_extend() or is_extend_in_batch``).
+        if not batch.forward_mode.is_decode() or batch.is_extend_in_batch:
             return
 
         bs = len(batch.reqs)
@@ -302,8 +333,13 @@ class NGRAMWorker(BaseSpecWorker):
             tree_mask = []
             mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
             # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
+            # Under DP attention, batch.seq_lens_cpu may be None (lengths kept on
+            # GPU); fall back to a one-time D2H copy so the full-mask build works.
+            seq_lens_cpu = batch.seq_lens_cpu
+            if seq_lens_cpu is None:
+                seq_lens_cpu = batch.seq_lens.cpu()
             for i in range(bs):
-                seq_len = batch.seq_lens_cpu[i]
+                seq_len = seq_lens_cpu[i]
                 req_mask = torch.ones(
                     (self.draft_token_num, seq_len), device=self.device
                 )
@@ -382,6 +418,34 @@ class NGRAMWorker(BaseSpecWorker):
 
         verify_input: NgramVerifyInput = batch.spec_info
         accept_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
+
+        if batch.forward_mode.is_idle():
+            # Idle DP rank (no local requests). _prepare_for_speculative_decoding kept
+            # it in IDLE mode (optionally attaching a zero-row verify spec_info on a
+            # global verify step so the draft-token coefficient is applied). We still
+            # run a forward so this rank's MoE/MLP collectives stay in lockstep with
+            # the active ranks, then discard the outputs and return an empty result.
+            # The plain target forward yields next_token_ids sized to the DP
+            # padded/gathered batch, so they must NOT flow through the active-path
+            # bookkeeping below (where bs == 0).
+            batch_result = self.target_worker.forward_batch_generation(batch)
+            empty = torch.empty((0,), dtype=torch.int64, device=self.device)
+            if on_publish is not None:
+                on_publish(batch.seq_lens)
+            return GenerationBatchResult(
+                logits_output=batch_result.logits_output,
+                next_token_ids=empty,
+                can_run_cuda_graph=batch_result.can_run_cuda_graph,
+                accept_lens=accept_lens,
+                new_seq_lens=batch.seq_lens,
+                next_draft_input=NgramVerifyInput(
+                    draft_token_num=self.draft_token_num,
+                    new_seq_lens=batch.seq_lens,
+                    accept_tokens=empty,
+                    accept_lens=accept_lens,
+                ),
+                speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+            )
 
         if batch.forward_mode.is_target_verify():
             # Prepare grammar data on CPU if needed
