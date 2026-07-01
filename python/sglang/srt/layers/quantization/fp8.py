@@ -1783,6 +1783,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_aiter()
+            or moe_runner_backend.is_ifmoe()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
         ):
@@ -2041,6 +2042,27 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         elif self.runner.runner_backend.is_triton():
             quant_info = self.get_triton_quant_info(layer)
+        elif self.runner.runner_backend.is_ifmoe():
+            from sglang.srt.layers.moe.moe_runner.ifmoe.quant_info import (
+                IFMoeQuantInfo,
+            )
+
+            quant_info = IFMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_scale=(
+                    layer.w13_weight_scale_inv
+                    if self.block_quant
+                    else layer.w13_weight_scale
+                ),
+                w2_weight_scale=(
+                    layer.w2_weight_scale_inv
+                    if self.block_quant
+                    else layer.w2_weight_scale
+                ),
+                routing_bias=getattr(layer, "correction_bias", None),
+                local_expert_offset=getattr(layer, "local_expert_offset", 0),
+            )
         else:
             raise NotImplementedError(
                 "Unsupported runner backend: %s" % self.runner.runner_backend

@@ -319,9 +319,15 @@ set(INCLUDES
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
 
+# IFMOE: Hopper (SM90) only — included in the SM90 binary, excluded from SM100+.
+set(IFMOE_SM90_SOURCES
+    "csrc/moe/ifmoe/kernel.cu"
+    "csrc/moe/ifmoe/cutlass_bw_sm90.cu"
+)
+
 # =========================== Common SM90 Build ============================= #
 # Build SM90 library with fast math optimization (same namespace, different directory)
-Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES} ${IFMOE_SM90_SOURCES})
 
 target_compile_options(common_ops_sm90_build PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>
@@ -332,6 +338,8 @@ set_target_properties(common_ops_sm90_build PROPERTIES
     OUTPUT_NAME "common_ops"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
 )
+# Enable IFMOE op registration in the SM90 binary only.
+target_compile_definitions(common_ops_sm90_build PRIVATE SGL_KERNEL_IFMOE_AVAILABLE=1)
 
 # =========================== Common SM100+ Build ============================= #
 # Build SM100+ library with precise math (same namespace, different directory)
