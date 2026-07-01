@@ -1176,36 +1176,37 @@ class HybridLinearAttnBackend(AttentionBackend):
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
+        # The verify scatter and the (optional) track scatter share the same src/dst
+        # tensors and the same per-request source row, differing only in their index
+        # arrays. Concatenate the two index sets so a single fused launch per buffer
+        # handles both, instead of issuing separate launches.
+        if mamba_track_indices is not None:
+            assert mamba_steps_to_track is not None
+            dst_indices = torch.cat([state_indices_tensor, mamba_track_indices])
+            step_indices = torch.cat(
+                [last_correct_step_indices, mamba_steps_to_track]
+            )
+            num_index_sets = 2
+        else:
+            dst_indices = state_indices_tensor
+            step_indices = last_correct_step_indices
+            num_index_sets = 1
+
         # Use fully fused kernel that handles masking internally
         # This avoids separate nonzero() and index_select() calls
         fused_mamba_state_scatter_with_mask(
             ssm_states,
             intermediate_state_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
+            dst_indices,
+            step_indices,
+            num_index_sets,
         )
         # conv intermediate uses the deduplicated sliding-window (overlapping)
         # layout, so it needs the strided-read scatter variant.
         fused_conv_window_scatter_with_mask(
             conv_states,
             intermediate_conv_window_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
+            dst_indices,
+            step_indices,
+            num_index_sets,
         )
-
-        # Track indices used for tracking mamba states for prefix cache
-        if mamba_track_indices is not None:
-            assert mamba_steps_to_track is not None
-            # Use fully fused kernel for track scatter operations
-            fused_mamba_state_scatter_with_mask(
-                ssm_states,
-                intermediate_state_cache,
-                mamba_track_indices,
-                mamba_steps_to_track,
-            )
-            fused_conv_window_scatter_with_mask(
-                conv_states,
-                intermediate_conv_window_cache,
-                mamba_track_indices,
-                mamba_steps_to_track,
-            )

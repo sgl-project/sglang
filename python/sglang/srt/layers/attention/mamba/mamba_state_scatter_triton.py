@@ -120,9 +120,11 @@ def track_mamba_states_if_needed(
 def _fused_mamba_state_scatter_with_mask_kernel(
     src_ptr,
     dst_ptr,
-    # Raw index arrays (before index_select)
-    dst_indices_raw_ptr,  # [total_requests] - state_indices_tensor
-    step_indices_raw_ptr,  # [total_requests] - last_correct_step_indices or mamba_steps_to_track
+    # Raw index arrays (before index_select), length = num_index_sets * set_size
+    dst_indices_raw_ptr,  # state_indices_tensor (set 0) [+ track indices (set 1)]
+    step_indices_raw_ptr,  # last_correct_step_indices (set 0) [+ steps_to_track (set 1)]
+    set_size,  # number of requests per index set
+    num_layers,
     elem_per_entry: tl.constexpr,
     src_layer_stride,
     src_req_stride,
@@ -137,30 +139,36 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     """
     Fused gather-scatter kernel with built-in masking.
 
-    This kernel fuses the index_select operations by:
-    1. Iterating over all requests (pid_req from 0 to total_requests-1)
-    2. Checking if step_indices_raw[pid_req] >= 0 (valid mask)
-    3. If valid, performing the scatter:
-       dst[l, dst_indices_raw[pid_req], :] = src[l, pid_req, step_indices_raw[pid_req], :]
+    Grid: (set_size, ceil(elem_per_entry / BLOCK_SIZE), num_index_sets)
 
-    Grid: (total_requests, num_layers, ceil(elem_per_entry / BLOCK_SIZE))
+    For each (request, element-block, index-set):
+    1. Resolve the flat index position idx_pos = pid_set * set_size + pid_req.
+    2. Check step_indices_raw[idx_pos] >= 0 (valid mask) once, amortized over layers.
+    3. If valid, loop over all layers performing the scatter:
+       dst[l, dst_indices_raw[idx_pos], :] = src[l, pid_req, step_indices_raw[idx_pos], :]
+
+    The source request row is always pid_req (resets per index set), while the
+    destination row comes from the concatenated index array, so multiple scatters
+    that share the same src/dst tensors (e.g. verify + track) fuse into one launch.
     """
     pid_req = tl.program_id(0)
-    pid_layer = tl.program_id(1).to(tl.int64)
-    pid_block = tl.program_id(2).to(tl.int64)
+    pid_block = tl.program_id(1).to(tl.int64)
+    pid_set = tl.program_id(2)
+
+    idx_pos = pid_set * set_size + pid_req
 
     # Load step index to check validity (step >= 0 means valid)
-    step_idx = tl.load(step_indices_raw_ptr + pid_req).to(tl.int64)
+    step_idx = tl.load(step_indices_raw_ptr + idx_pos).to(tl.int64)
 
     # Early exit if this request is not valid (step < 0)
     if step_idx < 0:
         return
 
     # Load destination index
-    dst_idx = tl.load(dst_indices_raw_ptr + pid_req).to(tl.int64)
+    dst_idx = tl.load(dst_indices_raw_ptr + idx_pos).to(tl.int64)
 
-    # Source index is just the request index itself
-    src_idx = pid_req
+    # Source row is the request index within the set
+    src_idx = pid_req.to(tl.int64)
 
     # Bounds check to avoid illegal memory access
     if not (
@@ -172,29 +180,38 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     ):
         return
 
-    # Compute base offsets
-    src_offset = (
-        pid_layer * src_layer_stride
-        + src_idx * src_req_stride
-        + step_idx * src_step_stride
-    )
-    dst_offset = pid_layer * dst_layer_stride + dst_idx * dst_req_stride
-
-    # Compute element range for this block
+    # Compute element range for this block (shared across layers)
     start = pid_block * BLOCK_SIZE
     offsets = start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < elem_per_entry
 
-    # Load from source and store to destination
-    data = tl.load(src_ptr + src_offset + offsets, mask=mask)
-    tl.store(dst_ptr + dst_offset + offsets, data, mask=mask)
+    # Per-request base offsets (layer term added inside the loop)
+    src_req_offset = src_idx * src_req_stride + step_idx * src_step_stride
+    dst_req_offset = dst_idx * dst_req_stride
+
+    # Iterate over layers; the validity/bounds checks above are done once and
+    # amortized over every layer instead of being re-evaluated per layer.
+    for layer in tl.range(num_layers):
+        layer64 = layer.to(tl.int64)
+        src_offset = layer64 * src_layer_stride + src_req_offset
+        dst_offset = layer64 * dst_layer_stride + dst_req_offset
+        data = tl.load(src_ptr + src_offset + offsets, mask=mask)
+        tl.store(dst_ptr + dst_offset + offsets, data, mask=mask)
+
+
+def _pick_block_size(elem_per_entry: int) -> int:
+    """Heuristic block size: fatter blocks than the legacy 1024 to improve
+    latency hiding / reduce grid size, capped so tiny entries don't over-allocate."""
+    next_pow2 = 1 << max(0, (elem_per_entry - 1)).bit_length()
+    return max(1024, min(8192, next_pow2))
 
 
 def fused_mamba_state_scatter_with_mask(
     dst: torch.Tensor,  # [num_layers, cache_size, *state_shape]
     src: torch.Tensor,  # [num_layers, spec_size, draft_tokens, *state_shape]
-    dst_indices_raw: torch.Tensor,  # [total_requests] - raw indices (e.g., state_indices_tensor)
-    step_indices_raw: torch.Tensor,  # [total_requests] - raw step indices (step >= 0 means valid)
+    dst_indices_raw: torch.Tensor,  # [num_index_sets * set_size] - raw dst indices
+    step_indices_raw: torch.Tensor,  # [num_index_sets * set_size] - raw step indices
+    num_index_sets: int = 1,
 ):
     """
     Fully fused gather-scatter with built-in masking for mamba state updates.
@@ -204,17 +221,31 @@ def fused_mamba_state_scatter_with_mask(
     2. valid_indices = valid_mask.nonzero()
     3. dst_indices = dst_indices_raw[valid_indices]  (index_select)
     4. step_indices = step_indices_raw[valid_indices]  (index_select)
-    5. for each valid i: dst[:, dst_indices[i], :] = src[:, i, step_indices[i], :]
+    5. for each valid i: dst[:, dst_indices[i], :] = src[:, i % set_size, step_indices[i], :]
+
+    When num_index_sets > 1, the index arrays are the concatenation of that many
+    equal-length sets that all scatter into the same dst from the same src (e.g.
+    the verify set followed by the track set). The source row resets per set, so a
+    single launch covers what used to be several separate launches.
 
     Args:
         dst: Destination tensor [num_layers, cache_size, *state_shape]
         src: Source tensor [num_layers, spec_size, draft_tokens, *state_shape]
-        dst_indices_raw: Raw destination indices for all requests [total_requests]
-        step_indices_raw: Raw step indices; entry >= 0 means valid [total_requests]
+        dst_indices_raw: Raw destination indices for all requests/sets
+        step_indices_raw: Raw step indices; entry >= 0 means valid
+        num_index_sets: Number of equal-length index sets concatenated together
     """
     total_requests = step_indices_raw.shape[0]
     if total_requests == 0:
         return
+
+    if num_index_sets < 1:
+        raise ValueError(f"num_index_sets must be >= 1, got {num_index_sets}")
+    if total_requests % num_index_sets != 0:
+        raise ValueError(
+            f"index length {total_requests} not divisible by num_index_sets {num_index_sets}"
+        )
+    set_size = total_requests // num_index_sets
 
     if dst.device != src.device:
         raise ValueError(
@@ -268,17 +299,21 @@ def fused_mamba_state_scatter_with_mask(
     if not src.is_contiguous():
         raise ValueError("src tensor must be contiguous")
 
-    # Block size for copying elements
-    BLOCK_SIZE = 1024
+    # Fatter blocks than the legacy 1024 to improve latency hiding.
+    BLOCK_SIZE = _pick_block_size(elem_per_entry)
+    num_warps = 8 if BLOCK_SIZE >= 4096 else 4
 
-    # Grid over all requests - invalid ones will early-exit in the kernel
-    grid = (total_requests, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
+    # Grid: layers are now an inner kernel loop (not a grid dim), and index sets
+    # form the third dim so fused verify+track scatters run in one launch.
+    grid = (set_size, triton.cdiv(elem_per_entry, BLOCK_SIZE), num_index_sets)
 
     _fused_mamba_state_scatter_with_mask_kernel[grid](
         src,
         dst,
         dst_indices_raw,
         step_indices_raw,
+        set_size,
+        num_layers,
         elem_per_entry,
         src_layer_stride,
         src_req_stride,
@@ -289,6 +324,7 @@ def fused_mamba_state_scatter_with_mask(
         src_step_size,
         dst_req_size,
         BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=num_warps,
     )
 
 
@@ -296,8 +332,11 @@ def fused_mamba_state_scatter_with_mask(
 def _fused_conv_window_scatter_with_mask_kernel(
     src_ptr,
     dst_ptr,
-    dst_indices_raw_ptr,  # [total_requests]
-    step_indices_raw_ptr,  # [total_requests], entry >= 0 means valid
+    # Raw index arrays (before index_select), length = num_index_sets * set_size
+    dst_indices_raw_ptr,  # state_indices_tensor (set 0) [+ track indices (set 1)]
+    step_indices_raw_ptr,  # last_correct_step_indices (set 0) [+ steps_to_track (set 1)]
+    set_size,  # number of requests per index set
+    num_layers,
     elem_per_entry: tl.constexpr,  # dim * (K-1)
     KM1: tl.constexpr,  # K-1 (conv window width)
     src_layer_stride,
@@ -321,17 +360,25 @@ def _fused_conv_window_scatter_with_mask_kernel(
     non-contiguous, so we index every ``(dim, win)`` element through the view's
     strides (``src_step_stride`` / ``src_dim_stride`` / ``src_win_stride``). The
     destination conv-state row stays contiguous in ``(dim, K-1)`` order.
+
+    Grid: (set_size, ceil(elem_per_entry / BLOCK_SIZE), num_index_sets). The
+    source request row is always pid_req (resets per index set), while the
+    destination row comes from the concatenated index array, so the verify and
+    track scatters fuse into a single launch. The validity/bounds checks are
+    done once and amortized over every layer (an inner kernel loop).
     """
     pid_req = tl.program_id(0)
-    pid_layer = tl.program_id(1).to(tl.int64)
-    pid_block = tl.program_id(2).to(tl.int64)
+    pid_block = tl.program_id(1).to(tl.int64)
+    pid_set = tl.program_id(2)
 
-    step_idx = tl.load(step_indices_raw_ptr + pid_req).to(tl.int64)
+    idx_pos = pid_set * set_size + pid_req
+
+    step_idx = tl.load(step_indices_raw_ptr + idx_pos).to(tl.int64)
     if step_idx < 0:
         return
 
-    dst_idx = tl.load(dst_indices_raw_ptr + pid_req).to(tl.int64)
-    src_idx = pid_req
+    dst_idx = tl.load(dst_indices_raw_ptr + idx_pos).to(tl.int64)
+    src_idx = pid_req.to(tl.int64)
 
     if not (
         (dst_idx >= 0)
@@ -349,25 +396,32 @@ def _fused_conv_window_scatter_with_mask_kernel(
     d = e // KM1
     w = e % KM1
 
-    src_off = (
-        pid_layer * src_layer_stride
-        + src_idx * src_req_stride
+    # Per-request base offsets (layer term added inside the loop).
+    src_req_offset = (
+        src_idx * src_req_stride
         + step_idx * src_step_stride
         + d * src_dim_stride
         + w * src_win_stride
     )
     # dst window is contiguous in (dim, K-1) order -> flat element index `e`.
-    dst_off = pid_layer * dst_layer_stride + dst_idx * dst_req_stride + e
+    dst_req_offset = dst_idx * dst_req_stride + e
 
-    data = tl.load(src_ptr + src_off, mask=mask, other=0.0)
-    tl.store(dst_ptr + dst_off, data, mask=mask)
+    # Iterate over layers; the validity/bounds checks above are done once and
+    # amortized over every layer instead of being re-evaluated per layer.
+    for layer in tl.range(num_layers):
+        layer64 = layer.to(tl.int64)
+        src_off = layer64 * src_layer_stride + src_req_offset
+        dst_off = layer64 * dst_layer_stride + dst_req_offset
+        data = tl.load(src_ptr + src_off, mask=mask, other=0.0)
+        tl.store(dst_ptr + dst_off, data, mask=mask)
 
 
 def fused_conv_window_scatter_with_mask(
     dst: torch.Tensor,  # conv_states [num_layers, cache_size, dim, K-1] (contiguous)
     src: torch.Tensor,  # deduped conv-window view [num_layers, spec_size, draft_tokens, dim, K-1]
-    dst_indices_raw: torch.Tensor,  # [total_requests]
-    step_indices_raw: torch.Tensor,  # [total_requests], entry >= 0 means valid
+    dst_indices_raw: torch.Tensor,  # [num_index_sets * set_size]
+    step_indices_raw: torch.Tensor,  # [num_index_sets * set_size], entry >= 0 means valid
+    num_index_sets: int = 1,
 ):
     """Conv-window variant of :func:`fused_mamba_state_scatter_with_mask`.
 
@@ -377,10 +431,23 @@ def fused_conv_window_scatter_with_mask(
     ``(dim, win)`` elements through the view's strides instead of flat-copying.
     ``dst`` (the real conv-state pool) is the usual contiguous
     ``[layers, cache, dim, K-1]``.
+
+    When num_index_sets > 1, the index arrays are the concatenation of that many
+    equal-length sets that all scatter into the same dst from the same src (e.g.
+    the verify set followed by the track set). The source row resets per set, so a
+    single launch covers what used to be several separate launches.
     """
     total_requests = step_indices_raw.shape[0]
     if total_requests == 0:
         return
+
+    if num_index_sets < 1:
+        raise ValueError(f"num_index_sets must be >= 1, got {num_index_sets}")
+    if total_requests % num_index_sets != 0:
+        raise ValueError(
+            f"index length {total_requests} not divisible by num_index_sets {num_index_sets}"
+        )
+    set_size = total_requests // num_index_sets
 
     if not (dst.is_cuda and src.is_cuda and dst.device == src.device):
         raise ValueError(
@@ -422,13 +489,17 @@ def fused_conv_window_scatter_with_mask(
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
 
     BLOCK_SIZE = 1024
-    grid = (total_requests, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
+    # Grid: layers are now an inner kernel loop (not a grid dim), and index sets
+    # form the third dim so fused verify+track scatters run in one launch.
+    grid = (set_size, triton.cdiv(elem_per_entry, BLOCK_SIZE), num_index_sets)
 
     _fused_conv_window_scatter_with_mask_kernel[grid](
         src,
         dst,
         dst_indices_raw,
         step_indices_raw,
+        set_size,
+        num_layers,
         elem_per_entry,
         km1,
         src.stride(0),
