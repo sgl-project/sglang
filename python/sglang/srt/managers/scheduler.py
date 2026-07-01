@@ -2060,6 +2060,7 @@ class Scheduler(
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
+                pd_rebootstrap_prefill_url=recv_req.pd_rebootstrap_prefill_url,
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
@@ -3980,7 +3981,16 @@ class Scheduler(
             if len(self.running_batch.reqs) != 0:
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
                 for req in retracted_reqs:
-                    self._add_request_to_queue(req)
+                    if self.disaggregation_mode == DisaggregationMode.DECODE:
+                        if hasattr(req, "kv_cache_cpu"):
+                            del req.kv_cache_cpu
+                        if req.output_ids:
+                            req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+                        req.pd_rebootstrap_in_progress = True
+                        req.time_stats.set_retract_time()
+                        self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
+                    else:
+                        self._add_request_to_queue(req)
 
             self.running_batch.batch_is_full = False
             self.chunked_req = None
@@ -4008,6 +4018,16 @@ class Scheduler(
                 f"reserved {before_mb:.1f} MB -> {after_mb:.1f} MB "
                 f"(freed {before_mb - after_mb:.1f} MB)"
             )
+        # Enqueue any rebootstrap requests that were staged during a
+        # retract-mode pause. Deferring until resume keeps the preallocation
+        # queue empty during the pause window (so an intervening weight update
+        # can flush the cache) and recomputes the prefix KV under the updated
+        # weights.
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.disagg_decode_prealloc_queue is not None
+        ):
+            self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
         self._engine_paused = False
 
     def load_lora_adapter(

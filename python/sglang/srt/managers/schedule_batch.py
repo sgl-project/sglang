@@ -693,6 +693,7 @@ class Req(ReqDllmMixin):
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        pd_rebootstrap_prefill_url: Optional[str] = None,
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
@@ -986,6 +987,11 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        self.pd_rebootstrap_prefill_url: Optional[str] = pd_rebootstrap_prefill_url
+        # Decode-local: the already-emitted boundary token to replay when a
+        # retracted request is rebootstrapped. Set in pause_generation(retract)
+        # and consumed in the decode transfer commit; never plumbed to prefill.
+        self.pd_rebootstrap_forced_output_id: Optional[int] = None
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
@@ -1502,6 +1508,51 @@ class Req(ReqDllmMixin):
             self.kv_cache_cpu, token_indices, mamba_indices=self.mamba_pool_idx
         )
         del self.kv_cache_cpu
+
+    def build_rebootstrap_payload(self) -> dict:
+        """Build the prefill ``/generate`` payload that asks the original prefill
+        worker to recompute this request's prefix KV under the current weights
+        (PD true-retraction rebootstrap).
+
+        ``input_ids`` are coerced to plain ``int`` so the payload is always
+        JSON-serializable even when ``origin_input_ids``/``output_ids`` hold
+        numpy scalars. The sampling-param allow-list forces ``max_new_tokens=1``
+        and drops stop/grammar/min_new_tokens so the recompute only re-derives
+        the prefix KV and samples a single handoff token. The already-emitted
+        boundary token is replayed on the *decode* side (the transfer commit
+        overrides the sampled handoff with it), so it is intentionally not sent
+        to the prefill here.
+        """
+        sp = self.sampling_params
+        return {
+            "input_ids": [int(x) for x in self.origin_input_ids]
+            + [int(x) for x in self.output_ids],
+            "sampling_params": {
+                "max_new_tokens": 1,
+                "temperature": sp.temperature,
+                "top_p": sp.top_p,
+                "top_k": sp.top_k,
+                "min_p": sp.min_p,
+                "frequency_penalty": sp.frequency_penalty,
+                "presence_penalty": sp.presence_penalty,
+                "repetition_penalty": sp.repetition_penalty,
+                "ignore_eos": sp.ignore_eos,
+                "skip_special_tokens": sp.skip_special_tokens,
+                "spaces_between_special_tokens": sp.spaces_between_special_tokens,
+                "no_stop_trim": sp.no_stop_trim,
+            },
+            "return_logprob": False,
+            "stream": False,
+            "rid": self.rid,
+            "bootstrap_host": self.bootstrap_host,
+            "bootstrap_port": self.bootstrap_port,
+            "bootstrap_room": self.bootstrap_room,
+            "pd_rebootstrap_prefill_url": self.pd_rebootstrap_prefill_url,
+            "priority": self.priority,
+            "extra_key": self.extra_key,
+            "routing_key": self.routing_key,
+            "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
+        }
 
     def log_time_stats(self):
         # If overlap schedule, we schedule one decode batch ahead so this gets called twice.

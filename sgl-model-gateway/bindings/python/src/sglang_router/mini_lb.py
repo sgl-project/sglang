@@ -34,6 +34,34 @@ def maybe_wrap_ipv6_address(address: str) -> str:
         return address
 
 
+def _inject_bootstrap_metadata(
+    request: dict, hostname: str, bootstrap_port: int, prefill_server: str
+) -> dict:
+    modified_request = request.copy()
+    batch_size = _get_request_batch_size(modified_request)
+    if batch_size is not None:
+        modified_request.update(
+            {
+                "bootstrap_host": [hostname] * batch_size,
+                "bootstrap_port": [bootstrap_port] * batch_size,
+                "bootstrap_room": [
+                    _generate_bootstrap_room() for _ in range(batch_size)
+                ],
+                "pd_rebootstrap_prefill_url": [prefill_server] * batch_size,
+            }
+        )
+    else:
+        modified_request.update(
+            {
+                "bootstrap_host": hostname,
+                "bootstrap_port": bootstrap_port,
+                "bootstrap_room": _generate_bootstrap_room(),
+                "pd_rebootstrap_prefill_url": prefill_server,
+            }
+        )
+    return modified_request
+
+
 class MiniLoadBalancer:
     def __init__(
         self,
@@ -360,27 +388,9 @@ async def handle_generate_request(request_data: dict):
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
-    modified_request = request_data.copy()
-
-    batch_size = _get_request_batch_size(modified_request)
-    if batch_size is not None:
-        modified_request.update(
-            {
-                "bootstrap_host": [hostname] * batch_size,
-                "bootstrap_port": [bootstrap_port] * batch_size,
-                "bootstrap_room": [
-                    _generate_bootstrap_room() for _ in range(batch_size)
-                ],
-            }
-        )
-    else:
-        modified_request.update(
-            {
-                "bootstrap_host": hostname,
-                "bootstrap_port": bootstrap_port,
-                "bootstrap_room": _generate_bootstrap_room(),
-            }
-        )
+    modified_request = _inject_bootstrap_metadata(
+        request_data, hostname, bootstrap_port, prefill_server
+    )
 
     if request_data.get("stream", False):
         return await lb.generate_stream(
@@ -398,13 +408,8 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
-    modified_request = request_data.copy()
-    modified_request.update(
-        {
-            "bootstrap_host": hostname,
-            "bootstrap_port": bootstrap_port,
-            "bootstrap_room": _generate_bootstrap_room(),
-        }
+    modified_request = _inject_bootstrap_metadata(
+        request_data, hostname, bootstrap_port, prefill_server
     )
 
     if request_data.get("stream", False):
