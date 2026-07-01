@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import re
 from typing import Any, Dict, List, Tuple
 
@@ -10,6 +11,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import is_json_finite
 
 logger = logging.getLogger(__name__)
 
@@ -178,9 +180,12 @@ class MinimaxM2Detector(BaseFormatDetector):
             elif param_type in ["number", "float"]:
                 try:
                     val = float(value)
-                    return val if val != int(val) else int(val)
                 except (ValueError, TypeError):
                     continue
+                # inf/nan: int(val) raises and they serialize to invalid JSON.
+                if not math.isfinite(val):
+                    continue
+                return val if val != int(val) else int(val)
             elif param_type in ["boolean", "bool"]:
                 lower_val = value.lower().strip()
                 if lower_val in ["true", "1", "yes", "on"]:
@@ -190,15 +195,19 @@ class MinimaxM2Detector(BaseFormatDetector):
                 continue
             elif param_type in ["object", "array"]:
                 try:
-                    return json.loads(value)
+                    parsed = json.loads(value)
                 except json.JSONDecodeError:
                     continue
+                if is_json_finite(parsed):
+                    return parsed
+                continue
 
         # Fallback: try JSON parse, then return as string
         try:
-            return json.loads(value)
+            parsed = json.loads(value)
         except json.JSONDecodeError:
             return value
+        return parsed if is_json_finite(parsed) else value
 
     def _get_param_types_from_config(
         self, param_name: str, param_config: dict

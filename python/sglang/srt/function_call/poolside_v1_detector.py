@@ -183,10 +183,10 @@ class PoolsideV1Detector(BaseFormatDetector):
         for decoder in decoders:
             try:
                 result = decoder(raw)
-                # ast.literal_eval can return non-JSON-serializable values
-                # (sets, complex numbers); reject so json.dumps downstream
-                # doesn't choke.
-                json.dumps(result)
+                # Reject values json.dumps can't emit as valid JSON: sets/complex
+                # from ast.literal_eval (TypeError), and non-finite floats like
+                # "[1e999]" -> [inf] (ValueError under allow_nan=False).
+                json.dumps(result, allow_nan=False)
                 return result
             except (ValueError, SyntaxError, TypeError):
                 continue
