@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from enum import Enum
 from typing import TYPE_CHECKING, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,10 @@ from sglang.srt.layers.utils import MultiPlatformOp, copy_or_rebind_param
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_device_sm,
     is_cpu,
+    is_cuda,
+    is_flashinfer_available,
     is_hip,
     is_npu,
     set_weight_attrs,
@@ -46,11 +50,13 @@ if TYPE_CHECKING:
         DispatchOutput,
         StandardDispatchOutput,
     )
+    from sglang.srt.server_args import ServerArgs
 
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
+_is_cuda = is_cuda()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -60,6 +66,99 @@ if _use_aiter:
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+
+
+class Bf16GemmBackend(Enum):
+    """Enum for unquantized BF16 GEMM backend selection."""
+
+    AUTO = "auto"
+    FLASHINFER = "flashinfer"
+
+    def is_auto(self) -> bool:
+        return self == Bf16GemmBackend.AUTO
+
+    def is_flashinfer(self) -> bool:
+        return self == Bf16GemmBackend.FLASHINFER
+
+
+_BF16_GEMM_BACKEND: Optional[Bf16GemmBackend] = None
+mm_bf16_tgv_or_cublaslt = None
+
+
+def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
+    """Initialize the unquantized BF16 GEMM backend configuration."""
+    global _BF16_GEMM_BACKEND, mm_bf16_tgv_or_cublaslt
+
+    backend = Bf16GemmBackend(server_args.bf16_gemm_backend)
+
+    if backend.is_flashinfer():
+        if not (_is_cuda and is_flashinfer_available()):
+            raise RuntimeError(
+                "FlashInfer BF16 GEMM requested via --bf16-gemm-backend=flashinfer, "
+                "but it's not available. This backend requires an NVIDIA GPU with "
+                "FlashInfer installed."
+            )
+
+        from flashinfer.cute_dsl.utils import is_cute_dsl_available
+        from flashinfer.gemm import mm_bf16
+
+        if not (
+            mm_bf16.is_backend_supported("tgv", get_device_sm())
+            and is_cute_dsl_available()
+        ):
+            raise RuntimeError(
+                "FlashInfer BF16 GEMM requested via --bf16-gemm-backend=flashinfer, "
+                "but it's not supported on this GPU/FlashInfer build. This backend "
+                "requires Blackwell (SM100) GPUs with FlashInfer CuTe DSL support."
+            )
+
+        from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE, bf16_gemm_sm100
+        from flashinfer.utils import _get_cache_buf
+
+        from sglang.jit_kernel.utils import is_arch_support_pdl
+        from sglang.srt.utils.custom_op import register_custom_op_from_extern
+
+        tgv_pdl_enabled = is_arch_support_pdl()
+
+        def _mm_bf16_tgv_or_cublaslt(
+            a: torch.Tensor,
+            b: torch.Tensor,
+            bias: Optional[torch.Tensor],
+        ) -> torch.Tensor:
+            out = torch.empty(
+                (a.shape[0], b.shape[1]), dtype=torch.bfloat16, device=a.device
+            )
+            workspace = _get_cache_buf(
+                "mm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+            )
+            runner_names = ["tgv"] if bias is not None else ["tgv", "cublaslt"]
+            bf16_gemm_sm100(a, b, bias, tgv_pdl_enabled, out, workspace, runner_names)
+            return out
+
+        def _mm_bf16_tgv_or_cublaslt_fake(
+            a: torch.Tensor,
+            b: torch.Tensor,
+            bias: Optional[torch.Tensor],
+        ) -> torch.Tensor:
+            return torch.empty(
+                (a.shape[0], b.shape[1]), dtype=torch.bfloat16, device=a.device
+            )
+
+        mm_bf16_tgv_or_cublaslt = register_custom_op_from_extern(
+            _mm_bf16_tgv_or_cublaslt,
+            op_name="mm_bf16_tgv_or_cublaslt",
+            fake_impl=_mm_bf16_tgv_or_cublaslt_fake,
+        )
+
+    _BF16_GEMM_BACKEND = backend
+
+
+def get_bf16_gemm_backend() -> Bf16GemmBackend:
+    """Get the current unquantized BF16 GEMM backend."""
+    global _BF16_GEMM_BACKEND
+    if _BF16_GEMM_BACKEND is None:
+        _BF16_GEMM_BACKEND = Bf16GemmBackend.AUTO
+    return _BF16_GEMM_BACKEND
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -151,6 +250,21 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
+
+        elif (
+            get_bf16_gemm_backend().is_flashinfer()
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and (bias is None or bias.dtype == torch.bfloat16)
+        ):
+            x_shapes = x.shape
+            if len(x_shapes) != 2:
+                x = x.view(-1, x_shapes[-1])
+            output = mm_bf16_tgv_or_cublaslt(x, layer.weight.T, bias)
+            if len(x_shapes) != 2:
+                output = output.view(*x_shapes[:-1], -1)
+            return output
 
         return F.linear(x, layer.weight, bias)
 
