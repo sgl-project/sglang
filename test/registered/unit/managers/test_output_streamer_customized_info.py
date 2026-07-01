@@ -7,6 +7,9 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
     _GenerationStreamAccumulator,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class _FakeReq:
@@ -72,9 +75,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
                 customized_info={"probe": [200, 201, 202]},
             )
         )
-        accumulator.accept(
-            req=_FakeReq("r2", [30], customized_info={"other": [300]})
-        )
+        accumulator.accept(req=_FakeReq("r2", [30], customized_info={"other": [300]}))
 
         payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
         customized_info = unwrap_from_pickle(payload.customized_info)
