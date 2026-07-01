@@ -14,9 +14,16 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-# FlashKDA runs on SM90+ (Hopper and newer); same single-GPU kernel-unit suite as
-# the other KDA kernel tests.
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+# SM90+ single-GPU kernel-unit suite. Disabled in CI: flash_kda is not in the
+# public runner image, and the module-level pytest.skip aborts non-zero under
+# `python3 file.py`. Drop `disabled=` once flash_kda ships in the runner image;
+# still runs locally / on internal CI where it is installed.
+register_cuda_ci(
+    est_time=20,
+    stage="base-b",
+    runner_config="1-gpu-large",
+    disabled="flash_kda not in public CI runner image (only on Ant-internal PyPI)",
+)
 
 if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9):
     pytest.skip(
