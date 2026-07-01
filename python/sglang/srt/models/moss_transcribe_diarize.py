@@ -112,9 +112,7 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
             raise ValueError(
                 "MOSS-Transcribe-Diarize audio item is missing audio_feature_lengths."
             )
-        audio_feature_lengths = audio_feature_lengths.to(
-            device=device, dtype=torch.long
-        )
+        audio_feature_lengths = audio_feature_lengths.to(device="cpu", dtype=torch.long)
         if audio_feature_lengths.numel() != input_features.shape[0]:
             raise ValueError(
                 "audio_feature_lengths must contain one length per input_features chunk: "
@@ -124,12 +122,10 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
         audio_chunk_mapping = getattr(item, "audio_chunk_mapping", None)
         if audio_chunk_mapping is None:
             audio_chunk_mapping = torch.zeros(
-                input_features.shape[0], dtype=torch.long, device=device
+                input_features.shape[0], dtype=torch.long, device="cpu"
             )
         else:
-            audio_chunk_mapping = audio_chunk_mapping.to(
-                device=device, dtype=torch.long
-            )
+            audio_chunk_mapping = audio_chunk_mapping.to(device="cpu", dtype=torch.long)
         if audio_chunk_mapping.numel() != input_features.shape[0]:
             raise ValueError(
                 "audio_chunk_mapping must contain one sample index per input_features chunk: "
@@ -148,15 +144,15 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
             forward_batch,
         )
 
-        num_audios = (
-            int(audio_chunk_mapping.max().item()) + 1
-            if audio_chunk_mapping.numel()
-            else 0
-        )
+        audio_feature_lengths_list = audio_feature_lengths.tolist()
+        audio_chunk_mapping_list = audio_chunk_mapping.tolist()
+        num_audios = 0
+        if audio_chunk_mapping_list:
+            num_audios = max(audio_chunk_mapping_list) + 1
         per_audio_chunks = [[] for _ in range(num_audios)]
         merge_size = int(self.config.audio_merge_size)
-        for chunk_idx, token_len in enumerate(audio_feature_lengths.tolist()):
-            sample_idx = int(audio_chunk_mapping[chunk_idx].item())
+        for chunk_idx, token_len in enumerate(audio_feature_lengths_list):
+            sample_idx = audio_chunk_mapping_list[chunk_idx]
             per_audio_chunks[sample_idx].append(
                 whisper_features[
                     chunk_idx : chunk_idx + 1, : int(token_len) * merge_size
@@ -166,6 +162,8 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
         adapted = []
         adaptor_dtype = next(self.vq_adaptor.parameters()).dtype
         for parts in per_audio_chunks:
+            if not parts:
+                continue
             feat = torch.cat(parts, dim=1).to(dtype=adaptor_dtype)
             merged = self.time_merge(feat)
             adapted.append(self.vq_adaptor(merged).squeeze(0))
