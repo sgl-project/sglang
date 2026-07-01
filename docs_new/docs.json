@@ -1240,6 +1240,13 @@
                     ]
                   },
                   {
+                    "group": "OmniDreams",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/OmniDreams/OmniDreams"
+                    ]
+                  },
+                  {
                     "group": "SANA-WM",
                     "tag": "NEW",
                     "pages": [

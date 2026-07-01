@@ -86,6 +86,7 @@ sglang serve --model-path ... --num-gpus 4 --ulysses-degree 2 --ring-degree 2
 sglang serve --model-path ... --num-gpus 2 --tp-size 2
 ```
 
+
 ## Testing
 
 ```bash
@@ -110,3 +111,4 @@ Defined in `envs.py` (300+ vars). Key ones:
 - `SGLANG_DIFFUSION_ATTENTION_BACKEND` — attention backend override
 - `SGLANG_CACHE_DIT_ENABLED` — enable Cache-DiT acceleration
 - `SGLANG_CLOUD_STORAGE_TYPE` — cloud output storage (s3, etc.)
+- `SGLANG_OMNIDREAMS_CUDA_GRAPH` — force-enable AR-rollout DiT CUDA-graph capture

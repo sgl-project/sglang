@@ -949,6 +949,18 @@ class SamplingParams:
             ),
         )
         add_argument(
+            "--hdmap-path",
+            type=str,
+            nargs="+",
+            help=(
+                "HD-map conditioning input for OmniDreams autoregressive video "
+                "generation (the central per-frame control signal). Pass a video "
+                "path (decoded to per-frame rasters), a per-frame list of image "
+                "paths, or a single image (broadcast fallback, no motion), e.g.: "
+                "--hdmap-path scene_hdmap.mp4  OR  --hdmap-path f0.png f1.png ..."
+            ),
+        )
+        add_argument(
             "--action",
             type=str,
             help=(

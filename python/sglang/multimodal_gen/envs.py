@@ -34,6 +34,16 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
+    # OmniDreams: force-enable the AR-rollout DiT CUDA-graph capture even when
+    # the pipeline config leaves it off. Overrides OmniDreamsPipelineConfig.enable_cuda_graph.
+    SGLANG_OMNIDREAMS_CUDA_GRAPH: bool = False
+    # OmniDreams: path to W8A8 FP8 text encoder (compressed-tensors format).
+    SGLANG_OMNIDREAMS_TEXT_ENCODER_FP8_PATH: str | None = None
+    # OmniDreams: self-attention backend for the AR DiT ("sdpa" | "sage3").
+    # sage3 routes self-attn through the sageattn3 Blackwell kernel (FP4); only
+    # applies to self-attn (cross-attn always uses sdpa). Falls back to sdpa on
+    # CPU / unsupported head_dim / missing sageattn3. Phase 2.
+    SGLANG_OMNIDREAMS_ATTN_BACKEND: str = "sdpa"
     # cache-dit env vars (primary transformer)
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
@@ -258,6 +268,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
+    # OmniDreams: force-enable the AR-rollout DiT CUDA-graph capture/replay.
+    # Overrides OmniDreamsPipelineConfig.enable_cuda_graph when set.
+    "SGLANG_OMNIDREAMS_CUDA_GRAPH": _lazy_bool("SGLANG_OMNIDREAMS_CUDA_GRAPH"),
+    # OmniDreams: W8A8 FP8 text encoder (compressed-tensors format) path.
+    "SGLANG_OMNIDREAMS_TEXT_ENCODER_FP8_PATH": _lazy_str(
+        "SGLANG_OMNIDREAMS_TEXT_ENCODER_FP8_PATH"
+    ),
+    # OmniDreams: self-attn backend (sdpa | sage3). Phase 2.
+    "SGLANG_OMNIDREAMS_ATTN_BACKEND": _lazy_str(
+        "SGLANG_OMNIDREAMS_ATTN_BACKEND", "sdpa"
+    ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(

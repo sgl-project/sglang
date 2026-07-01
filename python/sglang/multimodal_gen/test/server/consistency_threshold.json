@@ -127,6 +127,12 @@
             "psnr_threshold": 24.0,
             "mean_abs_diff_threshold": 10.0
         },
+        "omnidreams_2b_i2v": {
+            "clip_threshold": 0.90,
+            "ssim_threshold": 0.85,
+            "psnr_threshold": 20.0,
+            "mean_abs_diff_threshold": 15.0
+        },
         "ltx_2_two_stage_t2v": {
             "clip_threshold": 0.90,
             "ssim_threshold": 0.89,

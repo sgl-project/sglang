@@ -1,3 +1,4 @@
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -29,6 +30,8 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MULTI_FRAME_I2I_sampling_params,
     MULTI_IMAGE_TI2I_sampling_params,
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
+    OMNIDREAMS_I2V_HDMAP_sampling_params,
+    OMNIDREAMS_I2V_sampling_params,
     SANA_WM_TI2V_CI_sampling_params,
     T2I_sampling_params,
     T2V_sampling_params,
@@ -43,6 +46,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST,
     DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
     DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
+    DEFAULT_OMNIDREAMS_2B_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
@@ -830,6 +834,35 @@ TWO_GPU_CASES = [
         ),
         run_component_accuracy_check=False,
     ),
+    # === OmniDreams (NVIDIA autoregressive video world model) ===
+    DiffusionTestCase(
+        "omnidreams_2b_i2v",
+        DiffusionServerArgs(
+            model_path=DEFAULT_OMNIDREAMS_2B_MODEL_NAME_FOR_TEST,
+            modality="video",
+        ),
+        OMNIDREAMS_I2V_sampling_params,
+        run_perf_check=True,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+    ),
+    # Online HD-map conditioning path. Self-skips unless
+    # SGLANG_OMNIDREAMS_FIRST_FRAME_URL / SGLANG_OMNIDREAMS_HDMAP_URL are set
+    # (gated assets), so it is CI-safe. No GT baseline -> consistency/perf off.
+    DiffusionTestCase(
+        "omnidreams_2b_i2v_hdmap",
+        DiffusionServerArgs(
+            model_path=DEFAULT_OMNIDREAMS_2B_MODEL_NAME_FOR_TEST,
+            modality="video",
+        ),
+        OMNIDREAMS_I2V_HDMAP_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
 ]
 
 if not current_platform.is_hip():
@@ -846,6 +879,43 @@ if not current_platform.is_hip():
     )
 
 ONE_GPU_CASES += ONE_GPU_MODELOPT_FP8_CASES
+
+# === OmniDreams acceleration-path E2E cases (opt-in) ===
+# These exercise the FP8 / LightVAE / LightTAE / Text-Encoder-FP8 paths added by
+# the nested-Config refactor. They are sm_120-only and need extra assets
+# (LightVAE/LightTAE .pth resolved from the model dir; FP8 calibrated states /
+# W8A8 text encoder via env). They are therefore opt-in: set
+# SGLANG_OMNIDREAMS_ACCEL_E2E=1 to register them. Perf/consistency are off until
+# baselines + ground-truth are generated on the target GPU (mirrors the hdmap
+# case); the first goal is a clean no-crash generation per path.
+_OMNIDREAMS_CONFIG_DIR = Path(__file__).resolve().parents[1] / "test_files"
+_OMNIDREAMS_ACCEL_CONFIGS = {
+    "omnidreams_2b_i2v_dit_fp8": "omnidreams_dit_fp8.json",
+    "omnidreams_2b_i2v_lightvae_lighttae": "omnidreams_lightvae_lighttae.json",
+    "omnidreams_2b_i2v_te_fp8": "omnidreams_te_fp8.json",
+    "omnidreams_2b_i2v_mixed_fp8": "omnidreams_mixed_fp8.json",
+}
+if os.environ.get("SGLANG_OMNIDREAMS_ACCEL_E2E"):
+    for _case_id, _cfg_name in _OMNIDREAMS_ACCEL_CONFIGS.items():
+        ONE_GPU_CASES.append(
+            DiffusionTestCase(
+                _case_id,
+                DiffusionServerArgs(
+                    model_path=DEFAULT_OMNIDREAMS_2B_MODEL_NAME_FOR_TEST,
+                    modality="video",
+                    extras=[
+                        "--pipeline-config-path",
+                        str(_OMNIDREAMS_CONFIG_DIR / _cfg_name),
+                    ],
+                ),
+                OMNIDREAMS_I2V_sampling_params,
+                run_perf_check=False,
+                run_consistency_check=False,
+                run_component_accuracy_check=False,
+                run_models_api_check=False,
+            )
+        )
+
 TWO_GPU_CASES = _with_default_num_gpus(TWO_GPU_CASES, 2)
 
 

@@ -1600,10 +1600,9 @@ class AutoencoderKLWan(ParallelTiledVAE):
             self.clear_cache()
             iter_ = z.shape[2]
             x = self.post_quant_conv(z)
+            use_sp = self._should_use_spatial_parallel_decode(z)
             spatial_context = (
-                nullcontext()
-                if self._should_use_spatial_parallel_decode(z)
-                else disable_spatial_parallel_decode()
+                nullcontext() if use_sp else disable_spatial_parallel_decode()
             )
             with spatial_context:
                 with forward_context(
@@ -1613,7 +1612,13 @@ class AutoencoderKLWan(ParallelTiledVAE):
                     for i in range(iter_):
                         feat_idx.set(0)
                         first_chunk.set(i == 0)
-                        out_chunks.append(self.decoder(x[:, :, i : i + 1, :, :]))
+                        chunk = self.decoder(x[:, :, i : i + 1, :, :])
+                        # Non-SP path: stream chunks to CPU so out_chunks (grows
+                        # ~linearly with frames) doesn't OOM. SP keeps shards on
+                        # GPU for intra-layer halo/all-gather.
+                        if not use_sp:
+                            chunk = chunk.cpu()
+                        out_chunks.append(chunk)
                     out = (
                         torch.cat(out_chunks, 2)
                         if len(out_chunks) > 1

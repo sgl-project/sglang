@@ -1,0 +1,247 @@
+---
+title: OmniDreams
+metatags:
+    description: "Serve NVIDIA OmniDreams — an HD-map-conditioned autoregressive driving world model — offline and realtime with SGLang-diffusion."
+tag: REALTIME
+---
+
+## 1. Model Introduction
+
+[NVIDIA OmniDreams](https://research.nvidia.com/labs/sil/projects/omnidreams-blog/) is an HD-map-conditioned autoregressive world model for single-view (and multi-view) driving-video generation, built on Cosmos-Predict2.5-2B and distilled to a 2-step Self-Forcing flow-match schedule. Given a first frame and a **per-frame HD-map** control signal (lane lines + actor bounding boxes), it rolls out a temporally-coherent driving video one chunk at a time over a rolling block KV cache.
+
+In SGLang-diffusion OmniDreams belongs to the **realtime causal path** (like LingBot World): the server keeps a live session, samples per-chunk HD-map control events, reuses causal DiT + VAE state, and decodes frames incrementally. It also works as a one-shot offline generator.
+
+<div style={{border: "1px solid #dbe3ef", borderRadius: "16px", overflow: "hidden", background: "linear-gradient(135deg, #ffffff 0%, #f8fafc 48%, #ecfeff 100%)", boxShadow: "0 14px 36px rgba(15, 23, 42, 0.08)", margin: "22px 0 28px 0"}}>
+  <div style={{display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px", padding: "18px 22px", borderBottom: "1px solid #e2e8f0"}}>
+    <div>
+      <div style={{fontSize: "20px", fontWeight: 750, color: "#0f172a", lineHeight: 1.2}}>OmniDreams</div>
+      <div style={{fontSize: "13px", color: "#64748b", marginTop: "5px"}}>HD-map-conditioned AR driving world model in SGLang-diffusion</div>
+    </div>
+    <div style={{display: "inline-flex", alignItems: "center", whiteSpace: "nowrap", border: "1px solid #bae6fd", background: "#e0f2fe", color: "#0369a1", borderRadius: "999px", padding: "8px 12px", fontSize: "13px", fontWeight: 800}}>
+      first frame + HD-map &rarr; streaming driving video
+    </div>
+  </div>
+  <div style={{display: "grid", gridTemplateColumns: "170px 1fr"}}>
+    <div style={{padding: "12px 22px", borderBottom: "1px solid #edf2f7", color: "#64748b", fontWeight: 700, background: "rgba(248, 250, 252, 0.72)"}}>Category</div>
+    <div style={{padding: "12px 22px", borderBottom: "1px solid #edf2f7", color: "#1e293b"}}>
+      <span style={{display: "inline-block", marginRight: "6px", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>realtime</span>
+      <span style={{display: "inline-block", marginRight: "6px", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>world model</span>
+      <span style={{display: "inline-block", marginRight: "6px", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>causal DiT</span>
+      <span style={{display: "inline-block", marginRight: "6px", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>HD-map control</span>
+    </div>
+    <div style={{padding: "12px 22px", borderBottom: "1px solid #edf2f7", color: "#64748b", fontWeight: 700, background: "rgba(248, 250, 252, 0.72)"}}>Inputs</div>
+    <div style={{padding: "12px 22px", borderBottom: "1px solid #edf2f7", color: "#1e293b"}}>Prompt, first frame, and a per-frame HD-map raster sequence (lane lines + actor boxes)</div>
+    <div style={{padding: "12px 22px", borderBottom: "1px solid #edf2f7", color: "#64748b", fontWeight: 700, background: "rgba(248, 250, 252, 0.72)"}}>Outputs</div>
+    <div style={{padding: "12px 22px", borderBottom: "1px solid #edf2f7", color: "#1e293b"}}>Driving video — one-shot via <code>/v1/videos</code>, or streaming chunks over <code>/v1/realtime_video/generate</code></div>
+    <div style={{padding: "12px 22px", color: "#64748b", fontWeight: 700, background: "rgba(248, 250, 252, 0.72)"}}>Core runtime</div>
+    <div style={{padding: "12px 22px", color: "#1e293b"}}>Condition event queue, block KV cache (sink + rolling window), causal LightVAE/WanVAE decode cache, realtime session state</div>
+  </div>
+</div>
+
+This differs from offline diffusion video models such as Wan or LTX, which denoise a bounded latent sequence for one request. OmniDreams autoregresses chunk by chunk, so the runtime manages session state, HD-map control events, a rolling block KV cache, and a causal VAE decode cache. The HD-map is **mandatory** — without it the rollout goes out-of-distribution and collapses to gray mush after ~2 frames.
+
+**References:** [NVIDIA OmniDreams blog](https://research.nvidia.com/labs/sil/projects/omnidreams-blog/) · [FlashDreams model page](https://nvidia.github.io/flashdreams/main/models/omnidreams.html) · [FlashDreams latency tuning](https://nvidia.github.io/flashdreams/main/developer_guides/latency_tuning.html) · model card `nvidia/omni-dreams-models` · sample clips `nvidia/omni-dreams-samples` (gated).
+
+**Requirements:** ≥ 48 GB VRAM, PyTorch ≥ 2.11, Blackwell (SM 12.x) for the SageAttention-3 / FP8-compute paths; older GPUs fall back to eager bf16 + SDPA.
+
+## 2. Deployment
+
+```bash Command
+sglang serve \
+  --model-path nvidia/omni-dreams-models \
+  --pipeline-class-name OmniDreamsPipeline \
+  --num-gpus 1 \
+  --warmup false
+```
+
+The model path must contain `omni-dreams` so the registry detector resolves `OmniDreamsPipeline`. On a single 85 GB GPU no offload flags are needed; on smaller cards add `--dit-cpu-offload` (and `--text-encoder-cpu-offload` to drop peak VRAM by ~15 GB — the text encoder runs once per prompt and is cached).
+
+To pick a specific acceleration mode, pass a pipeline-config JSON via `--pipeline-config-path` (see [§5 Performance tuning](#5-performance-tuning)).
+
+## 3. Realtime WebUI
+
+The shared realtime WebUI is useful for validating latency, frame transport, and HD-map control behavior:
+
+```bash Command
+python -m http.server 18080 -d python/sglang/multimodal_gen/apps/realtime_webui
+```
+
+Open `http://127.0.0.1:18080` and point the WebSocket at:
+
+```text Example
+ws://127.0.0.1:30000/v1/realtime_video/generate
+```
+
+## 4. HTTP and WebSocket API
+
+OmniDreams exposes both a one-shot HTTP API and a streaming realtime WebSocket. The realtime endpoint keeps one live session, generates one AR chunk at a time, and accepts runtime HD-map / prompt events while generation is running.
+
+### Endpoints
+
+| API | Method | Purpose | Notes |
+| --- | --- | --- | --- |
+| `/v1/videos` | `POST` | One-shot offline generation. | `hdmap_path` + `reference_url` over HTTP must be `http(s)://` / `data:` URLs — local FS paths are rejected by an arbitrary-file-read guard. |
+| `/v1/videos/{id}` | `GET` | Poll one-shot job status. | `status` → `queued` → `completed` / `failed`. |
+| `/v1/realtime_video/generate` | `WebSocket` | Create one realtime OmniDreams session and stream generated chunks. | First client message must be an `init` message encoded with MessagePack. |
+
+### `init` message (realtime)
+
+Send this MessagePack map immediately after the WebSocket opens. Fields extend the shared `RealtimeVideoGenerationsRequest`.
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `type` | string | Yes | Must be `"init"`. |
+| `model` | string | No | Model id. Leave empty to use the served model. |
+| `prompt` | string | Yes | Scene description for the initial chunk. |
+| `first_frame` | bytes or string | Yes | Initial reference image. Send raw bytes, or a server-readable path / `data:` URL. |
+| `size` | string | Yes | Generation size as `WIDTHxHEIGHT`, e.g. `1280x704`. Must be a multiple of 16. |
+| `fps` | number | Yes | Target playback FPS (default 30). |
+| `num_frames` | integer | Yes | Frames per generated chunk. OmniDreams uses chunked AR generation; chunk 0 emits `1 + (len_t-1)*4` frames, steady-state chunks emit `len_t*4` (default `len_t=2` → 5 then 8). |
+| `seed` | integer | No | Random seed (default 42). |
+| `num_inference_steps` | integer | No | Denoise steps per chunk. Default `2` (distilled). |
+| `guidance_scale` | number | No | CFG scale. Default `1.0` (distilled, no CFG). |
+| `negative_prompt` | string | No | Negative prompt. |
+| `max_chunks` | integer | No | Stop after this many chunks. Omit for a continuous session. |
+| `realtime_causal_sink_size` | integer | No | Sink frames retained in the block KV cache (default `sink_size_t=0`). |
+| `realtime_causal_kv_cache_num_frames` | integer | No | Rolling window size in latent frames (default `window_size_t=6`). |
+| `realtime_output_format` | `"raw"`, `"webp"`, `"jpeg"` | No | Frame transport. `webp`/`jpeg` send encoded preview frames; `raw` sends raw RGB; omit for lossless delta-gzip RGB. |
+| `realtime_preview_max_width` | integer | No | Downscale preview frames to this max width. |
+| `realtime_output_pacing` | boolean | No | Pace frame sends to target FPS. |
+
+### Runtime `event` messages
+
+After `init`, send MessagePack event maps to update the live session. OmniDreams supports two event kinds:
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `type` | string | Yes | Must be `"event"`. |
+| `kind` | `"prompt"` or `"hdmap"` | Yes | Runtime event kind. |
+| `payload` | see below | Yes | The control signal. |
+| `event_id` | integer | No | Client sequence id; echoed in `chunk_stats` after the event is sampled. |
+
+**`prompt`** — a non-empty string. The most recent queued prompt is sampled at the next chunk; older queued prompts are replaced (latest wins).
+
+**`hdmap`** — the per-chunk HD-map raster(s). The payload is one of:
+- `bytes` — a single JPEG/PNG image for one HD-map frame.
+- `list[bytes]` — one JPEG/PNG per latent frame in the chunk (`len_t` items). The queue samples exactly `len_t` frames.
+- `str` — a base64-encoded JPEG/PNG, a `data:` URL, or a server-readable file path.
+
+If fewer than `len_t` frames have arrived when a chunk is sampled, the last received frame is tiled forward (graceful degradation under a lagging client). Before any HD-map event has ever arrived, the denoise stage falls back to a zeros HD-map.
+
+### Server messages
+
+| Message | Payload | Meaning |
+| --- | --- | --- |
+| `frame_batch` | MessagePack map with `payload` bytes | One batch of frames. Includes `chunk_index`, `num_frames`, `content_type`, `encoding`, `width`, `height`, and frame-batch metadata. |
+| `chunk_stats` | MessagePack map | Per-chunk timing and transport metrics (see below). |
+| `error` | MessagePack map | Server-side validation or generation error. |
+
+`chunk_stats` fields: `chunk_index`, `event_id`, `request_prepare_ms`, `scheduler_forward_ms`, `pace_wait_ms`, `header_write_ms`, `raw_payload_build_ms`, `raw_write_ms`, `ws_write_ms`, `chunk_total_ms`, `num_batches`, `num_frames`, `raw_bytes`, `ws_payload_bytes`, `content_type`. Use `scheduler_forward_ms` for model-side per-chunk latency and `chunk_total_ms` for end-to-end chunk latency.
+
+### Minimal client sketch
+
+```python Python
+import msgspec.msgpack
+import websocket
+
+ws = websocket.create_connection("ws://127.0.0.1:30000/v1/realtime_video/generate")
+ws.send_binary(msgspec.msgpack.encode({
+    "type": "init",
+    "prompt": "A car driving down a city street at dusk.",
+    "first_frame": open("first_frame.png", "rb").read(),
+    "size": "1280x704",
+    "fps": 30,
+    "num_frames": 8,
+    "num_inference_steps": 2,
+    "guidance_scale": 1,
+    "realtime_output_format": "webp",
+}))
+
+# Push per-chunk HD-map rasters (one JPEG per latent frame in the chunk).
+ws.send_binary(msgspec.msgpack.encode({
+    "type": "event",
+    "kind": "hdmap",
+    "event_id": 1,
+    "payload": [open("hdmap_f0.jpg", "rb").read(), open("hdmap_f1.jpg", "rb").read()],
+}))
+
+while True:
+    msg = msgspec.msgpack.decode(ws.recv())
+    if msg["type"] == "frame_batch":
+        frames = msg["payload"]  # bytes: decode per content_type/encoding
+    elif msg["type"] == "chunk_stats":
+        print(f"chunk {msg['chunk_index']}: forward={msg['scheduler_forward_ms']}ms total={msg['chunk_total_ms']}ms")
+```
+
+### One-shot HTTP example
+
+```bash Command
+curl -s http://127.0.0.1:30000/v1/videos -H "Content-Type: application/json" \
+  -d '{"prompt":"A car driving down a city street",
+       "reference_url":"http://127.0.0.1:8000/first_frame.png",
+       "hdmap_path":"http://127.0.0.1:8000/<clip>_hdmap.mp4",
+       "num_frames":29,"height":704,"width":1280,"seed":42,
+       "output_path":"outputs/omnidreams"}'
+```
+
+Serve a local sample clip over HTTP with `python -m http.server 8000 -d <clip_dir>` so `reference_url` / `hdmap_path` are reachable `http://` URLs.
+
+## 5. Performance tuning
+
+OmniDreams latency has two components, matching the [FlashDreams latency-tuning guide](https://nvidia.github.io/flashdreams/main/developer_guides/latency_tuning.html): **model/chunk latency** (HD-map prep + DiT + VAE decode) and **video-transport latency** (delivering frames to the viewer). Tune the model path first.
+
+### Acceleration modes
+
+Set `native_dit_acceleration` in a pipeline-config JSON (passed via `--pipeline-config-path`):
+
+| Mode | DiT compute | Attention | Notes |
+| --- | --- | --- | --- |
+| `disabled` (default) | eager bf16 | SDPA | Runs everywhere; baseline. |
+| `weight_only_fp8` | eager bf16 on dequantized FP8 weights | SDPA | Pre-quantized E4M3 weights dequantized to bf16 once (first request), then cached. Same steady-state latency as eager; ~first-request dequant cost. |
+| `fp8_compute` | FP8-compute GEMM via `torch._scaled_mm` | SageAttention-3 (sgl-kernel FP4) | Blackwell (SM 12.x) only. Set `omnidreams_attn_backend: "sage3"`. Falls back to SDPA on CPU / unsupported head-dim / GQA. |
+
+```json pipeline_config.json
+{
+  "native_dit_acceleration": "weight_only_fp8",
+  "omnidreams_attn_backend": "sdpa",
+  "image_encoder_config": {"impl": "lightvae"},
+  "encoder_config": {"impl": "lightvae"},
+  "decoder_config": {"impl": "lighttae"}
+}
+```
+
+`auto` / `required` are accepted as inert back-compat aliases (mapped to `disabled` / `weight_only_fp8` with a warning) so shipped JSON configs keep loading.
+
+### Resolution
+
+Resolution is the highest-impact latency knob — it changes HD-map, DiT, and VAE work per chunk. Tested aspect-compatible sizes (width × height, multiples of 16): `1280×704` (default), `1168×640`, `1024×560`, `896×496`, `640×352`. Lower resolution reduces per-chunk compute and transport payload, with an expected quality tradeoff.
+
+### Chunk geometry
+
+Chunk size is **not** an arbitrary latency knob — it is fixed by the distilled checkpoint:
+
+- Chunk 0 (i2v anchor): `1 + (len_t - 1) * 4` pixel frames.
+- Steady-state chunks: `len_t * 4` pixel frames.
+- Default `len_t = 2` → 5 frames then 8 frames. At 30 FPS an 8-frame chunk covers ~267 ms of video.
+
+The block KV cache window is `window_size_t = 6` latent frames with `sink_size_t = 0` sink tokens. Override per-request via `realtime_causal_kv_cache_num_frames` / `realtime_causal_sink_size` on the realtime `init` message. `len_t`, `window_size_t`, `sink_size_t` live on `OmniDreamsSamplingParams`.
+
+### VAE choice
+
+- **LightVAE + LightTAE** (streaming, pruned VAEs): lowest latency, no native extension. Use `omnidreams_lightvae_lighttae.json`.
+- **WanVAE** (full-quality): higher fidelity, higher VRAM. Used by `omnidreams_dit_fp8.json`.
+
+### Offload
+
+On < 48 GB cards add `--dit-cpu-offload`; add `--text-encoder-cpu-offload` to drop peak VRAM ~15 GB further (text encoder runs once per prompt and is cached). On ≥ 80 GB cards no offload is needed.
+
+## 6. Consistency
+
+OmniDreams uses HD-map-motion consistency: generated frame-to-frame pixel diff must be non-zero (the viewpoint moves because the HD-map raster shifts per frame) and per-frame std must stay stable (no gray-mush collapse). A frozen-angle rollout (zero within-chunk diff) indicates the HD-map was omitted or broadcast — that is OOD collapse, not a serving bug. Use raw-frame transport (`realtime_output_format: "raw"`) for consistency checks; use `webp`/`jpeg` for interactive preview.
+
+## 7. Notes
+
+- HD-map is **mandatory**. Without it the rollout collapses to gray after ~2 frames.
+- Use the realtime endpoint (`/v1/realtime_video/generate`) for interactive sessions; use `/v1/videos` for one-shot generation.
+- `weight_only_fp8` has a one-time dequant cost on the first request (cached for reuse); steady-state latency matches eager bf16.
+- The realtime adapter is open-loop today: it does not block on a fresh HD-map per chunk (it repeats the last frame when the queue lags). Closed-loop per-chunk HD-map conditioning is planned.

@@ -1298,6 +1298,45 @@ def get_generate_fn(
                 extra_body=extra_body if extra_body else None,
             )
 
+    def generate_hdmap_i2v(case_id, client) -> tuple[str, bytes]:
+        """OmniDreams I2V with per-frame HD-map conditioning.
+
+        Sends a JSON body (not multipart): both ``reference_url`` (first frame)
+        and ``hdmap_path`` ride in ``extra_body``. The multipart upload path
+        silently drops declared request fields like ``hdmap_path``, so this
+        dedicated helper is the only harness route that actually conditions on
+        the HD-map. Assets are URLs (gated sample data is not in CI), so the
+        case is skipped unless both are configured.
+        """
+        if not sampling_params.prompt:
+            pytest.skip(f"{case_id}: no text prompt configured")
+        if not sampling_params.image_path or not sampling_params.hdmap_path:
+            pytest.skip(
+                f"{case_id}: hdmap i2v needs image_path + hdmap_path URLs "
+                "(set SGLANG_OMNIDREAMS_FIRST_FRAME_URL / SGLANG_OMNIDREAMS_HDMAP_URL)"
+            )
+
+        extra_body: dict[str, Any] = {
+            "reference_url": sampling_params.image_path,
+            "hdmap_path": sampling_params.hdmap_path,
+        }
+        extra_body.update(sampling_params.extras)
+        if sampling_params.num_frames:
+            extra_body["num_frames"] = sampling_params.num_frames
+        if sampling_params.fps:
+            extra_body["fps"] = sampling_params.fps
+
+        return _create_and_download_video(
+            client,
+            case_id,
+            model=model_path,
+            prompt=sampling_params.prompt,
+            size=output_size,
+            seconds=video_seconds,
+            extra_body=extra_body,
+            expected_frame_count=sampling_params.num_frames,
+        )
+
     def generate_text_url_image_to_video(case_id, client) -> tuple[str, bytes]:
         if not sampling_params.prompt or not sampling_params.image_path:
             pytest.skip(f"{case_id}: no edit config")
@@ -1504,7 +1543,9 @@ def get_generate_fn(
     if modality == "3d":
         fn = generate_mesh
     elif modality == "video":
-        if sampling_params.realtime_num_chunks is not None:
+        if sampling_params.hdmap_path is not None:
+            fn = generate_hdmap_i2v
+        elif sampling_params.realtime_num_chunks is not None:
             fn = generate_realtime_video
         elif sampling_params.image_path and sampling_params.prompt:
             if getattr(sampling_params, "direct_url_test", False):

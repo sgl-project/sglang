@@ -2846,6 +2846,14 @@
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 592.3
         },
+        "omnidreams_2b_i2v": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 135.0
+        },
         "qwen_image_2512_modelopt_nvfp4_t2i": {
             "stages_ms": {},
             "denoise_step_ms": {},
