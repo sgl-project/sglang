@@ -34,7 +34,7 @@ runtime:
   page_size: 256
   max_running_requests: 256
   chunked_prefill_size: 8192
-  swa_full_tokens_ratio: 0.1
+  swa_full_tokens_ratio: 0.2
 
 # MTP / EAGLE speculative decoding (NextN head from the base model). Applied to
 # both prefill and decode. Flags mirror
