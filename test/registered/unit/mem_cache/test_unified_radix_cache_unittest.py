@@ -2564,13 +2564,14 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, leaf)
 
         locked = next(iter(tree.root_node.children.values()))
+        locked_len = len(locked.key)
         lock_result = tree.inc_lock_ref(locked)
         try:
             self._evict_with_dense_swa_checkpoints(
                 tree, EvictParams(num_tokens=0, swa_num_tokens=1)
             )
             self.assertIn(locked.key.child_key(ps), tree.root_node.children)
-            self.assertEqual(len(locked.key), len(base))
+            self.assertEqual(len(locked.key), locked_len)
             self.assertIsNotNone(locked.component_data[ComponentType.SWA].value)
         finally:
             tree.dec_lock_ref(locked, lock_result.to_dec_params())
