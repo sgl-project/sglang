@@ -62,6 +62,7 @@ class SchedulerRequestReceiver:
     max_recv_per_poll: int
     stream_output: Callable[..., None]
     get_last_forward_mode: Callable[[], Any]
+    skip_shm_flush: Callable[[], bool] = lambda: False
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
@@ -236,6 +237,8 @@ class SchedulerRequestReceiver:
         # Unwrap shared memory features AFTER all broadcasts complete,
         # so that ShmPointerMMData metadata (not full tensor data) is what
         # gets serialized during broadcast_pyobj.
+        if self.skip_shm_flush():
+            return
         if recv_reqs:
             if self.model_config.is_multimodal and has_shm_features(recv_reqs):
                 # The broadcast source returns with its original objects while
