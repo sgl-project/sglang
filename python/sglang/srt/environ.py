@@ -232,6 +232,14 @@ class Envs:
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
+    # Scheduler GC management (see managers/scheduler_gc_manager.py):
+    # defer automatic gen-2 collections and run full GC at idle instead, so a
+    # stop-the-world pause in one TP rank cannot stall the whole TP group
+    # mid-batch.
+    SGLANG_ENABLE_SCHEDULER_GC_MANAGEMENT = EnvBool(True)
+    SGLANG_SCHEDULER_IDLE_GC_INTERVAL = EnvFloat(300.0)
+    SGLANG_SCHEDULER_GC_GEN2_THRESHOLD = EnvInt(10000)
+
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)

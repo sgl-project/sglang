@@ -215,6 +215,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
+from sglang.srt.managers.scheduler_gc_manager import SchedulerGCManager
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
@@ -1107,6 +1108,10 @@ class Scheduler(
         # Configure GC logger
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
+
+        # Keep stop-the-world GC pauses away from the batch critical path
+        # (a gen-2 pause in one TP rank stalls every rank).
+        self.gc_manager = SchedulerGCManager()
 
     def init_disaggregation(self):
         self.mm_receiver = None
@@ -3524,6 +3529,9 @@ class Scheduler(
 
         # Publish the idle state so /get_loads and DP balancing do not see stale load.
         self.publish_load_snapshot(force=True)
+
+        # reclaim cyclic garbage while a pause cannot stall in-flight batches
+        self.gc_manager.on_idle()
 
         # sleep until next event
         self.maybe_sleep_on_idle()
