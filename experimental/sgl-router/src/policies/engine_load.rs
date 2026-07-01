@@ -158,26 +158,63 @@ impl EngineLoadTable {
         self.expected.len()
     }
 
-    /// One pass over the table returning, per worker URL, the summed queue
+    /// Shared accumulation pass behind [`Self::snapshot_fresh`] (and used
+    /// directly by `cache_aware_zmq::WorkerLoads`, which needs both halves):
+    /// one walk of the table, per worker URL, producing the summed queue
     /// depth (`num_running_reqs + num_waiting_reqs`) across that worker's
-    /// ranks — **but only for workers whose every known rank is fresh**. A
-    /// worker with any stale rank is omitted, so the caller falls back to its
-    /// own load signal. (Summing only the fresh ranks would make a worker
-    /// whose other ranks went silent look misleadingly idle and draw *more*
-    /// traffic.) Computed once per selection so per-worker lookups are O(1).
-    pub fn snapshot_fresh(&self, now: Instant) -> HashMap<String, usize> {
-        // url -> (summed depth across all ranks, all-ranks-fresh).
-        let mut acc: HashMap<String, (usize, bool)> = HashMap::new();
+    /// ranks and the OLDEST snapshot timestamp among them — **but only for
+    /// workers whose every known rank is fresh**. A worker with any stale
+    /// rank is omitted, so the caller falls back to its own load signal.
+    /// (Summing only the fresh ranks would make a worker whose other ranks
+    /// went silent look misleadingly idle and draw *more* traffic.)
+    /// `snapshot_fresh` and any other consumer walking this same pass can
+    /// never disagree with each other about which workers count as fresh.
+    ///
+    /// The oldest (not newest) rank's timestamp is deliberately what's kept
+    /// alongside the depth: a caller using it as a "dispatches not yet
+    /// reflected in this number" cutoff (see
+    /// `crate::policies::cache_aware_zmq::WorkerLoads::load_of`) needs a
+    /// bound that never treats an unreported dispatch as already-covered —
+    /// the freshest rank's timestamp could do exactly that for whichever
+    /// rank published less recently. This conservatism is one-sided, not
+    /// free: for a multi-rank worker with skewed publish times, a dispatch
+    /// that landed on (and was already reported by) the FRESHER rank can
+    /// get re-added by the caller's cutoff-based correction anyway, since
+    /// that correction has no way to attribute a dispatch to a specific
+    /// rank. That's an accepted, bounded over-count (it biases the wrong
+    /// direction relative to the under-count this method exists to avoid,
+    /// not a correctness hole) rather than something this method can close
+    /// on its own — closing it would require per-rank dispatch attribution,
+    /// which the router-side slot tracking below doesn't have.
+    pub(crate) fn fresh_worker_state(&self, now: Instant) -> HashMap<String, (usize, Instant)> {
+        // url -> (summed depth across all ranks, all-ranks-fresh, oldest at).
+        let mut acc: HashMap<String, (usize, bool, Instant)> = HashMap::new();
         for entry in self.by_rank.iter() {
-            let fresh = now.duration_since(entry.value().at) <= self.freshness;
+            let at = entry.value().at;
+            let fresh = now.duration_since(at) <= self.freshness;
             let l = &entry.value().load;
             let depth = (l.num_running_reqs.saturating_add(l.num_waiting_reqs)) as usize;
-            let slot = acc.entry(entry.key().0.clone()).or_insert((0, true));
+            let slot = acc.entry(entry.key().0.clone()).or_insert((0, true, at));
             slot.0 = slot.0.saturating_add(depth);
             slot.1 = slot.1 && fresh;
+            slot.2 = slot.2.min(at);
         }
         acc.into_iter()
-            .filter_map(|(url, (depth, all_fresh))| all_fresh.then_some((url, depth)))
+            .filter_map(|(url, (depth, all_fresh, oldest_at))| {
+                all_fresh.then_some((url, (depth, oldest_at)))
+            })
+            .collect()
+    }
+
+    /// Per worker URL, the summed queue depth (`num_running_reqs +
+    /// num_waiting_reqs`) across that worker's ranks, for workers whose
+    /// every known rank is fresh. Computed once per selection so per-worker
+    /// lookups are O(1). See [`Self::fresh_worker_state`] for the freshness
+    /// gate behind this.
+    pub fn snapshot_fresh(&self, now: Instant) -> HashMap<String, usize> {
+        self.fresh_worker_state(now)
+            .into_iter()
+            .map(|(url, (depth, _))| (url, depth))
             .collect()
     }
 
@@ -255,6 +292,38 @@ mod tests {
             !t.snapshot_fresh(now).contains_key("http://w:30000"),
             "any stale rank must drop the whole worker from the snapshot"
         );
+    }
+
+    #[test]
+    fn fresh_worker_state_picks_the_earliest_rank_timestamp() {
+        let t = EngineLoadTable::new();
+        let earlier = Instant::now() - Duration::from_secs(2);
+        let later = earlier + Duration::from_secs(1);
+        t.set("http://w:30000", 0, load(5, 1), later);
+        t.set("http://w:30000", 1, load(3, 2), earlier);
+        let now = later + Duration::from_millis(1);
+        assert_eq!(
+            t.fresh_worker_state(now).get("http://w:30000").copied(),
+            Some((11, earlier)),
+            "must expose the OLDEST rank's timestamp, not the newest"
+        );
+    }
+
+    #[test]
+    fn fresh_worker_state_agrees_with_snapshot_fresh_on_which_workers_are_present() {
+        let t = EngineLoadTable::with_freshness(Duration::from_secs(5));
+        let now = Instant::now();
+        let stale = now - Duration::from_secs(3600);
+        t.set("http://fresh:30000", 0, load(1, 0), now);
+        t.set("http://mixed:30000", 0, load(1, 0), now);
+        t.set("http://mixed:30000", 1, load(1, 0), stale);
+
+        let depths = t.snapshot_fresh(now);
+        let state = t.fresh_worker_state(now);
+        assert!(depths.contains_key("http://fresh:30000"));
+        assert!(state.contains_key("http://fresh:30000"));
+        assert!(!depths.contains_key("http://mixed:30000"));
+        assert!(!state.contains_key("http://mixed:30000"));
     }
 
     #[test]
