@@ -123,13 +123,23 @@ class NVFP4KVQuantizeUtil:
     """Utility wrapper for flashinfer NVFP4 KV quantization APIs."""
 
     @staticmethod
-    def _as_global_scale_tensor(global_scale, device) -> torch.Tensor:
+    def _normalize_global_scale_tensor(
+        global_scale: torch.Tensor, expected_device: torch.device
+    ) -> torch.Tensor:
         if global_scale is None:
             raise ValueError("NVFP4 KV cache requires a per-layer global scale.")
-        if isinstance(global_scale, (int, float)):
-            return torch.tensor([global_scale], dtype=torch.float32, device=device)
+        if not isinstance(global_scale, torch.Tensor):
+            raise TypeError(
+                "NVFP4 KV cache expects preloaded global scale tensors on device."
+            )
         if global_scale.dim() == 0:
             global_scale = global_scale.unsqueeze(0)
+        if global_scale.device != expected_device:
+            raise ValueError(
+                "NVFP4 global scale must already be on the same device as the KV tensor."
+            )
+        if global_scale.dtype != torch.float32:
+            raise ValueError("NVFP4 global scale must be a torch.float32 tensor.")
         return global_scale.contiguous()
 
     @staticmethod
@@ -142,7 +152,7 @@ class NVFP4KVQuantizeUtil:
             ) from exc
 
         b, m, n = tensor.shape
-        global_scale = NVFP4KVQuantizeUtil._as_global_scale_tensor(
+        global_scale = NVFP4KVQuantizeUtil._normalize_global_scale_tensor(
             global_scale, tensor.device
         )
         tensor_2d = tensor.reshape(b * m, n).contiguous()
@@ -173,7 +183,7 @@ class NVFP4KVQuantizeUtil:
             )
 
         b, m, n_half = quant_tensor.shape
-        global_scale = NVFP4KVQuantizeUtil._as_global_scale_tensor(
+        global_scale = NVFP4KVQuantizeUtil._normalize_global_scale_tensor(
             global_scale, quant_tensor.device
         )
         quant_2d = quant_tensor.view(torch.uint8).reshape(b * m, n_half).contiguous()

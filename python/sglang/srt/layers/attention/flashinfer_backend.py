@@ -348,11 +348,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 "for fp4_mx_block16."
             )
         self.is_nvfp4_kvcache = kv_cache_quant_method_name == "nvfp4"
-        self.nvfp4_kv_access = (
-            self.token_to_kv_pool.get_quantized_kv_access()
-            if self.is_nvfp4_kvcache
-            else None
-        )
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
         self.cpu_req_pool_indices = None
@@ -1107,7 +1102,6 @@ class FlashInferAttnBackend(AttentionBackend):
         # We perform dequant for chunk prefill/cache reuse.
         pool = self.token_to_kv_pool
         if self.is_nvfp4_kvcache:
-            assert self.nvfp4_kv_access is not None
             if self.dq_page_table is not None:
                 # Paged prefill reads prefix + current chunk from the FP8 workspace.
                 # Ragged prefill reads the current chunk directly from raw k/v.
@@ -1122,7 +1116,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     if v is not None and transfer_cur_kv
                     else None
                 )
-                self.nvfp4_kv_access.prepare_fp8_extend_workspace(
+                self.token_to_kv_pool.prepare_fp8_extend_workspace(
                     layer.layer_id,
                     layer.layer_id,
                     self.req_to_token_pool.req_to_token,
@@ -1134,7 +1128,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     v_cur_fp8=v_cur_fp8,
                 )
 
-            k_buffer_dq, v_buffer_dq = self.nvfp4_kv_access.fp8_workspace()
+            k_buffer_dq, v_buffer_dq = self.token_to_kv_pool.get_fp8_workspace()
             kv_cache = (
                 k_buffer_dq.view(-1, layer.tp_k_head_num, layer.head_dim),
                 v_buffer_dq.view(-1, layer.tp_v_head_num, layer.head_dim),

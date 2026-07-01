@@ -30,11 +30,9 @@ from abc import ABC, abstractmethod
 from typing import Optional
 
 import torch
+from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_MAX
 from sglang.srt.utils.common import is_sm100_supported
 from torch import Tensor
-
-
-NVFP4_SM100_GLOBAL_SCALE_MULTIPLIER = 6.0
 
 
 class KVCacheQuantMethodBase(ABC):
@@ -218,12 +216,16 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
                 if hasattr(layer, "v_scale") and layer.v_scale is not None
                 else 1.0
             )
-            # The model stores NVFP4 scales in the checkpoint convention.
-            # SM100 FlashInfer KV kernels expect the scale multiplied by the FP4
-            # E2M1 max value; keep that architecture detail local to this method.
+            # SM100 uses TRT-LLM XQA kernels that expect KV scales as
+            # amax / 448, but the calibrated checkpoint stores amax / (6 * 448).
+            # We multiply by E2M1_MAX (6.0) to bridge the gap.  SM120 uses a
+            # different kernel path where scales already include this factor.
+            # The FP4 data type itself is identical on both architectures.
+            # Reference: TRT-LLM FP8QDQLinearMethod.process_weights_after_loading_fused_qkv_linear
+            # https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/linear.py
             if is_sm100_supported():
-                k_scale *= NVFP4_SM100_GLOBAL_SCALE_MULTIPLIER
-                v_scale *= NVFP4_SM100_GLOBAL_SCALE_MULTIPLIER
+                k_scale *= E2M1_MAX
+                v_scale *= E2M1_MAX
             k_scales_cpu[layer_id] = k_scale
             v_scales_cpu[layer_id] = v_scale
             self.k_scales_float[layer_id] = k_scale

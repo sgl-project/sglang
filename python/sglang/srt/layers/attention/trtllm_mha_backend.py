@@ -166,12 +166,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "Use --kv-cache-dtype=nvfp4 or choose another decode backend "
                 "for fp4_mx_block16."
             )
-        self.nvfp4_kv_access = (
-            self.token_to_kv_pool.get_quantized_kv_access()
-            if self.is_nvfp4_kvcache
-            else None
-        )
-
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
         """Return the SWAKVPool to translate against, or None for non-SWA models.
@@ -773,8 +767,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         return k_cache, v_cache
 
     def _get_nvfp4_bmm_scales(self, layer: RadixAttention) -> tuple[float, float]:
-        assert self.nvfp4_kv_access is not None
-        return self.nvfp4_kv_access.quant_method.get_bmm_scales(layer.layer_id)
+        return self.kv_cache_quant_method.get_bmm_scales(layer.layer_id)
 
     def _get_nvfp4_decode_kv_cache(
         self, layer: RadixAttention
@@ -782,13 +775,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         tuple[torch.Tensor, torch.Tensor],
         tuple[torch.Tensor, torch.Tensor],
     ]:
-        assert self.nvfp4_kv_access is not None
-        raw = self.nvfp4_kv_access.raw_fp4_view(layer.layer_id)
+        k_fp4, v_fp4, k_scale, v_scale = self.token_to_kv_pool.get_raw_fp4_kv_buffer(
+            layer.layer_id
+        )
         kv_cache = self._reshape_paged_kv_cache(
-            raw.k, raw.v, layer, layer.head_dim // 2
+            k_fp4, v_fp4, layer, layer.head_dim // 2
         )
         kv_cache_block_scales = self._reshape_paged_kv_cache(
-            raw.k_scale, raw.v_scale, layer, layer.head_dim // 16
+            k_scale, v_scale, layer, layer.head_dim // 16
         )
         return kv_cache, kv_cache_block_scales
 
