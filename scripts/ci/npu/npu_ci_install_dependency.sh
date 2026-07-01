@@ -61,13 +61,24 @@ ${PIP_INSTALL} triton-ascend==3.2.1.dev20260530 --extra-index-url=https://mirror
 
 
 ### Install sgl-kernel-npu
-SGLANG_KERNEL_NPU_TAG="2026.6.2"
+SGLANG_KERNEL_NPU_TAG="2026.06.15.post2"
 mkdir sgl-kernel-npu
 (cd sgl-kernel-npu && wget "${GITHUB_PROXY_URL:=""}https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py311-cann9.0.0-${DEVICE_TYPE}-$(arch).zip" \
 && unzip ./sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py311-cann9.0.0-${DEVICE_TYPE}-$(arch).zip \
 && ${UV_PIP_INSTALL} ./deep_ep*.whl ./sgl_kernel_npu*.whl \
 && (cd "$(python3 -m pip show deep-ep | grep -E '^Location:' | awk '{print $2}')" && ln -s deep_ep/deep_ep_cpp*.so))
 
+### Install custom_ops
+mkdir custom_ops
+(cd custom_ops && wget "${GITHUB_PROXY_URL:=""}https://github.com/randgun/sgl-kernel-npu/releases/download/other-op/CANN-custom_ops-none-linux.aarch64.run" && \
+wget "${GITHUB_PROXY_URL:=""}https://github.com/randgun/sgl-kernel-npu/releases/download/other-op/cann-ops-transformer-custom_linux-aarch64.run" && \
+wget "${GITHUB_PROXY_URL:=""}https://github.com/randgun/sgl-kernel-npu/releases/download/other-op/custom_ops-1.0-cp311-cp311-linux_aarch64.whl" && \
+chmod +x *.run && \
+./CANN-custom_ops-none-linux.aarch64.run --install-path=/usr/local/Ascend/cann-9.0.0/opp && \
+./cann-ops-transformer-custom_linux-aarch64.run --install-path=/usr/local/Ascend/cann-9.0.0/opp && \
+${PIP_INSTALL} custom_ops-1.0-cp311-cp311-linux_aarch64.whl && \
+rm -rf *.{run,whl})
+rm -rf custom_ops
 
 ### Install SGLang
 rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml

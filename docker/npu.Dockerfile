@@ -98,6 +98,16 @@ RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG /sgl-wo
     cd /sgl-workspace/sglang/python && rm -rf pyproject.toml && mv pyproject_npu.toml pyproject.toml && \
     ${PIP_INSTALL} -v -e .[all_npu]
 
+RUN wget https://github.com/randgun/sgl-kernel-npu/releases/download/other-op/CANN-custom_ops-none-linux.aarch64.run && \
+    wget https://github.com/randgun/sgl-kernel-npu/releases/download/other-op/cann-ops-transformer-custom_linux-aarch64.run && \
+    wget https://github.com/randgun/sgl-kernel-npu/releases/download/other-op/custom_ops-1.0-cp311-cp311-linux_aarch64.whl && \
+    chmod +x *.run && \
+    ./CANN-custom_ops-none-linux.aarch64.run --install-path=/usr/local/Ascend/cann-${CANN_VERSION}/opp && \
+    ./cann-ops-transformer-custom_linux-aarch64.run --install-path=/usr/local/Ascend/cann-${CANN_VERSION}/opp && \
+    ${PIP_INSTALL} custom_ops-1.0-cp311-cp311-linux_aarch64.whl && \
+    rm -rf *.{run,whl}
+
+
 # Install Deep-ep
 # pin wheel to 0.45.1 ref: https://github.com/pypa/wheel/issues/662
 RUN ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil \
