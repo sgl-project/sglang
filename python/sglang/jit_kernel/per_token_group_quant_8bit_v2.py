@@ -75,8 +75,14 @@ def _per_token_group_quant_8bit_v2_custom_op(
     is_column_major = output_s.stride(last - 1) < output_s.stride(last)
     hidden_dim_num_groups = output_q.shape[last] // group_size
     num_tokens_per_expert = output_q.shape[last - 1]
-    scale_expert_stride = output_s.stride(0) if masked_layout else 0
-    scale_hidden_stride = output_s.stride(last)
+    if is_column_major:
+        scale_expert_stride = output_s.stride(0) if masked_layout else 0
+        scale_hidden_stride = output_s.stride(-1)
+    else:
+        scale_expert_stride = output_s.stride(-3) if output_s.dim() == 3 else 0
+        scale_hidden_stride = (
+            output_s.stride(-2) if output_s.dim() == 3 else output_s.stride(-1)
+        )
 
     module = _jit_module(input.dtype, output_q.dtype, is_arch_support_pdl())
     module.per_token_group_quant_8bit_v2(

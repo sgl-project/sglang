@@ -271,16 +271,28 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
         constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
         scale_element_t* scale_output;
         if constexpr (IS_COLUMN_MAJOR) {
-          constexpr int scale_token_stride = 1;
+          constexpr int column_major_scale_token_stride = 1;
           const int hidden_idx_packed = hidden_dim_group_idx / num_elems_per_pack;
           const int pack_idx = hidden_dim_group_idx % num_elems_per_pack;
           scale_output = reinterpret_cast<scale_element_t*>(output_s) +
                          (expert_idx * scale_expert_stride * num_elems_per_pack +
                           hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
-                          token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
+                          token_idx * column_major_scale_token_stride * num_elems_per_pack + pack_idx);
         } else {
           static_assert(!SCALE_UE8M0 || std::is_same_v<scale_packed_t, float>);
-          scale_output = reinterpret_cast<scale_element_t*>(output_s) + offset_num_groups;
+          if (scale_expert_stride > 0) {
+            // Non-masked 3D row-major output_s uses the existing stride slots
+            // for the new outer-major layout: (outer_stride, token_stride).
+            const int scale_outer_stride = scale_expert_stride;
+            const int scale_token_stride = scale_hidden_stride;
+            const int outer_idx = token_idx / num_tokens_per_expert;
+            const int token_idx_in_outer = token_idx % num_tokens_per_expert;
+            const int64_t scale_offset = (expert_idx + outer_idx) * scale_outer_stride +
+                                         token_idx_in_outer * scale_token_stride + hidden_dim_group_idx;
+            scale_output = reinterpret_cast<scale_element_t*>(output_s) + scale_offset;
+          } else {
+            scale_output = reinterpret_cast<scale_element_t*>(output_s) + offset_num_groups;
+          }
         }
 
         if constexpr (IS_COLUMN_MAJOR and SCALE_UE8M0) {

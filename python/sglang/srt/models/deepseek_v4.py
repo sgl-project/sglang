@@ -1085,14 +1085,15 @@ class MQALayer(nn.Module):
             T, G, D = o.shape
             R = self.o_lora_rank
             o_fp8, o_s = sglang_per_token_group_quant_fp8(
-                o.reshape(T * G, D).contiguous(),
+                o.contiguous(),
                 group_size=128,
                 scale_ue8m0=True,
+                scale_outer_major=True,
             )
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
-                (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
+                (o_fp8, o_s),
                 (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
                 output,
                 recipe=(1, 1, 128),
