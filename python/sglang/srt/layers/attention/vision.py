@@ -277,7 +277,11 @@ class VisionSdpaAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if self.flatten_batch:
+        # The bsz == 1 requirement only protects the flatten-batch mask built by
+        # generate_patch_attention_mask() below (it packs the whole batch into a
+        # single sequence). When the caller passes its own attention_mask, the
+        # batch dimension is handled normally, so bsz > 1 is valid (e.g. video).
+        if self.flatten_batch and attention_mask is None:
             assert bsz == 1, "flatten_batch is True, bsz must be 1"
 
         assert q.dim() == 3, q.shape
