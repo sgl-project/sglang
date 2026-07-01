@@ -711,5 +711,50 @@ class TestMiniCPMVUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
         return dict(processor_output, format="processor_output")
 
 
+class TestPhi4mmUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
+    model_path = "microsoft/Phi-4-multimodal-instruct"
+    chat_template = "phi-4-mm"
+
+    # The precomputed-embedding test calls `cls.visual(processor_output)`
+    # and feeds the result back into the engine. Phi-4 makes that path
+    # awkward to mock in a standalone test:
+    #   * HF's `image_embed.forward()` requires a `wte` kwarg (the LM's
+    #     word-token embedding) for the hidden_states init step it does
+    #     after the vision pass — needs the full LM, not just the
+    #     vision tower.
+    #   * sglang's `Phi4MMImageEncoder` uses `Idefics2VisionTransformer`
+    #     which pulls in `VisionAttention`, which dereferences global
+    #     server args + an attention TP group — both only initialised
+    #     inside a live Engine.
+    # The early-return I added in `phi4mm.get_image_feature` is the
+    # same shape used by the merged InternVL/MiniCPM/Pixtral PRs, and
+    # this PR's `test_accepts_processor_output` already exercises the
+    # full processor → mm_item → model path on H100, which is the
+    # critical bug surface (the silent-skip bug class). Skip the
+    # explicit precomputed-embedding test for phi4mm; CI exercises the
+    # full path on the live-Engine runner.
+    @unittest.skip(
+        "Phi4MM vision encoder is engine-coupled (needs server args + "
+        "TP groups + LM wte); precomputed-embedding code path is "
+        "covered by `phi4mm.get_image_feature`'s early-return + "
+        "`test_accepts_processor_output` E2E."
+    )
+    async def test_accepts_precomputed_embeddings(self):
+        pass
+
+    @classmethod
+    def _init_visual(cls):
+        # Phi4MM's vision tower requires either (a) the full HF model
+        # with peft-wrapped LoRA + flash_attn imports + a wte kwarg at
+        # forward time, or (b) sglang's encoder which needs engine
+        # state. The precomputed-embedding test is skipped for phi4mm
+        # (see the @unittest.skip above); install a no-op visual_func
+        # so the rest of the class doesn't fail at attribute access.
+        cls.visual = lambda processor_output: torch.zeros(0)
+
+    def _processor_output_image_data(self, processor_output):
+        return dict(processor_output, format="processor_output")
+
+
 if __name__ == "__main__":
     unittest.main()
