@@ -5,7 +5,7 @@
 import dataclasses
 import logging
 from contextlib import ExitStack
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 from unittest.mock import patch
 
 import torch
@@ -18,6 +18,9 @@ from sglang.srt.compilation.compile_phase import (
     is_in_torch_compile_warmup,
 )
 from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import print_warning_once
 
@@ -39,6 +42,16 @@ class ConcreteSizeEntry:
 
     # for cudagraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
+    input_addresses: Optional[list[int]] = None
+
+
+@dataclasses.dataclass
+class VariantGraphEntry:
+    """CUDA-only extra cudagraph state for mamba track=True replays."""
+
+    num_finished_warmup: int = 0
+    cudagraph: Optional[torch.cuda.CUDAGraph] = None
+    output: Optional[Any] = None
     input_addresses: Optional[list[int]] = None
 
 
@@ -92,6 +105,10 @@ class CUDAPiecewiseBackend:
         # the entries for different shapes that we need to either
         # compile or capture cudagraph
         self.concrete_size_entries: dict[int, ConcreteSizeEntry] = {}
+        # CUDA-only extra track=True cudagraphs keyed by runtime_shape.
+        # The default (track=False / no-mamba) graph continues to live in the
+        # base ConcreteSizeEntry so other backends keep the original contract.
+        self.track_variant_entries: dict[int, VariantGraphEntry] = {}
 
         # to_be_compiled_sizes tracks the remaining sizes to compile,
         # and updates during the compilation process, so we need to copy it
@@ -148,10 +165,46 @@ class CUDAPiecewiseBackend:
         if is_in_torch_compile_warmup():
             return entry.runnable(*args)
 
-        if entry.cudagraph is None:
-            if entry.num_finished_warmup < 1:  # noqa
-                entry.num_finished_warmup += 1
-                return entry.runnable(*args)
+        track_variant = self._infer_track_variant_from_args(
+            args, self.sym_shape_indices
+        )
+        if track_variant is True:
+            variant_entry = self.track_variant_entries.get(runtime_shape)
+            if variant_entry is None:
+                # The extra track=True graph is a CUDA-only extension. Capture it
+                # during explicit capture, but fall back to the compiled runnable
+                # if replay reaches this branch before a variant graph exists.
+                if get_pcg_capture_stream() is None:
+                    return entry.runnable(*args)
+                variant_entry = VariantGraphEntry()
+                self.track_variant_entries[runtime_shape] = variant_entry
+            return self._run_cudagraph_with_entry(variant_entry, entry.runnable, args)
+        else:
+            return self._run_cudagraph_with_entry(entry, entry.runnable, args)
+
+    @staticmethod
+    def _infer_track_variant_from_args(args, sym_shape_indices) -> Optional[bool]:
+        """Read the tc_piecewise track variant from CPU-side forward context.
+
+        The runner computes the Mamba tracking state before replay/capture and
+        stores it in TcPiecewiseForwardContext so the backend can select the
+        proper graph without synchronizing on a GPU bool tensor.
+        """
+        context = get_tc_piecewise_forward_context()
+        if context is None:
+            return None
+        return context.mamba_track_variant
+
+    def _run_cudagraph_with_entry(
+        self,
+        graph_entry: Union[ConcreteSizeEntry, VariantGraphEntry],
+        runnable: Callable,
+        args,
+    ) -> Any:
+        if graph_entry.cudagraph is None:
+            if graph_entry.num_finished_warmup < 1:  # noqa
+                graph_entry.num_finished_warmup += 1
+                return runnable(*args)
 
             # During normal capture (PiecewiseCudaGraphRunner.capture()),
             # set_pcg_capture_stream() guarantees a valid stream. However,
@@ -166,7 +219,7 @@ class CUDAPiecewiseBackend:
                     "recompilation. Falling back to eager execution for this "
                     "subgraph."
                 )
-                return entry.runnable(*args)
+                return runnable(*args)
             assert (
                 stream is not None
             ), "PCG capture stream is not set, please check if runtime recompilation happened"
@@ -175,7 +228,7 @@ class CUDAPiecewiseBackend:
                 input_addresses = [
                     x.data_ptr() for x in args if isinstance(x, torch.Tensor)
                 ]
-                entry.input_addresses = input_addresses
+                graph_entry.input_addresses = input_addresses
             cudagraph = torch.cuda.CUDAGraph()
 
             with ExitStack() as stack:
@@ -191,7 +244,7 @@ class CUDAPiecewiseBackend:
                 # mind-exploding: carefully manage the reference and memory.
                 with torch.cuda.graph(cudagraph, pool=self.graph_pool, stream=stream):
                     # `output` is managed by pytorch's cudagraph pool
-                    output = entry.runnable(*args)
+                    output = runnable(*args)
                     if self.is_last_graph:
                         # by converting it to weak ref,
                         # the original `output` will immediately be released
@@ -202,8 +255,8 @@ class CUDAPiecewiseBackend:
 
             # here we always use weak ref for the output
             # to save memory
-            entry.output = weak_ref_tensors(output)
-            entry.cudagraph = cudagraph
+            graph_entry.output = weak_ref_tensors(output)
+            graph_entry.cudagraph = cudagraph
 
             compilation_counter.num_cudagraph_captured += 1
 
@@ -217,9 +270,9 @@ class CUDAPiecewiseBackend:
             new_input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
-            assert new_input_addresses == entry.input_addresses, (
+            assert new_input_addresses == graph_entry.input_addresses, (
                 "Input addresses for cudagraphs are different during replay."
-                f" Expected {entry.input_addresses}, got {new_input_addresses}"
+                f" Expected {graph_entry.input_addresses}, got {new_input_addresses}"
             )
-        entry.cudagraph.replay()
-        return entry.output
+        graph_entry.cudagraph.replay()
+        return graph_entry.output
