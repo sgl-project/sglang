@@ -1,0 +1,62 @@
+name: PR Test NIXL Build (AMD)
+# Build-tests the optional ENABLE_NIXL=1 stage in docker/rocm.Dockerfile and
+# verifies the resulting image can import nixl with UCX present + plugins
+# discoverable. Build-only (no serving), so no multi-GPU runner is required.
+# Covers BOTH the un-suffixed ROCm 7.0 default base and the rocm720 (7.2) base,
+# since UCX --with-rocm links against /opt/rocm and behavior can drift by minor.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docker/rocm.Dockerfile'
+      - '.github/workflows/pr-test-amd-nixl-build.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  nixl-build-import:
+    if: github.event.pull_request.draft == false
+    runs-on: amd-docker-scale
+    strategy:
+      fail-fast: false
+      matrix:
+        # gfx950        -> ROCm 7.0 base (un-suffixed default path)
+        # gfx950-rocm720 -> ROCm 7.2 base (functionally validated flavor)
+        gpu_arch: ['gfx950', 'gfx950-rocm720']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build image with ENABLE_NIXL=1
+        run: |
+          docker build . -f docker/rocm.Dockerfile \
+            --build-arg SGL_BRANCH=${{ github.ref_name }} \
+            --build-arg GPU_ARCH=${{ matrix.gpu_arch }} \
+            --build-arg ENABLE_NIXL=1 \
+            --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
+            -t sglang-nixl-test:${{ matrix.gpu_arch }} \
+            --no-cache
+
+      - name: Verify nixl import + UCX + plugins
+        run: |
+          docker run --rm \
+            -e LD_LIBRARY_PATH=/opt/ucx/lib:/opt/rocm/lib \
+            sglang-nixl-test:${{ matrix.gpu_arch }} \
+            bash -lc '
+              set -eux
+              # nixl python package importable (built as nixl_rocm, symlinked to nixl)
+              python -c "import nixl; print(\"nixl OK:\", nixl.__file__)"
+              # UCX runtime present and built with ROCm transport
+              test -d /opt/ucx/lib
+              ucx_info -v
+              ucx_info -d | grep -iq rocm
+              # NIXL UCX plugin discoverable
+              python - <<PY
+              from nixl._api import nixl_agent, nixl_agent_config
+              a = nixl_agent("ci-smoke", nixl_agent_config(backends=["UCX"]))
+              print("nixl UCX backend init OK")
+              PY
+            '

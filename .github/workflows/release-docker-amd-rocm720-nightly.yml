@@ -90,7 +90,7 @@ jobs:
             exit 1
           fi
 
-          tag=v${version}-${rocm_tag}
+          tag=v${version}-${rocm_tag}-nixl-pr28348
           echo "IMAGE_TAG=${tag}-${{ env.DATE }}" >> $GITHUB_ENV
 
           # remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori

@@ -949,7 +949,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --custom-image rocm/sgl-dev:v0.5.13.post1-rocm720-mi30x-nixl-pr28348-20260616
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1075,6 +1075,7 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          DISAGG_IMAGE_OVERRIDE: rocm/sgl-dev:v0.5.13.post1-rocm720-mi35x-nixl-pr28348-20260616
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh

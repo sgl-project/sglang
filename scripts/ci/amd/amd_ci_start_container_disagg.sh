@@ -212,8 +212,15 @@ find_latest_image() {
   esac
 }
 
-# Pull and run the latest image
-IMAGE=$(find_latest_image "${GPU_ARCH}")
+# Pull and run the latest image.
+# DISAGG_IMAGE_OVERRIDE pins an exact image (skips the date-based auto-detect);
+# used to validate a specific prebuilt image (e.g. a NIXL-enabled build).
+if [[ -n "${DISAGG_IMAGE_OVERRIDE:-}" ]]; then
+  IMAGE="${DISAGG_IMAGE_OVERRIDE}"
+  echo "Using DISAGG_IMAGE_OVERRIDE: ${IMAGE}"
+else
+  IMAGE=$(find_latest_image "${GPU_ARCH}")
+fi
 # Try the local docker registry first (avoids Docker Hub rate limits and is
 # faster on the LAN); if that fails for any reason, fall back to the
 # public registry with exponential-backoff retries. Capture stderr so the
