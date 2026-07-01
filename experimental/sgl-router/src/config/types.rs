@@ -181,6 +181,16 @@ pub struct ModelConfig {
     /// id (downloaded on demand). Defaults to `id` when `--tokenizer-path`
     /// is omitted. Resolved by [`crate::tokenizer::adapter::load`].
     pub tokenizer_path: String,
+    /// Number of independent `Tokenizer` instances to load per model.
+    /// `dynamo_tokenizers::Tokenizer` wraps a `BPE` model whose word-merge
+    /// cache is one `RwLock<AHashMap<..>>` per instance; sharing a single
+    /// `Arc<Tokenizer>` across every tokio worker thread means every
+    /// concurrent `encode()` contends that one lock. Loading several
+    /// independent instances from the same file and round-robining across
+    /// them (see [`crate::tokenizer::TokenizerRegistry::get`]) spreads that
+    /// contention across N locks with no change to tokenization output.
+    /// Always >= 1 (enforced in [`crate::config::cli::Cli::into_config`]).
+    pub tokenizer_shards: usize,
     pub policy: PolicyKind,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Tuning for the cache-aware ZMQ policy. Ignored unless
@@ -192,6 +202,13 @@ pub struct ModelConfig {
     /// The chat handler reads `sticky.header_name` to populate
     /// [`crate::policies::SelectionContext::routing_key`].
     pub sticky: Option<StickyConfig>,
+}
+
+/// Default [`ModelConfig::tokenizer_shards`]. 8 independent instances is
+/// cheap (each is a few MB of vocab/merge tables) relative to typical tokio
+/// worker counts, while cutting per-shard lock contention by ~8x.
+pub fn default_tokenizer_shards() -> usize {
+    8
 }
 
 /// Per-model cache-aware-ZMQ tuning.

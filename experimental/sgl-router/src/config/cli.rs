@@ -11,9 +11,10 @@ use std::num::{NonZeroU32, NonZeroUsize};
 
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
-    resolve_mode, ActiveLoadConfig, AdmissionConfig, CacheAwareConfig, CircuitBreakerConfig,
-    Config, DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    default_tokenizer_shards, resolve_mode, ActiveLoadConfig, AdmissionConfig, CacheAwareConfig,
+    CircuitBreakerConfig, Config, DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    StickyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -45,6 +46,15 @@ pub struct Cli {
     /// as the repo id (download honors `HF_TOKEN` / `HF_HOME`).
     #[arg(long)]
     pub tokenizer_path: Option<String>,
+    /// Number of independent tokenizer instances to load for this model.
+    /// Every tokio worker thread otherwise shares one `Arc<Tokenizer>`,
+    /// serializing on the BPE word-merge cache's internal `RwLock` under
+    /// concurrent load; loading several independent instances and
+    /// round-robining across them (see
+    /// `crate::tokenizer::TokenizerRegistry::get`) spreads that contention
+    /// across N locks with no change to tokenization output. Must be >= 1.
+    #[arg(long, default_value_t = default_tokenizer_shards())]
+    pub tokenizer_shards: usize,
     /// Routing policy.
     #[arg(long, value_enum, default_value = "round_robin")]
     pub policy: PolicyKind,
@@ -248,6 +258,10 @@ impl Cli {
             ));
         }
 
+        if self.tokenizer_shards == 0 {
+            return Err(anyhow!("--tokenizer-shards must be at least 1"));
+        }
+
         let circuit_breaker = self.cb_threshold.map(|threshold| CircuitBreakerConfig {
             threshold,
             cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
@@ -284,6 +298,7 @@ impl Cli {
                 // Default the tokenizer source to the model id (treated as a
                 // HuggingFace repo id) when --tokenizer-path is omitted.
                 tokenizer_path: self.tokenizer_path.unwrap_or_else(|| self.model_id.clone()),
+                tokenizer_shards: self.tokenizer_shards,
                 id: self.model_id,
                 policy: self.policy,
                 circuit_breaker,
@@ -467,6 +482,22 @@ mod tests {
                 || err.to_string().to_lowercase().contains("0"),
             "got: {err}",
         );
+    }
+
+    #[test]
+    fn zero_tokenizer_shards_is_rejected() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--tokenizer-shards",
+            "0",
+        ]))
+        .expect_err("--tokenizer-shards 0 must be rejected");
+        // Unlike --max-concurrent-requests-per-worker (NonZeroUsize, rejected
+        // by clap at parse time), tokenizer_shards is a plain `usize` — the
+        // manual `if == 0` check in `into_config` (below) is the only guard,
+        // so this test is what actually pins that check firing, not clap.
+        assert!(err.to_string().contains("tokenizer-shards"), "got: {err}",);
     }
 
     #[test]

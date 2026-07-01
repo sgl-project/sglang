@@ -540,6 +540,7 @@ mod tests {
             model: ModelConfig {
                 id: id.into(),
                 tokenizer_path: "/tmp/x".into(),
+                tokenizer_shards: 1,
                 policy: PolicyKind::RoundRobin,
                 circuit_breaker: Some(RawCbConfig {
                     threshold: NonZeroU32::new(threshold).unwrap(),

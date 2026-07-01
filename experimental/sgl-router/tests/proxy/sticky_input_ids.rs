@@ -53,6 +53,7 @@ fn config() -> Config {
         model: ModelConfig {
             id: MODEL.into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_shards: 1,
             policy: PolicyKind::Sticky,
             circuit_breaker: None,
             cache_aware: None,

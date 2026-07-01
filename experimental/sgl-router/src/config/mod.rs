@@ -84,6 +84,7 @@ mod tests {
             model: ModelConfig {
                 id: model_id.into(),
                 tokenizer_path: "/tmp/tok.json".into(),
+                tokenizer_shards: 1,
                 policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,

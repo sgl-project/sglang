@@ -175,6 +175,7 @@ mod tests {
             model: ModelConfig {
                 id: id.into(),
                 tokenizer_path: "/tmp/x".into(),
+                tokenizer_shards: 1,
                 policy,
                 circuit_breaker: None,
                 cache_aware: None,

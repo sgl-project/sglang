@@ -69,6 +69,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
         model: sgl_router::config::ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_shards: 1,
             policy: sgl_router::config::PolicyKind::CacheAwareZmq,
             circuit_breaker: None,
             cache_aware: None,

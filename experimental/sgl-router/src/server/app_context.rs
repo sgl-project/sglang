@@ -118,6 +118,7 @@ impl AppContext {
                 model: crate::config::ModelConfig {
                     id: "stub-model".into(),
                     tokenizer_path: "stub".into(),
+                    tokenizer_shards: 1,
                     policy: crate::config::PolicyKind::RoundRobin,
                     circuit_breaker: None,
                     cache_aware: None,

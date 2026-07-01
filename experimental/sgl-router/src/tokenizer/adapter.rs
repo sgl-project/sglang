@@ -59,9 +59,21 @@ fn download_tokenizer_json(repo_id: &str) -> Result<std::path::PathBuf> {
 
 /// Download `file` from a HuggingFace repo id and return the cached local path.
 /// Shared by `tokenizer.json` (required) and `tokenizer_config.json` (optional).
+///
+/// `with_retries(3)`: `ApiBuilder`'s default is 0 retries, so a bare
+/// `from_env().build()` makes every HTTP call here a one-shot — any
+/// transient DNS/TLS/connection blip fails immediately. That was tolerable
+/// when this ran once per model at startup; `TokenizerShards::load` (see
+/// `crate::tokenizer::TokenizerShards`) now calls this up to
+/// `tokenizer_shards` times (default 8) per model, so a transient failure
+/// on shard 1 aborts the whole router before shards 2..N even get a chance.
+/// Shards 2..N read the same file from `hf-hub`'s on-disk cache once shard 1
+/// has populated it (no network for them at all), so in practice this retry
+/// budget matters only for the very first call.
 fn download_repo_file(repo_id: &str, file: &str) -> Result<std::path::PathBuf> {
     use hf_hub::api::sync::ApiBuilder;
     let api = ApiBuilder::from_env()
+        .with_retries(3)
         .build()
         .context("initialize HuggingFace Hub client")?;
     api.model(repo_id.to_string())

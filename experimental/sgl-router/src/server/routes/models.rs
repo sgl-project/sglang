@@ -50,6 +50,7 @@ mod tests {
         ctx.config.model = crate::config::ModelConfig {
             id: "qwen3".into(),
             tokenizer_path: "x".into(),
+            tokenizer_shards: 1,
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,

@@ -9,7 +9,7 @@ use anyhow::Result;
 use chat_template::ChatTemplate;
 use dashmap::DashMap;
 use dynamo_tokenizers::Tokenizer;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// How to turn a chat request's `messages` into the prompt the engine tokenizes
@@ -65,9 +65,111 @@ impl ChatEncoderEntry {
     }
 }
 
+/// N independent `Tokenizer` instances for one model, selected round-robin.
+///
+/// WHY: `dynamo_tokenizers::Tokenizer` is `Arc<dyn traits::Tokenizer>`
+/// internally; cloning it only clones the pointer, so every caller sharing
+/// one instance also shares its underlying `BPE` model's word-merge cache —
+/// a single `std::sync::RwLock<AHashMap<..>>` behind
+/// `tokenizers::utils::cache::Cache`. Under concurrent encode() calls from
+/// many tokio worker threads, that one lock becomes the bottleneck.
+///
+/// This is a second, complementary fix to the `dynamo-tokenizers` version
+/// bump documented on that dependency in Cargo.toml (which cut this same
+/// `Cache::get` frame's share of total process CPU from a measured 87% to a
+/// measured 20%, on identical code/traffic — see that comment for the only
+/// numbers in this repo that are independently checkable against a
+/// committed artifact). A later live capture during the same investigation,
+/// taken after that bump had already landed, broke the REMAINING `Cache::get`
+/// time down further: ~25 of its points were specifically `RwLock::try_read`'s
+/// CAS-retry loop plus `read_unlock`, not actual cache lookups — i.e. lock
+/// overhead, not useful work, on that one shared lock. That capture wasn't
+/// saved as a repo artifact, so treat "~25" as this investigation's own
+/// finding, not a number a future reader can re-derive from anything
+/// committed. Loading N instances from the same file gives each its own
+/// independent cache/lock, so concurrent callers spread across N locks
+/// instead of contending one. Every instance is loaded from the same source
+/// via [`adapter::load`], so which shard a call lands on can never change
+/// the tokenization output — only which lock it contends.
+struct TokenizerShards {
+    /// Always non-empty — the type's only constructors (`load`, and the
+    /// `#[cfg(test)]`-only `single`) both guarantee at least one element, so
+    /// `next()`'s `% self.shards.len()` can never divide by zero. Never
+    /// resized after construction: no method here takes `&mut self`.
+    shards: Vec<Arc<Tokenizer>>,
+    /// Round-robin cursor, incremented per selection. Wraps via `%
+    /// shards.len()`; overflow of the counter itself is harmless (wrapping
+    /// add) since only its value modulo `shards.len()` is ever read.
+    /// `&self` suffices in `next()` despite mutating this — interior
+    /// mutability via `AtomicUsize`, no `&mut` needed (and `&mut self` would
+    /// defeat the point: `TokenizerRegistry::get` is called concurrently
+    /// from every tokio worker thread, which is exactly the concurrency this
+    /// type exists to spread out, not serialize on).
+    next: AtomicUsize,
+}
+
+impl TokenizerShards {
+    /// Load `n` independent tokenizer instances from `source`. `n` is
+    /// clamped to at least 1 so a misconfigured 0 can't build an empty,
+    /// unusable registry entry.
+    ///
+    /// Sequential by design — do not parallelize this loop. For an HF
+    /// repo-id `source`, `adapter::load`'s first call downloads and
+    /// populates `hf-hub`'s on-disk cache; every subsequent call in this
+    /// same sequential loop then hits that cache with no network at all
+    /// (`hf_hub::api::sync::ApiRepo::get` checks the cache before ever
+    /// calling out). Running these N calls concurrently instead would
+    /// reintroduce a real race: `ApiRepo::get`'s cache check happens before
+    /// its own download lock is taken, so N concurrent first-callers could
+    /// each decide "not cached" and each kick off their own download
+    /// attempt, serialized only by `hf-hub`'s file lock rather than
+    /// deduplicated — turning "1 download + (N-1) free cache reads" back
+    /// into up to N downloads racing each other.
+    fn load(source: &str, n: usize) -> Result<Self> {
+        let n = n.max(1);
+        let shards = (0..n)
+            .map(|_| adapter::load(source))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            shards,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    /// Pick the next shard round-robin. `Relaxed` is sufficient for this
+    /// counter specifically because `shards` itself needs no ordering to
+    /// piggyback on: it's fully built in `load` before a `TokenizerShards`
+    /// is ever shared (`load_from_config` only inserts it into the registry
+    /// `DashMap` afterward), so the `DashMap` insert/lookup that publishes
+    /// this struct to other threads already provides the only cross-thread
+    /// visibility this type needs — `shards.len()` and its backing
+    /// allocation are immutable for the struct's entire life, never
+    /// requiring synchronization of their own. `Relaxed` on `fetch_add` only
+    /// has to pick a valid index into that fixed, already-visible `Vec`, and
+    /// every shard is behaviorally identical (see the type-level doc
+    /// comment), so any interleaving of concurrent `fetch_add`s yields a
+    /// valid, if not perfectly even, distribution.
+    fn next(&self) -> Arc<Tokenizer> {
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.shards.len();
+        Arc::clone(&self.shards[i])
+    }
+
+    /// Wrap a single already-loaded instance as a one-shard set. Lets tests
+    /// outside this module that build a `TokenizerRegistry` by hand (via
+    /// `attach_chat_encoder_for_test`'s siblings) keep constructing it from a
+    /// single `adapter::load` call.
+    #[cfg(test)]
+    fn single(t: Arc<Tokenizer>) -> Self {
+        Self {
+            shards: vec![t],
+            next: AtomicUsize::new(0),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct TokenizerRegistry {
-    inner: DashMap<String, Arc<Tokenizer>>,
+    inner: DashMap<String, TokenizerShards>,
     /// Per-model chat encoder, present only when the model's prompt format is
     /// known (a `tokenizer_config.json` chat template, or a built-in encoder
     /// like DeepSeek-V4's). Cache-aware routing uses it to tokenize chat
@@ -88,8 +190,8 @@ impl TokenizerRegistry {
     pub fn load_from_config(cfg: &crate::config::Config) -> Result<Self> {
         let me = TokenizerRegistry::default();
         let m = &cfg.model;
-        let t = adapter::load(&m.tokenizer_path)?;
-        me.inner.insert(m.id.clone(), t);
+        let shards = TokenizerShards::load(&m.tokenizer_path, m.tokenizer_shards)?;
+        me.inner.insert(m.id.clone(), shards);
         // Resolve the chat encoder, best-effort: a Jinja template from
         // tokenizer_config.json, else a built-in encoder for a recognized model
         // (DeepSeek-V4), else none (chat traffic routes via raw text). Every
@@ -131,8 +233,13 @@ impl TokenizerRegistry {
         None
     }
 
+    /// Return one of this model's tokenizer shards, round-robin. Every call
+    /// may return a *different* `Arc<Tokenizer>` instance than the previous
+    /// one for the same model — callers must not rely on pointer identity
+    /// across calls (see [`TokenizerShards`] for why: spreading callers
+    /// across N independently-locked instances is the whole point).
     pub fn get(&self, model_id: &str) -> Option<Arc<Tokenizer>> {
-        self.inner.get(model_id).map(|r| Arc::clone(&*r))
+        self.inner.get(model_id).map(|r| r.next())
     }
 
     /// Whether this model has a chat encoder (and thus the chat-aware
@@ -231,6 +338,7 @@ mod tests {
             model: crate::config::ModelConfig {
                 id: "tiny".into(),
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+                tokenizer_shards: 1,
                 policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,
@@ -254,15 +362,41 @@ mod tests {
         assert!(r.get("missing").is_none());
     }
 
+    /// With `tokenizer_shards = 1` (the default `cfg()` fixture), round-robin
+    /// selection over a single-element shard vec always returns the same
+    /// instance, so this preserves the pre-sharding "one shared Arc per
+    /// model" behavior for models that don't opt into multiple shards.
     #[test]
-    fn shared_arc_per_model() {
+    fn shared_arc_per_model_with_one_shard() {
         let r = TokenizerRegistry::load_from_config(&cfg()).unwrap();
         let a = r.get("tiny").unwrap();
         let b = r.get("tiny").unwrap();
         assert!(
             Arc::ptr_eq(&a, &b),
-            "registry should return shared Arc, not clones"
+            "with a single shard, registry should return the same Arc every call"
         );
+    }
+
+    /// With `tokenizer_shards = N > 1`, `get` round-robins across N distinct
+    /// `Arc<Tokenizer>` instances rather than always returning the same one.
+    #[test]
+    fn get_round_robins_across_shards() {
+        let mut c = cfg();
+        c.model.tokenizer_shards = 4;
+        let r = TokenizerRegistry::load_from_config(&c).unwrap();
+
+        let picks: Vec<Arc<Tokenizer>> = (0..8).map(|_| r.get("tiny").unwrap()).collect();
+
+        // Exactly 4 distinct underlying instances, cycling with period 4.
+        let distinct: std::collections::HashSet<usize> =
+            picks.iter().map(|a| Arc::as_ptr(a) as usize).collect();
+        assert_eq!(distinct.len(), 4, "expected exactly 4 distinct shards");
+        for i in 0..4 {
+            assert!(
+                Arc::ptr_eq(&picks[i], &picks[i + 4]),
+                "selection should cycle with period == shard count"
+            );
+        }
     }
 
     #[test]
@@ -407,7 +541,7 @@ mod tests {
         let reg = TokenizerRegistry::default();
         reg.inner.insert(
             "tiny".into(),
-            adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap(),
+            TokenizerShards::single(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
         );
         let cfg = serde_json::json!({
             "chat_template": "{{ bos_token }}{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}{% endfor %}",
@@ -443,7 +577,7 @@ mod tests {
         let reg = TokenizerRegistry::default();
         reg.inner.insert(
             "tiny".into(),
-            adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap(),
+            TokenizerShards::single(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
         );
         assert!(!reg.has_chat_encoder("tiny"));
         let messages = serde_json::json!([{"role":"user","content":"hi"}]);
@@ -458,7 +592,7 @@ mod tests {
         let reg = TokenizerRegistry::default();
         reg.inner.insert(
             "tiny".into(),
-            adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap(),
+            TokenizerShards::single(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
         );
         reg.attach_chat_template_for_test(
             "tiny",
@@ -483,5 +617,104 @@ mod tests {
         assert!(!is_deepseek_v4("deepseek-ai/DeepSeek-V3.2"));
         assert!(!is_deepseek_v4("Qwen/Qwen3-0.6B"));
         assert!(!is_deepseek_v4("tiny"));
+    }
+
+    /// Find a real, non-trivial `tokenizer.json` in the local HuggingFace
+    /// cache, if any is present. Returns `None` (the test that calls this
+    /// skips itself) rather than failing on machines/CI runners with no HF
+    /// cache populated — this test's value is in exercising a large,
+    /// real-world BPE vocab/merge table, not in requiring network access or a
+    /// specific model to be cached.
+    fn find_cached_real_tokenizer_json() -> Option<std::path::PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        let hub = std::path::Path::new(&home).join(".cache/huggingface/hub");
+        for entry in std::fs::read_dir(&hub).ok()?.flatten() {
+            let snapshots = entry.path().join("snapshots");
+            for snap in std::fs::read_dir(&snapshots).ok()?.flatten() {
+                let candidate = snap.path().join("tokenizer.json");
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+
+    /// Sharding must never change tokenization output: N independently
+    /// loaded instances of the same `tokenizer.json` are (by construction)
+    /// identical apart from their private, output-invisible merge caches, but
+    /// this pins that empirically rather than by argument alone — a
+    /// regression here (e.g. a shared mutable default inside the BPE model,
+    /// or a loader that isn't actually deterministic) would silently corrupt
+    /// downstream cache-affinity hashing, which requires byte-for-byte
+    /// identical token ids across shards.
+    ///
+    /// Prefers a real, large tokenizer.json from the local HF cache when one
+    /// is present (extra real-world coverage in local dev), but the fallback
+    /// is `tests/fixtures/tiny_bpe_tokenizer.json`, NOT the plain
+    /// `tiny_tokenizer.json` fixture other tests in this file use —
+    /// `tiny_tokenizer.json` has an empty `merges` array (pure byte-level
+    /// vocab, no BPE merging at all), which would make this test check
+    /// nothing about merge-cache divergence in exactly the CI environment
+    /// (`ubuntu-latest`, no HF cache — see `pr-test-sgl-router.yml`) this
+    /// test exists to protect: every run there would silently fall back and
+    /// silently pass regardless of whether sharding actually preserves
+    /// output. `tiny_bpe_tokenizer.json` is `tiny_tokenizer.json` plus four
+    /// real merges (t+h, th+e, i+n, in+g), so `assert_merge_actually_fired`
+    /// below can confirm real BPE merging ran, not just byte-level passthrough,
+    /// on ANY machine.
+    #[test]
+    fn sharded_instances_produce_identical_output() {
+        let source = find_cached_real_tokenizer_json()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "tests/fixtures/tiny_bpe_tokenizer.json".into());
+        eprintln!("sharded_instances_produce_identical_output: using {source}");
+
+        const N: usize = 8;
+        let shards = TokenizerShards::load(&source, N).expect("load N independent instances");
+        assert_eq!(shards.shards.len(), N);
+
+        let inputs: &[&str] = &[
+            "Hello, how are you today?",
+            "def fibonacci(n):\n    if n <= 1:\n        return n\n    return fibonacci(n - 1) + fibonacci(n - 2)\n",
+            "The quick brown fox jumps over the lazy dog near the riverbank while the sun sets slowly behind the distant mountains, casting long shadows across the valley below.",
+            "你好，世界！这是一个测试。今天天气怎么样？",
+            "SGLang is a fast serving framework for large language models and vision language models.",
+            "aaaaaaaaaa bbbbbbbbbb aaaaaaaaaa bbbbbbbbbb aaaaaaaaaa",
+            "",
+            "🚀🔥💯 emoji stress test with mixed ASCII and 日本語 text!!!",
+        ];
+
+        let mut any_merge_fired = false;
+        for text in inputs {
+            let outputs: Vec<Vec<u32>> = shards
+                .shards
+                .iter()
+                .map(|t| adapter::encode(t, text).expect("encode must succeed"))
+                .collect();
+            // A merge fired if the token count is less than the raw byte
+            // count — every unmerged byte is its own token in this
+            // byte-level vocab, so any reduction below `text.len()` (bytes,
+            // not chars) proves at least one BPE merge actually ran.
+            if !outputs[0].is_empty() && outputs[0].len() < text.len() {
+                any_merge_fired = true;
+            }
+            for (i, ids_i) in outputs.iter().enumerate() {
+                for (j, ids_j) in outputs.iter().enumerate() {
+                    assert_eq!(
+                        ids_i, ids_j,
+                        "shard {i} and shard {j} produced different token ids for {text:?}: \
+                         sharding must never change tokenization output"
+                    );
+                }
+            }
+        }
+        assert!(
+            any_merge_fired,
+            "none of the test inputs triggered a single BPE merge against {source} — this test \
+             would then be checking N identical byte-level passthroughs, not real shard-to-shard \
+             merge-cache divergence, silently validating nothing. Use a tokenizer.json with a \
+             non-empty merges table (see tests/fixtures/tiny_bpe_tokenizer.json)."
+        );
     }
 }
