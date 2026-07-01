@@ -262,6 +262,7 @@ class LoRAManager:
             del self.loras[lora_ref.lora_id]
             del self.lora_refs[lora_ref.lora_id]
             self.num_pinned_loras -= int(lora_ref.pinned)
+            self.memory_pool.release_lora_slot(lora_ref.lora_id)
         except Exception as e:
             return self.create_lora_update_result(
                 success=False,
