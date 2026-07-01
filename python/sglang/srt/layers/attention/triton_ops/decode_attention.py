@@ -441,6 +441,8 @@ def _fwd_grouped_kernel_stage1(
         base_offs_kpe = cur_kv_head * stride_buf_kh + offs_dpe[:, None]
     if not HAS_MLA:
         base_offs_v = cur_kv_head * stride_buf_vh + offs_dv[None, :]
+    if HAS_MLA and BLOCK_DV < BLOCK_DMODEL:
+        base_offs_v_mla = cur_kv_head * stride_buf_kh + offs_dv[None, :]
 
     if split_kv_end > split_kv_start:
         q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
@@ -500,7 +502,22 @@ def _fwd_grouped_kernel_stage1(
                 mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
             )
             if HAS_MLA:
-                v = tl.trans(k)
+                # MLA stores K and V in the same buffer.  When the key
+                # dimension (BLOCK_DMODEL) equals the value dimension
+                # (BLOCK_DV) a simple transpose suffices.  When they
+                # differ (e.g. Mistral-Large-3 / Mistral-Small-4 where
+                # K = kv_lora_rank + rope_dim but V = kv_lora_rank) we
+                # reload the first Lv elements from the KV buffer to
+                # avoid a shape mismatch in the subsequent ``tl.dot``.
+                if BLOCK_DV < BLOCK_DMODEL:
+                    offs_buf_v_mla = kv_loc[:, None] * stride_buf_kbs + base_offs_v_mla
+                    v = tl.load(
+                        K_Buffer + offs_buf_v_mla,
+                        mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                        other=0.0,
+                    )
+                else:
+                    v = tl.trans(k)
             else:
                 if PAGE_SIZE == 1:
                     offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
