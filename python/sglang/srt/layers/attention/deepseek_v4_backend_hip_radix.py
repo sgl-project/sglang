@@ -224,7 +224,30 @@ class DSV4AttnMetadata:
             ],
         )
 
-    def init_compression_metadata(self, unified_swa_pages: int = 0):
+    @staticmethod
+    def _physical_compress_loc(
+        page: torch.Tensor,
+        swa_pages: int,
+        dcp_size: int,
+        dcp_rank: int,
+        dead_row: int,
+    ) -> torch.Tensor:
+        """Map raw compress page id -> physical write row under physical DCP:
+        owner = page % dcp_size, local row = swa_pages + page // dcp_size;
+        non-owned (and any negative sentinel) pages go to the DEAD row."""
+        owned = ((page % dcp_size) == dcp_rank) & (page >= 0)
+        local = swa_pages + page // dcp_size
+        return torch.where(owned, local, torch.full_like(page, dead_row))
+
+    def init_compression_metadata(
+        self,
+        unified_swa_pages: int = 0,
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
+        physical: bool = False,
+        dead_c4: int = 0,
+        dead_c128: int = 0,
+    ):
         assert self.page_table.dim() == 2
         assert (
             self.raw_out_loc.shape == self.seq_lens_casual.shape
@@ -255,8 +278,19 @@ class DSV4AttnMetadata:
         if unified_swa_pages:
             if self.unified is None:
                 self.unified = UnifiedKvMetadata()
-            self.unified.c4_out_loc = self.c4_out_loc + unified_swa_pages
-            self.unified.c128_out_loc = self.c128_out_loc + unified_swa_pages
+            if physical and dcp_size > 1:
+                # Physical DCP: compressed pages are sharded across the group;
+                # each rank writes only its owned pages to its local row, others
+                # to the per-ratio DEAD row (overwritten, never read).
+                self.unified.c4_out_loc = self._physical_compress_loc(
+                    self.c4_out_loc, unified_swa_pages, dcp_size, dcp_rank, dead_c4
+                )
+                self.unified.c128_out_loc = self._physical_compress_loc(
+                    self.c128_out_loc, unified_swa_pages, dcp_size, dcp_rank, dead_c128
+                )
+            else:
+                self.unified.c4_out_loc = self.c4_out_loc + unified_swa_pages
+                self.unified.c128_out_loc = self.c128_out_loc + unified_swa_pages
 
     _CP_REINDEX_FIELDS = [
         "seq_lens_casual",
@@ -455,6 +489,18 @@ class DeepseekV4HipRadixBackend(
             DSV4RawVerifyMetadata,
             DSV4RawDecodeMetadata,
         ] = None
+
+        # Decode context parallel (DCP). For DSV4's MLA unified_kv the KV latent
+        # is replicated across every TP rank (num_key_value_heads=1), so DCP does
+        # not physically reshard KV; instead each rank attends only its
+        # round-robin shard of every token's KV stream and the partial softmax
+        # outputs are merged via an LSE all-gather + output all-reduce inside the
+        # DCP group (a sub-group of TP). This halves the per-rank KV read
+        # bandwidth of decode without changing the KV pool / allocator. HIP-only:
+        # this backend is selected only on ROCm.
+        self.dcp_size = getattr(model_runner, "dcp_size", 1) or 1
+        self.dcp_rank = getattr(model_runner, "dcp_rank", 0) or 0
+        self._dcp_group = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1105,6 +1151,74 @@ class DeepseekV4HipRadixBackend(
         core.unified.pf_cu_q = cu_q_per_req[bid]
         core.unified.pf_final_pos = (seq_lens - 1)[bid]
 
+    def _get_dcp_group(self):
+        if self._dcp_group is None:
+            from sglang.srt.distributed.parallel_state import get_dcp_group
+
+            self._dcp_group = get_dcp_group()
+        return self._dcp_group
+
+    def _decode_dcp(
+        self,
+        *,
+        q: torch.Tensor,  # [T, H_local, D]
+        unified: torch.Tensor,
+        kv_indices: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        attn_sink: torch.Tensor,  # [H_local]
+    ) -> torch.Tensor:
+        """DCP decode merge.
+
+        The DCP group is a sub-group of TP; the KV latent is replicated on every
+        rank. Steps:
+          1. All-gather Q heads across the group so every rank holds all
+             ``H_local * dcp_size`` group heads.
+          2. Each rank runs the sink-less decode over only its round-robin KV
+             shard (``DCP_RANK::DCP_SIZE`` stream entries), returning the partial
+             softmax output and its natural-log LSE.
+          3. ``cp_lse_ag_out_rs`` all-gathers the LSEs, recomputes the global
+             softmax denom, rescales + all-reduces the outputs, and slices this
+             rank's head block back out — yielding the sink-less full-KV result.
+          4. Fold attn_sink once over the merged denom:
+             ``O = O_nosink * sigmoid(global_lse - attn_sink)`` (equivalent to
+             dividing by ``Σexp + exp(sink)`` instead of ``Σexp``).
+        """
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels import runtime
+        from sglang.srt.layers.attention.utils import cp_lse_ag_out_rs
+
+        dcp_group = self._get_dcp_group()
+        # [T, H_local, D] -> [T, H_local * dcp_size, D]; rank r's heads land at
+        # [r * H_local : (r+1) * H_local], matching cp_lse_ag_out_rs's slice.
+        q_full = dcp_group.all_gather(q.contiguous(), dim=1)
+        pool = self.token_to_kv_pool
+        physical = getattr(pool, "unified_physical_dcp", False)
+        swa_pages = getattr(pool, "unified_swa_pages", 0) if physical else 0
+        out_shard, lse_shard = runtime.decode(
+            q=q_full,
+            unified_kv=unified,
+            kv_indices=kv_indices,
+            kv_indptr=kv_indptr,
+            attn_sink=attn_sink,
+            softmax_scale=self.softmax_scale,
+            apply_sink=False,
+            return_lse=True,
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
+            physical=physical,
+            swa_pages=swa_pages,
+        )
+        o_nosink, global_lse = cp_lse_ag_out_rs(
+            out_shard, lse_shard, dcp_group, return_lse=True
+        )
+        # o_nosink: [T, H_local, D] fp32; global_lse: [T, H_local] fp32.
+        # attn_sink is the full [n_heads] param; the non-DCP unified_kv kernel
+        # folds attn_sink[0:H_local] (h_offs in [0, H_local)) for every rank, so
+        # mirror that here: fold the first H_local sinks over the merged denom.
+        h_local = global_lse.shape[1]
+        sink = attn_sink.to(torch.float32)[:h_local].view(1, h_local)
+        scale = torch.sigmoid(global_lse - sink).unsqueeze(-1)  # [T, H_local, 1]
+        return (o_nosink.to(torch.float32) * scale).to(q.dtype)
+
     def _forward_unified_kv(
         self,
         *,
@@ -1171,6 +1285,14 @@ class DeepseekV4HipRadixBackend(
                 )
             else:
                 raise ValueError(f"bad compress_ratio {compress_ratio}")
+            if self.dcp_size > 1:
+                return self._decode_dcp(
+                    q=q,
+                    unified=unified,
+                    kv_indices=kv_indices,
+                    kv_indptr=kv_indptr,
+                    attn_sink=attn_sink,
+                )
             return runtime.decode(
                 q=q,
                 unified_kv=unified,
@@ -1595,8 +1717,16 @@ class DeepseekV4HipRadixBackend(
         )
 
         if need_compress:
+            pool = self.token_to_kv_pool
+            _physical = getattr(pool, "unified_physical_dcp", False)
+            _dead = getattr(pool, "unified_compress_dead_row", {}) or {}
             core_attn_metadata.init_compression_metadata(
-                unified_swa_pages=getattr(self.token_to_kv_pool, "unified_swa_pages", 0)
+                unified_swa_pages=getattr(pool, "unified_swa_pages", 0),
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
+                physical=_physical,
+                dead_c4=int(_dead.get(4, 0)),
+                dead_c128=int(_dead.get(128, 0)),
             )
             core_attn_metadata.init_flashmla_related()
         else:

@@ -533,6 +533,8 @@ class ModelRunnerKVCacheMixin:
                 online_mtp_max_draft_tokens=(
                     self.server_args.max_speculative_num_draft_tokens or 0
                 ),
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_dsa_model:
