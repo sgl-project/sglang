@@ -132,6 +132,7 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
+_use_fused_moe_gate = get_bool_env_var("SGLANG_USE_FUSED_MOE_GATE")
 
 # Experimental: skip the HIP padded-token routing-weight masking entirely.
 # Padded (CUDA-graph) rows are discarded downstream and the MoE combine is
@@ -1415,9 +1416,12 @@ def biased_grouped_topk_gpu(
         return topk_weights, topk_ids
 
     elif (
-        _is_cuda
-        # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
-        and experts_per_group <= 32
+        _is_cuda 
+        and ((
+                _use_fused_moe_gate
+                and experts_per_group  <= 32) or (num_experts == 256
+                and num_expert_group == 1
+            )) 
         and is_power_of_two(num_experts)
     ):
         topk_weights, topk_ids = moe_fused_gate(
