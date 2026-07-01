@@ -97,6 +97,7 @@ async def whisper_autodetect(
         if disaggregation_mode != "null":
             req.bootstrap_room = 0
             req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+            req.skip_radix_cache_insert = True
         # Drain the generator so the FSM is fully installed and any
         # downstream exception surfaces instead of being swallowed after
         # the first yield.
@@ -123,5 +124,6 @@ async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManag
         if disaggregation_mode != "null":
             generate_req_input.bootstrap_room = 0
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
+            generate_req_input.skip_radix_cache_insert = True
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
