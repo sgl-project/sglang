@@ -492,6 +492,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_MC,
             enable_taylorseer=envs.SGLANG_CACHE_DIT_TAYLORSEER,
             taylorseer_order=envs.SGLANG_CACHE_DIT_TS_ORDER,
+            enable_dmd=envs.SGLANG_CACHE_DIT_DMD,
+            dmd_history=envs.SGLANG_CACHE_DIT_DMD_HISTORY,
+            dmd_rank=envs.SGLANG_CACHE_DIT_DMD_RANK,
+            dmd_ridge=envs.SGLANG_CACHE_DIT_DMD_RIDGE,
+            dmd_svd_precision=envs.SGLANG_CACHE_DIT_DMD_SVD_PRECISION,
             num_inference_steps=(
                 num_inference_steps
                 if isinstance(num_inference_steps, int)
@@ -515,6 +520,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_SECONDARY_MC,
                 enable_taylorseer=envs.SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER,
                 taylorseer_order=envs.SGLANG_CACHE_DIT_SECONDARY_TS_ORDER,
+                enable_dmd=envs.SGLANG_CACHE_DIT_SECONDARY_DMD,
+                dmd_history=envs.SGLANG_CACHE_DIT_SECONDARY_DMD_HISTORY,
+                dmd_rank=envs.SGLANG_CACHE_DIT_SECONDARY_DMD_RANK,
+                dmd_ridge=envs.SGLANG_CACHE_DIT_SECONDARY_DMD_RIDGE,
+                dmd_svd_precision=envs.SGLANG_CACHE_DIT_SECONDARY_DMD_SVD_PRECISION,
                 num_inference_steps=num_low_noise_steps,
                 # SCM fields - shared with primary
                 steps_computation_mask=steps_computation_mask_2,
