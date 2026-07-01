@@ -16,6 +16,7 @@
 from pathlib import Path
 from typing import Optional
 
+from transformers import PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.srt.configs.model_config_parser_registry import (
@@ -43,6 +44,90 @@ from .mistral_utils import is_mistral_model, load_mistral_config
 
 def _set_architectures(config, arch_name):
     config.update({"architectures": [arch_name]})
+
+
+_ROPE_OVERRIDE_KEYS = ("rope_scaling", "rope_parameters")
+
+# Sub-config attributes that may hold the language-model config of a
+# composite (VLM / omni) model. Mirrors the attribute priority of
+# `get_hf_text_config` in common.py.
+_TEXT_SUB_CONFIG_ATTRS = (
+    "thinker_config",
+    "llm_config",
+    "language_config",
+    "text_config",
+)
+
+
+def _resolve_text_sub_config(config) -> Optional[PretrainedConfig]:
+    """Find the language-model sub-config of a composite (VLM/omni) config.
+
+    Follows the same attribute priority as `get_hf_text_config` in common.py.
+    Returns None for pure-text configs (no sub-config).
+    """
+    for attr in _TEXT_SUB_CONFIG_ATTRS:
+        sub = getattr(config, attr, None)
+        if isinstance(sub, PretrainedConfig):
+            if attr == "thinker_config":
+                inner = getattr(sub, "text_config", None)
+                if isinstance(inner, PretrainedConfig):
+                    return inner
+            return sub
+    return None
+
+
+def _merged_rope_override(config, key: str, value):
+    """Merge a rope override dict over the config's existing rope dict.
+
+    Model-card overrides like ``{"rope_type": "yarn", "factor": 4.0, ...}``
+    are partial: in transformers v5 ``rope_parameters`` also carries
+    checkpoint-required keys such as ``rope_theta`` and ``mrope_section``,
+    which a wholesale replacement would drop. Existing keys are kept unless
+    explicitly overridden.
+    """
+    existing = getattr(config, key, None)
+    if isinstance(value, dict) and isinstance(existing, dict):
+        return {**existing, **value}
+    return value
+
+
+def apply_model_override_args(config, model_override_args: dict) -> None:
+    """Apply ``--json-model-override-args`` to a (possibly composite) config.
+
+    A flat ``config.update()`` is not enough for composite (VLM-format)
+    configs whose language-model settings live in a sub-config such as
+    ``text_config`` (see issue #27974):
+
+    - Nested overrides (``{"text_config": {"rope_parameters": ...}}``) would
+      replace the sub-config object with a plain dict and crash later in
+      ``get_hf_text_config``. Instead, recurse into the existing sub-config.
+    - Flat rope overrides (``{"rope_scaling": ...}``) would only update the
+      unused parent config while the language model reads rope settings from
+      the text sub-config -- a silent no-op. Mirror them onto the text
+      sub-config as well.
+    """
+    flat_overrides = {}
+    for key, value in model_override_args.items():
+        existing = getattr(config, key, None)
+        if isinstance(value, dict) and isinstance(existing, PretrainedConfig):
+            apply_model_override_args(existing, value)
+        elif key in _ROPE_OVERRIDE_KEYS:
+            flat_overrides[key] = _merged_rope_override(config, key, value)
+        else:
+            flat_overrides[key] = value
+    if flat_overrides:
+        config.update(flat_overrides)
+
+    rope_keys = [k for k in _ROPE_OVERRIDE_KEYS if k in flat_overrides]
+    if rope_keys:
+        text_config = _resolve_text_sub_config(config)
+        if text_config is not None:
+            text_config.update(
+                {
+                    k: _merged_rope_override(text_config, k, model_override_args[k])
+                    for k in rope_keys
+                }
+            )
 
 
 def _apply_deepseek_ocr_overrides(config, model):
@@ -231,7 +316,7 @@ def get_config(
     )
 
     if model_override_args:
-        config.update(model_override_args)
+        apply_model_override_args(config, model_override_args)
 
     if is_gguf:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:

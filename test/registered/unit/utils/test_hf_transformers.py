@@ -20,6 +20,7 @@ from sglang.srt.utils.hf_transformers.common import (
     get_hf_text_config,
     get_rope_config,
 )
+from sglang.srt.utils.hf_transformers.config import apply_model_override_args
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -589,6 +590,103 @@ class TestPatchNemotronHPattern(unittest.TestCase):
             self.assertEqual(result, ["mamba", "moe", "attention"])
         except ImportError:
             self.skipTest("NemotronHConfig not available in this transformers version")
+
+
+# ---------------------------------------------------------------------------
+# apply_model_override_args (issue #27974)
+# ---------------------------------------------------------------------------
+
+
+class TestApplyModelOverrideArgs(unittest.TestCase):
+    YARN = {
+        "rope_type": "yarn",
+        "factor": 4.0,
+        "original_max_position_embeddings": 8192,
+    }
+
+    def _make_composite_config(self, sub_attr="text_config"):
+        text_cfg = PretrainedConfig()
+        text_cfg.num_attention_heads = 8
+        text_cfg.rope_parameters = {
+            "rope_type": "default",
+            "rope_theta": 1e7,
+            "mrope_section": [11, 11, 10],
+        }
+        cfg = PretrainedConfig()
+        setattr(cfg, sub_attr, text_cfg)
+        return cfg, text_cfg
+
+    def test_flat_update_on_pure_text_config(self):
+        cfg = PretrainedConfig()
+        cfg.num_hidden_layers = 2
+        apply_model_override_args(cfg, {"num_hidden_layers": 4})
+        self.assertEqual(cfg.num_hidden_layers, 4)
+
+    def test_flat_rope_override_reaches_text_config(self):
+        # Flat form used to be a silent no-op for VLM-format configs: the
+        # parent was updated while the language model read text_config.
+        cfg, text_cfg = self._make_composite_config()
+        apply_model_override_args(cfg, {"rope_scaling": dict(self.YARN)})
+        self.assertEqual(text_cfg.rope_parameters["rope_type"], "yarn")
+        self.assertEqual(text_cfg.rope_parameters["factor"], 4.0)
+
+    def test_flat_rope_override_merges_existing_keys(self):
+        # Partial yarn overrides must not drop checkpoint-required keys
+        # (rope_theta, mrope_section) folded into rope_parameters in v5.
+        cfg, text_cfg = self._make_composite_config()
+        apply_model_override_args(cfg, {"rope_scaling": dict(self.YARN)})
+        self.assertEqual(text_cfg.rope_parameters["rope_theta"], 1e7)
+        self.assertEqual(text_cfg.rope_parameters["mrope_section"], [11, 11, 10])
+
+    def test_flat_rope_override_mirrors_to_llm_config(self):
+        cfg, text_cfg = self._make_composite_config(sub_attr="llm_config")
+        apply_model_override_args(cfg, {"rope_parameters": dict(self.YARN)})
+        self.assertEqual(text_cfg.rope_parameters["rope_type"], "yarn")
+
+    def test_flat_rope_override_mirrors_to_thinker_text_config(self):
+        cfg, text_cfg = self._make_composite_config()
+        outer = PretrainedConfig()
+        outer.thinker_config = cfg
+        apply_model_override_args(outer, {"rope_scaling": dict(self.YARN)})
+        self.assertEqual(text_cfg.rope_parameters["rope_type"], "yarn")
+
+    def test_nested_override_recurses_into_sub_config(self):
+        # Nested form used to replace text_config with a plain dict and
+        # crash later in get_hf_text_config.
+        cfg, text_cfg = self._make_composite_config()
+        apply_model_override_args(
+            cfg, {"text_config": {"rope_parameters": dict(self.YARN)}}
+        )
+        self.assertIsInstance(cfg.text_config, PretrainedConfig)
+        self.assertIs(cfg.text_config, text_cfg)
+        self.assertEqual(text_cfg.num_attention_heads, 8)
+        self.assertEqual(text_cfg.rope_parameters["rope_type"], "yarn")
+        # Partial nested rope dicts merge over existing keys too.
+        self.assertEqual(text_cfg.rope_parameters["rope_theta"], 1e7)
+
+    def test_nested_non_rope_override(self):
+        cfg, text_cfg = self._make_composite_config()
+        apply_model_override_args(cfg, {"text_config": {"num_attention_heads": 16}})
+        self.assertEqual(text_cfg.num_attention_heads, 16)
+        self.assertEqual(text_cfg.rope_parameters["rope_type"], "default")
+
+    def test_non_dict_rope_override_replaces(self):
+        cfg = PretrainedConfig()
+        cfg.rope_parameters = {"rope_type": "default", "rope_theta": 1e6}
+        apply_model_override_args(cfg, {"rope_parameters": None})
+        self.assertIsNone(cfg.rope_parameters)
+
+    def test_get_hf_text_config_after_nested_override(self):
+        # End-to-end: get_hf_text_config must still resolve after the
+        # nested override (this is where the old code crashed).
+        cfg, text_cfg = self._make_composite_config()
+        cfg.architectures = None
+        apply_model_override_args(
+            cfg, {"text_config": {"rope_parameters": dict(self.YARN)}}
+        )
+        resolved = get_hf_text_config(cfg)
+        self.assertIs(resolved, text_cfg)
+        self.assertEqual(resolved.rope_parameters["rope_type"], "yarn")
 
 
 if __name__ == "__main__":
