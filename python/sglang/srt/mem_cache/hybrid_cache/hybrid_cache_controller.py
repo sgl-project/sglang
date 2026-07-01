@@ -207,13 +207,6 @@ class HybridCacheController(BaseHiCacheController):
                 host_pools=getattr(mem_pool_host, "entries", None),
             )
 
-    def _can_keep_write_back_indices(self) -> bool:
-        return (
-            self.io_backend == "kernel"
-            and self.mem_pool_host.layout == "page_first"
-            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
-        )
-
     def _start_storage_threads(self):
         super()._start_storage_threads()
         self._init_extra_host_mem_release_queues()
@@ -402,7 +395,11 @@ class HybridCacheController(BaseHiCacheController):
             return
         op = CacheOperation.merge_ops(self.write_queue)
         # Page-first write-back JIT kernels can keep destination host indices on CPU.
-        if self._can_keep_write_back_indices():
+        if (
+            self.io_backend == "kernel"
+            and self.mem_pool_host.layout == "page_first"
+            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+        ):
             host_indices = op.host_indices
             device_indices = op.device_indices
             resolved_pool_transfers = op.pool_transfers
