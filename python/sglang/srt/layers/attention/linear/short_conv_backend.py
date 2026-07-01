@@ -66,9 +66,14 @@ class ShortConvMetadata(NamedTuple):
     """
 
     layer_cache: Any
-    # Per-request MambaPool slot ids (device). int32/long depending on the pool;
-    # callers cast as their kernel requires.
+    # Per-request MambaPool slot ids (device), in the pool's native int32.
+    # Suitable directly for causal_conv1d's cache_indices.
     cache_indices: torch.Tensor
+    # int64 view of ``cache_indices`` for kernels that require a long index
+    # (e.g. ``index_copy_`` in ZAYA1's cca_decode). Resolved once per step and
+    # shared across conv layers; ``None`` outside decode. Prefer this over a
+    # per-layer ``cache_indices.to(torch.long)``.
+    cache_indices_long: Optional[torch.Tensor] = None
     # cu-seqlens for the varlen prefill conv (device, int32). None on decode.
     query_start_loc: Optional[torch.Tensor] = None
     # Per-request "resumes a cached prefix" mask (device bool). None on decode.
@@ -93,24 +98,27 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         # conv[0] == conv_state: [n_layers, n_slots, conv_dim, conv_kernel - 1]
         self.conv_states_shape = mamba_cache.conv[0].shape
 
-        # Extend-only, resolved once per step in ``init_forward_metadata`` so the
-        # slot-mapping lookup + its GPU->CPU sync run once per step, not once per
-        # (potentially ~60) conv layer.
+        # Per-step derived state, resolved once per step (not once per ~60 conv
+        # layers). ``_has_initial_state`` / ``_slot_ids_cpu`` / ``_has_prefix_cpu``
+        # are extend-only; ``_cache_indices_long`` is the decode int64 view,
+        # computed lazily on the first layer's conv_state_metadata call.
         self._has_initial_state: Optional[torch.Tensor] = None
         self._slot_ids_cpu: Optional[List[int]] = None
         self._has_prefix_cpu: Optional[List[bool]] = None
+        self._cache_indices_long: Optional[torch.Tensor] = None
 
-    def _reset_extend_state(self):
+    def _reset_step_state(self):
         self._has_initial_state = None
         self._slot_ids_cpu = None
         self._has_prefix_cpu = None
+        self._cache_indices_long = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # Builds self.forward_metadata (mamba_cache_indices, query_start_loc) and
         # runs the deferred mamba clear/COW ops.
         super().init_forward_metadata(forward_batch)
 
-        self._reset_extend_state()
+        self._reset_step_state()
         mode = forward_batch.forward_mode
         if (
             mode.is_extend()
@@ -130,7 +138,7 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
     ):
         # Decode / cuda-graph replay path -- no extend prefix state.
         super().init_forward_metadata_out_graph(forward_batch, in_capture)
-        self._reset_extend_state()
+        self._reset_step_state()
 
     def conv_state_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
@@ -139,14 +147,29 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
 
         The per-step fields are already resolved on ``self.forward_metadata`` /
         ``self._*`` (in ``init_forward_metadata`` / ``_out_graph``);
-        ``forward_batch`` is accepted for interface parity with the unit-test
-        mock and is not otherwise required here.
+        ``forward_batch`` selects whether the decode int64 index view is needed.
         """
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         md = self.forward_metadata
+        cache_indices = md.mamba_cache_indices
+
+        # Decode consumers need an int64 index (e.g. index_copy_ in cca_decode).
+        # Compute the cast ONCE per step, shared across all conv layers: on the
+        # first layer's call it is materialized (and, under cuda-graph capture,
+        # the cast is captured here so replay re-runs the single cast reading the
+        # refilled index buffer -- no per-layer cast in the graph). Reset each
+        # step in _reset_step_state.
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and self._cache_indices_long is None
+            and cache_indices is not None
+        ):
+            self._cache_indices_long = cache_indices.to(torch.long)
+
         return ShortConvMetadata(
             layer_cache=layer_cache,
-            cache_indices=md.mamba_cache_indices,
+            cache_indices=cache_indices,
+            cache_indices_long=self._cache_indices_long,
             query_start_loc=md.query_start_loc,
             has_initial_state=self._has_initial_state,
             slot_ids_cpu=self._slot_ids_cpu,
