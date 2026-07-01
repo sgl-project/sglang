@@ -23,13 +23,13 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.attention.utils import assert_buffer_fits
-from sglang.srt.layers.utils.dcp_utils import (
+from sglang.srt.layers.cp.dcp import (
     DecodeContextParallelMetadata,
     dcp_enabled,
     get_attention_dcp_world_size,
-    plan_dcp_decode_metadata,
     update_local_kv_lens_for_dcp,
 )
+from sglang.srt.layers.cp.dcp.planner import plan_dcp_decode_metadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,

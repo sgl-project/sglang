@@ -51,7 +51,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_group,
     is_allocation_symmetric,
 )
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
 
@@ -334,6 +333,13 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     def materialize_full_kv(
         self, forward_batch, layer: Any, k: Any, v: Any, swa_loc: Optional[Any] = None
     ) -> None:
+        # Lazy import to break the layers.cp <-> mem_cache import cycle:
+        # layers/cp/__init__.py eagerly imports this module, so a module-top
+        # `from mem_cache.memory_pool import KVWriteLoc` re-enters memory_pool
+        # while it is mid-init (memory_pool -> mem_cache.utils -> mla_buffer ->
+        # layers.cp.dcp). KVWriteLoc is only used here, at call time.
+        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
