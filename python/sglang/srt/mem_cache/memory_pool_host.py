@@ -2298,6 +2298,7 @@ class LogicalHostPool:
         self.start_layer = 0
         self.end_layer = 0
         self.kv_buffer = None
+        self.is_logical_anchor = True
         self.size_per_token = 0
         self.allocator = None
         self.can_use_write_back_jit = True
@@ -3149,6 +3150,10 @@ class HostPoolGroup:
     @property
     def kv_buffer(self):
         return self.anchor_entry.host_pool.kv_buffer
+
+    @property
+    def is_logical_anchor(self):
+        return getattr(self.anchor_entry.host_pool, "is_logical_anchor", False)
 
     @property
     def size_per_token(self):
