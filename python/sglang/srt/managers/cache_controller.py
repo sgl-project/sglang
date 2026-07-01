@@ -188,8 +188,13 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
+        self.storage_query_done = False
+        self.storage_hit_count = 0
 
         super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
+
+    def has_insufficient_storage_hit(self, threshold: int) -> bool:
+        return self.storage_query_done and self.storage_hit_count < threshold
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -1044,6 +1049,8 @@ class HiCacheController:
                 )
                 storage_hit_count = storage_hit_count_tensor.item()
 
+                operation.storage_query_done = True
+                operation.storage_hit_count = storage_hit_count
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)

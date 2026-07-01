@@ -578,13 +578,7 @@ class HiRadixCache(RadixCache):
 
         def _drain_revoke():
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                info = self.ongoing_prefetch.pop(req_id, None)
-                if info is not None:
-                    last_host_node, token_ids, _, _ = info
-                    last_host_node.release_host()
-                    cc.prefetch_tokens_occupied -= len(token_ids)
-                    if cc.prefetch_tokens_occupied < 0:
-                        cc.prefetch_tokens_occupied = 0
+                self._revoke_pending_prefetch(req_id)
 
         def _drain_backup():
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
@@ -1374,6 +1368,17 @@ class HiRadixCache(RadixCache):
         can_terminate = can_terminate or operation_terminated
         return can_terminate
 
+    def _revoke_pending_prefetch(self, req_id: str):
+        info = self.ongoing_prefetch.pop(req_id, None)
+        if info is None:
+            return
+        last_host_node, prefetch_key, _ = info
+        last_host_node.release_host()
+        cc = self.cache_controller
+        cc.prefetch_tokens_occupied = max(
+            0, cc.prefetch_tokens_occupied - len(prefetch_key)
+        )
+
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
             # there is no ongoing prefetch for this request or it has been revoked
@@ -1384,6 +1389,10 @@ class HiRadixCache(RadixCache):
         last_host_node, prefetch_key, host_indices, operation = self.ongoing_prefetch[
             req_id
         ]
+
+        if operation.has_insufficient_storage_hit(self.prefetch_threshold):
+            self._revoke_pending_prefetch(req_id)
+            return True
 
         if operation.host_indices is None:
             # prefetch has not been issued due to insufficient host memory

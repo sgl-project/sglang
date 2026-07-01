@@ -137,6 +137,11 @@ class PrefetchOperation(StorageOperation):
             pool_transfers=pool_transfers,
         )
         self.pool_transfers_done = not bool(pool_transfers)
+        self.storage_query_done = False
+        self.storage_hit_count = 0
+
+    def has_insufficient_storage_hit(self, threshold: int) -> bool:
+        return self.storage_query_done and self.storage_hit_count < threshold
 
     def increment(self, num_tokens: int):
         with self._lock:
