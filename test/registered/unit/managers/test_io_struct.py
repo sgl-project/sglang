@@ -419,6 +419,18 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req.lora_path, expected_lora_paths)
 
+        req = GenerateReqInput(text=["a", "b", "c"], lora_path=["x", "y"])
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            req.normalize_batch_and_arguments()
+
+        req = GenerateReqInput(text=["a", "b", "c"], lora_path=["x", "y", "z", "w"])
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            req.normalize_batch_and_arguments()
+
+        req = GenerateReqInput(text=["a", "b", "c"], lora_path=["x", "y", "z"])
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.lora_path, ["x", "y", "z"])
+
     def test_extra_key_normalization(self):
         """Test normalization of extra_key."""
         # Per-request list

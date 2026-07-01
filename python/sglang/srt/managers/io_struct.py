@@ -481,6 +481,10 @@ class GenerateReqInput:
             if isinstance(self.lora_path, str):
                 self.lora_path = [self.lora_path] * num
             elif isinstance(self.lora_path, list):
+                if len(self.lora_path) != self.batch_size:
+                    raise ValueError(
+                        "The length of lora_path should be equal to the batch size."
+                    )
                 self.lora_path = self.lora_path * self.parallel_sample_num
             else:
                 raise ValueError("lora_path should be a list or a string.")
