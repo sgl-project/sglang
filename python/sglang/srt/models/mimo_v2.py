@@ -1070,7 +1070,11 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 quant_config=None,
                 prefix=add_prefix("visual", prefix),
             )
-            self.build_audio_encoder(MiMoAudioEncoderConfig(**audio_config))
+            try:
+                self.build_audio_encoder(MiMoAudioEncoderConfig(**audio_config))
+            except Exception as e:
+                logger.warning(f"Failed to build audio encoder, skipping: {e}")
+                self.audio_tokenizer = None
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: (

@@ -18,7 +18,6 @@ import torch
 import torch.nn.functional as F
 from fastapi import HTTPException
 from PIL import Image
-from torchcodec.decoders import AudioDecoder
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
 )
@@ -41,6 +40,14 @@ from sglang.srt.multimodal.processors.mimo_audio import (
 from sglang.srt.multimodal.processors.qwen_vl import smart_nframes
 from sglang.srt.utils import ImageData, VideoData
 from sglang.utils import logger
+
+try:
+    from torchcodec.decoders import AudioDecoder
+except ImportError:
+    logger.warning(
+        "torchcodec is not installed; audio inputs will fail at request time"
+    )
+    AudioDecoder = None
 
 
 @dataclass
