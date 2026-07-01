@@ -631,7 +631,7 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
                 do_cfg,
             )
 
-            for chunk_idx in self.progress_bar(range(num_chunks)):
+            for chunk_idx in self.progress_bar(range(num_chunks), batch=batch):
                 chunk_kv, sink_num = self._accumulate_kv_cache(
                     kv_cache,
                     chunk_idx,

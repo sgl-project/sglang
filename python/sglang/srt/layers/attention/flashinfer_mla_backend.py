@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.runtime_context import get_parallel
+
 """
 Support attention backend for flashinfer MLA.
 The flashinfer_mla_disable_ragged flag controls whether to use ragged prefill wrapper and defaults to be false.
@@ -21,7 +23,13 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.attention.utils import assert_buffer_fits
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.utils.dcp_utils import (
+    DecodeContextParallelMetadata,
+    dcp_enabled,
+    get_attention_dcp_world_size,
+    plan_dcp_decode_metadata,
+    update_local_kv_lens_for_dcp,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -81,7 +89,7 @@ class FlashInferMhaChunkKVRunner:
     ):
         # Parse Constants
         self.num_local_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -336,7 +344,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 # fast_mla_decode_plan needs _cached_module from the initial
                 # begin_forward above, so install it only after that call completes.
                 decode_wrapper.plan = partial(fast_mla_decode_plan, decode_wrapper)
-            elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+            elif forward_mode.is_target_verify():
                 prefill_wrapper = BatchMLAPagedAttentionWrapper(
                     self.workspace_buffer,
                     use_cuda_graph=True,
@@ -381,17 +389,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 init_metadata_replay=False,
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrapper)
-        elif forward_batch.forward_mode.is_draft_extend():
-            self.indices_updater_prefill.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrapper_paged=self.prefill_wrapper_paged,
-                use_ragged=False,
-                spec_info=forward_batch.spec_info,
-            )
-            self.forward_metadata = PrefillMetadata(self.prefill_wrapper_paged, False)
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -420,6 +417,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 prefix_lens,
                 prefill_wrapper_paged=self.prefill_wrapper_paged,
                 use_ragged=use_ragged,
+                attn_dcp_metadata=forward_batch.attn_dcp_metadata,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrapper_paged, use_ragged
@@ -473,6 +471,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             assert seq_lens_cpu is not None
             kv_len_arr_cpu = seq_lens_cpu[:bs].to(torch.int32)
+            update_local_kv_lens_for_dcp(kv_len_arr_cpu)
             self.cuda_graph_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
                 kv_len_arr_cpu, dim=0
             )
@@ -493,7 +492,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 **self.fast_decode_kwargs,
             )
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+        elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -569,7 +568,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
         else:
             # mla paged prefill
-            k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
+            if (
+                forward_batch.attn_dcp_metadata is not None
+                and forward_batch.attn_dcp_metadata.dcp_kv_buffer is not None
+            ):
+                k_buf = forward_batch.attn_dcp_metadata.dcp_kv_buffer.to(q.dtype)
+            else:
+                k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
             if q_rope is None:
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 q, q_rope = (
@@ -634,6 +639,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
 
         o = q_nope.new_empty(q_nope.shape)
+        # for decode and dcp_world_size > 1, lse should be returned to compute final attn_out
         # Direct call to run without the wrapper
         o = decode_wrapper.run(
             q_nope,
@@ -641,8 +647,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             k_buffer[:, :, : layer.v_head_dim],
             k_buffer[:, :, layer.v_head_dim :],
             out=o,
+            # for decode forward_batch, each dcp rank computes total q and partial kv, thus, we need to return_lse for online softmax to get final attn_output
+            return_lse=forward_batch.forward_mode.is_decode() and dcp_enabled(),
         )
-
+        if isinstance(o, tuple):
+            out, lse = o
+            out = out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            return (out, lse)
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
@@ -650,7 +661,9 @@ class FlashInferMLAIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
         self.num_local_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads
+            // get_parallel().attn_tp_size
+            * get_attention_dcp_world_size()
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -720,6 +733,16 @@ class FlashInferMLAIndicesUpdaterDecode:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+
+            if dcp_enabled():
+                plan_dcp_decode_metadata(
+                    kv_lens,
+                    kv_indptr,
+                    kv_indices,
+                    init_metadata_replay,
+                    fast_decode_kwargs,
+                    bs,
+                )
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
@@ -759,7 +782,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
         self.num_local_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -785,6 +808,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         prefill_wrapper_paged: BatchMLAPagedAttentionWrapper,
         use_ragged: bool,
         spec_info: Optional[SpecInput] = None,
+        attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -805,6 +829,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
             self.qo_indptr,
             use_ragged,
             spec_info,
+            attn_dcp_metadata=attn_dcp_metadata,
         )
 
     def call_begin_forward(
@@ -820,6 +845,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         qo_indptr: torch.Tensor,
         use_ragged: bool,
         spec_info: Optional[SpecInput] = None,
+        attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None,
     ):
         bs = len(seq_lens)
         sm_scale = self.scaling
@@ -871,6 +897,11 @@ class FlashInferMLAIndicesUpdaterPrefill:
             )
         else:
             # mla paged prefill
+            if attn_dcp_metadata is not None:
+                if attn_dcp_metadata.dcp_kv_indptr is not None:
+                    kv_indptr = attn_dcp_metadata.dcp_kv_indptr
+                if attn_dcp_metadata.dcp_kv_indices is not None:
+                    kv_indices = attn_dcp_metadata.dcp_kv_indices
             kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
             wrapper_paged.plan(
                 qo_indptr,

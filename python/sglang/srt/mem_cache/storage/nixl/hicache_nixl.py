@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 import uuid
 from typing import Any, List, Optional
@@ -12,8 +13,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
+from sglang.srt.mem_cache.pool_host import HostKVCache
+from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import HiCacheL3Cleaner
 
 from .nixl_registry import NixlRegistry
 from .nixl_utils import NixlBackendConfig, NixlBackendSelection, NixlFileManager
@@ -28,6 +30,26 @@ except ImportError as e:
     ) from e
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_storage_dirs(raw: Optional[str]) -> List[str]:
+    """Split NIXL FILE storage directory config into ordered unique paths."""
+    if not raw:
+        return []
+    candidates = [path.strip() for path in raw.split(",")]
+    candidates = [path for path in candidates if path]
+    seen: dict[str, str] = {}
+    ordered: List[str] = []
+    for path in candidates:
+        real_path = os.path.realpath(path)
+        if real_path in seen:
+            raise ValueError(
+                "SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR contains duplicate "
+                f"path {path!r} (same mount as {seen[real_path]!r})."
+            )
+        seen[real_path] = path
+        ordered.append(path)
+    return ordered
 
 
 class HiCacheNixl(HiCacheStorage):
@@ -49,9 +71,11 @@ class HiCacheNixl(HiCacheStorage):
         use_direct_io = nixlconfig.get_use_direct_io()
 
         # Might be better to be unified across HiCache backends and moved to HiCacheController
-        file_path = envs.SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR.get() or file_path
+        storage_dirs = _parse_storage_dirs(
+            envs.SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR.get() or file_path
+        )
         self.file_manager = (
-            NixlFileManager(file_path, use_direct_io=use_direct_io)
+            NixlFileManager(storage_dirs, use_direct_io=use_direct_io)
             if plugin not in NixlBackendSelection.OBJ_PLUGINS
             else None
         )
@@ -118,6 +142,28 @@ class HiCacheNixl(HiCacheStorage):
         self._bounce_set: Optional[torch.Tensor] = None
         self._bounce_get: Optional[torch.Tensor] = None
         self._bounce_page_bytes: Optional[int] = None
+        cleanup_dirs = (
+            self.file_manager.iter_all_base_dirs()
+            if self.file_manager is not None
+            else []
+        )
+        cleaner_config = nixlconfig.get_l3_cleaner_config()
+        self._l3_cleaner: Optional[HiCacheL3Cleaner] = (
+            HiCacheL3Cleaner(
+                cleanup_dirs,
+                tp_rank,
+                high_watermark=cleaner_config["high_watermark"],
+                low_watermark=cleaner_config["low_watermark"],
+            )
+            if (
+                cleanup_dirs
+                and self.file_manager is not None
+                and cleaner_config["enabled"]
+            )
+            else None
+        )
+        if self._l3_cleaner is not None:
+            self._l3_cleaner.start()
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
@@ -308,6 +354,9 @@ class HiCacheNixl(HiCacheStorage):
         self.file_manager.clear()
 
     def close(self):
+        if self._l3_cleaner is not None:
+            self._l3_cleaner.stop()
+            self._l3_cleaner = None
         while self._host_regs:
             reg = self._host_regs.pop()
             try:

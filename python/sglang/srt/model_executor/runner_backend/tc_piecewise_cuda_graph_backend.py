@@ -1,3 +1,16 @@
+# Copyright 2023-2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """TcPiecewiseCudaGraphBackend — torch.compile-driven piecewise CUDA graph.
 
 FX-splits the model forward at attention layers; per-shape compiled
@@ -33,6 +46,9 @@ from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     enable_tc_piecewise_cuda_graph,
 )
+from sglang.srt.model_executor.runner_utils.pool import (
+    get_or_create_global_graph_memory_pool,
+)
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
@@ -40,6 +56,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
         BaseCudaGraphRunner,
     )
+    from sglang.srt.model_executor.runner.shape_key import ShapeKey
     from sglang.srt.server_args import ServerArgs
 
 
@@ -144,7 +161,9 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                 )
 
                 if self._pool is None:
-                    self._pool = self._device_module.graph_pool_handle()
+                    self._pool = get_or_create_global_graph_memory_pool(
+                        self._device_module
+                    )
                 set_graph_pool_id(self._pool)
 
                 self.install_compile(
@@ -193,7 +212,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
 
     def capture_one(
         self,
-        shape_key: Any,
+        shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
         dummies: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
@@ -207,7 +226,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-    def can_run(self, forward_batch: ForwardBatch, shape_key: Any) -> bool:
+    def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         # torch.compile manages its per-shape cache internally.
         # _run_compile_pass warms every shape in capture_num_tokens at __init__.
         return True
@@ -219,7 +238,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
 
     def replay(
         self,
-        shape_key: Any,
+        shape_key: ShapeKey,
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:

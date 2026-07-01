@@ -53,7 +53,7 @@ class SanaWMSelfForcingSamplerConfig:
     streaming_cfg_scale: float = 1.0
 
     @classmethod
-    def from_pipeline_config(cls, pcfg) -> "SanaWMSelfForcingSamplerConfig":
+    def from_pipeline_config(cls, pcfg) -> SanaWMSelfForcingSamplerConfig:
         """Read the streaming knobs off a pipeline config (note the ``or 1.0`` cfg-scale guard)."""
         return cls(
             num_frame_per_block=int(getattr(pcfg, "num_frame_per_block", 3)),

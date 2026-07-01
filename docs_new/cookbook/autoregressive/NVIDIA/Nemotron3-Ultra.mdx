@@ -60,7 +60,23 @@ The generator only emits a runnable command for combinations that NVIDIA / SGLan
 - **Attention backend**:
 
     **H100/H200**: Use flash attention 3 backend by default.
-    **B200/GB200/B300/GB300**: Use flashinfer backend by default.
+    **B200/GB200/B300/GB300**: Set `--attention-backend trtllm_mha`. The flashinfer default breaks the overlap scheduler on Blackwell, so `trtllm_mha` is required there.
+
+- **Mamba scheduler strategy**:
+
+    Always launch with `--mamba-scheduler-strategy extra_buffer`. This hybrid Transformer-Mamba model requires the `extra_buffer` strategy for correct scheduling of its Mamba state.
+
+- **Mamba backend**:
+
+    The Mamba layers use the Triton SSM kernels by default. For better performance, set `--mamba-backend flashinfer` to use the FlashInfer Mamba kernels instead.
+
+- **Mamba SSM precision**:
+
+    The SSM state dtype defaults to the model config value. Set `--mamba-ssm-dtype float16` to store the Mamba states in FP16, which reduces mamba cache memory without significant accuracy loss.
+
+- **Mamba SSM stochastic rounding**:
+
+    When storing the Mamba states in FP16, add `--enable-mamba-cache-stochastic-rounding` to round SSM cache writes stochastically and reduce accumulation bias. It requires `--mamba-ssm-dtype float16` and CUDA; with the default `--mamba-backend triton` it additionally requires SM100. Use `--mamba-cache-philox-rounds` to control the number of Philox rounds (`0` uses the backend default).
 
 - **TP support**:
 
@@ -76,27 +92,35 @@ The generator only emits a runnable command for combinations that NVIDIA / SGLan
 
     By default the attention layers are tensor-parallel (sharded across all TP ranks). Enabling DP attention (the toggle above, or `--dp <N> --enable-dp-attention`) instead runs attention as `N` data-parallel groups: each DP rank serves its own slice of the requests with its own KV cache. `--dp` must divide `--tp`.
 
+- **Expert parallel (EP)**:
+
+    This MoE only supports `ep_size == 1` (off) or `ep_size == tp_size`. To enable expert parallelism, set `--ep <tp>` with the same value as `--tp`.
+
+- **Multi-token prediction (MTP)**:
+
+    Enable MTP speculative decoding (the toggle above) for low latency.
+
 - **FP8 KV cache**:
 
-    To enable fp8 kv cache, please append `--kv-cache-dtype fp8_e4m3`.
+    To enable fp8 kv cache, set `--kv-cache-dtype fp8_e4m3`. This is enabled by default on the NVFP4 checkpoint.
 
 - **Reasoning parser**:
 
-    Append `--reasoning-parser nemotron_3` to enable structured reasoning traces (`reasoning_content` field in the response).
+    Set `--reasoning-parser nemotron_3` to enable structured reasoning traces (`reasoning_content` field in the response).
 
 - **Tool calling**:
 
-    Append `--tool-call-parser qwen3_coder` to enable tool calling support.
+    Set `--tool-call-parser qwen3_coder` to enable tool calling support.
 
 ## 4. Model Invocation
 
 ```shell Command
 python3 -m sglang.launch_server \
   --model-path nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16 \
-  --host 0.0.0.0 \
-  --port 5000 \
   --trust-remote-code \
   --tp 8 \
+  --mamba-scheduler-strategy extra_buffer \
+  --attention-backend trtllm_mha \
   --tool-call-parser qwen3_coder \
   --reasoning-parser nemotron_3
 ```
@@ -109,7 +133,7 @@ SGLang provides an OpenAI-compatible endpoint. Example with the OpenAI Python cl
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:5000/v1",
+    base_url="http://localhost:30000/v1",
     api_key="EMPTY",
 )
 
@@ -140,7 +164,7 @@ Streaming chat completion:
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:5000/v1",
+    base_url="http://localhost:30000/v1",
     api_key="EMPTY",
 )
 
@@ -181,7 +205,7 @@ The model supports two modes — Reasoning ON (default) vs OFF. This can be togg
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:5000/v1",
+    base_url="http://localhost:30000/v1",
     api_key="EMPTY",
 )
 
@@ -238,7 +262,7 @@ Call functions using the OpenAI Tools schema and inspect returned `tool_calls`. 
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:5000/v1",
+    base_url="http://localhost:30000/v1",
     api_key="EMPTY",
 )
 
@@ -268,7 +292,7 @@ TOOLS = [
 ]
 
 completion = client.chat.completions.create(
-    model="nemotron",
+    model="nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16",
     messages=[
         {"role": "system", "content": "You are a coding agent. Use tools to inspect the repo before answering."},
         {"role": "user", "content": "Where is the `RadixCache` class defined?"}
@@ -374,7 +398,7 @@ SERVED_MODEL_NAME = "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"
 
 # Client
 client = ThinkingBudgetClient(
-    base_url="http://127.0.0.1:5000/v1",
+    base_url="http://127.0.0.1:30000/v1",
     api_key="null",
     tokenizer_name_or_path=SERVED_MODEL_NAME
 )
@@ -425,9 +449,9 @@ python3 -m sglang.launch_server \
   --model-path nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
   --trust-remote-code \
   --tp 4 \
-  --max-running-requests 1024 \
-  --host 0.0.0.0 \
-  --port 5000
+  --mamba-scheduler-strategy extra_buffer \
+  --attention-backend trtllm_mha \
+  --max-running-requests 1024
 ```
 
 - Benchmark Command:
@@ -435,8 +459,6 @@ python3 -m sglang.launch_server \
 ```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
-  --host 0.0.0.0 \
-  --port 5000 \
   --model nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
   --dataset-name random \
   --random-input-len 1024 \
@@ -503,12 +525,14 @@ python3 -m sglang.launch_server \
   --model-path nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
   --trust-remote-code \
   --tp 4 \
+  --mamba-scheduler-strategy extra_buffer \
+  --attention-backend trtllm_mha \
   --reasoning-parser nemotron_3
 ```
 
 **Run Benchmark**
 ```bash Command
-python3 benchmark/gsm8k/bench_sglang.py --port 5000
+python3 benchmark/gsm8k/bench_sglang.py
 ```
 
 **Test Results:**
@@ -523,7 +547,7 @@ Output throughput: 745.333 token/s
 
 **Run Benchmark**
 ```bash Command
-python3 benchmark/mmlu/bench_sglang.py --port 5000
+python3 benchmark/mmlu/bench_sglang.py
 ```
 
 **Test Results:**

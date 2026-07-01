@@ -67,6 +67,11 @@ def _chunked_lora_expand_kernel(
     if pid_s >= num_segs:
         return
 
+    seg_start = tl.load(seg_indptr + pid_s)
+    seg_end = tl.load(seg_indptr + pid_s + 1)
+    if seg_start == seg_end:
+        return
+
     # Current block computes sequence with batch_id,
     # which starts from row seg_start of x with length seg_len.
     # qkv_id decides which of q,k,v to compute (0: q, 1: k, 2: v)
@@ -76,9 +81,6 @@ def _chunked_lora_expand_kernel(
     # If rank is 0, this kernel is a no-op.
     if cur_rank == 0:
         return
-
-    seg_start = tl.load(seg_indptr + pid_s)
-    seg_end = tl.load(seg_indptr + pid_s + 1)
 
     slice_id = tl.program_id(axis=1)
     slice_start = tl.load(slice_offsets + slice_id)
@@ -91,7 +93,7 @@ def _chunked_lora_expand_kernel(
     # Map logical sequence index to physical index
     s_offset_logical = tl.arange(0, BLOCK_M) + seg_start
     s_offset_physical = tl.load(
-        permutation + s_offset_logical, mask=s_offset_logical < seg_end
+        permutation + s_offset_logical, mask=s_offset_logical < seg_end, other=0
     )
 
     # Create pointers for the first block of x and weights[batch_id][n_start: n_end][:]
@@ -184,11 +186,16 @@ def chunked_sgmv_lora_expand_forward(
     BLOCK_N = config["BLOCK_N"]
 
     num_segments = batch_info.num_segments
+    segment_grid = (
+        batch_info.weight_indices.shape[0]
+        if batch_info.use_cuda_graph
+        else num_segments
+    )
 
     grid = (
         triton.cdiv(max_slice_size, BLOCK_N),
         num_slices,  # number of slices in the input/output
-        batch_info.bs if batch_info.use_cuda_graph else num_segments,
+        segment_grid,
     )
 
     if base_output is None:
@@ -215,7 +222,7 @@ def chunked_sgmv_lora_expand_forward(
         weight_indices=batch_info.weight_indices,
         lora_ranks=batch_info.lora_ranks,
         permutation=batch_info.permutation,
-        num_segs=num_segments,
+        num_segs=segment_grid,
         scalings=batch_info.scalings,
         slice_offsets=slice_offsets,
         # constants

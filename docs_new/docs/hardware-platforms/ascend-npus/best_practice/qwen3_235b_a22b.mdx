@@ -1,0 +1,230 @@
+---
+title: "Qwen3-235B-A22B"
+metatags:
+  description: "Best Practice for Qwen3-235B-A22B on Ascend NPU"
+---
+
+<Note>
+This page focuses on optimal configuration and benchmark results for Qwen3-235B-A22B on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3-235B-A22B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_235b_a22b).
+</Note>
+
+### Low Latency
+
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Qwen3-235B-A22B | Atlas 800I A3 | 8 | PD Mixed | 11K+1.5K | 8ms | BF16 | [Optimal Configuration](#qwen3-235b-a22b-bf16-8p-in11k-out1k5-8ms) |
+
+### High Throughput
+
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Qwen3-235B-A22B | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50.1ms | W8A8 INT8 | [Optimal Configuration](#qwen3-235b-a22b-w8a8-8p-in3k5-out1k5-50-1ms) |
+
+## Optimal Configuration
+
+<a id="single-node-pd-mixed" title="Referenced by external docs. Verify before removing."></a>
+
+### Qwen3-235B-A22B BF16 8P IN11K OUT1K5 8ms
+
+**Model**: Qwen3-235B-A22B
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 8
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: BF16
+
+**Dataset**: 11K+1.5K
+
+**TPOT**: 8ms
+
+#### Model Deployment
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#   DRAFT_MODEL_PATH: path to the draft model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+MODEL_PATH=/path/to/model-weights
+DRAFT_MODEL_PATH=/path/to/draft-model-weights
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=1600
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
+    --trust-remote-code \
+    --nnodes 1 \
+    --node-rank 0 \
+    --attention-backend ascend \
+    --device npu \
+    --max-running-requests 1 \
+    --dtype bfloat16 \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 16384 \
+    --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path $DRAFT_MODEL_PATH \
+    --speculative-num-steps 4 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 5 \
+    --disable-radix-cache \
+    --enable-dp-lm-head \
+    --tp 16 \
+    --mem-fraction-static 0.78 \
+    --cuda-graph-bs 1 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen25
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 1 \
+    --random-input-len 11000 \
+    --random-output-len 1500 \
+    --num-prompts 1 \
+    --random-range-ratio 1
+```
+
+### Qwen3-235B-A22B W8A8 8P IN3K5 OUT1K5 50.1ms
+
+**Model**: Qwen3-235B-A22B
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 8
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 3.5K+1.5K
+
+**TPOT**: 50.1ms
+
+#### Model Deployment
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#   DRAFT_MODEL_PATH: path to the draft model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+MODEL_PATH=/path/to/model-weights
+DRAFT_MODEL_PATH=/path/to/draft-model-weights
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=570
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=188416
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_NPU_FUSED_MOE_MODE=2
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
+    --trust-remote-code \
+    --nnodes 1 \
+    --node-rank 0 \
+    --attention-backend ascend \
+    --device npu \
+    --quantization modelslim \
+    --max-running-requests 432 \
+    --context-length 8192 \
+    --dtype bfloat16 \
+    --chunked-prefill-size 94208 \
+    --max-prefill-tokens 458880 \
+    --sampling-backend ascend \
+    --ep-dispatch-algorithm static \
+    --disable-radix-cache \
+    --moe-a2a-backend ascend_fuseep \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path $DRAFT_MODEL_PATH \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant \
+    --tp 16 \
+    --dp-size 16 \
+    --enable-dp-attention \
+    --enable-dp-lm-head \
+    --mem-fraction-static 0.8 \
+    --cuda-graph-bs 1 2 4 8 16 20 24 26 27 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen25
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 432 \
+    --random-input-len 3500 \
+    --random-output-len 1500 \
+    --num-prompts 1728 \
+    --random-range-ratio 1
+```

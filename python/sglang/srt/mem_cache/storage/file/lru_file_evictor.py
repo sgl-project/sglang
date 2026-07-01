@@ -81,7 +81,7 @@ class LRUFileEvictor:
         self._is_storage_owner = (not is_mla_model) or (tp_rank == 0)
 
         # suffixed_key -> file size in bytes; oldest at front.
-        self._lru: "OrderedDict[str, int]" = OrderedDict()
+        self._lru: OrderedDict[str, int] = OrderedDict()
         self._pending_writes: Set[str] = set()
         self._total_bytes: int = 0
         self._lock = threading.Lock()

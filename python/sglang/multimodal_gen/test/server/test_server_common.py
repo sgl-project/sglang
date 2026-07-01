@@ -63,7 +63,7 @@ logger = init_logger(__name__)
 
 # Track test cases missing estimated_full_test_time_s for time measurement output
 _MISSING_ESTIMATED_TIME_CASES: set[str] = set()
-_PENDING_BASELINE_DUMPS: dict[str, tuple["PerformanceSummary", bool]] = {}
+_PENDING_BASELINE_DUMPS: dict[str, tuple[PerformanceSummary, bool]] = {}
 _OPENAI_REQUEST_TIMEOUT_SECS = float(
     os.environ.get("SGLANG_TEST_OPENAI_REQUEST_TIMEOUT_SECS", "600")
 )
@@ -101,7 +101,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
-    sampling_params = case.sampling_params
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
     extra_args = f"--model-type diffusion {extra_args}".strip()
 
@@ -114,7 +113,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         extra_args += f" --ulysses-degree {server_args.ulysses_degree}"
 
     if server_args.dit_layerwise_offload:
-        extra_args += f" --dit-layerwise-offload true"
+        extra_args += " --dit-layerwise-offload true"
 
     if server_args.dit_offload_prefetch_size:
         extra_args += (
@@ -122,7 +121,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         )
 
     if server_args.text_encoder_cpu_offload:
-        extra_args += f" --text-encoder-cpu-offload"
+        extra_args += " --text-encoder-cpu-offload"
 
     if server_args.ring_degree is not None:
         extra_args += f" --ring-degree {server_args.ring_degree}"
@@ -137,6 +136,22 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     # Strict ports: fail immediately if port is occupied instead of silently
     # picking another one (which causes the test client to connect to the wrong server).
     extra_args += " --strict-ports"
+
+    # Shape-only mesh cases (e.g. hunyuan3d_shape_gen) validate geometry via
+    # mesh-correctness and must NOT run the paint/texture stages, whose
+    # verification checks texture artifacts (paint_mesh/normal_maps/renderer)
+    # that the shape-only path never produces. Inject a pipeline-config override
+    # disabling paint for these cases.
+    if server_args.custom_validator == "mesh":
+        import json as _json
+        import tempfile as _tempfile
+
+        _paint_off_cfg = os.path.join(
+            _tempfile.gettempdir(), f"{case.id}_paint_off.json"
+        )
+        with open(_paint_off_cfg, "w") as _f:
+            _json.dump({"paint_enable": False}, _f)
+        extra_args += f" --config {_paint_off_cfg}"
 
     for arg in server_args.extras:
         extra_args += f" {arg}"
@@ -186,17 +201,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
                 f"is not available in the installed version. "
                 f"Upgrade diffusers to enable this test."
             )
-        raise
-
-    try:
-        # Reconstruct output size for OpenAI API
-        # Allow override via environment variable (useful for AMD where large resolutions can cause GPU hang)
-        output_size = os.environ.get(
-            "SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size
-        )
-    except Exception as exc:
-        logger.error("Warm-up failed for %s: %s", case.id, exc)
-        ctx.cleanup()
         raise
 
     try:
@@ -409,14 +413,11 @@ class DiffusionServerBase:
             if not is_baseline_generation_mode:
                 missing_scenario = True
 
-        # Check for missing estimated_full_test_time_s
-        missing_estimated_time = False
         if (
             not missing_scenario
             and not is_baseline_generation_mode
             and scenario.estimated_full_test_time_s is None
         ):
-            missing_estimated_time = True
             _MISSING_ESTIMATED_TIME_CASES.add(case.id)
 
         validator_name = case.server_args.custom_validator or "default"
@@ -518,7 +519,7 @@ class DiffusionServerBase:
     def _dump_baseline_for_testcase(
         self,
         case: DiffusionTestCase,
-        summary: "PerformanceSummary",
+        summary: PerformanceSummary,
         missing_scenario: bool = False,
         measured_full_time: float | None = None,
     ) -> None:

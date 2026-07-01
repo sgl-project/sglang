@@ -103,8 +103,9 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 3. Advanced Usage
 
-{/* Keep only the subsections that apply. Each runnable block is followed by an
-    **Output Example:** + a ```text Output block with REAL server output. */}
+{/* Keep only the subsections that apply. Commands and outputs in this section are
+    COLLAPSIBLE (required — match DeepSeek-V4 §3): each runnable example lives in an
+    <Accordion>, its REAL server output in a following <Accordion title="Example Output">. */}
 
 ### 3.1 Reasoning
 
@@ -113,6 +114,8 @@ Enable the `__REASONING_PARSER__` reasoning parser (toggle **Reasoning Parser** 
 {/* This example assumes a SEPARATE-FIELD parser (thinking → `reasoning_content`,
     answer → `content`). If your parser emits inline `<think>...</think>` tags inside
     `content`, parse the tags from `content` instead. */}
+
+<Accordion title="Reasoning Example (Python)">
 
 ```python Example
 from openai import OpenAI
@@ -128,18 +131,23 @@ print("Reasoning:", getattr(msg, "reasoning_content", None))
 print("Answer:", msg.content)
 ```
 
-**Output Example:**
+</Accordion>
+
+<Accordion title="Example Output">
 
 ```text Output
 TODO: paste real server output here.
 ```
 
+</Accordion>
+
 ### 3.2 Tool Calling
 
 Enable the `__TOOLCALL_PARSER__` tool-call parser (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`.
 
-{/* TODO: tool-calling example + **Output Example:**. On thinking-mode models the
-    follow-up may put text in `reasoning_content`; print both that and `content`. */}
+{/* TODO: tool-calling example in an <Accordion> + an <Accordion title="Example Output">.
+    On thinking-mode models the follow-up may put text in `reasoning_content`;
+    print both that and `content`. */}
 
 ### 3.3 HiCache (Hierarchical KV Caching)
 

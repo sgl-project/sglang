@@ -107,12 +107,12 @@ def _init_compressed_attn_metadata_triton(
     bs = seq_lens.shape[0]
     device = seq_lens.device
 
-    c4_out_loc = torch.empty(bs, dtype=torch.int32, device=device)
+    c4_out_loc = torch.empty(bs, dtype=torch.int64, device=device)
     c4_positions = torch.empty(bs, dtype=torch.int32, device=device)
     c4_seq_lens_raw = torch.empty(bs, dtype=torch.int32, device=device)
     c4_seq_lens_clamp1 = torch.empty(bs, dtype=torch.int32, device=device)
 
-    c128_out_loc = torch.empty(bs, dtype=torch.int32, device=device)
+    c128_out_loc = torch.empty(bs, dtype=torch.int64, device=device)
     c128_positions = torch.empty(bs, dtype=torch.int32, device=device)
     c128_seq_lens_raw = torch.empty(bs, dtype=torch.int32, device=device)
     c128_seq_lens_clamp1 = torch.empty(bs, dtype=torch.int32, device=device)
