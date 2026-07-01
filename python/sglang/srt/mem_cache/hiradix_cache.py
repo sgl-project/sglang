@@ -1719,7 +1719,6 @@ class HiRadixCache(RadixCache):
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[key.child_key(self.page_size)] = new_node
-        # A split turns one node into two (new_node -> child): net +1 node.
         self.entry_count_ += 1
 
         if child.backuped:

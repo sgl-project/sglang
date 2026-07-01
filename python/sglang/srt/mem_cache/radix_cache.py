@@ -338,8 +338,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         self.root_node.hash_value = []
         self.evictable_size_ = 0
         self.protected_size_ = 0
-        # Structural node count (excludes root), maintained incrementally so
-        # get_cache_stats() stays O(1) on the metrics path.
         self.entry_count_ = 0
         self.evictable_leaves.clear()
         self._reset_session_radix_state()
@@ -636,13 +634,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         return self.protected_size_
 
     def get_cache_stats(self) -> Tuple[int, int]:
-        """Return (entry_count, total_tokens) currently held in the radix tree.
-
-        ``entry_count`` is the number of tree nodes (excluding root), tracked
-        incrementally; ``total_tokens`` is the device-resident token count
-        (evictable + protected). Both are O(1) so this is safe to call on the
-        throttled metrics path.
-        """
+        """Return (entry_count, total_tokens) currently held in the radix tree."""
         return self.entry_count_, self.evictable_size_ + self.protected_size_
 
     def all_values_flatten(self):
@@ -698,7 +690,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
         new_node.parent.children[key.child_key(self.page_size)] = new_node
-        # A split turns one node into two (new_node -> child): net +1 node.
         self.entry_count_ += 1
 
         # Split hash_value if it was already computed, otherwise leave as None
