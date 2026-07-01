@@ -646,6 +646,8 @@ class LayerNorm(MultiPlatformOp):
 
 
 class GemmaRMSNorm(MultiPlatformOp):
+    _fused_fp8_quant_available = None  # Class-level cache
+
     def __init__(
         self,
         hidden_size: int,
@@ -668,6 +670,33 @@ class GemmaRMSNorm(MultiPlatformOp):
         # Keep storage stable for CUDA graphs or fused paths that capture this buffer.
         torch.add(param.data, 1.0, out=self.gemma_weight)
 
+    @staticmethod
+    def _check_fused_fp8_quant():
+        if GemmaRMSNorm._fused_fp8_quant_available is None:
+            try:
+                from sglang.jit_kernel.fused_add_rmsnorm_per_token_quant import (
+                    fused_add_rmsnorm_per_token_quant,
+                )
+                GemmaRMSNorm._fused_fp8_quant_available = True
+                GemmaRMSNorm._fused_add_rmsnorm_per_token_quant = staticmethod(
+                    fused_add_rmsnorm_per_token_quant
+                )
+            except ImportError:
+                GemmaRMSNorm._fused_fp8_quant_available = False
+        return GemmaRMSNorm._fused_fp8_quant_available
+
+    def _should_use_fused_fp8(self, x: torch.Tensor) -> bool:
+        """Check if fused norm+fp8 quant should be used."""
+        if not self._check_fused_fp8_quant():
+            return False
+        if x.dtype != torch.bfloat16 or x.shape[-1] % 8 != 0:
+            return False
+        try:
+            server_args = get_global_server_args()
+            return server_args.quantization == "fp8"
+        except Exception:
+            return False
+
     def _forward_impl(
         self,
         x: torch.Tensor,
@@ -681,6 +710,20 @@ class GemmaRMSNorm(MultiPlatformOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
+
+            if self._should_use_fused_fp8(x):
+                # Fused: add + rmsnorm + per-token FP8 quant in one kernel
+                from sglang.jit_kernel.fused_add_rmsnorm_per_token_quant import (
+                    fused_add_rmsnorm_per_token_quant,
+                )
+                bf16_out, fp8_out, fp8_scale = fused_add_rmsnorm_per_token_quant(
+                    x, residual, (1.0 + self.weight.data), eps=self.variance_epsilon
+                )
+                # Attach FP8 data as attributes for downstream linear to skip quant
+                bf16_out._sglang_fp8_data = fp8_out
+                bf16_out._sglang_fp8_scale = fp8_scale
+                return bf16_out, residual
+
             gemma_fused_add_rmsnorm(
                 x, residual, self.weight.data, self.variance_epsilon
             )
