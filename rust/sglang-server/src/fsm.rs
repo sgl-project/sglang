@@ -10,7 +10,6 @@
 //! Received, Validating, Normalizing, Encoding, Tokenizing, Queued,
 //! Streaming { chunks_sent }, Finalizing, Completed, Failed(Error), Aborted
 //! ```
-#![allow(dead_code)] // TODO: remove when the consumer PR lands
 
 use crate::error::Error;
 
@@ -38,8 +37,7 @@ pub enum RequestState {
 /// Outcome of validation, selecting the ingress branch.
 #[derive(Debug, Clone, Copy)]
 pub enum ValidationOutcome {
-    /// Has multimodal inputs → Encoding. Deferred: no encoder yet.
-    #[allow(dead_code)]
+    /// Has multimodal inputs → Encoding (deferred this iteration).
     HasMultimodal,
     /// Plain text → Tokenizing.
     NeedsTokenize,
@@ -54,12 +52,15 @@ pub enum ValidationOutcome {
 pub enum Event {
     // --- ingress ---
     Validated(ValidationOutcome),
-    NeedsNormalize,
+    /// Generate request's sampling params normalized: Validating → Normalizing.
+    Normalized,
     EncodeDone,
     TokenizeDone,
     SchedulerPicked,
     // --- egress ---
-    Chunk { finish: bool },
+    Chunk {
+        finish: bool,
+    },
     FinalFrameSent,
     // --- terminal (valid from any state) ---
     Error(Error),
@@ -113,7 +114,7 @@ impl RequestState {
             (Received, Validated(_)) => Validating,
             // Generate requests pass through Normalizing (sampling-param
             // normalize/verify); control requests skip straight to Queued.
-            (Validating, NeedsNormalize) => Normalizing,
+            (Validating, Normalized) => Normalizing,
             (Validating, Validated(AlreadyTokenized)) => Queued,
             (Normalizing, Validated(HasMultimodal)) => Encoding,
             (Normalizing, Validated(NeedsTokenize)) => Tokenizing,
