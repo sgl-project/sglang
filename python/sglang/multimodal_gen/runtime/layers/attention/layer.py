@@ -2,8 +2,8 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import os
-from contextlib import nullcontext
 from collections.abc import Sequence
+from contextlib import nullcontext
 from typing import Type
 
 import torch
