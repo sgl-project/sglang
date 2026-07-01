@@ -786,6 +786,13 @@ class GemmaRMSNorm(MultiPlatformOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
             return self.forward_native(x, residual)
+        if envs.SGLANG_NPU_FORWARD_RMS_GEMMA_RMS_NORM.get():
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                out, _, residual_out = torch_npu.npu_add_rms_norm(x, residual, 1.0 + self.weight, self.variance_epsilon)
+                return out, residual_out
+            return torch_npu.npu_rms_norm(x, 1.0 + self.weight, self.variance_epsilon)[0]
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
