@@ -227,6 +227,8 @@ def _sanity_check_input(x_fp8: Tuple[torch.Tensor, torch.Tensor]):
 
     if x_scale.dtype == torch.int:
         return
+    if not DEEPGEMM_SCALE_UE8M0:
+        return
 
     from sglang.srt.layers.quantization.fp8_utils import ceil_to_ue8m0
 
