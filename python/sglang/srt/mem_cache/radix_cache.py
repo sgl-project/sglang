@@ -596,8 +596,6 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self._record_remove_event(x)
 
         self.update_eviction_metrics(num_evicted, start_time)
-        if collect_lifetime and num_evicted > 0:
-            self.metrics_collector.increment_eviction_events()
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
