@@ -1044,6 +1044,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
         enable_kv_cache_events = bool(
             server_args.kv_events_config
+            and ps.pp_rank == 0
             and ps.attn_tp_rank == 0
             and ps.attn_cp_rank == 0
         )

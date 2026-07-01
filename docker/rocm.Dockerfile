@@ -14,6 +14,12 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
 
+# Usage (to build SGLang ROCm + NIXL docker image, for prefill/decode disaggregation):
+# Builds UCX (--with-rocm) and upstream ai-dynamo/nixl from source by default.
+# Set ENABLE_NIXL=0 to skip NIXL.
+# At runtime use --disaggregation-transfer-backend nixl (env is wired via /etc/bash.bashrc).
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
+
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
@@ -31,7 +37,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="7d604afe5fa7efba63c0dce323b95d9daf2db112"
+ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -41,7 +47,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="7d604afe5fa7efba63c0dce323b95d9daf2db112"
+ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
 
 # ===============================
 # Base image 950 and args
@@ -51,7 +57,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="7d604afe5fa7efba63c0dce323b95d9daf2db112"
+ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -61,7 +67,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="7d604afe5fa7efba63c0dce323b95d9daf2db112"
+ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
 
 # ===============================
 # Chosen arch and args
@@ -105,6 +111,15 @@ ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
 ARG MORI_COMMIT="bf99bdf18fc69887a346913ca01c315c2aa9bd4c"
+
+# NIXL (upstream ai-dynamo/nixl) — KV transfer backend for prefill/decode disaggregation.
+# Built from source for ROCm; needs UCX built --with-rocm (built here from openucx).
+# Enabled by default; disable with --build-arg ENABLE_NIXL=0.
+ARG ENABLE_NIXL=1
+ARG UCX_REPO="https://github.com/openucx/ucx.git"
+ARG UCX_BRANCH="v1.19.x"
+ARG NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
+ARG NIXL_COMMIT="c28061f9782e099f975bcc79198b7b5a1a36cc40"
 
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5-a-38
@@ -489,6 +504,40 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   echo "[MORI] Done."'
 
 # -----------------------
+# NIXL — upstream ai-dynamo/nixl KV transfer backend for PD disaggregation on ROCm.
+# Builds UCX (--with-rocm) + nixl from source by default; skip with ENABLE_NIXL=0.
+# --no-build-isolation reuses the image's ROCm torch (nixl pins torch==2.11.* as a build dep,
+# which would otherwise pull a multi-GB CUDA torch); --no-deps keeps CUDA runtime deps out.
+# wheel_variant=rocm names the pkg nixl_rocm, so symlink `nixl` since SGLang imports plain nixl.
+# taskflow (header-only) is provided via pkg-config so meson skips its broken upstream wrap
+# download (GitHub regenerated the v3.10.0 tarball, breaking the pinned source_hash).
+RUN /bin/bash -lc 'set -euo pipefail; \
+  [ "${ENABLE_NIXL}" = "1" ] || { echo "[NIXL] skip (ENABLE_NIXL=${ENABLE_NIXL})"; exit 0; }; \
+  apt-get update && apt-get install -y --no-install-recommends \
+      build-essential autoconf automake libtool pkg-config git \
+      libibverbs-dev librdmacm-dev rdma-core && rm -rf /var/lib/apt/lists/*; \
+  pip install --no-cache-dir meson ninja pybind11 meson-python patchelf pyyaml; \
+  git clone --depth=1 -b "${UCX_BRANCH}" "${UCX_REPO}" /sgl-workspace/ucx; \
+  cd /sgl-workspace/ucx && ./autogen.sh && mkdir build && cd build && \
+  ../configure --prefix=/opt/ucx --enable-shared --disable-static --disable-doxygen-doc \
+      --enable-optimizations --enable-devel-headers \
+      --with-rocm=/opt/rocm --with-verbs --with-dm --enable-mt && \
+  make -j"$(nproc)" && make install; \
+  git clone --depth=1 -b v3.10.0 https://github.com/taskflow/taskflow.git /sgl-workspace/taskflow; \
+  cp -r /sgl-workspace/taskflow/taskflow /usr/local/include/; \
+  mkdir -p /usr/local/lib/pkgconfig; \
+  printf "Name: taskflow\nDescription: Taskflow\nVersion: 3.10.0\nCflags: -I/usr/local/include\n" > /usr/local/lib/pkgconfig/taskflow.pc; \
+  git clone "${NIXL_REPO}" /sgl-workspace/nixl && cd /sgl-workspace/nixl && git checkout -f "${NIXL_COMMIT}"; \
+  CXXFLAGS="-Wno-error" LD_LIBRARY_PATH="/opt/ucx/lib:/opt/rocm/lib" PKG_CONFIG_PATH="/usr/local/lib/pkgconfig" \
+  pip install . --no-deps --no-build-isolation \
+      --config-settings=setup-args="-Ducx_path=/opt/ucx" \
+      --config-settings=setup-args="-Dwheel_variant=rocm" \
+      --config-settings=setup-args="-Denable_plugins=UCX,POSIX"; \
+  SITE=$(python3 -c "import sysconfig; print(sysconfig.get_paths()[\"purelib\"])"); \
+  ln -sfn nixl_rocm "$SITE/nixl"; \
+  echo "export LD_LIBRARY_PATH=/opt/ucx/lib:\${LD_LIBRARY_PATH}" >> /etc/bash.bashrc'
+
+# -----------------------
 # Hot patch: torch-ROCm
 # The artifact hardcoded the supported triton version to be 3.5.1.
 # Rewrite the restriction directly.
@@ -569,7 +618,8 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
      && cd triton-custom \
      && git checkout ${TRITON_COMMIT} \
      && pip install -r python/requirements.txt \
-     && pip install -e .; \
+     && pip install -e . \
+     && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
     fi
 
 # -----------------------

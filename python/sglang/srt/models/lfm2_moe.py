@@ -18,7 +18,7 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_fn,
@@ -47,6 +47,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
 
@@ -103,7 +104,7 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
 
         if self.tp_size > config.num_experts:
@@ -286,7 +287,7 @@ class Lfm2MoeShortConv(nn.Module):
         self.hidden_size = config.hidden_size
 
         # Get tensor parallel size for sharding
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.hidden_size_per_partition = self.hidden_size // self.tp_size
 
         # Use MergedColumnParallelLinear so each output (B, C, x) is sharded separately
