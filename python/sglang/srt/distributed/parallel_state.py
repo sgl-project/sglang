@@ -26,6 +26,7 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import inspect
 import logging
 import os
 import pickle
@@ -1929,7 +1930,7 @@ def init_distributed_environment(
             pg_options = get_torch_distributed_pg_options()
 
         # this backend is used for WORLD
-        torch.distributed.init_process_group(
+        init_process_group_kwargs = dict(
             backend=backend,
             init_method=distributed_init_method,
             world_size=world_size,
@@ -1937,6 +1938,28 @@ def init_distributed_environment(
             timeout=timeout,
             pg_options=pg_options,
         )
+        if (
+            backend == "nccl"
+            and moe_a2a_backend == "deepep_v2"
+            and "device_id"
+            in inspect.signature(torch.distributed.init_process_group).parameters
+        ):
+            init_local_rank = local_rank
+            if init_local_rank == -1:
+                if distributed_init_method == "env://":
+                    init_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+                else:
+                    init_local_rank = rank
+            # On multi-node runs the global rank can exceed the per-node GPU
+            # count, so wrap it into the local device range before using it as
+            # the cuda device id passed to NCCL.
+            device_count = torch.cuda.device_count()
+            if init_local_rank >= 0 and device_count > 0:
+                init_local_rank = init_local_rank % device_count
+                init_process_group_kwargs["device_id"] = torch.device(
+                    f"cuda:{init_local_rank}"
+                )
+        torch.distributed.init_process_group(**init_process_group_kwargs)
 
         # Create a global TCPStore for coordination (used by NIXL)
         if moe_a2a_backend == "nixl":

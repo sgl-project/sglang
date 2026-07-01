@@ -1336,5 +1336,53 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         self.assertEqual(parsed.sampling_backend, "token_oracle")
 
 
+class TestDeepEPV2Args(CustomTestCase):
+    """DeepEP v2 server-args resolution + validation. The dummy-model path
+    short-circuits __post_init__, so _handle_a2a_moe() is invoked directly."""
+
+    def _args(self, **overrides):
+        server_args = ServerArgs(model_path="dummy", moe_a2a_backend="deepep_v2")
+        # The deepep_v2 branch mutates cuda_graph_config.{decode,prefill}.backend,
+        # so it must exist (the dummy path leaves it unset otherwise).
+        server_args.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL, max_bs=512),
+            prefill=PhaseConfig(backend=Backend.FULL, max_bs=512),
+        )
+        for key, value in overrides.items():
+            setattr(server_args, key, value)
+        return server_args
+
+    def test_auto_runner_resolves_to_deep_gemm_for_fp8(self):
+        args = self._args(
+            moe_runner_backend="auto", deepep_v2_dispatcher_output_dtype="fp8"
+        )
+        args._handle_a2a_moe()
+        self.assertEqual(args.moe_runner_backend, "deep_gemm")
+
+    def test_auto_runner_resolves_to_triton_for_bf16(self):
+        args = self._args(
+            moe_runner_backend="auto", deepep_v2_dispatcher_output_dtype="bf16"
+        )
+        args._handle_a2a_moe()
+        self.assertEqual(args.moe_runner_backend, "triton")
+
+    def test_auto_runner_defaults_to_deep_gemm(self):
+        args = self._args(
+            moe_runner_backend="auto", deepep_v2_dispatcher_output_dtype="auto"
+        )
+        args._handle_a2a_moe()
+        self.assertEqual(args.moe_runner_backend, "deep_gemm")
+
+    def test_unsupported_runner_rejected(self):
+        args = self._args(moe_runner_backend="flashinfer_trtllm")
+        with self.assertRaises(ValueError):
+            args._handle_a2a_moe()
+
+    def test_two_batch_overlap_rejected(self):
+        args = self._args(moe_runner_backend="deep_gemm", enable_two_batch_overlap=True)
+        with self.assertRaises(ValueError):
+            args._handle_a2a_moe()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -255,6 +255,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "ascend_fuseep",
     "flashinfer",
     "megamoe",
+    "deepep_v2",
 ]
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
@@ -1685,12 +1686,23 @@ class ServerArgs:
             "ascend_fuseep",
             "flashinfer",
             "megamoe",
+            "deepep_v2",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
             choices=MOE_A2A_BACKEND_CHOICES,
         ),
     ] = "none"
+    deepep_v2_mode: A[
+        Literal["direct", "hybrid"],
+        "DeepEP v2 ElasticBuffer mode: `direct` (decode-like) or `hybrid` "
+        "(prefill-like). Fixed at server init; not equivalent to DeepEP v1 modes.",
+    ] = "direct"
+    deepep_v2_dispatcher_output_dtype: A[
+        Literal["auto", "bf16", "fp8"],
+        "DeepEP v2 dispatcher output dtype. `auto`: fp8 for the DeepGEMM runner, bf16 for "
+        "Triton.",
+    ] = "auto"
     moe_runner_backend: A[
         str,
         Arg(
@@ -5577,6 +5589,89 @@ class ServerArgs:
             self.ep_size = self.tp_size
             logger.warning(
                 f"Nixl MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
+        if self.moe_a2a_backend == "deepep_v2":
+            if self.moe_runner_backend == "auto":
+                # The generic auto -> runner resolution above only fires for
+                # moe_a2a_backend "none", so deepep_v2 would otherwise reach the
+                # check below with the default "auto" and fail. deep_gemm is the
+                # production FP8 path, triton the BF16 functional path. Key off the
+                # dispatcher output dtype and default to the deep_gemm FP8 path:
+                # self.quantization is not reliably resolved at server-args time
+                # (FP8 is detected from the checkpoint later), so it cannot drive
+                # this; a genuinely BF16 run should set
+                # --deepep-v2-dispatcher-output-dtype bf16 (or --moe-runner-backend
+                # triton).
+                self.moe_runner_backend = (
+                    "triton"
+                    if self.deepep_v2_dispatcher_output_dtype == "bf16"
+                    else "deep_gemm"
+                )
+                logger.warning(
+                    "DeepEP v2 MoE: resolved --moe-runner-backend auto -> %s "
+                    "(--deepep-v2-dispatcher-output-dtype=%s).",
+                    self.moe_runner_backend,
+                    self.deepep_v2_dispatcher_output_dtype,
+                )
+            if self.moe_runner_backend not in ["deep_gemm", "triton"]:
+                raise ValueError(
+                    "DeepEP v2 MoE currently supports only "
+                    "--moe-runner-backend deep_gemm or triton. "
+                    f"Got {self.moe_runner_backend!r}. Add a runner adapter before "
+                    "enabling DeepEP v2 with other MoE runners."
+                )
+            if self.enable_two_batch_overlap or self.enable_single_batch_overlap:
+                raise ValueError(
+                    "DeepEP v2 MoE has not implemented the TBO/SBO overlap hooks yet. "
+                    "Disable --enable-two-batch-overlap and "
+                    "--enable-single-batch-overlap when using --moe-a2a-backend deepep_v2."
+                )
+            if self.enforce_shared_experts_fusion:
+                raise ValueError(
+                    "DeepEP v2 MoE has not validated fused shared experts yet. "
+                    "Remove --enforce-shared-experts-fusion when using "
+                    "--moe-a2a-backend deepep_v2."
+                )
+            self.ep_size = self.tp_size
+            self.disable_shared_experts_fusion = True
+            # CUDA graph is safe on the DeepEP v2 decode masked-GEMM path under ANY
+            # comm mode (direct or hybrid): the masked layout is chosen per-batch by
+            # inference phase (decode), not by the comm mode, giving static shapes
+            # with no host readback. deep_gemm runner + fp8 dispatch are required;
+            # every other combination (triton/bf16, or the prefill/extend contiguous
+            # path) needs a host readback / cpu_sync and is not capturable, so the
+            # decode graph is disabled there (the prefill graph is always disabled).
+            deepep_v2_fp8 = self.deepep_v2_dispatcher_output_dtype == "fp8" or (
+                self.deepep_v2_dispatcher_output_dtype == "auto"
+                and self.moe_runner_backend == "deep_gemm"
+            )
+            deepep_v2_graph_ok = (
+                self.moe_runner_backend == "deep_gemm" and deepep_v2_fp8
+            )
+            if not deepep_v2_graph_ok:
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            else:
+                # The decode masked-GEMM path is capture-safe under any comm mode
+                # (static shapes, no host readback). The prefill/extend path goes
+                # through the non-masked contiguous layout with a host readback and
+                # is not capturable, so keep the decode graph but always disable the
+                # prefill graph under DeepEP v2.
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            logger.warning(
+                f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+            logger.warning(
+                "DeepEP v2 MoE is using deepep_v2_mode=%s. This controls "
+                "ElasticBuffer direct/hybrid mode and is independent from "
+                "--deepep-mode normal/low_latency. DeepEP v2 MoE enables the "
+                "decode CUDA graph on the deep_gemm + fp8 masked decode path "
+                "(any comm mode) and disables shared expert fusion. "
+                "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK is a "
+                "per-rank communication buffer capacity, not a model limit; "
+                "increase it for large prefill/chunked-prefill workloads.",
+                self.deepep_v2_mode,
             )
 
         if self.moe_a2a_backend == "ascend_fuseep":
