@@ -34,7 +34,7 @@ from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
+from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip, is_xpu
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
@@ -471,7 +472,7 @@ def apply_qk_norm(
     k_eps = k_norm.variance_epsilon
 
     if (
-        _is_cuda  # TODO(dark): have not tested on ROCm or other backends
+        (_is_cuda or _is_xpu)  # TODO(dark): have not tested on ROCm or other backends
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
