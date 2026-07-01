@@ -167,17 +167,6 @@ class SWAKVPool(BaseSWAKVPool):
             # swa_loc is the full->SWA translation, computed once per forward by
             # the attention backend; set_kv_buffer never translates internally.
             assert swa_loc is not None
-            if self.swa_kv_pool.is_quantized_kv_cache:
-                self.swa_kv_pool._set_quantized_kv_buffer(
-                    layer_id_pool,
-                    layer_id,
-                    swa_loc,
-                    cache_k,
-                    cache_v,
-                    k_scale,
-                    v_scale,
-                )
-                return
             self.swa_kv_pool.set_kv_buffer(
                 None,
                 swa_loc,
@@ -188,17 +177,6 @@ class SWAKVPool(BaseSWAKVPool):
                 layer_id_override=layer_id_pool,
             )
         else:
-            if self.full_kv_pool.is_quantized_kv_cache:
-                self.full_kv_pool._set_quantized_kv_buffer(
-                    layer_id_pool,
-                    layer_id,
-                    loc,
-                    cache_k,
-                    cache_v,
-                    k_scale,
-                    v_scale,
-                )
-                return
             self.full_kv_pool.set_kv_buffer(
                 None,
                 loc,

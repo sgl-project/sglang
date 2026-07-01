@@ -81,11 +81,10 @@ class KVCacheQuantMethodBase(ABC):
         cache_v: Tensor,
         k_scale=None,
         v_scale=None,
-        device_module=None,
-        alt_stream=None,
     ) -> None:
         """Quantize cache_k / cache_v and write into buffers at loc."""
 
+    @abstractmethod
     def dequantize_prev_kv(
         self,
         k_fp4: Tensor,
@@ -94,16 +93,19 @@ class KVCacheQuantMethodBase(ABC):
         v_scales: Tensor,
         layer_id: int,
     ) -> tuple[Tensor, Tensor]:
-        """Dequantize stored FP4 KV into the FP8 extend workspace."""
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support FP4 KV dequantization."
-        )
+        """Dequantize stored FP4 KV (selected token indices already applied).
 
+        Returns:
+            (k_fp8, v_fp8): Both in torch.float8_e4m3fn dtype with shape
+            matching the input (after unpacking). These are written into the
+            shared dequant workspace buffer for the FlashInfer FP8 prefill kernel.
+        """
+
+    @abstractmethod
     def compute_cell_size(
         self, head_num: int, head_dim: int, num_layers: int, kv_size: int
     ) -> int:
         """Per-token memory footprint in bytes (for capacity estimation)."""
-        raise NotImplementedError
 
     def load_scales_from_model(self, model_runner) -> None:
         """Load per-layer global scales from model weights (no-op by default)."""
@@ -130,11 +132,23 @@ class UnquantizedKVCacheMethod(KVCacheQuantMethodBase):
         cache_v,
         k_scale=None,
         v_scale=None,
-        device_module=None,
-        alt_stream=None,
     ) -> None:
         raise RuntimeError(
             "Unquantized KV cache writes are handled by MHATokenToKVPool.set_kv_buffer."
+        )
+
+    def dequantize_prev_kv(
+        self, k_fp4, k_scales, v_fp4, v_scales, layer_id
+    ) -> tuple[Tensor, Tensor]:
+        raise NotImplementedError(
+            "Unquantized KV cache does not support FP4 KV dequantization."
+        )
+
+    def compute_cell_size(
+        self, head_num: int, head_dim: int, num_layers: int, kv_size: int
+    ) -> int:
+        raise NotImplementedError(
+            "Unquantized KV cache capacity is computed by the default pool configurator."
         )
 
 
@@ -291,8 +305,6 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         cache_v: Tensor,
         k_scale=None,
         v_scale=None,
-        device_module=None,
-        alt_stream=None,
     ) -> None:
         from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
 
@@ -308,22 +320,10 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         cache_k_fp4_sf = cache_k_fp4_sf.view(torch.uint8)
         cache_v_fp4_sf = cache_v_fp4_sf.view(torch.uint8)
 
-        from sglang.srt.model_executor.runner import get_is_capture_mode
-
-        if get_is_capture_mode() and alt_stream is not None:
-            current_stream = device_module.current_stream()
-            alt_stream.wait_stream(current_stream)
-            k_buffer[loc] = cache_k
-            k_scale_buffer[loc] = cache_k_fp4_sf
-            with device_module.stream(alt_stream):
-                v_buffer[loc] = cache_v
-                v_scale_buffer[loc] = cache_v_fp4_sf
-            current_stream.wait_stream(alt_stream)
-        else:
-            k_buffer[loc] = cache_k
-            v_buffer[loc] = cache_v
-            k_scale_buffer[loc] = cache_k_fp4_sf
-            v_scale_buffer[loc] = cache_v_fp4_sf
+        k_buffer[loc] = cache_k
+        v_buffer[loc] = cache_v
+        k_scale_buffer[loc] = cache_k_fp4_sf
+        v_scale_buffer[loc] = cache_v_fp4_sf
 
     def dequantize_prev_kv(
         self,
@@ -440,30 +440,16 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
         cache_v,
         k_scale=None,
         v_scale=None,
-        device_module=None,
-        alt_stream=None,
     ) -> None:
         from sglang.srt.layers.quantization.kvfp4_tensor import FP4MXBlock16KVQuantizeUtil
 
         cache_k_fp4, cache_k_sf = FP4MXBlock16KVQuantizeUtil.batched_quantize(cache_k)
         cache_v_fp4, cache_v_sf = FP4MXBlock16KVQuantizeUtil.batched_quantize(cache_v)
 
-        from sglang.srt.model_executor.runner import get_is_capture_mode
-
-        if get_is_capture_mode() and alt_stream is not None:
-            current_stream = device_module.current_stream()
-            alt_stream.wait_stream(current_stream)
-            k_buffer[loc] = cache_k_fp4
-            k_scale_buffer[loc] = cache_k_sf
-            with device_module.stream(alt_stream):
-                v_buffer[loc] = cache_v_fp4
-                v_scale_buffer[loc] = cache_v_sf
-            current_stream.wait_stream(alt_stream)
-        else:
-            k_buffer[loc] = cache_k_fp4
-            v_buffer[loc] = cache_v_fp4
-            k_scale_buffer[loc] = cache_k_sf
-            v_scale_buffer[loc] = cache_v_sf
+        k_buffer[loc] = cache_k_fp4
+        v_buffer[loc] = cache_v_fp4
+        k_scale_buffer[loc] = cache_k_sf
+        v_scale_buffer[loc] = cache_v_sf
 
     def dequantize_prev_kv(
         self,

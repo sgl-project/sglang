@@ -12,32 +12,60 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Low-level tensor helpers for FP4 KV cache quantization.
-
-Recipe selection and buffer ownership live in ``fp4_kv_cache_quant_method.py``. This
-module only implements the packing, unpacking, and FlashInfer calls used by the
-concrete quantization methods.
-"""
+# Define a enum class for FP4 formats, including MXFP4, NVFP4 and future formats
+from enum import Enum
 
 import torch
 
+
+class FP4KVCacheRecipe(Enum):
+    MXFP4 = 1  # KVFP4: block-wise scaling
+    NVFP4 = 2  # two-level scaling: global FP32 + block FP8 E4M3
+
+
 E2M1_MAX = 6.0
-# Keep constants as Python literals. The compiled helpers materialize them with
+MAX_BLOCK_SCALE_FP8 = 448.0  # Maximum FP8 E4M3 value
+# E2M1 format: 1 sign bit + 2 exponent bits + 1 mantissa bit = 4 bits
+# 16 possible values: 0x0-0xF
+# Negative values: 0x8-0xF (sign bit = 1)
+# Positive values: 0x0-0x7 (sign bit = 0)
+# Keep constants as Python literals. Compiled helpers materialize them with
 # input.new_tensor(), so they follow the caller device without a global GPU tensor
 # or a CPU tensor .to(device) in the hot path.
-E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+E2M1_VALUES = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
 E2M1_BOUNDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 
 
 class FP4MXBlock16KVQuantizeUtil:
-    """Utility class for block-16 FP4 quantization and dequantization operations."""
+    """Block-wise FP4 (E2M1) quantization for KV cache.
+
+    Similar to MXFP4 but uses block_size=16 (MXFP4 spec defines block_size=32).
+    Each block of 16 elements shares one uint8 exponent-only scale factor.
+    """
 
     @staticmethod
     @torch.compile
     def batched_quantize(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
 
-        Quantize tensor to block-16 FP4 format
+        Quantize tensor to KVFP4 format
         Args:
             tensor: Input tensor of shape [B, M, N]
 
@@ -83,7 +111,7 @@ class FP4MXBlock16KVQuantizeUtil:
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
         """
-        Dequantize block-16 FP4 tensor
+        Dequantize KVFP4 tensor
         Args:
             quant_tensor: Quantized tensor of shape [B, M, N/2]
             scale_factors: Scale factors of shape [B, M*N/16]
@@ -100,14 +128,9 @@ class FP4MXBlock16KVQuantizeUtil:
         fp4_vals[..., 0::2] = quant_tensor & 0x0F
         fp4_vals[..., 1::2] = (quant_tensor >> 4) & 0x0F
 
-        # Extract sign and magnitude
-        sign_mask = (fp4_vals & 0x08) != 0
-        magnitude_idx = fp4_vals & 0x07
-
         # Convert to float values
         values = quant_tensor.new_tensor(E2M1_VALUES, dtype=torch.float32)
-        float_vals = values[magnitude_idx.long()]
-        float_vals = torch.where(sign_mask, -float_vals, float_vals)
+        float_vals = values[fp4_vals.long()]
 
         # Reshape for block-wise scaling
         reshaped = float_vals.view(b, m * n // 16, 16)
@@ -117,6 +140,9 @@ class FP4MXBlock16KVQuantizeUtil:
         scaled = reshaped * torch.exp2(scale_exp.unsqueeze(-1))
 
         return scaled.view(b, m, n).to(dtype)
+
+
+BlockFP4KVQuantizeUtil = FP4MXBlock16KVQuantizeUtil
 
 
 class NVFP4KVQuantizeUtil:

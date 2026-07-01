@@ -1877,8 +1877,6 @@ class MHATokenToKVPool(KVCache):
             cache_v,
             k_scale,
             v_scale,
-            device_module=self.device_module,
-            alt_stream=self.alt_stream,
         )
 
     def get_raw_fp4_kv_buffer(
@@ -1913,6 +1911,13 @@ class MHATokenToKVPool(KVCache):
         k_cur_fp8: Optional[torch.Tensor] = None,
         v_cur_fp8: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the shared FP8 workspace used by FlashInfer extend attention.
+
+        Cached prefix tokens are stored as packed FP4 plus per-block scales, so
+        paged prefill dequantizes those prefix tokens into the FP8 workspace.
+        The current extend chunk can already be FP8 and is copied into the same
+        workspace after the prefix region.
+        """
         k_fp4, v_fp4, k_scales, v_scales = self.get_raw_fp4_kv_buffer(layer_id)
         dq_k, dq_v = self.get_fp8_workspace()
 
@@ -2567,7 +2572,6 @@ class HybridLinearKVPool(KVCache):
         self.mamba_pool = mamba_pool
         self.use_mla = use_mla
         if not use_mla:
-            TokenToKVPoolClass = MHATokenToKVPool
             quant_method_kwarg = {"quant_method": quant_method}
 
             if current_platform.is_out_of_tree():
@@ -2586,11 +2590,10 @@ class HybridLinearKVPool(KVCache):
             elif full_kv_pool_class is not None:
                 # Caller-selected MHA layout variant (e.g. the page-major
                 # PageMajorMHATokenToKVPool). NPU / out-of-tree classes keep
-                # priority since they do not understand alternate layouts.
+                # priority since they don't understand alternate layouts.
                 TokenToKVPoolClass = full_kv_pool_class
             else:
                 TokenToKVPoolClass = MHATokenToKVPool
-                quant_method_kwarg = {"quant_method": quant_method}
 
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,
