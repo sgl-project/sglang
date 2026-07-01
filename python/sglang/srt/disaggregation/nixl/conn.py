@@ -428,7 +428,14 @@ class NixlKVManager(CommonKVManager):
             self._num_slots_src = (
                 self.kv_args.kv_data_lens[0] // self.kv_args.kv_item_lens[0]
             )
-            transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
+            transfer_queue_size = (
+                envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
+                if envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.is_set()
+                else 1
+            )
+            if not transfer_queue_size or transfer_queue_size < 1:
+                transfer_queue_size = 1
+
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
