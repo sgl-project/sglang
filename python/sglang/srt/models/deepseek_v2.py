@@ -453,7 +453,8 @@ class MoEGate(nn.Module):
             if (
                 quant_config is not None
                 and _use_aiter
-                and quant_config.get_name() in (
+                and quant_config.get_name()
+                in (
                     "fp8",
                     "compressed_tensors",
                     "quark",
