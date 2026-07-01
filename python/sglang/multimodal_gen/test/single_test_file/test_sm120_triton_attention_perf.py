@@ -1,4 +1,5 @@
 import unittest
+import warnings
 
 import torch
 
@@ -71,7 +72,7 @@ class TestSM120TritonAttentionPerf(unittest.TestCase):
         sdpa_ms = self._bench_cuda_ms(
             lambda: sdpa_impl.forward(query, key, value, None)
         )
-        print(
+        bench_message = (
             "SM120_TRITON_ATTN_BENCH "
             f"shape=({batch_size},{seq_len},{num_heads},{head_size}) "
             f"dtype={dtype} "
@@ -79,6 +80,8 @@ class TestSM120TritonAttentionPerf(unittest.TestCase):
             f"torch_sdpa_ms={sdpa_ms:.3f} "
             f"speedup={sdpa_ms / sm120_ms:.3f}x"
         )
+        print(bench_message, flush=True)
+        warnings.warn(bench_message, RuntimeWarning, stacklevel=1)
 
     @staticmethod
     def _bench_cuda_ms(fn, warmup: int = 5, repeats: int = 20) -> float:
