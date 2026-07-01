@@ -41,6 +41,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     PerformanceSummary,
     ScenarioConfig,
     get_model_task_type_for_server_args,
+    get_perf_baseline_path,
 )
 from sglang.multimodal_gen.test.test_utils import (
     SGL_TEST_FILES_CI_DATA_REVISION,
@@ -50,6 +51,7 @@ from sglang.multimodal_gen.test.test_utils import (
     extract_key_frames_from_video,
     get_consistency_gt_candidates,
     get_consistency_gt_remote_files,
+    get_consistency_threshold_path,
     get_consistency_thresholds,
     get_dynamic_server_port,
     gt_exists,
@@ -232,7 +234,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             logger.error(
                 f'\n{"=" * 60}\n'
                 f'Add "estimated_full_test_time_s" to scenario "{case.id}":\n\n'
-                f"File: python/sglang/multimodal_gen/test/server/perf_baselines.json\n\n"
+                f"File: {get_perf_baseline_path()}\n\n"
                 f'    "{case.id}": {{\n'
                 f"        ...\n"
                 f'        "estimated_full_test_time_s": {_measured_full_time:.1f}\n'
@@ -441,7 +443,7 @@ class DiffusionServerBase:
                 self._dump_baseline_for_testcase(case, summary, missing_scenario)
                 if missing_scenario:
                     pytest.fail(
-                        f"Testcase '{case.id}' not found in perf_baselines.json"
+                        f"Testcase '{case.id}' not found in {get_perf_baseline_path()}"
                     )
                 return
 
@@ -552,7 +554,7 @@ class DiffusionServerBase:
                 )
         action = "add" if missing_scenario else "update"
         output = f"""
-{action} this baseline in the "scenarios" section of perf_baselines.json:
+{action} this baseline in the "scenarios" section of {get_perf_baseline_path()}:
 
 "{case.id}": {json.dumps(baseline, indent=4)}
 
@@ -607,10 +609,10 @@ Add the expected file(s) to sgl-project/ci-data in diffusion-ci/consistency_gt/s
 
 For this case, expected file(s): {names}
 
-Repository: https://github.com/sgl-project/ci-data (path: diffusion-ci/consistency_gt/sglang_generated/)
+Repository: https://github.com/sgl-project/ci-data (path: diffusion-ci/consistency_gt/sglang_generated/, with optional platform subdirectories such as 5090/)
 Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
-(Optional) Per-case override in consistency_threshold.json:
+(Optional) Per-case override in {get_consistency_threshold_path()}:
   "cases": {{
     "{case.id}": {{
       "clip_threshold": 0.92,
