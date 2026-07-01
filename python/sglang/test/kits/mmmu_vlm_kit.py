@@ -367,7 +367,7 @@ class MMMUMultiModelTestBase(CustomTestCase):
                 api_key=self.api_key,
                 other_args=[
                     "--trust-remote-code",
-                    "--cuda-graph-max-bs",
+                    "--cuda-graph-max-bs-decode",
                     "64",
                     "--enable-multimodal",
                     "--mem-fraction-static",

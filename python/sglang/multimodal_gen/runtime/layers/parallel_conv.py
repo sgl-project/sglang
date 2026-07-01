@@ -13,13 +13,50 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 if current_platform.is_cuda():
+    from sglang.jit_kernel.diffusion.causal_conv3d_cat_pad import (
+        can_use_fused_causal_conv3d_cat_pad_cuda,
+        fused_causal_conv3d_cat_pad_cuda,
+    )
     from sglang.jit_kernel.diffusion.triton.causal_conv3d_pad import (
-        fused_causal_conv3d_cat_pad,
+        fused_causal_conv3d_cat_pad as fused_causal_conv3d_cat_pad_triton,
     )
 else:
-    fused_causal_conv3d_cat_pad = None
+    can_use_fused_causal_conv3d_cat_pad_cuda = None
+    fused_causal_conv3d_cat_pad_cuda = None
+    fused_causal_conv3d_cat_pad_triton = None
+
+
+_causal_conv3d_cat_pad_cuda_failed = False
+
+
+def fused_causal_conv3d_cat_pad(
+    x: torch.Tensor,
+    cache_x: torch.Tensor,
+    padding: list[int],
+) -> torch.Tensor:
+    global _causal_conv3d_cat_pad_cuda_failed
+    if (
+        fused_causal_conv3d_cat_pad_cuda is not None
+        and can_use_fused_causal_conv3d_cat_pad_cuda(x, cache_x, padding)
+        and not _causal_conv3d_cat_pad_cuda_failed
+    ):
+        try:
+            return fused_causal_conv3d_cat_pad_cuda(x, cache_x, padding)
+        except Exception:
+            logger.warning(
+                "fused_causal_conv3d_cat_pad_cuda failed, falling back to Triton",
+                exc_info=True,
+            )
+            _causal_conv3d_cat_pad_cuda_failed = True
+    if fused_causal_conv3d_cat_pad_triton is None:
+        raise RuntimeError("causal Conv3D cat/pad fusion is only available on CUDA")
+    return fused_causal_conv3d_cat_pad_triton(x, cache_x, padding)
+
 
 _SPATIAL_PARALLEL_DECODE_DISABLED = contextvars.ContextVar(
     "spatial_parallel_decode_disabled", default=False
