@@ -77,7 +77,6 @@ def _build_swa_tree(
         head_dim=head_dim,
         swa_attention_layer_ids=swa_attention_layer_ids,
         full_attention_layer_ids=full_attention_layer_ids,
-        enable_kvcache_transpose=False,
         device=device,
     )
     allocator = SWATokenToKVPoolAllocator(
@@ -226,7 +225,6 @@ class TestSWA(unittest.TestCase):
             head_dim=head_dim,
             swa_attention_layer_ids=swa_attention_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
         )
         alloc = SWATokenToKVPoolAllocator(
@@ -310,7 +308,6 @@ class TestSWA(unittest.TestCase):
             head_dim=head_dim,
             swa_attention_layer_ids=swa_attention_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
         )
         # setup token to kv pool allocator
@@ -468,7 +465,6 @@ class TestSWA(unittest.TestCase):
             head_dim=head_dim,
             swa_attention_layer_ids=swa_attention_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
         )
         # setup token to kv pool allocator

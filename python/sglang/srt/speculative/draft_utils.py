@@ -236,10 +236,15 @@ class DraftBackendFactory:
         )
 
     def _create_dsv4_decode_backend(self):
-        # On NPU the "dsv4" backend resolves to the Ascend V4 subclass; its
-        # draft path reuses the Ascend multi-step draft backend.
+        # Decode here is the EAGLE multi-step draft decode path.
         if is_npu():
-            return self._create_ascend_decode_backend()
+            from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+                DeepseekV4AscendMultiStepDraftBackend,
+            )
+
+            return DeepseekV4AscendMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
         elif is_hip():
             from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
                 DeepseekV4MultiStepBackend,
@@ -338,9 +343,13 @@ class DraftBackendFactory:
 
     def _create_dsv4_prefill_backend(self):
         # On NPU the "dsv4" backend resolves to the Ascend V4 subclass; its
-        # draft-extend path reuses the Ascend prefill draft backend.
+        # draft-extend path uses the registered DSV4 prefill backend.
         if is_npu():
-            return self._create_ascend_prefill_backend()
+            from sglang.srt.layers.attention.attention_registry import (
+                ATTENTION_BACKENDS,
+            )
+
+            return ATTENTION_BACKENDS["dsv4"](self.draft_model_runner)
         elif is_hip():
             from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
                 DeepseekV4HipRadixBackend,
