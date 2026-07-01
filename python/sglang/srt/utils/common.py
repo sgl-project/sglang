@@ -1495,6 +1495,10 @@ def point_to_point_pyobj(
     dst: int = 1,
     async_send: bool = False,
 ):
+    """Send data from src to dst in group using DeviceToDevice communication."""
+    # Generic way to get current device for any accelerator ('cuda', 'xpu', 'hpu', etc)
+    device_module = torch.get_device_module()
+    current_device = device_module.current_device()
     """Send data from src to dst in group."""
     from sglang.srt.distributed.parallel_state import P2PWork
 
@@ -1505,10 +1509,7 @@ def point_to_point_pyobj(
     if rank == src:
         p2p_works = []
         if len(data) == 0:
-            tensor_size = torch.tensor(
-                [0],
-                dtype=torch.long,
-            )
+            tensor_size = torch.tensor([0], dtype=torch.long, device=current_device)
             work = send_func(tensor_size, dst, group=group)
             if async_send:
                 p2p_works.append(P2PWork(work, tensor_size))
@@ -1517,8 +1518,10 @@ def point_to_point_pyobj(
             size = len(serialized_data)
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
-            )
-            tensor_size = torch.tensor([size], dtype=torch.long)
+            ).to(
+                device=current_device
+            )  # Move to current accelerator device
+            tensor_size = torch.tensor([size], dtype=torch.long, device=current_device)
 
             work = send_func(tensor_size, dst, group=group)
             if async_send:
@@ -1529,10 +1532,7 @@ def point_to_point_pyobj(
         return p2p_works
 
     elif rank == dst:
-        tensor_size = torch.tensor(
-            [0],
-            dtype=torch.long,
-        )
+        tensor_size = torch.tensor([0], dtype=torch.long, device=current_device)
         work = dist.irecv(tensor_size, src=src, group=group)
         work.wait()
         size = tensor_size.item()
@@ -1540,10 +1540,7 @@ def point_to_point_pyobj(
         if size == 0:
             return []
 
-        tensor_data = torch.empty(
-            size,
-            dtype=torch.uint8,
-        )
+        tensor_data = torch.empty(size, dtype=torch.uint8, device=current_device)
         work = dist.irecv(tensor_data, src=src, group=group)
         work.wait()
 
