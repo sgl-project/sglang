@@ -110,7 +110,7 @@ The Playground is where you experiment with **SGLang features beyond the verifie
 The knobs come in two flavors:
 
 - **Built-in SGLang features** — parallelism overrides (TP / CP / DP-Attention — DP-Attention's value is the DP degree, with `off` to disable), MoE backend + EP, reasoning / tool-call parsers, speculative-decoding presets, prefill/decode disaggregation, HiCache tiers, and HiSparse hierarchical sparse attention (decode-role only — the card appears once PD-Disagg mode is set to decode).
-- **DeepSeek-V4 specific features** — MegaMoE W4A8 / W4A4 fused kernel (Blackwell only).
+- **DeepSeek-V4 specific features** — MegaMoE W4A8 / W4A4 fused kernel (Blackwell only; Hopper SM90 uses a separate all-FP8 MegaMoE path — see Configuration Tips below).
 
 Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the verified base but stripped by an override. When no override differs from the base cell, the playground inherits the base's **Verified** badge; any actual change flips it to **Not Verified** until the new configuration is run end-to-end and submitted back.
 
@@ -286,6 +286,8 @@ Two options are available for running DeepSeek-V4 on Hopper:
 - **Original FP4 checkpoints** — apply the W4A16 MoE kernels (Marlin) as the command generator picks for Hopper cells. This path works on both H100 and H200 and is the only option for H100 (no FP8 path). It is TP-only; on H200 the Pro variant fits on a single 8-GPU node, while H100 Pro needs 2 nodes (TP=16).
 - **Converted FP8 checkpoints** (H100 and H200 only) — pre-repackaged FP8 weights at [`sgl-project/DeepSeek-V4-Flash-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Flash-FP8) and [`sgl-project/DeepSeek-V4-Pro-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Pro-FP8) unlock DP-attention + DeepEP and richer parallelism (e.g. Pro TP=16 across 2 nodes).
 
+On these FP8 checkpoints you can additionally enable the all-FP8 **MegaMoE** path on SM90 for higher long-context / large-decode throughput — see the **SM90 (Hopper) FP8 MegaMoE** note in Configuration Tips below.
+
 PD-Disagg recipes on H200 may require `docker run --privileged --ulimit memlock=-1`
 (or `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`) so mooncake
 can discover the IB HCAs; without IB exposure mooncake silently falls back to
@@ -321,10 +323,37 @@ Two variants are exposed:
   (~89.5 GPQA on Pro).
 
 Notes:
-- MegaMoE is **only supported on Blackwell GPUs** (B200 / B300 / GB200 / GB300). The chip is hidden when the Deploy panel's base cell sits on Hopper (H100 / H200).
+- The W4A8 / W4A4 variants above are **Blackwell-only** (B200 / B300 / GB200 / GB300). On **Hopper (SM90, H100 / H200)** use the all-FP8 MegaMoE path described below instead.
 - MegaMoE is **only wired into the `high-throughput` recipe** on Blackwell (per [sgl-project/sglang#26451](https://github.com/sgl-project/sglang/pull/26451)). The chip is hidden on `low-latency` and `balanced` — switch to `high-throughput` to expose it.
 - When running MegaMoE, don't set `--moe-runner-backend` manually.
 - Adjust `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` based on your workload and memory usage. Setting higher number of tokens for MegaMoE requires more HBM space (recommended: 8320 for high-throughput).
+
+**SM90 (Hopper) FP8 MegaMoE (Experimental)**
+
+On SM90 (Hopper, H100 / H200), the all-FP8 MegaMoE path routes MoE through the
+DeepGEMM `mega_moe` runner for higher long-context / large-decode throughput on
+the FP8 checkpoints. Unlike the Blackwell W4A8 / W4A4 variants above, experts
+stay in **FP8** — keep `SGLANG_DSV4_FP4_EXPERTS=0`. It requires a `sgl-deep-gemm`
+build with SM90 FP8 MegaMoE support. **Please use the latest image for this
+feature.**
+
+Enable the MegaMoE path with `--moe-a2a-backend megamoe` — or equivalently set
+`SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1`, which auto-configures the same backend:
+
+```bash Command
+SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096 \
+SGLANG_DSV4_FP4_EXPERTS=0 \
+sglang serve \
+  --model-path sgl-project/DeepSeek-V4-Flash-FP8 \
+  --tp 8 \
+  --moe-a2a-backend megamoe \
+  --chunked-prefill-size 4096
+```
+
+`SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` caps the number of tokens
+the MegaMoE path processes per rank (i.e. per GPU); the MegaMoE path is only used
+for batches at or below this cap. The right value depends on your parallelism /
+token-split scheme, and larger values reserve more HBM.
 
 **GB300 PD-Disagg cross-pod MNNVL**
 
