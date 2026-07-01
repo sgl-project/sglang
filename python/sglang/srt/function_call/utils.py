@@ -1,3 +1,6 @@
+import ast
+import threading
+import warnings
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
@@ -217,6 +220,34 @@ def _is_complete_json(input_str: str) -> bool:
         return True
     except JSONDecodeError:
         return False
+
+
+# ``warnings.catch_warnings`` mutates the *process-global* warning filters and
+# is therefore not thread-safe (CPython docs). Tool-call parsing runs on the
+# request path and may execute concurrently, so the enter/eval/restore window
+# is serialized. These helpers are microsecond-cheap; the lock has no perf impact.
+_safe_ast_lock = threading.Lock()
+
+
+def _run_ast_strict(fn, *args):
+    """Run an ``ast`` function with invalid-escape warnings promoted to errors.
+
+    Holds ``_safe_ast_lock`` because ``catch_warnings`` touches global state."""
+    with _safe_ast_lock, warnings.catch_warnings():
+        warnings.filterwarnings("error", category=SyntaxWarning)
+        warnings.filterwarnings("error", category=DeprecationWarning)
+        try:
+            return fn(*args)
+        except (SyntaxWarning, DeprecationWarning) as e:
+            raise SyntaxError(str(e)) from e
+
+
+def safe_literal_eval(value: str) -> Any:
+    return _run_ast_strict(ast.literal_eval, value)
+
+
+def safe_ast_parse(source: str) -> ast.Module:
+    return _run_ast_strict(ast.parse, source)
 
 
 def _get_tool_schema_defs(tools: List[Tool]) -> dict:
