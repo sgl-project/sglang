@@ -22,6 +22,9 @@ from sglang.srt.sampling.penaltylib.orchestrator import (
 from sglang.srt.sampling.penaltylib.presence_penalty import (
     BatchedPresencePenalizer,
 )
+from sglang.srt.sampling.penaltylib.repetition_penalty import (
+    BatchedRepetitionPenalizer,
+)
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
@@ -29,11 +32,19 @@ DEVICE = "cpu"
 
 
 # Helpers: mock Req and ScheduleBatch
-def _make_req(freq=0.0, presence=0.0, min_tokens=0, stop_ids=None, eos_id=2):
+def _make_req(
+    freq=0.0,
+    presence=0.0,
+    repetition=1.0,
+    min_tokens=0,
+    stop_ids=None,
+    eos_id=2,
+):
     """Create a mock request with sampling params."""
     req = MagicMock()
     req.sampling_params.frequency_penalty = freq
     req.sampling_params.presence_penalty = presence
+    req.sampling_params.repetition_penalty = repetition
     req.sampling_params.min_new_tokens = min_tokens
     req.sampling_params.stop_token_ids = stop_ids
     req.tokenizer.additional_stop_token_ids = None
@@ -48,6 +59,24 @@ def _make_batch(reqs):
     batch.reqs = reqs
     batch.device = DEVICE
     return batch
+
+
+def _make_sampling_info(orchestrator, batch_size):
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+
+    return SamplingBatchInfo(
+        temperatures=torch.ones(batch_size, 1, device=DEVICE),
+        top_ps=torch.ones(batch_size, device=DEVICE),
+        top_ks=torch.ones(batch_size, dtype=torch.int32, device=DEVICE),
+        min_ps=torch.zeros(batch_size, device=DEVICE),
+        is_all_greedy=False,
+        need_top_p_sampling=False,
+        need_top_k_sampling=False,
+        need_min_p_sampling=False,
+        vocab_size=VOCAB_SIZE,
+        penalizer_orchestrator=orchestrator,
+        device=DEVICE,
+    )
 
 
 # BatchedPenalizerOrchestrator
@@ -184,6 +213,18 @@ class TestBatchedFrequencyPenalizer(CustomTestCase):
         pen.apply(logits)
         self.assertAlmostEqual(logits[0, 3].item(), -2.0, places=5)
 
+    def test_negative_penalty_increases_repeated_token_logit(self):
+        """Test that valid negative frequency_penalty increases repeated token logits."""
+        _, pen = self._setup([-0.5])
+        pen.cumulate_output_tokens(torch.tensor([4]))
+        pen.cumulate_output_tokens(torch.tensor([4]))
+
+        logits = torch.zeros(1, VOCAB_SIZE)
+        pen.apply(logits)
+
+        self.assertAlmostEqual(logits[0, 4].item(), 1.0, places=5)
+        self.assertAlmostEqual(logits[0, 0].item(), 0.0, places=5)
+
     def test_filter_keeps_subset(self):
         """Test that filter retains only the selected batch indices."""
         orch, pen = self._setup([1.0, 2.0])
@@ -249,6 +290,18 @@ class TestBatchedPresencePenalizer(CustomTestCase):
         pen.apply(logits)
         # scatter_ overwrites (not adds), so penalty should be 1.0, not 2.0
         self.assertAlmostEqual(logits[0, 7].item(), -1.0, places=5)
+
+    def test_negative_penalty_increases_present_token_logit(self):
+        """Test that valid negative presence_penalty increases present token logits once."""
+        _, pen = self._setup([-0.75])
+        pen.cumulate_output_tokens(torch.tensor([7]))
+        pen.cumulate_output_tokens(torch.tensor([7]))
+
+        logits = torch.zeros(1, VOCAB_SIZE)
+        pen.apply(logits)
+
+        self.assertAlmostEqual(logits[0, 7].item(), 0.75, places=5)
+        self.assertAlmostEqual(logits[0, 0].item(), 0.0, places=5)
 
     def test_filter_keeps_subset(self):
         """Test that filter retains the first request's presence penalty."""
@@ -369,6 +422,112 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
         self.assertFalse(hasattr(pen, "min_new_tokens"))
         self.assertFalse(hasattr(pen, "stop_token_penalties"))
         self.assertFalse(hasattr(pen, "len_output_tokens"))
+
+
+# BatchedRepetitionPenalizer
+class TestBatchedRepetitionPenalizer(CustomTestCase):
+
+    def _setup(self, repetition_values):
+        reqs = [_make_req(repetition=r) for r in repetition_values]
+        batch = _make_batch(reqs)
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedRepetitionPenalizer}
+        )
+        pen = orch.penalizers[BatchedRepetitionPenalizer]
+        return orch, pen
+
+    def test_is_required_with_non_default_penalty(self):
+        """Test that repetition_penalty != 1.0 makes the penalizer required."""
+        _, pen = self._setup([1.2])
+        self.assertTrue(pen.is_required())
+
+    def test_is_not_required_with_default_penalty(self):
+        """Test that repetition_penalty=1.0 makes the penalizer not required."""
+        _, pen = self._setup([1.0])
+        self.assertFalse(pen.is_required())
+
+    def test_apply_scales_seen_token_logits_by_sign(self):
+        """Test repetition penalty divides positive logits and multiplies negative logits."""
+        _, pen = self._setup([2.0, 2.0])
+        pen.cumulate_output_tokens(torch.tensor([5, 5]))
+
+        logits = torch.zeros(2, VOCAB_SIZE)
+        logits[0, 5] = 4.0
+        logits[1, 5] = -4.0
+        logits[0, 6] = 3.0
+
+        pen.apply(logits)
+
+        self.assertAlmostEqual(logits[0, 5].item(), 2.0, places=5)
+        self.assertAlmostEqual(logits[1, 5].item(), -8.0, places=5)
+        self.assertAlmostEqual(logits[0, 6].item(), 3.0, places=5)
+
+    def test_penalty_below_one_scales_seen_token_logits_by_sign(self):
+        """Test repetition_penalty < 1.0 uses the same positive/negative rule."""
+        _, pen = self._setup([0.5, 0.5])
+        pen.cumulate_output_tokens(torch.tensor([5, 5]))
+
+        logits = torch.zeros(2, VOCAB_SIZE)
+        logits[0, 5] = 4.0
+        logits[1, 5] = -4.0
+
+        pen.apply(logits)
+
+        self.assertAlmostEqual(logits[0, 5].item(), 8.0, places=5)
+        self.assertAlmostEqual(logits[1, 5].item(), -2.0, places=5)
+
+    def test_repeated_same_token_keeps_single_penalty(self):
+        """Test that repetition penalty marks presence and does not compound."""
+        _, pen = self._setup([2.0])
+        pen.cumulate_output_tokens(torch.tensor([5]))
+        pen.cumulate_output_tokens(torch.tensor([5]))
+
+        scaling = pen.get_scaling_penalties()
+        self.assertAlmostEqual(scaling[0, 5].item(), 2.0, places=5)
+
+        logits = torch.zeros(1, VOCAB_SIZE)
+        logits[0, 5] = 4.0
+        pen.apply(logits)
+        self.assertAlmostEqual(logits[0, 5].item(), 2.0, places=5)
+
+    def test_get_scaling_penalties_returns_cumulated_tensor(self):
+        """Test that scaling penalties expose only seen tokens as non-one values."""
+        _, pen = self._setup([1.5])
+        pen.cumulate_output_tokens(torch.tensor([9]))
+
+        scaling = pen.get_scaling_penalties()
+
+        self.assertEqual(scaling.shape, (1, VOCAB_SIZE))
+        self.assertAlmostEqual(scaling[0, 9].item(), 1.5, places=5)
+        self.assertAlmostEqual(scaling[0, 0].item(), 1.0, places=5)
+
+    def test_filter_keeps_subset(self):
+        """Test that filter retains only selected repetition penalty rows."""
+        _, pen = self._setup([1.5, 2.0])
+        pen.cumulate_output_tokens(torch.tensor([3, 4]))
+
+        pen.filter(torch.tensor([1]))
+
+        self.assertEqual(pen.repetition_penalties.shape[0], 1)
+        self.assertAlmostEqual(pen.repetition_penalties[0, 0].item(), 2.0, places=5)
+        self.assertAlmostEqual(
+            pen.cumulated_repetition_penalties[0, 4].item(), 2.0, places=5
+        )
+
+    def test_merge_concatenates(self):
+        """Test that merge concatenates repetition penalty tensors."""
+        _, pen1 = self._setup([1.5])
+        _, pen2 = self._setup([2.0])
+        pen1.merge(pen2)
+        self.assertEqual(pen1.repetition_penalties.shape[0], 2)
+
+    def test_teardown_cleans_attributes(self):
+        """Test that teardown removes repetition penalty tensors."""
+        _, pen = self._setup([1.5])
+        pen.teardown()
+        self.assertFalse(hasattr(pen, "repetition_penalties"))
+        self.assertFalse(hasattr(pen, "cumulated_repetition_penalties"))
+        self.assertFalse(pen.is_prepared())
 
 
 # _BatchedPenalizer base class edge cases
@@ -515,6 +674,82 @@ class TestOrchestratorMultiplePenalizers(CustomTestCase):
         self.assertTrue(orch_a.is_required)
         pen = orch_a.penalizers[BatchedFrequencyPenalizer]
         self.assertEqual(pen.frequency_penalties.shape[0], 2)
+
+    def test_apply_repeat_expands_additive_and_scaling_penalties(self):
+        """Test speculative repeat mode applies additive and multiplicative penalties per draft."""
+        reqs = [_make_req(freq=1.0, repetition=2.0)]
+        batch = _make_batch(reqs)
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE,
+            batch,
+            {BatchedFrequencyPenalizer, BatchedRepetitionPenalizer},
+        )
+        orch.cumulate_output_tokens(torch.tensor([5]))
+
+        logits = torch.zeros(2, VOCAB_SIZE)
+        logits[0, 5] = 4.0
+        logits[1, 5] = -4.0
+
+        orch.apply(logits, repeat=2)
+
+        self.assertAlmostEqual(logits[0, 5].item(), 1.5, places=5)
+        self.assertAlmostEqual(logits[1, 5].item(), -10.0, places=5)
+        self.assertAlmostEqual(logits[0, 0].item(), 0.0, places=5)
+
+    def test_apply_repeat_expands_penalties_for_multiple_requests(self):
+        """Test repeat mode keeps per-request penalties aligned after expansion."""
+        reqs = [
+            _make_req(freq=1.0, presence=0.5, repetition=2.0),
+            _make_req(freq=0.25, presence=1.0, repetition=0.5),
+        ]
+        batch = _make_batch(reqs)
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE,
+            batch,
+            {
+                BatchedFrequencyPenalizer,
+                BatchedPresencePenalizer,
+                BatchedRepetitionPenalizer,
+            },
+        )
+        orch.cumulate_output_tokens(torch.tensor([5, 7]))
+
+        logits = torch.zeros(4, VOCAB_SIZE)
+        logits[0, 5] = 4.0
+        logits[1, 5] = -4.0
+        logits[2, 7] = 4.0
+        logits[3, 7] = -4.0
+
+        orch.apply(logits, repeat=2)
+
+        self.assertAlmostEqual(logits[0, 5].item(), 1.25, places=5)
+        self.assertAlmostEqual(logits[1, 5].item(), -11.0, places=5)
+        self.assertAlmostEqual(logits[2, 7].item(), 5.5, places=5)
+        self.assertAlmostEqual(logits[3, 7].item(), -2.625, places=5)
+        self.assertAlmostEqual(logits[0, 0].item(), 0.0, places=5)
+
+    def test_sampling_batch_info_copy_applies_cached_penalties_once(self):
+        """Test overlap-style cached penalties without a live orchestrator."""
+        reqs = [_make_req(freq=1.0, repetition=2.0)]
+        batch = _make_batch(reqs)
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE,
+            batch,
+            {BatchedFrequencyPenalizer, BatchedRepetitionPenalizer},
+        )
+        orch.cumulate_output_tokens(torch.tensor([5]))
+        sampling_info = _make_sampling_info(orch, len(reqs)).copy_for_forward()
+
+        self.assertIsNone(sampling_info.penalizer_orchestrator)
+        self.assertIsNotNone(sampling_info.acc_additive_penalties)
+        self.assertIsNotNone(sampling_info.acc_scaling_penalties)
+
+        logits = torch.zeros(1, VOCAB_SIZE)
+        logits[0, 5] = 5.0
+        sampling_info.apply_logits_bias(logits)
+
+        self.assertAlmostEqual(logits[0, 5].item(), 2.0, places=5)
+        self.assertAlmostEqual(logits[0, 0].item(), 0.0, places=5)
 
 
 if __name__ == "__main__":
