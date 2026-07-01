@@ -33,7 +33,10 @@ fi
 echo "Installing python extras: [${EXTRAS}]"
 
 # Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
-if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
+if [[ "${HOSTNAME_VALUE}" == mia1-p01* ]]; then
+  GPU_ARCH="mi35x"
+  echo "Detected GPU architecture from hostname: ${GPU_ARCH}"
+elif [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
   GPU_ARCH="${BASH_REMATCH[1]}"
   echo "Detected GPU architecture from hostname: ${GPU_ARCH}"
 else

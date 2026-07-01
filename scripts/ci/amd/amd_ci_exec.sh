@@ -6,7 +6,10 @@ HOSTNAME_VALUE=$(hostname)
 GPU_FAMILY=""
 
 # Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
-if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
+if [[ "${HOSTNAME_VALUE}" == mia1-p01* ]]; then
+  GPU_FAMILY="mi35x"
+  echo "Detected GPU family from hostname: ${GPU_FAMILY}"
+elif [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
   GPU_FAMILY="${BASH_REMATCH[1]}"
   echo "Detected GPU family from hostname: ${GPU_FAMILY}"
 else

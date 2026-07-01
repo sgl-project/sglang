@@ -109,6 +109,7 @@ env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+  HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
 
 concurrency:
   # Scheduled, run_all_tests, and manual dispatch runs get unique groups (never cancel each other).
@@ -507,7 +508,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi35x-gpu-1]
+        runner: [linux-sglang-mi35x-di]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -1076,7 +1077,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi35x-gpu-8.fabric]
+        runner: [linux-sglang-mi35x-di]
 
     runs-on: ${{matrix.runner}}
 
