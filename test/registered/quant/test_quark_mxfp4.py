@@ -81,20 +81,10 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
                 raise RuntimeError(f"Server {url} failed to start in {timeout}s")
             time.sleep(1)
 
-        # # Extract and display peak GPU memory from logs
-        combined_output = cls.stdout.getvalue() + cls.stderr.getvalue()
-
-        peak_memory_before_load = cls._extract_peak_memory_before_load(combined_output)
-        if is_cuda_alike() and not peak_memory_before_load:
-            raise ValueError("Should have found peak memory")
-        cls.peak_memory_before_load = float(peak_memory_before_load)
-
-        memory_increase_load_weights = cls._extract_memory_increase_load_weights(
-            combined_output
-        )
-        if is_cuda_alike() and not memory_increase_load_weights:
-            raise ValueError("Should have found memory increase in load_weights")
-        cls.memory_increase_load_weights = float(memory_increase_load_weights)
+        # Keep the raw server for memory numbers, which are parsed lazily by
+        # _test_peak_memory so subclasses that don't test memory (e.g. the
+        # NVFP4->MXFP4 accuracy-only class) don't require these log lines.
+        cls.combined_output = cls.stdout.getvalue() + cls.stderr.getvalue()
 
     @classmethod
     def _extract_peak_memory_before_load(cls, log_output):
@@ -109,8 +99,11 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
     @classmethod
     def _extract_memory_increase_load_weights(cls, log_output):
         """Extract memory increase during load_weights call."""
-        # Search for the log message pattern
-        pattern = r"Memory increase during load_weights:\s+([\d.]+)\s+GiB"
+        # Signed: the value is (free_before - free_after) around load_weights.
+        # When the on-device source representation is larger than the loaded
+        # result (e.g. requantizing to a more compact format), loading frees
+        # net memory and the reported increase is negative.
+        pattern = r"Memory increase during load_weights:\s+(-?[\d.]+)\s+GiB"
         match = re.search(pattern, log_output)
         if match:
             return match.group(1)
@@ -132,21 +125,33 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
         if not is_cuda_alike():
             self.skipTest("not is_cuda_alike")
 
+        peak_memory_before_load = self._extract_peak_memory_before_load(
+            self.combined_output
+        )
+        if not peak_memory_before_load:
+            raise ValueError("Should have found peak memory")
+        peak_memory_before_load = float(peak_memory_before_load)
+
+        memory_increase_load_weights = self._extract_memory_increase_load_weights(
+            self.combined_output
+        )
+        if not memory_increase_load_weights:
+            raise ValueError("Should have found memory increase in load_weights")
+        memory_increase_load_weights = float(memory_increase_load_weights)
+
         # NOTE: We can not simply rely on peak memory after `load_weights` as functions used
         # in-between (e.g. NVFP4->MXFP4 requantization) during weight loading may have a higher peak memory footprint
         # than simply the allocated weights.
         if add_peak_memory_before_load:
-            reference_gib = (
-                self.memory_increase_load_weights + self.peak_memory_before_load
-            )
+            reference_gib = memory_increase_load_weights + peak_memory_before_load
         else:
-            reference_gib = self.memory_increase_load_weights
+            reference_gib = memory_increase_load_weights
 
         assert reference_gib < threshold
 
         if test_start:
             # Weights initialized on meta device (not for dense BF16->MXFP4)
-            assert self.peak_memory_before_load < 5
+            assert peak_memory_before_load < 5
 
     def _test_gsm8k(self, accuracy_threshold):
         """Helper method to test GSM8K accuracy against a threshold."""
