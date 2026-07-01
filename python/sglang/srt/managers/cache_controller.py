@@ -251,6 +251,7 @@ class HiCacheController:
         self.has_draft = False
         self.mem_pool_device_draft = None
         self.mem_pool_host_draft = None
+        self.mem_pool_host_draft_indexer = None
         self.draft_page_get_func = None
         self.draft_page_set_func = None
 
@@ -702,13 +703,7 @@ class HiCacheController:
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
             )
-            if self.has_draft:
-                self.mem_pool_host_draft.backup_from_device_all_layer(
-                    self.mem_pool_device_draft,
-                    host_indices,
-                    device_indices,
-                    self.io_backend,
-                )
+            self._backup_draft_from_device_all_layer(host_indices, device_indices)
             finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
@@ -782,14 +777,7 @@ class HiCacheController:
                     i,
                     self.io_backend,
                 )
-                if self.has_draft and i < self.mem_pool_host_draft.layer_num:
-                    self.mem_pool_host_draft.load_to_device_per_layer(
-                        self.mem_pool_device_draft,
-                        host_indices,
-                        device_indices,
-                        i,
-                        self.io_backend,
-                    )
+                self._load_draft_to_device_per_layer(host_indices, device_indices, i)
                 producer_event.complete(i)
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
@@ -819,15 +807,68 @@ class HiCacheController:
         self.mem_pool_host.free(host_indices)
         return len(host_indices)
 
-    def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
+    def _backup_draft_from_device_all_layer(
+        self, host_indices: torch.Tensor, device_indices: torch.Tensor
+    ) -> None:
+        if not self.has_draft or host_indices.numel() == 0:
+            return
+
+        self.mem_pool_host_draft.backup_from_device_all_layer(
+            self.mem_pool_device_draft,
+            host_indices,
+            device_indices,
+            self.io_backend,
+        )
+        if self.mem_pool_host_draft_indexer is not None:
+            self.mem_pool_host_draft_indexer.backup_from_device_all_layer(
+                self.mem_pool_device_draft,
+                host_indices,
+                device_indices,
+                self.io_backend,
+            )
+
+    def _load_draft_to_device_per_layer(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        if not self.has_draft or host_indices.numel() == 0:
+            return
+
+        if layer_id < self.mem_pool_host_draft.layer_num:
+            self.mem_pool_host_draft.load_to_device_per_layer(
+                self.mem_pool_device_draft,
+                host_indices,
+                device_indices,
+                layer_id,
+                self.io_backend,
+            )
+        if (
+            self.mem_pool_host_draft_indexer is not None
+            and layer_id < self.mem_pool_host_draft_indexer.layer_num
+        ):
+            self.mem_pool_host_draft_indexer.load_to_device_per_layer(
+                self.mem_pool_device_draft,
+                host_indices,
+                device_indices,
+                layer_id,
+                self.io_backend,
+            )
+
+    def set_draft_kv_pool(
+        self, draft_device_pool, draft_host_pool, draft_indexer_host_pool=None
+    ) -> None:
         """Register draft KV pools so L2/L3 ops piggyback draft transfers."""
         self.has_draft = True
         self.mem_pool_device_draft = draft_device_pool
         self.mem_pool_host_draft = draft_host_pool
+        self.mem_pool_host_draft_indexer = draft_indexer_host_pool
         logger.info(
-            "HiCache draft KV registered: %s (host %d slots)",
+            "HiCache draft KV registered: %s (host %d slots, dsa_indexer=%s)",
             type(draft_device_pool).__name__,
             draft_host_pool.size,
+            draft_indexer_host_pool is not None,
         )
 
         # If storage is already attached, wire up the draft I/O path now.
@@ -854,6 +895,10 @@ class HiCacheController:
             self.storage_backend.register_mem_host_pool_v2(
                 self.mem_pool_host_draft, PoolName.DRAFT
             )
+            if self.mem_pool_host_draft_indexer is not None:
+                self.storage_backend.register_mem_host_pool_v2(
+                    self.mem_pool_host_draft_indexer, PoolName.DRAFT_INDEXER
+                )
             self.draft_page_get_func = self._draft_page_get_v2
             self.draft_page_set_func = self._draft_page_set_v2
             return
@@ -1123,49 +1168,60 @@ class HiCacheController:
 
     def _draft_page_set_v2(self, hash_values, host_indices) -> None:
         self.storage_backend.batch_set_v2(
-            [
-                PoolTransfer(
-                    name=PoolName.DRAFT,
-                    host_indices=host_indices,
-                    keys=list(hash_values),
-                )
-            ]
+            self._draft_pool_transfers(hash_values, host_indices)
         )
 
     def _draft_page_get_v2(self, hash_values, host_indices) -> None:
         self.storage_backend.batch_get_v2(
-            [
+            self._draft_pool_transfers(hash_values, host_indices)
+        )
+
+    def _draft_pool_transfers(self, hash_values, host_indices) -> List[PoolTransfer]:
+        transfers = [
+            PoolTransfer(
+                name=PoolName.DRAFT,
+                host_indices=host_indices,
+                keys=list(hash_values),
+            )
+        ]
+        if self.mem_pool_host_draft_indexer is not None:
+            transfers.append(
                 PoolTransfer(
-                    name=PoolName.DRAFT,
+                    name=PoolName.DRAFT_INDEXER,
                     host_indices=host_indices,
                     keys=list(hash_values),
                 )
-            ]
-        )
+            )
+        return transfers
+
+    def _draft_generic_host_pools(self):
+        yield PoolName.DRAFT, self.mem_pool_host_draft
+        if self.mem_pool_host_draft_indexer is not None:
+            yield PoolName.DRAFT_INDEXER, self.mem_pool_host_draft_indexer
 
     def _draft_page_set_generic(self, hash_values, host_indices) -> None:
         # `{hash}.draft` mirrors HiCacheStorage._get_component_key's
         # `{key}.{pool_name}` convention so target/draft pages never collide.
-        draft_keys = [f"{h}.{PoolName.DRAFT}" for h in hash_values]
-        draft_data = [
-            self.mem_pool_host_draft.get_data_page(host_indices[i * self.page_size])
-            for i in range(len(draft_keys))
-        ]
-        self.storage_backend.batch_set(draft_keys, draft_data)
+        for pool_name, host_pool in self._draft_generic_host_pools():
+            draft_keys = [f"{h}.{pool_name}" for h in hash_values]
+            draft_data = [
+                host_pool.get_data_page(host_indices[i * self.page_size])
+                for i in range(len(draft_keys))
+            ]
+            self.storage_backend.batch_set(draft_keys, draft_data)
 
     def _draft_page_get_generic(self, hash_values, host_indices) -> None:
-        draft_keys = [f"{h}.{PoolName.DRAFT}" for h in hash_values]
-        draft_dummy = [
-            self.mem_pool_host_draft.get_dummy_flat_data_page() for _ in draft_keys
-        ]
-        draft_pages = self.storage_backend.batch_get(draft_keys, draft_dummy)
-        if draft_pages is None:
-            return
-        for i, p in enumerate(draft_pages):
-            if p is not None:
-                self.mem_pool_host_draft.set_from_flat_data_page(
-                    host_indices[i * self.page_size], p
-                )
+        for pool_name, host_pool in self._draft_generic_host_pools():
+            draft_keys = [f"{h}.{pool_name}" for h in hash_values]
+            draft_dummy = [host_pool.get_dummy_flat_data_page() for _ in draft_keys]
+            draft_pages = self.storage_backend.batch_get(draft_keys, draft_dummy)
+            if draft_pages is None:
+                continue
+            for i, p in enumerate(draft_pages):
+                if p is not None:
+                    host_pool.set_from_flat_data_page(
+                        host_indices[i * self.page_size], p
+                    )
 
     # Backup batch by batch
     def _page_backup(self, operation):
