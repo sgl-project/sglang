@@ -1160,7 +1160,7 @@ class ModelConfig:
             # MXFP4 support can, and probably shoud, be added in a separate PR.
             layer_algos = {
                 str(info.get("quant_algo", "")).upper()
-                for info in json_quant_configs.get("quantized_layers", {}).values()
+                for info in (json_quant_configs.get("quantized_layers") or {}).values()
             }
             if is_nemotron_h or (layer_algos & {"MXFP8", "NVFP4"}):
                 return {"quant_method": "modelopt_mixed", "quant_algo": quant_algo}

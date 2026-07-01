@@ -690,6 +690,23 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
 
         self.assertEqual(result["quant_method"], "w4afp8")
 
+    def test_mixed_precision_null_quantized_layers_keeps_w4afp8_route(self):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.hf_config = MagicMock()
+        model_config.hf_config.model_type = "qwen3"
+        model_config.hf_config.architectures = ["Qwen3MoeForCausalLM"]
+
+        result = model_config._parse_modelopt_quant_config(
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": None,
+                }
+            }
+        )
+
+        self.assertEqual(result["quant_method"], "w4afp8")
+
     def test_nemotron_mixed_precision_uses_modelopt_mixed(self):
         model_config = ModelConfig.__new__(ModelConfig)
         model_config.hf_config = MagicMock()
