@@ -213,6 +213,21 @@ def _run_triton_sparse_decode(
     softmax_scale: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run the tiled Triton sparse decode kernel on one paged KV cache."""
+    from sglang.srt.layers.attention.sm120_mhead_kernel import (
+        run_mhead_sparse_decode,
+    )
+
+    return run_mhead_sparse_decode(q, k_cache, indices, topk_length, softmax_scale)
+
+
+def _run_triton_sparse_decode_legacy(
+    q: torch.Tensor,  # [B, 1, H, D] bf16
+    k_cache: torch.Tensor,  # [num_pages, page_size, 1, bpt] float8
+    indices: torch.Tensor,  # [B, ...] int32
+    topk_length: Optional[torch.Tensor],
+    softmax_scale: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Original per-head tiled Triton sparse decode kernel (kept for reference)."""
     B, _, H, D = q.shape
     num_pages = k_cache.shape[0]
     page_size = k_cache.shape[1]
