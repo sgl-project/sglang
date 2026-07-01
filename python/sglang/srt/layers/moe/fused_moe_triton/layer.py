@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
+import time
 from enum import Enum
 from functools import cached_property
 from typing import List, Optional, Tuple
@@ -79,6 +80,86 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_moe_weight_load_profile_log_count = 0
+
+
+def _tensor_profile_summary(name: str, tensor: torch.Tensor) -> str:
+    return (
+        f"{name}_shape={tuple(tensor.shape)} "
+        f"{name}_stride={tuple(tensor.stride())} "
+        f"{name}_contig={tensor.is_contiguous()} "
+        f"{name}_device={tensor.device} "
+        f"{name}_dtype={tensor.dtype} "
+        f"{name}_offset={tensor.storage_offset()}"
+    )
+
+
+def _maybe_log_moe_weight_load_profile(
+    op: str,
+    elapsed_s: float,
+    label: str,
+    src: torch.Tensor,
+    dst: Optional[torch.Tensor] = None,
+) -> None:
+    global _moe_weight_load_profile_log_count
+    if not envs.SGLANG_MOE_WEIGHT_LOAD_PROFILE.get():
+        return
+    if elapsed_s < envs.SGLANG_MOE_WEIGHT_LOAD_PROFILE_THRESHOLD_S.get():
+        return
+    if (
+        _moe_weight_load_profile_log_count
+        >= envs.SGLANG_MOE_WEIGHT_LOAD_PROFILE_MAX_LOGS.get()
+    ):
+        return
+
+    _moe_weight_load_profile_log_count += 1
+    current_device = torch.cuda.current_device() if torch.cuda.is_available() else "n/a"
+    fields = [
+        "SGLANG_MOE_WEIGHT_LOAD_PROFILE",
+        f"op={op}",
+        f"elapsed_s={elapsed_s:.3f}",
+        f"cuda_device={current_device}",
+        label,
+        _tensor_profile_summary("src", src),
+    ]
+    if dst is not None:
+        fields.append(_tensor_profile_summary("dst", dst))
+    print(" ".join(fields), flush=True)
+
+
+def _profiled_moe_weight_copy(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    label: str,
+) -> None:
+    if not envs.SGLANG_MOE_WEIGHT_LOAD_PROFILE.get():
+        dst.copy_(src)
+        return
+
+    start = time.perf_counter()
+    dst.copy_(src)
+    elapsed_s = time.perf_counter() - start
+    _maybe_log_moe_weight_load_profile("copy", elapsed_s, label, src, dst)
+
+
+def _maybe_make_loaded_weight_contiguous(loaded_weight: torch.Tensor) -> torch.Tensor:
+    if (
+        envs.SGLANG_MOE_CONTIGUOUS_WEIGHT_LOAD.get()
+        and loaded_weight.device.type == "cpu"
+        and not loaded_weight.is_contiguous()
+    ):
+        print_info_once(
+            "SGLANG_MOE_CONTIGUOUS_WEIGHT_LOAD=1: materializing non-contiguous "
+            "CPU MoE weights before copy_."
+        )
+        start = time.perf_counter()
+        contiguous_weight = loaded_weight.contiguous()
+        elapsed_s = time.perf_counter() - start
+        _maybe_log_moe_weight_load_profile(
+            "contiguous", elapsed_s, "kind=loaded_weight", loaded_weight
+        )
+        return contiguous_weight
+    return loaded_weight
 
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
@@ -500,7 +581,12 @@ class FusedMoE(torch.nn.Module):
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
-        expert_data.copy_(loaded_weight)
+        loaded_weight = _maybe_make_loaded_weight_contiguous(loaded_weight)
+        _profiled_moe_weight_copy(
+            expert_data,
+            loaded_weight,
+            f"kind=w13 shard_id={shard_id} shard_dim={shard_dim} tp_rank={tp_rank}",
+        )
 
     def _load_w2(
         self,
@@ -570,7 +656,12 @@ class FusedMoE(torch.nn.Module):
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
-        expert_data.copy_(loaded_weight)
+        loaded_weight = _maybe_make_loaded_weight_contiguous(loaded_weight)
+        _profiled_moe_weight_copy(
+            expert_data,
+            loaded_weight,
+            f"kind=w2 shard_id={shard_id} shard_dim={shard_dim} tp_rank={tp_rank}",
+        )
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
