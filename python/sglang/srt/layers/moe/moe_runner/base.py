@@ -33,6 +33,18 @@ _moe_output_buf: contextvars.ContextVar[Optional[torch.Tensor]] = (
 )
 
 
+@dataclass
+class MoeOutputCopyAddState:
+    shared_output: torch.Tensor
+    ready_event: Optional[object]
+    consumed: bool = False
+
+
+_moe_output_copy_add_state: contextvars.ContextVar[Optional[MoeOutputCopyAddState]] = (
+    contextvars.ContextVar("moe_output_copy_add_state", default=None)
+)
+
+
 @contextmanager
 def moe_output_buffer_ctx(buf: torch.Tensor) -> Generator[None, None, None]:
     token = _moe_output_buf.set(buf)
@@ -40,6 +52,50 @@ def moe_output_buffer_ctx(buf: torch.Tensor) -> Generator[None, None, None]:
         yield
     finally:
         _moe_output_buf.reset(token)
+
+
+@contextmanager
+def moe_output_copy_add_ctx(
+    shared_output: torch.Tensor,
+    ready_event: Optional[torch.cuda.Event] = None,
+) -> Generator[MoeOutputCopyAddState, None, None]:
+    state = MoeOutputCopyAddState(
+        shared_output=shared_output,
+        ready_event=ready_event,
+    )
+    token = _moe_output_copy_add_state.set(state)
+    try:
+        yield state
+    finally:
+        _moe_output_copy_add_state.reset(token)
+
+
+def maybe_moe_output_copy_add(
+    routed: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    state = _moe_output_copy_add_state.get()
+    if (
+        state is not None
+        and state.shared_output.shape == routed.shape
+        and state.shared_output.dtype == routed.dtype
+        and state.shared_output.device == routed.device
+        and out.shape == routed.shape
+        and out.dtype == routed.dtype
+        and out.device == routed.device
+    ):
+        if state.ready_event is not None:
+            torch.cuda.current_stream().wait_event(state.ready_event)
+        # `out=` is the copy destination: this replaces `out.copy_(routed)`
+        # plus a later `routed += shared` with one TensorIterator add store.
+        torch.add(routed, state.shared_output, out=out)
+        state.consumed = True
+        return out
+
+    if routed is out:
+        return out
+    out.copy_(routed)
+    return out
 
 
 @dataclass
