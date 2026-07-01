@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
@@ -199,6 +200,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             and self.topk == 1
         )
+        # GLM-5.2 MTP IndexShare: anchor the reused indexer top-k on the
+        # draft-extend step (last verified token) instead of draft-decode step 0.
+        self.dsa_index_topk = getattr(
+            self.draft_runner.model_config.hf_config, "index_topk", None
+        )
+        self.seed_topk_from_extend = (
+            self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+        )
+        # Eager draft-extend seed buffer (graph paths use their own static ones).
+        self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
@@ -612,7 +623,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         scores = None
         if self.index_share_for_mtp_iteration:
             forward_batch.reuse_mtp_topk_indices = True
-            spec_info.mtp_topk_indices = None
+            # Keep the draft-extend seed so step 0 reuses it; else recompute it.
+            if not (
+                self.seed_topk_from_extend and spec_info.mtp_topk_indices is not None
+            ):
+                spec_info.mtp_topk_indices = None
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -776,6 +791,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
 
+        # Seed the first draft-decode loop from each request's last prefill
+        # position. Gather last-per-req before the copy (prefill can be long).
+        # Skipped under context-parallel prefill (token layout wouldn't match).
+        seed_from_extend = (
+            self.seed_topk_from_extend
+            and not forward_batch.forward_mode.is_idle()
+            and not dsa_use_prefill_cp(forward_batch)
+        )
+        if seed_from_extend:
+            bs = forward_batch.batch_size
+            forward_batch.spec_info.mtp_seed_topk_capture = self._extend_topk_buf(bs)
+            forward_batch.spec_info.mtp_seed_topk_select = (
+                torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+            ).long()
+
         canary_ctx = (
             context_tuple(
                 c.with_ops_outside_graph(
@@ -791,6 +821,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
+
+        prefill_seed_topk = None
+        if seed_from_extend:
+            prefill_seed_topk = self.dsa_extend_topk_buf[:bs].clone()
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = self.server_args.speculative_use_rejection_sampling
@@ -811,7 +845,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             bonus_tokens=next_token_ids,
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
+            mtp_topk_indices=prefill_seed_topk,
         )
+
+    def _extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
+        """Lazily-grown int32 [num_tokens, index_topk] eager draft-extend seed buffer."""
+        buf = self.dsa_extend_topk_buf
+        if buf is None or buf.shape[0] < num_tokens:
+            buf = torch.full(
+                (num_tokens, self.dsa_index_topk),
+                -1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.dsa_extend_topk_buf = buf
+        return buf[:num_tokens]
 
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
@@ -864,6 +912,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
 
+        # Eager path publishes the indexer top-k into a worker buffer (the graph
+        # path uses the runner's static buffer). Gathered at select_index below.
+        if self.seed_topk_from_extend and not can_cuda_graph:
+            forward_batch.spec_info.mtp_seed_topk_capture = self._extend_topk_buf(
+                forward_batch.input_ids.shape[0]
+            )
+
         canary_ctx = (
             context_tuple(
                 c.with_ops_outside_graph(
@@ -893,6 +948,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             draft_logits_output.next_token_logits,
             f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
         )
+
+        # Gather the per-request last-position indexer top-k as the next loop's
+        # seed (select_index already picks the last accepted position per req).
+        seed_topk_indices = None
+        if self.seed_topk_from_extend:
+            if can_cuda_graph:
+                extend_topk_buf = (
+                    self.cuda_graph_runner_for_draft_extend.buffers.mtp_seed_topk_capture
+                )
+            else:
+                extend_topk_buf = forward_batch.spec_info.mtp_seed_topk_capture
+            # Fancy indexing returns a fresh tensor (detached from the buffer).
+            seed_topk_indices = extend_topk_buf[select_index]
 
         # Reorganize the spec info for the next batch
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
@@ -943,6 +1011,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         if self.server_args.speculative_use_rejection_sampling:
             next_draft_input.draft_probs = ret_draft_probs
+        if self.seed_topk_from_extend:
+            next_draft_input.mtp_topk_indices = seed_topk_indices
 
 
 class EAGLEWorkerV2(BaseSpecWorker):

@@ -65,6 +65,8 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     hidden_states: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
+    # MTP IndexShare: draft-extend indexer top-k seed reused by every step.
+    mtp_seed_topk: Optional[torch.Tensor] = None
 
 
 class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
@@ -224,6 +226,19 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64, device="cpu"
         )
 
+        # MTP IndexShare: static seed buffer (one indexer-topk row per request)
+        # reused by every captured draft-decode step.
+        if self.eagle_worker.seed_topk_from_extend:
+            # Init to 0 (a valid index): capture reads this before any real seed
+            # exists, and all-(-1) "attend to nothing" rows could NaN at capture.
+            mtp_seed_topk = torch.zeros(
+                (self.max_bs, self.eagle_worker.dsa_index_topk),
+                dtype=torch.int32,
+                device=model_runner.device,
+            )
+        else:
+            mtp_seed_topk = None
+
         self.buffers = EagleDraftInputBuffers(
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
@@ -241,6 +256,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             hidden_states=hidden_states,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+            mtp_seed_topk=mtp_seed_topk,
         )
         self.buffers.share_buffers()
 
@@ -368,6 +384,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             hidden_states=hidden_states,
             capture_hidden_mode=capture_mode,
         )
+        # MTP IndexShare: capture the reuse path (step 0 reads the seed buffer,
+        # not the indexer); execute() fills the buffer before replay.
+        if self.buffers.mtp_seed_topk is not None:
+            spec_info.mtp_topk_indices = self.buffers.mtp_seed_topk[:num_seqs]
 
         sampling_info = SamplingBatchInfo(
             temperatures=self.temperatures[:num_seqs],
@@ -493,6 +513,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 buffers.draft_probs.zero_()
             if buffers.hidden_states is not None:
                 buffers.hidden_states.zero_()
+            if buffers.mtp_seed_topk is not None:
+                # Padded rows use index 0 (valid), not stale seed indices.
+                buffers.mtp_seed_topk.zero_()
             buffers.req_pool_indices.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
@@ -552,6 +575,14 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             and forward_batch.spec_info.hidden_states is not None
         ):
             buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+        # MTP IndexShare: copy the carried seed into the static buffer the graph
+        # reuses; a missing seed (e.g. first draft) falls back to index 0.
+        if buffers.mtp_seed_topk is not None:
+            seed = forward_batch.spec_info.mtp_topk_indices
+            if seed is not None:
+                buffers.mtp_seed_topk[:raw_bs].copy_(seed)
+            else:
+                buffers.mtp_seed_topk[:raw_bs].zero_()
         # Only rejection sampling reads temperatures (renorm_draft_probs); skip
         # the copy otherwise to keep the non-RS path free of extra work.
         if (

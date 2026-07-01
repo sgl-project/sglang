@@ -113,6 +113,9 @@ class StandaloneDraftWorker(EagleDraftWorker):
             )
             and self.topk == 1
         )
+        self.dsa_index_topk = None
+        self.seed_topk_from_extend = False
+        self.dsa_extend_topk_buf = None
 
     def alloc_memory_pool(
         self,
