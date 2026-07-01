@@ -7,6 +7,7 @@ context length, GGUF detection, etc.) that don't require actual model files.
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from transformers import PretrainedConfig
 
@@ -589,6 +590,73 @@ class TestPatchNemotronHPattern(unittest.TestCase):
             self.assertEqual(result, ["mamba", "moe", "attention"])
         except ImportError:
             self.skipTest("NemotronHConfig not available in this transformers version")
+
+
+# ---------------------------------------------------------------------------
+# HfModelConfigParser
+# ---------------------------------------------------------------------------
+
+
+class TestHfModelConfigParser(unittest.TestCase):
+    def test_glm_moe_dsa_restores_raw_config_after_registry_reload(self):
+        from sglang.srt.utils.hf_transformers import config as hf_config_module
+
+        raw_config = {
+            "architectures": ["GlmMoeDsaForCausalLM"],
+            "head_dim": 192,
+            "index_head_dim": 128,
+            "kv_lora_rank": 512,
+            "model_type": "glm_moe_dsa",
+            "q_lora_rank": 2048,
+            "qk_head_dim": 256,
+            "qk_nope_head_dim": 192,
+            "qk_rope_head_dim": 64,
+            "v_head_dim": 256,
+        }
+
+        def make_clobbered_config():
+            cfg = PretrainedConfig()
+            cfg.architectures = ["GlmMoeDsaForCausalLM"]
+            cfg.model_type = "glm_moe_dsa"
+            cfg.qk_head_dim = 256
+            cfg.qk_nope_head_dim = 192
+            cfg.qk_rope_head_dim = 192
+            cfg.v_head_dim = 192
+            return cfg
+
+        initial_config = make_clobbered_config()
+        registry_config = make_clobbered_config()
+
+        class RegistryConfig:
+            @staticmethod
+            def from_pretrained(model, revision=None):
+                return registry_config
+
+        with (
+            patch.object(
+                hf_config_module.AutoConfig,
+                "from_pretrained",
+                return_value=initial_config,
+            ),
+            patch(
+                "transformers.PretrainedConfig.get_config_dict",
+                return_value=(raw_config, {}),
+            ),
+            patch.dict(
+                hf_config_module._CONFIG_REGISTRY,
+                {"glm_moe_dsa": RegistryConfig},
+            ),
+        ):
+            config = hf_config_module.HfModelConfigParser().parse(
+                "fake-model", trust_remote_code=False
+            )
+
+        self.assertIs(config, registry_config)
+        self.assertEqual(config.qk_rope_head_dim, 64)
+        self.assertEqual(config.qk_head_dim, 256)
+        self.assertEqual(config.v_head_dim, 256)
+        self.assertEqual(config.kv_lora_rank, 512)
+        self.assertEqual(config.q_lora_rank, 2048)
 
 
 if __name__ == "__main__":
