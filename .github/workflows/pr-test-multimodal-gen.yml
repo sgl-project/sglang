@@ -144,7 +144,7 @@ jobs:
         with:
           artifact-suffix: ${{ matrix.part }}
 
-  multimodal-gen-test-1-gpu-5090:
+  multimodal-gen-test-1-5090:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
