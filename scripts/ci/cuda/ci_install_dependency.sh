@@ -110,6 +110,14 @@ detect_host() {
 }
 
 kill_existing_processes() {
+    if [ "$IS_BLACKWELL" = "1" ] \
+        && [ "${GITHUB_ACTIONS:-}" = "true" ] \
+        && [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+        echo "ERROR: CUDA_VISIBLE_DEVICES must be set for Blackwell CI jobs."
+        echo "Refusing to fall back to all visible GPUs on a shared self-hosted runner."
+        exit 1
+    fi
+
     python3 "${REPO_ROOT}/python/sglang/cli/killall.py"
     KILLALL_EXIT=$?
     echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
@@ -192,6 +200,114 @@ setup_pip_toolchain() {
     PIP_UNINSTALL_SUFFIX=""
 
     $PIP_UNINSTALL_CMD sgl-kernel sglang-kernel sglang sgl-fa4 flash-attn-4 $PIP_UNINSTALL_SUFFIX || true
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+remove_stale_cuda12_nvidia_wheels() {
+    REMOVED_STALE_CUDA12_NVIDIA_WHEELS=0
+
+    if [ "$CU_MAJOR" != "13" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    local stale_cuda12_pkgs=(
+        nvidia-cublas-cu12
+        nvidia-cuda-cupti-cu12
+        nvidia-cuda-nvrtc-cu12
+        nvidia-cuda-runtime-cu12
+        nvidia-cudnn-cu12
+        nvidia-cufft-cu12
+        nvidia-cufile-cu12
+        nvidia-curand-cu12
+        nvidia-cusolver-cu12
+        nvidia-cusparse-cu12
+        nvidia-cusparselt-cu12
+        nvidia-nccl-cu12
+        nvidia-nvjitlink-cu12
+        nvidia-nvshmem-cu12
+        nvidia-nvtx-cu12
+    )
+    local installed_pkgs=()
+
+    for pkg in "${stale_cuda12_pkgs[@]}"; do
+        if python3 -m pip show "$pkg" >/dev/null 2>&1; then
+            installed_pkgs+=("$pkg")
+        fi
+    done
+
+    if [ ${#installed_pkgs[@]} -eq 0 ]; then
+        echo "No stale CUDA 12 NVIDIA wheels found for ${CU_VERSION} job"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    echo "Removing stale CUDA 12 NVIDIA wheels from ${CU_VERSION} job: ${installed_pkgs[*]}"
+    $PIP_UNINSTALL_CMD "${installed_pkgs[@]}" $PIP_UNINSTALL_SUFFIX
+    REMOVED_STALE_CUDA12_NVIDIA_WHEELS=1
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+restore_cuda13_nvidia_wheels() {
+    if [ "$CU_MAJOR" != "13" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    local restore_reasons=()
+    if [ "${REMOVED_STALE_CUDA12_NVIDIA_WHEELS:-0}" = "1" ]; then
+        restore_reasons+=("CUDA 12 cleanup")
+    fi
+
+    local site_packages
+    site_packages=$(python3 -c "import site; print(site.getsitepackages()[0])")
+    if python3 -m pip show nvidia-cudnn-cu13 >/dev/null 2>&1 \
+        && ! find "$site_packages" -path "*/nvidia/*/lib/libcudnn.so.9*" -print -quit | grep -q .; then
+        restore_reasons+=("missing libcudnn.so.9")
+    fi
+
+    if [ ${#restore_reasons[@]} -eq 0 ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    local cuda13_pkgs=(
+        nvidia-cublas
+        nvidia-cuda-cupti
+        nvidia-cuda-nvrtc
+        nvidia-cuda-runtime
+        nvidia-cudnn-cu13
+        nvidia-cufft
+        nvidia-cufile
+        nvidia-curand
+        nvidia-cusolver
+        nvidia-cusparse
+        nvidia-cusparselt-cu13
+        nvidia-nccl-cu13
+        nvidia-nvjitlink
+        nvidia-nvshmem-cu13
+        nvidia-nvtx
+    )
+    local installed_specs=()
+    local version
+
+    for pkg in "${cuda13_pkgs[@]}"; do
+        version=$(python3 -m pip show "$pkg" 2>/dev/null | awk -F': ' '/^Version:/ {print $2; exit}' || true)
+        if [ -n "$version" ]; then
+            installed_specs+=("${pkg}==${version}")
+        fi
+    done
+
+    if [ ${#installed_specs[@]} -eq 0 ]; then
+        echo "No installed CUDA 13 NVIDIA wheels found to restore after CUDA 12 cleanup"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    echo "Restoring CUDA 13 NVIDIA wheel files (${restore_reasons[*]}): ${installed_specs[*]}"
+    $PIP_CMD install --force-reinstall --no-deps "${installed_specs[@]}" $PIP_INSTALL_SUFFIX
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -516,10 +632,14 @@ setup_ld_library_path() {
     # NVIDIA pip packages and torch ship .so files under site-packages that are
     # not on the default LD_LIBRARY_PATH.
     SITE_PACKAGES=$(python3 -c "import site, sys; print(site.getsitepackages()[0])")
-    NVIDIA_LIBS=$(find "$SITE_PACKAGES" -path "*/nvidia/*/lib" -type d 2>/dev/null | tr '\n' ':')
     TORCH_LIB="$SITE_PACKAGES/torch/lib"
-    VENV_LD="${NVIDIA_LIBS}${TORCH_LIB}"
-    export LD_LIBRARY_PATH="${VENV_LD}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    mapfile -t CI_LD_DIRS < <(
+        find "$SITE_PACKAGES" -path "*/nvidia/*/lib" -type d 2>/dev/null | sort
+        [ -d "$TORCH_LIB" ] && printf '%s\n' "$TORCH_LIB"
+        [ -n "${LD_LIBRARY_PATH:-}" ] && tr ':' '\n' <<< "$LD_LIBRARY_PATH"
+    )
+    LD_LIBRARY_PATH=$(printf '%s\n' "${CI_LD_DIRS[@]}" | awk 'NF && !seen[$0]++ { printf "%s%s", sep, $0; sep=":" }')
+    export LD_LIBRARY_PATH
 
     if [ "$USE_VENV" = "1" ] && [ -n "$UV_VENV" ]; then
         echo "export LD_LIBRARY_PATH=\"$LD_LIBRARY_PATH\"" >> "$UV_VENV/env.sh"
@@ -552,14 +672,18 @@ main() {
     install_apt_packages
     clean_site_packages
     setup_pip_toolchain
+    remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer
     install_sglang
+    restore_cuda13_nvidia_wheels
+    setup_ld_library_path
     install_sglang_kernel
     install_sglang_router
     download_flashinfer_cache
     force_reinstall_cutlass_dsl_libs_cu13
     stabilize_flashinfer_jit_paths
     install_extra_deps
+    setup_ld_library_path
     install_test_tools
     prepare_runner
     setup_ld_library_path
