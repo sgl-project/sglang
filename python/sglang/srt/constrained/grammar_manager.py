@@ -139,16 +139,20 @@ class GrammarManager:
 
         return add_to_grammar_queue
 
-    def get_ready_grammar_requests(self) -> List[Req]:
+    def poll_ready_grammar_request_rids(self) -> List[List[str]]:
         """
-        Move requests whose grammar objects are ready from grammar_queue to waiting_queue.
+        Poll grammar_queue and return [ready_rids, failed_rids].
 
-        Rank i returns two sets ready_reqs_i, failed_reqs_i
-        ready_reqs_all = all_gather(ready_reqs_i)
-        failed_reqs_all = all_gather(failed_reqs_i)
+        Each rank first computes local ready/failed grammar queue indices.
+        These indices are synchronized within the TP/DP grammar sync group:
+        ready_idxs_all = all_gather(ready_idxs_i)
+        failed_idxs_all = all_gather(failed_idxs_i)
 
-        ready_reqs = intersect(ready_reqs_all)
-        failed_reqs = union(failed_reqs_all)
+        synced_ready_idxs = intersect(ready_idxs_all)
+        synced_failed_idxs = union(failed_idxs_all)
+
+        The synchronized indices are converted to request RIDs before returning,
+        so PP consensus can merge grammar readiness by stable request identity.
         """
         assert self.grammar_backend
         ready_req_idxs: set[int] = set()
@@ -198,46 +202,75 @@ class GrammarManager:
             synced_ready_req_idxs = set.intersection(*[x[0] for x in all_gather_output])
             synced_failed_req_idxs = set.union(*[x[1] for x in all_gather_output])
 
-        # Return ready requests
+        ready_rids = [
+            self.grammar_queue[i].rid
+            for i in range(len(self.grammar_queue))
+            if i in synced_ready_req_idxs
+        ]
+        failed_rids = [
+            self.grammar_queue[i].rid
+            for i in range(len(self.grammar_queue))
+            if i in synced_failed_req_idxs
+        ]
+        return [ready_rids, failed_rids]
+
+    def pop_ready_grammar_requests_by_rids(
+        self, ready_rids: List[str], failed_rids: List[str]
+    ) -> List[Req]:
+        """Move consensus-ready grammar requests out of grammar_queue."""
+        assert self.grammar_backend
+        ready_rid_set = set(ready_rids)
+        failed_rid_set = set(failed_rids)
+        # A timeout/failure from any rank should win over readiness.
+        ready_rid_set -= failed_rid_set
+
         return_reqs: List[Req] = []
-        for i in synced_ready_req_idxs:
-            req = self.grammar_queue[i]
+        popped_req_idxs: set[int] = set()
+        for i, req in enumerate(self.grammar_queue):
+            is_failed = req.rid in failed_rid_set
+            is_ready = req.rid in ready_rid_set
+            if not is_failed and not is_ready:
+                continue
+
+            popped_req_idxs.add(i)
             return_reqs.append(req)
             if req.finished() or req.grammar is None:  # It is aborted by AbortReq
                 continue
 
-            assert isinstance(req.grammar, futures.Future) and req.grammar_key
-            try:
-                req.grammar = req.grammar.result()
-            except Exception as e:
-                logger.error(
-                    f"Grammar compilation raised an exception: {e}, "
-                    f"grammar_key={req.grammar_key}"
+            assert req.grammar_key
+            assert isinstance(req.grammar, futures.Future), f"{req=}"
+            if is_failed:
+                req.grammar.cancel()
+                self.grammar_backend.set_cache(
+                    req.grammar_key,
+                    InvalidGrammarObject("Grammar preprocessing timed out"),
                 )
-                req.grammar = InvalidGrammarObject(f"Grammar compilation failed: {e}")
-            self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-            self._apply_request_reasoning_budget(req)
-            if isinstance(req.grammar, InvalidGrammarObject):
-                error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
+                error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"
                 req.set_finish_with_abort(error_msg)
-
-        # Return failed requests
-        for i in synced_failed_req_idxs:
-            req = self.grammar_queue[i]
-            return_reqs.append(req)
-
-            assert isinstance(req.grammar, futures.Future) and req.grammar_key
-            req.grammar.cancel()
-            self.grammar_backend.set_cache(
-                req.grammar_key, InvalidGrammarObject("Grammar preprocessing timed out")
-            )
-            error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"
-            req.set_finish_with_abort(error_msg)
+            else:
+                try:
+                    req.grammar = req.grammar.result()
+                except Exception as e:
+                    logger.error(
+                        f"Grammar compilation raised an exception: {e}, "
+                        f"grammar_key={req.grammar_key}"
+                    )
+                    req.grammar = InvalidGrammarObject(
+                        f"Grammar compilation failed: {e}"
+                    )
+                self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+                self._apply_request_reasoning_budget(req)
+                if isinstance(req.grammar, InvalidGrammarObject):
+                    error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
+                    req.set_finish_with_abort(error_msg)
 
         # Remove finished requests from grammar_queue
         self.grammar_queue = [
-            req
-            for i, req in enumerate(self.grammar_queue)
-            if i not in synced_ready_req_idxs and i not in synced_failed_req_idxs
+            req for i, req in enumerate(self.grammar_queue) if i not in popped_req_idxs
         ]
         return return_reqs
+
+    def get_ready_grammar_requests(self) -> List[Req]:
+        """Move requests whose grammar objects are ready from grammar_queue."""
+        ready_rids, failed_rids = self.poll_ready_grammar_request_rids()
+        return self.pop_ready_grammar_requests_by_rids(ready_rids, failed_rids)
