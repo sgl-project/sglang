@@ -1,6 +1,6 @@
 import logging
 from http import HTTPStatus
-from typing import Any, Dict, Union
+from typing import Any, Dict, List, Union
 
 from fastapi import HTTPException, Request
 from pydantic import ValidationError
