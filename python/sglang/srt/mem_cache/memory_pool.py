@@ -2359,21 +2359,15 @@ class HybridLinearKVPool(KVCache):
         self.mamba_pool = mamba_pool
         self.use_mla = use_mla
         if not use_mla:
-            TokenToKVPoolClass = MHATokenToKVPool
-
-            if current_platform.is_out_of_tree():
-                TokenToKVPoolClass = current_platform.get_mha_kv_pool_cls()
-            elif _is_npu:
-                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-                    NPUMHATokenToKVPool,
-                )
-
-                TokenToKVPoolClass = NPUMHATokenToKVPool
-            elif full_kv_pool_class is not None:
-                # Caller-selected MHA layout variant (e.g. the page-major
-                # PageMajorMHATokenToKVPool). NPU / out-of-tree classes keep
-                # priority since they don't understand alternate layouts.
-                TokenToKVPoolClass = full_kv_pool_class
+            # The platform seam (in-tree NPU / out-of-tree) keeps priority over
+            # the caller-selected MHA layout variant (e.g. the page-major
+            # PageMajorMHATokenToKVPool) since those classes don't understand
+            # alternate layouts.
+            TokenToKVPoolClass = (
+                current_platform.get_mha_kv_pool_cls()
+                or full_kv_pool_class
+                or MHATokenToKVPool
+            )
 
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,
@@ -2387,16 +2381,9 @@ class HybridLinearKVPool(KVCache):
                 enable_kv_cache_copy=enable_kv_cache_copy,
             )
         else:
-            TokenToKVPoolClass = MLATokenToKVPool
-
-            if current_platform.is_out_of_tree():
-                TokenToKVPoolClass = current_platform.get_mla_kv_pool_cls()
-            elif _is_npu:
-                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-                    NPUMLATokenToKVPool,
-                )
-
-                TokenToKVPoolClass = NPUMLATokenToKVPool
+            TokenToKVPoolClass = (
+                current_platform.get_mla_kv_pool_cls() or MLATokenToKVPool
+            )
 
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,

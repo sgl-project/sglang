@@ -131,3 +131,8 @@ class CpuSRTPlatform(CpuDeviceMixin, SRTPlatform):
 
     def is_pin_memory_available(self) -> bool:
         return False
+
+    def get_graph_runner_cls(self) -> type:
+        from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
+
+        return CPUGraphRunner

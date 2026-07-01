@@ -111,7 +111,6 @@ from sglang.srt.eplb.lplb_solver import (
     clear_global_lplb_solvers,
     set_global_lplb_solver,
 )
-from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
@@ -141,7 +140,6 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -2623,22 +2621,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
         )
 
-        if current_platform.is_out_of_tree():
-            GraphRunnerCls = current_platform.get_graph_runner_cls()
-            self.decode_cuda_graph_runner = GraphRunnerCls(self)
-        else:
-            from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
-                DecodeCudaGraphRunner,
-            )
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
 
-            graph_runners = defaultdict(
-                lambda: DecodeCudaGraphRunner,
-                {
-                    "cpu": CPUGraphRunner,
-                    "npu": NPUGraphRunner,
-                },
-            )
-            self.decode_cuda_graph_runner = graph_runners[self.device](self)
+        GraphRunnerCls = (
+            current_platform.get_graph_runner_cls() or DecodeCudaGraphRunner
+        )
+        self.decode_cuda_graph_runner = GraphRunnerCls(self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
