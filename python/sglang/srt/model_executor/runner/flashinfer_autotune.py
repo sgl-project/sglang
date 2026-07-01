@@ -11,14 +11,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""FlashInfer autotune mechanics shared by the eager/cuda-graph runners.
-
-Kept out of ``BaseRunner`` so the target-worker warmup path (``BaseRunner``) and
-the speculative draft graph-capture path (the per-algorithm draft runners) both
-reach the same code without the draft-specific one-shot / draft-worker policy
-living on ``BaseRunner``.
-"""
-
 from __future__ import annotations
 
 import contextlib
