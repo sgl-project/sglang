@@ -667,6 +667,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 shard_size = loaded_weight.shape[output_dim]
                 shard_offset = loaded_weight.shape[output_dim] * loaded_shard_id
 
+            pack_factor = getattr(param, "pack_factor", None)
+            if pack_factor is not None:
+                shard_size = shard_size // pack_factor
+                shard_offset = shard_offset // pack_factor
+
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = self.tp_rank * shard_size
 

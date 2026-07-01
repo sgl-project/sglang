@@ -6,10 +6,13 @@ from typing import TYPE_CHECKING
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
 
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    NPUW8A8Int8DynamicMoEMethod,
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUW8A8Int8MoEMethod,
 )
 from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.ascend import (
+    AscendQuantInfo,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
@@ -21,6 +24,13 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
+
 __all__ = ["NPUCompressedTensorsW8A8Int8DynamicMoE"]
 
 logger = logging.getLogger(__name__)
@@ -31,7 +41,8 @@ class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
     def __init__(self, weight_quant, input_quant):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
-        self.kernel = NPUW8A8Int8DynamicMoEMethod()
+        self.w13_kernel = NPUW8A8Int8MoEMethod()
+        self.w2_kernel = NPUW8A8Int8MoEMethod()
 
         self.static_input_scales = not self.input_quant.dynamic
         per_channel = (
@@ -118,37 +129,33 @@ class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self.kernel.process_weights_after_loading(layer)
+        self.w13_kernel.process_weights_after_loading(layer, "w13")
+        self.w2_kernel.process_weights_after_loading(layer, "w2")
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        layer.w13_kernel = self.w13_kernel
+        layer.w2_kernel = self.w2_kernel
+        moe_runner_config.layer = layer
         self.moe_runner_config = moe_runner_config
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = MoeRunnerBackend.ASCEND
+        self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply_weights(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
-        return self.kernel.apply(layer, dispatch_output)
-
-    def apply_without_routing_weights(
-        self,
-        layer,
-        hidden_states,
-        hidden_states_scale,
-        group_list_type,
-        group_list,
-        output_dtype,
-    ):
-        # NPU MoE bypasses MoeRunner: expose the kernel's existing
-        # apply_without_routing_weights directly through the scheme.
-        return self.kernel.apply_without_routing_weights(
-            layer,
-            hidden_states,
-            hidden_states_scale,
-            group_list_type,
-            group_list,
-            output_dtype,
+        backend = self.runner.runner_backend
+        quant_info = AscendQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w13_offset=layer.w13_weight_offset,
+            w2_offset=layer.w2_weight_offset,
         )
+        return self.runner.run(dispatch_output, quant_info)
