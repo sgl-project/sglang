@@ -3180,6 +3180,17 @@ class Scheduler(
 
         # Whether to run the profiler
         self.profiler_manager._profile_batch_predicate(batch)
+
+        profile_annotation = self.profiler_manager._build_profile_annotation(batch)
+        with profile_annotation:
+            return self._run_batch_inner(batch, pp_proxy_tensors)
+
+    def _run_batch_inner(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+        """Inner implementation of run_batch, optionally wrapped by profiler annotations."""
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
