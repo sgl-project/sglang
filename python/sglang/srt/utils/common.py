@@ -1326,6 +1326,9 @@ def kill_process_tree(
 CHILD_PROCESS_SHUTDOWN_TIMEOUT_ENV = "SGLANG_CHILD_PROCESS_SHUTDOWN_TIMEOUT"
 DEFAULT_CHILD_PROCESS_SHUTDOWN_TIMEOUT = 10.0
 
+SCHEDULER_SHUTDOWN_WAIT_TIMEOUT_ENV = "SGLANG_SCHEDULER_SHUTDOWN_TIMEOUT"
+DEFAULT_SCHEDULER_SHUTDOWN_WAIT_TIMEOUT = 15.0
+
 
 def get_child_process_shutdown_timeout() -> float:
     """Seconds to wait for children to clean up on SIGTERM before SIGKILL."""
@@ -1333,6 +1336,16 @@ def get_child_process_shutdown_timeout() -> float:
         os.environ.get(
             CHILD_PROCESS_SHUTDOWN_TIMEOUT_ENV,
             DEFAULT_CHILD_PROCESS_SHUTDOWN_TIMEOUT,
+        )
+    )
+
+
+def get_scheduler_shutdown_wait_timeout() -> float:
+    """Seconds to wait for schedulers to exit via ShutdownReq before SIGTERMing them."""
+    return float(
+        os.environ.get(
+            SCHEDULER_SHUTDOWN_WAIT_TIMEOUT_ENV,
+            DEFAULT_SCHEDULER_SHUTDOWN_WAIT_TIMEOUT,
         )
     )
 

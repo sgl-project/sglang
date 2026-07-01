@@ -119,6 +119,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_child_process_shutdown_timeout,
     get_or_create_event_loop,
+    get_scheduler_shutdown_wait_timeout,
     graceful_kill_process_tree,
     kill_process_tree,
 )
@@ -2683,21 +2684,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Stop watchdog first — otherwise child exits trigger false crash detection.
         if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()
-        # Ask schedulers to release resources in userspace and exit via ShutdownReq.
-        # Wait for them to exit before sending SIGTERM to remaining children,
-        # otherwise the SIGTERM would race with ShutdownReq processing.
-        self._dispatch_to_scheduler(ShutdownReq())
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and collect_scheduler_processes():
-            time.sleep(0.1)
+        with self.soft_watchdog.disable():
+            # Ask schedulers to release resources in userspace and exit via ShutdownReq.
+            # Wait for them to exit before sending SIGTERM to remaining children,
+            # otherwise the SIGTERM would race with ShutdownReq processing.
+            self._dispatch_to_scheduler(ShutdownReq())
+            deadline = time.monotonic() + get_scheduler_shutdown_wait_timeout()
+            while time.monotonic() < deadline and collect_scheduler_processes():
+                time.sleep(0.1)
 
-        # SIGTERM remaining children (detokenizer, hicache sidecar, etc.),
-        # then SIGKILL stragglers after timeout.
-        graceful_kill_process_tree(
-            os.getpid(),
-            include_parent=False,
-            timeout=get_child_process_shutdown_timeout(),
-        )
+            # SIGTERM remaining children (detokenizer, hicache sidecar, etc.),
+            # then SIGKILL stragglers after timeout.
+            graceful_kill_process_tree(
+                os.getpid(),
+                include_parent=False,
+                timeout=get_child_process_shutdown_timeout(),
+            )
 
         # os._exit: sys.exit() would be caught by the asyncio event loop.
         os._exit(0)
