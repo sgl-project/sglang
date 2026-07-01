@@ -42,6 +42,20 @@ uv pip install --force-reinstall sgl-deep-gemm --index-url https://docs.sglang.a
 
 ## Method 2: From source
 
+Installing from source builds the bundled gRPC extension, which requires a Rust toolchain and the Protocol Buffers compiler in addition to the CUDA toolkit. On a fresh machine, install these first:
+
+```bash Prerequisites
+# Rust toolchain (builds the sglang.srt.grpc._core extension)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+
+# Protocol Buffers compiler (Debian/Ubuntu)
+apt-get update && apt-get install -y protobuf-compiler
+
+# Point CUDA_HOME at your CUDA toolkit if it is not already set
+export CUDA_HOME=$(dirname "$(dirname "$(command -v nvcc)")")
+```
+
 ```bash Command
 # Use the last release branch
 git clone -b v0.5.12 https://github.com/sgl-project/sglang.git
@@ -54,6 +68,9 @@ pip install -e "python"
 
 **Quick fixes to common problems**
 
+- `Could not find protoc` during the build means the Protocol Buffers compiler is missing. Install it with `apt-get install -y protobuf-compiler`, or set `PROTOC` to an existing `protoc` binary.
+- A Rust build failure usually means the Rust toolchain is missing. Install it via [rustup](https://rustup.rs/) and re-run the install.
+- If your checkout lives on a network filesystem (common on cloud pods, or an NFS-mounted home), the Rust build is slow and may intermittently fail to link with `No such file or directory`. Point Cargo at local disk before installing to avoid both, for example `export CARGO_TARGET_DIR=/tmp/sglang-rust`. It builds several times faster there.
 - If you want to develop SGLang, you can try the dev docker image. Please refer to [setup docker container](../developer_guide/development_guide_using_docker#setup-docker-container). The docker image is `lmsysorg/sglang:dev`.
 
 ## Method 3: Using docker
