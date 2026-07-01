@@ -136,6 +136,15 @@ area. The **Type** column uses Prometheus metric types (`Counter`, `Gauge`,
 `Histogram`, `Summary`). Any labels listed in **Extra labels** are attached in
 addition to the common labels described below.
 
+> **Metric activity.** Most metrics below are actively populated during normal
+> operation. A handful are currently **inactive** — they are registered on the
+> endpoint but the code path that would populate them is not wired up, so they
+> always report their default value (or are never emitted). Inactive metrics are
+> marked with a dagger (`†`) in the tables and listed together under
+> [Currently inactive metrics](#currently-inactive-metrics). Feature-gated
+> metrics (see [Enablement flags](#enablement-flags)) are *not* inactive — they
+> are populated with real values once their feature is turned on.
+
 ### Labels
 
 Two collectors emit metrics, each with its own set of common labels applied to
@@ -161,10 +170,43 @@ Some metrics are only created when the corresponding feature is turned on:
 | --- | --- | --- |
 | MFU estimation | `--enable-mfu-metrics` | `estimated_flops_per_gpu_total`, `estimated_read_bytes_per_gpu_total`, `estimated_write_bytes_per_gpu_total` |
 | LoRA | LoRA serving enabled | `lora_pool_slots_used`, `lora_pool_slots_total`, `lora_pool_utilization` |
-| Hierarchical (Hi)Cache | `--enable-hierarchical-cache` | `hicache_host_used_tokens`, `hicache_host_total_tokens` |
-| Expert parallelism load balancing | MoE with EP enabled | `eplb_balancedness` |
+| Hierarchical (Hi)Cache | `--enable-hierarchical-cache` | `hicache_host_used_tokens`, `hicache_host_total_tokens`, `evicted_tokens_total`, `eviction_duration_seconds`, `load_back_tokens_total`, `load_back_duration_seconds` |
+| L3 / storage tier | storage backend enabled | `prefetched_tokens_total`, `backuped_tokens_total`, `prefetch_pgs`, `backup_pgs`, `prefetch_bandwidth`, `backup_bandwidth` |
+| Prefill/Decode disaggregation | disaggregation mode enabled | queue-depth, `kv_transfer_*`, `num_bootstrap_failed_reqs_total`, `num_transfer_failed_reqs_total` |
+| Per-device GPU timing | `SGLANG_ENABLE_METRICS_DEVICE_TIMER=1` | `gpu_execution_seconds_total`, `gpu_overlap_wait_seconds_total`, `dp_cooperation_gpu_execution_seconds_total` |
+| Expert parallelism load balancing | `SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC=1` (MoE, `moe_ep_rank == 0`) | `eplb_balancedness` |
 | EPLB heatmap | `SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL > 0` | `eplb_gpu_physical_count` |
 | Function latency timer | metrics enabled | `func_latency_seconds` |
+
+### Currently inactive metrics
+
+The following metrics are registered on the `/metrics` endpoint but are **not
+currently populated** by any code path — they always report their default value
+(e.g. `0`) or are never emitted at all. They are kept here for completeness and
+so operators do not build alerts on top of them expecting live data. Each is
+also marked with `†` in the tables below.
+
+| Metric | Reason it is inactive |
+| --- | --- |
+| `sglang:utilization` | Only computed when `max_running_requests_under_SLO` is set, which never happens; stays `0` (or `-1` in prefill-disaggregation mode). |
+| `sglang:max_running_requests_under_SLO` | Source value is never assigned anywhere, so the gauge is never emitted. |
+| `sglang:pending_prealloc_token_usage` | Backing `SchedulerStats` field is never populated; always `0`. |
+| `sglang:engine_startup_time` | Backing `SchedulerStats` field is never populated; always `0`. |
+| `sglang:engine_load_weights_time` | Backing `SchedulerStats` field is never populated; always `0`. |
+| `sglang:is_cuda_graph` | Backing `SchedulerStats` field is never populated; superseded by `cuda_graph_passes_total`. |
+| `sglang:num_prefill_retries_total` | `increment_prefill_retries()` has no callers. |
+| `sglang:num_grammar_total` | Populated only by `log_grammar_stats()`, which has no callers. |
+| `sglang:num_grammar_cache_hit_total` | Populated only by `log_grammar_stats()`, which has no callers. |
+| `sglang:num_grammar_aborted_total` | Populated only by `log_grammar_stats()`, which has no callers. |
+| `sglang:num_grammar_timeout_total` | Populated only by `log_grammar_stats()`, which has no callers. |
+| `sglang:grammar_compilation_time_seconds` | Populated only by `log_grammar_stats()`, which has no callers. |
+| `sglang:grammar_schema_count` | Populated only by `log_grammar_stats()`, which has no callers. |
+| `sglang:grammar_ebnf_size` | Populated only by `log_grammar_stats()`, which has no callers. |
+| `sglang:grammar_tree_traversal_time_avg` | Populated only by `log_grammar_stats()`, which has no callers. |
+| `sglang:grammar_tree_traversal_time_max` | Populated only by `log_grammar_stats()`, which has no callers. |
+
+> Note: `sglang:num_grammar_queue_reqs` is **active** — it is a separate gauge
+> sourced from the scheduler's grammar queue length, not from `log_grammar_stats()`.
 
 ### Request metrics
 
@@ -199,13 +241,13 @@ Some metrics are only created when the corresponding feature is turned on:
 | `sglang:full_token_usage` | Gauge | | The token usage for full attention layers. |
 | `sglang:swa_token_usage` | Gauge | | The token usage for SWA (sliding window attention) layers. |
 | `sglang:mamba_usage` | Gauge | | The token usage for Mamba layers. |
-| `sglang:pending_prealloc_token_usage` | Gauge | | The token usage for pending preallocated tokens (not preallocated yet). |
+| `sglang:pending_prealloc_token_usage` † | Gauge | | The token usage for pending preallocated tokens (not preallocated yet). |
 | `sglang:gen_throughput` | Gauge | | The generation throughput (token/s). |
 | `sglang:cache_hit_rate` | Gauge | | The prefix cache hit rate. |
 | `sglang:new_token_ratio` | Gauge | | The new token ratio. |
 | `sglang:decode_sum_seq_lens` | Gauge | | The sum of all sequence lengths in decode. |
-| `sglang:utilization` | Gauge | | The utilization. |
-| `sglang:max_running_requests_under_SLO` | Gauge | | The maximum number of running requests under SLO. |
+| `sglang:utilization` † | Gauge | | The utilization. |
+| `sglang:max_running_requests_under_SLO` † | Gauge | | The maximum number of running requests under SLO. |
 | `sglang:cache_config_info` | Gauge | `page_size`, `num_pages` | Cache configuration information. |
 
 ### Retraction and retries
@@ -217,7 +259,7 @@ Some metrics are only created when the corresponding feature is turned on:
 | `sglang:num_retracted_input_tokens_total` | Counter | | Total number of retracted input tokens. |
 | `sglang:num_retracted_output_tokens_total` | Counter | | Total number of retracted output tokens. |
 | `sglang:num_retractions` | Histogram | | Histogram of retraction counts per request. |
-| `sglang:num_prefill_retries_total` | Counter | | Total number of prefill retries. |
+| `sglang:num_prefill_retries_total` † | Counter | | Total number of prefill retries. |
 
 ### Speculative decoding
 
@@ -228,17 +270,23 @@ Some metrics are only created when the corresponding feature is turned on:
 
 ### Grammar / structured output
 
+> All metrics in this table are currently **inactive** (`†`): they are populated
+> only by `log_grammar_stats()`, which has no callers. The live signal for
+> structured-output load is `sglang:num_grammar_queue_reqs` (see
+> [Scheduler state](#scheduler-state)) and `sglang:num_so_requests_total` (see
+> [Request metrics](#request-metrics)).
+
 | Metric | Type | Extra labels | Description |
 | --- | --- | --- | --- |
-| `sglang:num_grammar_total` | Counter | | Number of total grammar requests. |
-| `sglang:num_grammar_cache_hit_total` | Counter | | Number of grammar cache hits. |
-| `sglang:num_grammar_aborted_total` | Counter | | Number of grammar aborted requests. |
-| `sglang:num_grammar_timeout_total` | Counter | | Number of grammar timeouts. |
-| `sglang:grammar_compilation_time_seconds` | Histogram | | Histogram of grammar compilation time in seconds. |
-| `sglang:grammar_schema_count` | Histogram | | Histogram of grammar schema count. |
-| `sglang:grammar_ebnf_size` | Histogram | | Histogram of grammar EBNF size. |
-| `sglang:grammar_tree_traversal_time_avg` | Histogram | | Histogram of average grammar tree traversal time in seconds. |
-| `sglang:grammar_tree_traversal_time_max` | Histogram | | Histogram of max grammar tree traversal time in seconds. |
+| `sglang:num_grammar_total` † | Counter | | Number of total grammar requests. |
+| `sglang:num_grammar_cache_hit_total` † | Counter | | Number of grammar cache hits. |
+| `sglang:num_grammar_aborted_total` † | Counter | | Number of grammar aborted requests. |
+| `sglang:num_grammar_timeout_total` † | Counter | | Number of grammar timeouts. |
+| `sglang:grammar_compilation_time_seconds` † | Histogram | | Histogram of grammar compilation time in seconds. |
+| `sglang:grammar_schema_count` † | Histogram | | Histogram of grammar schema count. |
+| `sglang:grammar_ebnf_size` † | Histogram | | Histogram of grammar EBNF size. |
+| `sglang:grammar_tree_traversal_time_avg` † | Histogram | | Histogram of average grammar tree traversal time in seconds. |
+| `sglang:grammar_tree_traversal_time_max` † | Histogram | | Histogram of max grammar tree traversal time in seconds. |
 
 ### Prefill/Decode disaggregation and KV transfer
 
@@ -267,7 +315,7 @@ Some metrics are only created when the corresponding feature is turned on:
 | `sglang:estimated_read_bytes_per_gpu_total` | Counter | | Estimated bytes read from memory per GPU (for MFU). |
 | `sglang:estimated_write_bytes_per_gpu_total` | Counter | | Estimated bytes written to memory per GPU (for MFU). |
 | `sglang:cuda_graph_passes_total` | Counter | `mode` | Total number of forward passes categorized by CUDA graph. |
-| `sglang:is_cuda_graph` | Gauge | | Whether the batch is using CUDA graph. |
+| `sglang:is_cuda_graph` † | Gauge | | Whether the batch is using CUDA graph. |
 | `sglang:dp_cooperation_realtime_tokens_total` | Counter | `mode`, `num_prefill_ranks` | Total tokens processed, labeled with DP cooperation info. |
 | `sglang:dp_cooperation_gpu_execution_seconds_total` | Counter | `category`, `num_prefill_ranks` | GPU busy time, labeled with DP cooperation info. |
 
@@ -323,8 +371,8 @@ Some metrics are only created when the corresponding feature is turned on:
 
 | Metric | Type | Extra labels | Description |
 | --- | --- | --- | --- |
-| `sglang:engine_startup_time` | Gauge | | The time taken for the engine to start up. |
-| `sglang:engine_load_weights_time` | Gauge | | The time taken for the engine to load weights. |
+| `sglang:engine_startup_time` † | Gauge | | The time taken for the engine to start up. |
+| `sglang:engine_load_weights_time` † | Gauge | | The time taken for the engine to load weights. |
 | `sglang:process_cpu_seconds_total` | Counter | `component` | Total CPU time consumed by this process (user + system). |
 | `sglang:func_latency_seconds` | Histogram | `name` | Function latency in seconds (per instrumented function). |
 
