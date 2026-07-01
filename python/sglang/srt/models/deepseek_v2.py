@@ -506,16 +506,13 @@ class MoEGate(nn.Module):
 
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
-            elif _is_npu:
+            elif _is_npu or not _is_cuda:
                 logits = F.linear(hidden_states, self.weight, None)
             else:
-                if self.is_deepseek_v4:
-                    from sglang.jit_kernel.dsv4 import linear_bf16_fp32
+                # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
+                from sglang.jit_kernel.dsv4 import linear_bf16_fp32
 
-                    logits = linear_bf16_fp32(hidden_states, self.weight)
-                else:
-                    # After testing, we may use the faster code in `if deepseek v4` branch
-                    logits = F.linear(hidden_states, self.weight, None)
+                logits = linear_bf16_fp32(hidden_states, self.weight)
 
         return logits
 
