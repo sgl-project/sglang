@@ -114,6 +114,13 @@ from sglang.srt.utils.common import get_compiler_backend
 logger = init_logger(__name__)
 
 
+def _ensure_tensor_model_output(model_output):
+    sample = getattr(model_output, "sample", None)
+    if isinstance(sample, torch.Tensor):
+        return sample
+    return model_output
+
+
 @dataclass(slots=True)
 class DenoisingContext:
     """Loop-scoped state shared across the denoising skeleton and its hooks."""
@@ -538,6 +545,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 model_name="transformer",
                 sp_group=sp_group,
                 tp_group=tp_group,
+                has_separate_cfg=batch.do_classifier_free_guidance,
             )
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
@@ -1810,12 +1818,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             getattr(current_model, "forward", current_model),
             {"guidance": guidance},
         )
-        return current_model(
+        model_output = current_model(
             hidden_states=latent_model_input,
             timestep=timestep,
             **guidance_kwargs,
             **kwargs,
         )
+        return _ensure_tensor_model_output(model_output)
 
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
         """

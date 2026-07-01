@@ -66,7 +66,8 @@ from sglang.multimodal_gen.utils import (
 
 logger = init_logger(__name__)
 
-LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
+LTX2_TWO_STAGE_DEVICE_MODES = ("original", "resident")
+LTX2_TWO_STAGE_DEVICE_MODE_CHOICES = (*LTX2_TWO_STAGE_DEVICE_MODES, "snapshot")
 LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
@@ -77,6 +78,13 @@ def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
     if mode is None:
         return None
     mode = mode.lower()
+    if mode == "snapshot":
+        logger.warning(
+            "ltx2_two_stage_device_mode=snapshot is deprecated and is treated "
+            "as original. Please use ltx2_two_stage_device_mode=original or "
+            "resident instead. This alias may be removed after two release cycles."
+        )
+        return "original"
     return mode
 
 
@@ -497,7 +505,7 @@ class ServerArgs(DisaggServerArgsMixin):
         if mode not in LTX2_TWO_STAGE_DEVICE_MODES:
             raise ValueError(
                 f"Invalid ltx2_two_stage_device_mode={mode!r}. "
-                f"Expected one of {LTX2_TWO_STAGE_DEVICE_MODES}."
+                f"Expected one of {LTX2_TWO_STAGE_DEVICE_MODE_CHOICES}."
             )
 
         self.ltx2_two_stage_device_mode = mode
@@ -505,9 +513,9 @@ class ServerArgs(DisaggServerArgsMixin):
     def _resolve_default_ltx2_two_stage_device_mode(self) -> str:
         if not current_platform.is_cuda():
             logger.info(
-                "Automatically set ltx2_two_stage_device_mode=snapshot on non-CUDA platform"
+                "Automatically set ltx2_two_stage_device_mode=original on non-CUDA platform"
             )
-            return "snapshot"
+            return "original"
 
         device_name = str(current_platform.get_device_name(0)).upper()
         device_total_memory_gb = (
@@ -525,22 +533,16 @@ class ServerArgs(DisaggServerArgsMixin):
             return "resident"
 
         logger.info(
-            "Automatically set ltx2_two_stage_device_mode=snapshot for CUDA GPU (%s, %.2f GiB total)",
+            "Automatically set ltx2_two_stage_device_mode=original for CUDA GPU (%s, %.2f GiB total)",
             device_name,
             device_total_memory_gb,
         )
-        return "snapshot"
+        return "original"
 
     def _is_ltx23_two_stage_pipeline(self) -> bool:
         return is_ltx2_two_stage_pipeline_name(self.pipeline_class_name) and (
             self._is_ltx23_model_path(self.model_path)
             or is_ltx23_native_variant(self.pipeline_config.vae_config.arch_config)
-        )
-
-    def _uses_ltx23_snapshot_two_stage_residency(self) -> bool:
-        return (
-            self.ltx2_two_stage_device_mode == "snapshot"
-            and self._is_ltx23_two_stage_pipeline()
         )
 
     def _uses_ltx23_high_memory_resident_two_stage_mode(self) -> bool:
@@ -724,6 +726,8 @@ class ServerArgs(DisaggServerArgsMixin):
             if mode_explicit or not legacy_explicit:
                 self.warmup = self.warmup_mode != "off"
                 self.server_warmup = self.warmup_mode == "server"
+            elif self.warmup:
+                self.server_warmup = self.server_warmup or self.warmup_mode == "server"
 
         # Explicit resolutions imply warmup is on (request-based).
         if self.warmup_resolutions is not None:
@@ -819,26 +823,40 @@ class ServerArgs(DisaggServerArgsMixin):
         # because non-CFG models (e.g. FLUX) crash when CFG parallel splits ranks.
         if cfg_unspecified:
             deployment_config = self.pipeline_config.get_model_deployment_config()
-            cfg_group_size = self.dp_size * self.tp_size * 2
-            if (
-                self.performance_mode != "manual"
-                and deployment_config.auto_enable_cfg_parallel
-                and self.num_gpus >= 2
-                and self.num_gpus % cfg_group_size == 0
-                and sp_unspecified
-                and ulysses_unspecified
-                and ring_unspecified
-                and self._model_default_uses_cfg()
-            ):
-                self.enable_cfg_parallel = True
-                logger.info(
-                    "Automatically enabled CFG parallel for %d GPUs. "
-                    "Use --sp-degree / --ulysses-degree to use sequence "
-                    "parallelism instead.",
-                    self.num_gpus,
-                )
-            else:
+            auto_cfg_parallel_degree = deployment_config.get_auto_cfg_parallel_degree(
+                self.num_gpus
+            )
+            if auto_cfg_parallel_degree < 1:
                 self.enable_cfg_parallel = False
+            else:
+                cfg_group_size = self.dp_size * self.tp_size * auto_cfg_parallel_degree
+                if (
+                    self.performance_mode != "manual"
+                    and deployment_config.auto_enable_cfg_parallel
+                    and self.num_gpus >= 2
+                    and self.num_gpus % cfg_group_size == 0
+                    and sp_unspecified
+                    and ulysses_unspecified
+                    and ring_unspecified
+                    and self._model_default_uses_cfg()
+                ):
+                    self.cfg_parallel_degree = auto_cfg_parallel_degree
+                    self.enable_cfg_parallel = auto_cfg_parallel_degree > 1
+                    if self.enable_cfg_parallel:
+                        logger.info(
+                            "Automatically enabled CFG parallel at degree %d for %d GPUs. "
+                            "Use --sp-degree / --ulysses-degree to use sequence "
+                            "parallelism instead.",
+                            self.cfg_parallel_degree,
+                            self.num_gpus,
+                        )
+                    else:
+                        logger.info(
+                            "Automatically disabled CFG parallel for %d GPUs based on model deployment config.",
+                            self.num_gpus,
+                        )
+                else:
+                    self.enable_cfg_parallel = False
 
         # Resolve cfg_parallel_degree to a concrete int now that enable_cfg_parallel is settled.
         if self.cfg_parallel_degree is None:
@@ -1410,14 +1428,15 @@ class ServerArgs(DisaggServerArgsMixin):
         parser.add_argument(
             "--ltx2-two-stage-device-mode",
             type=str,
-            choices=LTX2_TWO_STAGE_DEVICE_MODES,
+            choices=LTX2_TWO_STAGE_DEVICE_MODE_CHOICES,
             default=ServerArgs.ltx2_two_stage_device_mode,
             help=(
                 "LTX-2.3 two-stage device residency mode: "
                 "'original' keeps official two-stage semantics without premerged stage2, "
-                "'snapshot' keeps premerged stage2 with snapshot-based release, "
                 "'resident' keeps both transformers resident on GPU. "
-                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise snapshot."
+                "'snapshot' is deprecated, treated as 'original', and may be "
+                "removed after two release cycles. "
+                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise original."
             ),
         )
         parser.add_argument(
@@ -1942,6 +1961,20 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
         # validate layerwise offload conflicts
+        if envs.SGLANG_CACHE_DIT_ENABLED and self.use_fsdp_inference:
+            if self.is_arg_explicitly_set("use_fsdp_inference"):
+                raise ValueError(
+                    "FSDP inference cannot be enabled together with cache-dit. "
+                    "cache-dit wraps known DiT block structures, while FSDP wraps "
+                    "and shards modules before cache-dit can inspect them. "
+                    "Please disable --use-fsdp-inference or disable "
+                    "SGLANG_CACHE_DIT_ENABLED."
+                )
+            logger.warning(
+                "cache-dit is enabled, automatically disabling use_fsdp_inference."
+            )
+            self.use_fsdp_inference = False
+
         if self.layerwise_offload_components:
             if self.dit_offload_prefetch_size < 0.0:
                 raise ValueError("dit_offload_prefetch_size must be non-negative")

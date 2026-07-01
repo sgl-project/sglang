@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
+    RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -25,6 +26,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     WeightOnlyFP8ColumnParallelLinear,
     WeightOnlyFP8Linear,
+    WeightOnlyFP8RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
@@ -66,6 +68,11 @@ class Qwen3VLQuantizedLinear(ReplicatedLinear):
 
 
 class Qwen3VLColumnParallelLinear(ColumnParallelLinear):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(x)[0]
+
+
+class Qwen3VLRowParallelLinear(RowParallelLinear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return super().forward(x)[0]
 
@@ -132,6 +139,51 @@ def _make_text_linear(
     return nn.Linear(in_features, out_features, bias=bias)
 
 
+def _make_text_row_linear(
+    in_features: int,
+    out_features: int,
+    *,
+    bias: bool,
+    quant_config: QuantizationConfig | None,
+    use_weight_only_fp8: bool,
+    use_tensor_parallel: bool,
+    prefix: str,
+):
+    tp_size = _tp_world_size()
+    use_row_parallel = (
+        use_tensor_parallel and tp_size > 1 and in_features % tp_size == 0
+    )
+    if use_weight_only_fp8:
+        if use_row_parallel:
+            return WeightOnlyFP8RowParallelLinear(
+                in_features,
+                out_features,
+                bias=bias,
+                input_is_parallel=True,
+                enable_fused_w8a8=False,
+            )
+        return WeightOnlyFP8Linear(
+            in_features, out_features, bias=bias, enable_fused_w8a8=False
+        )
+    if use_row_parallel:
+        return Qwen3VLRowParallelLinear(
+            input_size=in_features,
+            output_size=out_features,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+    if quant_config is not None:
+        return Qwen3VLQuantizedLinear(
+            in_features,
+            out_features,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+    return nn.Linear(in_features, out_features, bias=bias)
+
+
 def _gather_tensor_parallel_activation(
     x: torch.Tensor, linear: nn.Module
 ) -> torch.Tensor:
@@ -159,10 +211,14 @@ class Qwen3VLTextAttention(nn.Module):
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.total_num_heads = config.num_attention_heads
         self.total_num_key_value_heads = config.num_key_value_heads
-        self.tp_size = _tp_world_size() if use_tensor_parallel else 1
-        if self.tp_size > 1:
-            assert self.total_num_heads % self.tp_size == 0
-            assert self.total_num_key_value_heads % self.tp_size == 0
+        tp_size = _tp_world_size() if use_tensor_parallel else 1
+        use_tensor_parallel = (
+            use_tensor_parallel
+            and tp_size > 1
+            and self.total_num_heads % tp_size == 0
+            and self.total_num_key_value_heads % tp_size == 0
+        )
+        self.tp_size = tp_size if use_tensor_parallel else 1
         self.num_heads = self.total_num_heads // self.tp_size
         self.num_key_value_heads = self.total_num_key_value_heads // self.tp_size
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
@@ -200,14 +256,13 @@ class Qwen3VLTextAttention(nn.Module):
             gather_output=False,
             prefix=f"{prefix}.v_proj",
         )
-        self.o_proj = _make_text_linear(
+        self.o_proj = _make_text_row_linear(
             config.num_attention_heads * self.head_dim,
             config.hidden_size,
             bias=config.attention_bias,
             quant_config=quant_config,
             use_weight_only_fp8=use_weight_only_fp8,
             use_tensor_parallel=use_tensor_parallel,
-            gather_output=True,
             prefix=f"{prefix}.o_proj",
         )
         self.q_norm = Qwen3VLTextRMSNorm(
@@ -279,7 +334,10 @@ class Qwen3VLTextAttention(nn.Module):
         attn_output = self.attn(query_states, key_states, value_states)
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = _gather_tensor_parallel_activation(attn_output, self.q_proj)
+        if not isinstance(
+            self.o_proj, (Qwen3VLRowParallelLinear, WeightOnlyFP8RowParallelLinear)
+        ):
+            attn_output = _gather_tensor_parallel_activation(attn_output, self.q_proj)
         attn_output = self.o_proj(attn_output)
         return attn_output
 
@@ -317,23 +375,25 @@ class Qwen3VLTextMLP(nn.Module):
             gather_output=False,
             prefix=f"{prefix}.up_proj",
         )
-        self.down_proj = _make_text_linear(
+        self.down_proj = _make_text_row_linear(
             self.intermediate_size,
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
             use_weight_only_fp8=use_weight_only_fp8,
             use_tensor_parallel=use_tensor_parallel,
-            gather_output=True,
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
         hidden_states = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
-        hidden_states = _gather_tensor_parallel_activation(
-            hidden_states, self.gate_proj
-        )
+        if not isinstance(
+            self.down_proj, (Qwen3VLRowParallelLinear, WeightOnlyFP8RowParallelLinear)
+        ):
+            hidden_states = _gather_tensor_parallel_activation(
+                hidden_states, self.gate_proj
+            )
         down_proj = self.down_proj(hidden_states)
         return down_proj
 
@@ -524,9 +584,8 @@ class Qwen3VLTextModel(nn.Module):
 
         attention_mask = create_causal_mask(
             config=self.config,
-            input_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=text_position_ids,
         )

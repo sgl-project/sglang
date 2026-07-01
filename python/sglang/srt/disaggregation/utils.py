@@ -511,6 +511,16 @@ def get_kv_class(
     raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
 
 
+def _get_cp_rank_page_bounds(
+    total_pages: int, cp_rank: int, cp_size: int
+) -> Tuple[int, int]:
+    base = total_pages // cp_size
+    rem = total_pages % cp_size
+    local_start = cp_rank * base + min(cp_rank, rem)
+    n_pages = base + (1 if cp_rank < rem else 0)
+    return local_start, local_start + n_pages
+
+
 def page_indices_to_cp_rank_page_indices(
     page_indices: np.ndarray,
     total_pages: int,
@@ -558,37 +568,35 @@ def page_indices_to_cp_rank_page_indices(
 
 
 def filter_kv_indices_for_cp_rank(
-    kv_mgr: CommonKVManager, kv_indices: np.ndarray, index_slice: slice
+    kv_mgr: CommonKVManager,
+    kv_indices: np.ndarray,
+    index_slice: slice,
+    total_pages: Optional[int] = None,
 ) -> Tuple[np.ndarray, slice]:
     """Filters kv_indices and index_slice for the current CP rank."""
-    total_pages = len(kv_indices)
+    if total_pages is None:
+        total_pages = len(kv_indices)
     cp_rank = kv_mgr.attn_cp_rank
     cp_size = kv_mgr.attn_cp_size
 
-    rank_page_indices = page_indices_to_cp_rank_page_indices(
-        page_indices=kv_indices,
-        total_pages=total_pages,
-        cp_rank=cp_rank,
-        cp_size=cp_size,
-    )
+    if cp_size <= 1:
+        return kv_indices, index_slice
 
-    if rank_page_indices.size == 0:
+    rank_start, rank_end = _get_cp_rank_page_bounds(total_pages, cp_rank, cp_size)
+    chunk_start = index_slice.start if index_slice.start is not None else 0
+    chunk_end = index_slice.stop if index_slice.stop is not None else total_pages
+    first_pos = max(rank_start, chunk_start) - chunk_start
+    last_pos = min(rank_end, chunk_end) - chunk_start
+
+    if last_pos <= first_pos:
         new_kv_indices = kv_indices[:0]
-        new_index_slice = slice(index_slice.start, index_slice.start)
+        new_index_slice = slice(chunk_start, chunk_start)
     else:
-        mask = np.isin(kv_indices, rank_page_indices)
-        if not mask.any():
-            new_kv_indices = kv_indices[:0]
-            new_index_slice = slice(index_slice.start, index_slice.start)
-        else:
-            first_pos = int(mask.argmax())
-            last_pos = len(mask) - int(mask[::-1].argmax())
-
-            new_kv_indices = kv_indices[first_pos:last_pos]
-            new_index_slice = slice(
-                index_slice.start + first_pos,
-                index_slice.start + last_pos,
-            )
+        new_kv_indices = kv_indices[first_pos:last_pos]
+        new_index_slice = slice(
+            chunk_start + first_pos,
+            chunk_start + last_pos,
+        )
     return new_kv_indices, new_index_slice
 
 
@@ -635,7 +643,11 @@ def setup_state_kv_args(
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+    from sglang.srt.mem_cache.memory_pool import (
+        DSATokenToKVPool,
+        HybridLinearKVPool,
+        MiniMaxSparseKVPool,
+    )
 
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
@@ -643,7 +655,16 @@ def setup_state_kv_args(
     kv_args.state_item_lens = []
     kv_args.state_dim_per_tensor = []
 
-    if hasattr(token_to_kv_pool, "get_state_buf_infos"):
+    if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
+        if token_to_kv_pool.index_kv_pool is not None:
+            raise NotImplementedError(
+                "PD disaggregation for MiniMax sparse layers with index value "
+                "(index_kv_pool) is not yet supported; only K-only sparse layers are."
+            )
+        if token_to_kv_pool.index_k_pool is not None:
+            dp, dl, il = token_to_kv_pool.get_index_k_state_buf_infos()
+            append_state_component(kv_args, StateType.MINIMAX_INDEX_K, dp, dl, il)
+    elif hasattr(token_to_kv_pool, "get_state_buf_infos"):
         data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
 
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
