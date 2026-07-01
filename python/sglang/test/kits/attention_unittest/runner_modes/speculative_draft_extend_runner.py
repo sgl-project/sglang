@@ -496,6 +496,20 @@ class _EagleDraftExtendV2WorkerHarness:
         self.eagle_use_aux_hidden_state = False
         self.hot_token_id = None
         self.draft_runner.model = model_forward
+        self.index_share_for_mtp_iteration = (
+            getattr(
+                self.model_config.hf_config,
+                "index_share_for_mtp_iteration",
+                False,
+            )
+            and self.topk == 1
+        )
+        self.dsa_index_topk = getattr(
+            self.draft_runner.model_config.hf_config, "index_topk", None
+        )
+        self.seed_topk_from_extend = (
+            self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+        )
 
 
 def _build_eagle_draft_extend_fixture(
