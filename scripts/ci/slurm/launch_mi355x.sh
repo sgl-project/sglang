@@ -68,7 +68,7 @@ resolve_snapshot() {
         local hash resolved
         hash="$(cat "$p/refs/main")"
         resolved="$p/snapshots/$hash"
-        if [[ -d "$resolved" ]]; then
+        if [[ -n "$hash" && -d "$resolved" ]]; then
             echo "resolved snapshot: $p -> $resolved" >&2
             echo "$resolved"
             return 0
