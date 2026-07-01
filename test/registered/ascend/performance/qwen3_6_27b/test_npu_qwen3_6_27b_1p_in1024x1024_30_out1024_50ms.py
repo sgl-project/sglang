@@ -95,7 +95,8 @@ class TestNPUQwen3_6_27B_1P_In1024x1024_30_Out1024_50ms(TestNpuPerformanceTestCa
     model = QWEN3_6_27B_MODEL_PATH
     other_args = QWEN3_6_27B_1024_OTHER_ARGS
     envs = QWEN3_6_27B_1024_ENVS
-    dataset_name = "random"
+    backend = "sglang-oai-chat"
+    dataset_name = "image"
     max_concurrency = 48
     num_prompts = 48
     input_len = 30
