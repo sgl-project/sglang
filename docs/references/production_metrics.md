@@ -173,10 +173,10 @@ Some metrics are only created when the corresponding feature is turned on:
 | Hierarchical (Hi)Cache | `--enable-hierarchical-cache` | `hicache_host_used_tokens`, `hicache_host_total_tokens`, `evicted_tokens_total`, `eviction_duration_seconds`, `load_back_tokens_total`, `load_back_duration_seconds` |
 | L3 / storage tier | storage backend enabled | `prefetched_tokens_total`, `backuped_tokens_total`, `prefetch_pgs`, `backup_pgs`, `prefetch_bandwidth`, `backup_bandwidth` |
 | Prefill/Decode disaggregation | disaggregation mode enabled | queue-depth, `kv_transfer_*`, `num_bootstrap_failed_reqs_total`, `num_transfer_failed_reqs_total` |
-| Per-device GPU timing | `SGLANG_ENABLE_METRICS_DEVICE_TIMER=1` | `gpu_execution_seconds_total`, `gpu_overlap_wait_seconds_total`, `dp_cooperation_gpu_execution_seconds_total` |
+| Per-device forward timing | `SGLANG_ENABLE_METRICS_DEVICE_TIMER=1` | `forward_execution_seconds_total`, `dp_cooperation_forward_execution_seconds_total` |
 | Expert parallelism load balancing | `SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC=1` (MoE, `moe_ep_rank == 0`) | `eplb_balancedness` |
 | EPLB heatmap | `SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL > 0` | `eplb_gpu_physical_count` |
-| Function latency timer | metrics enabled | `func_latency_seconds` |
+| Streaming sessions | `--enable-streaming-session` | `num_streaming_sessions`, `streaming_session_held_tokens` |
 
 ### Currently inactive metrics
 
@@ -191,8 +191,6 @@ also marked with `†` in the tables below.
 | `sglang:utilization` | Only computed when `max_running_requests_under_SLO` is set, which never happens; stays `0` (or `-1` in prefill-disaggregation mode). |
 | `sglang:max_running_requests_under_SLO` | Source value is never assigned anywhere, so the gauge is never emitted. |
 | `sglang:pending_prealloc_token_usage` | Backing `SchedulerStats` field is never populated; always `0`. |
-| `sglang:engine_startup_time` | Backing `SchedulerStats` field is never populated; always `0`. |
-| `sglang:engine_load_weights_time` | Backing `SchedulerStats` field is never populated; always `0`. |
 | `sglang:is_cuda_graph` | Backing `SchedulerStats` field is never populated; superseded by `cuda_graph_passes_total`. |
 | `sglang:num_prefill_retries_total` | `increment_prefill_retries()` has no callers. |
 | `sglang:num_grammar_total` | Populated only by `log_grammar_stats()`, which has no callers. |
@@ -218,24 +216,35 @@ also marked with `†` in the tables below.
 | `sglang:num_requests_total` | Counter | | Number of requests processed. |
 | `sglang:num_so_requests_total` | Counter | | Number of structured output requests processed. |
 | `sglang:num_aborted_requests_total` | Counter | | Number of requests aborted. |
+| `sglang:spec_verify_calls_total` | Counter | | Number of speculative decoding verification calls. |
 | `sglang:prompt_tokens_histogram` | Histogram | | Histogram of prompt token length. |
+| `sglang:uncached_prompt_tokens_histogram` | Histogram | | Histogram of uncached prompt token length. |
 | `sglang:generation_tokens_histogram` | Histogram | | Histogram of generation token length. |
 | `sglang:time_to_first_token_seconds` | Histogram | | Histogram of time to first token in seconds. |
 | `sglang:inter_token_latency_seconds` | Histogram | | Histogram of inter-token latency in seconds. |
 | `sglang:e2e_request_latency_seconds` | Histogram | | Histogram of end-to-end request latency in seconds. |
 | `sglang:per_stage_req_latency_seconds` | Histogram | `stage` | Latency of each stage of a request's lifecycle. |
 | `sglang:queue_time_seconds` | Histogram | | Histogram of queueing time in seconds. |
+| `sglang:get_loads_duration_seconds` | Histogram | | Time spent serving `/v1/loads` requests in seconds. |
 
 ### Scheduler state
 
 | Metric | Type | Extra labels | Description |
 | --- | --- | --- | --- |
 | `sglang:num_running_reqs` | Gauge | | The number of running requests. |
-| `sglang:num_running_reqs_offline_batch` | Gauge | | The number of running low-priority offline batch requests. |
 | `sglang:num_queue_reqs` | Gauge | | The number of requests in the waiting queue. |
 | `sglang:num_grammar_queue_reqs` | Gauge | | The number of requests in the grammar waiting queue. |
 | `sglang:num_paused_reqs` | Gauge | | The number of paused requests by async weight sync. |
 | `sglang:num_used_tokens` | Gauge | | The number of used tokens. |
+| `sglang:kv_available_tokens` | Gauge | | Number of free token slots in the KV cache pool. |
+| `sglang:kv_evictable_tokens` | Gauge | | Number of evictable radix-cached token slots in the KV cache pool. |
+| `sglang:kv_used_tokens` | Gauge | | Number of actively used token slots in the KV cache pool. |
+| `sglang:swa_available_tokens` | Gauge | | Number of free token slots in the SWA pool. |
+| `sglang:swa_evictable_tokens` | Gauge | | Number of evictable radix-cached token slots in the SWA pool. |
+| `sglang:swa_used_tokens` | Gauge | | Number of actively used token slots in the SWA pool. |
+| `sglang:mamba_available_tokens` | Gauge | | Number of free state slots in the Mamba SSM pool. |
+| `sglang:mamba_evictable_tokens` | Gauge | | Number of evictable radix-cached state slots in the Mamba SSM pool. |
+| `sglang:mamba_used_tokens` | Gauge | | Number of actively used state slots in the Mamba SSM pool. |
 | `sglang:max_total_num_tokens` | Gauge | | Maximum total number of tokens in the KV cache pool. |
 | `sglang:token_usage` | Gauge | | The token usage. |
 | `sglang:full_token_usage` | Gauge | | The token usage for full attention layers. |
@@ -247,8 +256,12 @@ also marked with `†` in the tables below.
 | `sglang:new_token_ratio` | Gauge | | The new token ratio. |
 | `sglang:decode_sum_seq_lens` | Gauge | | The sum of all sequence lengths in decode. |
 | `sglang:utilization` † | Gauge | | The utilization. |
+| `sglang:fwd_occupancy` | Gauge | | Forward pass GPU occupancy percentage. |
 | `sglang:max_running_requests_under_SLO` † | Gauge | | The maximum number of running requests under SLO. |
-| `sglang:cache_config_info` | Gauge | `page_size`, `num_pages` | Cache configuration information. |
+| `sglang:page_size` | Gauge | | KV cache page size in tokens. |
+| `sglang:num_pages` | Gauge | | Number of KV cache pages. |
+| `sglang:context_len` | Gauge | | Maximum context length. |
+| `sglang:startup_available_gpu_memory_gb` | Gauge | | Available GPU memory in GB at startup. |
 
 ### Retraction and retries
 
@@ -258,7 +271,6 @@ also marked with `†` in the tables below.
 | `sglang:num_retracted_requests_total` | Counter | | Total number of retracted requests. |
 | `sglang:num_retracted_input_tokens_total` | Counter | | Total number of retracted input tokens. |
 | `sglang:num_retracted_output_tokens_total` | Counter | | Total number of retracted output tokens. |
-| `sglang:num_retractions` | Histogram | | Histogram of retraction counts per request. |
 | `sglang:num_prefill_retries_total` † | Counter | | Total number of prefill retries. |
 
 ### Speculative decoding
@@ -267,6 +279,8 @@ also marked with `†` in the tables below.
 | --- | --- | --- | --- |
 | `sglang:spec_accept_length` | Gauge | | The average acceptance length of speculative decoding. |
 | `sglang:spec_accept_rate` | Gauge | | The average acceptance rate of speculative decoding (`accepted tokens / total draft tokens` in batch). |
+| `sglang:spec_num_steps` | Gauge | | Currently active speculative decoding step count. |
+| `sglang:spec_num_draft_tokens` | Gauge | | Currently active speculative draft token count. |
 
 ### Grammar / structured output
 
@@ -292,7 +306,7 @@ also marked with `†` in the tables below.
 
 | Metric | Type | Extra labels | Description |
 | --- | --- | --- | --- |
-| `sglang:num_prefill_prealloc_queue_reqs` | Gauge | | The number of requests in the prefill prealloc queue. |
+| `sglang:num_prefill_bootstrap_queue_reqs` | Gauge | | The number of requests in the prefill bootstrap queue. |
 | `sglang:num_prefill_inflight_queue_reqs` | Gauge | | The number of requests in the prefill inflight queue. |
 | `sglang:num_decode_prealloc_queue_reqs` | Gauge | | The number of requests in the decode prealloc queue. |
 | `sglang:num_decode_transfer_queue_reqs` | Gauge | | The number of requests in the decode transfer queue. |
@@ -309,15 +323,14 @@ also marked with `†` in the tables below.
 | Metric | Type | Extra labels | Description |
 | --- | --- | --- | --- |
 | `sglang:realtime_tokens_total` | Counter | `mode` | Total number of tokens processed (updated each log interval). `mode`: `prefill_compute`, `prefill_cache`, `decode`. |
-| `sglang:gpu_execution_seconds_total` | Counter | `category` | Total time that GPU is busy executing a workload. See `ForwardMode` for category labels. |
-| `sglang:gpu_overlap_wait_seconds_total` | Counter | `category` | Total time the GPU forward stream was idle waiting for the CPU schedule stream (overlap bubble). |
+| `sglang:forward_execution_seconds_total` | Counter | `category` | Total time the GPU is busy executing model forward passes. See `ForwardMode` for category labels. |
 | `sglang:estimated_flops_per_gpu_total` | Counter | | Estimated floating-point operations per GPU (for MFU). |
 | `sglang:estimated_read_bytes_per_gpu_total` | Counter | | Estimated bytes read from memory per GPU (for MFU). |
 | `sglang:estimated_write_bytes_per_gpu_total` | Counter | | Estimated bytes written to memory per GPU (for MFU). |
 | `sglang:cuda_graph_passes_total` | Counter | `mode` | Total number of forward passes categorized by CUDA graph. |
 | `sglang:is_cuda_graph` † | Gauge | | Whether the batch is using CUDA graph. |
 | `sglang:dp_cooperation_realtime_tokens_total` | Counter | `mode`, `num_prefill_ranks` | Total tokens processed, labeled with DP cooperation info. |
-| `sglang:dp_cooperation_gpu_execution_seconds_total` | Counter | `category`, `num_prefill_ranks` | GPU busy time, labeled with DP cooperation info. |
+| `sglang:dp_cooperation_forward_execution_seconds_total` | Counter | `category`, `num_prefill_ranks` | Forward execution time, labeled with DP cooperation info. |
 
 ### Hierarchical cache, radix cache, and storage
 
@@ -367,14 +380,20 @@ also marked with `†` in the tables below.
 | `sglang:prefill_delayer_wait_seconds` | Histogram | | Histogram of wait time in seconds by the prefill delayer. |
 | `sglang:prefill_delayer_outcomes_total` | Counter | `input_estimation`, `output_allow`, `output_reason`, `actual_execution` | Prefill delayer outcome counts. |
 
+### Streaming sessions
+
+| Metric | Type | Extra labels | Description |
+| --- | --- | --- | --- |
+| `sglang:num_streaming_sessions` | Gauge | | The number of streaming sessions. |
+| `sglang:streaming_session_held_tokens` | Gauge | | Number of KV tokens currently held by streaming session slots. |
+
 ### Engine and process
 
 | Metric | Type | Extra labels | Description |
 | --- | --- | --- | --- |
-| `sglang:engine_startup_time` † | Gauge | | The time taken for the engine to start up. |
-| `sglang:engine_load_weights_time` † | Gauge | | The time taken for the engine to load weights. |
-| `sglang:process_cpu_seconds_total` | Counter | `component` | Total CPU time consumed by this process (user + system). |
-| `sglang:func_latency_seconds` | Histogram | `name` | Function latency in seconds (per instrumented function). |
+| `sglang:engine_startup_time` | Gauge | | The time taken for the engine to start up. |
+| `sglang:engine_load_weights_time` | Gauge | | The time taken for the engine to load weights. |
+| `sglang:weight_load_duration_seconds` | Gauge | `source` | Wall time of the most recent `update_weights_from_<source>` call. |
 
 ## Setup Guide
 
