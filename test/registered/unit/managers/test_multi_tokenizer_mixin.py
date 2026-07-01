@@ -41,6 +41,8 @@ def _make_batch_str_output() -> BatchStrOutput:
         output_token_ids_logprobs_val=[[], []],
         output_token_ids_logprobs_idx=[[], []],
         output_token_entropy_val=[0.0, 0.0],
+        output_token_sampling_mask=[[], []],
+        output_token_sampling_logprobs=[[], []],
         output_hidden_states=[None, None],
         routed_experts=[None, None],
         indexer_topk=[None, None],
