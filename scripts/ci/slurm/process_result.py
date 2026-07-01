@@ -53,10 +53,10 @@ prefill_num_workers = decode_tp = decode_ep = decode_dp_attn = decode_num_worker
 
 recipe_file = os.environ.get("RECIPE_FILE")
 if recipe_file and Path(recipe_file).exists():
-    import yaml
+    sys.path.insert(0, str(Path(__file__).parent))
+    from recipe_utils import load_recipe
 
-    with open(recipe_file) as f:
-        recipe = yaml.safe_load(f)
+    recipe = load_recipe(recipe_file)
 
     res = recipe.get("resources", {})
     prefill_num_workers = res.get("prefill_workers", 0)

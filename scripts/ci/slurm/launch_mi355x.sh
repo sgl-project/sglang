@@ -59,37 +59,55 @@ if [[ -z "$MODEL_PATH" ]]; then
 fi
 
 # Resolve a HuggingFace cache dir (models--org--name) to its live snapshot dir.
-# Lets nightly-configs point at the shared cache without hardcoding a snapshot
-# hash; if MODEL_PATH is already a concrete snapshot (or plain dir), use as-is.
-if [[ -f "$MODEL_PATH/refs/main" && -d "$MODEL_PATH/snapshots" ]]; then
-    SNAP_HASH="$(cat "$MODEL_PATH/refs/main")"
-    RESOLVED="$MODEL_PATH/snapshots/$SNAP_HASH"
-    if [[ -d "$RESOLVED" ]]; then
-        echo "resolved snapshot: $MODEL_PATH -> $RESOLVED"
-        MODEL_PATH="$RESOLVED"
-    else
-        echo "ERROR: refs/main=$SNAP_HASH but $RESOLVED missing" >&2
-        exit 1
+# Lets nightly-configs / recipes point at the shared cache without hardcoding a
+# snapshot hash; a concrete snapshot dir (or plain dir) is returned unchanged.
+# Used for both MODEL_PATH and an optional speculative draft model path.
+resolve_snapshot() {
+    local p="$1"
+    if [[ -f "$p/refs/main" && -d "$p/snapshots" ]]; then
+        local hash resolved
+        hash="$(cat "$p/refs/main")"
+        resolved="$p/snapshots/$hash"
+        if [[ -d "$resolved" ]]; then
+            echo "resolved snapshot: $p -> $resolved" >&2
+            echo "$resolved"
+            return 0
+        fi
+        echo "ERROR: refs/main=$hash but $resolved missing" >&2
+        return 1
     fi
-fi
+    echo "$p"
+}
+MODEL_PATH="$(resolve_snapshot "$MODEL_PATH")" || exit 1
 
 # ---------------------------------------------------------------------------
 # Parse the recipe (runtime + bench + topology) into shell vars.
 # ---------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Ensure PyYAML is available to the host python used for parsing.
 python3 -c 'import yaml' 2>/dev/null || pip install pyyaml -q 2>/dev/null \
     || pip install --user pyyaml -q 2>/dev/null || true
 
 # Emit KEY=value lines and eval them (robust single-level command substitution;
 # avoids a nested read<<EOF/$(<<PY) heredoc that misparses on some shells).
-RECIPE_VARS="$(python3 - "$CONFIG_FILE" <<'PY'
-import sys, yaml
-r = yaml.safe_load(open(sys.argv[1]))
+# recipe_utils.load_recipe resolves any `extends:` inheritance before we read it.
+# Model-specific env / server flags are NOT emitted here -- they are written as
+# bash arrays to model_flags.sh below (avoids multi-layer shell quoting).
+RECIPE_VARS="$(python3 - "$CONFIG_FILE" "$SCRIPT_DIR" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[2])
+from recipe_utils import load_recipe
+r = load_recipe(sys.argv[1])
 rt = r["runtime"]; b = r["backend"]["sglang_config"]; bn = r["bench"]
 res = r.get("resources", {})
 def emit(k, v): print(f"{k}={v}")
 emit("IMAGE", rt["image"])
-emit("ATTN", rt["attention_backend"])
+# Attention backend: single (`attention_backend`) or split
+# (`prefill_attention_backend`/`decode_attention_backend`). Empty when absent.
+emit("ATTN", rt.get("attention_backend", ""))
+emit("PATTN", rt.get("prefill_attention_backend", ""))
+emit("DATTN", rt.get("decode_attention_backend", ""))
 emit("IB", rt["ib_devices"])
 emit("PPORT", rt["prefill_port"])
 emit("DPORT", rt["decode_port"])
@@ -100,16 +118,19 @@ emit("MEMFRAC", rt["mem_fraction_static"])
 emit("PAGE", rt["page_size"])
 emit("MAXREQ", rt["max_running_requests"])
 emit("CHUNK", rt["chunked_prefill_size"])
-emit("SWA", rt["swa_full_tokens_ratio"])
+# swa is DSV4-specific; emit empty when a model omits it so the flag is dropped.
+emit("SWA", rt.get("swa_full_tokens_ratio", ""))
 emit("PTP", b["prefill"]["tensor-parallel-size"])
 emit("DTP", b["decode"]["tensor-parallel-size"])
 emit("PEP", b["prefill"].get("expert-parallel-size", 1))
 emit("PDP", b["prefill"].get("data-parallel-size", 1))
 m = r.get("mtp", {}) or {}
 emit("MTP_ENABLED", 1 if m.get("enabled") else 0)
+emit("MTP_ALGO", m.get("algorithm", "EAGLE"))
 emit("MTP_STEPS", m.get("num_steps", 3))
 emit("MTP_TOPK", m.get("eagle_topk", 1))
 emit("MTP_DRAFT", m.get("num_draft_tokens", 4))
+emit("MTP_DRAFT_PATH", m.get("draft_model_path", ""))
 # Worker counts double as node counts here: one server per node (TP == GPUs/node).
 # 1P1D today; bumping these reserves 2P2D / 1P3D / 3P1D. Multi-node-per-worker
 # (TP > GPUs/node, needs --dist-init-addr/--nnodes/--node-rank) is out of scope.
@@ -134,7 +155,7 @@ eval "$RECIPE_VARS"
 if [[ -n "${IMAGE_OVERRIDE:-}" ]]; then
     IMAGE="$IMAGE_OVERRIDE"
 fi
-echo "recipe: image=$IMAGE attn=$ATTN ib=$IB ptp=$PTP dtp=$DTP concs=$CONCS isl=$ISL osl=$OSL"
+echo "recipe: image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP concs=$CONCS isl=$ISL osl=$OSL"
 
 # ---------------------------------------------------------------------------
 # Shared NFS scratch (visible to login node + compute nodes). Raw bench output
@@ -142,7 +163,6 @@ echo "recipe: image=$IMAGE attn=$ATTN ib=$IB ptp=$PTP dtp=$DTP concs=$CONCS isl=
 # ---------------------------------------------------------------------------
 WORKDIR="$HOME/.mi355x_ci/${MATRIX_CONFIG_NAME}"
 rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Accuracy-gate helpers (written when enabled). Pre-stage the GSM8K test set on
 # shared NFS from the login node (which has internet) so the in-container eval
@@ -161,28 +181,45 @@ sys.exit(0 if acc > thr else 1)
 PY
 fi
 
-# DSV4 load-bearing env (see test/registered/amd/test_deepseek_v4_flash_fp8.py).
-# SGLANG_DSV4_FP4_EXPERTS is precision-driven: true for fp4 weights, false for fp8.
-if [[ "$PRECISION" == "fp4" ]]; then
-    FP4_EXPERTS=true
-else
-    FP4_EXPERTS=false
-fi
-DSV4_ENV=(
-  -e SGLANG_DEFAULT_THINKING=1 -e SGLANG_DSV4_REASONING_EFFORT=max
-  -e SGLANG_OPT_DEEPGEMM_HC_PRENORM=false -e SGLANG_USE_AITER=1
-  -e SGLANG_USE_ROCM700A=1 -e SGLANG_OPT_USE_FUSED_COMPRESS=true
-  -e SGLANG_OPT_USE_FUSED_COMPRESS_TRITON=true
-  -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton
-  -e SGLANG_OPT_FP8_WO_A_GEMM=false -e SGLANG_OPT_USE_JIT_INDEXER_METADATA=false
-  -e SGLANG_OPT_USE_TOPK_V2=false -e SGLANG_OPT_USE_AITER_INDEXER=true
-  -e SGLANG_OPT_USE_TILELANG_INDEXER=false -e SGLANG_OPT_USE_TILELANG_MHC_PRE=false
-  -e SGLANG_OPT_USE_TILELANG_MHC_POST=false -e SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
-  -e SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=false -e SGLANG_ROCM_USE_MULTI_STREAM=false
-  -e AITER_BF16_FP8_MOE_BOUND=0 -e SGLANG_DSV4_FP4_EXPERTS=$FP4_EXPERTS
-)
-DSV4_ENV_STR="${DSV4_ENV[*]}"
+# MORI KV-transport env (fixed for the RoCE fabric; model-independent).
 MORI_ENV="-e MORI_DISABLE_AUTO_XGMI=1 -e NCCL_IB_HCA=ionic -e NCCL_IB_GID_INDEX=1 -e NCCL_CROSS_NIC=1"
+
+# ---------------------------------------------------------------------------
+# Model-specific env + server flags: written as bash arrays to model_flags.sh
+# (sourced by prefill.sh/decode.sh below). Everything model-specific -- docker
+# `-e` env vars and sglang server args (parsers, loader config, model quirks) --
+# lives in the recipe's `model:` block, so adding a model is recipe-only; the
+# launcher stays a pure executor. Each server arg (including its value) MUST be
+# a separate YAML list item so shlex.quote treats "--foo" and "bar" as two argv
+# tokens rather than fusing them into one.
+python3 - "$CONFIG_FILE" "$SCRIPT_DIR" "$WORKDIR/model_flags.sh" <<'PY'
+import shlex, sys
+sys.path.insert(0, sys.argv[2])
+from recipe_utils import load_recipe
+r = load_recipe(sys.argv[1])
+model = r.get("model", {}) or {}
+env = model.get("env", {}) or {}
+server_args = model.get("server_args", []) or []
+
+# YAML `true`/`false` parse to Python bool; render them lowercase so env values
+# stay byte-identical to how they were written in shell (`=false`, not `=False`)
+# -- SGLang's env parsing is case-sensitive for some of these flags.
+def fmt(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+
+env_args = []
+for k, v in env.items():
+    env_args += ["-e", f"{k}={fmt(v)}"]
+
+def q(items):
+    return " ".join(shlex.quote(fmt(x)) for x in items)
+
+with open(sys.argv[3], "w") as f:
+    f.write(f"MODEL_ENV_ARGS=({q(env_args)})\n")
+    f.write(f"MODEL_SERVER_ARGS=({q(server_args)})\n")
+PY
 
 # Optional topology / speculative-decode flags driven by the recipe. Base recipes
 # (EP1/DP1, no mtp) leave EXTRA_FLAGS empty, preserving prior behavior exactly.
@@ -190,17 +227,35 @@ EXTRA_FLAGS=""
 (( PDP > 1 )) && EXTRA_FLAGS="$EXTRA_FLAGS --enable-dp-attention --dp-size $PDP"
 (( PEP > 1 )) && EXTRA_FLAGS="$EXTRA_FLAGS --ep-size $PEP"
 if [[ "$MTP_ENABLED" == "1" ]]; then
-    EXTRA_FLAGS="$EXTRA_FLAGS --speculative-algorithm EAGLE \
+    EXTRA_FLAGS="$EXTRA_FLAGS --speculative-algorithm $MTP_ALGO \
 --speculative-num-steps $MTP_STEPS --speculative-eagle-topk $MTP_TOPK \
 --speculative-num-draft-tokens $MTP_DRAFT"
+    # EAGLE3 (and other draft-model algos) need an external draft checkpoint;
+    # built-in EAGLE (DSV4) omits draft_model_path and this stays unset.
+    if [[ -n "$MTP_DRAFT_PATH" ]]; then
+        DRAFT_RESOLVED="$(resolve_snapshot "$MTP_DRAFT_PATH")" || exit 1
+        EXTRA_FLAGS="$EXTRA_FLAGS --speculative-draft-model-path $DRAFT_RESOLVED"
+    fi
 fi
-echo "extra flags: ${EXTRA_FLAGS:-<none>} (pep=$PEP pdp=$PDP mtp=$MTP_ENABLED)"
+echo "extra flags: ${EXTRA_FLAGS:-<none>} (pep=$PEP pdp=$PDP mtp=$MTP_ENABLED algo=$MTP_ALGO)"
 
+# Attention backend: single `--attention-backend` when the recipe sets
+# `attention_backend`; split `--prefill-/--decode-attention-backend` when it
+# sets the per-role keys instead. A model that omits all three emits nothing.
+ATTN_FLAGS=""
+[[ -n "$ATTN" ]]  && ATTN_FLAGS="$ATTN_FLAGS --attention-backend $ATTN"
+[[ -n "$PATTN" ]] && ATTN_FLAGS="$ATTN_FLAGS --prefill-attention-backend $PATTN"
+[[ -n "$DATTN" ]] && ATTN_FLAGS="$ATTN_FLAGS --decode-attention-backend $DATTN"
+# swa is model-specific (DSV4); drop the flag when the recipe omits it.
+SWA_FLAG=""
+[[ -n "$SWA" ]] && SWA_FLAG=" --swa-full-tokens-ratio $SWA"
+
+# Generic disagg flags shared by both roles. Model-specific parsers / quirks are
+# in MODEL_SERVER_ARGS (model_flags.sh), NOT here.
 COMMON_FLAGS="--trust-remote-code --tp $PTP --disable-radix-cache \
---attention-backend $ATTN --max-running-requests $MAXREQ --page-size $PAGE \
---mem-fraction-static $MEMFRAC --swa-full-tokens-ratio $SWA \
---chunked-prefill-size $CHUNK --disable-shared-experts-fusion \
---tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
+$ATTN_FLAGS --max-running-requests $MAXREQ --page-size $PAGE \
+--mem-fraction-static $MEMFRAC$SWA_FLAG \
+--chunked-prefill-size $CHUNK \
 --disaggregation-transfer-backend mori --disaggregation-ib-device $IB$EXTRA_FLAGS"
 
 DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \
@@ -211,24 +266,33 @@ DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \
 # ---------------------------------------------------------------------------
 # Write per-role scripts that srun dispatches to each compute node.
 # ---------------------------------------------------------------------------
+# prefill.sh/decode.sh source model_flags.sh at runtime for the model-specific
+# env + server arrays. These are UNQUOTED `<<EOF` heredocs, so `$MORI_ENV`,
+# `$COMMON_FLAGS`, `$IMAGE`, `$MODEL_PATH` expand now (at generation), while the
+# `${MODEL_ENV_ARGS[@]}` / `${MODEL_SERVER_ARGS[@]}` refs are backslash-escaped
+# so they survive into the written script and expand at runtime after `source`.
 cat > "$WORKDIR/prefill.sh" <<EOF
 #!/bin/bash
+source "$WORKDIR/model_flags.sh"
 docker rm -f mi355x_prefill 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_prefill \
-  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR \
+  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV "\${MODEL_ENV_ARGS[@]}" \
   $IMAGE python3 -m sglang.launch_server \
   --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
-  $COMMON_FLAGS --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
+  $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
+  --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
 EOF
 
 cat > "$WORKDIR/decode.sh" <<EOF
 #!/bin/bash
+source "$WORKDIR/model_flags.sh"
 docker rm -f mi355x_decode 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_decode \
-  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR \
+  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV "\${MODEL_ENV_ARGS[@]}" \
   $IMAGE python3 -m sglang.launch_server \
   --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
-  $COMMON_FLAGS --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
+  $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
+  --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
 EOF
 
 # Smoke-test payload + validator (separate files to avoid quoting inside the

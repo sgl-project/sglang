@@ -1,4 +1,4 @@
-# MI355X DeepSeek-V4-Pro-FP8 2-node 1P1D disaggregation recipe.
+# MI355X DeepSeek-V4-Pro-FP8 2-node 1P1D disaggregation recipe (base).
 #
 # Pro mirrors the Flash topology (TP8 1P1D) as a starting point; Pro weights are
 # larger, so mem_fraction_static / max_running_requests may need tuning.
@@ -6,7 +6,10 @@
 # Consumed by:
 #   * scripts/ci/slurm/process_result.py reads `resources` and
 #     `backend.sglang_config` (TP/EP/DP + worker counts) for the summary table.
-#   * scripts/ci/slurm/launch_mi355x.sh reads `runtime` and `bench`.
+#   * scripts/ci/slurm/launch_mi355x.sh reads `runtime`, `bench`, `model`, `mtp`.
+#
+# The DP8/EP8 + MTP variants in this dir `extends:` this file and override only
+# their delta, so shared config lives here once.
 
 resources:
   prefill_workers: 1
@@ -22,6 +25,38 @@ backend:
       tensor-parallel-size: 8
       expert-parallel-size: 1
       data-parallel-size: 1
+
+# Model-specific docker env + sglang server args. The launcher writes these
+# verbatim (via model_flags.sh) so DSV4 quirks live here, not in the launcher.
+# Each server arg + its value is a SEPARATE list item (shlex.quote per token).
+model:
+  env:
+    SGLANG_DEFAULT_THINKING: 1
+    SGLANG_DSV4_REASONING_EFFORT: max
+    SGLANG_OPT_DEEPGEMM_HC_PRENORM: false
+    SGLANG_USE_AITER: 1
+    SGLANG_USE_ROCM700A: 1
+    SGLANG_OPT_USE_FUSED_COMPRESS: true
+    SGLANG_OPT_USE_FUSED_COMPRESS_TRITON: true
+    SGLANG_HACK_FLASHMLA_BACKEND: unified_kv_triton
+    SGLANG_OPT_FP8_WO_A_GEMM: false
+    SGLANG_OPT_USE_JIT_INDEXER_METADATA: false
+    SGLANG_OPT_USE_TOPK_V2: false
+    SGLANG_OPT_USE_AITER_INDEXER: true
+    SGLANG_OPT_USE_TILELANG_INDEXER: false
+    SGLANG_OPT_USE_TILELANG_MHC_PRE: false
+    SGLANG_OPT_USE_TILELANG_MHC_POST: false
+    SGLANG_FP8_PAGED_MQA_LOGITS_TORCH: 1
+    SGLANG_OPT_USE_MULTI_STREAM_OVERLAP: false
+    SGLANG_ROCM_USE_MULTI_STREAM: false
+    AITER_BF16_FP8_MOE_BOUND: 0
+    SGLANG_DSV4_FP4_EXPERTS: false   # fp8 weights
+  server_args:
+    - --disable-shared-experts-fusion
+    - --tool-call-parser
+    - deepseekv4
+    - --reasoning-parser
+    - deepseek-v4
 
 runtime:
   image: lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623
