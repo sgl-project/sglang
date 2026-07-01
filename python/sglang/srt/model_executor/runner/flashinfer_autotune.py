@@ -34,12 +34,7 @@ logger = logging.getLogger(__name__)
 def should_run_flashinfer_autotune(
     model_runner: ModelRunner, *, for_speculative_draft: bool = False
 ) -> bool:
-    """Return whether FlashInfer autotune should run for ``model_runner``.
-
-    In speculative mode, the default call is for target-worker warmup and
-    returns True only for target workers. Draft graph-capture paths pass
-    for_speculative_draft=True, which returns True only for draft workers.
-    """
+    """Check if flashinfer autotune should be run."""
     mr = model_runner
     if mr.device != "cuda":
         return False
@@ -192,7 +187,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool)
 def run_flashinfer_autotune_forward(
     model_runner: ModelRunner, forward_fn: Callable[[], None], *, skip_logits: bool
 ) -> None:
-    """Run ``forward_fn`` once inside the FlashInfer autotune context."""
+    """Run flashinfer autotune forward."""
     with flashinfer_autotune_context(model_runner, skip_logits=skip_logits):
         forward_fn()
 
@@ -204,16 +199,7 @@ def maybe_flashinfer_autotune_speculative_draft(
     post_warmup_hook: Optional[Callable[[], None]] = None,
     skip_logits: bool = False,
 ) -> None:
-    """Run one concrete speculative-draft forward under FlashInfer autotune.
-
-    ``runner`` is the draft cuda-graph runner (it exposes ``.model_runner`` and
-    its ``__class__`` identifies the capture phase). Speculative draft graph
-    runners have algorithm-specific inputs that the generic target-verify dummy
-    forward cannot represent, so they call this after building their real
-    capture-time ForwardBatch and before graph capture. The per-runner-phase
-    flag keeps autotune one-shot for repeated graph shapes while still allowing
-    draft and draft-extend to tune their different token shapes.
-    """
+    """Run speculative draft flashinfer autotune."""
     mr = runner.model_runner
     phase_key = f"{runner.__class__.__module__}.{runner.__class__.__qualname__}"
     tuned_phases = getattr(mr, "_flashinfer_spec_draft_autotuned_phases", None)
