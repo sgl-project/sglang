@@ -42,6 +42,7 @@ RUN source $HOME/.local/bin/env && \
     cd python && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install . && \
+    uv pip install pytest && \
     cd ../sgl-kernel && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install .

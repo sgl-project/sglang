@@ -69,6 +69,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xgrammar==0.2.1",
+  "zstandard",
 ]
 
 [project.optional-dependencies]
