@@ -46,6 +46,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     load_action_stats,
     normalize_action,
 )
+
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -134,6 +135,8 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
 
     For I2V: writes ``[1, 3, H, W]`` to ``batch.preprocessed_image``.
     For V2V: writes ``[1, 3, T_in, H, W]`` to ``batch.preprocessed_video``.
+    For transfer: writes ``[1, 3, T, H, W]`` control pixels to
+    ``batch.extra["preprocessed_control"]`` (independent of I2V / V2V).
     No-op for T2V / T2I.
     """
 
@@ -142,7 +145,85 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         return VerificationResult()
 
+    def _load_control_video(
+        self, control_path: str, target_w: int, target_h: int, num_frames: int
+    ) -> torch.Tensor:
+        """Load a control video and return ``[1, 3, num_frames, H, W]`` in [-1, 1].
+
+        Unlike the V2V conditioning input (which only locks a few frames), the
+        control map spans the whole clip, so it is resized/cropped per frame and
+        truncated to exactly ``num_frames``.
+
+        The control video must be at least ``num_frames`` long. Padding a short
+        control video (e.g. by repeating its last frame) would silently freeze
+        the control signal over the tail of the generated clip and misalign
+        control/target frames, so a too-short control video is rejected instead.
+        """
+        frames = load_video(control_path)
+        if not frames:
+            raise ValueError(f"No frames decoded from control video: {control_path!r}")
+        if len(frames) < num_frames:
+            raise ValueError(
+                f"Control video {control_path!r} has {len(frames)} frame(s) but the "
+                f"target clip needs {num_frames}. Provide a control video at least as "
+                f"long as the requested output (num_frames={num_frames}); short "
+                "control inputs are rejected to avoid silently misaligned frames."
+            )
+        frames = frames[:num_frames]
+        processed = [
+            _pil_to_normalized_tensor(
+                _resize_crop_pil(f.convert("RGB"), target_w, target_h)
+            )
+            for f in frames
+        ]
+        return torch.stack(processed, dim=1).unsqueeze(0).contiguous()
+
+    @staticmethod
+    def _normalize_control_paths(control_path: Any) -> list[str]:
+        """Normalize ``control_path`` (str / list / None) to a list of paths.
+
+        Multiple paths drive multi-hint transfer (e.g. ``[edge.mp4, depth.mp4]``):
+        each is VAE-encoded into its own control-latent block and all blocks
+        prefix the target clip in the GEN sequence.
+        """
+        if control_path is None:
+            return []
+        if isinstance(control_path, str):
+            if not control_path.strip():
+                raise ValueError("control_path is an empty string")
+            return [control_path]
+        if isinstance(control_path, (list, tuple)):
+            paths: list[str] = []
+            for i, p in enumerate(control_path):
+                if not isinstance(p, str) or not p.strip():
+                    raise ValueError(
+                        f"control_path[{i}] must be a non-empty string, got {p!r}"
+                    )
+                paths.append(p)
+            return paths
+        raise ValueError(
+            "control_path must be a string or list of strings, got "
+            f"{type(control_path).__name__}"
+        )
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        control_paths = self._normalize_control_paths(
+            getattr(batch.sampling_params, "control_path", None)
+        )
+        if control_paths:
+            control_tensors = [
+                self._load_control_video(
+                    p, batch.width, batch.height, batch.num_frames
+                )
+                for p in control_paths
+            ]
+            batch.extra["preprocessed_control"] = control_tensors
+            self.log_info(
+                f"Preprocessed {len(control_tensors)} control video(s) to "
+                f"{control_tensors[0].shape[2]} frames at "
+                f"{batch.width}x{batch.height}"
+            )
+
         image_path = batch.image_path
         if isinstance(image_path, list):
             image_path = image_path[0] if image_path else None
@@ -539,6 +620,36 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
         self.log_info(f"Prepared latents with shape {shape}")
 
+        # Transfer (control-video) conditioning: VAE-encode each control clip
+        # into clean latents the transformer prepends to the GEN sequence. Stored
+        # as a list (one block per hint) so multi-hint transfer (edge + depth …)
+        # threads through the denoiser uniformly with the single-hint case.
+        preprocessed_control = batch.extra.get("preprocessed_control")
+        if preprocessed_control is not None:
+            control_blocks = (
+                preprocessed_control
+                if isinstance(preprocessed_control, list)
+                else [preprocessed_control]
+            )
+            vae_dtype = next(self.vae.parameters()).dtype
+            control_latents_list: list[torch.Tensor] = []
+            for control_pixels_t in control_blocks:
+                control_pixels = control_pixels_t.to(device=device, dtype=vae_dtype)
+                with torch.no_grad():
+                    control_latent = self._vae_encode(control_pixels).to(dtype)
+                if control_latent.shape[-2:] != latents.shape[-2:]:
+                    raise ValueError(
+                        "control latent spatial dims "
+                        f"{tuple(control_latent.shape[-2:])} must match the target "
+                        f"latents {tuple(latents.shape[-2:])}"
+                    )
+                control_latents_list.append(control_latent)
+            batch.extra["control_latents"] = control_latents_list
+            self.log_info(
+                f"Prepared {len(control_latents_list)} control latent block(s) "
+                f"with shape {tuple(control_latents_list[0].shape)}"
+            )
+
         sound_duration = float(getattr(batch, "sound_duration", 0.0) or 0.0)
         if sound_duration > 0.0:
             if not getattr(self.transformer, "sound_gen", False):
@@ -895,6 +1006,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         action_noisy_mask: torch.Tensor | None = None,
         action_fps: float | None = None,
         action_start_frame_offset: int = 1,
+        control_latents: list[torch.Tensor] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Run transformer forward pass.
 
@@ -928,6 +1040,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 action_noisy_mask=action_noisy_mask,
                 action_fps=action_fps,
                 action_start_frame_offset=action_start_frame_offset,
+                control_latents=control_latents,
             )
 
     def _manage_device_placement(self, server_args: ServerArgs):
@@ -990,11 +1103,23 @@ class Cosmos3DenoisingStage(PipelineStage):
         fps = batch.extra.get("fps", 24.0)
         velocity_mask = batch.extra.get("velocity_mask")
         condition_latents = batch.extra.get("condition_latents")
+        control_latents = batch.extra.get("control_latents")
         guidance_interval = getattr(batch.sampling_params, "guidance_interval", None)
+        control_guidance = getattr(batch.sampling_params, "control_guidance", 1.0)
+        if control_guidance is None:
+            control_guidance = 1.0
+        control_guidance_interval = getattr(
+            batch.sampling_params, "control_guidance_interval", None
+        )
 
         do_cfg = guidance_scale > 1.0
+        # Control-CFG runs even when text guidance is off (its own extra
+        # control-dropped forward), so it can drive CFG parallel on its own.
+        any_control_cfg = control_latents is not None and control_guidance != 1.0
 
-        enable_cfg_parallel = server_args.enable_cfg_parallel and do_cfg
+        enable_cfg_parallel = server_args.enable_cfg_parallel and (
+            do_cfg or any_control_cfg
+        )
         if action_latents is not None and enable_cfg_parallel:
             raise NotImplementedError(
                 "Cosmos3 action generation does not support CFG parallel yet"
@@ -1056,10 +1181,60 @@ class Cosmos3DenoisingStage(PipelineStage):
             effective_scale = (
                 guidance_scale if self._cfg_active_at(t, guidance_interval) else 1.0
             )
+            # Transfer control-CFG: active only when a control video is present,
+            # ``control_guidance != 1.0``, and the step is inside the (optional)
+            # control window. It needs a second control-dropped forward, so it
+            # owns the prediction for the step and composes text CFG internally.
+            control_cfg_active = (
+                control_latents is not None
+                and control_guidance != 1.0
+                and self._cfg_active_at(t, control_guidance_interval)
+            )
 
-            if do_cfg:
-                if enable_cfg_parallel:
-                    noise_pred = self._predict_noise_cfg_parallel(
+            if control_cfg_active:
+                # Control-CFG owns the step: 2 branches (text guidance off) or 3
+                # (text guidance on), distributed across CFG ranks and reduced by
+                # ``_predict_noise_cfg`` (sequential per rank, no batching).
+                branches = self._control_cfg_branches(
+                    cond_text_ids,
+                    cond_text_mask,
+                    uncond_text_ids,
+                    uncond_text_mask,
+                    cond_text_seq_len=batch.extra["cond_text_seq_len"],
+                    uncond_text_seq_len=batch.extra["uncond_text_seq_len"],
+                    control_latents=control_latents,
+                    text_guidance_scale=effective_scale,
+                    control_guidance_scale=control_guidance,
+                )
+                noise_pred = self._predict_noise_cfg(
+                    branches,
+                    latents=latents,
+                    timestep=timestep,
+                    video_shape=video_shape,
+                    fps=fps,
+                    cfg_rank=cfg_rank,
+                    cfg_world_size=cfg_world_size,
+                    noisy_frame_mask=velocity_mask,
+                    current_timestep=i,
+                    sound_latents=sound_latents,
+                    action_latents=action_latents,
+                    action_domain_ids=action_domain_ids,
+                    action_noisy_mask=action_velocity_mask,
+                    action_fps=action_fps,
+                    action_start_frame_offset=action_start_frame_offset,
+                )
+            elif do_cfg and effective_scale != 1.0:
+                cond_text_seq_len = batch.extra["cond_text_seq_len"]
+                uncond_text_seq_len = batch.extra["uncond_text_seq_len"]
+                can_batch_text_cfg = (
+                    cfg_world_size == 1
+                    and control_latents is None
+                    and cond_text_seq_len == uncond_text_seq_len
+                )
+                if can_batch_text_cfg:
+                    # Single-GPU, control-free text CFG: one batch_size=2 forward
+                    # (lower launch overhead, no control tokens to duplicate).
+                    noise_pred = self._predict_noise_cfg_batched(
                         latents=latents,
                         timestep=timestep,
                         cond_text_ids=cond_text_ids,
@@ -1069,29 +1244,8 @@ class Cosmos3DenoisingStage(PipelineStage):
                         video_shape=video_shape,
                         fps=fps,
                         guidance_scale=effective_scale,
-                        cfg_rank=cfg_rank,
                         noisy_frame_mask=velocity_mask,
-                        cond_text_seq_len=batch.extra["cond_text_seq_len"],
-                        uncond_text_seq_len=batch.extra["uncond_text_seq_len"],
-                        current_timestep=i,
-                        sound_latents=sound_latents,
-                        action_latents=action_latents,
-                        action_domain_ids=action_domain_ids,
-                        action_noisy_mask=action_velocity_mask,
-                        action_fps=action_fps,
-                        action_start_frame_offset=action_start_frame_offset,
-                    )
-                elif effective_scale == 1.0:
-                    noise_pred = self._run_transformer(
-                        latents=latents,
-                        timestep=timestep,
-                        text_ids=cond_text_ids,
-                        text_mask=cond_text_mask,
-                        video_shape=video_shape,
-                        fps=fps,
-                        cache_key="cond",
-                        noisy_frame_mask=velocity_mask,
-                        max_text_seq_len=batch.extra["cond_text_seq_len"],
+                        max_text_seq_len=cond_text_seq_len,
                         current_timestep=i,
                         sound_latents=sound_latents,
                         action_latents=action_latents,
@@ -1101,19 +1255,40 @@ class Cosmos3DenoisingStage(PipelineStage):
                         action_start_frame_offset=action_start_frame_offset,
                     )
                 else:
+                    if (
+                        cond_text_seq_len != uncond_text_seq_len
+                        and not self._logged_cfg_split
+                        and not self._current_batch_is_warmup
+                    ):
+                        self._logged_cfg_split = True
+                        self.log_info(
+                            "Prompt and negative prompt tokenize to different lengths "
+                            f"({cond_text_seq_len} vs {uncond_text_seq_len}); running "
+                            "the CFG branches in separate forwards to keep padding "
+                            "out of the cross-attention"
+                        )
+                    # CFG parallel, control passthrough, or unequal text lengths:
+                    # distribute unbatched branches across ranks. Separate
+                    # forwards preserve each branch's native text length.
+                    branches = self._text_cfg_branches(
+                        cond_text_ids,
+                        cond_text_mask,
+                        uncond_text_ids,
+                        uncond_text_mask,
+                        guidance_scale=effective_scale,
+                        cond_text_seq_len=cond_text_seq_len,
+                        uncond_text_seq_len=uncond_text_seq_len,
+                        control_latents=control_latents,
+                    )
                     noise_pred = self._predict_noise_cfg(
+                        branches,
                         latents=latents,
                         timestep=timestep,
-                        cond_text_ids=cond_text_ids,
-                        cond_text_mask=cond_text_mask,
-                        uncond_text_ids=uncond_text_ids,
-                        uncond_text_mask=uncond_text_mask,
                         video_shape=video_shape,
                         fps=fps,
-                        guidance_scale=effective_scale,
+                        cfg_rank=cfg_rank,
+                        cfg_world_size=cfg_world_size,
                         noisy_frame_mask=velocity_mask,
-                        cond_text_seq_len=batch.extra["cond_text_seq_len"],
-                        uncond_text_seq_len=batch.extra["uncond_text_seq_len"],
                         current_timestep=i,
                         sound_latents=sound_latents,
                         action_latents=action_latents,
@@ -1123,6 +1298,8 @@ class Cosmos3DenoisingStage(PipelineStage):
                         action_start_frame_offset=action_start_frame_offset,
                     )
             else:
+                # No CFG this step (guidance off or outside the CFG window): a
+                # single conditional forward, run identically on every rank.
                 noise_pred = self._run_transformer(
                     latents=latents,
                     timestep=timestep,
@@ -1140,6 +1317,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                     action_noisy_mask=action_velocity_mask,
                     action_fps=action_fps,
                     action_start_frame_offset=action_start_frame_offset,
+                    control_latents=control_latents,
                 )
 
             # Unpack multi-modality outputs; ordering is (video[, action][, sound]).
@@ -1221,87 +1399,88 @@ class Cosmos3DenoisingStage(PipelineStage):
 
     def _predict_noise_cfg(
         self,
+        branches: list[dict],
+        *,
         latents: torch.Tensor,
         timestep: torch.Tensor,
-        cond_text_ids: torch.Tensor,
-        cond_text_mask: torch.Tensor,
-        uncond_text_ids: torch.Tensor,
-        uncond_text_mask: torch.Tensor,
         video_shape: tuple[int, int, int],
         fps: float,
-        guidance_scale: float,
-        cond_text_seq_len: int,
-        uncond_text_seq_len: int,
-        **kwargs: Any,
+        cfg_rank: int,
+        cfg_world_size: int,
+        noisy_frame_mask: torch.Tensor | None = None,
+        current_timestep: int | None = None,
+        sound_latents: torch.Tensor | None = None,
+        action_latents: torch.Tensor | None = None,
+        action_domain_ids: torch.Tensor | None = None,
+        action_noisy_mask: torch.Tensor | None = None,
+        action_fps: float | None = None,
+        action_start_frame_offset: int = 1,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        """Run CFG, batching the two branches only when that is lossless.
+        """Combine CFG branches as the weighted sum ``sum_b coeff_b * f(branch_b)``.
 
-        A batched forward needs one shared text length, so the shorter prompt
-        gets right-padded. Those pad positions carry all-zero UND K/V, and the
-        GEN cross-attention runs unmasked over the full text K/V — a zero key
-        scores logit 0 and still takes softmax mass while contributing nothing,
-        which weakens the padded branch's conditioning. Fall back to one
-        forward per branch, each trimmed to its own length, whenever the
-        prompts differ in length.
+        Both text CFG and transfer control-CFG are linear in their per-branch
+        forwards, so each is expressed as a list of branches (text ids/mask,
+        control latents, UND cache key, coeff) and reduced here. ``branches`` is
+        identical on every CFG rank.
+
+        Branches are distributed round-robin across the ``cfg_world_size`` CFG
+        ranks. A rank runs its branches sequentially and a final sum all-reduce
+        combines ranks. Forwards are never batched, which preserves each text
+        branch's native length and bounds activation memory with control inputs.
         """
-        if cond_text_seq_len == uncond_text_seq_len:
-            return self._predict_noise_cfg_batched(
+        acc = None
+        for i, branch in enumerate(branches):
+            if i % cfg_world_size != cfg_rank:
+                continue
+            out = self._run_transformer(
                 latents=latents,
                 timestep=timestep,
-                cond_text_ids=cond_text_ids,
-                cond_text_mask=cond_text_mask,
-                uncond_text_ids=uncond_text_ids,
-                uncond_text_mask=uncond_text_mask,
+                text_ids=branch["text_ids"],
+                text_mask=branch["text_mask"],
                 video_shape=video_shape,
                 fps=fps,
-                guidance_scale=guidance_scale,
-                max_text_seq_len=cond_text_seq_len,
-                **kwargs,
+                cache_key=branch["cache_key"],
+                noisy_frame_mask=noisy_frame_mask,
+                max_text_seq_len=branch["text_seq_len"],
+                current_timestep=current_timestep,
+                sound_latents=sound_latents,
+                action_latents=action_latents,
+                action_domain_ids=action_domain_ids,
+                action_noisy_mask=action_noisy_mask,
+                action_fps=action_fps,
+                action_start_frame_offset=action_start_frame_offset,
+                control_latents=branch["control_latents"],
             )
+            coeff = branch["coeff"]
+            if isinstance(out, tuple):
+                scaled = tuple(coeff * prediction for prediction in out)
+                acc = (
+                    scaled
+                    if acc is None
+                    else tuple(
+                        total + contribution
+                        for total, contribution in zip(acc, scaled, strict=True)
+                    )
+                )
+            else:
+                scaled = coeff * out
+                acc = scaled if acc is None else acc + scaled
 
-        if not self._logged_cfg_split and not self._current_batch_is_warmup:
-            self._logged_cfg_split = True
-            self.log_info(
-                "Prompt and negative prompt tokenize to different lengths "
-                f"({cond_text_seq_len} vs {uncond_text_seq_len}); running the "
-                "CFG branches in separate forwards to keep padding out of the "
-                "cross-attention"
-            )
+        if acc is None:
+            # More ranks than branches: contribute zeros to the all-reduce.
+            acc = self._zero_like_output(latents, action_latents, sound_latents)
 
-        cond = self._run_transformer(
-            latents=latents,
-            timestep=timestep,
-            text_ids=cond_text_ids,
-            text_mask=cond_text_mask,
-            video_shape=video_shape,
-            fps=fps,
-            cache_key="cond",
-            max_text_seq_len=cond_text_seq_len,
-            **kwargs,
-        )
-        uncond = self._run_transformer(
-            latents=latents,
-            timestep=timestep,
-            text_ids=uncond_text_ids,
-            text_mask=uncond_text_mask,
-            video_shape=video_shape,
-            fps=fps,
-            cache_key="uncond",
-            max_text_seq_len=uncond_text_seq_len,
-            **kwargs,
-        )
-
-        def _cfg_combine(
-            cond_pred: torch.Tensor, uncond_pred: torch.Tensor
-        ) -> torch.Tensor:
-            return uncond_pred + guidance_scale * (cond_pred - uncond_pred)
-
-        if isinstance(cond, tuple):
-            return tuple(_cfg_combine(c, u) for c, u in zip(cond, uncond, strict=True))
-        return _cfg_combine(cond, uncond)
+        if cfg_world_size > 1:
+            if isinstance(acc, tuple):
+                return tuple(
+                    cfg_model_parallel_all_reduce(prediction) for prediction in acc
+                )
+            return cfg_model_parallel_all_reduce(acc)
+        return acc
 
     def _predict_noise_cfg_batched(
         self,
+        *,
         latents: torch.Tensor,
         timestep: torch.Tensor,
         cond_text_ids: torch.Tensor,
@@ -1321,133 +1500,191 @@ class Cosmos3DenoisingStage(PipelineStage):
         action_fps: float | None = None,
         action_start_frame_offset: int = 1,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        """Run CFG by stacking both branches into a batch_size=2 forward.
+        """Run CFG as one ``batch_size=2`` forward stacking both branches (``[uncond, cond]``).
 
-        Halves the kernel-launch count vs running cond and uncond serially.
-        Order is ``[uncond, cond]`` so the chunk-and-combine math below
-        matches the standard CFG formula.
+        Kept only for the non-parallel, control-free text path: one batched
+        forward has lower kernel-launch overhead than two serial ones, and
+        doubling the GEN tokens is cheap here. The caller does not route control
+        through this (batching the larger control-in forwards risks OOM on big
+        models — that path uses ``_predict_noise_cfg`` instead) and CFG parallel
+        splits branches across ranks rather than batching.
         """
-        latents_batched = torch.cat([latents, latents], dim=0)
-        text_ids_batched = torch.cat([uncond_text_ids, cond_text_ids], dim=0)
-        text_mask_batched = torch.cat([uncond_text_mask, cond_text_mask], dim=0)
-        timestep_batched = timestep.expand(2)
-        mask_batched = (
+        latents_b = torch.cat([latents, latents], dim=0)
+        text_ids_b = torch.cat([uncond_text_ids, cond_text_ids], dim=0)
+        text_mask_b = torch.cat([uncond_text_mask, cond_text_mask], dim=0)
+        timestep_b = timestep.expand(2)
+        mask_b = (
             torch.cat([noisy_frame_mask, noisy_frame_mask], dim=0)
             if noisy_frame_mask is not None
             else None
         )
-        sound_batched = (
+        sound_b = (
             torch.cat([sound_latents, sound_latents], dim=0)
             if sound_latents is not None
             else None
         )
-        action_batched = (
+        action_b = (
             torch.cat([action_latents, action_latents], dim=0)
             if action_latents is not None
             else None
         )
-        action_domain_ids_batched = (
+        action_domain_b = (
             torch.cat([action_domain_ids, action_domain_ids], dim=0)
             if action_domain_ids is not None
             else None
         )
-        action_noisy_mask_batched = (
+        action_mask_b = (
             torch.cat([action_noisy_mask, action_noisy_mask], dim=0)
             if action_noisy_mask is not None
             else None
         )
 
         out = self._run_transformer(
-            latents=latents_batched,
-            timestep=timestep_batched,
-            text_ids=text_ids_batched,
-            text_mask=text_mask_batched,
+            latents=latents_b,
+            timestep=timestep_b,
+            text_ids=text_ids_b,
+            text_mask=text_mask_b,
             video_shape=video_shape,
             fps=fps,
             cache_key="cfg_batched",
-            noisy_frame_mask=mask_batched,
+            noisy_frame_mask=mask_b,
             max_text_seq_len=max_text_seq_len,
             current_timestep=current_timestep,
-            sound_latents=sound_batched,
-            action_latents=action_batched,
-            action_domain_ids=action_domain_ids_batched,
-            action_noisy_mask=action_noisy_mask_batched,
+            sound_latents=sound_b,
+            action_latents=action_b,
+            action_domain_ids=action_domain_b,
+            action_noisy_mask=action_mask_b,
             action_fps=action_fps,
             action_start_frame_offset=action_start_frame_offset,
+            control_latents=None,
         )
 
-        def _cfg_combine(pred: torch.Tensor) -> torch.Tensor:
-            uncond, cond = pred.chunk(2, dim=0)
+        def _combine(o: torch.Tensor) -> torch.Tensor:
+            uncond, cond = o.chunk(2, dim=0)
             return uncond + guidance_scale * (cond - uncond)
 
         if isinstance(out, tuple):
-            return tuple(_cfg_combine(p) for p in out)
-        return _cfg_combine(out)
+            return tuple(_combine(p) for p in out)
+        return _combine(out)
 
-    def _predict_noise_cfg_parallel(
-        self,
+    @staticmethod
+    def _zero_like_output(
         latents: torch.Tensor,
-        timestep: torch.Tensor,
+        action_latents: torch.Tensor | None,
+        sound_latents: torch.Tensor | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Zero prediction matching the forward's (video[, action][, sound]) layout."""
+        zeros = [torch.zeros_like(latents)]
+        if action_latents is not None:
+            zeros.append(torch.zeros_like(action_latents))
+        if sound_latents is not None:
+            zeros.append(torch.zeros_like(sound_latents))
+        return zeros[0] if len(zeros) == 1 else tuple(zeros)
+
+    @staticmethod
+    def _text_cfg_branches(
         cond_text_ids: torch.Tensor,
         cond_text_mask: torch.Tensor,
         uncond_text_ids: torch.Tensor,
         uncond_text_mask: torch.Tensor,
-        video_shape: tuple[int, int, int],
-        fps: float,
+        *,
         guidance_scale: float,
-        cfg_rank: int,
-        noisy_frame_mask: torch.Tensor | None = None,
-        cond_text_seq_len: int | None = None,
-        uncond_text_seq_len: int | None = None,
-        current_timestep: int | None = None,
-        sound_latents: torch.Tensor | None = None,
-        action_latents: torch.Tensor | None = None,
-        action_domain_ids: torch.Tensor | None = None,
-        action_noisy_mask: torch.Tensor | None = None,
-        action_fps: float | None = None,
-        action_start_frame_offset: int = 1,
-    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        """Run CFG with one branch per CFG rank, combined by all-reduce.
+        cond_text_seq_len: int | None,
+        uncond_text_seq_len: int | None,
+        control_latents: list[torch.Tensor] | None,
+    ) -> list[dict]:
+        """Standard text CFG as two branches: ``g*cond + (1-g)*uncond``.
 
-        Rank 0 runs the conditional branch and contributes ``g·cond`` to the
-        sum; rank 1 runs the unconditional branch and contributes
-        ``(1−g)·uncond``. The all-reduce sum is exactly the standard CFG
-        result. Each rank keeps its own UND K/V cache (``"cond"`` /
-        ``"uncond"``). When sound/action modalities are present the forward
-        returns a per-modality tuple; each branch scales every modality by its
-        coefficient and the reduction combines them element-wise.
+        Control latents (if any) pass through both branches unchanged — text CFG
+        does not drop the control map; that is what control-CFG adds.
         """
-        if cfg_rank == 0:
-            text_ids, text_mask, cache_key = cond_text_ids, cond_text_mask, "cond"
-            text_seq_len = cond_text_seq_len
-            coeff = guidance_scale
-        else:
-            text_ids, text_mask, cache_key = uncond_text_ids, uncond_text_mask, "uncond"
-            text_seq_len = uncond_text_seq_len
-            coeff = 1.0 - guidance_scale
+        return [
+            {
+                "cache_key": "cond",
+                "text_ids": cond_text_ids,
+                "text_mask": cond_text_mask,
+                "text_seq_len": cond_text_seq_len,
+                "control_latents": control_latents,
+                "coeff": guidance_scale,
+            },
+            {
+                "cache_key": "uncond",
+                "text_ids": uncond_text_ids,
+                "text_mask": uncond_text_mask,
+                "text_seq_len": uncond_text_seq_len,
+                "control_latents": control_latents,
+                "coeff": 1.0 - guidance_scale,
+            },
+        ]
 
-        out = self._run_transformer(
-            latents=latents,
-            timestep=timestep,
-            text_ids=text_ids,
-            text_mask=text_mask,
-            video_shape=video_shape,
-            fps=fps,
-            cache_key=cache_key,
-            noisy_frame_mask=noisy_frame_mask,
-            max_text_seq_len=text_seq_len,
-            current_timestep=current_timestep,
-            sound_latents=sound_latents,
-            action_latents=action_latents,
-            action_domain_ids=action_domain_ids,
-            action_noisy_mask=action_noisy_mask,
-            action_fps=action_fps,
-            action_start_frame_offset=action_start_frame_offset,
-        )
+    @staticmethod
+    def _control_cfg_branches(
+        cond_text_ids: torch.Tensor,
+        cond_text_mask: torch.Tensor,
+        uncond_text_ids: torch.Tensor,
+        uncond_text_mask: torch.Tensor,
+        *,
+        cond_text_seq_len: int | None,
+        uncond_text_seq_len: int | None,
+        control_latents: list[torch.Tensor] | None,
+        text_guidance_scale: float,
+        control_guidance_scale: float,
+    ) -> list[dict]:
+        """Transfer control-CFG (optionally composed with text CFG) as branches.
 
-        if isinstance(out, tuple):
-            return tuple(cfg_model_parallel_all_reduce(coeff * p) for p in out)
-        return cfg_model_parallel_all_reduce(coeff * out)
+        Two conditional forwards share the cond-text branch but differ in whether
+        the control map is packed in:
+
+        - ``cond_full`` — control clips in (the standard transfer forward)
+        - ``cond_nc``   — control clips dropped (``control_latents=None``)
+
+        mixed on the generated span as ``cond = cond_nc + cg*(cond_full -
+        cond_nc)``. When text CFG is also active a third (uncond, control-in)
+        forward composes the text blend ``pred = uncond + g*(cond - uncond)`` on
+        top. Expanding both gives the coefficient-weighted sum reduced by
+        ``_predict_noise_cfg``::
+
+            pred = g*cg*cond_full + g*(1-cg)*cond_nc + (1-g)*uncond
+
+        (with ``g = 1`` collapsing to ``cg*cond_full + (1-cg)*cond_nc``).
+
+        Branch order places the two control-in forwards first and ``cond_nc``
+        second so the round-robin split in ``_predict_noise_cfg`` lands the
+        control-in pair on rank 0 and ``cond_nc`` on rank 1 under 2-rank CFG.
+        ``cond_full`` and ``cond_nc`` reuse distinct UND cache keys (``"cond"`` /
+        ``"cond_nc"``) because their GEN rope layout differs.
+        """
+        g = text_guidance_scale
+        cg = control_guidance_scale
+        cond_full = {
+            "cache_key": "cond",
+            "text_ids": cond_text_ids,
+            "text_mask": cond_text_mask,
+            "text_seq_len": cond_text_seq_len,
+            "control_latents": control_latents,
+        }
+        cond_nc = {
+            "cache_key": "cond_nc",
+            "text_ids": cond_text_ids,
+            "text_mask": cond_text_mask,
+            "text_seq_len": cond_text_seq_len,
+            "control_latents": None,
+        }
+        if g == 1.0:
+            cond_full["coeff"] = cg
+            cond_nc["coeff"] = 1.0 - cg
+            return [cond_full, cond_nc]
+        cond_full["coeff"] = g * cg
+        cond_nc["coeff"] = g * (1.0 - cg)
+        uncond = {
+            "cache_key": "uncond",
+            "text_ids": uncond_text_ids,
+            "text_mask": uncond_text_mask,
+            "text_seq_len": uncond_text_seq_len,
+            "control_latents": control_latents,
+            "coeff": 1.0 - g,
+        }
+        return [cond_full, cond_nc, uncond]
 
 
 class Cosmos3DecodingStage(PipelineStage):

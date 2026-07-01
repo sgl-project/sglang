@@ -7,7 +7,7 @@ cross-attends from noisy visual tokens to that cache at every denoising step.
 """
 
 import math
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from typing import Any
 
 import torch
@@ -1302,8 +1302,18 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         action_frames: int = 0,
         action_fps: float | None = None,
         action_start_frame_offset: int = 1,
+        control_frames: int | Sequence[int] = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute mRoPE position IDs for UND text and GEN visual + action + sound tokens."""
+        """Compute mRoPE position IDs for UND text and GEN tokens.
+
+        The GEN sequence is ordered ``[control, video, action, sound]``. When
+        control clips are present they are prepended in order; each shares the
+        video's temporal coordinate frame (``share_vision_temporal_positions``)
+        so control frame ``t`` aligns with target frame ``t``.
+        ``control_frames`` is the per-clip latent frame count: an ``int`` for a
+        single control clip, or a sequence (one entry per clip) for the
+        multi-hint (e.g. edge + depth) case.
+        """
         B = text_mask.shape[0]
         S_text = text_mask.shape[1]
         text_lengths = text_mask.sum(dim=1).long()
@@ -1350,6 +1360,39 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 )
                 pos_dtype = torch.promote_types(v_pos.dtype, s_pos.dtype)
                 v_pos = torch.cat([v_pos.to(pos_dtype), s_pos.to(pos_dtype)], dim=1)
+            if control_frames:
+                # Control clips prefix the GEN sequence and share the video's
+                # temporal positions (same media_offset, T-grid, and fps
+                # modulation), so control frame t aligns with target frame t.
+                # Build all clip blocks in packing order ([c0, c1, ...]) and
+                # prepend them as a single contiguous block so the position IDs
+                # match the hidden layout produced in ``forward``.
+                cf_list = (
+                    [control_frames]
+                    if isinstance(control_frames, int)
+                    else [int(c) for c in control_frames]
+                )
+                c_pos_blocks = []
+                for cf in cf_list:
+                    if cf <= 0:
+                        continue
+                    c_pos, _ = compute_mrope_position_ids_vision(
+                        cf,
+                        Hp,
+                        Wp,
+                        temporal_offset=media_offset,
+                        device=device,
+                        fps=effective_fps,
+                        base_fps=self.base_fps,
+                        temporal_compression_factor=self.temporal_compression_factor,
+                    )
+                    c_pos_blocks.append(c_pos)
+                if c_pos_blocks:
+                    c_pos_all = torch.cat(c_pos_blocks, dim=1)
+                    pos_dtype = torch.promote_types(v_pos.dtype, c_pos_all.dtype)
+                    v_pos = torch.cat(
+                        [c_pos_all.to(pos_dtype), v_pos.to(pos_dtype)], dim=1
+                    )
             if real_len < S_text:
                 t_pos = torch.cat(
                     [
@@ -1412,6 +1455,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         action_noisy_mask: torch.Tensor | None = None,
         action_fps: float | None = None,
         action_start_frame_offset: int = 1,
+        control_latents: torch.Tensor | list[torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Forward pass for denoising.
@@ -1442,6 +1486,11 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 Defaults to the video fps when None.
             action_start_frame_offset: Temporal offset applied to action
                 position IDs relative to the video's media_offset (default 1).
+            control_latents: Optional [B, C, T_ctrl, H, W] control-video latents
+                (transfer / control-net conditioning). They are patchified and
+                projected with the shared ``proj_in``, prepended to the GEN
+                sequence as clean (noise-free) tokens that share the video's
+                temporal positions, and excluded from the output projection.
 
         Returns:
             [B, C, T, H, W] velocity prediction, or a tuple
@@ -1474,8 +1523,44 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                     device=action_latents.device,
                 )
 
+        # Transfer / control-video conditioning: one or more control clips
+        # (e.g. edge + depth) are packed as clean vision tokens that prefix the
+        # target clip in the GEN sequence. Each clip reuses ``proj_in`` and the
+        # shared transformer; blocks are concatenated in input order.
+        control_clips: list[torch.Tensor] = []
+        if control_latents is not None:
+            control_clips = (
+                list(control_latents)
+                if isinstance(control_latents, (list, tuple))
+                else [control_latents]
+            )
+        control_frame_counts: list[int] = []
+        hidden_control_blocks: list[torch.Tensor] = []
+        control_token_len = 0
+        for clip in control_clips:
+            _, _, c_frames, Hc, Wc = clip.shape
+            if (Hc, Wc) != (H, W):
+                raise ValueError(
+                    "control_latents spatial dims "
+                    f"{(Hc, Wc)} must match hidden_states {(H, W)}"
+                )
+            block, _ = self.proj_in(
+                self.patchify(clip.to(hidden_states.dtype), c_frames, Hc, Wc)
+            )
+            hidden_control_blocks.append(block)
+            control_frame_counts.append(c_frames)
+            control_token_len += block.shape[1]
+        has_control = len(hidden_control_blocks) > 0
+        hidden_control = (
+            torch.cat(hidden_control_blocks, dim=1) if has_control else None
+        )
+
         extra_frames = action_frames + sound_frames
         sequence_shard_enabled = self.sp_size > 1
+        # When a control clip is present we always assemble the combined GEN
+        # stream (control prefix + video [+ action] [+ sound]) instead of the
+        # video-only fast path.
+        use_assembly_path = extra_frames > 0 or has_control
 
         # Add timestep embedding (computed in float32 for numerical stability, then cast back)
         time_embed = self.time_embedder(timestep.float())
@@ -1500,7 +1585,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 .to(hidden_gen.dtype)
             )
 
-        if extra_frames == 0:
+        if not use_assembly_path:
             # Video-only: shard the visual tokens, then add the timestep
             # embedding on the local shard.
             if sequence_shard_enabled:
@@ -1536,14 +1621,20 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 hidden_gen = hidden_gen + time_embed.unsqueeze(1)
         else:
             # Multi-modal: assemble the full GEN sequence
-            # (video[, action][, sound]) with timestep embeddings, then shard
-            # the combined stream so sequence parallelism splits every modality
-            # evenly. The per-modality output heads run after the post-loop
-            # all-gather reassembles the sequence.
+            # ([control,] video[, action][, sound]) with timestep embeddings,
+            # then shard the combined stream so sequence parallelism splits
+            # every modality evenly. The per-modality output heads run after the
+            # post-loop all-gather reassembles the sequence.
             if token_noisy_mask is not None:
                 hidden_gen = hidden_gen + time_embed.unsqueeze(1) * token_noisy_mask
             else:
                 hidden_gen = hidden_gen + time_embed.unsqueeze(1)
+
+            # Control tokens are clean conditioning: prepend them WITHOUT a
+            # timestep embedding so the GEN tokens can attend to the raw control
+            # map. They are stripped before the output projection.
+            if has_control:
+                hidden_gen = torch.cat([hidden_control, hidden_gen], dim=1)
 
             if action_latents is not None:
                 hidden_action = self.action_proj_in(
@@ -1604,6 +1695,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 action_frames=action_frames,
                 action_fps=action_fps if action_fps is not None else fps,
                 action_start_frame_offset=action_start_frame_offset,
+                control_frames=control_frame_counts,
             )
             # UND K/V cache is kept FULL on all ranks (not sharded). Text
             # sequence is short, so memory impact is minimal, and the GEN
@@ -1652,7 +1744,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         hidden_gen = hidden_gen + residual
         hidden_gen = self.norm_moe_gen(hidden_gen)
 
-        if extra_frames == 0:
+        if not use_assembly_path:
             # Video-only: project on the local shard and gather the (much
             # smaller) patch-space output. With patch_latent_dim ~=
             # hidden_size / 21 for cosmos3, this cuts the post-loop SP
@@ -1671,12 +1763,15 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             if seq_shard_pad > 0:
                 hidden_gen = hidden_gen[:, :seq_len_orig, :]
 
-        s_video = seq_len_orig - extra_frames
-        output, _ = self.proj_out(hidden_gen[:, :s_video, :])
+        # Sequence layout: [control prefix | video | action | sound]. Control
+        # tokens are conditioning only and produce no output.
+        s_video = seq_len_orig - extra_frames - control_token_len
+        video_start = control_token_len
+        output, _ = self.proj_out(hidden_gen[:, video_start : video_start + s_video, :])
         video_pred = self.unpatchify(output, T, H, W)
 
         extra_outputs: list[torch.Tensor] = []
-        idx = s_video
+        idx = video_start + s_video
         if action_frames > 0:
             action_hidden = hidden_gen[:, idx : idx + action_frames, :]
             extra_outputs.append(self.action_proj_out(action_hidden, action_domain_ids))
@@ -1686,6 +1781,10 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             sound_output, _ = self.audio_proj_out(sound_hidden)
             extra_outputs.append(sound_output.permute(0, 2, 1).contiguous())
 
+        # Control-only conditioning (no action/sound): keep the bare-tensor
+        # return type identical to the video-only path.
+        if not extra_outputs:
+            return video_pred
         return (video_pred, *extra_outputs)
 
     def preprocess_loaded_state_dict(

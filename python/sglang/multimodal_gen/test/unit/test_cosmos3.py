@@ -44,6 +44,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader imp
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
+    Cosmos3OmniTransformer,
     DomainAwareLinear,
     compute_mrope_position_ids_action,
     compute_mrope_position_ids_sound,
@@ -688,31 +689,27 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
                 self.assertNotIn("use_system_prompt", request_cls.model_fields)
                 self.assertNotIn("use_guardrails", request_cls.model_fields)
 
-    def test_cosmos3_modal_fields_pass_through_as_extras(self):
-        for field_name in ("video_path", "video_url"):
+    def test_cosmos3_modal_fields_are_video_request_fields(self):
+        for field_name in (
+            "video_path",
+            "video_url",
+            "generate_sound",
+            "sound_duration",
+            "condition_frame_indexes",
+            "condition_frame_indexes_vision",
+            "condition_video_keep",
+            "action_mode",
+            "domain_id",
+            "domain_name",
+            "raw_action_dim",
+            "action_fps",
+            "action",
+            "action_view_point",
+            "action_stats_path",
+            "action_normalization",
+        ):
             with self.subTest(field_name=field_name):
                 self.assertIn(field_name, VideoGenerationsRequest.model_fields)
-
-        modal_values = {
-            "generate_sound": True,
-            "sound_duration": 3.0,
-            "condition_frame_indexes": [0, 2],
-            "condition_frame_indexes_vision": [0, 2],
-            "condition_video_keep": "last",
-            "action_mode": "policy",
-            "domain_id": 1,
-            "domain_name": "umi",
-            "raw_action_dim": 9,
-            "action_fps": 30.0,
-            "action": [0.0, 1.0],
-            "action_view_point": "ego_view",
-            "action_normalization": "mean_std",
-        }
-        req = VideoGenerationsRequest(prompt="test", **modal_values)
-        for field_name, value in modal_values.items():
-            with self.subTest(field_name=field_name):
-                self.assertNotIn(field_name, VideoGenerationsRequest.model_fields)
-                self.assertEqual(getattr(req, field_name), value)
 
     def test_cosmos3_http_aliases_map_to_sampling_params(self):
         req = VideoGenerationsRequest(
@@ -866,6 +863,246 @@ class TestCosmos3MRoPE(unittest.TestCase):
         # video latent frame 1 sits at media_offset+1; action frame 4 (4 frames
         # per latent at tcf=4) lands at the same temporal position.
         self.assertAlmostEqual(float(vid[0, 1]), float(act[0, 4]), places=4)
+
+
+class TestCosmos3Transfer(unittest.TestCase):
+    """Transfer (control-video) conditioning: rope packing, control-CFG, defaults."""
+
+    DEVICE = torch.device("cpu")
+
+    @staticmethod
+    def _transformer_self() -> Cosmos3OmniTransformer:
+        model = Cosmos3OmniTransformer.__new__(Cosmos3OmniTransformer)
+        model.temporal_margin = 15000
+        model.base_fps = 24.0
+        model.temporal_compression_factor = 4
+        model.sound_latent_fps = 25.0
+        model.temporal_compression_factor_sound = 1
+        return model
+
+    def test_single_control_shares_video_positions(self):
+        model = self._transformer_self()
+        text_mask = torch.ones(1, 4)
+        T, Hp, Wp = 3, 2, 2
+        tpc = T * Hp * Wp
+
+        _, base = model._compute_rope_position_ids(
+            text_mask, T, Hp, Wp, fps=None, device=self.DEVICE, control_frames=0
+        )
+        _, with_ctrl = model._compute_rope_position_ids(
+            text_mask, T, Hp, Wp, fps=None, device=self.DEVICE, control_frames=T
+        )
+        self.assertEqual(tuple(with_ctrl.shape), (3, 1, 2 * tpc))
+        # control prefix == video block, and video block is unchanged.
+        self.assertTrue(torch.equal(with_ctrl[:, :, :tpc], with_ctrl[:, :, tpc:]))
+        self.assertTrue(torch.equal(with_ctrl[:, :, tpc:], base))
+
+    def test_multi_control_prepended_in_order(self):
+        model = self._transformer_self()
+        text_mask = torch.ones(1, 4)
+        T, Hp, Wp = 3, 2, 2
+        tpc = T * Hp * Wp
+
+        _, base = model._compute_rope_position_ids(
+            text_mask, T, Hp, Wp, fps=None, device=self.DEVICE, control_frames=0
+        )
+        _, multi = model._compute_rope_position_ids(
+            text_mask, T, Hp, Wp, fps=None, device=self.DEVICE, control_frames=[T, T]
+        )
+        self.assertEqual(tuple(multi.shape), (3, 1, 3 * tpc))
+        c0 = multi[:, :, :tpc]
+        c1 = multi[:, :, tpc : 2 * tpc]
+        vid = multi[:, :, 2 * tpc :]
+        self.assertTrue(torch.equal(c0, vid))
+        self.assertTrue(torch.equal(c1, vid))
+        self.assertTrue(torch.equal(vid, base))
+
+    def test_control_cfg_blend_math(self):
+        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+
+        # Per-branch forward values (each run un-batched, bs=1): cond_full
+        # (control in, cond text) -> 20; cond_nc (control dropped) -> 10; uncond
+        # (control in, uncond text) -> 2. The unified executor reduces the
+        # coefficient-weighted branch sum built by _control_cfg_branches.
+        def fake_run(**kw):
+            bs = kw["latents"].shape[0]
+            if kw["control_latents"] is None:
+                return torch.full((bs,), 10.0)  # cond_nc, control dropped
+            if kw["cache_key"] == "uncond":
+                return torch.full((bs,), 2.0)  # uncond, control in
+            return torch.full((bs,), 20.0)  # cond_full, control in
+
+        stage._run_transformer = fake_run
+        cond_text_ids = torch.zeros(1)
+        cond_text_mask = torch.ones(1)
+        uncond_text_ids = torch.zeros(1)
+        uncond_text_mask = torch.ones(1)
+        control_latents = [torch.zeros(1)]
+
+        def _run(text_g, control_g):
+            branches = stage._control_cfg_branches(
+                cond_text_ids,
+                cond_text_mask,
+                uncond_text_ids,
+                uncond_text_mask,
+                cond_text_seq_len=None,
+                uncond_text_seq_len=None,
+                control_latents=control_latents,
+                text_guidance_scale=text_g,
+                control_guidance_scale=control_g,
+            )
+            return stage._predict_noise_cfg(
+                branches,
+                latents=torch.zeros(1),
+                timestep=torch.zeros(1),
+                video_shape=(1, 1, 1),
+                fps=24.0,
+                cfg_rank=0,
+                cfg_world_size=1,
+            )
+
+        # control-CFG only (g=1): cg*cond_full + (1-cg)*cond_nc
+        #   = 2*20 + (-1)*10 = 30
+        out = _run(text_g=1.0, control_g=2.0)
+        self.assertTrue(torch.allclose(out, torch.full((1,), 30.0)))
+
+        # control-CFG + text CFG (g=3): g*cg*cond_full + g*(1-cg)*cond_nc
+        #   + (1-g)*uncond = 6*20 + (-3)*10 + (-2)*2 = 86
+        out2 = _run(text_g=3.0, control_g=2.0)
+        self.assertTrue(torch.allclose(out2, torch.full((1,), 86.0)))
+
+    def test_text_cfg_batched_single_gpu(self):
+        """Single-GPU text CFG batches both branches into one bs=2 forward."""
+        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+
+        def fake_run(**kw):
+            self.assertIsNone(kw["control_latents"])
+            self.assertEqual(kw["latents"].shape[0], 2)  # batched [uncond, cond]
+            return torch.tensor([2.0, 20.0])
+
+        stage._run_transformer = fake_run
+        out = stage._predict_noise_cfg_batched(
+            latents=torch.zeros(1),
+            timestep=torch.zeros(1),
+            cond_text_ids=torch.zeros(1),
+            cond_text_mask=torch.ones(1),
+            uncond_text_ids=torch.zeros(1),
+            uncond_text_mask=torch.ones(1),
+            video_shape=(1, 1, 1),
+            fps=24.0,
+            guidance_scale=3.0,
+        )
+        # uncond + g*(cond - uncond) = 2 + 3*(20-2) = 56
+        self.assertTrue(torch.allclose(out, torch.full((1,), 56.0)))
+
+    def test_control_cfg_parallel_distribution(self):
+        """Round-robin branch distribution + all-reduce equals the serial blend."""
+        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+        seen = {}
+
+        def make_run(rank):
+            seen[rank] = []
+
+            def fake_run(**kw):
+                seen[rank].append(kw["cache_key"])
+                bs = kw["latents"].shape[0]
+                if kw["control_latents"] is None:
+                    return torch.full((bs,), 10.0)  # cond_nc
+                if kw["cache_key"] == "uncond":
+                    return torch.full((bs,), 2.0)  # uncond
+                return torch.full((bs,), 20.0)  # cond_full
+
+            return fake_run
+
+        def run(rank, world):
+            stage._run_transformer = make_run(rank)
+            branches = stage._control_cfg_branches(
+                torch.zeros(1),
+                torch.ones(1),
+                torch.zeros(1),
+                torch.ones(1),
+                cond_text_seq_len=None,
+                uncond_text_seq_len=None,
+                control_latents=[torch.zeros(1)],
+                text_guidance_scale=3.0,
+                control_guidance_scale=2.0,
+            )
+            return stage._predict_noise_cfg(
+                branches,
+                latents=torch.zeros(1),
+                timestep=torch.zeros(1),
+                video_shape=(1, 1, 1),
+                fps=24.0,
+                cfg_rank=rank,
+                cfg_world_size=world,
+            )
+
+        target = (
+            "sglang.multimodal_gen.runtime.pipelines_core.stages."
+            "model_specific_stages.cosmos3.cfg_model_parallel_all_reduce"
+        )
+        # Stand in for the all-reduce with identity so each rank returns its own
+        # partial; summing them mimics the cross-rank reduction.
+        with mock.patch(target, side_effect=lambda x: x):
+            # 2 ranks: rank 0 runs the two control-in forwards (cond_full +
+            # uncond), rank 1 runs only the control-dropped cond_nc.
+            r0 = run(0, 2)
+            r1 = run(1, 2)
+            self.assertEqual(seen[0], ["cond", "uncond"])
+            self.assertEqual(seen[1], ["cond_nc"])
+            self.assertTrue(torch.allclose(r0 + r1, torch.full((1,), 86.0)))
+
+            seen.clear()
+            # 4 ranks for 3 branches: rank 3 is idle and contributes zeros.
+            parts = [run(r, 4) for r in range(4)]
+            self.assertEqual(seen[0], ["cond"])
+            self.assertEqual(seen[1], ["cond_nc"])
+            self.assertEqual(seen[2], ["uncond"])
+            self.assertEqual(seen[3], [])
+            self.assertTrue(torch.allclose(parts[3], torch.zeros(1)))
+            self.assertTrue(
+                torch.allclose(sum(parts), torch.full((1,), 86.0))
+            )
+
+    def test_single_hint_defaults_applied(self):
+        sp = Cosmos3SamplingParams(
+            prompt="t", control_path="edge.mp4", control_hint="edge"
+        )
+        sp._explicit_fields = {"prompt", "control_path", "control_hint"}
+        sp._apply_transfer_hint_defaults()
+        self.assertEqual(sp.control_guidance, 1.5)
+        self.assertEqual(sp.guidance_scale, 3.0)
+        self.assertEqual(sp.flow_shift, 10.0)
+
+    def test_explicit_value_overrides_hint_default(self):
+        sp = Cosmos3SamplingParams(
+            prompt="t",
+            control_path="seg.mp4",
+            control_hint="seg",
+            control_guidance=4.2,
+        )
+        sp._explicit_fields = {"control_path", "control_hint", "control_guidance"}
+        sp._apply_transfer_hint_defaults()
+        self.assertEqual(sp.control_guidance, 4.2)
+
+    def test_multi_hint_defaults_not_applied(self):
+        sp = Cosmos3SamplingParams(
+            prompt="t",
+            control_path=["edge.mp4", "depth.mp4"],
+            control_hint=["edge", "depth"],
+        )
+        base_guidance = sp.guidance_scale
+        sp._explicit_fields = {"control_path", "control_hint"}
+        sp._apply_transfer_hint_defaults()
+        self.assertEqual(sp.control_guidance, 1.0)
+        self.assertEqual(sp.guidance_scale, base_guidance)
+
+    def test_unknown_hint_rejected(self):
+        sp = Cosmos3SamplingParams(
+            prompt="t", control_path="x.mp4", control_hint="bogus"
+        )
+        with self.assertRaises(ValueError):
+            sp._resolve_control_hints()
 
 
 class TestCosmos3DomainAwareLinear(unittest.TestCase):

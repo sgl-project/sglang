@@ -265,6 +265,35 @@ def _coerce_optional_int_list(value: Any) -> list[int] | None:
     return [int(value)]
 
 
+def _coerce_optional_float_list(value: Any) -> list[float] | None:
+    value = _parse_form_extra_value(value)
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    if isinstance(value, (list, tuple)):
+        return [float(item) for item in value]
+    return [float(value)]
+
+
+def _coerce_optional_str_list(value: Any) -> str | list[str] | None:
+    """Coerce a control_path/control_hint value to str or list[str].
+
+    Accepts a JSON list (``["edge.mp4", "depth.mp4"]``), a plain string, or a
+    native list. Empty values resolve to ``None`` so unset fields don't override
+    sampling-param defaults.
+    """
+    value = _parse_form_extra_value(value)
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        items = [str(item) for item in value if str(item).strip()]
+        return items or None
+    if isinstance(value, str):
+        return value if value.strip() else None
+    return str(value)
+
+
 def _resolve_video_path(req: VideoGenerationsRequest) -> str | None:
     video_path = _request_value(req, "video_path") or _request_value(req, "video_url")
     if video_path:
@@ -323,6 +352,22 @@ def _cosmos3_sampling_param_kwargs(
     condition_frame_indexes = _coerce_optional_int_list(condition_frame_indexes)
     if condition_frame_indexes is not None:
         kwargs["condition_frame_indexes"] = condition_frame_indexes
+
+    # Transfer (control-video) conditioning.
+    control_path = _coerce_optional_str_list(_request_value(req, "control_path"))
+    if control_path is not None:
+        kwargs["control_path"] = control_path
+    control_hint = _coerce_optional_str_list(_request_value(req, "control_hint"))
+    if control_hint is not None:
+        kwargs["control_hint"] = control_hint
+    control_guidance = _request_value(req, "control_guidance")
+    if control_guidance is not None:
+        kwargs["control_guidance"] = float(control_guidance)
+    control_guidance_interval = _coerce_optional_float_list(
+        _request_value(req, "control_guidance_interval")
+    )
+    if control_guidance_interval is not None:
+        kwargs["control_guidance_interval"] = tuple(control_guidance_interval)
 
     for name in (
         "condition_video_keep",
@@ -584,6 +629,24 @@ async def create_video(
     max_sequence_length: Optional[int] = Form(None),
     flow_shift: Optional[float] = Form(None),
     enable_teacache: Optional[bool] = Form(None),
+    generate_sound: Optional[bool] = Form(None),
+    sound_duration: Optional[float] = Form(None),
+    condition_frame_indexes: Optional[str] = Form(None),
+    condition_frame_indexes_vision: Optional[str] = Form(None),
+    condition_video_keep: Optional[str] = Form(None),
+    control_path: Optional[str] = Form(None),
+    control_hint: Optional[str] = Form(None),
+    control_guidance: Optional[float] = Form(None),
+    control_guidance_interval: Optional[str] = Form(None),
+    action_mode: Optional[str] = Form(None),
+    domain_id: Optional[int] = Form(None),
+    domain_name: Optional[str] = Form(None),
+    raw_action_dim: Optional[int] = Form(None),
+    action_fps: Optional[float] = Form(None),
+    action: Optional[str] = Form(None),
+    action_view_point: Optional[str] = Form(None),
+    action_stats_path: Optional[str] = Form(None),
+    action_normalization: Optional[str] = Form(None),
     enable_frame_interpolation: Optional[bool] = Form(None),
     frame_interpolation_exp: Optional[int] = Form(None),
     frame_interpolation_scale: Optional[float] = Form(None),
@@ -725,6 +788,34 @@ async def create_video(
             max_sequence_length=form_value("max_sequence_length", max_sequence_length),
             flow_shift=form_value("flow_shift", flow_shift),
             enable_teacache=form_value("enable_teacache", enable_teacache),
+            generate_sound=form_value("generate_sound", generate_sound),
+            sound_duration=form_value("sound_duration", sound_duration),
+            condition_frame_indexes=form_value(
+                "condition_frame_indexes", condition_frame_indexes
+            ),
+            condition_frame_indexes_vision=form_value(
+                "condition_frame_indexes_vision", condition_frame_indexes_vision
+            ),
+            condition_video_keep=form_value(
+                "condition_video_keep", condition_video_keep
+            ),
+            control_path=form_value("control_path", control_path),
+            control_hint=form_value("control_hint", control_hint),
+            control_guidance=form_value("control_guidance", control_guidance),
+            control_guidance_interval=form_value(
+                "control_guidance_interval", control_guidance_interval
+            ),
+            action_mode=form_value("action_mode", action_mode),
+            domain_id=form_value("domain_id", domain_id),
+            domain_name=form_value("domain_name", domain_name),
+            raw_action_dim=form_value("raw_action_dim", raw_action_dim),
+            action_fps=form_value("action_fps", action_fps),
+            action=form_value("action", action),
+            action_view_point=form_value("action_view_point", action_view_point),
+            action_stats_path=form_value("action_stats_path", action_stats_path),
+            action_normalization=form_value(
+                "action_normalization", action_normalization
+            ),
             enable_frame_interpolation=form_value(
                 "enable_frame_interpolation", enable_frame_interpolation
             ),
