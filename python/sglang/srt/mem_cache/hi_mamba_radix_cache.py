@@ -151,6 +151,8 @@ class HiMambaRadixCache(MambaRadixCache):
             prefetch_threshold=prefetch_threshold,
             load_cache_event=self.load_cache_event,
             enable_storage_metrics=self.enable_storage_metrics,
+            enable_metrics=params.enable_metrics,
+            extra_metric_labels=self.extra_metric_labels,
             attn_cp_group=params.attn_cp_cache_group,
             attn_tp_group=params.attn_tp_cache_group,
         )
@@ -379,19 +381,34 @@ class HiMambaRadixCache(MambaRadixCache):
             # write to host if the node is not backuped
             self.write_backup(node)
 
+    def _finish_write_through_ack(self, ack_id: int, *, release_lock: bool) -> bool:
+        backuped_node = self.ongoing_write_through.pop(ack_id, None)
+        if backuped_node is None:
+            return False
+
+        self._record_store_event(backuped_node, medium=StorageMedium.CPU)
+        if release_lock:
+            self.dec_lock_ref(backuped_node)
+        if self.enable_storage:
+            self.write_backup_storage(backuped_node)
+        return True
+
     def writing_check(self, write_back=False):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
-                for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                    finish_event.synchronize()
-                    for ack_id in ack_list:
-                        backuped_node = self.ongoing_write_through.pop(ack_id)
-                        self._record_store_event(
-                            backuped_node, medium=StorageMedium.CPU
+                for ack in self.cache_controller.ack_write_queue:
+                    ack.finish_event.synchronize()
+                    matched = False
+                    for ack_id in ack.node_ids:
+                        matched |= self._finish_write_through_ack(
+                            ack_id, release_lock=False
                         )
-                        if self.enable_storage:
-                            self.write_backup_storage(backuped_node)
+                    if matched:
+                        self.cache_controller.record_l1_l2_transfer_complete(
+                            direction="offload",
+                            ack=ack,
+                        )
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -401,8 +418,8 @@ class HiMambaRadixCache(MambaRadixCache):
         # independently (no cross-rank sync).
         finish_count = 0
         if len(self.ongoing_write_through) > 0:
-            for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                if not finish_event.query():
+            for ack in self.cache_controller.ack_write_queue:
+                if not ack.finish_event.query():
                     break
                 finish_count += 1
 
@@ -416,23 +433,33 @@ class HiMambaRadixCache(MambaRadixCache):
         finish_count = int(queue_size.item())
 
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
-                backuped_node = self.ongoing_write_through.pop(ack_id)
-                self._record_store_event(backuped_node, medium=StorageMedium.CPU)
-                self.dec_lock_ref(backuped_node)
-                if self.enable_storage:
-                    self.write_backup_storage(backuped_node)
+            ack = self.cache_controller.ack_write_queue.pop(0)
+            ack.finish_event.synchronize()
+
+            matched = False
+            for ack_id in ack.node_ids:
+                matched |= self._finish_write_through_ack(ack_id, release_lock=True)
+            if matched:
+                self.cache_controller.record_l1_l2_transfer_complete(
+                    direction="offload",
+                    ack=ack,
+                )
             finish_count -= 1
 
     def loading_check(self):
         # Every rank must enter the all_reduce below; ongoing_load_back can
         # diverge across ranks.
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
-            if not finish_event.query():
+        for ack in self.cache_controller.ack_load_queue:
+            if not ack.finish_event.query():
+                # the KV cache loading is still ongoing
                 break
+
+            self.cache_controller.record_l1_l2_transfer_complete(
+                direction="onboard",
+                ack=ack,
+            )
+
             finish_count += 1
 
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")

@@ -92,6 +92,7 @@ class UnifiedTreeNode:
         self.hash_value = None
         self.hit_count = 0
         self.priority = priority
+        self.write_through_pending_id: Optional[int] = None
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
             _NUM_COMPONENT_TYPES * 2
         )
@@ -100,7 +101,6 @@ class UnifiedTreeNode:
         )
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
-        self.write_through_pending_id: Optional[int] = None
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -1633,8 +1633,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             updated_nodes,
         )
 
-    def _finish_write_through_ack(self, ack_id: int) -> None:
-        lock_node, lock_params, publish_nodes = self.ongoing_write_through.pop(ack_id)
+    def _finish_write_through_ack(self, ack_id: int) -> bool:
+        pending = self.ongoing_write_through.pop(ack_id, None)
+        if pending is None:
+            return False
+
+        lock_node, lock_params, publish_nodes = pending
         for node in publish_nodes:
             if node.write_through_pending_id == ack_id:
                 node.write_through_pending_id = None
@@ -1646,6 +1650,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # suffix; the prefix fragment must be persisted as well.
             for node in publish_nodes:
                 self.write_backup_storage(node)
+        return True
 
     def load_back(
         self,
@@ -2339,11 +2344,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if write_back:
             # Blocking: wait for all pending write-backs
             while self.ongoing_write_through:
-                for _, finish_event, ack_list in cc.ack_write_queue:
-                    finish_event.synchronize()
-                    for ack_id in ack_list:
-                        if ack_id in self.ongoing_write_through:
-                            self._finish_write_through_ack(ack_id)
+                for ack in cc.ack_write_queue:
+                    ack.finish_event.synchronize()
+                    matched = False
+                    for ack_id in ack.node_ids:
+                        matched |= self._finish_write_through_ack(ack_id)
+                    if matched:
+                        cc.record_l1_l2_transfer_complete(
+                            direction="offload",
+                            ack=ack,
+                        )
                 cc.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -2352,21 +2362,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # diverge across ranks (e.g. write_backup returning 0 on a subset).
         finish_count = 0
         if self.pp_rank == 0:
-            for _, finish_event, ack_list in cc.ack_write_queue:
-                if not finish_event.query():
+            for ack in cc.ack_write_queue:
+                if not ack.finish_event.query():
                     break
                 finish_count += 1
-
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+        finish_count = int(finish_count_tensor.item())
 
         # Process completed acks
         while finish_count > 0:
-            _, finish_event, ack_list = cc.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
-                self._finish_write_through_ack(ack_id)
+            ack = cc.ack_write_queue.pop(0)
+            ack.finish_event.synchronize()
+
+            matched = False
+            for ack_id in ack.node_ids:
+                matched |= self._finish_write_through_ack(ack_id)
+            if matched:
+                self.cache_controller.record_l1_l2_transfer_complete(
+                    direction="offload",
+                    ack=ack,
+                )
             finish_count -= 1
 
     def loading_check(self) -> None:
@@ -2378,18 +2394,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # diverge across ranks.
         finish_count = 0
         if self.pp_rank == 0:
-            for _, finish_event, ack_list in cc.ack_load_queue:
-                if not finish_event.query():
+            for ack in cc.ack_load_queue:
+                if not ack.finish_event.query():
                     break
                 finish_count += 1
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+        finish_count = int(finish_count_tensor.item())
 
         while finish_count > 0:
-            _, finish_event, ack_list = cc.ack_load_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = cc.ack_load_queue.pop(0)
+            ack.finish_event.synchronize()
+            self.cache_controller.record_l1_l2_transfer_complete(
+                direction="onboard",
+                ack=ack,
+            )
+            for ack_id in ack.node_ids:
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)

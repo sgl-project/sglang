@@ -140,6 +140,8 @@ class HiRadixCache(RadixCache):
                 extra_config=extra_config,
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
+                enable_metrics=self._enable_metrics_flag,
+                extra_metric_labels=self.extra_metric_labels,
                 load_cache_event=self.load_cache_event,
                 attn_cp_group=self.attn_cp_group,
                 attn_tp_group=self.attn_tp_group,
@@ -177,6 +179,8 @@ class HiRadixCache(RadixCache):
                 model_name=server_args.served_model_name,
                 storage_backend_extra_config=extra_config,
                 enable_storage_metrics=self.enable_storage_metrics,
+                enable_metrics=params.enable_metrics,
+                extra_metric_labels=self.extra_metric_labels,
             )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -820,7 +824,7 @@ class HiRadixCache(RadixCache):
     def _replace_pending_write_through_node(
         self, old_node: TreeNode, new_nodes: List[TreeNode]
     ) -> None:
-        ack_id = old_node.write_through_pending_id
+        ack_id = getattr(old_node, "write_through_pending_id", None)
         if ack_id is None:
             return
 
@@ -845,17 +849,21 @@ class HiRadixCache(RadixCache):
             node.write_through_pending_id = ack_id
         self.ongoing_write_through[ack_id] = (lock_node, backup_len, updated_nodes)
 
-    def _finish_write_through_ack(self, ack_id: int, *, release_lock: bool) -> None:
-        lock_node, backup_len, publish_nodes = self.ongoing_write_through.pop(ack_id)
+    def _finish_write_through_ack(self, ack_id: int, *, release_lock: bool) -> bool:
+        pending = self.ongoing_write_through.pop(ack_id, None)
+        if pending is None:
+            return False
+
+        lock_node, backup_len, publish_nodes = pending
         for node in publish_nodes:
-            if node.write_through_pending_id == ack_id:
+            if getattr(node, "write_through_pending_id", None) == ack_id:
                 node.write_through_pending_id = None
-            # DMA confirmed -- block is now on host.
             self._record_store_event(node, medium=StorageMedium.CPU)
         if self.enable_storage:
             self.write_backup_storage(lock_node, backup_len)
         if release_lock:
             self.dec_lock_ref(lock_node)
+        return True
 
     def write_backup_storage(self, node: TreeNode, backup_len: Optional[int] = None):
         # Recover pre-split data via walk-and-concat if node was split.
@@ -933,10 +941,18 @@ class HiRadixCache(RadixCache):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
-                for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                    finish_event.synchronize()
-                    for ack_id in ack_list:
-                        self._finish_write_through_ack(ack_id, release_lock=False)
+                for ack in self.cache_controller.ack_write_queue:
+                    ack.finish_event.synchronize()
+                    matched = False
+                    for ack_id in ack.node_ids:
+                        matched |= self._finish_write_through_ack(
+                            ack_id, release_lock=False
+                        )
+                    if matched:
+                        self.cache_controller.record_l1_l2_transfer_complete(
+                            direction="offload",
+                            ack=ack,
+                        )
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -947,40 +963,51 @@ class HiRadixCache(RadixCache):
         # sequence and deadlocks under TP > 1. (Matches UnifiedRadixCache.)
         finish_count = 0
         if self.pp_rank == 0:
-            for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                if not finish_event.query():
+            for ack in self.cache_controller.ack_write_queue:
+                if not ack.finish_event.query():
                     break
                 finish_count += 1
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+        finish_count = int(finish_count_tensor.item())
 
         if finish_count > 0:
             logger.debug(f"Process {finish_count} write back operations")
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
-                self._finish_write_through_ack(ack_id, release_lock=True)
+            ack = self.cache_controller.ack_write_queue.pop(0)
+            ack.finish_event.synchronize()
+
+            matched = False
+            for ack_id in ack.node_ids:
+                matched |= self._finish_write_through_ack(ack_id, release_lock=True)
+            if matched:
+                self.cache_controller.record_l1_l2_transfer_complete(
+                    direction="offload",
+                    ack=ack,
+                )
             finish_count -= 1
 
     def loading_check(self):
         finish_count = 0
         if self.pp_rank == 0:
-            for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
-                if not finish_event.query():
+            for ack in self.cache_controller.ack_load_queue:
+                if not ack.finish_event.query():
                     break
                 finish_count += 1
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+        finish_count = int(finish_count_tensor.item())
 
         if finish_count > 0:
             logger.debug(f"Process {finish_count} load operations")
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = self.cache_controller.ack_load_queue.pop(0)
+            ack.finish_event.synchronize()
+            self.cache_controller.record_l1_l2_transfer_complete(
+                direction="onboard",
+                ack=ack,
+            )
+            for ack_id in ack.node_ids:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
             finish_count -= 1

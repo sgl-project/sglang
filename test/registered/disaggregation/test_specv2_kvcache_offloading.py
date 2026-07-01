@@ -8,6 +8,7 @@ Requires: torch, sglang (run in an environment with sglang installed)
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
@@ -89,6 +90,10 @@ def _make_manager(pool_size: int, page_size: int = 1):
 class _FinishedEvent:
     def synchronize(self):
         pass
+
+
+def _ack(node_id: int):
+    return SimpleNamespace(finish_event=_FinishedEvent(), node_ids=[node_id])
 
 
 class TestReleaseFinishedReq(unittest.TestCase):
@@ -293,7 +298,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             8,
         )
         manager.cache_controller = MagicMock()
-        manager.cache_controller.ack_write_queue = [(None, _FinishedEvent(), [7])]
+        manager.cache_controller.ack_write_queue = [_ack(7)]
         manager._trigger_backup = MagicMock(return_value="last_hash")
 
         manager._check_offload_progress(1)
@@ -327,7 +332,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
         self.assertEqual(manager.offloaded_state[req.rid].inc_len, 4)
         manager.cache_controller.write.assert_called_once()
 
-        manager.cache_controller.ack_write_queue = [(None, _FinishedEvent(), [1])]
+        manager.cache_controller.ack_write_queue = [_ack(1)]
         manager._trigger_backup = MagicMock(return_value="last_hash")
 
         manager._check_offload_progress(1)
@@ -370,7 +375,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             8,
         )
         manager.cache_controller = MagicMock()
-        manager.cache_controller.ack_write_queue = [(None, _FinishedEvent(), [8])]
+        manager.cache_controller.ack_write_queue = [_ack(8)]
         manager._trigger_backup = MagicMock(return_value="last_hash")
 
         manager._check_offload_progress(1)
@@ -400,7 +405,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             12,
         )
         manager.cache_controller = MagicMock()
-        manager.cache_controller.ack_write_queue = [(None, _FinishedEvent(), [9])]
+        manager.cache_controller.ack_write_queue = [_ack(9)]
         manager._trigger_backup = MagicMock(return_value="last_hash")
 
         manager._check_offload_progress(1)

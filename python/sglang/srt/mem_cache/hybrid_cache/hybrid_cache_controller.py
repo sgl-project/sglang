@@ -12,9 +12,6 @@ import torch
 
 from sglang.srt.managers.cache_controller import CacheOperation as BaseCacheOperation
 from sglang.srt.managers.cache_controller import (
-    HiCacheAck,
-)
-from sglang.srt.managers.cache_controller import (
     HiCacheController as BaseHiCacheController,
 )
 from sglang.srt.managers.cache_controller import (
@@ -172,6 +169,8 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         transfer_layer_num: Optional[int] = None,
         enable_storage_metrics: bool = False,
+        enable_metrics: bool = False,
+        extra_metric_labels: Optional[dict[str, str]] = None,
     ):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
@@ -191,6 +190,8 @@ class HybridCacheController(BaseHiCacheController):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            enable_metrics=enable_metrics,
+            extra_metric_labels=extra_metric_labels,
         )
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
@@ -408,8 +409,12 @@ class HybridCacheController(BaseHiCacheController):
                 self.move_hybrid_indices(op)
             )
         self.write_queue.clear()
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
+        # enable_timing so record_l1_l2_transfer_complete can use elapsed_time()
+        # for the real device transfer duration (host fallback returns None).
+        start_event = device_module.Event(enable_timing=True)
+        finish_event = device_module.Event(enable_timing=True)
+
+        token_count = int(host_indices.numel())
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
@@ -434,7 +439,15 @@ class HybridCacheController(BaseHiCacheController):
                 device_indices,
                 resolved_pool_transfers,
             )
-        self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+        self.ack_write_queue.append(
+            self._make_hicache_ack(
+                start_event=start_event,
+                finish_event=finish_event,
+                node_ids=op.node_ids,
+                token_count=token_count,
+                pool_transfers=resolved_pool_transfers,
+            )
+        )
 
     def load(
         self,
@@ -489,6 +502,8 @@ class HybridCacheController(BaseHiCacheController):
         )
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
+
+        token_count = int(host_indices.numel())
         producer_event.start_event.record()
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
@@ -521,10 +536,12 @@ class HybridCacheController(BaseHiCacheController):
                 resolved_pool_transfers,
             )
         self.ack_load_queue.append(
-            HiCacheAck(
-                producer_event.start_event,
-                producer_event.finish_event,
-                op.node_ids,
+            self._make_hicache_ack(
+                start_event=producer_event.start_event,
+                finish_event=producer_event.finish_event,
+                node_ids=op.node_ids,
+                token_count=token_count,
+                pool_transfers=resolved_pool_transfers,
             )
         )
         return producer_id
