@@ -85,8 +85,15 @@ class MlxModelRunnerStub(ModelRunner):
     # AttributeError.
     canary_manager = None
 
-    def __init__(self, *args, mlx_pool_size: int | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        mlx_pool_size: int | None = None,
+        mlx_max_running_requests: int | None = None,
+        **kwargs,
+    ):
         self._mlx_pool_size = mlx_pool_size
+        self._mlx_max_running_requests = mlx_max_running_requests
         super().__init__(*args, **kwargs)
 
     def load_model(self):
@@ -145,10 +152,17 @@ class MlxModelRunnerStub(ModelRunner):
             self.max_total_num_tokens = self._mlx_pool_size
         else:
             self.max_total_num_tokens = self.model_config.context_len
-        self.max_running_requests = min(
-            self.max_total_num_tokens // 2,
-            4096,
-        )
+        # Scheduler concurrency cap: prefer the MLX runner's memory-safe value so the
+        # scheduler never admits more concurrent requests than the working set can hold and
+        # --max-running-requests is honored. Fall back to the pool-derived heuristic only when
+        # the runner did not auto-size it (radix on / explicit pool).
+        if self._mlx_max_running_requests is not None:
+            self.max_running_requests = self._mlx_max_running_requests
+        else:
+            self.max_running_requests = min(
+                self.max_total_num_tokens // 2,
+                4096,
+            )
         self.is_hybrid_swa = False
 
         # Create minimal pools
