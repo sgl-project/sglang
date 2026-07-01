@@ -30,8 +30,8 @@ class DFlashVerifyInput(SpecInput):
     draft_token: torch.Tensor
     positions: torch.Tensor
     draft_token_num: int
-    # Kept for compatibility with attention backends that gate tree metadata by `topk > 1`.
-    # DFLASH verify is linear (non-tree), so this is always 1.
+    # Gates tree metadata in attention backends that key on `topk > 1`. The linear
+    # chain path leaves this at 1; `from_tree` sets it to tree_width for tree mode (#29524).
     topk: int = 1
     # Custom attention "allow mask" for TARGET_VERIFY in backends that require it.
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
@@ -45,6 +45,29 @@ class DFlashVerifyInput(SpecInput):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
         if self.num_tokens_per_batch == -1:
             self.num_tokens_per_batch = int(self.draft_token_num)
+
+    @classmethod
+    def from_tree(
+        cls,
+        *,
+        draft_token: torch.Tensor,
+        positions: torch.Tensor,
+        custom_mask: torch.Tensor,
+        tree_width: int,
+        num_nodes: int,
+        **kwargs,
+    ) -> "DFlashVerifyInput":
+        """Build a tree-mode verify input (#29524): ``topk = tree_width`` and a
+        tree-causal ``custom_mask``. Field semantics are unchanged from the linear
+        chain case; only the previously-fixed ``topk``/``custom_mask`` are populated."""
+        return cls(
+            draft_token=draft_token,
+            positions=positions,
+            draft_token_num=num_nodes,
+            topk=tree_width,
+            custom_mask=custom_mask,
+            **kwargs,
+        )
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
@@ -147,3 +170,64 @@ class DFlashVerifyInput(SpecInput):
                 )
                 self.custom_mask = mask
         return kv_indices, cum_kv_seq_len, qo_indptr, mask
+
+
+def build_dflash_tree_verify_input(
+    *,
+    root_tokens: list[int],
+    topk_tokens: list[list[list[int]]],
+    topk_logprobs: list[list[list[float]]],
+    tree_width: int,
+    budget: int,
+    construction: str,
+    base_positions: list[int],
+    kv_lens: list[int],
+    device,
+) -> Tuple["DFlashVerifyInput", dict]:
+    """Bridge from per-request draft-head top-W output to a tree-mode verify input
+    (#29524, JetSpec). Builds one tree per request, materializes the verify buffers +
+    tree-causal mask, and packs them into a ``DFlashVerifyInput.from_tree``.
+
+    This is the documented integration seam that the (deferred, GPU-validated) worker
+    decode loop will call once the live verify-loop integration lands. The host-side
+    pieces it composes (``build_tree`` / ``tree_to_verify_buffers`` /
+    ``build_tree_custom_mask``) are unit-tested in
+    ``test/registered/spec/dflash/test_dflash_tree.py``.
+
+    Args:
+        root_tokens: per-request root token (bonus / last verified), length ``bs``.
+        topk_tokens / topk_logprobs: per request, shape ``(depth_count, W)``.
+        tree_width / budget / construction: tree drafting knobs.
+        base_positions: per-request absolute position of the root (= seq_len).
+        kv_lens: per-request committed-prefix length, for the mask context part.
+
+    Returns ``(verify_input, buffers)`` where ``buffers`` is the dict from
+    ``tree_to_verify_buffers``.
+    """
+    from sglang.srt.speculative.dflash_tree import (
+        build_tree,
+        build_tree_custom_mask,
+        tree_to_verify_buffers,
+    )
+
+    trees = [
+        build_tree(
+            root_tokens[b],
+            topk_tokens[b],
+            topk_logprobs[b],
+            tree_width=tree_width,
+            budget=budget,
+            construction=construction,
+        )
+        for b in range(len(root_tokens))
+    ]
+    buffers = tree_to_verify_buffers(trees, budget, base_positions, device=device)
+    custom_mask = build_tree_custom_mask(trees, budget, kv_lens, device=device)
+    verify_input = DFlashVerifyInput.from_tree(
+        draft_token=buffers["draft_token"].reshape(-1),
+        positions=buffers["positions"].reshape(-1),
+        custom_mask=custom_mask,
+        tree_width=tree_width,
+        num_nodes=budget,
+    )
+    return verify_input, buffers

@@ -1529,6 +1529,18 @@ class ServerArgs:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_dflash_tree_width: A[
+        Optional[int],
+        "DFLASH only. Top-W candidates kept per draft depth. 1 (default) = linear chain (current behavior). W>1 (tree drafting) is not yet runnable: the host-side core is implemented but the live verify-loop integration is the #29524 GPU follow-up, so W>1 is rejected at startup.",
+    ] = None
+    speculative_dflash_tree_budget: A[
+        Optional[int],
+        "DFLASH tree only. Max total nodes B in the draft tree (greedy best-first); defaults to the full W-ary tree size. Inert until tree mode is wired (#29524 follow-up).",
+    ] = None
+    speculative_dflash_tree_construction: A[
+        str,
+        "DFLASH tree builder: 'depth_first' (default; guarantees acceptance >= chain) or 'opt_prefix' (paper-optimal best-first). Inert until tree mode is wired (#29524 follow-up).",
+    ] = "depth_first"
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",
