@@ -53,6 +53,8 @@ register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-large")
 # Per-token byte layout
 _BYTES_PER_TOKEN = _NOPE_ROPE_STRIDE + _SCALE_STRIDE  # 576 + 8 = 584
 
+_IS_SM120 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
+
 
 def _build_kvcache(
     num_pages: int,
@@ -179,6 +181,7 @@ def _build_q_indices(
     return q, indices
 
 
+@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
 class TestGatherAndDequant(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -228,6 +231,7 @@ class TestGatherAndDequant(CustomTestCase):
         )
 
 
+@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
 class TestSparseDecodeTritonVsTorch(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -340,6 +344,7 @@ class TestSparseDecodeTritonVsTorch(CustomTestCase):
         )
 
 
+@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
 class TestApplyAttnSink(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -382,6 +387,7 @@ class TestApplyAttnSink(CustomTestCase):
         )
 
 
+@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
 class TestMergePartialAttn(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -423,6 +429,7 @@ class TestMergePartialAttn(CustomTestCase):
         torch.testing.assert_close(merged_lse, lse1, atol=1e-5, rtol=1e-5)
 
 
+@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
 class TestEntryPointDispatch(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -453,6 +460,39 @@ class TestEntryPointDispatch(CustomTestCase):
 
         torch.testing.assert_close(
             out_torch.to(torch.float32),
+            out_triton.to(torch.float32),
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+    def test_flashinfer_backend_matches_triton(self):
+        """FlashInfer SM120 sparse MLA decode matches Triton reference."""
+        import importlib
+
+        if importlib.util.find_spec("flashinfer.sparse_mla_sm120") is None:
+            self.skipTest("FlashInfer SM120 sparse MLA not available")
+
+        k_cache, _ = _build_kvcache(4, 64, device=self.device, seed=5)
+        q, indices = _build_q_indices(1, 4, 32, 4, 64, device=self.device, seed=13)
+        topk_length = torch.tensor([32], dtype=torch.int32, device=self.device)
+
+        kwargs = dict(
+            q=q,
+            k_cache=k_cache,
+            indices=indices,
+            topk_length=topk_length,
+            attn_sink=None,
+            head_dim_v=_D,
+            softmax_scale=_D**-0.5,
+        )
+
+        with mock.patch.object(fmod, "_sm120_default_backend", "triton"):
+            out_triton, _ = flash_mla_with_kvcache_sm120(**kwargs)
+        with mock.patch.object(fmod, "_sm120_default_backend", "flashinfer"):
+            out_fi, _ = flash_mla_with_kvcache_sm120(**kwargs)
+
+        torch.testing.assert_close(
+            out_fi.to(torch.float32),
             out_triton.to(torch.float32),
             atol=5e-2,
             rtol=5e-2,

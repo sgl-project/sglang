@@ -123,7 +123,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
-    OpenSessionReqOutput,
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
@@ -254,6 +253,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
     is_cuda,
+    is_hip,
     is_mps,
     kill_itself_when_parent_died,
     require_mlp_sync,
@@ -292,6 +292,7 @@ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
+_is_hip = is_hip()
 
 
 class Scheduler(
@@ -356,10 +357,6 @@ class Scheduler(
         )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
-        self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
-
-        # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
-        self.gracefully_exit = False
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
@@ -395,27 +392,11 @@ class Scheduler(
         self.init_model_config()
 
         # Init metrics stats
-        self.metrics_collector_context = SchedulerMetricsCollector.init_new(
-            server_args=self.server_args,
-            ps=self.ps,
-            tp_rank=tp_rank,
-            pp_rank=pp_rank,
-            dp_rank=dp_rank,
-            enable_priority_scheduling=self.enable_priority_scheduling,
-            enable_lora=self.enable_lora,
-            enable_hierarchical_cache=self.enable_hierarchical_cache,
-        )
-        self.metrics_collector = self.metrics_collector_context.collector
+        self.init_metrics_collector(tp_rank, pp_rank, dp_rank)
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
         self.init_idle_sleeper()
-
-        self.mm_receiver = None
-        self.disagg_prefill_bootstrap_queue = None
-        self.disagg_prefill_inflight_queue = None
-        self.disagg_decode_prealloc_queue = None
-        self.disagg_decode_transfer_queue = None
 
         # Init ZBAL, switch allocator should before any torch alloc action
         self.init_zbal_on_npu()
@@ -478,10 +459,7 @@ class Scheduler(
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
 
-        if self.enable_hisparse:
-            # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
-            self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
-            self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+        self.init_hisparse_coordinator()
 
         if (
             self.server_args.disaggregation_mode == "decode"
@@ -520,14 +498,7 @@ class Scheduler(
         # Init diffusion LLM
         self.init_diffusion_llm()
 
-        self.metrics_reporter = SchedulerMetricsReporter(
-            scheduler=self,
-            tp_rank=tp_rank,
-            pp_rank=pp_rank,
-            dp_rank=dp_rank,
-            metrics_collector_context=self.metrics_collector_context,
-            metrics_collector=self.metrics_collector,
-        )
+        self.init_metrics_reporter(tp_rank, pp_rank, dp_rank)
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
@@ -615,6 +586,21 @@ class Scheduler(
                     )
                     self.page_size = self.dllm_config.block_size
                     self.server_args.page_size = self.dllm_config.block_size
+
+    def init_metrics_collector(
+        self, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
+    ) -> None:
+        self.metrics_collector_context = SchedulerMetricsCollector.init_new(
+            server_args=self.server_args,
+            ps=self.ps,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            dp_rank=dp_rank,
+            enable_priority_scheduling=self.enable_priority_scheduling,
+            enable_lora=self.enable_lora,
+            enable_hierarchical_cache=self.enable_hierarchical_cache,
+        )
+        self.metrics_collector = self.metrics_collector_context.collector
 
     def init_ipc_channels(self, port_args: PortArgs):
         is_rank_zero = (
@@ -866,9 +852,6 @@ class Scheduler(
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
-        if self.spec_algorithm.is_frozen_kv_mtp():
-            # Frozen-KV MTP draft construction needs the target KV pool.
-            self.init_target_memory_pool()
         self.maybe_init_draft_worker()
 
         # Allocate KV cache pools for all workers.
@@ -970,7 +953,18 @@ class Scheduler(
                 startup_available_gpu_memory_gb=avail_mem,
             )
 
+    def init_hisparse_coordinator(self) -> None:
+        self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        if not self.enable_hisparse:
+            return
+
+        # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
+        self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
+        self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
     def init_running_status(self):
+        # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
+        self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
@@ -1027,6 +1021,19 @@ class Scheduler(
                     "Dynamic chunking will be disabled."
                 )
                 self.enable_dynamic_chunking = False
+
+    def init_metrics_reporter(
+        self, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
+    ) -> None:
+        # Override point for deployments that need a specialized reporter.
+        self.metrics_reporter = SchedulerMetricsReporter(
+            scheduler=self,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            dp_rank=dp_rank,
+            metrics_collector_context=self.metrics_collector_context,
+            metrics_collector=self.metrics_collector,
+        )
 
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
@@ -1102,6 +1109,12 @@ class Scheduler(
             configure_gc_logger()
 
     def init_disaggregation(self):
+        self.mm_receiver = None
+        self.disagg_prefill_bootstrap_queue = None
+        self.disagg_prefill_inflight_queue = None
+        self.disagg_decode_prealloc_queue = None
+        self.disagg_decode_transfer_queue = None
+
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
@@ -1110,16 +1123,11 @@ class Scheduler(
         )
 
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
-        draft_token_to_kv_pool, model_config = kv_cache_builder.get_draft_kv_pool(
+        draft_token_to_kv_pool = kv_cache_builder.get_draft_kv_pool(
             draft_worker=self.draft_worker,
             spec_algorithm=self.spec_algorithm,
             server_args=self.server_args,
         )
-        # Default to the target model_config so the MetadataBuffers branches
-        # below can always access it; overridden by the draft model_config
-        # when this node runs a spec module.
-        if model_config is None:
-            model_config = self.model_config
 
         if self.spec_algorithm.carries_draft_hidden_states():
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
@@ -2011,36 +2019,11 @@ class Scheduler(
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
-        # Radix-native session: session_id is just a tag; KV bulk-freed on close.
+        # Radix-native sessions use only the top-level session_id.
         radix_native_session = (
-            session_id is not None and self.server_args.enable_session_radix_cache
+            recv_req.session_id is not None
+            and self.server_args.enable_session_radix_cache
         )
-        if radix_native_session:
-            sp = recv_req.session_params
-            if (
-                sp.rid is not None
-                or sp.offset is not None
-                or sp.replace is not None
-                or sp.drop_previous_output is not None
-            ):
-                error_msg = (
-                    "Invalid request: radix-native sessions do not support "
-                    "session_params rid/offset/replace/drop_previous_output; "
-                    "send full context each turn."
-                )
-                req = Req(
-                    recv_req.rid,
-                    recv_req.input_text,
-                    recv_req.input_ids,
-                    recv_req.sampling_params,
-                    vocab_size=self.model_config.vocab_size,
-                    http_worker_ipc=recv_req.http_worker_ipc,
-                )
-                req.tokenizer = self.tokenizer
-                req.set_finish_with_abort(error_msg)
-                self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
-                return
 
         if session_id is None or radix_native_session:
             # Normal non-session request, or a radix-native session request
@@ -2063,6 +2046,7 @@ class Scheduler(
                 token_ids_logprob=recv_req.token_ids_logprob,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
+                session_id=recv_req.session_id,
                 input_embeds=recv_req.input_embeds,
                 positional_embed_overrides=recv_req.positional_embed_overrides,
                 token_type_ids=recv_req.token_type_ids,
@@ -2094,8 +2078,6 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
-            if radix_native_session:
-                req.session_id = session_id
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -3259,15 +3241,23 @@ class Scheduler(
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(future_indices, batch_result)
-                            # Result D2H on copy_stream overlaps the next forward
-                            # instead of serializing on forward_stream; it's a leaf
-                            # gated by copy_done, so nothing on forward_stream waits.
-                            self.copy_stream.wait_stream(self.forward_stream)
-                            with self.copy_stream_ctx:
+                            if _is_hip:
+                                # Cross-stream sync costs more than the tiny D2H it
+                                # overlaps.
                                 batch_result.copy_to_cpu(
                                     return_logprob=batch.return_logprob,
                                     return_hidden_states=batch.return_hidden_states,
                                 )
+                            else:
+                                # Result D2H on copy_stream overlaps the next forward
+                                # instead of serializing on forward_stream; it's a leaf
+                                # gated by copy_done, so nothing on forward_stream waits.
+                                self.copy_stream.wait_stream(self.forward_stream)
+                                with self.copy_stream_ctx:
+                                    batch_result.copy_to_cpu(
+                                        return_logprob=batch.return_logprob,
+                                        return_hidden_states=batch.return_hidden_states,
+                                    )
                         else:
                             batch_result.future_indices = future_indices
 
@@ -4082,24 +4072,17 @@ class Scheduler(
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
-        if self.server_args.enable_session_radix_cache:
-            # Radix-native: open is implicit; explicit open only permits id reuse.
-            session_id = recv_req.session_id
-            self.tree_cache.register_session(session_id)
-            output = OpenSessionReqOutput(
-                session_id=session_id, success=session_id is not None
-            )
-        else:
-            output = self.session_controller.open(recv_req)
+        output = self.session_controller.open(recv_req)
         if self.ps.pp_rank == 0 and self.ps.tp_rank == 0 and self.ps.attn_cp_rank == 0:
             return output
         return None
 
     def close_session(self, recv_req: CloseSessionReqInput):
         if self.server_args.enable_session_radix_cache:
-            # "Close" just triggers eviction of the session's tagged KV.
-            self.tree_cache.release_session(recv_req.session_id)
-        else:
+            self.tree_cache.release_radix_session(recv_req.session_id)
+        if recv_req.session_id in self.session_controller or not (
+            self.server_args.enable_session_radix_cache
+        ):
             self.session_controller.close(recv_req)
 
     def maybe_sleep_on_idle(self):
