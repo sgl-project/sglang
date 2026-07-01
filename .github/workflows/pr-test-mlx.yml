@@ -38,8 +38,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: 'pip'
-          cache-dependency-path: 'python/pyproject_other.toml'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: 'python/pyproject_other.toml'
 
       - name: Verify Apple Silicon runner
         run: |
@@ -49,20 +53,20 @@ jobs:
       - name: Install dependencies (MLX / srt_mps extra)
         timeout-minutes: 30
         run: |
-          python3 -m pip install --upgrade pip
           test -f python/pyproject_other.toml || { echo "alt pyproject_other.toml missing"; exit 1; }
           # Swap in the Apple Silicon project metadata, then install the srt_mps
-          # extra (mlx, mlx-lm, runtime_common, torch). The all_mps diffusion
-          # chain is not needed here.
+          # extra (mlx, mlx-lm, runtime_common, torch) into an isolated uv venv.
+          # The all_mps diffusion chain is not needed here.
           rm -f python/pyproject.toml
           mv python/pyproject_other.toml python/pyproject.toml
-          python3 -m pip install -e "python[srt_mps]"
-          python3 -m pip install pytest
+          uv venv
+          uv pip install -e "python[srt_mps]"
+          uv pip install pytest
 
       - name: Report MLX / torch versions
         run: |
-          python3 -c "import mlx.core as mx; print('mlx', mx.__version__)"
-          python3 -c "import torch; print('torch', torch.__version__)"
+          uv run python -c "import mlx.core as mx; print('mlx', mx.__version__)"
+          uv run python -c "import torch; print('torch', torch.__version__)"
 
       - name: Run model-free MLX unit tests
         timeout-minutes: 15
@@ -71,7 +75,7 @@ jobs:
           # (its model and server suites use run_suite.py). None load a model:
           # signature contracts, mocked Metal capture, dummy ServerArgs patching,
           # and quant-config dicts.
-          python3 -m pytest -v \
+          uv run python -m pytest -v \
             test/registered/unit/hardware_backend/mlx/test_runner_init_contract.py \
             test/registered/unit/hardware_backend/mlx/test_metal_profiler.py \
             test/registered/unit/hardware_backend/mlx/test_attention_patching.py \
