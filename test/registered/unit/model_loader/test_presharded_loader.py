@@ -9,6 +9,8 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -434,6 +436,284 @@ class TestBuildDumpPlan(unittest.TestCase):
             ) as f:
                 f.write("{}")
             self.assertTrue(PreshardedModelLoader._presharded_ready(tmp))
+
+
+class TestBuildSubfolderName(unittest.TestCase):
+    """`_build_subfolder_name` must fold `moe_dense_tp_size` into the cache
+    key, since it changes the effective TP width used for dense layers
+    (see dp_attention.py: local_tp_size = moe_dense_tp_size or tp_size)
+    independently of tp/dp/ep/pp. Without this, two runs with different
+    moe_dense_tp_size values would collide on the same subfolder and load
+    mismatched dense-layer shards."""
+
+    def _build(
+        self,
+        *,
+        moe_dense_tp_size,
+        tp=4,
+        dp=1,
+        ep=1,
+        pp=1,
+        quantization=None,
+        ep_num_redundant_experts=0,
+        init_expert_location="trivial",
+    ):
+        # Bypass __init__ (which needs a real LoadConfig): this means
+        # self.load_config is missing, so _compute_structural_signature's
+        # access to it raises AttributeError and is caught, falling back to
+        # no structural signature -- exactly like a model class that can't
+        # be built on meta device. That keeps these tests focused purely on
+        # the manually-enumerated parallelism parts of the key.
+        loader = object.__new__(PreshardedModelLoader)
+        with mock.patch(
+            "sglang.srt.distributed.get_tensor_model_parallel_world_size",
+            return_value=tp,
+        ), mock.patch(
+            "sglang.srt.distributed.get_moe_data_parallel_world_size",
+            return_value=dp,
+        ), mock.patch(
+            "sglang.srt.distributed.get_moe_expert_parallel_world_size",
+            return_value=ep,
+        ), mock.patch(
+            "sglang.srt.distributed.get_pipeline_model_parallel_world_size",
+            return_value=pp,
+        ), mock.patch(
+            "sglang.srt.model_loader.loader.get_global_server_args",
+            return_value=SimpleNamespace(
+                moe_dense_tp_size=moe_dense_tp_size,
+                ep_num_redundant_experts=ep_num_redundant_experts,
+                init_expert_location=init_expert_location,
+            ),
+        ):
+            model_config = SimpleNamespace(quantization=quantization)
+            return loader._build_subfolder_name(model_config)
+
+    def test_default_moe_dense_tp_size_omits_suffix(self):
+        # moe_dense_tp_size=None ⇒ local_dense_tp falls back to tp_size, so
+        # the dense-layer split is identical to the plain TP split and no
+        # extra suffix is needed.
+        name = self._build(moe_dense_tp_size=None, tp=4)
+        self.assertEqual(name, "TP-4")
+
+    def test_moe_dense_tp_size_equal_to_tp_omits_suffix(self):
+        name = self._build(moe_dense_tp_size=4, tp=4)
+        self.assertEqual(name, "TP-4")
+
+    def test_moe_dense_tp_size_one_adds_suffix(self):
+        # moe_dense_tp_size=1 with tp=4 makes the dense-layer split diverge
+        # from the plain TP split, so the subfolder name must differ.
+        name = self._build(moe_dense_tp_size=1, tp=4)
+        self.assertEqual(name, "TP-4-DenseTP-1")
+
+    def test_none_and_one_are_distinguished_when_tp_not_one(self):
+        # This is the actual collision the fix addresses: with tp=4, the
+        # two valid values of moe_dense_tp_size (None and 1) used to map
+        # to the same subfolder name.
+        name_default = self._build(moe_dense_tp_size=None, tp=4)
+        name_one = self._build(moe_dense_tp_size=1, tp=4)
+        self.assertNotEqual(name_default, name_one)
+
+    def test_none_and_tp_size_value_collapse_to_same_name(self):
+        # Passing moe_dense_tp_size explicitly equal to tp_size is
+        # semantically the same as leaving it None, so they should still
+        # share a cache entry.
+        name_default = self._build(moe_dense_tp_size=None, tp=4)
+        name_explicit = self._build(moe_dense_tp_size=4, tp=4)
+        self.assertEqual(name_default, name_explicit)
+
+    def test_moe_dense_tp_size_with_other_parallel_dims_and_quant(self):
+        name = self._build(
+            moe_dense_tp_size=1, tp=8, dp=2, ep=8, pp=2, quantization="fp8"
+        )
+        self.assertEqual(name, "TP-8-DP-2-EP-8-PP-2-DenseTP-1-dtype-fp8")
+
+    def test_default_eplb_config_omits_suffixes(self):
+        # ep_num_redundant_experts=0 and init_expert_location="trivial" are
+        # the no-EPLB defaults; neither should add anything to the key.
+        name = self._build(moe_dense_tp_size=None, tp=4)
+        self.assertEqual(name, "TP-4")
+
+    def test_ep_num_redundant_experts_adds_suffix(self):
+        # Redundant experts change which physical expert lands on a rank
+        # without changing that rank's expert-slot tensor shapes, so the
+        # structural signature can't catch this -- it must be an explicit
+        # part of the key.
+        name = self._build(
+            moe_dense_tp_size=None, tp=8, ep=8, ep_num_redundant_experts=16
+        )
+        self.assertEqual(name, "TP-8-EP-8-RedEP-16")
+
+    def test_different_redundant_expert_counts_diverge(self):
+        name_a = self._build(
+            moe_dense_tp_size=None, tp=8, ep=8, ep_num_redundant_experts=16
+        )
+        name_b = self._build(
+            moe_dense_tp_size=None, tp=8, ep=8, ep_num_redundant_experts=32
+        )
+        self.assertNotEqual(name_a, name_b)
+
+    def test_init_expert_location_adds_hashed_suffix(self):
+        name = self._build(
+            moe_dense_tp_size=None,
+            tp=8,
+            ep=8,
+            init_expert_location="/path/to/expert_location.json",
+        )
+        self.assertIn("ExpLoc-", name)
+        self.assertNotIn("/path/to/expert_location.json", name)
+
+    def test_different_init_expert_location_diverge(self):
+        name_a = self._build(
+            moe_dense_tp_size=None,
+            tp=8,
+            ep=8,
+            init_expert_location="/path/to/a.json",
+        )
+        name_b = self._build(
+            moe_dense_tp_size=None,
+            tp=8,
+            ep=8,
+            init_expert_location="/path/to/b.json",
+        )
+        self.assertNotEqual(name_a, name_b)
+
+    def test_eplb_suffixes_combine_with_existing_parts(self):
+        name = self._build(
+            moe_dense_tp_size=1,
+            tp=8,
+            dp=2,
+            ep=8,
+            pp=2,
+            quantization="fp8",
+            ep_num_redundant_experts=16,
+            init_expert_location="/path/to/loc.json",
+        )
+        self.assertTrue(name.startswith("TP-8-DP-2-EP-8-PP-2-DenseTP-1-dtype-fp8-"))
+        self.assertIn("RedEP-16", name)
+        self.assertIn("ExpLoc-", name)
+
+    def test_tp_one_with_dense_tp_one_omits_suffix(self):
+        # When tp_size itself is 1, moe_dense_tp_size=1 doesn't diverge from
+        # tp, so no suffix should be added.
+        name = self._build(moe_dense_tp_size=1, tp=1)
+        self.assertEqual(name, "TP-1")
+
+    def test_structural_signature_failure_falls_back_silently(self):
+        # When the model class can't be built on meta device (here: the
+        # loader has no self.load_config at all, simulating any failure
+        # inside _compute_structural_signature), _build_subfolder_name must
+        # still return a usable name with no "sig-" suffix, not raise.
+        name = self._build(moe_dense_tp_size=None, tp=4)
+        self.assertNotIn("sig-", name)
+
+
+class TestStructuralSignature(unittest.TestCase):
+    """The structural signature is the long-term fix for the underlying
+    problem `moe_dense_tp_size` was an instance of: instead of hand-
+    enumerating every parallelism knob that might change a rank's tensor
+    shapes, hash the (name, shape, dtype) of every parameter in a
+    meta-device model skeleton built under the live parallel state. Any
+    future sharding knob that changes shapes is automatically caught
+    without touching `_build_subfolder_name`."""
+
+    def test_hash_is_deterministic(self):
+        sig_input = [("a.weight", (4, 4), "torch.float32")]
+        self.assertEqual(
+            PreshardedModelLoader._hash_structural_signature(sig_input),
+            PreshardedModelLoader._hash_structural_signature(list(sig_input)),
+        )
+
+    def test_hash_changes_with_shape(self):
+        a = [("a.weight", (4, 4), "torch.float32")]
+        b = [("a.weight", (4, 8), "torch.float32")]
+        self.assertNotEqual(
+            PreshardedModelLoader._hash_structural_signature(a),
+            PreshardedModelLoader._hash_structural_signature(b),
+        )
+
+    def test_hash_changes_with_dtype(self):
+        a = [("a.weight", (4, 4), "torch.float32")]
+        b = [("a.weight", (4, 4), "torch.float16")]
+        self.assertNotEqual(
+            PreshardedModelLoader._hash_structural_signature(a),
+            PreshardedModelLoader._hash_structural_signature(b),
+        )
+
+    def test_hash_changes_with_added_or_removed_tensor(self):
+        # Simulates a new sharding knob splitting one tensor into two (or
+        # adding a new per-rank buffer) -- the exact case manual flag
+        # enumeration would miss if nobody updates _build_subfolder_name.
+        a = [("a.weight", (4, 4), "torch.float32")]
+        b = [
+            ("a.weight", (4, 4), "torch.float32"),
+            ("a.extra_buf", (4,), "torch.float32"),
+        ]
+        self.assertNotEqual(
+            PreshardedModelLoader._hash_structural_signature(a),
+            PreshardedModelLoader._hash_structural_signature(b),
+        )
+
+    def test_hash_is_order_independent_given_presorted_input(self):
+        # _compute_structural_signature always sorts before hashing, so
+        # callers that pre-sort (as it does) get a stable hash regardless
+        # of the original state_dict iteration order.
+        a = [("a.weight", (4, 4), "torch.float32"), ("b.weight", (2,), "torch.int8")]
+        b = sorted(reversed(a))
+        self.assertEqual(
+            PreshardedModelLoader._hash_structural_signature(a),
+            PreshardedModelLoader._hash_structural_signature(sorted(b)),
+        )
+
+    def test_compute_structural_signature_returns_none_on_failure(self):
+        # No self.load_config (and no real model class behind
+        # SimpleNamespace) means _get_quantization_config / _initialize_model
+        # will raise; this must be swallowed and return None, never raise,
+        # since a model class that can't be built on meta device must not
+        # break the overall load.
+        loader = object.__new__(PreshardedModelLoader)
+        model_config = SimpleNamespace(quantization=None)
+        self.assertIsNone(loader._compute_structural_signature(model_config))
+
+    def test_compute_structural_signature_picks_up_meta_model_shapes(self):
+        # End-to-end on a tiny real nn.Module standing in for the model
+        # class, to prove the meta-device construction + hashing wiring
+        # actually reflects shapes that depend on the live parallel state
+        # (here simulated via a width captured at construction time).
+        import torch.nn as nn
+
+        class FakeModelLoader(PreshardedModelLoader):
+            def __init__(self, width):
+                self._width = width
+                self.load_config = SimpleNamespace()
+
+        def _initialize_model_stub(model_config, load_config, quant_config):
+            return nn.Linear(4, model_config.width, bias=False)
+
+        with mock.patch(
+            "sglang.srt.model_loader.loader._get_quantization_config",
+            return_value=None,
+        ), mock.patch(
+            "sglang.srt.model_loader.loader._initialize_model",
+            side_effect=_initialize_model_stub,
+        ), mock.patch(
+            "sglang.srt.model_loader.loader.set_default_torch_dtype",
+            return_value=mock.MagicMock(__enter__=mock.Mock(), __exit__=mock.Mock()),
+        ):
+            loader_narrow = FakeModelLoader(width=2)
+            loader_wide = FakeModelLoader(width=8)
+            model_config_narrow = SimpleNamespace(
+                quantization=None, dtype=torch.float32, width=2
+            )
+            model_config_wide = SimpleNamespace(
+                quantization=None, dtype=torch.float32, width=8
+            )
+            sig_narrow = loader_narrow._compute_structural_signature(
+                model_config_narrow
+            )
+            sig_wide = loader_wide._compute_structural_signature(model_config_wide)
+        self.assertIsNotNone(sig_narrow)
+        self.assertIsNotNone(sig_wide)
+        self.assertNotEqual(sig_narrow, sig_wide)
 
 
 if __name__ == "__main__":
