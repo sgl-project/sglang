@@ -1270,8 +1270,24 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        is_dummy: bool = False,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
+        self._is_dummy = is_dummy
+
+        if is_dummy:
+            self._init_dummy(
+                device_pool,
+                host_to_device_ratio,
+                host_size,
+                page_size,
+                layout,
+                pin_memory,
+                device,
+                allocator_type,
+            )
+            return
+
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -1300,9 +1316,63 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
         self._init_write_back_staging_buffers()
 
+    def _init_dummy(
+        self,
+        device_pool: MLATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool,
+        device: str,
+        allocator_type: str,
+    ):
+        """Allocator-only init for non-rank-0 MLA ranks: keep free-slot
+        bookkeeping in sync without allocating the host KV buffer."""
+        self.device_pool = device_pool
+        self.page_size = page_size
+        self.layout = layout
+        self.pin_memory = pin_memory
+        self.device = device
+        self.allocator = get_allocator_from_storage(allocator_type)
+
+        self.dtype = device_pool.store_dtype
+        self.size_per_token = self.get_size_per_token()
+
+        if host_size > 0:
+            self.size = int(host_size * 1e9 // self.size_per_token)
+        else:
+            self.size = int(device_pool.size * host_to_device_ratio)
+        self.page_num = self.size // self.page_size + 1
+        self.size = self.page_num * self.page_size
+        self.start_layer = device_pool.start_layer
+        self.end_layer = device_pool.end_layer
+
+        self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
+        self.layout_dim = self.token_stride_size * self.layer_num
+
+        self.can_use_jit = False
+        self.kv_buffer = None
+        self.data_refs = None
+        self.data_ptrs = None
+
+        logger.info(
+            "MLATokenToKVPoolHost dummy mode: allocator-only, size=%d tokens, "
+            "saving %.2f GB host memory",
+            self.size,
+            self.size * self.size_per_token / 1e9,
+        )
+
+        self.lock = threading.RLock()
+        self.clear()
+
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
         for registering host memory with the disaggregation transfer engine."""
+        if self._is_dummy:
+            # Non-rank-0 MLA dedup ranks own no host buffer (data_ptrs/kv_buffer
+            # are None). There is nothing to register with the transfer engine.
+            return [], [], []
         data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
         data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
         item_lens = [self.token_stride_size * self.page_size] * self.layer_num
@@ -1424,6 +1494,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        assert not self._is_dummy, "load on a dummy (non-rank-0 MLA) host pool"
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -1507,6 +1578,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        assert not self._is_dummy, "backup on a dummy (non-rank-0 MLA) host pool"
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -3154,6 +3226,17 @@ class HostPoolGroup:
     def size_per_token(self):
         return self.anchor_entry.host_pool.size_per_token
 
+    def get_size_per_token(self):
+        # Some storage-backend factories (e.g. HF3FS) call this as a method on
+        # the host pool; delegate to the anchor pool so a HostPoolGroup works.
+        return self.anchor_entry.host_pool.get_size_per_token()
+
+    @property
+    def _is_dummy(self):
+        # Surface the anchor (KV) pool's dummy flag so dedup-aware guards
+        # (e.g. skipping register_mem_pool_host) fire for the grouped case too.
+        return getattr(self.anchor_entry.host_pool, "_is_dummy", False)
+
     @property
     def allocator(self):
         return self.anchor_entry.host_pool.allocator
@@ -3279,7 +3362,9 @@ class DSAIndexerPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        is_dummy: bool = False,
     ):
+        self._is_dummy = is_dummy
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = layout
@@ -3309,6 +3394,20 @@ class DSAIndexerPoolHost(HostKVCache):
         self.size_per_token = (
             self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
         )
+
+        if is_dummy:
+            # Non-rank-0 DSA dedup: allocator-only, indexer data arrives via
+            # broadcast at load time, so skip the host buffer allocation.
+            self.index_k_with_scale_buffer = None
+            self.index_k_device_ptrs = None
+            logger.info(
+                "DSAIndexerPoolHost dummy mode: allocator-only, size=%d tokens, "
+                "skipping indexer buffer allocation",
+                self.size,
+            )
+            self.lock = threading.RLock()
+            self.clear()
+            return
 
         buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
         requested_bytes = buf_elem_size * self.indexer_dtype.itemsize

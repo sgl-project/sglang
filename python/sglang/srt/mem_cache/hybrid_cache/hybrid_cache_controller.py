@@ -31,6 +31,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import PoolEntry
+from sglang.srt.mem_cache.mla_host_dedup import (
+    MLAHostDedupPrebuild,
+    storage_supports_host_dedup,
+)
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
@@ -172,6 +176,7 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         transfer_layer_num: Optional[int] = None,
         enable_storage_metrics: bool = False,
+        mla_dedup_prebuild: Optional[MLAHostDedupPrebuild] = None,
     ):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
@@ -191,12 +196,31 @@ class HybridCacheController(BaseHiCacheController):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            mla_dedup_prebuild=mla_dedup_prebuild,
         )
+        # The base gate ran with storage_backend=None; re-apply it with the
+        # real startup backend so broadcast never runs against full
+        # (non-dummy) pools.
+        if self.mla_broadcast_enabled and not storage_supports_host_dedup(
+            startup_storage_backend
+        ):
+            self._destroy_mla_broadcast_group()
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
         if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
             self.layer_num = transfer_layer_num
             self.layer_done_counter = LayerDoneCounter(self.layer_num)
+            # The broadcast indexes the MLA KV buffer by layer_num; an
+            # expanded transfer layer count (e.g. +Mamba state) would index
+            # out of bounds and the extra pools aren't deduped — disable.
+            if self.mla_broadcast_enabled:
+                logger.info(
+                    "Disabling MLA host-dedup broadcast: transfer layer count "
+                    "(%d) exceeds the MLA KV layers, so extra hybrid pools "
+                    "(e.g. Mamba) are not deduplicated.",
+                    self.layer_num,
+                )
+                self._destroy_mla_broadcast_group()
 
         if startup_storage_backend is not None:
             self.attach_storage_backend(
@@ -227,6 +251,9 @@ class HybridCacheController(BaseHiCacheController):
         )
 
         for entry in host_pools or []:
+            # Dummy pool: nothing to register; this rank never reads L3.
+            if getattr(entry.host_pool, "_is_dummy", False):
+                continue
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     @staticmethod
@@ -394,6 +421,17 @@ class HybridCacheController(BaseHiCacheController):
         if not self.write_queue:
             return
         op = CacheOperation.merge_ops(self.write_queue)
+        self.write_queue.clear()
+        start_event = device_module.Event()
+        finish_event = device_module.Event()
+        if self._mla_skip_host_io:
+            # MLA/DSA dedup: dummy host pools on this rank; skip D2H, just ack.
+            start_event.record()
+            finish_event.record()
+            self.ack_write_queue.append(
+                HiCacheAck(start_event, finish_event, op.node_ids)
+            )
+            return
         # Page-first write-back JIT kernels can keep destination host indices on CPU.
         if (
             self.io_backend == "kernel"
@@ -407,9 +445,6 @@ class HybridCacheController(BaseHiCacheController):
             host_indices, device_indices, resolved_pool_transfers = (
                 self.move_hybrid_indices(op)
             )
-        self.write_queue.clear()
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
@@ -484,10 +519,12 @@ class HybridCacheController(BaseHiCacheController):
             return -1
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
+        self.load_queue.clear()
+        if self.mla_broadcast_enabled:
+            return self._start_loading_mla(producer_id, op)
         host_indices, device_indices, resolved_pool_transfers = (
             self.move_hybrid_indices(op)
         )
-        self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
         with device_module.stream(self.load_stream):
@@ -528,6 +565,27 @@ class HybridCacheController(BaseHiCacheController):
             )
         )
         return producer_id
+
+    def _load_mla_on_src_rank(self, op: CacheOperation) -> None:
+        """Src-rank H2D including the extra pool transfers (DSA indexer)."""
+        host_indices, device_indices, resolved_pool_transfers = (
+            self.move_hybrid_indices(op)
+        )
+        for i in range(self.layer_num):
+            self.mem_pool_host.load_to_device_per_layer(
+                self.mem_pool_device,
+                host_indices,
+                device_indices,
+                i,
+                self.io_backend,
+                pool_transfers=resolved_pool_transfers,
+            )
+        self._record_transfer_indices_on_stream(
+            self.load_stream,
+            host_indices,
+            device_indices,
+            resolved_pool_transfers,
+        )
 
     def _record_transfer_indices_on_stream(
         self,
@@ -639,6 +697,15 @@ class HybridCacheController(BaseHiCacheController):
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation):
+        # Dummy host pools (KV and indexer): no L3 reads on this rank. Must
+        # precede super()._page_transfer and the sidecar batch_get below;
+        # pool_transfers_done lets this rank pass the all-reduced termination
+        # check.
+        if self._mla_skip_host_io:
+            operation.completed_tokens += len(operation.hash_value) * self.page_size
+            operation.pool_transfers_done = True
+            return
+
         # KV pools first — determines actual completed page count
         super()._page_transfer(operation)
 
