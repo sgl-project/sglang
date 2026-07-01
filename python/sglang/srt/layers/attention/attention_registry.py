@@ -304,11 +304,9 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
             linear_attn_backend = GDNAttnBackend(runner)
         elif runner.mamba2_config is not None:
-            from sglang.srt.configs.lfm2 import (
-                Lfm2Config,
-                Lfm2MoeConfig,
-                Lfm2VlConfig,
-            )
+            from sglang.srt.configs.lfm2 import Lfm2Config
+            from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
+            from sglang.srt.configs.lfm2_vl import Lfm2VlConfig
             from sglang.srt.configs.zaya import ZayaConfig
 
             # Short-conv hybrids (ZAYA1 CCA, LFM2 short conv) share a conv-state
