@@ -652,9 +652,10 @@ class TboForwardBatchPreparer:
             output_dict[key] = old_value[start_token_index:end_token_index]
 
         attention_tp_size = get_parallel().attn_tp_size
-        output_dict["tbo_padded_len"] = (
+        _tbo_padded_len = (
             (end_token_index - start_token_index - 1) // attention_tp_size + 1
         ) * attention_tp_size
+        output_dict["tbo_padded_len"] = _tbo_padded_len
 
         for key in [
             "req_pool_indices",

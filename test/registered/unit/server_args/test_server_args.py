@@ -1336,5 +1336,48 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         self.assertEqual(parsed.sampling_backend, "token_oracle")
 
 
+class TestTwoBatchOverlapBackend(CustomTestCase):
+    """Non-EP DP two-batch-overlap backend requirement.
+
+    With no EP a2a backend (moe_a2a_backend='none'), --enable-two-batch-overlap
+    is only valid on the DeepSeek-V4 non-EP DP TP-MoE path (overlapping the DP
+    all_gatherv / reduce_scatterv with the other ubatch's compute), which
+    requires --enable-dp-attention. This replaced the removed opt-in
+    SGLANG_ENABLE_DP_TBO env: enabling DP TBO now needs no extra flag.
+
+    dummy-model short-circuits __post_init__, so the guard handler is invoked
+    directly (same pattern as TestDeepEPWaterfillArgs)."""
+
+    def _args(self, **overrides):
+        args = ServerArgs(model_path="dummy")
+        args.enable_two_batch_overlap = True
+        args.moe_a2a_backend = "none"
+        args.enable_dp_attention = False
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_no_a2a_without_dp_attention_raises(self):
+        args = self._args(enable_dp_attention=False)
+        with self.assertRaisesRegex(ValueError, "enable-dp-attention"):
+            args._check_two_batch_overlap()
+
+    def test_no_a2a_with_dp_attention_ok(self):
+        # DP TBO path is valid: --enable-dp-attention + --enable-two-batch-overlap
+        # with a2a backend 'none' must NOT raise (no SGLANG_ENABLE_DP_TBO needed).
+        args = self._args(enable_dp_attention=True)
+        args._check_two_batch_overlap()
+
+    def test_ep_a2a_backend_ok_without_dp_attention(self):
+        # EP a2a path (e.g. deepep) overlaps dispatch/combine; the guard does not
+        # require dp-attention there.
+        args = self._args(moe_a2a_backend="deepep", enable_dp_attention=False)
+        args._check_two_batch_overlap()
+
+    def test_tbo_disabled_is_noop(self):
+        args = self._args(enable_two_batch_overlap=False, enable_dp_attention=False)
+        args._check_two_batch_overlap()
+
+
 if __name__ == "__main__":
     unittest.main()
