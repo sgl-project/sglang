@@ -325,6 +325,15 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         model_runner = ModelRunner(**runner_kwargs)
         model_runner.alloc_memory_pool()
         model_runner.init_attention_backends()
+        # bench_one_batch bypasses the Scheduler, so the Mamba SSU backend that
+        # Scheduler.init_mamba_backend() would set up is never initialized. Do it
+        # here (per tp_rank, i.e. per worker process) for mamba/linear-attn models.
+        if model_runner.mambaish_config is not None:
+            from sglang.srt.layers.attention.mamba.ops import (
+                initialize_mamba_selective_state_update_backend,
+            )
+
+            initialize_mamba_selective_state_update_backend(server_args)
         model_runner.init_cuda_graphs()
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
     tokenizer = get_tokenizer(
