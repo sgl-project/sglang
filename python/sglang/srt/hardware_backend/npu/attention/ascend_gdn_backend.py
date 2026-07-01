@@ -1,5 +1,6 @@
 from typing import Optional, Tuple, Union
 
+import sgl_kernel_npu  # noqa: F401
 import torch
 from sgl_kernel_npu.fla.fused_gdn_gating import (
     fused_gdn_gating_kernel_without_sigmoid,
@@ -8,7 +9,6 @@ from sgl_kernel_npu.fla.fused_gdn_gating import (
 from sgl_kernel_npu.mamba.causal_conv1d import (
     causal_conv1d_fn_npu,
     causal_conv1d_update_npu,
-    causal_conv1d_update_v2,
 )
 
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
@@ -125,16 +125,17 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         assert isinstance(mixed_qkv, torch.Tensor)
-        conv_states_tmp = conv_states.transpose(1, 2).clone()
-        mixed_qkv = causal_conv1d_update(
+        mixed_qkv = torch.ops.npu.causal_conv1d(
             mixed_qkv,
-            conv_states_tmp,
-            layer.conv_weights,
-            layer.bias,
-            layer.activation,
-            conv_state_indices=cache_indices,
+            layer.conv_weights.transpose(0, 1).contiguous(),
+            conv_states=conv_states,
+            bias=layer.bias,
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            activation_mode=1,
+            pad_slot_id=-1,
+            run_mode=1,
         )
-        conv_states[:] = conv_states_tmp.transpose(1, 2)
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -219,44 +220,41 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 dtype=torch.int32,
                 device=mixed_qkv.device,
             )
-            mixed_qkv = causal_conv1d_update_v2(
-                x=mixed_qkv.view(batch_size, draft_token_num, -1).contiguous(),
-                conv_state=conv_states.contiguous(),
-                weight=layer.conv_weights.transpose(0, 1).contiguous(),
-                bias=layer.bias,
-                activation=layer.activation,
-                conv_state_indices=cache_indices,
-                num_accepted_tokens=num_accepted_tokens,
-                pad_slot_id=-1,
-                validate_data=False,
-            ).view(seq_len, -1)
-        else:
-            mixed_qkv = mixed_qkv.transpose(0, 1)
-            if forward_metadata.has_mamba_track_mask:
-                mixed_qkv_to_track = mixed_qkv[
-                    :, forward_metadata.track_conv_indices
-                ].transpose(0, 1)
-                conv_states.transpose(1, 2)[
-                    forward_metadata.conv_states_mask_indices
-                ] = mixed_qkv_to_track
-            kernel_size = layer.conv_weights.shape[-1]
-            conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :]
-            conv_states_tmp = conv_states_for_prefill.transpose(1, 2).contiguous()
-
-            mixed_qkv = causal_conv1d_fn(
+            mixed_qkv = torch.ops.npu.causal_conv1d(
                 mixed_qkv,
-                layer.conv_weights,
-                layer.bias,
-                activation=layer.activation,
-                conv_states=conv_states_tmp,
-                has_initial_state=has_initial_states,
-                cache_indices=cache_indices,
+                layer.conv_weights.transpose(0, 1).contiguous(),
+                conv_states=conv_states,
+                bias=layer.bias,
                 query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
-            conv_states[:, -(kernel_size - 1) :, :] = conv_states_tmp.transpose(
-                1, 2
-            ).contiguous()
+                cache_indices=cache_indices,
+                num_accepted_tokens=num_accepted_tokens,
+                activation_mode=1,
+                pad_slot_id=-1,
+                run_mode=1,
+            )
+        else:
+            if forward_metadata.has_mamba_track_mask:
+                mixed_qkv_to_track = mixed_qkv[forward_metadata.track_conv_indices]
+                conv_states[forward_metadata.conv_states_mask_indices] = (
+                    mixed_qkv_to_track
+                )
+            kernel_size = layer.conv_weights.shape[-1]
+            conv_states_for_prefill = conv_states[
+                :, -(kernel_size - 1) :, :
+            ].contiguous()
+            mixed_qkv = torch.ops.npu.causal_conv1d(
+                mixed_qkv,
+                layer.conv_weights.transpose(0, 1).contiguous(),
+                conv_states=conv_states_for_prefill,
+                bias=layer.bias,
+                query_start_loc=query_start_loc,
+                cache_indices=cache_indices,
+                has_initial_state=has_initial_states,
+                activation_mode=1,
+                pad_slot_id=-1,
+                run_mode=0,
+            )
+            conv_states[:, -(kernel_size - 1) :, :] = conv_states_for_prefill
         if is_target_verify:
             g, beta = fused_gdn_gating_kernel_without_sigmoid(
                 layer.A_log, a, b, layer.dt_bias
