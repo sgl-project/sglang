@@ -6,7 +6,7 @@ unit-test suite, **organized by the action needed to address it**.
 
 Anything failing that is not listed here should be treated as a regression.
 
-Last updated: 2026-06-05
+Last updated: 2026-06-09
 
 ## Reference runs
 
@@ -178,13 +178,7 @@ moment production is fixed; no test method invokes them today.
 | DSV4 | `[no test]` (`dsv4/README.md`) | `flash_mla.flash_mla_with_kvcache` asserts `indices.shape == (b, s_q, topk)`; metadata sized for live batch, q is static-token-padded |
 | DSA MHA_ONE_SHOT dense fallback | `[no test]` (`dsa/README.md`) | DSA passes K as concatenated `prefix + extend` to `module.attn(save_kv_cache=False)`; `unified_attention_with_output` (`radix_attention.py:170-208`) slices K to `num_token_non_padded_cpu`, dropping the prefix portion — piecewise CG diverges from eager ~50% mismatch (~0.35 max diff) |
 
-## C.5. Sparse-kernel production bugs
-
-| Citation | Symptom | Trigger | Status |
-|---|---|---|---|
-| Triton dense `DRAFT_EXTEND` (non-V2) | Eager fixture/reference mismatch on narrow accepted-token layouts | Test omitted | `[no test]` (`dense/README.md`) |
-
-## C.6. DSA-specific structural gaps
+## C.5. DSA-specific structural gaps
 
 | Item | Status | Root cause |
 |---|---|---|

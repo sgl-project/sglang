@@ -21,6 +21,7 @@ from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner i
 )
 from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
     run_dense_draft_extend_v2_cuda_graph_case,
+    run_dense_eagle_draft_extend_case,
     run_dense_eagle_draft_extend_v2_cuda_graph_runner_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
@@ -244,6 +245,34 @@ class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
             "ngram",
         ),
     )
+    DRAFT_EXTEND_CASES = (
+        (
+            DenseAttentionCase(
+                name="runner_eagle_draft_extend_ragged_accept",
+                backend="triton",
+                forward_mode=ForwardMode.DRAFT_EXTEND,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(2, 5),
+                extend_lens=(1, 3),
+            ),
+            "eagle",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_frozen_kv_mtp_draft_extend_ragged_accept",
+                backend="triton",
+                forward_mode=ForwardMode.DRAFT_EXTEND,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(2, 5),
+                extend_lens=(1, 3),
+            ),
+            "frozen_kv_mtp",
+        ),
+    )
     DRAFT_EXTEND_V2_CUDA_GRAPH_CASES = (
         DenseAttentionCase(
             name="runner_cuda_graph_eagle_draft_extend_v2_fixed_tokens",
@@ -416,6 +445,19 @@ class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
                     self,
                     case,
                     topk=topk,
+                    spec_kind=spec_kind,
+                )
+
+    def test_runner_mode_eagle_draft_extend_cases(self):
+        for case, spec_kind in self.DRAFT_EXTEND_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                spec_kind=spec_kind,
+            ):
+                run_dense_eagle_draft_extend_case(
+                    self,
+                    case,
                     spec_kind=spec_kind,
                 )
 
