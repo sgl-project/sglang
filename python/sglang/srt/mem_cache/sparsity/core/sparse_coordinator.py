@@ -61,8 +61,11 @@ class SparseConfig:
     swap_in_block_size: int = 960
     algorithm: Optional[str] = None
     backend: Optional[str] = None
-    page_size: Optional[int] = None
-    min_sparse_prompt_len: Optional[int] = None
+    # Default to 1 (token-wise) so page arithmetic never sees None.
+    page_size: int = 1
+    # Default to 0 so _compute_sparse_mask works even when callers omit it
+    # (None would raise a TypeError in the >= comparison).
+    min_sparse_prompt_len: int = 0
     sparse_extra_config: dict = field(
         default_factory=dict
     )  # Algorithm-specific config, parsed by each algorithm

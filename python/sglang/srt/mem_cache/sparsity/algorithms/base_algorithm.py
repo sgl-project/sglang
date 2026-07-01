@@ -222,7 +222,11 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         if layer_id == self.end_layer - 1:
             success_indices = req_pool_indices[valid_mask]
             self.states.repr_constructed[success_indices] = True
-            self.states.last_constructed_page[success_indices] = num_pages[valid_mask]
+            # seq_lens (hence num_pages) may be int32 while last_constructed_page
+            # is int64; cast to avoid an index_put dtype-mismatch error.
+            self.states.last_constructed_page[success_indices] = num_pages[
+                valid_mask
+            ].to(self.states.last_constructed_page.dtype)
 
     def update_representations(
         self,
@@ -257,7 +261,9 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         # Update tracking states
         if layer_id == self.end_layer - 1:
             success_indices = req_pool_indices[valid_mask]
-            self.states.last_constructed_page[success_indices] = end_page[valid_mask]
+            self.states.last_constructed_page[success_indices] = end_page[
+                valid_mask
+            ].to(self.states.last_constructed_page.dtype)
 
     def retrieve_topk(
         self,

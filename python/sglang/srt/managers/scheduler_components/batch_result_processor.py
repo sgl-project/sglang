@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import SparseCoordinator
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
     from sglang.srt.server_args import ServerArgs
 
@@ -69,6 +70,7 @@ class SchedulerBatchResultProcessor:
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
     hisparse_coordinator: Optional[HiSparseCoordinator]
+    sparse_coordinator: Optional[SparseCoordinator]
     req_to_token_pool: ReqToTokenPool
     decode_offload_manager: Optional[DecodeKVCacheOffloadManager]
     metrics_collector: SchedulerMetricsCollector
@@ -78,6 +80,14 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
+
+    def _sparse_request_end(self, req: Req) -> None:
+        """Clear sparse-attention per-request state before the req slot is
+        released/reused (avoids stale page representations). No-op when sparse
+        attention is disabled. Must be called before ``release_kv_cache`` since
+        release can clear ``req.req_pool_idx``."""
+        if self.sparse_coordinator is not None:
+            self.sparse_coordinator.on_request_end(req)
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -91,6 +101,7 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_quick_finish_time()
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                self._sparse_request_end(req)
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
@@ -236,6 +247,7 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
+                        self._sparse_request_end(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -320,6 +332,7 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
+                        self._sparse_request_end(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     else:
@@ -841,6 +854,7 @@ class SchedulerBatchResultProcessor:
             else:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                self._sparse_request_end(req)
                 prepare_release = getattr(
                     self.model_worker, "prepare_for_kv_cache_release", None
                 )

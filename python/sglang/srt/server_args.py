@@ -1950,6 +1950,14 @@ class ServerArgs:
             aliases=["--hierarchical-sparse-attention-extra-config"],
         ),
     ] = None
+    enable_sparse_attention: A[
+        bool,
+        "(Experimental) Enable query-aware sparse attention (e.g. Quest) on the FlashAttention decode path for non-MLA models.",
+    ] = False
+    sparse_attention_config: A[
+        Optional[str],
+        'A JSON string configuring sparse attention. Example: \'{"algorithm": "quest", "backend": "fa3", "min_sparse_prompt_len": 256, "sparsity_ratio": 0.5, "num_recent_pages": 4}\'',
+    ] = None
 
     # -------------------------------------------------------------------------
     # LMCache

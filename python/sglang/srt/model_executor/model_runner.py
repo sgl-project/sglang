@@ -573,6 +573,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
 
+        # Experimental query-aware sparse attention (e.g. Quest) on FlashAttention.
+        self.sparse_coordinator = None
+
         self._linear_attn_registry_cache: Any = _UNSET
 
         # Load model weights and configure
@@ -857,6 +860,36 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                 swap_in_block_size=hisparse_cfg.swap_in_block_size,
+            )
+
+        # Experimental: query-aware sparse attention (e.g. Quest) wired onto the
+        # FlashAttention decode path for non-MLA models. Decoupled from HiSparse.
+        if self.server_args.enable_sparse_attention:
+            from sglang.srt.mem_cache.sparsity.factory import (
+                create_sparse_coordinator,
+                parse_sparse_attention_config,
+            )
+
+            sparse_cfg = parse_sparse_attention_config(self.server_args)
+            sparse_start_layer = getattr(self, "start_layer", 0)
+            sparse_end_layer = getattr(self, "end_layer", None) or (
+                self.model_config.num_hidden_layers
+            )
+            self.sparse_coordinator = create_sparse_coordinator(
+                device=self.device,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool=self.token_to_kv_pool,
+                start_layer=sparse_start_layer,
+                end_layer=sparse_end_layer,
+                server_args=self.server_args,
+                config=sparse_cfg,
+            )
+            logger.info(
+                "Sparse attention enabled: algorithm=%s, backend=%s, layers [%d, %d)",
+                sparse_cfg.algorithm,
+                sparse_cfg.backend,
+                sparse_start_layer,
+                sparse_end_layer,
             )
 
         self.init_routed_experts_capturer()

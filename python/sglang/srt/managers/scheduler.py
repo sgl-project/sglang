@@ -358,6 +358,10 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
 
+        # Experimental query-aware sparse attention (e.g. Quest), runner-owned.
+        self.enable_sparse_attention = server_args.enable_sparse_attention
+        self.sparse_coordinator = None
+
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
             compute_dp_attention_world_info(
@@ -460,6 +464,12 @@ class Scheduler(
             c.attach_radix_cache(self.tree_cache)
 
         self.init_hisparse_coordinator()
+
+        if self.enable_sparse_attention:
+            # Created inside ModelRunner.initialize(); bind the runner-owned instance.
+            self.sparse_coordinator = getattr(
+                self.tp_worker.model_runner, "sparse_coordinator", None
+            )
 
         if (
             self.server_args.disaggregation_mode == "decode"
@@ -1852,6 +1862,7 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            sparse_coordinator=self.sparse_coordinator,
             req_to_token_pool=self.req_to_token_pool,
             decode_offload_manager=self.decode_offload_manager,
             metrics_collector=self.metrics_collector,
@@ -2947,6 +2958,12 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+
+        if self.sparse_coordinator is not None:
+            # Register newly admitted requests with the sparse-attention coordinator
+            # (records prompt length + resets per-request representation state).
+            for req in new_batch.reqs:
+                self.sparse_coordinator.on_request_begin(req)
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
