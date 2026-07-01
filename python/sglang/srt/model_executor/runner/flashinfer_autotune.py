@@ -133,19 +133,20 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     flashinfer_version = getattr(flashinfer, "__version__", "unknown")
 
     server_args = mr.server_args
-    model_key = "|".join(
-        [
-            str(server_args.model_path),
-            str(mr.dtype),
-            str(server_args.quantization),
-            str(server_args.moe_runner_backend),
-            str(mr.tp_size),
-            str(mr.pp_size),
-            str(mr.dp_size),
-            str(mr.moe_ep_size),
-            str(mr.model_config.hf_config.__class__.__name__),
-        ]
-    )
+    model_key_parts = [
+        str(server_args.model_path),
+        str(mr.dtype),
+        str(server_args.quantization),
+        str(server_args.moe_runner_backend),
+        str(mr.tp_size),
+        str(mr.pp_size),
+        str(mr.dp_size),
+        str(mr.moe_ep_size),
+        str(mr.model_config.hf_config.__class__.__name__),
+    ]
+    if mr.is_draft_worker:
+        model_key_parts.append(f"draft_quant={mr.model_config.quantization}")
+    model_key = "|".join(model_key_parts)
     cache_key = hashlib.sha256(model_key.encode()).hexdigest()[:16]
     cache_dir = (
         Path(envs.SGLANG_CACHE_DIR.get())
