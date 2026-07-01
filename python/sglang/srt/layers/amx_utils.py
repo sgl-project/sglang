@@ -141,6 +141,7 @@ def _amx_process_weight_after_loading(
         device == torch.device("cpu") and cpu_has_amx_support()
     )
 
+    is_conv_weight = False
     if qweight_packed_method is None:
         for i, weight_name in enumerate(weight_names):
             weight_tensor = getattr(module, weight_name)
