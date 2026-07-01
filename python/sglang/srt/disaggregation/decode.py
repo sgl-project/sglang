@@ -601,6 +601,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         resumed_reqs = []
         indices_to_remove = set()
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
+        # Radix-aware resume: when the decode-side radix cache is enabled and the KV
+        # pool supports a partial CPU restore, a resumed request re-matches the tree
+        # and reuses its still-cached device prefix (mirroring pop_preallocated)
+        # instead of re-allocating from scratch + fully restoring from CPU. HiSparse
+        # is incompatible with decode-side L1 radix cache, so it stays on the
+        # full-restore path below.
+        use_radix = (
+            self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            and not self.scheduler.enable_hisparse
+            and getattr(
+                self.token_to_kv_pool_allocator, "support_partial_cpu_restore", False
+            )
+        )
         if uses_swa_tail_prealloc:
             full_allocatable_tokens, swa_allocatable_tokens = (
                 self._swa_aware_allocatable_token_budgets(count_retracted=False)
@@ -609,6 +622,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             full_allocatable_tokens = self._allocatable_token_budgets(
                 count_retracted=False
             )
+            swa_allocatable_tokens = 0
 
         for i, req in enumerate(self.retracted_queue):
             if rids_to_check is not None and req.rid not in rids_to_check:
@@ -617,22 +631,72 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            full_required, swa_required = self._prealloc_required_tokens(req)
-            if full_required > full_allocatable_tokens:
-                break
-            if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
-                break
+            if use_radix:
+                # The radix-aware path requires support_partial_cpu_restore, which the
+                # SWA allocator never advertises, and _uses_swa_tail_prealloc() is
+                # SWA-only -- so it is always False here. Assert it so that opting a
+                # SWA-tail pool into partial restore fails loudly instead of silently
+                # under-counting the SWA budget (the _pre_alloc SWA note explains the
+                # under-estimate when prefix_len > 0) and over-admitting.
+                assert (
+                    not uses_swa_tail_prealloc
+                ), "radix-aware resume is not supported for SWA-tail pools"
+                # Match + lock the device-resident prefix.
+                prefix_match = self._match_prefix_and_lock(req)
+                prefix_len = prefix_match.l1_prefix_len
+                fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+                full_required = (
+                    self._required_alloc_tokens(
+                        fill_len=fill_len, prefix_len=prefix_len
+                    )
+                    + self.num_reserved_decode_tokens
+                )
+                if full_required > full_allocatable_tokens:
+                    # _match_prefix_and_lock always inc_lock_ref's (an empty prefix
+                    # still locks the root), so release unconditionally on bail to
+                    # keep lock_ref balanced.
+                    self.tree_cache.dec_lock_ref(req.last_node)
+                    break
 
-            resumed_reqs.append(req)
-            indices_to_remove.add(i)
-            req.is_retracted = False
-            self._pre_alloc(req)
-            full_allocatable_tokens -= full_required
-            if uses_swa_tail_prealloc:
-                swa_allocatable_tokens -= swa_required
+                resumed_reqs.append(req)
+                indices_to_remove.add(i)
+                req.is_retracted = False
+                # The CPU copy is authoritative for [prefix_len, seqlen-1), so pass
+                # total_prefix_len == prefix_len (no HiCache loadback gap) and restore
+                # only that suffix; the matched prefix is reused on device.
+                self._pre_alloc(
+                    req, prefix_match.prefix_indices, prefix_len, prefix_len
+                )
+                req.cache_protected_len = prefix_len
+                req.load_kv_cache(
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool_allocator,
+                    start=prefix_len,
+                )
+                # Locking pinned previously-evictable pages; refresh the budget from
+                # the live pool state rather than a flat decrement.
+                full_allocatable_tokens = self._allocatable_token_budgets(
+                    count_retracted=False
+                )
+            else:
+                full_required, swa_required = self._prealloc_required_tokens(req)
+                if full_required > full_allocatable_tokens:
+                    break
+                if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
+                    break
 
-            # load from cpu, release the cpu copy
-            req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
+                resumed_reqs.append(req)
+                indices_to_remove.add(i)
+                req.is_retracted = False
+                self._pre_alloc(req)
+                full_allocatable_tokens -= full_required
+                if uses_swa_tail_prealloc:
+                    swa_allocatable_tokens -= swa_required
+
+                # load from cpu, release the cpu copy
+                req.load_kv_cache(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
+                )
 
         self.retracted_queue = [
             entry
@@ -1340,9 +1404,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 (req.req_pool_idx, slice(0, prefix_len)), prefix_indices
             )
 
-        # TODO(retraction): when retraction is implemented with radix cache
-        # awareness, a retracted request should re-match the tree here
-        # instead of re-allocating from scratch. See resume_retracted_reqs.
         delta_len = fill_len - total_prefix_len
         required_alloc_tokens = self._required_alloc_tokens(
             fill_len=fill_len, prefix_len=prefix_len

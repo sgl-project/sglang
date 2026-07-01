@@ -378,7 +378,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None, start: int = 0):
+        # SWA does not advertise support_partial_cpu_restore, so resume never
+        # requests a partial (start > 0) restore here. Guard with raise (not assert)
+        # so it survives python -O: a partial restore here would corrupt the prefix.
+        if start != 0:
+            raise ValueError("partial CPU restore is not supported for the SWA pool")
         return self._kvcache.load_cpu_copy(
             kv_cache_cpu, indices, mamba_indices=mamba_indices
         )
