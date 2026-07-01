@@ -212,8 +212,6 @@ class SpeculativeAlgorithm(Enum):
             return DFlashWorkerV2
 
         if self.is_dspark():
-            # V2 worker; scheduler runs it synchronously when overlap is
-            # disabled, same as DFLASH.
             from sglang.srt.speculative.dspark_worker_v2 import DSparkWorkerV2
 
             return DSparkWorkerV2

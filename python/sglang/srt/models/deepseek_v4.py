@@ -1927,9 +1927,6 @@ class DeepseekV4Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
-            # DSpark aux hidden states are captured in CP-local order; rerange
-            # them to full request-token order to match out_cache_loc/positions
-            # before they reach the draft KV materialization.
             aux_hidden_states = [
                 cp_all_gather_rerange_output(
                     aux,
@@ -1939,13 +1936,6 @@ class DeepseekV4Model(nn.Module):
                 )
                 for aux in aux_hidden_states
             ]
-            # cp_all_gather_rerange_output pads the first dim to the next
-            # cp_size multiple (e.g. 93 real tokens -> 96 for cp_size=4); the
-            # extra rows are zero-padded. DSpark stores the full aux tensor
-            # (CaptureHiddenMode.FULL, no row indexing), so trim it back to the
-            # real token count to match out_cache_loc / positions. The main
-            # hidden path already selects real rows via cumsum(extend), so it
-            # is left untouched.
             if forward_batch.extend_seq_lens_cpu is not None:
                 real_n = int(sum(forward_batch.extend_seq_lens_cpu))
                 aux_hidden_states = [

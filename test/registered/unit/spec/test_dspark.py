@@ -34,8 +34,6 @@ class TestDSparkPredicates(CustomTestCase):
             self.assertFalse(other(), other.__name__)
 
     def test_capability_predicates(self):
-        # Block drafter verified by the target (like DFLASH), with its own draft
-        # KV chains and target hidden states carried in, and no topk tree.
         self.assertTrue(self.algo.supports_target_verify_for_draft())
         self.assertTrue(self.algo.has_draft_kv())
         self.assertTrue(self.algo.carries_draft_hidden_states())
@@ -157,9 +155,6 @@ class TestDSparkDraftInputBatch(CustomTestCase):
         )
 
     def test_merge_then_filter_asymmetric_cur_allocated(self):
-        # Regression: merging an input without cur_allocated_seq_lens_cpu into one
-        # that has it must drop it to None rather than leave a stale-sized array that
-        # filter_batch then indexes out of bounds (the serving crash in merge_batch).
         a = self._make(2, with_cur=True)
         b = self._make(1, with_cur=False)
         a.merge_batch(b)
