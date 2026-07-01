@@ -155,21 +155,33 @@ class CUDAPiecewiseBackend:
 
             # During normal capture (PiecewiseCudaGraphRunner.capture()),
             # set_pcg_capture_stream() guarantees a valid stream. However,
-            # Dynamo may silently recompile on HIP/MLA serving batches whose
-            # token count exceeds the captured range. The replacement backend
-            # has no capture stream; fall back there instead of crashing while
-            # preserving the original assertion on other platforms.
+            # Dynamo may silently recompile at runtime and call this backend
+            # outside the capture context. Fall back instead of trying to
+            # capture a cudagraph without a stream.
             stream = get_pcg_capture_stream()
-            if _is_hip and stream is None:
-                print_warning_once(
-                    "PCG capture stream is not set; likely a Dynamo runtime "
-                    "recompilation. Falling back to eager execution for this "
-                    "subgraph."
-                )
+            if stream is None:
+                if _is_hip:
+                    print_warning_once(
+                        "PCG capture stream is not set; likely a Dynamo runtime "
+                        "recompilation. Falling back to eager execution for this "
+                        "subgraph."
+                    )
+                elif not getattr(self, "_warned_runtime_recompile", False):
+                    logger.warning(
+                        "PCG capture stream is not set for runtime_shape=%d. "
+                        "This usually indicates a runtime recompilation "
+                        "(e.g. an Optional[Tensor] kwarg like "
+                        "input_deepstack_embeds changed type between warmup "
+                        "and runtime). Falling back to the compiled graph "
+                        "without cudagraph replay for this shape. "
+                        "Consider aligning warmup kwargs with runtime or "
+                        "running without --enforce-piecewise-cuda-graph.",
+                        runtime_shape,
+                    )
+                    self._warned_runtime_recompile = True
+                entry.use_cudagraph = False
+                entry.cudagraph = None
                 return entry.runnable(*args)
-            assert (
-                stream is not None
-            ), "PCG capture stream is not set, please check if runtime recompilation happened"
 
             if self.compile_config.get_enable_debug_mode():
                 input_addresses = [

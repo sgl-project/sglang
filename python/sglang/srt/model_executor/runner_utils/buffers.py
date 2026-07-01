@@ -337,6 +337,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
     positions: torch.Tensor
     input_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
+    input_deepstack_embeds: Optional[torch.Tensor] = None
 
     @classmethod
     def create(
@@ -350,6 +351,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
         hidden_size: int,
         dtype: torch.dtype,
         enable_mamba_track: bool,
+        num_deepstack_embeddings: int = 0,
     ) -> PrefillInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_tokens,), dtype=torch.int64)
@@ -372,9 +374,17 @@ class PrefillInputBuffers(ForwardInputBuffers):
             if is_multimodal:
                 input_embeds = torch.zeros((max_num_tokens, hidden_size), dtype=dtype)
                 mrope_positions = torch.zeros((3, max_num_tokens), dtype=torch.int64)
+                if num_deepstack_embeddings > 0:
+                    input_deepstack_embeds = torch.zeros(
+                        (max_num_tokens, hidden_size * num_deepstack_embeddings),
+                        dtype=dtype,
+                    )
+                else:
+                    input_deepstack_embeds = None
             else:
                 input_embeds = None
                 mrope_positions = None
+                input_deepstack_embeds = None
 
         return cls(
             input_ids=input_ids,
@@ -385,6 +395,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
             positions=positions,
             input_embeds=input_embeds,
             mrope_positions=mrope_positions,
+            input_deepstack_embeds=input_deepstack_embeds,
         )
 
     def populate_from_forward_batch(

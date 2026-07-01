@@ -786,6 +786,7 @@ def build_prefill_registry(
     is_multimodal: bool = False,
     hidden_size: int = 0,
     embed_dtype: Optional[torch.dtype] = None,
+    num_deepstack_embeddings: int = 0,
     enable_mamba_track: bool = False,
     register_input_embeds: bool = True,
     share_pool: bool = True,
@@ -865,6 +866,17 @@ def build_prefill_registry(
                 GraphSlot(
                     "input_embeds",
                     lambda _bs2, mt: (mt, hidden_size),
+                    embed_dtype,
+                    axis="tokens",
+                    padding_policy=PaddingPolicy.ZERO,
+                    copy_from_fb=False,
+                )
+            )
+        if num_deepstack_embeddings > 0:
+            slots.append(
+                GraphSlot(
+                    "input_deepstack_embeds",
+                    lambda _bs2, mt: (mt, hidden_size * num_deepstack_embeddings),
                     embed_dtype,
                     axis="tokens",
                     padding_policy=PaddingPolicy.ZERO,

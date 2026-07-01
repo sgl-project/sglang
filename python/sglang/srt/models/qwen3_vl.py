@@ -18,7 +18,7 @@ import logging
 import re
 from collections import defaultdict
 from functools import lru_cache, partial
-from typing import Callable, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -1298,7 +1298,16 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # deepstack
         self.deepstack_visual_indexes = config.vision_config.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-        self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
+        # Only advertise use_deepstack when the checkpoint actually provides
+        # deepstack layers. Otherwise the runtime would still pass a zero-column
+        # dummy ``input_deepstack_embeds`` kwarg into the language model, which
+        # (a) has no functional effect, and (b) causes a dynamo kwargs-shape
+        # mismatch against the warmup-captured piecewise cuda graph, eventually
+        # triggering the PCG capture-stream fallback path.
+        if self.num_deepstack_embeddings > 0:
+            self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
+        else:
+            self.use_deepstack = {}
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
@@ -1375,6 +1384,86 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     def should_apply_lora(self, module_name: str) -> bool:
         return bool(self._lora_pattern.match(module_name))
 
+    def _ensure_deepstack_kwarg(
+        self,
+        input_embeds: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Guarantee ``input_deepstack_embeds`` is always a Tensor before
+        dispatching to the inner language_model, so that dynamo's guard built
+        during piecewise cuda-graph warmup keeps matching on real runtime
+        requests (and we don't fall back off the cuda-graph path).
+
+        * Checkpoints without deepstack layers (``num_deepstack_embeddings == 0``,
+          e.g. Qwen3.5 language-only): do nothing. ``use_deepstack`` is already
+          ``{}`` in that case, so no kwarg is injected anywhere — warmup and
+          runtime stay in sync.
+        * Checkpoints with deepstack (Qwen3-VL): multimodal requests already get
+          a real feature tensor via ``general_mm_embed_routine``; pure-text
+          requests and warmup would otherwise skip the kwarg entirely. We
+          therefore synthesize a zero-filled dummy with the *same shape
+          formula* as the real tensor (``[num_tokens, hidden * num_deepstack]``)
+          and mark dim 0 as dynamic so dynamo compiles a symbolic-shape graph
+          rather than specializing to the warmup token count.
+        """
+        if self.num_deepstack_embeddings == 0:
+            return kwargs
+
+        real_deepstack_embeds = kwargs.get("input_deepstack_embeds", None)
+        static_deepstack_embeds = getattr(forward_batch, "input_deepstack_embeds", None)
+        if static_deepstack_embeds is not None:
+            static_deepstack_embeds.zero_()
+            if real_deepstack_embeds is not None:
+                if real_deepstack_embeds.shape[-1] != static_deepstack_embeds.shape[-1]:
+                    raise ValueError(
+                        "input_deepstack_embeds hidden size does not match the "
+                        "piecewise CUDA graph static buffer: "
+                        f"{real_deepstack_embeds.shape=} "
+                        f"{static_deepstack_embeds.shape=}"
+                    )
+                if real_deepstack_embeds.shape[0] > static_deepstack_embeds.shape[0]:
+                    raise ValueError(
+                        "input_deepstack_embeds token count exceeds the piecewise "
+                        "CUDA graph static buffer: "
+                        f"{real_deepstack_embeds.shape=} "
+                        f"{static_deepstack_embeds.shape=}"
+                    )
+                copy_len = real_deepstack_embeds.shape[0]
+                static_deepstack_embeds[:copy_len].copy_(
+                    real_deepstack_embeds.to(
+                        device=static_deepstack_embeds.device,
+                        dtype=static_deepstack_embeds.dtype,
+                    )
+                )
+            kwargs["input_deepstack_embeds"] = static_deepstack_embeds
+            return kwargs
+
+        if real_deepstack_embeds is not None:
+            return kwargs
+        if input_embeds is None:
+            return kwargs
+
+        dummy = torch.zeros(
+            (
+                input_embeds.shape[0],
+                input_embeds.shape[-1] * self.num_deepstack_embeddings,
+            ),
+            dtype=input_embeds.dtype,
+            device=input_embeds.device,
+        )
+        try:
+            torch._dynamo.mark_dynamic(dummy, 0)
+        except Exception as e:
+            # Best-effort; different torch versions may expose this differently.
+            logger.warning(
+                "Failed to mark tensor as dynamic for PCG: %s. This may cause performance degradation.",
+                e,
+            )
+            pass
+        kwargs["input_deepstack_embeds"] = dummy
+        return kwargs
+
     @torch.no_grad()
     def forward(
         self,
@@ -1416,6 +1505,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             multimodal_model=self,
             positions=positions,
             use_deepstack=self.use_deepstack,
+            extra_lm_kwargs_fn=self._ensure_deepstack_kwarg,
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
