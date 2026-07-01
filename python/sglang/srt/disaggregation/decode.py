@@ -723,7 +723,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
                 logger.error(error_msg)
                 for decode_req in reqs:
-                    decode_req.kv_receiver.abort()
+                    # kv_receiver may be None from a prior self.queue cleanup
+                    if decode_req.kv_receiver is not None:
+                        decode_req.kv_receiver.abort()
                 del self._ensure_retry_count[bootstrap_addr]
                 del self._ensure_last_attempt_time[bootstrap_addr]
             else:
@@ -834,6 +836,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.kv_receiver = None
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
+
+        # DecodeRequest is shared between self.queue and self.pending_reqs;
+        # drop failed reqs from both
+        if failed_reqs:
+            failed_ids = {id(r) for r in failed_reqs}
+            self.pending_reqs = [
+                r for r in self.pending_reqs if id(r) not in failed_ids
+            ]
 
         # HiSparse physical constraint: max requests by device buffer capacity.
         # Each admitted req needs padded_buffer_size from hisparse device pool.
