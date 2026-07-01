@@ -25,7 +25,7 @@ For more details, see the [Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turb
 
 SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
 
-Please refer to the [official SGLang-diffusion installation guide](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/install.md) for installation instructions.
+Please refer to the [official SGLang-diffusion installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for installation instructions.
 
 ## 3. Model Deployment
 
@@ -46,14 +46,14 @@ The step count and guidance scale are **request-time** settings (see [API Usage]
 
 ### 3.2 Configuration Tips
 
-Currently supported optimizations are listed [here](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/support_matrix.md).
+Currently supported optimizations are listed [here](/docs/sglang-diffusion/compatibility_matrix).
 
 - `--num-gpus`: Number of GPUs to use.
 - `--tp-size`: Tensor parallelism size (the recommended multi-GPU path for Krea-2). Its attention heads (48, with 12 KV heads) and text heads (20) are divisible by a tensor-parallel size of 1, 2, or 4.
 
 ## 4. API Usage
 
-For complete API documentation, please refer to the [official API usage guide](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/openai_api.md).
+For complete API documentation, please refer to the [official API usage guide](/docs/sglang-diffusion/api/openai_api).
 
 ### 4.1 Generate an Image
 
