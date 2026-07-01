@@ -231,6 +231,100 @@ class TestRegisterToBootstrap(CustomTestCase):
         self.assertNotIn("[::]", url_used)
         self.assertIn("[::1]", url_used)
 
+    def test_sender_follow_bootstrap_room_uses_system_dp_rank_for_plain_dp(self):
+        from sglang.srt.disaggregation.common.conn import CommonKVSender
+
+        mgr = self._make_manager()
+        mgr.attn_dp_rank = 0
+        mgr.system_dp_size = 2
+        mgr.system_dp_rank = 1
+        mgr.server_args.dp_size = 2
+
+        CommonKVSender(
+            mgr,
+            bootstrap_addr="127.0.0.1:8765",
+            bootstrap_room=3,
+            dest_tp_ranks=[0],
+            pp_rank=0,
+        )
+
+        mgr.record_failure.assert_not_called()
+
+    def test_sender_follow_bootstrap_room_rejects_wrong_plain_dp_rank(self):
+        from sglang.srt.disaggregation.common.conn import CommonKVSender, KVPoll
+
+        mgr = self._make_manager()
+        mgr.attn_dp_rank = 0
+        mgr.system_dp_size = 2
+        mgr.system_dp_rank = 1
+        mgr.server_args.dp_size = 2
+
+        CommonKVSender(
+            mgr,
+            bootstrap_addr="127.0.0.1:8765",
+            bootstrap_room=2,
+            dest_tp_ranks=[0],
+            pp_rank=0,
+        )
+
+        mgr.record_failure.assert_called_once()
+        self.assertIn("dispatched to dp_rank 1", mgr.record_failure.call_args[0][1])
+        mgr.update_status.assert_any_call(2, KVPoll.Failed)
+
+    @patch("sglang.srt.disaggregation.common.conn.requests.post")
+    def test_sender_register_dp_rank_uses_system_dp_rank_for_plain_dp(self, mock_post):
+        from sglang.srt.disaggregation.common.conn import CommonKVSender
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_post.return_value = mock_response
+
+        mgr = self._make_manager()
+        mgr.attn_dp_rank = 0
+        mgr.system_dp_size = 2
+        mgr.system_dp_rank = 1
+        mgr.server_args.dp_size = 2
+        mgr.server_args.load_balance_method = "round_robin"
+
+        CommonKVSender(
+            mgr,
+            bootstrap_addr="127.0.0.1:8765",
+            bootstrap_room=3,
+            dest_tp_ranks=[0],
+            pp_rank=0,
+        )
+
+        payload = mock_post.call_args[1]["json"]
+        self.assertEqual(payload["dp_rank"], 1)
+
+    @patch("sglang.srt.disaggregation.common.conn.requests.post")
+    def test_sender_register_dp_rank_keeps_attention_rank_for_dp_attention(
+        self, mock_post
+    ):
+        from sglang.srt.disaggregation.common.conn import CommonKVSender
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_post.return_value = mock_response
+
+        mgr = self._make_manager()
+        mgr.attn_dp_rank = 2
+        mgr.system_dp_size = 1
+        mgr.system_dp_rank = 0
+        mgr.server_args.dp_size = 4
+        mgr.server_args.load_balance_method = "round_robin"
+
+        CommonKVSender(
+            mgr,
+            bootstrap_addr="127.0.0.1:8765",
+            bootstrap_room=6,
+            dest_tp_ranks=[0],
+            pp_rank=0,
+        )
+
+        payload = mock_post.call_args[1]["json"]
+        self.assertEqual(payload["dp_rank"], 2)
+
     def _make_manager(self, dist_init_addr=None):
         """Create a lightweight mock manager that has the attributes needed
         by register_to_bootstrap, without going through CommonKVManager.__init__
@@ -259,6 +353,7 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.system_dp_rank = 0
         mgr.local_ip = "127.0.0.1"
         mgr.rank_port = 12345
+        mgr.is_dummy_cp_rank = False
 
         mgr.kv_args = MagicMock()
         mgr.kv_args.page_size = 16
@@ -266,6 +361,7 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.server_args = MagicMock()
         mgr.server_args.kv_cache_dtype = "auto"
         mgr.server_args.load_balance_method = "follow_bootstrap_room"
+        mgr.server_args.dp_size = 1
 
         return mgr
 
