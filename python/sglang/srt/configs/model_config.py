@@ -1311,6 +1311,7 @@ class ModelConfig:
             "petit_nvfp4",
             "quark",
             "modelslim",
+            "humming",
             "quark_mxfp4",
         ]
         compatible_quantization_methods = {

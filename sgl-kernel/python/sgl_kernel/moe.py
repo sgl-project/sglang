@@ -12,6 +12,7 @@ def moe_align_block_size(
     num_tokens_post_pad,
     cumsum_buffer,
     pad_sorted_token_ids=False,
+    ignore_invalid_expert=False,
 ):
     torch.ops.sgl_kernel.moe_align_block_size.default(
         topk_ids,
@@ -22,6 +23,7 @@ def moe_align_block_size(
         num_tokens_post_pad,
         cumsum_buffer,
         pad_sorted_token_ids,
+        ignore_invalid_expert,
     )
 
 

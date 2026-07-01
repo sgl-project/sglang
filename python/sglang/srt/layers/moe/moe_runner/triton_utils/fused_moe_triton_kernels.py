@@ -996,6 +996,7 @@ def act_and_mul_kernel(
     ACTIVATION_TYPE: tl.constexpr,
     SWIGLU_LIMIT: tl.constexpr = 0.0,
     HAS_SWIGLU_LIMIT: tl.constexpr = False,
+    HAS_EXPERT_FILTER: tl.constexpr = True,
 ):
     """
     Unified activation and multiply kernel that handles both sorted and unsorted routing,
@@ -1007,10 +1008,10 @@ def act_and_mul_kernel(
     half_hidden_size = hidden_size // 2
     pid = tl.program_id(0)
 
-    expert_id = tl.load(expert_ids_ptr + pid // expert_step)
-
-    if expert_id == -1:
-        return
+    if HAS_EXPERT_FILTER:
+        expert_id = tl.load(expert_ids_ptr + pid // expert_step)
+        if expert_id == -1:
+            return
 
     gateup_output_ptr = gateup_output + pid * hidden_size
     down_input_ptr = down_input + pid * half_hidden_size
@@ -1060,8 +1061,13 @@ def act_and_mul_triton(
     """
     grid = (down_input.shape[0],)
     hidden_size = gateup_output.shape[1]
-    expert_ids_row = topk_ids.view(-1) if not down_moe_use_tma else expert_ids
-    expert_step = 1 if not down_moe_use_tma else config["BLOCK_SIZE_M"]
+    has_expert_filter = topk_ids is not None or expert_ids is not None
+    if has_expert_filter:
+        expert_ids_row = topk_ids.view(-1) if not down_moe_use_tma else expert_ids
+        expert_step = 1 if not down_moe_use_tma else config["BLOCK_SIZE_M"]
+    else:
+        expert_ids_row = None
+        expert_step = 1
     has_swiglu_limit = swiglu_limit is not None
     act_and_mul_kernel[grid](
         gateup_output,
@@ -1073,6 +1079,7 @@ def act_and_mul_triton(
         ACTIVATION_TYPE=activation,
         SWIGLU_LIMIT=float(swiglu_limit) if has_swiglu_limit else 0.0,
         HAS_SWIGLU_LIMIT=has_swiglu_limit,
+        HAS_EXPERT_FILTER=has_expert_filter,
     )
 
 

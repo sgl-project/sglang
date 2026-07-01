@@ -185,10 +185,13 @@ class FusedMoE(torch.nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
+        self.params_dtype = params_dtype
+        self.layer_name = prefix
         self.layer_id = layer_id
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.num_experts = num_experts
+        self.with_bias = with_bias
         self.num_fused_shared_experts = num_fused_shared_experts
 
         self.enable_flashinfer_cutlass_moe = (

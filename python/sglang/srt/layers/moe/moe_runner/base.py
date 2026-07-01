@@ -70,6 +70,9 @@ class MoeRunnerConfig:
     # otherwise chunk gate/up then apply alpha/limit).
     gate_up_interleaved: bool = True
 
+    # MoE Layer
+    layer: Optional[torch.nn.Module] = None
+
 
 @dataclass
 class RunnerInput(ABC):
