@@ -82,7 +82,10 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.distributed.parallel_state import (
+    RankParallelismConfig,
+    monkey_patch_vllm_parallel_state,
+)
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     join_process_groups,
@@ -424,6 +427,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
         self.remote_instance_transfer_engine_weight_info = None
+        self.parallelism_config = None
 
         self.msprobe_debugger = None
         if server_args.msprobe_dump_config is not None:
@@ -656,6 +660,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.remote_instance_weight_loader_use_transfer_engine():
             self.remote_instance_init_transfer_engine()
+            self.parallelism_config = RankParallelismConfig.from_parallel_state(
+                self.tp_rank
+            )
 
         if not self.is_draft_worker:
             set_global_expert_location_metadata(
@@ -723,13 +730,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.server_args.remote_instance_weight_loader_backend
             != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
             and self.remote_instance_transfer_engine is not None
-            and self.remote_instance_transfer_engine_weight_info is None
         ):
-            # Register memory and upstream the transfer engine info to the bootstrap server
-            self.remote_instance_transfer_engine_weight_info = register_memory_region(
-                self.model, self.remote_instance_transfer_engine
-            )
+            if self.remote_instance_transfer_engine_weight_info is None:
+                # Register memory and upstream the transfer engine info to the bootstrap server for seed.
+                self.remote_instance_transfer_engine_weight_info = (
+                    register_memory_region(
+                        self.model, self.remote_instance_transfer_engine
+                    )
+                )
             self._register_to_engine_info_bootstrap()
+            if self.parallelism_config is not None:
+                self._register_parallelism_config_to_bootstrap()
 
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
@@ -1064,17 +1075,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         import requests as http_requests
 
-        if self.server_args.dist_init_addr:
-            # Multi-node: bootstrap server is on the head node (node_rank==0).
-            # Derive host from dist_init_addr (shared across all nodes).
-            bootstrap_host = (
-                NetworkAddress.parse(self.server_args.dist_init_addr).resolved().host
-            )
-        else:
-            bootstrap_host = "127.0.0.1"
-
-        bootstrap_port = self.server_args.engine_info_bootstrap_port
-        bootstrap_na = NetworkAddress(bootstrap_host, bootstrap_port)
+        bootstrap_na = self._get_bootstrap_network_address()
         url = f"{bootstrap_na.to_url()}/register_transfer_engine_info"
 
         payload = {
@@ -1101,6 +1102,49 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(
                 f"Failed to register transfer engine info for tp_rank={self.tp_rank}: {e}"
             )
+
+    def _register_parallelism_config_to_bootstrap(self):
+        """Register parallelism config with the EngineInfoBootstrapServer via HTTP PUT."""
+        import requests as http_requests
+
+        bootstrap_na = self._get_bootstrap_network_address()
+        url = f"{bootstrap_na.to_url()}/register_parallelism_config"
+
+        payload = {
+            "tp_rank": self.tp_rank,
+            "parallelism_config": self.parallelism_config.to_dict(),
+        }
+
+        try:
+            resp = http_requests.put(url, json=payload, timeout=5)
+            if resp.status_code == 200:
+                logger.info(
+                    f"Registered parallelism config for tp_rank={self.tp_rank} "
+                    f"with bootstrap server at {bootstrap_na}"
+                )
+            else:
+                logger.error(
+                    f"Failed to register parallelism config for tp_rank={self.tp_rank}: "
+                    f"{resp.status_code}, {resp.text}"
+                )
+        except Exception as e:
+            logger.error(
+                f"Failed to register parallelism config for tp_rank={self.tp_rank}: {e}"
+            )
+
+    def _get_bootstrap_network_address(self) -> NetworkAddress:
+        """Get the NetworkAddress for the EngineInfoBootstrapServer."""
+        if self.server_args.dist_init_addr:
+            # Multi-node: bootstrap server is on the head node (node_rank==0).
+            # Derive host from dist_init_addr (shared across all nodes).
+            bootstrap_host = (
+                NetworkAddress.parse(self.server_args.dist_init_addr).resolved().host
+            )
+        else:
+            bootstrap_host = "127.0.0.1"
+
+        bootstrap_port = self.server_args.engine_info_bootstrap_port
+        return NetworkAddress(bootstrap_host, bootstrap_port)
 
     def model_specific_adjustment(self):
         server_args = self.server_args
