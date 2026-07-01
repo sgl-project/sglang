@@ -516,5 +516,81 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
             self.assertNotIn(r, tm.rid_to_state)
 
 
+class TestWaitOneResponseSurvivesRidCleanup(CustomTestCase):
+    """Regression test for the rid_to_state KeyError race in _wait_one_response.
+
+    _handle_batch_output removes a rid from rid_to_state the moment its request
+    finishes. For batched / parallel-sample requests the per-request generators
+    are created in a loop and only advanced later (asyncio.gather over
+    gen.__anext__()), so a request that finishes inside that window has its rid
+    deleted before _wait_one_response first runs. Re-reading
+    self.rid_to_state[obj.rid] there used to raise KeyError and drop the response
+    mid-stream (seen as "Response ended prematurely" on the client).
+
+    The fix threads the caller-held ReqState into _wait_one_response instead of
+    re-reading the dict, so the already-produced output is delivered regardless
+    of whether the rid has been cleaned up.
+    """
+
+    @staticmethod
+    def _make_tm() -> TokenizerManager:
+        tm = _make_tokenizer_manager()
+        tm.request_logger = Mock()
+        tm.request_metrics_exporter_manager = Mock()
+        tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+        return tm
+
+    @staticmethod
+    def _finish_state(state: ReqState, rid: str) -> dict:
+        """Attach a finished output to `state`, as _handle_batch_output would."""
+        out = {
+            "text": "hello",
+            "meta_info": {"id": rid, "finish_reason": {"type": "stop"}},
+        }
+        state.out_list.append(out)
+        state.finished = True
+        state.event.set()
+        return out
+
+    @staticmethod
+    def _first_response(tm: TokenizerManager, state: ReqState):
+        async def _drive():
+            async for response in tm._wait_one_response(state.obj, state):
+                return response
+            return None
+
+        return asyncio.run(_drive())
+
+    def test_delivers_output_after_rid_removed(self):
+        """Output is still delivered when the rid was cleaned up before waiting.
+
+        This is the regression scenario: the request finished and its rid was
+        removed from rid_to_state before _wait_one_response ran. Pre-fix this
+        raised KeyError on the internal self.rid_to_state[obj.rid] lookup.
+        """
+        tm = self._make_tm()
+        rid = "race_removed_rid"
+        state = _make_req_state(rid)
+        expected = self._finish_state(state, rid)
+        # rid intentionally absent from rid_to_state (already cleaned up).
+        self.assertNotIn(rid, tm.rid_to_state)
+
+        result = self._first_response(tm, state)
+
+        self.assertEqual(result, expected)
+
+    def test_delivers_output_when_rid_present(self):
+        """Control: the normal path (rid present) still delivers the output."""
+        tm = self._make_tm()
+        rid = "race_present_rid"
+        state = _make_req_state(rid)
+        tm.rid_to_state[rid] = state
+        expected = self._finish_state(state, rid)
+
+        result = self._first_response(tm, state)
+
+        self.assertEqual(result, expected)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
