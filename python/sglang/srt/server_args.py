@@ -6966,15 +6966,18 @@ class ServerArgs:
                 "--export-metrics-to-file-dir is required when --export-metrics-to-file is enabled"
             )
 
-        # Check two batch overlap
+        # Check two batch overlap. With no EP a2a backend, TBO is only valid on
+        # the non-EP DP TP-MoE path (all_gatherv/reduce_scatterv overlap), which
+        # requires DP attention; enabling it there needs no extra opt-in flag.
         if (
             self.enable_two_batch_overlap
             and self.moe_a2a_backend == "none"
-            and not envs.SGLANG_ENABLE_DP_TBO.get()
+            and not self.enable_dp_attention
         ):
             raise ValueError(
-                "When enabling two batch overlap, moe_a2a_backend cannot be 'none' "
-                "(set SGLANG_ENABLE_DP_TBO=1 for the DeepSeek-V4 non-EP DP TBO path)."
+                "When enabling two batch overlap without an EP a2a backend "
+                "(moe_a2a_backend='none'), --enable-dp-attention is required "
+                "(DeepSeek-V4 non-EP DP TBO path)."
             )
 
         # Check communications compression
