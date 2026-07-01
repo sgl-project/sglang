@@ -4557,9 +4557,20 @@ class ServerArgs:
         assert self._support_mamba_cache_extra_buffer(
             model_arch
         ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
-        assert (
-            is_cuda() or is_musa() or is_npu()
-        ), "extra_buffer needs CUDA/MUSA/NPU (FLA)."
+        if is_hip():
+            # ROCm runs the FLA-Triton GDN path: the chunk kernel returns the
+            # per-chunk hidden state `h` used for branch-point state tracking, and
+            # the donate/track/scatter ops are Triton + torch (device-agnostic).
+            # Validated identical-output on the (dominant) unaligned h-extraction
+            # path: test_qwen36_extra_buffer_donate_mi35x. extra_buffer_lazy is not
+            # yet validated on ROCm.
+            assert (
+                not self.enable_mamba_extra_buffer_lazy()
+            ), "extra_buffer_lazy is not yet supported on ROCm/HIP; use extra_buffer."
+        else:
+            assert (
+                is_cuda() or is_musa() or is_npu()
+            ), "extra_buffer needs CUDA/MUSA/NPU (FLA)."
         if self.speculative_num_draft_tokens is not None:
             assert (
                 not self.enable_mamba_extra_buffer_lazy()
