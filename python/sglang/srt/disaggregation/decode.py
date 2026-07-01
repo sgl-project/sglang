@@ -58,6 +58,11 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    dsv4_prealloc_kwargs,
+    dsv4_state_payloads,
+    dsv4_unwrap_prealloc,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
@@ -1050,22 +1055,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return ring_rows.astype(np.int32)
 
             state_types = self.kv_manager.kv_args.state_types
-            state_indices: Optional[List] = []
-            for st in state_types:
-                if st == StateType.MAMBA:
-                    state_indices.append(_mamba_payload())
-                elif st == StateType.SWA:
-                    state_indices.append(_swa_payload())
-                elif st == StateType.DSA:
-                    state_indices.append(_dsa_payload())
-                elif st == StateType.MINIMAX_INDEX_K:
-                    # Index rows live at the same loc as main KV on the same
-                    # page_size, so reuse the full-seq page-ids.
-                    state_indices.append(_dsa_payload())
-                elif st == StateType.SWA_RING:
-                    state_indices.append(_swa_ring_payload())
-                else:
-                    state_indices.append(None)
+            # MINIMAX_INDEX_K reuses _dsa_payload: index rows live at the same loc
+            # as main KV on the same page_size.
+            payloads = {
+                StateType.MAMBA: _mamba_payload,
+                StateType.SWA: _swa_payload,
+                StateType.DSA: _dsa_payload,
+                StateType.MINIMAX_INDEX_K: _dsa_payload,
+                StateType.SWA_RING: _swa_ring_payload,
+            }
+            payloads.update(
+                dsv4_state_payloads(
+                    self.req_to_token_pool,
+                    decode_req.req.req_pool_idx,
+                    seq_len,
+                    self.token_to_kv_pool_allocator.page_size,
+                    self.scheduler.sliding_window_size,
+                )
+            )
+            state_indices: Optional[List] = [
+                payloads[st]() if st in payloads else None for st in state_types
+            ]
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
@@ -1385,6 +1395,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if prefix_len > 0
                 else torch.tensor([-1], dtype=torch.int64, device=device)
             )
+            # dsv4_prealloc_kwargs and dsv4_unwrap_prealloc (below) are a pair:
+            # the kwargs make the DSV4 allocator return a bundle, unwrap reads it.
+            dsv4_kwargs = dsv4_prealloc_kwargs(
+                self.token_to_kv_pool_allocator,
+                req,
+                fill_len,
+                self.req_to_token_pool,
+                device=device,
+            )
             if self._uses_swa_tail_prealloc() and prefix_len == 0:
                 # Tail-only SWA allocation: only valid when prefix_len == 0.
                 # When prefix_len > 0 (radix cache hit), we fall back to
@@ -1398,6 +1417,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     last_loc=last_loc,
                     extend_num_tokens=fill_len,
                     swa_tail_len=self._swa_tail_len(fill_len),
+                    **dsv4_kwargs,
                 )
                 req.swa_evicted_seqlen = fill_len - self._swa_tail_len(fill_len)
             else:
@@ -1410,7 +1430,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                     last_loc=last_loc,
                     extend_num_tokens=delta_len,
+                    **dsv4_kwargs,
                 )
+            kv_loc = dsv4_unwrap_prealloc(
+                kv_loc, self.req_to_token_pool, req, total_prefix_len, fill_len
+            )
 
         assert kv_loc is not None, (
             f"KV cache is full! Bug in memory estimation. "

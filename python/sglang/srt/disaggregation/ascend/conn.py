@@ -1,4 +1,5 @@
 import concurrent.futures
+import enum
 import logging
 from typing import List, Tuple
 
@@ -16,6 +17,21 @@ from sglang.srt.disaggregation.mooncake.conn import (
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
+
+
+class AscendStateType(str, enum.Enum):
+    """DSV4-on-NPU per-pool PD components, kept out of the cross-hardware
+    StateType enum. Sent via the same page-indexed path as SWA."""
+
+    DSV4_SWA = "dsv4_swa"
+    DSV4_C4 = "dsv4_c4"
+    DSV4_C128 = "dsv4_c128"
+    DSV4_INDEXER = "dsv4_indexer"
+    DSV4_C4_STATE = "dsv4_c4_state"
+    DSV4_C128_STATE = "dsv4_c128_state"
+
+
+_DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
 
 
 class AscendKVManager(MooncakeKVManager):
@@ -177,6 +193,13 @@ class AscendKVManager(MooncakeKVManager):
             return process_layers(layers_params)
 
         return 0
+
+    def _is_generic_kvcache_state_type(self, st) -> bool:
+        # DSV4 per-pool components also use the page-indexed send path.
+        return (
+            super()._is_generic_kvcache_state_type(st)
+            or st in _DSV4_KVCACHE_STATE_TYPES
+        )
 
 
 class AscendKVSender(MooncakeKVSender):

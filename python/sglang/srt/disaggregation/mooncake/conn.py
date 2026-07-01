@@ -923,6 +923,11 @@ class MooncakeKVManager(CommonKVManager):
             f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
         )
 
+    def _is_generic_kvcache_state_type(self, st: "StateType") -> bool:
+        """State types sent via the page-indexed ``_send_kvcache_generic`` path
+        (not the mamba-state path); subclasses extend for hardware components."""
+        return st in (StateType.SWA, StateType.DSA, StateType.SWA_RING)
+
     def maybe_send_extra(
         self,
         req: TransferInfo,
@@ -1001,7 +1006,7 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         or rc
                     )
-            elif st in (StateType.SWA, StateType.DSA, StateType.SWA_RING):
+            elif self._is_generic_kvcache_state_type(st):
                 if (
                     target_rank_registration_info is not None
                     and not self.is_mla_backend
@@ -1827,7 +1832,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
             )
             # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
-            kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
+            # DSV4-on-NPU has no full-token contiguous KV (kv_item_lens empty),
+            # ships per-pool instead, so report 0.
+            kv_item_len = (
+                self.kv_mgr.kv_args.kv_item_lens[0]
+                if self.kv_mgr.kv_args.kv_item_lens
+                else 0
+            )
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
