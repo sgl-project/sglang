@@ -181,20 +181,27 @@ class MRotaryEmbedding(RotaryEmbedding):
                     dim=-1,
                 )
 
+        # Rotate in fp32. cos/sin come from the fp32 cos_sin_cache (forward_native never
+        # dtype-matches it), but apply_rotary_emb downcasts them to the input dtype, so a
+        # bf16 query would round cos/sin and the products to bf16 (~1 ULP, dense_query_post_rope
+        # 3.125e-2). Megatron applies RoPE in fp32 (apply_rotary_pos_emb_in_fp32=True); passing
+        # fp32 inputs keeps the whole rotation in fp32 to match bit-exactly, then cast back.
+        q_dtype = query.dtype
         seq_len_q = query.shape[0]
         query_shape = query.shape
         query = query.view(seq_len_q, -1, self.head_size)
-        query_rot = query[..., : self.rotary_dim]
+        query_rot = query[..., : self.rotary_dim].float()
         query_pass = query[..., self.rotary_dim :]
-        query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style).to(q_dtype)
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
+        k_dtype = key.dtype
         seq_len_k = key.shape[0]
         key_shape = key.shape
         key = key.view(seq_len_k, -1, self.head_size)
-        key_rot = key[..., : self.rotary_dim]
+        key_rot = key[..., : self.rotary_dim].float()
         key_pass = key[..., self.rotary_dim :]
-        key_rot = apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        key_rot = apply_rotary_emb(key_rot, cos, sin, self.is_neox_style).to(k_dtype)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
