@@ -2818,6 +2818,10 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            # Only the decoupled drafter needs this, it uses max_new_tokens=1<<30
+            # because it never self-terminates, so it is necessary to skip normal
+            # decode-budget reservation. Decoupled verifier works normally.
+            ignore_decode_budget=(self.server_args.decoupled_spec_role == "drafter"),
         )
 
         if self.chunked_req is not None:

@@ -555,6 +555,80 @@ class TestPrefillAdder(CustomTestCase):
         req.set_extend_range.assert_called_once_with(0, 200)
         self.assertIn(req, adder.can_run_list)
 
+    def _build_prefill_req(self, *, max_new_tokens, extend_input_len=10):
+        # A request shaped for the non-chunked add_one_req path. The decoupled
+        # drafter's mirror requests use max_new_tokens=1<<30 (it never
+        # self-terminates), so pass a huge value to exercise that case.
+        req = self.create_mock_req(
+            "draft_mirror", priority=0, max_new_tokens=max_new_tokens
+        )
+        req.host_hit_length = 0
+        req.prefix_indices = []
+        req.full_untruncated_fill_ids = list(range(extend_input_len))
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        return req
+
+    def test_ignore_decode_budget_zeroes_running_request_offset(self):
+        # With the flag set, _get_running_request_total_token_offset must return
+        # 0 so the running batch does not inflate rem_total_token_offset with the
+        # drafter's astronomical max_new_tokens.
+        running_req = self.create_mock_req("run1", priority=0, max_new_tokens=1 << 30)
+        running_batch = self.create_running_batch([running_req])
+
+        adder_off = self.create_adder(running_batch, ignore_decode_budget=True)
+        self.assertEqual(adder_off.rem_total_token_offset, 0)
+        self.assertEqual(
+            adder_off._get_running_request_total_token_offset(running_req), 0
+        )
+
+        # Default (flag off): the running request reserves min(max_new, CLIP).
+        running_req2 = self.create_mock_req("run2", priority=0, max_new_tokens=1 << 30)
+        running_batch2 = self.create_running_batch([running_req2])
+        adder_on = self.create_adder(running_batch2)
+        self.assertGreater(adder_on.rem_total_token_offset, 0)
+        self.assertGreater(
+            adder_on._get_running_request_total_token_offset(running_req2), 0
+        )
+
+    def test_ignore_decode_budget_admits_huge_max_new_tokens(self):
+        # Tight budget that cannot fit even the CLIP_MAX_NEW_TOKENS reservation
+        # for a single request. The drafter mirror request has max_new_tokens
+        # = 1<<30, so without the flag it can never be admitted.
+        self.mock_token_allocator.available_size.return_value = 1000
+
+        # Flag ON: the decode-budget reservation is zeroed, so the request is
+        # admitted and only its input tokens (+page) are reserved.
+        adder = self.create_adder(
+            self.create_running_batch(), ignore_decode_budget=True
+        )
+        req = self._build_prefill_req(max_new_tokens=1 << 30, extend_input_len=10)
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertIn(req, adder.can_run_list)
+        # max_new_tokens reservation is 0: only extend_input_len (10) + page (1).
+        self.assertEqual(adder.rem_total_token_offset, 11)
+
+    def test_decode_budget_rejects_huge_max_new_tokens_when_flag_off(self):
+        # Same tight budget, but with the flag off the full CLIP_MAX_NEW_TOKENS
+        # reservation is required and the huge request is rejected.
+        self.mock_token_allocator.available_size.return_value = 1000
+
+        adder = self.create_adder(self.create_running_batch())
+        req = self._build_prefill_req(max_new_tokens=1 << 30, extend_input_len=10)
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertNotIn(req, adder.can_run_list)
+
 
 if __name__ == "__main__":
     unittest.main()
