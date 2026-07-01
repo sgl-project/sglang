@@ -177,15 +177,15 @@ class VerifierCommitSegment:
 
     def append_message(self, message: VerifyCommit) -> None:
         """
-        It runs on TokenSyncThread under _pending_lock. That loop only
-        catches zmq.error.ContextTerminated, so a raise here escapes _run and
-        silently kills the drafter control thread. It then stops applying
-        ALL requests' controls while the verifier keeps pushing.
+        It runs on DrafterIpcThread under _inbox_lock. A raise here escapes the
+        per-message router; DrafterIpcThread._run catches it (logs + breaks), so
+        the thread terminates loudly rather than silently dropping ALL requests'
+        controls while the verifier keeps pushing.
 
-        TODO: 1. peer-data violations (non-contiguous / invalid len)
-        should quarantine just that request (drop + add to close_keys), not
-        crash the thread. 2. phase 5.c will handle the drafter failure by
-        degrading the verifier into normal autoregressive decoding.
+        TODO: 1. peer-data violations (non-contiguous / invalid len) should
+        quarantine just that request (drop + add to close_keys), not terminate
+        the thread. 2. phase 5.c will handle the drafter failure by degrading
+        the verifier into normal autoregressive decoding.
         """
         if message.draft_key != self.draft_key:
             raise RuntimeError(
