@@ -884,8 +884,8 @@ class Engine(EngineScoreMixin, EngineBase):
                 subprocess_watchdog,
             )
 
-        # Launch detokenizer process(es) — optionally fronted by a router
-        # when detokenizer_worker_num > 1.
+        # Launch detokenizer process(es) — optionally fronted by a router when
+        # detokenizer_worker_num > 1.
         detoken_procs, detoken_names = cls._launch_detokenizer_subprocesses(
             server_args=server_args,
             port_args=port_args,
