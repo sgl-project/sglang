@@ -2422,7 +2422,7 @@ class DeepseekV2Model(nn.Module):
         if (
             _use_aiter_gfx95
             and config.n_routed_experts == 256
-            and self.embed_tokens.embedding_dim == 7168
+            and getattr(self.embed_tokens, "embedding_dim", config.hidden_size) == 7168
         ):
             num_moe_layers = sum(
                 [
@@ -2452,7 +2452,7 @@ class DeepseekV2Model(nn.Module):
                     config.n_routed_experts,
                     num_moe_layers,
                     allocate_size,
-                    self.embed_tokens.embedding_dim,
+                    getattr(self.embed_tokens, "embedding_dim", config.hidden_size),
                 )
             )
         self.layers_to_capture = []
