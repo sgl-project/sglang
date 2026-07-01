@@ -2308,6 +2308,36 @@ class AiterAttnBackend(AttentionBackend):
                     sinks,
                 )
 
+            # Fast path: when there is no cached prefix, the current tokens are
+            # the full context and the freshly-computed K/V are already
+            # contiguous. Run the varlen FMHA (FmhaFwdKernel) directly on them
+            # and skip the paged-KV gather of mha_batch_prefill_func. Any prefix
+            # reuse (radix/chunked prefill), FP8 KV, sliding window, sinks, or a
+            # logits soft cap falls through to the paged path below.
+            if (
+                forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
+                and not any(forward_batch.extend_prefix_lens_cpu)
+                and self.kv_cache_dtype != fp8_dtype
+                and window_size == (-1, -1)
+                and sinks is None
+                and self.logits_soft_cap == 0.0
+            ):
+                o = flash_attn_varlen_func(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    self.qo_indptr[:bs0],
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.max_q_len,
+                    self.forward_metadata.max_q_len,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                )
+                if o.dtype != self.input_dtype:
+                    o = o.to(self.input_dtype)
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
             # NHD path — original aiter paged batch_prefill.
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
