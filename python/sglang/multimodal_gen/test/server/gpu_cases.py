@@ -849,6 +849,29 @@ ONE_GPU_CASES += ONE_GPU_MODELOPT_FP8_CASES
 TWO_GPU_CASES = _with_default_num_gpus(TWO_GPU_CASES, 2)
 
 
+def _select_5090_canary_cases(case_ids: tuple[str, ...]) -> list[DiffusionTestCase]:
+    cases_by_id = {case.id: case for case in ONE_GPU_CASES}
+    missing = [case_id for case_id in case_ids if case_id not in cases_by_id]
+    if missing:
+        raise RuntimeError(f"Unknown 5090 diffusion canary case(s): {missing}")
+
+    # 5090 is a 32GB consumer Blackwell runner, so reuse lightweight H100
+    # 1-GPU cases but skip H100-specific perf baseline validation.
+    return [
+        replace(cases_by_id[case_id], run_perf_check=False) for case_id in case_ids
+    ]
+
+
+ONE_GPU_5090_CASES = _select_5090_canary_cases(
+    (
+        "zimage_image_t2i",
+        "flux_2_klein_base_image_t2i",
+        "wan2_1_t2v_1.3b",
+        "turbo_wan2_1_t2v_1.3b",
+    )
+)
+
+
 def _discover_unit_tests() -> list[str]:
     unit_dir = Path(__file__).resolve().parent.parent / "unit"
     if not unit_dir.is_dir():
@@ -878,6 +901,9 @@ FILE_SUITES = {
 PARAMETRIZED_CASE_GROUPS = {
     "1-gpu": [
         ("test_server_1_gpu.py", ONE_GPU_CASES),
+    ],
+    "1-gpu-5090": [
+        ("test_server_1_gpu_5090.py", ONE_GPU_5090_CASES),
     ],
     "2-gpu": [
         ("test_server_2_gpu.py", TWO_GPU_CASES),
