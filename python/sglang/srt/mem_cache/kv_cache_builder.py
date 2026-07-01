@@ -32,6 +32,7 @@ from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
+from sglang.srt.utils.tensor_bridge import use_mlx
 
 if TYPE_CHECKING:
 
@@ -178,18 +179,31 @@ def build_kv_cache(
             "Transformers backend to avoid multimodal prefix-cache mismatches."
         )
 
-    # Decode radix cache is unsupported with hybrid SWA/SSM models —
-    # these use specialized memory pools incompatible with the
-    # prefix-match-and-lock allocation path.
+    # Decode-side radix cache: SWA is supported only via the unified radix tree
+    # (its component pools handle the prefix-match-and-lock path); the default
+    # SWARadixCache and the Mamba/SSM pools are not supported.
     if (
         server_args.disaggregation_decode_enable_radix_cache
         and server_args.disaggregation_mode == "decode"
     ):
         if is_hybrid_swa:
-            raise ValueError(
-                "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with sliding window attention (SWA) models"
-            )
+            if not (envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx()):
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache with sliding "
+                    "window attention (SWA) models requires the unified radix "
+                    "tree (set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1)."
+                )
+            # Compressed-KV SWA variants are not supported yet, even under unified.
+            if getattr(model_config, "is_deepseek_v4_arch", False):
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache does not support "
+                    "DeepSeek-V4 (DSA) compressed KV (c4/c128/indexer) yet."
+                )
+            if getattr(model_config, "is_hybrid_swa_compress", False):
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache does not support "
+                    "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
+                )
         if is_hybrid_ssm:
             raise ValueError(
                 "--disaggregation-decode-enable-radix-cache is incompatible "

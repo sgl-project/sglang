@@ -626,23 +626,25 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.LOAD_BACK:
-            # `node` is best_match_node; the SWA validator guarantees every
-            # ancestor within `sliding_window_size` has value or host_value.
+            # `node` is normally best_match_node; storage prefetch may instead
+            # anchor on a loaded FULL node with SWA tombstones in its window.
             n_swa = 0
             backed_up: list[torch.Tensor] = []
             nodes: list = []
             cur = node
             while cur is not self.cache.root_node and n_swa < self.sliding_window_size:
                 cd = cur.component_data[ct]
-                assert cd.host_value is not None or cd.value is not None
                 if cd.value is not None:
                     # device exists, skip it
                     n_swa += len(cd.value)
-                else:
+                elif cd.host_value is not None:
                     # host only, collect it
                     backed_up.append(cd.host_value)
                     nodes.append(cur)
                     n_swa += len(cd.host_value)
+                else:
+                    # FULL-only tombstones mark the SWA eviction boundary.
+                    break
                 cur = cur.parent
 
             if not backed_up:

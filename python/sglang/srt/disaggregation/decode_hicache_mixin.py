@@ -11,7 +11,10 @@ import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
-from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
+    InitLoadBackParams,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -28,6 +31,7 @@ class DecodePrefixMatch:
     last_device_node: Any
     last_host_node: Any = None
     prefetch_registered: bool = False
+    lock_params: Optional[DecLockRefParams] = None
 
     @property
     def l1_prefix_len(self) -> int:
@@ -75,18 +79,37 @@ class DecodeHiCachePreallocMixin:
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 matched_len = l1_prefix_len + l2_host_hit_length
                 suffix_tokens = req.origin_input_ids[matched_len:]
+                query_kwargs = {}
+                if (
+                    self.tree_cache.supports_swa()
+                    and hasattr(self, "_uses_swa_tail_prealloc")
+                    and self._uses_swa_tail_prealloc()
+                ):
+                    fill_len = len(req.origin_input_ids) + max(
+                        len(req.output_ids) - 1, 0
+                    )
+                    req.swa_evicted_seqlen = max(
+                        req.swa_evicted_seqlen,
+                        fill_len - self._swa_tail_len(fill_len),
+                    )
+                    max_storage_len = max(0, req.swa_evicted_seqlen - matched_len)
+                    suffix_tokens = suffix_tokens[:max_storage_len]
+                    if hasattr(self.tree_cache, "_build_storage_hit_query_transfers"):
+                        query_kwargs["full_only"] = True
                 last_hash = last_host_node.get_last_hash_value()
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
-                    last_host_node,
-                    suffix_tokens,
-                    last_hash,
-                    prefix_keys,
-                )
+                if suffix_tokens:
+                    l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
+                        last_host_node,
+                        suffix_tokens,
+                        last_hash,
+                        prefix_keys,
+                        **query_kwargs,
+                    )
 
         return DecodePrefixMatch(
             prefix_indices=prefix_indices,
@@ -121,12 +144,24 @@ class DecodeHiCachePreallocMixin:
                 if self.tree_cache.hicache_storage_pass_prefix_keys
                 else None
             )
+            full_only = (
+                self.tree_cache.supports_swa()
+                and prefix_match.decode_prefix_len <= req.swa_evicted_seqlen
+            )
+            prefetch_kwargs = {"full_only": True} if full_only else {}
             self.tree_cache.prefetch_from_storage(
-                req.rid, node, suffix, last_hash, prefix_keys
+                req.rid,
+                node,
+                suffix,
+                last_hash,
+                prefix_keys,
+                **prefetch_kwargs,
             )
-            prefix_match.prefetch_registered = (
-                req.rid in self.tree_cache.ongoing_prefetch
-            )
+            prefetch_info = self.tree_cache.ongoing_prefetch.get(req.rid)
+            prefix_match.prefetch_registered = prefetch_info is not None
+            if not prefix_match.prefetch_registered:
+                prefix_match.l3_storage_hit_length = 0
+                prefix_match.last_host_node = None
         except Exception as e:
             logger.warning(
                 "HiCache L3 prefetch failed for rid=%s: %s; falling back to L2-only LoadingBack",
@@ -175,8 +210,12 @@ class DecodeHiCacheTransferMixin:
         ):
             self.tree_cache.release_aborted_request(decode_req.req.rid)
         if decode_req.hicache_restored_node is not None:
-            self.tree_cache.dec_lock_ref(decode_req.hicache_restored_node)
+            self.tree_cache.dec_lock_ref(
+                decode_req.hicache_restored_node,
+                decode_req.hicache_restored_lock_params,
+            )
             decode_req.hicache_restored_node = None
+            decode_req.hicache_restored_lock_params = None
 
     def _try_hicache_queue_load_back(self, dr: DecodeRequest) -> bool:
         """Queue one L2->L1 load_back op for ``dr``; True iff a DMA was queued.
@@ -189,10 +228,13 @@ class DecodeHiCacheTransferMixin:
         pm = dr.prefix_match
 
         # Wait for L3 -> L2 prefetch to drain (skip when no L3 hit).
+        loaded_host_node = None
         if pm.l3_storage_hit_length > 0:
             if not self.tree_cache.check_prefetch_progress(dr.req.rid):
                 return False
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.rid)
+            if hasattr(self.tree_cache, "pop_prefetch_loaded_node"):
+                loaded_host_node = self.tree_cache.pop_prefetch_loaded_node(dr.req.rid)
 
         # Re-match: req.last_node / prefix_indices updated to current device state.
         rematch = match_prefix_for_req(
@@ -204,8 +246,12 @@ class DecodeHiCacheTransferMixin:
         )
         new_indices, restored_node = self.tree_cache.init_load_back(
             InitLoadBackParams(
-                best_match_node=rematch.best_match_node,
-                host_hit_length=rematch.host_hit_length,
+                best_match_node=loaded_host_node or rematch.best_match_node,
+                host_hit_length=(
+                    pm.l3_storage_hit_length
+                    if loaded_host_node is not None
+                    else rematch.host_hit_length
+                ),
                 req=dr.req,
             )
         )
@@ -229,7 +275,9 @@ class DecodeHiCacheTransferMixin:
             [rematch.device_indices[pm.l1_prefix_len :], new_indices]
         )
         dr.hicache_restored_node = restored_node
-        self.tree_cache.inc_lock_ref(restored_node)
+        dr.hicache_restored_lock_params = self.tree_cache.inc_lock_ref(
+            restored_node
+        ).to_dec_params()
 
         if len(new_indices) == 0:
             # Whole prefix already on device; no DMA needed.
@@ -294,7 +342,9 @@ class DecodeHiCacheTransferMixin:
         if prefix_match is None or not prefix_match.needs_local_restore:
             return
 
-        self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
+        self.tree_cache.dec_lock_ref(
+            prefix_match.last_device_node, prefix_match.lock_params
+        )
 
         self.tree_cache.req_to_token_pool.write(
             (
@@ -307,3 +357,9 @@ class DecodeHiCacheTransferMixin:
             [prefix_match.prefix_indices, decode_req.hicache_restored_kv_indices]
         )
         decode_req.req.last_node = decode_req.hicache_restored_node
+        if decode_req.hicache_restored_lock_params is not None:
+            decode_req.req.swa_uuid_for_lock = (
+                decode_req.hicache_restored_lock_params.swa_uuid_for_lock
+            )
+        decode_req.hicache_restored_node = None
+        decode_req.hicache_restored_lock_params = None
