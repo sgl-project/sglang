@@ -76,7 +76,10 @@ than restating.
   use it. Model-specific axes only where applicable (MegaMoE backend + `megamoeQuant`
   only on Blackwell MoE, gated by `requiresHw`; `hisparse` only DSA-style). Knobs that are
   meaningless for a subset of variants/hw are `disable`d with a reason, not silently live
-  (e.g. MoE knobs greyed on dense variants). No empty/stub axes.
+  (e.g. MoE knobs greyed on dense variants) — and the `disable` must be **per-value /
+  per-option**, not on the select/axis object (an object-level `disable` is a silent
+  no-op: the chips render live despite the source looking disabled; spot-check the actual
+  greying rather than trusting the presence of `disable`+reason). No empty/stub axes.
 - **No leftover `__TOKEN__`** — the config was stamped from the template and every
   placeholder is filled (`grep -rn '__[A-Z_]*__'` on the new config/benchmarks/MDX returns
   nothing).

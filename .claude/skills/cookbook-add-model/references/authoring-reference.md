@@ -146,6 +146,15 @@ schemas (full reference in the `_playground.jsx` header):
 - Constraints are AND across keys, OR within each key's array.
 - Bare `disabled: true` / `disable: true` is a static always-disabled form
   (used for "Coming soon" chips).
+- **Per-VALUE / per-OPTION only.** The constraint must sit on each value or
+  option object (as above). A `disable`/`disableReason` placed on the *axis /
+  select object itself* (a sibling of `values` / `options`) is **silently
+  ignored** — the engine's `evaluateChip` runs per entry, never on the axis
+  object, so every chip renders fully live despite looking disabled in source.
+  To grey a whole select on some variants/hw, repeat the constraint on every
+  value: `moe.backend.options[]` (per-option) works, but a bare
+  `ep: { values: [1, 2, 4], disable: {...} }` does NOT — wrap each value:
+  `values: [{ value: 1, disable: {...}, disableReason: "…" }, …]`.
 
 ## 2.4 Create the MDX page
 

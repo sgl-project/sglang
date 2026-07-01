@@ -78,6 +78,20 @@ the page (otherwise a stripped cell's baseline can't be re-applied) — but
 benchmarked with NEXTN ships a single `eagle` preset, not both. (Pilot history:
 Qwen3.5 once shipped both; corrected to EAGLE-only.)
 
+**Drop a general axis when its shared preset can't safely express the model's
+flags** — not only when the model lacks the feature. If a preset would need a
+**per-variant** value that one shared preset string can't template (e.g.
+Gemma4's per-variant `--speculative-draft-model-path …/<variant>-it-assistant`)
+AND the axis's strip-list doesn't cover that flag (so toggling the axis OFF
+leaves a dangling flag → a broken command), drop the axis and keep the feature
+as the **strategy dimension** instead (every-control-survives still holds).
+Prefer this over emitting an untested/broken command shape. The cleaner
+long-term fix — adding the flag to the engine's strip-list so the toggle removes
+it — is an engine change, out of a migration PR's data-only scope; note it as a
+follow-up. (Contrast K2.5: a SINGLE hw-gated `--speculative-draft-model-path`
+rides inside one preset fine — the blocker is per-variant divergence, not draft
+paths as such.)
+
 **MTP `--max-running-requests` hint (engine, automatic):** when a cell's
 command turns speculative decoding on (`--speculative-algorithm` present)
 without `--max-running-requests`, the Deploy panel + Playground auto-render an
@@ -176,7 +190,7 @@ model-specific note — never toggle-/migration-centric explanations.
 
 | Family | strategies | Notes |
 |---|---|---|
-| Gemma4 | `low-latency` (MTP on — the legacy toggle's own "Lower Latency" subtitle) / `high-throughput` (MTP off); mi300x hides the toggle → its single recipe → `balanced` (trio union, Qwen3.5 Xeon pattern) | variants = e2b/e4b/12b/31b/26b-a4b; checkpoint radio Standard(BF16)/QAT(q4_0) → quant ids via `modelNames`; §3.3 prose carries AMD recipes beyond the widget's mi300x — maintainer call on cells-from-prose vs tips; vision/audio invocation prose carries over (deployment matrix is text-standard); "gemma4 branch" version → speed drops, MMLU/GSM8K accuracy keeps (mind the few-shot vs run_eval harness footnote); dedicated multi-arch dev images verbatim |
+| Gemma4 | `low-latency` (MTP on — the legacy toggle's own "Lower Latency" subtitle) / `high-throughput` (MTP off); mi300x hides the toggle → its single recipe → `balanced` (trio union, Qwen3.5 Xeon pattern) | variants = e2b/e4b/12b/31b/26b-a4b; checkpoint radio Standard(BF16)/QAT(q4_0) → quant ids via `modelNames`; §3.3 prose carries AMD recipes beyond the widget's mi300x — maintainer call on cells-from-prose vs tips; vision/audio invocation prose carries over (deployment matrix is text-standard); "gemma4 branch" version is non-reproducible → drop the WHOLE result (speed AND accuracy) unless pinnable to the support PR/commit the page attributes the numbers to (day-0 rule, §hard-rule-2); the few-shot vs run_eval harness footnote stays a benchmarks/§3 note; dedicated multi-arch dev images verbatim |
 | Nemotron3-Ultra | dpattention carries "Low latency"/"High throughput" subtitles (naming rule) but THREE perf controls stack — multi-value DP-Attention (2/4/8) × MTP × EP — design the tier mapping via the step-2 table; maintainer sign-off required | NVIDIA-only (h100→gb300) with a per-quant verified-hw SUPPORT matrix → absent cells; "Model" radio = the quant dim (BF16 / NVFP4 Blackwell-only); TP radio 8/16 — TP=16 is 2-node → `nodes` dim; **kvcache radio (None/fp8_e4m3/bf16) → `flagSelects` axis, config-only** (the generic primitive merged in #28128 — NO engine PR); `launch_server` + spec-V2 env prefix verbatim; dedicated `dev-nemotron3-ultra(+cu13)` images verbatim ("not in any stable release"); **"main branch" version is non-reproducible → drop the WHOLE measured result (speed AND accuracy)** unless it can be pinned to the support PR/commit (day-0 rule, §hard-rule-2) |
 | GLM-4.5, GLM-4.6 | `low-latency` (TP, + MTP from the legacy checkbox) / `high-throughput` (TP+DP+EP) | |
 | GLM-4.7 | `low-latency`(2 GPUs) / `balanced`(4) / `high-throughput`(8) — gpus 2/4/8 + SUPPORT matrix; confirm naming, tiers are GPU budgets | measured-best B200 TP=2 NVFP4 → the verified cell |
