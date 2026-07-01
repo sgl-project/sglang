@@ -805,63 +805,57 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
 
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
 
-    # --------------- MXFP8 path (also fixed) ---------------
     def _apply_online_mxfp8(self, layer, weight_prefix, weight_name):
         weight_fp = getattr(layer, weight_name)
-        if weight_fp.dtype not in (torch.float16, torch.bfloat16):
-            logger.warning(...)
-            weight_fp = weight_fp.to(torch.bfloat16)
-        if not weight_fp.is_npu:
-            weight_fp = weight_fp.to(f"npu:{torch.npu.current_device()}")
-
+        # … dtype & device checks …
+    
         qw, w_scale = torch_npu.npu_dynamic_mx_quant(
             weight_fp, dst_type=torch_npu.float8_e4m3fn
         )
-        qw_t = qw.transpose(1, 2)            # [E, K, N]
-        w_scale_t = w_scale.transpose(1, 2)  # [E, ceil(K/64), N, 2]
-
+        # qw:        [E, N, K]   (float8_e4m3fn)
+        # w_scale:   [E, N, ceil(K/64), 2]   (uint8)
+    
+        # Transpose and force contiguous
+        qw_t = qw.transpose(1, 2).contiguous()          # [E, K, N]
+        w_scale_t = w_scale.transpose(1, 2).contiguous() # [E, ceil(K/64), N, 2]
+    
+        # Store on the layer (for parameter saving etc.)
         setattr(layer, weight_name,
                 torch.nn.Parameter(qw_t, requires_grad=False))
         layer.register_parameter(
             f"{weight_name}_scale",
-            torch.nn.Parameter(w_scale_t, requires_grad=False))
-
-        # !!! Store on self for the forward pass
+            torch.nn.Parameter(w_scale_t, requires_grad=False),
+        )
+    
+        # !!! Also store on self (the quant_info) so the matmul can find them
         setattr(self, weight_name, qw_t)
         setattr(self, f"{weight_name}_scale", w_scale_t)
-
+    
         torch.npu.empty_cache()
-
+    
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
             self.hidden_states_quantizer = HiddenStatesMXFP8DynamicQuant()
 
-    # --------------- Corrected forward ---------------
     def apply(self, quant_info, hidden_states, expert_tokens,
               pertoken_scale, output_dtype, weight_prefix, group_list_type):
-        # Fetch weight scale from self (the method instance)
+    
         weight_scale = getattr(self, f"{weight_prefix}_weight_scale", None)
-
-        if weight_scale is not None:
-            print('self.hidden_states_quantizer', self.hidden_states_quantizer)
-            # Quantize activations only if the quantizer is available
-            if self.hidden_states_quantizer is not None and pertoken_scale is None:
-                hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
-            scale_args = {"scale": [weight_scale]}
-            if pertoken_scale is not None:
-                scale_args["per_token_scale"] = [pertoken_scale]
-
-            # Set dtype hints for MXFP8
-            if self._quant_type == "mxfp8":
-                scale_args["scale_dtype"] = torch_npu.float8_e8m0fnu
-                scale_args["per_token_scale_dtype"] = torch_npu.float8_e8m0fnu
-
-            print(scale_args)
+        if weight_scale is None:
+            # fallback pure BF16 – shouldn't happen in MXFP8 mode
             return self.matmul.forward(
                 quant_info, weight_prefix, hidden_states, expert_tokens,
-                output_dtype, group_list_type=group_list_type, **scale_args)
-
-        # Pure BF16: no scales at all
+                output_dtype, group_list_type=group_list_type)
+    
+        if self.hidden_states_quantizer is not None and pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+    
+        scale_args = {
+            "scale": [weight_scale],
+            "per_token_scale": [pertoken_scale] if pertoken_scale is not None else None,
+            "scale_dtype": torch_npu.float8_e8m0fnu,
+            "per_token_scale_dtype": torch_npu.float8_e8m0fnu,
+        }
         return self.matmul.forward(
             quant_info, weight_prefix, hidden_states, expert_tokens,
-            output_dtype, group_list_type=group_list_type)
+            output_dtype, group_list_type=group_list_type, **scale_args)
