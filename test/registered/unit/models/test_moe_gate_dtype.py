@@ -39,6 +39,25 @@ class TestMoeGateDtype(CustomTestCase):
         self.assertEqual(glm4_gate.e_score_correction_bias.dtype, torch.bfloat16)
         self.assertEqual(glm4_lite_gate.e_score_correction_bias.dtype, torch.bfloat16)
 
+    def test_flashinfer_trtllm_correction_bias_is_bf16_with_quant_config(self):
+        class DummyQuantConfig:
+            def get_name(self):
+                return "dummy_quant"
+
+        with patch.object(
+            moe_utils, "MOE_RUNNER_BACKEND", MoeRunnerBackend.FLASHINFER_TRTLLM
+        ):
+            deepseek_gate = MoEGate(
+                SimpleNamespace(
+                    topk_method="noaux_tc",
+                    n_routed_experts=8,
+                    hidden_size=16,
+                ),
+                quant_config=DummyQuantConfig(),
+            )
+
+        self.assertEqual(deepseek_gate.e_score_correction_bias.dtype, torch.bfloat16)
+
 
 if __name__ == "__main__":
     unittest.main()
