@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <cublasdx.hpp>
+#include <cusolverdx.hpp>
 
 namespace {
 
@@ -42,75 +43,37 @@ struct ipm_smem {
   float r[NV];
   float d[NV];
   float alpha;
+  int solve_status;
   bool avail_flag;
 };
 
-// In-place Cholesky factorization a = L L^T (lower triangle), no external
-// linkage. Replaces cuSolverDx::posv to keep the kernel self-contained
-// under sglang's tvm-ffi load_jit (which uses plain c++ for the final
-// link step and so cannot satisfy cuSolverDx's device-link requirement).
-//
-// For the typical LPLB shape (N <= 32) the algorithm is dwarfed by the
-// cuBLASDx GEMMs.
-template <int N, int BLOCK_DIM>
-__device__ __forceinline__ void cholesky_factor(float a[N][N]) {
-  const int tid = threadIdx.x;
-  for (int k = 0; k < N; k++) {
-    if (tid == 0) {
-      // Clamp the pivot away from zero before sqrtf. Numerical drift in
-      // the IPM iterations can push a[k][k] slightly negative on
-      // otherwise-PSD matrices, which would produce NaN and propagate
-      // through the rest of the solve. The convergence check at the end
-      // of the kernel writes 0.5 on non-convergence regardless.
-      a[k][k] = sqrtf(fmaxf(a[k][k], 1e-12f));
-    }
-    __syncthreads();
-    const float pivot = a[k][k];
-    for (int i = k + 1 + tid; i < N; i += BLOCK_DIM) {
-      a[i][k] /= pivot;
-    }
-    __syncthreads();
-    // Schur complement: a[i][j] -= a[i][k] * a[j][k] for j>k, i>=j
-    for (int idx = tid; idx < N * N; idx += BLOCK_DIM) {
-      const int i = idx / N, j = idx % N;
-      if (j > k && i >= j && i < N) {
-        a[i][j] -= a[i][k] * a[j][k];
-      }
-    }
-    __syncthreads();
+template <int N, int SM_VER, int BLOCK_DIM>
+__device__ __forceinline__ void posv_solve(float a[N][N], float b[N], int* status) {
+  if (threadIdx.x == 0) {
+    *status = 0;
   }
-}
+  __syncthreads();
 
-// Solve L L^T x = b in-place on b, where L is the lower triangle of a
-// (filled by `cholesky_factor`). Forward then back substitution; both
-// run on a single thread because N is small and the inner loops have
-// loop-carried dependencies that don't parallelize cheaply.
-template <int N, int BLOCK_DIM>
-__device__ __forceinline__ void cholesky_apply(const float a[N][N], float b[N]) {
-  const int tid = threadIdx.x;
-  if (tid == 0) {
-    for (int i = 0; i < N; i++) {
-      float s = b[i];
-      for (int j = 0; j < i; j++) {
-        s -= a[i][j] * b[j];
-      }
-      b[i] = s / a[i][i];
-    }
-    for (int i = N - 1; i >= 0; i--) {
-      float s = b[i];
-      for (int j = i + 1; j < N; j++) {
-        s -= a[j][i] * b[j];
-      }
-      b[i] = s / a[i][i];
+  using Posv = decltype(cusolverdx::Size<N, N, 1>() +
+                        cusolverdx::Function<cusolverdx::function::posv>() +
+                        cusolverdx::Precision<float>() +
+                        cusolverdx::Type<cusolverdx::type::real>() +
+                        cusolverdx::FillMode<cusolverdx::fill_mode::lower>() +
+                        cusolverdx::Arrangement<cusolverdx::row_major, cusolverdx::col_major>() +
+                        cusolverdx::SM<SM_VER>() +
+                        cusolverdx::Block() +
+                        cusolverdx::BlockDim<BLOCK_DIM>() +
+                        cusolverdx::BatchesPerBlock<1>());
+
+  Posv().execute(a[0], /*runtime_lda=*/N, b, /*runtime_ldb=*/N, status);
+  __syncthreads();
+
+  if (*status != 0) {
+    for (int i = threadIdx.x; i < N; i += BLOCK_DIM) {
+      b[i] = __int_as_float(0x7fffffff);
     }
   }
   __syncthreads();
-}
-
-template <int N, int SM_VER, int BLOCK_DIM>
-__device__ __forceinline__ void cholesky_solve(float a[N][N], float b[N]) {
-  cholesky_factor<N, BLOCK_DIM>(a);
-  cholesky_apply<N, BLOCK_DIM>(a, b);
 }
 
 template <int M, int N, int K, int SM_VER, int BLOCK_DIM>
@@ -182,7 +145,7 @@ __global__ void ipm_solve_kernel(
 
     matmul_NT<NC, NC, NV, SM_VER, BLOCK_DIM>(ax2[0], a[0], ax2a[0]);
     matmul_NT<NC, 1, NV, SM_VER, BLOCK_DIM>(ax2[0], c, ax2c);
-    cholesky_solve<NC, SM_VER, BLOCK_DIM>(ax2a, ax2c);
+    posv_solve<NC, SM_VER, BLOCK_DIM>(ax2a, ax2c, &smem->solve_status);
     matmul_NN<1, NV, NC, SM_VER, BLOCK_DIM>(ax2c, a[0], r);
 
     if (tid < 32) {
