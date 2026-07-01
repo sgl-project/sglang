@@ -198,8 +198,9 @@ class HostKVCache(abc.ABC):
     @abc.abstractmethod
     def get_dummy_flat_data_page(self) -> torch.Tensor:
         """
-        Get a dummy flat data page from the host memory pool.
-        This is used for prefetching or initializing empty pages.
+        Get a dummy flat data page shaped like one host page, for use as a scratch
+        read buffer (e.g. non-zero-copy prefetch). The contents are uninitialized:
+        callers must fully overwrite the buffer before reading from it.
         """
         raise NotImplementedError()
 
