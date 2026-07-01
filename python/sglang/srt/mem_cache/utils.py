@@ -28,6 +28,12 @@ from sglang.srt.mem_cache.evict_policy import (
     SLRUStrategy,
 )
 from sglang.srt.mem_cache.triton_ops.mla_buffer import (
+    dsa_cp_shared_device_slot_indices_triton as dsa_cp_shared_device_slot_indices_triton,
+)
+from sglang.srt.mem_cache.triton_ops.mla_buffer import (
+    dsa_cp_shared_local_slot_indices_triton as dsa_cp_shared_local_slot_indices_triton,
+)
+from sglang.srt.mem_cache.triton_ops.mla_buffer import (
     get_mla_kv_buffer_kernel as get_mla_kv_buffer_kernel,
 )
 from sglang.srt.mem_cache.triton_ops.mla_buffer import (
@@ -41,6 +47,9 @@ from sglang.srt.mem_cache.triton_ops.mla_buffer import (
 )
 from sglang.srt.mem_cache.triton_ops.mla_buffer import (
     set_mla_kv_buffer_triton as set_mla_kv_buffer_triton,
+)
+from sglang.srt.mem_cache.triton_ops.mla_buffer import (
+    set_mla_kv_buffer_triton_cp_shared as set_mla_kv_buffer_triton_cp_shared,
 )
 from sglang.srt.mem_cache.triton_ops.mla_buffer import (
     set_mla_kv_buffer_triton_fp8_quant as set_mla_kv_buffer_triton_fp8_quant,

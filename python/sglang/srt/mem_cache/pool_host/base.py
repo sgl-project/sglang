@@ -88,13 +88,14 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        allocator=None,
     ):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.allocator = allocator or get_allocator_from_storage(allocator_type)
         self.can_use_write_back_jit = False
 
         self.dtype = device_pool.store_dtype
@@ -132,9 +133,20 @@ class HostKVCache(abc.ABC):
                 f"size of the hierarchical cache."
             )
         else:
-            logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
-            )
+            log_host_allocation = getattr(self.allocator, "log_host_allocation", None)
+            if log_host_allocation is not None:
+                log_host_allocation(
+                    requested_bytes,
+                    logger,
+                    pool_name="hierarchical KV cache",
+                    token_capacity=self.size,
+                    page_num=self.page_num,
+                    page_size=self.page_size,
+                )
+            else:
+                logger.info(
+                    f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+                )
 
         self.kv_buffer = self.init_kv_buffer()
 
@@ -161,6 +173,9 @@ class HostKVCache(abc.ABC):
                 if buf is not None:
                     _cuda_host_unregister(buf)
         self.kv_buffer = None
+        allocator_destroy = getattr(getattr(self, "allocator", None), "destroy", None)
+        if allocator_destroy is not None:
+            allocator_destroy()
 
     @abc.abstractmethod
     def get_size_per_token(self):

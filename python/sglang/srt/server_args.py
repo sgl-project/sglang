@@ -950,6 +950,10 @@ class ServerArgs:
     dsa_prefill_cp_mode: A[str, Arg(no_cli=True)] = "round-robin-split"
     enable_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
     prefill_cp_mode: A[str, Arg(no_cli=True)] = "in-seq-split"
+    enable_dsa_cp_shared_kv_cache: A[
+        bool,
+        "Enable DSA CP shared KV cache for L1 HBM and HiCache L2 when hierarchical cache is enabled. Requires --enable-prefill-cp.",
+    ] = False
     # DP attention
     enable_dp_attention: A[
         bool,
@@ -3610,6 +3614,36 @@ class ServerArgs:
             "fp8_e4m3",
         ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
 
+    def _should_default_dsa_cp_shared_prefill_to_flashmla_kv(
+        self,
+        kv_cache_dtype: str,
+        major: int,
+        user_set_prefill: bool,
+    ) -> bool:
+        return (
+            not user_set_prefill
+            and self.enable_dsa_cp_shared_kv_cache
+            and self.attn_cp_size > 1
+            and kv_cache_dtype == "bfloat16"
+            and major < 10
+            and not is_hip()
+        )
+
+    def _should_default_dsa_cp_shared_fp8_prefill_to_flashmla_sparse(
+        self,
+        kv_cache_dtype: str,
+        major: int,
+        user_set_prefill: bool,
+    ) -> bool:
+        return (
+            not user_set_prefill
+            and self.enable_dsa_cp_shared_kv_cache
+            and self.attn_cp_size > 1
+            and kv_cache_dtype == "fp8_e4m3"
+            and major == 9
+            and not is_hip()
+        )
+
     def _set_default_dsa_backends(self, kv_cache_dtype: str, major: int) -> str:
         from sglang.srt.arg_groups.hisparse_hook import (
             apply_hisparse_dsa_backend_defaults,
@@ -3635,7 +3669,15 @@ class ServerArgs:
             else:
                 # Hopper FP8 defaults to flashmla_kv for both prefill and decode.
                 if not user_set_prefill:
-                    self.dsa_prefill_backend = "flashmla_kv"
+                    if self._should_default_dsa_cp_shared_fp8_prefill_to_flashmla_sparse(
+                        kv_cache_dtype, major, user_set_prefill
+                    ):
+                        self.dsa_prefill_backend = "flashmla_sparse"
+                        logger.warning(
+                            "Default DSA CP shared FP8 prefill to flashmla_sparse."
+                        )
+                    else:
+                        self.dsa_prefill_backend = "flashmla_kv"
                 if not user_set_decode:
                     self.dsa_decode_backend = "flashmla_kv"
         else:
@@ -3648,7 +3690,15 @@ class ServerArgs:
             else:
                 # Hopper defaults for bfloat16
                 if not user_set_prefill:
-                    self.dsa_prefill_backend = "flashmla_sparse"
+                    if self._should_default_dsa_cp_shared_prefill_to_flashmla_kv(
+                        kv_cache_dtype, major, user_set_prefill
+                    ):
+                        self.dsa_prefill_backend = "flashmla_kv"
+                        logger.warning(
+                            "Default DSA CP shared BF16 prefill to flashmla_kv."
+                        )
+                    else:
+                        self.dsa_prefill_backend = "flashmla_sparse"
                 if not user_set_decode:
                     self.dsa_decode_backend = "fa3"
 
@@ -3814,6 +3864,10 @@ class ServerArgs:
                     assert (
                         self.disaggregation_mode != "decode"
                     ), "CP is only supported for prefill when PD disaggregation, please remove --enable-prefill-cp."
+                elif self.enable_dsa_cp_shared_kv_cache:
+                    raise ValueError(
+                        "--enable-dsa-cp-shared-kv-cache requires --enable-prefill-cp."
+                    )
 
             else:
                 # DeepSeek V3/R1/V3.1

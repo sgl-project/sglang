@@ -310,6 +310,32 @@ class HiCacheController:
             )
         return 0, 1
 
+    def _cp_shared_hicache_enabled(self) -> bool:
+        mem_pool_host = getattr(self, "mem_pool_host", None)
+        return bool(getattr(mem_pool_host, "enable_cp_shared_dsa_l2", False))
+
+    def _cp_shared_hicache_is_io_rank(self) -> bool:
+        mem_pool_host = getattr(self, "mem_pool_host", None)
+        is_io_rank = getattr(mem_pool_host, "cp_shared_l2_is_owner", None)
+        return True if is_io_rank is None else is_io_rank()
+
+    def _cp_shared_hicache_skip_io(self) -> bool:
+        return (
+            self._cp_shared_hicache_enabled()
+            and not self._cp_shared_hicache_is_io_rank()
+        )
+
+    def host_available_size(self) -> int:
+        return self.mem_pool_host.available_size()
+
+    def _increment_cp_shared_prefetch_follower(
+        self, operation, token_count: int
+    ) -> bool:
+        if not self._cp_shared_hicache_skip_io():
+            return False
+        operation.increment(token_count)
+        return True
+
     def _create_prefetch_sync_groups(self) -> None:
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
@@ -666,6 +692,16 @@ class HiCacheController:
         """
         Back up KV caches from device memory to host memory.
         """
+        if self._cp_shared_hicache_enabled():
+            host_indices = self.mem_pool_host.alloc(len(device_indices))
+            if host_indices is None:
+                return None
+            self.write_queue.append(
+                CacheOperation(host_indices, device_indices, node_id, priority)
+            )
+            self.start_writing()
+            return host_indices
+
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
@@ -816,6 +852,9 @@ class HiCacheController:
         if not backup_only:
             raise ValueError("Other eviction policies are not supported yet.")
 
+        if self._cp_shared_hicache_enabled():
+            self.mem_pool_host.free(host_indices)
+            return len(host_indices)
         self.mem_pool_host.free(host_indices)
         return len(host_indices)
 
@@ -902,6 +941,11 @@ class HiCacheController:
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
     ):
+        if self._increment_cp_shared_prefetch_follower(
+            operation, len(hash_values) * self.page_size
+        ):
+            return
+
         results = self.storage_backend.batch_get_v1(
             hash_values, host_indices, extra_info
         )
@@ -917,12 +961,35 @@ class HiCacheController:
 
     # todo: deprecate
     def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
+        if self._increment_cp_shared_prefetch_follower(
+            operation, len(hash_values) * self.page_size
+        ):
+            return
+
         dummy_page_dst = [
             self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
         ]
         page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
         if page_data is None:
             return
+        if self._cp_shared_hicache_enabled():
+            inc = 0
+            for i in range(len(hash_values)):
+                if page_data[i] is None:
+                    logger.warning(
+                        f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
+                    )
+                    break
+                # Must set the data before increasing the completed tokens.
+                # Otherwise this page may be read before being set.
+                self.mem_pool_host.set_from_flat_data_page(
+                    host_indices[i * self.page_size],
+                    page_data[i],
+                )
+                inc += self.page_size
+            operation.increment(inc)
+            return
+
         for i in range(len(hash_values)):
             if page_data[i] is None:
                 logger.warning(
@@ -1009,7 +1076,12 @@ class HiCacheController:
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+            if self._cp_shared_hicache_skip_io():
+                hit_page_num = len(batch_hashes)
+            else:
+                hit_page_num = self.storage_backend.batch_exists(
+                    batch_hashes, extra_info
+                )
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
@@ -1084,6 +1156,8 @@ class HiCacheController:
 
     # todo: deprecate
     def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
+        if self._cp_shared_hicache_skip_io():
+            return True
         data = [
             self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
             for i in range(len(hash_values))
@@ -1091,6 +1165,8 @@ class HiCacheController:
         return self.storage_backend.batch_set(hash_values, data)
 
     def _page_set_zero_copy(self, hash_values, host_indices, extra_info=None) -> bool:
+        if self._cp_shared_hicache_skip_io():
+            return True
         return all(
             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
         )
@@ -1109,6 +1185,8 @@ class HiCacheController:
     def _draft_page_get(self, hash_values, host_indices) -> None:
         """Best-effort read draft KV pages from L3 (mirrors `_draft_page_set`)."""
         if self.draft_page_get_func is None:
+            return
+        if self._cp_shared_hicache_skip_io():
             return
         try:
             self.draft_page_get_func(hash_values, host_indices)

@@ -1556,7 +1556,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Pre-evict host if insufficient
         kv_tokens = len(device_value)
-        host_avail = self.cache_controller.mem_pool_host.available_size()
+        host_avail = self.cache_controller.host_available_size()
         if host_avail < kv_tokens:
             needed = kv_tokens - host_avail
             evicted = self.evict_host(needed)

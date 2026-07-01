@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NoOpMHATokenToKVPool,
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
+    should_enable_dsa_cp_shared_kvcache,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
@@ -852,6 +853,11 @@ class ModelRunnerKVCacheMixin:
                 pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                     self.server_args
                 ).host_to_device_ratio
+            if should_enable_dsa_cp_shared_kvcache(
+                enable_hisparse=self.enable_hisparse,
+                enabled=self.server_args.enable_dsa_cp_shared_kv_cache,
+            ):
+                pool_kwargs["enable_cp_shared_kvcache"] = True
             self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,

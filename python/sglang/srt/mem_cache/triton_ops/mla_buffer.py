@@ -168,6 +168,206 @@ def set_mla_kv_buffer_triton(
 
 
 @triton.jit
+def set_mla_kv_buffer_cp_shared_kernel(
+    kv_buffer_ptr,
+    cache_k_nope_ptr,
+    cache_k_rope_ptr,
+    loc_ptr,
+    buffer_stride: tl.constexpr,
+    nope_stride: tl.constexpr,
+    rope_stride: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    cp_rank: tl.constexpr,
+    cp_size: tl.constexpr,
+    slots_per_page: tl.constexpr,
+    BLOCK: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
+):
+    pid_loc = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+
+    base = pid_blk * BLOCK
+    offs = base + tl.arange(0, BLOCK)
+    total_dim = nope_dim + rope_dim
+
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
+    page = loc // slots_per_page
+    page_offset = loc - page * slots_per_page
+    owned = (loc >= 0) & ((page % cp_size) == cp_rank)
+    local_page = page // cp_size
+    local_loc = local_page * slots_per_page + page_offset
+    mask = (offs < total_dim) & owned
+    dst_ptr = kv_buffer_ptr + local_loc * buffer_stride + offs
+
+    if base + BLOCK <= nope_dim:
+        src = tl.load(
+            cache_k_nope_ptr + pid_loc * nope_stride + offs,
+            mask=mask,
+        )
+    elif base >= nope_dim:
+        offs_rope = offs - nope_dim
+        src = tl.load(
+            cache_k_rope_ptr + pid_loc * rope_stride + offs_rope,
+            mask=mask,
+        )
+    else:
+        is_nope = offs < nope_dim
+        is_rope = (offs >= nope_dim) & (offs < total_dim)
+
+        src_nope = tl.load(
+            cache_k_nope_ptr + pid_loc * nope_stride + offs,
+            mask=mask & is_nope,
+            other=0,
+        )
+        src_rope = tl.load(
+            cache_k_rope_ptr + pid_loc * rope_stride + (offs - nope_dim),
+            mask=mask & is_rope,
+            other=0,
+        )
+        src = tl.where(is_nope, src_nope, src_rope)
+
+    tl.store(dst_ptr, src, mask=mask)
+
+
+def set_mla_kv_buffer_triton_cp_shared(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    *,
+    cp_rank: int,
+    cp_size: int,
+    slots_per_page: int,
+):
+    nope_dim = cache_k_nope.shape[-1]
+    rope_dim = cache_k_rope.shape[-1]
+    total_dim = nope_dim + rope_dim
+    BLOCK = triton.next_power_of_2(total_dim)
+    grid = (loc.numel(), 1)
+    pdl_kwargs = {}
+    set_mla_kv_buffer_cp_shared_kernel[grid](
+        kv_buffer,
+        cache_k_nope,
+        cache_k_rope,
+        loc,
+        kv_buffer.stride(0),
+        cache_k_nope.stride(0),
+        cache_k_rope.stride(0),
+        nope_dim,
+        rope_dim,
+        cp_rank,
+        cp_size,
+        slots_per_page,
+        BLOCK=BLOCK,
+        **pdl_kwargs,
+    )
+
+
+@triton.jit
+def dsa_cp_shared_slot_indices_kernel(
+    src,
+    dst,
+    n_elements: tl.constexpr,
+    cp_rank: tl.constexpr,
+    cp_size: tl.constexpr,
+    slots_per_page: tl.constexpr,
+    pages_per_rank: tl.constexpr,
+    padding_value: tl.constexpr,
+    PEER_MAPPED: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_elements
+    values = tl.load(src + offsets, mask=mask, other=padding_value)
+    valid = values != padding_value
+    safe_values = tl.where(valid, values, 0)
+    pages = safe_values // slots_per_page
+    page_offsets = safe_values - pages * slots_per_page
+    local_pages = pages // cp_size
+    if PEER_MAPPED:
+        owner_rank = pages % cp_size
+        segment_rank = (owner_rank - cp_rank + cp_size) % cp_size
+        local_pages = segment_rank * pages_per_rank + local_pages
+    mapped_slots = local_pages * slots_per_page + page_offsets
+    tl.store(dst + offsets, tl.where(valid, mapped_slots, values), mask=mask)
+
+
+def _dsa_cp_shared_map_slots(
+    slot_indices: torch.Tensor,
+    *,
+    cp_rank: int,
+    cp_size: int,
+    slots_per_page: int,
+    pages_per_rank: int,
+    padding_value: int,
+    peer_mapped: bool,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor | None:
+    if not slot_indices.is_cuda:
+        return None
+    out = torch.empty_like(slot_indices, dtype=output_dtype or slot_indices.dtype)
+    n_elements = slot_indices.numel()
+    block = 256
+    grid = (triton.cdiv(n_elements, block),)
+    dsa_cp_shared_slot_indices_kernel[grid](
+        slot_indices,
+        out,
+        n_elements,
+        cp_rank,
+        cp_size,
+        slots_per_page,
+        pages_per_rank,
+        padding_value,
+        PEER_MAPPED=peer_mapped,
+        BLOCK=block,
+    )
+    return out
+
+
+def dsa_cp_shared_device_slot_indices_triton(
+    slot_indices: torch.Tensor,
+    *,
+    cp_rank: int,
+    cp_size: int,
+    slots_per_page: int,
+    pages_per_rank: int,
+    padding_value: int,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor | None:
+    return _dsa_cp_shared_map_slots(
+        slot_indices,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        slots_per_page=slots_per_page,
+        pages_per_rank=pages_per_rank,
+        padding_value=padding_value,
+        peer_mapped=True,
+        output_dtype=output_dtype,
+    )
+
+
+def dsa_cp_shared_local_slot_indices_triton(
+    slot_indices: torch.Tensor,
+    *,
+    cp_size: int,
+    slots_per_page: int,
+    padding_value: int,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor | None:
+    return _dsa_cp_shared_map_slots(
+        slot_indices,
+        cp_rank=0,
+        cp_size=cp_size,
+        slots_per_page=slots_per_page,
+        pages_per_rank=0,
+        padding_value=padding_value,
+        peer_mapped=False,
+        output_dtype=output_dtype,
+    )
+
+
+@triton.jit
 def set_mla_kv_buffer_fp8_quant_kernel(
     kv_buffer_fp8_ptr,
     cache_k_nope_ptr,
