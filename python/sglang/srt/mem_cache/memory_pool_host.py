@@ -219,6 +219,25 @@ ALLOC_MEMORY_FUNCS = defaultdict(
 
 
 class HostKVCache(abc.ABC):
+    """Base class for host-side KV cache pools.
+
+    Attributes:
+        is_mooncake_registerable: Whether this pool's buffer can be zero-copy
+            registered with Mooncake's distributed memory store. Defaults to True
+            for pools with physical buffers. Logical anchors and pools using
+            non-Mooncake allocators override this to False.
+    """
+
+    @property
+    def is_mooncake_registerable(self) -> bool:
+        """Whether this pool's buffer can be zero-copy registered with Mooncake.
+
+        Returns True for pools with physical buffers allocated by Mooncake-compatible
+        allocators. Returns False for:
+        - Logical anchors (no physical buffer, only page indices)
+        - Pools using non-Mooncake allocators (e.g., mmap for draft pools)
+        """
+        return True
 
     def __init__(
         self,
@@ -1732,6 +1751,11 @@ class LogicalHostPool:
     compressed side pools use these logical FULL indices as stable page anchors.
     """
 
+    @property
+    def is_mooncake_registerable(self) -> bool:
+        """Logical anchors have no physical buffer to register."""
+        return False
+
     def __init__(self, size: int, page_size: int):
         if size % page_size != 0:
             raise ValueError(
@@ -2513,6 +2537,11 @@ class HostPoolGroup:
     @property
     def end_layer(self):
         return self.anchor_entry.host_pool.end_layer
+
+    @property
+    def is_mooncake_registerable(self) -> bool:
+        """Delegate to anchor pool's Mooncake registration capability."""
+        return self.anchor_entry.host_pool.is_mooncake_registerable
 
     def get_ksize_per_token(self):
         return self.anchor_entry.host_pool.get_ksize_per_token()
