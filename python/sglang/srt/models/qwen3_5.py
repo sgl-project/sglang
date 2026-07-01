@@ -1412,6 +1412,49 @@ class Qwen3_5ForCausalLM(nn.Module):
             num_groups=None,
         )
 
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+        input_embeds: torch.Tensor = None,
+    ):
+        start, end = split_interval
+        # Embed
+        if start == 0:
+            if input_embeds is None:
+                forward_batch.hidden_states = self.embed_tokens(input_ids)
+            else:
+                forward_batch.hidden_states = input_embeds
+            forward_batch.residual = None
+
+        # Decoder layers
+        for i in range(start, end):
+            with get_global_expert_distribution_recorder().with_current_layer(i):
+                layer = self.layers[i]
+                forward_batch.hidden_states, forward_batch.residual = layer(
+                    positions=positions,
+                    hidden_states=forward_batch.hidden_states,
+                    residual=forward_batch.residual,
+                    forward_batch=forward_batch,
+                )
+
+        if end == self.config.num_hidden_layers:
+            # Norm
+            if forward_batch.residual is None:
+                hidden_states = self.norm(forward_batch.hidden_states)
+            else:
+                hidden_states, _ = self.norm(
+                    forward_batch.hidden_states, forward_batch.residual
+                )
+            forward_batch.hidden_states = hidden_states
+
+        # Returns None: this is the inner language model; the outer
+        # ConditionalGeneration wrapper handles logits_processor.
+        return None
+
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
     def __init__(
@@ -1682,6 +1725,34 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         else:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
+
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+        input_embeds: torch.Tensor = None,
+    ):
+        if forward_batch.contains_mm_inputs():
+            raise NotImplementedError(
+                "Qwen3.5 multimodal split-prefill is not supported"
+            )
+
+        _, end = split_interval
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+
+        self.model.forward_split_prefill(
+            input_ids, positions, forward_batch, split_interval, input_embeds
+        )
+
+        if end == self.end_layer:
+            return self.logits_processor(
+                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
+            )
+        return None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -2167,6 +2238,34 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             num_logical_experts=text_config.num_experts,
             num_groups=None,
         )
+
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+        input_embeds: torch.Tensor = None,
+    ):
+        if forward_batch.contains_mm_inputs():
+            raise NotImplementedError(
+                "Qwen3.5 multimodal split-prefill is not supported"
+            )
+
+        _, end = split_interval
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+
+        self.model.forward_split_prefill(
+            input_ids, positions, forward_batch, split_interval, input_embeds
+        )
+
+        if end == self.end_layer:
+            return self.logits_processor(
+                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
+            )
+        return None
 
 
 EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]

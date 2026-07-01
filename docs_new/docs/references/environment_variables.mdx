@@ -908,6 +908,36 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force using PyTorch gather/scatter fallback instead of Triton fused kernels for staging operations. Useful for debugging.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_PIPELINED_KV_TRANSFER</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable layer-pipelined KV transfer. Splits prefill into layer groups and transfers KV cache incrementally after each group, overlapping RDMA transfer with GPU compute. Only effective in PD disaggregation prefill mode. When enabled together with overlap schedule, overlap is automatically disabled (pipelined subsumes its CPU sync savings). When using with <code>--hicache-storage-backend mooncake</code>, set <code>MOONCAKE_DEVICE</code> to a separate IB port (e.g. <code>mlx5_5</code>) to avoid RDMA resource conflicts.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PIPELINE_GROUP_SIZE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>(Optional) Override adaptive formula with a fixed number of layers per pipeline group. When not set, group_size is computed automatically based on prompt length.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set (adaptive)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PIPELINE_MIN_TOKENS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Minimum average input token length to activate pipelined mode. Batches below this threshold use the normal (non-pipelined) path to avoid overhead on short prompts.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>3072</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PIPELINE_SAT_MULTIPLIER</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Multiplier for MIN_TOKENS that defines the prompt-length saturation point in the adaptive pipeline group-size formula.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>3.0</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PIPELINE_MAX_ITERS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum pipeline iterations (used for shortest eligible prompts). The adaptive formula linearly interpolates between MAX_ITERS and MIN_ITERS based on prompt length. Higher values mean smaller groups and more transfer overlap.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>10</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PIPELINE_MIN_ITERS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Minimum pipeline iterations (used for longest prompts at saturation point = SAT_MULTIPLIER × MIN_TOKENS). Lower bound ensures large groups don't add excessive per-group overhead.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>4</code></td>
+    </tr>
   </tbody>
 </table>
 

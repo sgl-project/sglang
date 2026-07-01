@@ -63,6 +63,9 @@ class FakeKVSender(BaseKVSender):
     def get_transfer_metric(self) -> KVTransferMetric:
         return KVTransferMetric()
 
+    def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
+        return num_pages > 0 or last_chunk
+
     def init(
         self,
         kv_indices: list[int],
@@ -81,6 +84,23 @@ class FakeKVSender(BaseKVSender):
         self.has_sent = True
         logger.debug(
             f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}"
+        )
+
+    def send_layer(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        layer_id: int = 0,
+        cuda_event=None,
+        is_last: bool = False,
+        state_indices=None,
+    ):
+        """Per-layer KV send stub for warmup."""
+        logger.debug(f"FakeKVSender send_layer layer_id={layer_id} is_last={is_last}")
+
+    def send_final_metadata(self, state_indices=None):
+        self.has_sent = True
+        logger.debug(
+            f"FakeKVSender send_final_metadata with state_indices: {state_indices}"
         )
 
     def failure_exception(self):
