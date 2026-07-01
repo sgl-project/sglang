@@ -184,8 +184,6 @@ class PagedIndexerMetadata:
             copy_fields=copy_fields,
             assign_fields=assign_fields,
         )
-        # A plan contains per-forward tensor views and must never survive a
-        # metadata copy/replay boundary. Graph-backed forwards are ineligible.
         self.nonpaged_plan = None
 
 
