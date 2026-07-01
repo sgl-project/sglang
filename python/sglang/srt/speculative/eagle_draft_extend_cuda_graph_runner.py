@@ -33,6 +33,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     is_hip,
@@ -152,11 +153,19 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
 
-            _hidden_size = EagleDraftExtendInput.hidden_size_for(self.eagle_worker)
+            # Width and dtype both come from the draft `model_runner` so the
+            # source stays consistent (the draft dtype matches the target dtype
+            # that produced these hidden states).
+            _hidden_dtype = model_runner.model_config.dtype
+            _hidden_size = (
+                None
+                if self.eagle_worker.speculative_algorithm.is_standalone()
+                else get_draft_input_from_target_hidden_dim(model_runner)
+            )
             hidden_states = (
                 torch.zeros(
                     (self.max_num_token, _hidden_size),
-                    dtype=EagleDraftExtendInput.dtype_for(self.eagle_worker),
+                    dtype=_hidden_dtype,
                 )
                 if _hidden_size is not None
                 else None
@@ -547,10 +556,17 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             seq_lens_sum=seq_lens_sum,
             seq_lens_cpu=buffers.seq_lens_cpu,
             encoder_lens=None,
-            out_cache_loc=forward_batch.out_cache_loc,
+            out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             spec_info=forward_batch.spec_info,
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
+
+        # Snapshot built -- the forward is done reading the shared pool. Publish
+        # a read-done event the scheduler's WAR barrier waits on.
+        read_done = self.device_module.Event()
+        read_done.record()
+        self.model_runner.war_fastpath_read_done_event = read_done
 
         self.raw_bs = raw_bs
         self.bs = bs

@@ -93,7 +93,6 @@ from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_strea
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
-    log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -130,7 +129,7 @@ def build_replay_fb_view(
     fields like spec_info, out_cache_loc, and the runtime
     actual_forward_mode) with the padded capture-time buffers from
     buffers (for req_pool_indices, seq_lens, seq_lens_cpu,
-    encoder_lens).
+    positions, encoder_lens).
 
     forward_mode is the capture-time mode (used by backends for
     bucket / dispatch decisions); actual_forward_mode is the
@@ -145,6 +144,7 @@ def build_replay_fb_view(
         forward_mode=capture_forward_mode,
         actual_forward_mode=forward_batch.forward_mode,
         input_ids=buffers.input_ids[:num_tokens],
+        positions=buffers.positions[:num_tokens],
         req_pool_indices=buffers.req_pool_indices[:bs],
         seq_lens=buffers.seq_lens[:bs],
         seq_lens_sum=(
@@ -235,7 +235,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
-                if not self.model_runner.spec_algorithm.is_dflash():
+                if (
+                    not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
+                ):
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
             self.num_tokens_per_bs = (
@@ -251,7 +253,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.num_tokens_per_bs
         )
-        log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
@@ -804,12 +805,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ):
                     kwargs["input_embeds"] = self.buffers.input_embeds[:num_tokens]
 
-                return forward(
+                out = forward(
                     forward_batch.input_ids,
                     forward_batch.positions,
                     forward_batch,
                     **kwargs,
                 )
+                dflash_sampler = getattr(
+                    self.model_runner, "dflash_draft_sampler", None
+                )
+                if dflash_sampler is not None:
+                    # Must be captured here, or replay leaves a stale output buffer
+                    # the worker would read as valid tokens -- fail loudly instead.
+                    if (
+                        not isinstance(out, LogitsProcessorOutput)
+                        or out.hidden_states is None
+                    ):
+                        raise RuntimeError(
+                            "DFLASH draft sampler set but the draft forward has no "
+                            "hidden_states to capture into the graph."
+                        )
+                    dflash_sampler(out.hidden_states)
+                return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
             canary_ctx = (
@@ -979,6 +996,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
+            # Publish a read-done event for the WAR barrier: a cuda-graph forward
+            # finishes its shared req_to_token / SWA reads at this pre-replay
+            # snapshot, so plain DECODE and DFLASH TARGET_VERIFY both qualify.
+            if forward_batch.forward_mode.is_decode() or (
+                forward_batch.forward_mode.is_target_verify()
+                and self.model_runner.spec_algorithm.is_dflash()
+            ):
+                read_done = self.device_module.Event()
+                read_done.record()
+                self.model_runner.war_fastpath_read_done_event = read_done
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
         if isinstance(output, LogitsProcessorOutput):
