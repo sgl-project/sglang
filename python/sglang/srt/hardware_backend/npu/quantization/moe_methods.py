@@ -842,11 +842,13 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         # Fetch weight scale from self (the method instance)
         weight_scale = getattr(self, f"{weight_prefix}_weight_scale", None)
 
+        print('weight_scale', weight_scale)
+
         if weight_scale is not None:
+            print('self.hidden_states_quantize', self.hidden_states_quantize)
             # Quantize activations only if the quantizer is available
             if self.hidden_states_quantizer is not None and pertoken_scale is None:
                 hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
-
             scale_args = {"scale": [weight_scale]}
             if pertoken_scale is not None:
                 scale_args["per_token_scale"] = [pertoken_scale]
@@ -856,6 +858,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
                 scale_args["scale_dtype"] = torch_npu.float8_e8m0fnu
                 scale_args["per_token_scale_dtype"] = torch_npu.float8_e8m0fnu
 
+            print(scale_args)
             return self.matmul.forward(
                 quant_info, weight_prefix, hidden_states, expert_tokens,
                 output_dtype, group_list_type=group_list_type, **scale_args)
