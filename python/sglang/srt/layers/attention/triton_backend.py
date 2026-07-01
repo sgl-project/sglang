@@ -18,9 +18,11 @@ from sglang.srt.layers.attention.triton_ops.kv_indices import (
 )
 from sglang.srt.layers.attention.triton_ops.metadata import get_num_kv_splits_triton
 from sglang.srt.layers.attention.utils import (
+    assert_buffer_fits,
     cp_lse_ag_out_rs,
     create_triton_kv_indices_for_dcp_triton,
     get_dcp_lens,
+    get_req_to_token_capacity_len,
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -1764,7 +1766,8 @@ class TritonMultiStepDraftBackend:
         self.device = model_runner.device
         # Cached variables for generate_draft_decode_kv_indices
         self.req_to_token_pool = model_runner.req_to_token_pool
-        self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+        self.req_to_token_capacity_len = get_req_to_token_capacity_len(model_runner)
+        self.pool_len = self.req_to_token_capacity_len
         self.page_size = model_runner.server_args.page_size
 
     def common_template(
@@ -1783,6 +1786,17 @@ class TritonMultiStepDraftBackend:
             # seq_lens_sum here only slice-clamps a preallocated kv_indices buffer;
             # over-estimate is safe. Use a static UB to skip the per-iter .sum().item() D2H.
             seq_lens_sum = num_seqs * self.max_context_len
+
+        required_kv_indices_len = draft_kv_indices_used_len(
+            seq_lens_sum, self.topk, bs, self.speculative_num_steps
+        )
+        assert_buffer_fits(
+            required_kv_indices_len,
+            kv_indices_buffer.shape[1],
+            "EAGLE draft kv_indices row (size max_bs * topk * req_to_token_capacity_len)",
+            bs=bs,
+            seq_lens_sum=seq_lens_sum,
+        )
 
         generate_draft_decode_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)
@@ -1814,7 +1828,7 @@ class TritonMultiStepDraftBackend:
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices_width = draft_kv_indices_buffer_width(
-            forward_batch.batch_size, self.topk, self.max_context_len
+            forward_batch.batch_size, self.topk, self.req_to_token_capacity_len
         )
         kv_indices = torch.empty(
             (self.speculative_num_steps, kv_indices_width),
@@ -1835,7 +1849,7 @@ class TritonMultiStepDraftBackend:
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         kv_indices_width = draft_kv_indices_buffer_width(
-            max_bs, self.topk, self.max_context_len
+            max_bs, self.topk, self.req_to_token_capacity_len
         )
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, kv_indices_width),

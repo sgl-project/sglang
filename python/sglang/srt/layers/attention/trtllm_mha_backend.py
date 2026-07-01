@@ -22,7 +22,12 @@ from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
 from sglang.srt.layers.attention.triton_ops.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
-from sglang.srt.layers.attention.utils import canonicalize_stride
+from sglang.srt.layers.attention.utils import (
+    canonicalize_stride,
+    get_model_context_len,
+    get_req_to_token_capacity_len,
+    get_req_to_token_capacity_pages,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -98,7 +103,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         config = model_runner.model_config
 
         # MHA-specific dimensions
-        self.max_context_len = model_runner.model_config.context_len
+        self.max_context_len = get_model_context_len(model_runner)
         self.hidden_size = config.hidden_size
 
         # Runtime parameters
@@ -106,6 +111,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.req_to_token_capacity_len = get_req_to_token_capacity_len(model_runner)
+        self.req_to_token_capacity_pages = get_req_to_token_capacity_pages(
+            model_runner
+        )
         self.device = model_runner.device
 
         # Workspace allocation
@@ -140,9 +149,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # Static page-table width (upper bound). The CUDA-graph path builds the
         # page table on-device sized to this constant, so it never reads a runtime
         # max. See _fill_page_table_device.
-        self.max_num_pages = (
-            self.max_context_len + self.page_size - 1
-        ) // self.page_size
+        self.max_num_pages = self.req_to_token_capacity_pages
 
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None

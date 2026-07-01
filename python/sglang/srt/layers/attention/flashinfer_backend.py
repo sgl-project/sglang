@@ -25,6 +25,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
+    get_req_to_token_capacity_len,
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -1876,7 +1877,8 @@ class FlashInferMultiStepDraftBackend:
         self.max_context_len = self.attn_backends[0].max_context_len
 
         # Cached variables for generate_draft_decode_kv_indices
-        self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+        self.req_to_token_capacity_len = get_req_to_token_capacity_len(model_runner)
+        self.pool_len = self.req_to_token_capacity_len
         self.req_to_token_pool = model_runner.req_to_token_pool
 
     def common_template(
@@ -1895,7 +1897,7 @@ class FlashInferMultiStepDraftBackend:
         assert_buffer_fits(
             required_kv_indices_len,
             kv_indices_buffer.shape[1],
-            "EAGLE draft kv_indices row (size max_bs * topk * max_context_len)",
+            "EAGLE draft kv_indices row (size max_bs * topk * req_to_token_capacity_len)",
             bs=bs,
             seq_lens_sum=seq_lens_sum,
         )
@@ -1937,7 +1939,7 @@ class FlashInferMultiStepDraftBackend:
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices_width = draft_kv_indices_buffer_width(
-            forward_batch.batch_size, self.topk, self.max_context_len
+            forward_batch.batch_size, self.topk, self.req_to_token_capacity_len
         )
         kv_indices = torch.empty(
             (self.speculative_num_steps, kv_indices_width),
@@ -1958,10 +1960,10 @@ class FlashInferMultiStepDraftBackend:
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         # generate_draft_decode_kv_indices packs topk per-branch sequences per row,
-        # so the row needs the topk factor -- same as the eager init_forward_metadata
-        # (batch_size * topk * max_context_len). Dropping it overflows the buffer.
+        # so the row needs the topk factor and req_to_token's addressable width.
+        # Dropping either under-allocates and overflows the buffer.
         kv_indices_width = draft_kv_indices_buffer_width(
-            max_bs, self.topk, self.max_context_len
+            max_bs, self.topk, self.req_to_token_capacity_len
         )
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, kv_indices_width),
