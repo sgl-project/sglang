@@ -24,6 +24,7 @@ from sglang.jit_kernel.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
+    fused_rope_pack,
 )
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
@@ -1060,24 +1061,32 @@ class MQALayer(nn.Module):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
-        if _is_npu:
-            v4_rope_inplace_npu(
-                o[..., -self.qk_rope_head_dim :],
-                None,
+        if _FP8_WO_A_GEMM and _is_cuda:
+            o = fused_rope_pack(
+                o,
                 self.freqs_cis,
-                positions,
+                positions=positions,
+                num_groups=self.n_local_groups,
                 inverse=True,
             )
         else:
-            fused_rope_inplace(
-                o[..., -self.qk_rope_head_dim :],
-                None,
-                self.freqs_cis,
-                positions=positions,
-                inverse=True,
-            )
-
-        o = o.view(o.shape[0], self.n_local_groups, -1)
+            if _is_npu:
+                v4_rope_inplace_npu(
+                    o[..., -self.qk_rope_head_dim :],
+                    None,
+                    self.freqs_cis,
+                    positions,
+                    inverse=True,
+                )
+            else:
+                fused_rope_inplace(
+                    o[..., -self.qk_rope_head_dim :],
+                    None,
+                    self.freqs_cis,
+                    positions=positions,
+                    inverse=True,
+                )
+            o = o.view(o.shape[0], self.n_local_groups, -1)
 
         if _FP8_WO_A_GEMM:
             import deep_gemm
