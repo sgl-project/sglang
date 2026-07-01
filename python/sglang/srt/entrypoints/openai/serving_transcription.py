@@ -330,7 +330,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
                         request.language = lang
                         logger.info("Auto-detected language: '%s'", lang)
                 else:
-                    visible = cumulative_text
+                    visible = self._adapter.postprocess_text(cumulative_text)
 
                 delta = visible[len(visible_buffer) :]
                 visible_buffer = visible
