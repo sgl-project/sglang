@@ -1175,6 +1175,14 @@ class TritonAttnBackend(AttentionBackend):
             k_buffer, v_buffer = pool.get_kv_buffer(layer.layer_id)
             k = k_buffer[cache_loc]
             v = v_buffer[cache_loc]
+            # Dequantize shared KV from fp8 cache to match compute dtype
+            if k.dtype != q.dtype:
+                k = k.to(q.dtype)
+                v = v.to(q.dtype)
+                if layer.k_scale_float is not None:
+                    k.mul_(layer.k_scale_float)
+                if layer.v_scale_float is not None:
+                    v.mul_(layer.v_scale_float)
         elif k is None or v is None:
             raise ValueError("Both k and v should be None or not None")
         else:
