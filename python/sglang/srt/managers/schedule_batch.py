@@ -39,7 +39,6 @@ ScheduleBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
-import re
 from array import array
 from concurrent.futures import Future
 from enum import Enum, auto
@@ -108,7 +107,11 @@ from sglang.srt.observability.req_time_stats import (
     SchedulerReqTimeStats,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params import (
+    STOP_REGEX_MATCH_TIMEOUT,
+    SamplingParams,
+    match_stop_regex,
+)
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
@@ -1338,7 +1341,10 @@ class Req(ReqDllmMixin):
         def matched(text: str) -> bool:
             if stop_str is not None:
                 return stop_str in text
-            return re.search(stop_regex, text) is not None
+            try:
+                return match_stop_regex(stop_regex, text)
+            except TimeoutError:
+                return False
 
         tail_len = self._stop_match_tail_len(new_accepted_len)
         start = len(self.output_ids) - tail_len
@@ -1376,7 +1382,20 @@ class Req(ReqDllmMixin):
             # Check stop regex
             if len(self.sampling_params.stop_regex_strs) > 0:
                 for stop_regex_str in self.sampling_params.stop_regex_strs:
-                    if re.search(stop_regex_str, tail_str):
+                    try:
+                        matched = match_stop_regex(stop_regex_str, tail_str)
+                    except TimeoutError:
+                        # Pathological stop_regex (ReDoS): abort this request
+                        # instead of letting it stall the scheduler loop.
+                        self.finished_reason = FINISH_ABORT(
+                            f"stop_regex {stop_regex_str!r} evaluation exceeded "
+                            f"the {STOP_REGEX_MATCH_TIMEOUT}s budget and was "
+                            "aborted to protect the scheduler.",
+                            HTTPStatus.BAD_REQUEST,
+                            "BadRequestError",
+                        )
+                        return True
+                    if matched:
                         self.finished_reason = FINISHED_MATCHED_REGEX(
                             matched=stop_regex_str
                         )
