@@ -10,7 +10,7 @@ ARG HOPPER_SBO=0
 ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.4.3
+ARG SGL_KERNEL_VERSION=0.4.4
 ARG SGL_VERSION
 ARG SGL_DEEP_GEMM_VERSION=0.1.3
 ARG USE_LATEST_SGLANG=0
@@ -244,7 +244,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
                | xargs -r python3 -m pip uninstall -y && \
            python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
-               torch torchvision torchaudio --force-reinstall; \
+               torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --force-reinstall; \
            python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
        fi \
     && cd /sgl-workspace \
@@ -564,6 +564,30 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
+# Optional ai-dynamo nightly for Dynamo + SGLang integration testing. Gated by
+# INSTALL_DYNAMO so it lands only in the dev image (release-docker-dev.yml sets
+# it), not the version-tagged release/runtime images. Empty DYNAMO_VERSION
+# resolves the latest (highest-version) nightly, matching `pip install --pre`;
+# set it to pin an exact version for a reproducible build.
+ARG INSTALL_DYNAMO=0
+ARG DYNAMO_VERSION=
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -eu; \
+    if [ "$INSTALL_DYNAMO" = "1" ]; then \
+        if [ -z "$DYNAMO_VERSION" ]; then \
+            index="$(curl -fsSL --retry 3 --retry-delay 2 https://pypi.nvidia.com/ai-dynamo/)" \
+                || { echo "ERROR: failed to fetch the ai-dynamo index from pypi.nvidia.com"; exit 1; }; \
+            DYNAMO_VERSION="$(printf '%s\n' "$index" \
+                | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}' | sort -Vu | tail -1)"; \
+            case "$DYNAMO_VERSION" in \
+                *.*.*.dev????????) : ;; \
+                *) echo "ERROR: no X.Y.Z.devYYYYMMDD nightly found in the index (format may have changed)"; exit 1 ;; \
+            esac; \
+        fi; \
+        echo "Installing ai-dynamo==${DYNAMO_VERSION}"; \
+        python3 -m pip install --extra-index-url https://pypi.nvidia.com "ai-dynamo==${DYNAMO_VERSION}"; \
+    fi
+
 # Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
 # the `nixl` import path) but unconditionally requires nixl-cu12, so we install
 # it with --no-deps and pair it with the matching nixl-cu12 / nixl-cu13 binary
@@ -621,6 +645,7 @@ ARG BUILD_TYPE
 ARG CUDA_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
+ARG INSTALL_DYNAMO=0
 
 WORKDIR /sgl-workspace
 
@@ -655,6 +680,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                  success=1 && break; \
                  echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
              done; \
+             # x86: if no prebuilt sgl-flash-attn3 variant matches this torch+CUDA \
+             # combo (e.g. cu129 publishes no torch>=2.10 cubin), fall back to \
+             # runtime JIT instead of failing the build, mirroring the aarch64 branch. \
+             if [ "$success" != "1" ]; then \
+                 echo "WARNING: no matching sgl-flash-attn3 cubin variant for this torch+CUDA; kernels will be JIT-compiled at runtime"; \
+                 success=1; \
+             fi; \
          fi; \
          [ "$success" = "1" ] ) \
     && mkdir -p /root/.cache/huggingface /root/.cache/sglang \
@@ -665,8 +697,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Install pre-built gateway artifacts from parallel builder
 COPY --from=gateway_builder /build/sgl-model-gateway-bin /usr/local/bin/sgl-model-gateway
 COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
+# When ai-dynamo is installed (dev image), reinstall the gateway wheel with
+# --no-deps so it cannot re-resolve and replace Dynamo's shared dependencies.
+# Otherwise resolve the gateway's own dependencies normally.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl \
+    if [ "$INSTALL_DYNAMO" = "1" ]; then \
+        python3 -m pip install --force-reinstall --no-deps /tmp/gateway_wheels/*.whl; \
+    else \
+        python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl; \
+    fi \
     && rm -rf /tmp/gateway_wheels
 
 # Set workspace directory

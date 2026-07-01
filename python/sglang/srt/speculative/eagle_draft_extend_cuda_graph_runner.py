@@ -33,6 +33,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     is_hip,
@@ -71,7 +72,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
     Subclasses DecodeCudaGraphRunner to inherit the outer capture
     loop + backend scaffolding. Overrides capture_one_shape,
-    replay, can_run for EAGLE-specific draft-extend semantics.
+    replay, can_run_graph for EAGLE-specific draft-extend semantics.
     """
 
     def __init__(
@@ -152,11 +153,19 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
 
-            _hidden_size = EagleDraftExtendInput.hidden_size_for(self.eagle_worker)
+            # Width and dtype both come from the draft `model_runner` so the
+            # source stays consistent (the draft dtype matches the target dtype
+            # that produced these hidden states).
+            _hidden_dtype = model_runner.model_config.dtype
+            _hidden_size = (
+                None
+                if self.eagle_worker.speculative_algorithm.is_standalone()
+                else get_draft_input_from_target_hidden_dim(model_runner)
+            )
             hidden_states = (
                 torch.zeros(
                     (self.max_num_token, _hidden_size),
-                    dtype=EagleDraftExtendInput.dtype_for(self.eagle_worker),
+                    dtype=_hidden_dtype,
                 )
                 if _hidden_size is not None
                 else None
@@ -195,6 +204,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_gpu = None
                 global_num_tokens_for_logprob_gpu = None
 
+            hot_token_id = getattr(self.eagle_worker, "hot_token_id", None)
             if hasattr(
                 self.model_runner.model_config.hf_config, "draft_vocab_size"
             ):  # llama_eagle
@@ -203,6 +213,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 self.model_runner.model_config.hf_config, "hot_vocab_size"
             ):  # llama_eagle3
                 vocab_size = self.model_runner.model_config.hf_config.hot_vocab_size
+            elif hot_token_id is not None:
+                # FR-Spec: reduced vocab is injected via a late
+                # json_model_override_args, so hf_config lacks it; size from the head.
+                vocab_size = len(hot_token_id)
             else:
                 vocab_size = self.model_runner.model_config.vocab_size
 
@@ -255,7 +269,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(size=bs)
 
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -340,6 +354,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             hidden_states=hidden_states,
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
+            # Padded tree width per req; drives the constant qo layout.
+            num_tokens_per_req=self.num_tokens_per_bs,
         )
 
         forward_batch = ForwardBatch(
@@ -427,7 +443,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     ),
                 )
 
-    def replay(self, forward_batch: ForwardBatch):
+    def execute(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers
@@ -540,10 +556,17 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             seq_lens_sum=seq_lens_sum,
             seq_lens_cpu=buffers.seq_lens_cpu,
             encoder_lens=None,
-            out_cache_loc=forward_batch.out_cache_loc,
+            out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             spec_info=forward_batch.spec_info,
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
+
+        # Snapshot built -- the forward is done reading the shared pool. Publish
+        # a read-done event the scheduler's WAR barrier waits on.
+        read_done = self.device_module.Event()
+        read_done.record()
+        self.model_runner.war_fastpath_read_done_event = read_done
 
         self.raw_bs = raw_bs
         self.bs = bs
