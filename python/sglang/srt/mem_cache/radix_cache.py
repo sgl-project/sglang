@@ -248,6 +248,13 @@ class TreeNode:
         TreeNode.counter += 1
 
     @property
+    def prefix_len(self):
+        ret =  self.parent.prefix_len if self.parent else 0
+        ret += len(self.key)
+
+        return ret
+
+    @property
     def evicted(self):
         return self.value is None
 
