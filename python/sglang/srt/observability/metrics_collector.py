@@ -1916,6 +1916,16 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.swa_prefix_truncated_num_tokens = Counter(
+            name="sglang:swa_prefix_truncated_tokens_total",
+            documentation=(
+                "The number of prefix tokens that matched in the radix tree but "
+                "were truncated from the cache hit because the sliding-window "
+                "attention KV had already been evicted (tombstoned)."
+            ),
+            labelnames=labels.keys(),
+        )
+
         self.load_back_duration_seconds = Histogram(
             name="sglang:load_back_duration_seconds",
             documentation="Time taken to load memory from CPU to GPU in seconds.",
@@ -1931,6 +1941,9 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_swa_prefix_truncated_num_tokens(self, num_tokens: int) -> None:
+        self.swa_prefix_truncated_num_tokens.labels(**self.labels).inc(num_tokens)
 
     def increment_load_back_num_tokens(self, num_tokens: int) -> None:
         self.load_back_num_tokens.labels(**self.labels).inc(num_tokens)
