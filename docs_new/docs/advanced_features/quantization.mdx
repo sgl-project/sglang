@@ -156,7 +156,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
     </tr>
     <tr>
       <td><code>modelopt_mixed</code></td>
-      <td>Yes (Blackwell/SM100+ for MXFP8/NVFP4 layers)</td>
+      <td>Yes (SM80-SM90 via FP4 fallback for NVFP4; SM100+ for MXFP8 linears)</td>
       <td>No</td>
       <td>No</td>
       <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a> mixed-precision checkpoints with per-layer FP8, NVFP4, and MXFP8; auto-selected from compatible <code>hf_quant_config.json</code> metadata</td>
@@ -566,13 +566,13 @@ If a model is already quantized (e.g., from Hugging Face), you can load it direc
     ```
 
 * **Mixed Precision Models:**
-    ModelOpt `MIXED_PRECISION` checkpoints that combine FP8, NVFP4, or MXFP8 layers are auto-detected as `modelopt_mixed` when their `hf_quant_config.json` records microscaling or NVFP4 layers. Use this path for Blackwell checkpoints that mix MXFP8 dense layers with NVFP4 experts.
+    ModelOpt `MIXED_PRECISION` checkpoints that combine FP8, NVFP4, or MXFP8 layers are auto-detected as `modelopt_mixed` when their `hf_quant_config.json` records microscaling or NVFP4 layers. NVFP4 layers use the ModelOpt FP4 capability path; MXFP8 linear layers use FlashInfer CUTLASS and require Blackwell.
     ```bash Command
     python3 -m sglang.launch_server \
         --model-path /path/to/modelopt-mixed-checkpoint \
         --port 30000
     ```
-    The MXFP8 integration serves block-32 E4M3 weights with E8M0 block scales through FlashInfer CUTLASS on Blackwell. It supports the MXFP8/NVFP4 ModelOpt layout used by mixed Qwen3.5 checkpoints; ModelOpt MXFP4 layers are intentionally not routed to `modelopt_mixed`, because that representation needs a distinct MXFP4 linear method.
+    The MXFP8 integration serves block-32 E4M3 weights with E8M0 block scales through FlashInfer CUTLASS on Blackwell. It supports MXFP8 shared or dense linear layers alongside NVFP4 routed experts; ModelOpt MXFP4 layers are intentionally not routed to `modelopt_mixed`, because that representation needs a distinct MXFP4 linear method.
 
 ##### Creating Your Own Quantized Checkpoints
 
