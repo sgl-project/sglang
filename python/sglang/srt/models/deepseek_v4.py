@@ -59,9 +59,11 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
+    get_attention_cp_group,
     get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
+    is_cp_tp_enabled,
     is_dp_attention_enabled,
     is_dp_gatherv_active,
 )
@@ -280,6 +282,79 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 )
 
 
+# ── CP-in-DP metadata helpers ──────────────────────────────────────────────
+# Q runs at B_full but KV/Indexer/Compressor use B_local, so FlashMLA needs
+# B_full metadata while the rest of the pipeline uses B_local.
+
+_CP_TP_STATIC_FIELDS = (
+    "c1_flashmla",
+    "c4_flashmla",
+    "c128_flashmla",
+)
+_CP_TP_DYNAMIC_FIELDS = (
+    "c4_sparse_page_indices",
+    "c4_sparse_topk_lengths",
+)
+
+
+def _cp_tp_save_full_meta(core_meta) -> dict:
+    """Snapshot B_full metadata before apply_cp_reindex."""
+    full = {}
+    for f in core_meta._CP_REINDEX_FIELDS:
+        v = getattr(core_meta, f)
+        if v is not None:
+            full[f] = v
+    for f in _CP_TP_STATIC_FIELDS:
+        full[f] = getattr(core_meta, f + "_metadata")
+    for f in _CP_TP_DYNAMIC_FIELDS:
+        full[f] = getattr(core_meta, f)
+    return full
+
+
+def _cp_tp_swap_to_full(core_meta, full_meta, cp_size, forward_batch):
+    """Replace B_local metadata with B_full; all-gather dynamic fields. Returns saved B_local refs."""
+    local_refs = {}
+    for f in core_meta._CP_REINDEX_FIELDS:
+        local_refs[f] = getattr(core_meta, f)
+    for f in _CP_TP_STATIC_FIELDS:
+        local_refs[f] = getattr(core_meta, f + "_metadata")
+    for f in _CP_TP_DYNAMIC_FIELDS:
+        local_refs[f] = getattr(core_meta, f)
+
+    for f in core_meta._CP_REINDEX_FIELDS:
+        if f in full_meta:
+            setattr(core_meta, f, full_meta[f])
+    for f in _CP_TP_STATIC_FIELDS:
+        setattr(core_meta, f + "_metadata", full_meta[f])
+
+    stream = torch.cuda.current_stream()
+    for f in _CP_TP_DYNAMIC_FIELDS:
+        local_val = local_refs[f]
+        if local_val is None:
+            continue
+        gathered = cp_all_gather_rerange_output(
+            local_val.unsqueeze(-1).contiguous() if local_val.ndim == 1 else local_val.contiguous(),
+            cp_size,
+            forward_batch,
+            stream,
+        )
+        if local_val.ndim == 1:
+            gathered = gathered.squeeze(-1)
+        setattr(core_meta, f, gathered)
+
+    return local_refs
+
+
+def _cp_tp_restore_to_local(core_meta, local_refs):
+    """Restore B_local metadata from saved refs."""
+    for f in core_meta._CP_REINDEX_FIELDS:
+        setattr(core_meta, f, local_refs[f])
+    for f in _CP_TP_STATIC_FIELDS:
+        setattr(core_meta, f + "_metadata", local_refs[f])
+    for f in _CP_TP_DYNAMIC_FIELDS:
+        setattr(core_meta, f, local_refs[f])
+
+
 class MQALayer(nn.Module):
     def __init__(
         self,
@@ -294,10 +369,17 @@ class MQALayer(nn.Module):
         self.tp_rank = attn_tp_rank = get_parallel().attn_tp_rank
         self.tp_size = attn_tp_size = get_parallel().attn_tp_size
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        self._use_cp_tp_init = False
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
-            self.tp_rank = attn_tp_rank = 0
-            self.tp_size = attn_tp_size = 1
+            _use_cp_tp_init = is_cp_tp_enabled()
+            if _use_cp_tp_init:
+                self.tp_rank = attn_tp_rank = get_parallel().attn_cp_rank
+                self.tp_size = attn_tp_size = self.cp_size
+            else:
+                self.tp_rank = attn_tp_rank = 0
+                self.tp_size = attn_tp_size = 1
+            self._use_cp_tp_init = _use_cp_tp_init
         self.layer_id = layer_id
         self.dim = config.hidden_size
         self.qk_rope_head_dim = config.qk_rope_head_dim
@@ -465,10 +547,12 @@ class MQALayer(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=attn_tp_size == get_tensor_model_parallel_world_size()
-            and attn_tp_size > 1,
+            and attn_tp_size > 1
+            and not self._use_cp_tp_init,
             prefix=add_prefix("wo_b", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
         )
 
         self.attn_mqa = RadixAttention(
@@ -552,7 +636,7 @@ class MQALayer(nn.Module):
     ) -> torch.Tensor:
         """Bf16-kv path used by the DSA prefill-CP case (needs all-gather)."""
         if qkv_a is not None:
-            kv = qkv_a[..., self.q_lora_rank :]
+            kv = qkv_a[..., self.q_lora_rank :].contiguous()
         else:
             kv, _ = self.wkv(x)
         kv = kv.contiguous()
@@ -751,16 +835,41 @@ class MQALayer(nn.Module):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        """Returns (q, kv, positions_for_inverse_rope).
+        CP-TP: q_lora/positions are all-gathered before wq_b; KV/Indexer/Compressor use B_local."""
         x_linear = x_quant if x_quant is not None else x
+        use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        use_cp_tp = self._use_cp_tp_init and dsa_use_prefill_cp(forward_batch)
+
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
             q_lora = qkv_a[..., : self.q_lora_rank]
         else:
             q_lora, _ = self.wq_a(x_linear)
             qkv_a = None
+        q_lora = self.q_norm(q_lora)
 
-        use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        # B_local references for Indexer/KV; all-gather q_lora+positions before wq_b.
+        q_lora_local = q_lora
+        positions_local = positions
+        if use_cp_tp:
+            q_lora = cp_all_gather_rerange_output(
+                q_lora.contiguous(),
+                self.cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+            positions = cp_all_gather_rerange_output(
+                positions.unsqueeze(-1).contiguous(),
+                self.cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            ).squeeze(-1)
+
+        q = self._compute_q_b(q_lora, positions, q_out)
+
+        # KV uses B_local positions.
         kv: Optional[torch.Tensor]
 
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
@@ -833,7 +942,7 @@ class MQALayer(nn.Module):
             if not unified and use_cp:
                 # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
-                kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+                kv = self._compute_kv_bf16(x, positions_local, qkv_a=qkv_a)
                 kv = cp_all_gather_rerange_output(
                     kv.contiguous(),
                     self.cp_size,
@@ -873,7 +982,7 @@ class MQALayer(nn.Module):
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
-                kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
+                kv = self._compute_kv_bf16(x_linear, positions_local, qkv_a=qkv_a)
                 # HIP/ROCm-only: the unified_kv 2-source prefill path is exclusive
                 # to DeepseekV4HipRadixBackend. Guard with _is_hip so this CP
                 # all-gather never enters the NVIDIA (DeepseekV4AttnBackend) path.
@@ -890,7 +999,7 @@ class MQALayer(nn.Module):
             elif use_cp:
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
-                kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
+                kv = self._compute_kv_bf16(x_linear, positions_local, qkv_a=qkv_a)
                 kv = cp_all_gather_rerange_output(
                     kv.contiguous(),
                     self.cp_size,
@@ -904,16 +1013,17 @@ class MQALayer(nn.Module):
                 )
             else:
                 self._compute_kv_to_cache(
-                    x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
+                    x_linear, positions_local, forward_batch, attn_backend, qkv_a=qkv_a
                 )
                 kv = None
 
         del qkv_a
 
+        # Indexer/Compressor use B_local.
         if self.indexer is not None:
             self.indexer(
                 x=x,
-                q_lora=q_lora,
+                q_lora=q_lora_local,
                 forward_batch=forward_batch,
                 attn_backend=attn_backend,
             )
@@ -925,7 +1035,7 @@ class MQALayer(nn.Module):
                 self.compressor,
             )
 
-        return q, kv
+        return q, kv, positions
 
     def forward(
         self,
@@ -943,6 +1053,10 @@ class MQALayer(nn.Module):
                 attn_backend,
                 (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
             )
+
+        use_cp_tp_forward = (
+            self._use_cp_tp_init and dsa_use_prefill_cp(forward_batch)
+        )
 
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
@@ -964,10 +1078,13 @@ class MQALayer(nn.Module):
             # heads inject NaN into attention on gfx942 (fnuz), so zero-init
             # there; other archs tolerate new_empty and skip the per-forward
             # memset.
+            # CP-TP runs attention over the full B_full = B_local * cp_size, so
+            # pad the row count too when CP-TP is active this forward.
+            B_q = x.shape[0] * self.cp_size if use_cp_tp_forward else x.shape[0]
             if _is_gfx942_supported:
-                q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
+                q_padded = x.new_zeros(B_q, padded_num_heads, self.head_dim)
             else:
-                q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+                q_padded = x.new_empty(B_q, padded_num_heads, self.head_dim)
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
             if self._attn_sink_local is None:
@@ -1002,8 +1119,9 @@ class MQALayer(nn.Module):
                     x_quant=x_quant,
                 )
             kv = None
+            # multi-stream path doesn't return positions; keep original.
         else:
-            q, kv = self._forward_prepare(
+            q, kv, positions = self._forward_prepare(
                 x,
                 positions,
                 forward_batch,
@@ -1016,6 +1134,15 @@ class MQALayer(nn.Module):
         # tell the backend to skip its own store_cache. When `kv is None`
         # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
         # attention path doesn't read it once `save_kv_cache=False`.
+        _local_refs = None
+        if use_cp_tp_forward:
+            core_meta = forward_batch.attn_backend.forward_metadata.core_attn_metadata
+            _local_refs = _cp_tp_swap_to_full(
+                core_meta, forward_batch._cp_tp_full_meta,
+                self.cp_size, forward_batch,
+            )
+
+        # KV cache already written; use q as sentinel for k==v assert when no CP.
         attn_k = kv if kv is not None else q
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -1103,8 +1230,18 @@ class MQALayer(nn.Module):
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
         o, _ = self.wo_b(o.flatten(1))
-        if self.tp_size > 1 and self.tp_size < get_tensor_model_parallel_world_size():
+        if (
+            not use_cp_tp_forward
+            and self.tp_size > 1
+            and self.tp_size < get_tensor_model_parallel_world_size()
+        ):
             o = attn_tp_all_reduce(o)
+
+        if use_cp_tp_forward:
+            core_meta = forward_batch.attn_backend.forward_metadata.core_attn_metadata
+            _cp_tp_restore_to_local(core_meta, _local_refs)
+            o = get_attention_cp_group().all_reduce(o)
+            o = cp_split_and_rebuild_data(forward_batch, o)
 
         return o
 
@@ -2020,6 +2157,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                     attn_backend = get_attn_backend()
                     metadata = attn_backend.forward_metadata
                     core_meta = metadata.core_attn_metadata
+                    if is_cp_tp_enabled():
+                        core_meta.init_flashmla_related()
+                        forward_batch._cp_tp_full_meta = _cp_tp_save_full_meta(core_meta)
                     core_meta.apply_cp_reindex()
                     core_meta.init_flashmla_related(is_prefill=True)
                     if metadata.indexer_metadata is not None:
