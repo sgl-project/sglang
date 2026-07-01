@@ -261,6 +261,11 @@ class LoRAManager:
             del self.loras[lora_ref.lora_id]
             del self.lora_refs[lora_ref.lora_id]
             self.num_pinned_loras -= int(lora_ref.pinned)
+            # Free the memory-pool buffer slot too, so a later load (colocate RL pushes a fresh uid
+            # every step) re-copies the new weights into a cleanly-freed slot instead of leaving a
+            # dangling uid_to_buffer_id entry that makes the reload skip the in-place buffer copy ->
+            # served (cuda-graph) buffer would keep stale weights. Cuda-graph-replay-safe.
+            self.memory_pool.free_lora(lora_ref.lora_id)
         except Exception as e:
             return self.create_lora_update_result(
                 success=False,
@@ -813,7 +818,11 @@ class LoRAManager:
                 continue
 
             # The module should be converted if it is included in target_names
-            if module_name.split(".")[-1] in self.target_modules:
+            parts = module_name.split(".")
+            if (
+                parts[-1] in self.target_modules
+                or ".".join(parts[-2:]) in self.target_modules
+            ):
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
                     continue
