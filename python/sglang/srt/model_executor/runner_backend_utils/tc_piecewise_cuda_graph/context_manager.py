@@ -112,9 +112,6 @@ def set_tc_piecewise_forward_context(
         _tc_piecewise_forward_context = None
 
 
-# Numbered suggestion list plugged into PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG
-# when the failing prefill backend is TcPiecewise. The overall message template
-# lives in runner_backend_utils/__init__.py.
 TCPCG_FAILURE_HINT = (
     "1. change to breakable by --cuda-graph-backend-prefill=breakable\n"
     "2. disable the prefill CUDA graph by --cuda-graph-backend-prefill=disabled\n"
