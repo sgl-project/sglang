@@ -917,6 +917,7 @@
                       "docs/hardware-platforms/ascend-npus/best_practice/glm5_1",
                       "docs/hardware-platforms/ascend-npus/best_practice/kimi_k2_6",
                       "docs/hardware-platforms/ascend-npus/best_practice/minimax_m2_5",
+                      "docs/hardware-platforms/ascend-npus/best_practice/mimo_v2_flash",
                       "docs/hardware-platforms/ascend-npus/best_practice/qwen3-8b",
                       "docs/hardware-platforms/ascend-npus/best_practice/qwen3_32b",
                       "docs/hardware-platforms/ascend-npus/best_practice/qwen3_30b_a3b",

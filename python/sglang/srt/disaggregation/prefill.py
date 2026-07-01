@@ -39,8 +39,10 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
+    is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
@@ -269,9 +271,8 @@ class PrefillBootstrapQueue:
             return False
 
         req.time_stats.set_bootstrap_done_time()
-        num_kv_indices = len(req.origin_input_ids)
-
         decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
+        num_kv_indices = len(req.origin_input_ids)
         req.start_send_idx = decode_prefix_len
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
         num_pages = kv_to_page_num(
@@ -979,10 +980,11 @@ class SchedulerDisaggregationPrefillMixin:
         """
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
+        transfer_input_len = len(req.origin_input_ids)
         end_idx = (
             end_idx
             if end_idx is not None
-            else min(req.extend_range.end, len(req.origin_input_ids))
+            else min(req.extend_range.end, transfer_input_len)
         )
 
         if not last_chunk:
@@ -1007,13 +1009,12 @@ class SchedulerDisaggregationPrefillMixin:
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
-            # fill_ids includes the token sampled during prefill, but decode
-            # registers state pages over origin_input_ids (DecodePreallocQueue)
-            # and the main pool send is clamped to end_idx above. Matching that
-            # length here avoids emitting an extra state page when the sampled
-            # token crosses a page boundary, which mismatched src/dst lengths in
-            # group_concurrent_contiguous.
-            seq_len = min(req.extend_range.end, len(req.origin_input_ids))
+            # Most state payloads read token-pool rows and should match the KV
+            # range actually materialized on prefill. C128 state is request
+            # scoped, so its transfer index must use the logical input length
+            # that decode used to register the destination row.
+            seq_len = min(req.extend_range.end, transfer_input_len)
+            c128_seq_len = transfer_input_len
 
             def _mamba_payload():
                 return [
@@ -1059,6 +1060,22 @@ class SchedulerDisaggregationPrefillMixin:
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
+            def _c128_state_payload():
+                online = is_dsv4_c128_online_enabled()
+                ring_size = (
+                    1
+                    if online
+                    else self.token_to_kv_pool_allocator.get_kvcache().get_ring_size(
+                        128
+                    )
+                )
+                return get_dsv4_c128_state_indices(
+                    int(req.req_pool_idx),
+                    c128_seq_len,
+                    online=online,
+                    ring_size=ring_size,
+                )
+
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
@@ -1070,8 +1087,14 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(_swa_payload())
                 elif st == StateType.DSA:
                     state_indices.append(_dsa_payload())
+                elif st == StateType.MINIMAX_INDEX_K:
+                    # Index rows live at the same loc as main KV on the same
+                    # page_size, so reuse the full-seq page-ids.
+                    state_indices.append(_dsa_payload())
                 elif st == StateType.SWA_RING:
                     state_indices.append(_swa_ring_payload())
+                elif st == StateType.C128_STATE:
+                    state_indices.append(_c128_state_payload())
                 else:
                     state_indices.append(None)
 
