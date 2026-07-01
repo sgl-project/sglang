@@ -1327,13 +1327,57 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     lru.remove_node(node)
         return device_freed, host_freed
 
+    def _delete_tombstone_leaf_all_layers(
+        self,
+        node: UnifiedTreeNode,
+        tracker: dict[ComponentType, int],
+        tracker_target: EvictLayer,
+        *,
+        has_device: bool,
+        has_host: bool,
+    ) -> UnifiedTreeNode:
+        if has_device:
+            self._record_remove_event(node, medium=StorageMedium.GPU)
+            for comp in self.components.values():
+                if comp.node_has_component_data(node):
+                    self._evict_component_and_detach_lru(
+                        node,
+                        comp,
+                        target=EvictLayer.DEVICE,
+                        tracker=(
+                            tracker if EvictLayer.DEVICE in tracker_target else None
+                        ),
+                    )
+            node.component_data[BASE_COMPONENT_TYPE].value = None
+
+        if has_host:
+            self._record_remove_event(node, medium=StorageMedium.CPU)
+            for comp in self.components.values():
+                if comp.node_has_component_data(node, target=EvictLayer.HOST):
+                    self._evict_component_and_detach_lru(
+                        node,
+                        comp,
+                        target=EvictLayer.HOST,
+                        tracker=tracker if EvictLayer.HOST in tracker_target else None,
+                    )
+
+        self.evictable_device_leaves.discard(node)
+        self.evictable_host_leaves.discard(node)
+        self._remove_leaf_from_parent(node)
+        parent = node.parent
+        self._update_evictable_leaf_sets(parent)
+        return parent
+
     def _iteratively_delete_tombstone_leaf(
-        self, deleted_node: UnifiedTreeNode, tracker: dict[ComponentType, int]
+        self,
+        deleted_node: UnifiedTreeNode,
+        tracker: dict[ComponentType, int],
+        tracker_target: EvictLayer = EvictLayer.DEVICE,
     ):
         """Walk up from *deleted_node* and cascade-delete childless ancestors.
 
-        Only the Full (base) component decides whether a node survives:
-          - Full device present  → keep as D-leaf
+        Full (base) usually decides whether a node survives:
+          - Full device present  → keep as D-leaf, unless a required component is absent
           - Full host present    → keep as H-leaf
           - neither              → evict all remaining data, delete, continue up
         """
@@ -1347,6 +1391,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             has_device = cur.component_data[ct].value is not None
             has_host = cur.component_data[ct].host_value is not None
+            required_component_missing_all_layers = not self.enable_storage and any(
+                component_type in self.components
+                and cur.component_data[component_type].value is None
+                and cur.component_data[component_type].host_value is None
+                for component_type in (ComponentType.SWA, ComponentType.MAMBA)
+            )
+            if required_component_missing_all_layers and (has_device or has_host):
+                cur = self._delete_tombstone_leaf_all_layers(
+                    cur,
+                    tracker,
+                    tracker_target,
+                    has_device=has_device,
+                    has_host=has_host,
+                )
+                continue
 
             if has_device:
                 self._update_evictable_leaf_sets(cur)
@@ -1356,7 +1415,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for comp in self.components.values():
                 if comp.node_has_component_data(cur):
                     self._evict_component_and_detach_lru(
-                        cur, comp, target=EvictLayer.DEVICE, tracker=tracker
+                        cur,
+                        comp,
+                        target=EvictLayer.DEVICE,
+                        tracker=(
+                            tracker if EvictLayer.DEVICE in tracker_target else None
+                        ),
                     )
 
             if has_host:
@@ -1367,7 +1431,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for comp in self.components.values():
                 if comp.node_has_component_data(cur, target=EvictLayer.HOST):
                     self._evict_component_and_detach_lru(
-                        cur, comp, target=EvictLayer.HOST, tracker=tracker
+                        cur,
+                        comp,
+                        target=EvictLayer.HOST,
+                        tracker=tracker if EvictLayer.HOST in tracker_target else None,
                     )
 
             self.evictable_host_leaves.discard(cur)
@@ -1375,6 +1442,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             parent = cur.parent
             self._update_evictable_leaf_sets(parent)
             cur = parent
+
+        return cur
 
     def _for_each_component_lru(
         self,
@@ -1471,7 +1540,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _evict_device_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
-    ) -> None:
+    ) -> Optional[UnifiedTreeNode]:
         """Evict a device leaf node, choosing the right strategy:
 
         - backuped: demote to host via _evict_to_host (node stays in tree)
@@ -1488,10 +1557,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ):
                 written = self.write_backup(node, write_back=True)
                 if written == 0:
-                    return
+                    return None
                 self.writing_check(write_back=True)
                 self._evict_to_host(node, tracker)
-                return
+                return node.parent
             else:
                 # Write-through: node has no backup, delete entirely.
                 self._record_remove_event(node, medium=StorageMedium.GPU)
@@ -1503,13 +1572,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 parent = node.parent
                 self._remove_leaf_from_parent(node)
                 self._update_evictable_leaf_sets(parent)
-                self._iteratively_delete_tombstone_leaf(node, tracker)
-                return
+                return self._iteratively_delete_tombstone_leaf(node, tracker)
         self._evict_to_host(node, tracker)
+        return node.parent
 
     def _evict_host_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
-    ) -> None:
+    ) -> UnifiedTreeNode:
         """Atomically evict all components on a host leaf.
 
         All freed tokens are accumulated into *tracker*."""
@@ -1523,7 +1592,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             tracker[comp.component_type] += hf
         self.evictable_host_leaves.discard(node)
         self._remove_leaf_from_parent(node)
-        self._iteratively_delete_tombstone_leaf(node, tracker)
+        return self._iteratively_delete_tombstone_leaf(
+            node, tracker, tracker_target=EvictLayer.HOST
+        )
 
     # ---- HiCache: Backup / LoadBack ----
 

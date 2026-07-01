@@ -2081,6 +2081,342 @@ class UnifiedRadixCacheSuite:
         self.assertIs(tree.root_node.children[parent_key], parent)
         self.assertTrue(all(evicted == 0 for evicted in tracker.values()))
 
+    def test_tombstone_cleanup_deletes_swa_tombstone_full_parent(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+
+        tree, allocator, _ = build_fixture(self.cfg)
+        parent = UnifiedTreeNode(self.cfg.components)
+        deleted = UnifiedTreeNode(self.cfg.components)
+
+        full_available_before = allocator.full_attn_allocator.available_size()
+        swa_available_before = allocator.swa_attn_allocator.available_size()
+        full_value = self._alloc(allocator, self.cfg.page_size)
+        self.assertIsNotNone(full_value)
+        allocator.free_swa(full_value)
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(),
+            full_available_before - len(full_value),
+        )
+        self.assertEqual(
+            allocator.swa_attn_allocator.available_size(), swa_available_before
+        )
+
+        parent.key = RadixKey(array("q", self._make_seq(1, 1)))
+        deleted.key = RadixKey(array("q", self._make_seq(1000, 1)))
+        parent.parent = tree.root_node
+        deleted.parent = parent
+        parent.component_data[ComponentType.FULL].value = full_value.clone()
+        parent.component_data[ComponentType.SWA].value = None
+        parent_key = parent.key.child_key(tree.page_size)
+        tree.root_node.children[parent_key] = parent
+        tree.component_evictable_size_[ComponentType.FULL] += len(full_value)
+        tree._update_evictable_leaf_sets(parent)
+        self.assertIn(parent, tree.evictable_device_leaves)
+        self.assertEqual(
+            len(tree.match_prefix(MatchPrefixParams(key=parent.key)).device_indices),
+            0,
+        )
+
+        tracker = {ct: 0 for ct in tree.tree_components}
+
+        tree._iteratively_delete_tombstone_leaf(deleted, tracker)
+
+        self.assertNotIn(parent_key, tree.root_node.children)
+        self.assertNotIn(parent, tree.evictable_device_leaves)
+        self.assertEqual(tracker[ComponentType.FULL], len(full_value))
+        self.assertEqual(tracker[ComponentType.SWA], 0)
+        self.assertEqual(tree.full_evictable_size(), 0)
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(), full_available_before
+        )
+        self.assertEqual(
+            allocator.swa_attn_allocator.available_size(), swa_available_before
+        )
+        self.assertEqual(
+            len(tree.match_prefix(MatchPrefixParams(key=parent.key)).device_indices),
+            0,
+        )
+        tree.sanity_check()
+
+    def test_tombstone_cleanup_deletes_mamba_data_for_swa_tombstone(self):
+        if not self.cfg.has_swa or not self.cfg.has_mamba:
+            self.skipTest("requires SWA and Mamba components")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        parent = UnifiedTreeNode(self.cfg.components)
+        deleted = UnifiedTreeNode(self.cfg.components)
+
+        full_available_before = allocator.full_attn_allocator.available_size()
+        swa_available_before = allocator.swa_attn_allocator.available_size()
+        mamba_available_before = req_to_token_pool.mamba_allocator.available_size()
+
+        full_value = self._alloc(allocator, self.cfg.page_size)
+        self.assertIsNotNone(full_value)
+        allocator.free_swa(full_value)
+        mamba_value = req_to_token_pool.mamba_allocator.alloc(1)
+        self.assertIsNotNone(mamba_value)
+
+        parent.key = RadixKey(array("q", self._make_seq(1, 1)))
+        deleted.key = RadixKey(array("q", self._make_seq(1000, 1)))
+        parent.parent = tree.root_node
+        deleted.parent = parent
+        parent.component_data[ComponentType.FULL].value = full_value.clone()
+        parent.component_data[ComponentType.SWA].value = None
+        parent.component_data[ComponentType.SWA].host_value = None
+        parent.component_data[ComponentType.MAMBA].value = mamba_value.clone()
+        parent_key = parent.key.child_key(tree.page_size)
+        tree.root_node.children[parent_key] = parent
+        tree.component_evictable_size_[ComponentType.FULL] += len(full_value)
+        tree.component_evictable_size_[ComponentType.MAMBA] += len(mamba_value)
+        tree.lru_lists[ComponentType.MAMBA].insert_mru(parent)
+        tree._update_evictable_leaf_sets(parent)
+        self.assertIn(parent, tree.evictable_device_leaves)
+        self.assertTrue(tree.lru_lists[ComponentType.MAMBA].in_list(parent))
+
+        tracker = {ct: 0 for ct in tree.tree_components}
+
+        tree._iteratively_delete_tombstone_leaf(deleted, tracker)
+
+        self.assertNotIn(parent_key, tree.root_node.children)
+        self.assertNotIn(parent, tree.evictable_device_leaves)
+        self.assertFalse(tree.lru_lists[ComponentType.MAMBA].in_list(parent))
+        self.assertIsNone(parent.component_data[ComponentType.FULL].value)
+        self.assertIsNone(parent.component_data[ComponentType.MAMBA].value)
+        self.assertEqual(tracker[ComponentType.FULL], len(full_value))
+        self.assertEqual(tracker[ComponentType.SWA], 0)
+        self.assertEqual(tracker[ComponentType.MAMBA], len(mamba_value))
+        self.assertEqual(tree.full_evictable_size(), 0)
+        self.assertEqual(tree.mamba_evictable_size(), 0)
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(), full_available_before
+        )
+        self.assertEqual(
+            allocator.swa_attn_allocator.available_size(), swa_available_before
+        )
+        self.assertEqual(
+            req_to_token_pool.mamba_allocator.available_size(), mamba_available_before
+        )
+        tree.sanity_check()
+
+    def test_tombstone_cleanup_deletes_mamba_tombstone_full_parent(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa:
+            self.skipTest("requires Mamba without SWA")
+
+        tree, allocator, _ = build_fixture(self.cfg)
+        parent = UnifiedTreeNode(self.cfg.components)
+        deleted = UnifiedTreeNode(self.cfg.components)
+
+        full_available_before = allocator.available_size()
+        full_value = self._alloc(allocator, self.cfg.page_size)
+        self.assertIsNotNone(full_value)
+
+        parent.key = RadixKey(array("q", self._make_seq(1, 1)))
+        deleted.key = RadixKey(array("q", self._make_seq(1000, 1)))
+        parent.parent = tree.root_node
+        deleted.parent = parent
+        parent.component_data[ComponentType.FULL].value = full_value.clone()
+        parent.component_data[ComponentType.MAMBA].value = None
+        parent.component_data[ComponentType.MAMBA].host_value = None
+        parent_key = parent.key.child_key(tree.page_size)
+        tree.root_node.children[parent_key] = parent
+        tree.component_evictable_size_[ComponentType.FULL] += len(full_value)
+        tree._update_evictable_leaf_sets(parent)
+        self.assertIn(parent, tree.evictable_device_leaves)
+
+        tracker = {ct: 0 for ct in tree.tree_components}
+
+        tree._iteratively_delete_tombstone_leaf(deleted, tracker)
+
+        self.assertNotIn(parent_key, tree.root_node.children)
+        self.assertNotIn(parent, tree.evictable_device_leaves)
+        self.assertIsNone(parent.component_data[ComponentType.FULL].value)
+        self.assertEqual(tracker[ComponentType.FULL], len(full_value))
+        self.assertEqual(tracker[ComponentType.MAMBA], 0)
+        self.assertEqual(tree.full_evictable_size(), 0)
+        self.assertEqual(allocator.available_size(), full_available_before)
+        tree.sanity_check()
+
+    def test_tombstone_cleanup_deletes_swa_tombstone_full_host_parent(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+
+        tree, allocator, _ = build_fixture(self.cfg)
+        parent = UnifiedTreeNode(self.cfg.components)
+        deleted = UnifiedTreeNode(self.cfg.components)
+
+        full_available_before = allocator.full_attn_allocator.available_size()
+        swa_available_before = allocator.swa_attn_allocator.available_size()
+        full_value = self._alloc(allocator, self.cfg.page_size)
+        self.assertIsNotNone(full_value)
+        allocator.free_swa(full_value)
+
+        parent.key = RadixKey(array("q", self._make_seq(1, 1)))
+        deleted.key = RadixKey(array("q", self._make_seq(1000, 1)))
+        parent.parent = tree.root_node
+        deleted.parent = parent
+        parent.component_data[ComponentType.FULL].value = full_value.clone()
+        parent.component_data[ComponentType.FULL].host_value = torch.arange(
+            len(full_value), dtype=torch.int64, device=tree.device
+        )
+        parent.component_data[ComponentType.SWA].value = None
+        parent.component_data[ComponentType.SWA].host_value = None
+        parent_key = parent.key.child_key(tree.page_size)
+        tree.root_node.children[parent_key] = parent
+        tree.component_evictable_size_[ComponentType.FULL] += len(full_value)
+        tree._update_evictable_leaf_sets(parent)
+        self.assertIn(parent, tree.evictable_device_leaves)
+
+        tracker = {ct: 0 for ct in tree.tree_components}
+
+        tree._iteratively_delete_tombstone_leaf(deleted, tracker)
+
+        self.assertNotIn(parent_key, tree.root_node.children)
+        self.assertNotIn(parent, tree.evictable_device_leaves)
+        self.assertEqual(tracker[ComponentType.FULL], len(full_value))
+        self.assertIsNone(parent.component_data[ComponentType.FULL].host_value)
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(), full_available_before
+        )
+        self.assertEqual(
+            allocator.swa_attn_allocator.available_size(), swa_available_before
+        )
+        tree.sanity_check()
+
+    def test_tombstone_cleanup_host_eviction_recovers_stale_lru_cursor(self):
+        if not self.cfg.has_swa or not self.cfg.has_mamba or self.cfg.page_size != 1:
+            self.skipTest("requires SWA+Mamba with page_size=1")
+
+        for component_type in (ComponentType.SWA, ComponentType.MAMBA):
+            with self.subTest(component_type=component_type):
+                tree, _, _ = build_fixture(self.cfg)
+                missing_component = (
+                    ComponentType.MAMBA
+                    if component_type == ComponentType.SWA
+                    else ComponentType.SWA
+                )
+
+                parent = UnifiedTreeNode(self.cfg.components)
+                child = UnifiedTreeNode(self.cfg.components)
+                remaining = UnifiedTreeNode(self.cfg.components)
+                parent.key = RadixKey(array("q", self._make_seq(1, 1)))
+                child.key = RadixKey(array("q", self._make_seq(1000, 1)))
+                remaining.key = RadixKey(array("q", self._make_seq(2000, 1)))
+                parent.parent = tree.root_node
+                child.parent = parent
+                remaining.parent = tree.root_node
+
+                for node in (child, parent, remaining):
+                    node.component_data[ComponentType.FULL].host_value = torch.arange(
+                        len(node.key), dtype=torch.int64, device=tree.device
+                    )
+                    for ct in (ComponentType.SWA, ComponentType.MAMBA):
+                        if node is parent and ct == missing_component:
+                            continue
+                        node.component_data[ct].host_value = torch.arange(
+                            1, dtype=torch.int64, device=tree.device
+                        )
+
+                parent_key = parent.key.child_key(tree.page_size)
+                child_key = child.key.child_key(tree.page_size)
+                remaining_key = remaining.key.child_key(tree.page_size)
+                tree.root_node.children[parent_key] = parent
+                parent.children[child_key] = child
+                tree.root_node.children[remaining_key] = remaining
+                tree._update_evictable_leaf_sets(parent)
+                tree._update_evictable_leaf_sets(child)
+                tree._update_evictable_leaf_sets(remaining)
+
+                for ct in (ComponentType.SWA, ComponentType.MAMBA):
+                    host_lru = tree.host_lru_lists[ct]
+                    for node in (child, parent, remaining):
+                        if node.component_data[ct].host_value is not None:
+                            host_lru.insert_mru(node)
+
+                host_lru = tree.host_lru_lists[component_type]
+                self.assertIs(host_lru.get_lru_no_host_lock(), child)
+                self.assertIs(host_lru.get_prev_no_host_lock(child), parent)
+
+                evicted = tree.evict_host(3, component_type)
+
+                self.assertEqual(evicted, 3)
+                self.assertEqual(tree.root_node.children, {})
+                self.assertFalse(host_lru.in_list(parent))
+                self.assertFalse(host_lru.in_list(remaining))
+                tree.sanity_check()
+
+    def test_tombstone_cleanup_keeps_parent_when_swa_host_present(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        parent = UnifiedTreeNode(self.cfg.components)
+        deleted = UnifiedTreeNode(self.cfg.components)
+
+        full_value = self._alloc(allocator, self.cfg.page_size)
+        self.assertIsNotNone(full_value)
+        swa_value = allocator.translate_loc_from_full_to_swa(full_value)
+        allocator.free_swa(full_value)
+
+        parent.key = RadixKey(array("q", self._make_seq(1, 1)))
+        deleted.key = RadixKey(array("q", self._make_seq(1000, 1)))
+        parent.parent = tree.root_node
+        deleted.parent = parent
+        parent.component_data[ComponentType.FULL].value = full_value.clone()
+        parent.component_data[ComponentType.FULL].host_value = torch.arange(
+            len(full_value), dtype=torch.int64, device=tree.device
+        )
+        parent.component_data[ComponentType.SWA].value = None
+        parent.component_data[ComponentType.SWA].host_value = swa_value.clone()
+        if self.cfg.has_mamba:
+            mamba_value = req_to_token_pool.mamba_allocator.alloc(1)
+            self.assertIsNotNone(mamba_value)
+            parent.component_data[ComponentType.MAMBA].value = mamba_value.clone()
+        parent_key = parent.key.child_key(tree.page_size)
+        tree.root_node.children[parent_key] = parent
+
+        tracker = {ct: 0 for ct in tree.tree_components}
+
+        tree._iteratively_delete_tombstone_leaf(deleted, tracker)
+
+        self.assertIn(parent_key, tree.root_node.children)
+        self.assertIs(tree.root_node.children[parent_key], parent)
+        self.assertTrue(all(evicted == 0 for evicted in tracker.values()))
+
+    def test_tombstone_cleanup_keeps_parent_when_storage_enabled(self):
+        if not self.cfg.has_swa and not self.cfg.has_mamba:
+            self.skipTest("requires SWA or Mamba component")
+
+        tree, allocator, _ = build_fixture(self.cfg)
+        tree.enable_storage = True
+        parent = UnifiedTreeNode(self.cfg.components)
+        deleted = UnifiedTreeNode(self.cfg.components)
+
+        full_value = self._alloc(allocator, self.cfg.page_size)
+        self.assertIsNotNone(full_value)
+        if self.cfg.has_swa:
+            allocator.free_swa(full_value)
+
+        parent.key = RadixKey(array("q", self._make_seq(1, 1)))
+        deleted.key = RadixKey(array("q", self._make_seq(1000, 1)))
+        parent.parent = tree.root_node
+        deleted.parent = parent
+        parent.component_data[ComponentType.FULL].value = full_value.clone()
+        for component_type in (ComponentType.SWA, ComponentType.MAMBA):
+            if component_type in tree.components:
+                parent.component_data[component_type].value = None
+                parent.component_data[component_type].host_value = None
+        parent_key = parent.key.child_key(tree.page_size)
+        tree.root_node.children[parent_key] = parent
+
+        tracker = {ct: 0 for ct in tree.tree_components}
+
+        tree._iteratively_delete_tombstone_leaf(deleted, tracker)
+
+        self.assertIn(parent_key, tree.root_node.children)
+        self.assertIs(tree.root_node.children[parent_key], parent)
+        self.assertTrue(all(evicted == 0 for evicted in tracker.values()))
+
     def test_internal_readonly_does_not_modify_tree(self):
         """Verify readonly match does not modify tree structure (no split)."""
         if self.cfg.page_size > 1 or self.cfg.has_mamba or self.cfg.has_swa:
