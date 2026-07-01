@@ -310,12 +310,10 @@ class MambaComponent(TreeComponent):
             if cache_len is None:
                 cache_len = 0
             if self.enable_mamba_extra_buffer:
-                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(
-                    req
-                )
-                mamba_value = (
-                    req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
-                )
+                if req.mamba_track_slot is not None:
+                    mamba_value = req.mamba_track_slot.clone()
+                else:
+                    mamba_value = req.mamba_pool_idx.unsqueeze(0).clone()
             else:
                 mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
             insert_params.mamba_value = mamba_value
@@ -323,14 +321,11 @@ class MambaComponent(TreeComponent):
         else:
             if cache_len is None:
                 return 0
-            # Donate the mamba index to the radix cache instead of copying.
             if self.enable_mamba_extra_buffer:
-                new_slot = self._alloc_mamba_slot()
-                mamba_value_donated = (
-                    self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
-                        req, new_slot
-                    )
-                )
+                if req.mamba_track_slot is not None:
+                    mamba_value_donated = req.mamba_track_slot.clone()
+                else:
+                    mamba_value_donated = req.mamba_pool_idx.unsqueeze(0).clone()
             else:
                 mamba_value_donated = self._alloc_mamba_slot()
                 self.cache.req_to_token_pool.mamba_pool.copy_from(
@@ -350,26 +345,23 @@ class MambaComponent(TreeComponent):
             mamba_exist = (
                 insert_result.mamba_exist if insert_result is not None else True
             )
-            if self.enable_mamba_extra_buffer:
-                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(
-                    req
-                )
-            else:
-                keep_idx = None
-            if mamba_exist:
-                keep_idx = None
-            free_mamba_cache = True if self.enable_mamba_extra_buffer else mamba_exist
-            if free_mamba_cache:
+            donated_to_tree = self.enable_mamba_extra_buffer and not mamba_exist
+            free_mamba = self.enable_mamba_extra_buffer or mamba_exist
+            if free_mamba:
                 self.cache.req_to_token_pool.free_mamba_cache(
-                    req, mamba_ping_pong_track_buffer_to_keep=keep_idx
+                    req, donated_to_tree=donated_to_tree
                 )
         else:
-            if insert_params.mamba_value is not None and (
-                insert_result is None or insert_result.mamba_exist
-            ):
-                self.cache.req_to_token_pool.mamba_allocator.free(
-                    insert_params.mamba_value
-                )
+            mamba_exist = insert_result is None or insert_result.mamba_exist
+            if self.enable_mamba_extra_buffer:
+                if mamba_exist and req.mamba_track_slot is not None:
+                    self.cache.req_to_token_pool.mamba_allocator.free(req.mamba_track_slot)
+                req.mamba_track_slot = None
+            else:
+                if insert_params.mamba_value is not None and mamba_exist:
+                    self.cache.req_to_token_pool.mamba_allocator.free(
+                        insert_params.mamba_value
+                    )
             req.mamba_last_track_seqlen = None
 
     # ---- HiCache Hooks ----

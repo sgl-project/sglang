@@ -208,14 +208,9 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             pre_alloc_size=pre_alloc_size,
         )
 
-        self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
-        # Each request needs 1 main mamba slot + ping-pong slots when extra_buffer is enabled.
-        # Cap the pool at max concurrent requests * slots_per_req to avoid allocating failed.
-        slots_per_req = 1 + (
-            self.mamba_ping_pong_track_buffer_size if enable_mamba_extra_buffer else 0
-        )
+        slots_per_req = 1 + (1 if enable_mamba_extra_buffer else 0)
         max_slots_needed = (size + pre_alloc_size) * slots_per_req
         if mamba_size is not None:
             effective_mamba_size = max(mamba_size, max_slots_needed)

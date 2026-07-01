@@ -2937,6 +2937,9 @@ class ServerArgs:
         if envs.SGLANG_USE_MODELSCOPE.get():
             self._handle_modelscope_paths()
 
+        # Mamba radix cache strategy is resolved per-model in
+        # _handle_mamba_radix_cache() based on model capabilities and device
+        # support. For non-mamba models, "auto" stays unresolved.
         # In speculative scenario:
         # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
         # - Otherwise, the draft model defaults to the same quantization as the target model.
@@ -5173,10 +5176,10 @@ class ServerArgs:
                 )
             if self.enable_mamba_extra_buffer():
                 raise ValueError(
-                    "--enable-linear-replayssm requires --mamba-scheduler-strategy "
+                    "--enable-linear-replayssm requires --mamba-radix-cache-strategy "
                     "no_buffer (the default); the extra_buffer ping-pong "
                     "donation path is not yet supported (follow-up). Got "
-                    f"--mamba-scheduler-strategy={self.mamba_scheduler_strategy!r}."
+                    f"--mamba-radix-cache-strategy={self.mamba_radix_cache_strategy!r}."
                 )
             if self.disaggregation_mode != "null":
                 # The disaggregated decode pool (HybridMambaDecodeReqToTokenPool)
@@ -6930,7 +6933,9 @@ class ServerArgs:
         # It is used to determine the caching point in a sequence during prefill.
         if not hasattr(self, "_mamba_cache_chunk_size"):
             hf_config = self.get_model_config().hf_config
-            chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
+            chunk_size = getattr(hf_config, "mamba_chunk_size", None)
+            if chunk_size is None:
+                chunk_size = getattr(hf_config, "chunk_size", FLA_CHUNK_SIZE)
             assert (
                 max(chunk_size, self.page_size) % min(chunk_size, self.page_size) == 0
             ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {self.page_size=}"

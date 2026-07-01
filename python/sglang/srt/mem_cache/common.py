@@ -40,10 +40,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.model_executor.forward_batch_info import DSV4StateLens
 
-# Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
-MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
-# Lazy mode: 1 + 1 slots (1 ping-pong + 1 running), second ping-pong allocated on demand at boundary.
-MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
+MAMBA_STATE_PER_REQ_PREFIX_CACHE = 1
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
