@@ -697,6 +697,50 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if self.trace_ctx.tracing_enable:
             self.trace_ctx.trace_event("retract", 1, convert_time_to_realtime_ns(ts))
 
+    def record_cache_match(
+        self,
+        rid: str,
+        device_tokens: int,
+        host_tokens: int,
+        storage_tokens: int,
+        prefix_tokens: int,
+        input_tokens: int,
+        last_node_id: Optional[int] = None,
+        ts=None,
+    ):
+        """Record per-request cache-match snapshot (DEBUG log + trace event)."""
+        hit_rate = min(1.0, prefix_tokens / input_tokens) if input_tokens > 0 else 0.0
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "cache_match rid=%s device=%d host=%d storage=%d prefix=%d "
+                "input=%d hit_rate=%.3f last_node=%s",
+                rid,
+                device_tokens,
+                host_tokens,
+                storage_tokens,
+                prefix_tokens,
+                input_tokens,
+                hit_rate,
+                last_node_id,
+            )
+
+        if self.trace_ctx.tracing_enable:
+            ts = ts or time.perf_counter()
+            attrs = {
+                "cache.device_tokens": device_tokens,
+                "cache.host_tokens": host_tokens,
+                "cache.storage_tokens": storage_tokens,
+                "cache.prefix_tokens": prefix_tokens,
+                "cache.input_tokens": input_tokens,
+                "cache.hit_rate": hit_rate,
+            }
+            if last_node_id is not None:
+                attrs["cache.last_node_id"] = last_node_id
+            self.trace_ctx.trace_event(
+                "cache_match", 1, convert_time_to_realtime_ns(ts), attrs
+            )
+
     def reset_prefill_retry_time(self):
         self.wait_queue_entry_time = 0.0
         self.forward_entry_time = 0.0
