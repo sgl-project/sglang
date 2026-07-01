@@ -215,6 +215,9 @@ class FusedMoE(torch.nn.Module):
 
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
+        self.intermediate_size_per_partition_unpadded = (
+            self.intermediate_size_per_partition
+        )
         self.reduce_results = reduce_results
         self.use_presharded_weights = use_presharded_weights
 
@@ -457,14 +460,21 @@ class FusedMoE(torch.nn.Module):
 
         if shard_id in {"w1", "w3"} and self.moe_runner_config.is_gated:
             # non-fused version
-            shard_size = expert_data.shape[shard_dim] // 2
+            param_shard_size = expert_data.shape[shard_dim] // 2
         elif shard_id in {"w13"} or (
             shard_id in {"w1", "w3"} and not self.moe_runner_config.is_gated
         ):
             # fused version
-            shard_size = expert_data.shape[shard_dim]
+            param_shard_size = expert_data.shape[shard_dim]
         else:
             raise NotImplementedError
+        weight_shard_size = param_shard_size
+        if self.use_padded_loading and not self.use_presharded_weights and not is_bias:
+            if not (shard_id == "w13" and self.moe_runner_config.is_gated):
+                # FlashInfer TRTLLM may pad the destination shard to 128, while
+                # the checkpoint tensor is still unpadded. Slice the source by
+                # its real per-rank size, then copy into the padded destination.
+                weight_shard_size = loaded_weight.shape[shard_dim] // self.moe_tp_size
 
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
@@ -474,9 +484,50 @@ class FusedMoE(torch.nn.Module):
         if (
             (switch_w13 and shard_id == "w1") or (not switch_w13 and shard_id == "w3")
         ) and self.moe_runner_config.is_gated:
-            start = shard_size
+            start = param_shard_size
         else:
             start = 0
+
+        # Hot-update can load a fused W13 tensor, while FlashInfer TRTLLM stores
+        # the destination as two separately padded halves, e.g.
+        # [W3][W3 pad][W1][W1 pad]. Copy each half separately so W1 data does
+        # not spill into W3 padding.
+        if (
+            self.use_flashinfer_trtllm_moe
+            and shard_id == "w13"
+            and self.moe_runner_config.is_gated
+            and not is_bias
+        ):
+            # A fused W13 source is laid out as two logical halves, W1 then W3,
+            # while FlashInfer TRTLLM stores W13 as W3 then W1. Shard each
+            # source half independently before copying into the padded layout.
+            param_half_size = expert_data.shape[shard_dim] // 2
+            source_half_size = loaded_weight.shape[shard_dim] // 2
+            weight_half_shard_size = source_half_size
+            if not self.use_presharded_weights:
+                weight_half_shard_size //= self.moe_tp_size
+            weight_start = (
+                0 if self.use_presharded_weights else weight_half_shard_size * tp_rank
+            )
+
+            for param_start, source_start in (
+                (0, source_half_size + weight_start),
+                (param_half_size, weight_start),
+            ):
+                half_expert_data, half_loaded_weight = (
+                    narrow_padded_param_and_loaded_weight(
+                        expert_data,
+                        loaded_weight,
+                        param_start,
+                        source_start,
+                        shard_dim,
+                        param_half_size,
+                        narrow_weight=True,
+                        weight_shard_size=weight_half_shard_size,
+                    )
+                )
+                half_expert_data.copy_(half_loaded_weight)
+            return
 
         if self.use_padded_loading:
             if _is_cpu and is_bias:
@@ -485,10 +536,11 @@ class FusedMoE(torch.nn.Module):
                 expert_data,
                 loaded_weight,
                 start,
-                shard_size * tp_rank,
+                weight_shard_size * tp_rank,
                 shard_dim,
-                shard_size,
-                not self.use_presharded_weights,
+                param_shard_size,
+                narrow_weight=not self.use_presharded_weights,
+                weight_shard_size=weight_shard_size,
             )
         else:
             if not self.use_presharded_weights:
@@ -496,10 +548,10 @@ class FusedMoE(torch.nn.Module):
                     # do not transpose for bias
                     loaded_weight = loaded_weight.transpose(-2, -1)
                 loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * tp_rank, shard_size
+                    shard_dim, param_shard_size * tp_rank, param_shard_size
                 )
 
-            expert_data = expert_data.narrow(shard_dim, start, shard_size)
+            expert_data = expert_data.narrow(shard_dim, start, param_shard_size)
         expert_data.copy_(loaded_weight)
 
     def _load_w2(
@@ -543,11 +595,16 @@ class FusedMoE(torch.nn.Module):
         if is_bias:
             # this expert_data is a bias, not weight,
             # for w2_weight_bias in TP, it does not need to be sharded
-            shard_size = expert_data.shape[-1]
+            param_shard_size = expert_data.shape[-1]
         else:
             # this parameter is a weight matrix
             # for w2 in TP, it shards the input_features, i.e., shard_dim=2
-            shard_size = expert_data.shape[shard_dim]
+            param_shard_size = expert_data.shape[shard_dim]
+        weight_shard_size = param_shard_size
+        if self.use_padded_loading and not self.use_presharded_weights and not is_bias:
+            # FlashInfer TRTLLM may pad the destination shard to 128, while the
+            # checkpoint tensor is still unpadded.
+            weight_shard_size = loaded_weight.shape[shard_dim] // self.moe_tp_size
 
         if self.use_padded_loading:
             if _is_cpu and is_bias:
@@ -556,17 +613,18 @@ class FusedMoE(torch.nn.Module):
                 expert_data,
                 loaded_weight,
                 0,  # param_data_start
-                shard_size * tp_rank,
+                weight_shard_size * tp_rank,
                 shard_dim,
-                shard_size,
-                not self.use_presharded_weights,
+                param_shard_size,
+                narrow_weight=not self.use_presharded_weights,
+                weight_shard_size=weight_shard_size,
             )
         else:
             if not is_bias and not self.use_presharded_weights:
                 if self.use_triton_kernels:
                     loaded_weight = loaded_weight.transpose(-2, -1)
                 loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * tp_rank, shard_size
+                    shard_dim, param_shard_size * tp_rank, param_shard_size
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
@@ -1025,6 +1083,15 @@ class FusedMoE(torch.nn.Module):
         method = self.quant_method
         if hasattr(self, "scheme"):
             method = self.scheme
+        if method.__class__.__name__ == "KTEPWrapperMethod":
+            method = method.gpu_method
+        if isinstance(method, UnquantizedFusedMoEMethod):
+            method.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
+                layer=self,
+                param=param,
+                weight_name=weight_name,
+            )
+
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (

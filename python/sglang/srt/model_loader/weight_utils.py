@@ -1732,9 +1732,23 @@ def narrow_padded_param_and_loaded_weight(
     dim,
     shard_size,
     narrow_weight=True,
+    weight_shard_size=None,
 ):
-    actual_shard_size = get_actual_shard_size(
-        shard_size, weight_start, loaded_weight.size(dim)
+    """Return matching param/weight slices and zero padded param tail.
+
+    shard_size is the size of the destination param shard, including any
+    padding. weight_shard_size is the size of the incoming weight shard before
+    destination padding; it defaults to shard_size for existing callers.
+    """
+    if weight_shard_size is None:
+        weight_shard_size = shard_size
+
+    if not narrow_weight:
+        weight_start = 0
+
+    actual_shard_size = min(
+        shard_size,
+        get_actual_shard_size(weight_shard_size, weight_start, loaded_weight.size(dim)),
     )
 
     if narrow_weight:

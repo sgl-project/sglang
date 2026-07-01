@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,47 @@ _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+_FLASHINFER_TRTLLM_BF16_LAYOUT_META_ATTR = "_sglang_flashinfer_trtllm_bf16_layout_meta"
+_FLASHINFER_TRTLLM_BF16_LAYOUT_CANONICAL = "canonical"
+_FLASHINFER_TRTLLM_BF16_LAYOUT_PACKED = "flashinfer_trtllm_bf16"
+
+
+def _get_flashinfer_trtllm_bf16_layout_meta(param: Parameter) -> dict:
+    return getattr(param, _FLASHINFER_TRTLLM_BF16_LAYOUT_META_ATTR, {})
+
+
+def _set_flashinfer_trtllm_bf16_layout_meta(
+    param: Parameter,
+    *,
+    canonical_shape: tuple[int, ...],
+    storage_layout: str,
+    packed_shape: tuple[int, ...] | None = None,
+) -> None:
+    meta = dict(_get_flashinfer_trtllm_bf16_layout_meta(param))
+    meta["canonical_shape"] = tuple(canonical_shape)
+    meta["storage_layout"] = storage_layout
+    if packed_shape is not None:
+        meta["packed_shape"] = tuple(packed_shape)
+    setattr(param, _FLASHINFER_TRTLLM_BF16_LAYOUT_META_ATTR, meta)
+
+
+def _zero_flashinfer_trtllm_bf16_padding(layer: torch.nn.Module) -> None:
+    padded_size = getattr(layer, "intermediate_size_per_partition", None)
+    unpadded_size = getattr(layer, "intermediate_size_per_partition_unpadded", None)
+    if padded_size is None or unpadded_size is None or unpadded_size >= padded_size:
+        return
+
+    w13_weight = layer.w13_weight.data
+    w2_weight = layer.w2_weight.data
+    if w13_weight.dim() == 3:
+        w13_weight[:, unpadded_size:padded_size, :].zero_()
+        if layer.moe_runner_config.is_gated:
+            w13_weight[:, padded_size + unpadded_size : 2 * padded_size, :].zero_()
+
+    if w2_weight.dim() == 3:
+        w2_weight[:, :, unpadded_size:padded_size].zero_()
+
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -199,6 +241,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
+        if self.use_flashinfer_trtllm_moe:
+            _set_flashinfer_trtllm_bf16_layout_meta(
+                w13_weight,
+                canonical_shape=tuple(w13_weight.data.shape),
+                storage_layout=_FLASHINFER_TRTLLM_BF16_LAYOUT_CANONICAL,
+            )
 
         if self.with_bias:
             w13_weight_bias = torch.nn.Parameter(
@@ -221,6 +269,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+        if self.use_flashinfer_trtllm_moe:
+            _set_flashinfer_trtllm_bf16_layout_meta(
+                w2_weight,
+                canonical_shape=tuple(w2_weight.data.shape),
+                storage_layout=_FLASHINFER_TRTLLM_BF16_LAYOUT_CANONICAL,
+            )
 
         if self.with_bias:
             w2_weight_bias = torch.nn.Parameter(
@@ -274,6 +328,33 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
+            w13_meta = _get_flashinfer_trtllm_bf16_layout_meta(layer.w13_weight)
+            w2_meta = _get_flashinfer_trtllm_bf16_layout_meta(layer.w2_weight)
+            w13_layout = w13_meta.get("storage_layout")
+            w2_layout = w2_meta.get("storage_layout")
+            if (
+                w13_layout == _FLASHINFER_TRTLLM_BF16_LAYOUT_PACKED
+                and w2_layout == _FLASHINFER_TRTLLM_BF16_LAYOUT_PACKED
+            ):
+                return
+            if (
+                w13_layout != _FLASHINFER_TRTLLM_BF16_LAYOUT_CANONICAL
+                or w2_layout != _FLASHINFER_TRTLLM_BF16_LAYOUT_CANONICAL
+            ):
+                raise RuntimeError(
+                    "FlashInfer TRT-LLM BF16 MoE weights must have canonical "
+                    "layout metadata before process_weights_after_loading."
+                )
+
+            # Ensure padded slots are zero before packing. For example, hot
+            # update may restore params back to canonical shape with a reshape,
+            # not an inverse unpack, so padding can contain old packed values.
+            _zero_flashinfer_trtllm_bf16_padding(layer)
+
+            canonical_shape_w13 = tuple(layer.w13_weight.data.shape)
+            canonical_shape_w2 = tuple(layer.w2_weight.data.shape)
+            self._cache_permute_indices.clear()
+
             from flashinfer.fused_moe.core import (
                 _maybe_get_cached_w3_w1_permute_indices,
                 convert_to_block_layout,
@@ -337,6 +418,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             layer.w2_weight.data = layer.w2_weight.data.reshape(
                 layer.num_local_experts, *new_shape_w2
             )
+            _set_flashinfer_trtllm_bf16_layout_meta(
+                layer.w13_weight,
+                canonical_shape=canonical_shape_w13,
+                storage_layout=_FLASHINFER_TRTLLM_BF16_LAYOUT_PACKED,
+                packed_shape=tuple(layer.w13_weight.data.shape),
+            )
+            _set_flashinfer_trtllm_bf16_layout_meta(
+                layer.w2_weight,
+                canonical_shape=canonical_shape_w2,
+                storage_layout=_FLASHINFER_TRTLLM_BF16_LAYOUT_PACKED,
+                packed_shape=tuple(layer.w2_weight.data.shape),
+            )
 
         if _is_npu:
             for weight_name in ["w13_weight", "w2_weight"]:
@@ -354,41 +447,59 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         param: torch.nn.Parameter,
         weight_name: str,
     ) -> None:
-        """Restore canonical BF16 MoE load shapes before hot weight copy.
+        """Prepare BF16 MoE params for canonical hot-update loading.
 
         The flashinfer TRT-LLM BF16 postprocess reshapes expert weights into
-        block layout. During weight update, checkpoint tensors are in
-        canonical layout and need a temporary shape restore for copy.
+        block layout. During weight update, checkpoint tensors are canonical
+        replacement values, so the packed storage can be discarded and reused as
+        a canonical load buffer before copy.
         """
-        if not get_moe_runner_backend().is_flashinfer_trtllm_routed():
+        if not self.use_flashinfer_trtllm_moe:
             return
 
         expected_shape = None
-        if weight_name.endswith(".experts.w13_weight"):
+        if param is getattr(layer, "w13_weight", None) or weight_name.endswith(
+            ".experts.w13_weight"
+        ):
             w13_rows = (
                 2 * layer.intermediate_size_per_partition
                 if layer.moe_runner_config.is_gated
                 else layer.intermediate_size_per_partition
             )
             expected_shape = (layer.num_local_experts, w13_rows, layer.hidden_size)
-        elif weight_name.endswith(".experts.w2_weight"):
+        elif param is getattr(layer, "w2_weight", None) or weight_name.endswith(
+            ".experts.w2_weight"
+        ):
             expected_shape = (
                 layer.num_local_experts,
                 layer.hidden_size,
                 layer.intermediate_size_per_partition,
             )
 
-        if expected_shape is None or tuple(param.data.shape) == expected_shape:
+        if expected_shape is None:
             return
 
-        expected_numel = expected_shape[0] * expected_shape[1] * expected_shape[2]
-        if param.data.numel() != expected_numel:
-            raise RuntimeError(
-                f"Cannot restore flashinfer TRT-LLM BF16 MoE weight shape for {weight_name}: "
-                f"current shape={tuple(param.data.shape)}, expected shape={expected_shape}."
-            )
+        meta = _get_flashinfer_trtllm_bf16_layout_meta(param)
+        expected_shape = tuple(meta.get("canonical_shape", expected_shape))
+        current_shape = tuple(param.data.shape)
 
-        param.data = param.data.reshape(expected_shape)
+        if current_shape != expected_shape:
+            expected_numel = math.prod(expected_shape)
+            if param.data.numel() != expected_numel:
+                raise RuntimeError(
+                    f"Cannot restore flashinfer TRT-LLM BF16 MoE weight shape for {weight_name}: "
+                    f"current shape={current_shape}, expected shape={expected_shape}."
+                )
+
+            self._cache_permute_indices.clear()
+            param.data = param.data.reshape(expected_shape)
+
+        _set_flashinfer_trtllm_bf16_layout_meta(
+            param,
+            canonical_shape=expected_shape,
+            storage_layout=_FLASHINFER_TRTLLM_BF16_LAYOUT_CANONICAL,
+            packed_shape=meta.get("packed_shape", current_shape),
+        )
 
     def _aiter_ck_moe_supported(self, layer) -> bool:
         # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
