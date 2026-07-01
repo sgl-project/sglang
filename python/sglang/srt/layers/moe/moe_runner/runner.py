@@ -67,6 +67,8 @@ class MoeRunner:
             self.runner_core = None  # FlashInfer MXFP4 only supports fused path
         elif runner_backend.is_cutlass():
             self.runner_core = None  # CUTLASS uses the direct cutlass_moe_fp4 path
+        elif runner_backend.is_hpc():
+            self.runner_core = None  # HPC-ops only supports fused path
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
