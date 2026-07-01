@@ -134,6 +134,7 @@ LOAD_FORMAT_CHOICES = [
     "remote_instance",
     "fastsafetensors",
     "private",
+    "instanttensor",
     "runai_streamer",
 ]
 

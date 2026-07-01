@@ -101,6 +101,7 @@ srt_hip = [
   "sglang[runtime_common]",
   "torch",
   "wave-lang==3.8.2",
+  "instanttensor>=0.1.9",
 ]
 
 diffusion_hip = [
