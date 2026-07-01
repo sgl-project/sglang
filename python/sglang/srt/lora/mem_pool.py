@@ -1000,27 +1000,44 @@ class LoRAMemoryPool:
 
                 if expert_match:
                     # Per-expert MoE weight — 2D tensors, one per expert.
-                    # Init A and B independently: under ``experts_shared_outer_loras``,
-                    # fc1 has shared A (Tensor in temp_A_buffer) + per-expert B
-                    # (dict in temp_B_buffer), and fc2 has the opposite. A shared
-                    # init on both would either clobber the shared Tensor or leave
-                    # the per-expert side as None.
+                    # Init A and B INDEPENDENTLY (both buffer and cache_keys). Under
+                    # ``experts_shared_outer_loras`` one side of a projection is a
+                    # shared 3D Tensor (set by the dim()==3 branch below) and the
+                    # other is this per-expert dict: fc1 = shared A + per-expert B,
+                    # fc2 = the opposite. The old coupled init keyed every dict off
+                    # ``temp_A_buffer is None``, which either left the per-expert
+                    # side's cache_keys as None (-> TypeError at
+                    # ``[expert_id] = name``) or clobbered the shared side the 3D
+                    # branch already populated. So each side now guards its own
+                    # buffer + cache_keys and never touches the other side.
                     target_module = target_module + "_moe"
-                    if temp_A_buffer[target_module] is None:
-                        temp_A_buffer[target_module] = {}
-                        temp_B_buffer[target_module] = {}
-                        temp_A_cache_keys[target_module] = {}
-                        temp_B_cache_keys[target_module] = {}
-
                     expert_id = int(expert_match.group(1))
                     if "lora_A" in name:
+                        assert not isinstance(
+                            temp_A_buffer[target_module], torch.Tensor
+                        ), (
+                            f"{target_module} lora_A already holds a shared-outer 3D "
+                            f"tensor but also got per-expert weight '{name}'; a "
+                            f"projection side must use one layout, not both."
+                        )
                         if temp_A_buffer[target_module] is None:
                             temp_A_buffer[target_module] = {}
+                        if temp_A_cache_keys[target_module] is None:
+                            temp_A_cache_keys[target_module] = {}
                         temp_A_buffer[target_module][expert_id] = weights
                         temp_A_cache_keys[target_module][expert_id] = name
                     else:
+                        assert not isinstance(
+                            temp_B_buffer[target_module], torch.Tensor
+                        ), (
+                            f"{target_module} lora_B already holds a shared-outer 3D "
+                            f"tensor but also got per-expert weight '{name}'; a "
+                            f"projection side must use one layout, not both."
+                        )
                         if temp_B_buffer[target_module] is None:
                             temp_B_buffer[target_module] = {}
+                        if temp_B_cache_keys[target_module] is None:
+                            temp_B_cache_keys[target_module] = {}
                         temp_B_buffer[target_module][expert_id] = weights
                         temp_B_cache_keys[target_module][expert_id] = name
                 elif "experts" in name and weights.dim() == 3:
