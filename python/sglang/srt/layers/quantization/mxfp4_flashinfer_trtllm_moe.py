@@ -348,6 +348,16 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         intermediate_size = w2.shape[2] * 2 if w2.dtype == torch.uint8 else w2.shape[2]
         hidden_size = w13.shape[2] * 2 if w13.dtype == torch.uint8 else w13.shape[2]
 
+        if hidden_states.shape[0] == 0:
+            return StandardCombineInput(
+                hidden_states=torch.empty(
+                    0,
+                    hidden_size,
+                    dtype=torch.bfloat16,
+                    device=hidden_states.device,
+                )
+            )
+
         num_local_experts = layer.num_local_experts
         if w13_scale.dim() == 2:
             w13_scale = w13_scale.reshape(num_local_experts, 2 * intermediate_size, -1)

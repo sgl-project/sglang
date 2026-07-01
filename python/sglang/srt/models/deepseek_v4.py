@@ -1803,6 +1803,8 @@ class DeepseekV4Model(nn.Module):
                 hc_eps=self.hc_eps,
             )
         shape, dtype = x.size(), x.dtype
+        if x.shape[0] == 0:
+            return torch.empty((0, shape[-1]), dtype=dtype, device=x.device)
         x = x.flatten(1).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = F.linear(x, hc_fn) * rsqrt
@@ -1895,7 +1897,12 @@ class DeepseekV4Model(nn.Module):
             # Flatten 3D mHC tensor for PP IPC.
             return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
 
-        pre_hc_head = hidden_states.flatten(1)
+        if hidden_states.shape[0] == 0:
+            pre_hc_head = hidden_states.new_empty(
+                (0, self.hc_mult * self.hidden_size)
+            )
+        else:
+            pre_hc_head = hidden_states.flatten(1)
 
         hidden_states = self.hc_head(
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
