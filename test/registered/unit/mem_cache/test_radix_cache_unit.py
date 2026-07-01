@@ -523,6 +523,79 @@ class TestRadixCache(unittest.TestCase):
         self.assertEqual(len(remove_events), 1)
         self.assertEqual(remove_events[0].block_hashes, stored_hashes)
 
+    def test_kv_cache_events_extra_keys_on_first_block(self):
+        """extra_key is surfaced on the first BlockStored only, as a 1-tuple."""
+        cache = RadixCache.create_simulated(page_size=4, enable_kv_cache_events=True)
+
+        # Salted sequence spanning two pages.
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3, 4, 5, 6, 7, 8]), "salt-A"),
+                value=None,
+            )
+        )
+        salted = [e for e in cache.take_events() if isinstance(e, BlockStored)]
+        self.assertEqual(len(salted), 2)
+        self.assertEqual(salted[0].extra_keys, [("salt-A",)])
+        self.assertIsNone(salted[1].extra_keys)
+
+        # Unsalted sequence: every block omits extra_keys.
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [9, 10, 11, 12, 13, 14, 15, 16]), None),
+                value=None,
+            )
+        )
+        unsalted = [e for e in cache.take_events() if isinstance(e, BlockStored)]
+        self.assertEqual(len(unsalted), 2)
+        for event in unsalted:
+            self.assertIsNone(event.extra_keys)
+
+    def test_kv_cache_events_salt_not_reemitted_on_shared_prefix(self):
+        """A continuation in the same salt namespace does not re-emit the salt."""
+        cache = RadixCache.create_simulated(page_size=4, enable_kv_cache_events=True)
+
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3, 4, 5, 6, 7, 8]), "salt-A"),
+                value=None,
+            )
+        )
+        cache.take_events()  # drain the first-insert events
+
+        # Shares the first page; the diverging leaf is rooted below the shared
+        # node, so it is not a first block and carries no extra_keys.
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3, 4, 9, 10, 11, 12]), "salt-A"),
+                value=None,
+            )
+        )
+        events = [e for e in cache.take_events() if isinstance(e, BlockStored)]
+        self.assertGreater(len(events), 0)
+        for event in events:
+            self.assertIsNone(event.extra_keys)
+
+    def test_kv_cache_events_same_tokens_different_salt(self):
+        """Same tokens + different salt collide on block_hash; extra_keys disambiguates."""
+        cache = RadixCache.create_simulated(page_size=4, enable_kv_cache_events=True)
+
+        cache.insert(
+            InsertParams(key=RadixKey(array("q", [1, 2, 3, 4]), "salt-A"), value=None)
+        )
+        a = [e for e in cache.take_events() if isinstance(e, BlockStored)][0]
+
+        cache.insert(
+            InsertParams(key=RadixKey(array("q", [1, 2, 3, 4]), "salt-B"), value=None)
+        )
+        b = [e for e in cache.take_events() if isinstance(e, BlockStored)][0]
+
+        # block_hash does not fold in the salt, so the two collide ...
+        self.assertEqual(a.block_hashes, b.block_hashes)
+        # ... and extra_keys is the only signal that tells them apart.
+        self.assertEqual(a.extra_keys, [("salt-A",)])
+        self.assertEqual(b.extra_keys, [("salt-B",)])
+
     def test_extra_key_isolation(self):
         """Test that keys with different extra_key values are isolated."""
         cache = RadixCache.create_simulated()

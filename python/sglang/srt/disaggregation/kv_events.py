@@ -90,6 +90,14 @@ class BlockStored(KVCacheEvent):
     block_size: int
     lora_id: Optional[int]
     medium: Optional[str] = None
+    # Per-block extra classification inputs aligned with ``block_hashes`` (entry
+    # ``i`` belongs to ``block_hashes[i]``), or ``None`` when no block in this
+    # event carries any. Holds the request's ``extra_key`` namespace -- the cache
+    # salt and/or LoRA id -- on the first block of a sequence. This namespace
+    # classifies blocks in the radix tree without changing ``block_hashes``, so
+    # surfacing it here lets prefix-cache-aware routers reconstruct namespaced
+    # block identities.
+    extra_keys: Optional[list[Optional[tuple[str, ...]]]] = None
 
 
 class BlockRemoved(KVCacheEvent):
