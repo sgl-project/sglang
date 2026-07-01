@@ -620,13 +620,18 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
-        new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-            seqlens_32_2d, 64, deep_gemm.get_num_sms()
-        )
         if metadata.paged_mqa_schedule_metadata is None:
+            new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+                seqlens_32_2d, 64, deep_gemm.get_num_sms()
+            )
             object.__setattr__(metadata, "paged_mqa_schedule_metadata", new_schedule)
         else:
-            metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+            deep_gemm.get_paged_mqa_logits_metadata_out(
+                seqlens_32_2d,
+                metadata.paged_mqa_schedule_metadata,
+                64,
+                deep_gemm.get_num_sms(),
+            )
 
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if (
