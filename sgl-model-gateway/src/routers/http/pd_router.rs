@@ -702,14 +702,43 @@ impl PDRouter {
         }
         .emit();
 
-        let (prefill_result, decode_result) =
-            tokio::join!(prefill_request.send(), decode_request.send());
+        // A PD request is a PAIR: the prefill leg cannot finish until the decode
+        // worker's KV receiver registers via the bootstrap handshake. If the
+        // decode leg fails at the transport level, the prefill leg can NEVER
+        // make progress, so awaiting both unconditionally (the previous
+        // `tokio::join!`) blocks on the doomed prefill leg until
+        // `request_timeout_secs` and leaves an orphaned Bootstrapping room on
+        // the prefill worker. Instead, drive both but resolve decode first; on a
+        // decode transport error, cancel the prefill leg (drop -> reqwest
+        // cancel-on-drop) and return a retryable error so the dispatcher
+        // re-dispatches the pair with a fresh bootstrap room.
+        let mut prefill_fut = Box::pin(prefill_request.send());
+        let decode_fut = decode_request.send();
+        tokio::pin!(decode_fut);
+        let mut prefill_result = None;
+        let decode_result = loop {
+            tokio::select! {
+                biased;
+                d = &mut decode_fut => break d,
+                p = &mut prefill_fut, if prefill_result.is_none() => {
+                    prefill_result = Some(p);
+                }
+            }
+        };
 
         events::RequestReceivedEvent {}.emit();
 
         // Process decode response
         match decode_result {
             Ok(res) => {
+                // Decode produced response headers, so the pair is live. Ensure
+                // we have the prefill leg's result for the paths below (status
+                // check / logprob extraction); await it if decode won the race.
+                let prefill_result = match prefill_result {
+                    Some(p) => p,
+                    None => (&mut prefill_fut).await,
+                };
+
                 let status = StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 debug!("Decode response status: {}", status);
@@ -854,13 +883,23 @@ impl PDRouter {
                 // healthy prefill. Mark the response so the outer
                 // dispatcher skips its status-derived `record_outcome`
                 // and we don't double-count.
+                // The prefill leg is now doomed (its bootstrap partner is gone),
+                // so cancel it instead of waiting: dropping the reqwest future
+                // closes the connection and lets the prefill worker release the
+                // orphaned Bootstrapping room. This is what avoids the hang until
+                // request_timeout_secs.
+                drop(prefill_fut);
                 decode.record_outcome(false);
+                // Do not penalize prefill for a decode-driven cancellation: use
+                // its outcome only if it already completed; a still-in-flight
+                // (now cancelled) prefill is not a prefill fault.
                 let prefill_ok = match &prefill_result {
-                    Ok(res) => {
+                    Some(Ok(res)) => {
                         let s = res.status();
                         s.is_success() || s.is_client_error()
                     }
-                    Err(_) => false,
+                    Some(Err(_)) => false,
+                    None => true,
                 };
                 prefill.record_outcome(prefill_ok);
 
