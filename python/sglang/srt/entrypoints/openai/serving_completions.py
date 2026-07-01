@@ -132,6 +132,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
             images_config=getattr(request, "images_config", None),
+            session_params=request.session_params,
         )
 
         return adapted_request, request
