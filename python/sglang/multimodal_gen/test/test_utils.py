@@ -1089,21 +1089,6 @@ def _remote_consistency_gt_candidates(
     return [(filename, f"{base_url}/{filename}") for filename in filenames]
 
 
-def _remote_consistency_gt_candidate_sets(
-    base_url: str,
-    case_id: str,
-    num_gpus: int,
-    is_video: bool,
-    output_format: str | None = None,
-) -> list[list[tuple[str, str]]]:
-    return [
-        [(filename, f"{base_url}/{filename}") for filename in filenames]
-        for filenames in get_consistency_gt_candidate_sets(
-            case_id, num_gpus, is_video, output_format
-        )
-    ]
-
-
 def _is_ascend_consistency_case(case_id: str) -> bool:
     return "npu" in case_id
 
@@ -1190,11 +1175,13 @@ def _find_remote_consistency_gt_files(
     is_video: bool,
     output_format: str | None = None,
 ) -> list[tuple[str, str]]:
-    for base_url in _remote_consistency_gt_base_urls(case_id):
-        candidate_sets = _remote_consistency_gt_candidate_sets(
-            base_url, case_id, num_gpus, is_video, output_format
-        )
-        for candidates in candidate_sets:
+    for filenames in get_consistency_gt_candidate_sets(
+        case_id, num_gpus, is_video, output_format
+    ):
+        for base_url in _remote_consistency_gt_base_urls(case_id):
+            candidates = [
+                (filename, f"{base_url}/{filename}") for filename in filenames
+            ]
             if is_video:
                 exists = [_remote_file_exists(url) for _, url in candidates]
                 if all(status is not False for status in exists):

@@ -108,6 +108,54 @@ def test_remote_image_gt_falls_back_to_sglang_when_official_missing(monkeypatch)
     ]
 
 
+def test_remote_platform_video_gt_prefers_platform_sglang_before_default_official(
+    monkeypatch,
+):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "5090")
+    sglang_platform_prefix = (
+        f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}/5090/"
+    )
+    official_default_prefix = (
+        f"{test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE}/unit_video_1gpu_"
+    )
+    monkeypatch.setattr(
+        test_utils,
+        "_remote_file_exists",
+        lambda url: url.startswith(sglang_platform_prefix)
+        or url.startswith(official_default_prefix),
+    )
+
+    files = test_utils._find_remote_consistency_gt_files(
+        "unit_video",
+        1,
+        is_video=True,
+    )
+
+    assert files == [
+        (
+            "5090/unit_video_1gpu_frame_0.png",
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                "/5090/unit_video_1gpu_frame_0.png"
+            ),
+        ),
+        (
+            "5090/unit_video_1gpu_frame_mid.png",
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                "/5090/unit_video_1gpu_frame_mid.png"
+            ),
+        ),
+        (
+            "5090/unit_video_1gpu_frame_last.png",
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                "/5090/unit_video_1gpu_frame_last.png"
+            ),
+        ),
+    ]
+
+
 def test_remote_npu_image_gt_prefers_official_ascend_when_present(monkeypatch):
     monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
     official_ascend_prefix = (
