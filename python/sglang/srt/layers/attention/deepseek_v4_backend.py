@@ -506,10 +506,62 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
+        self._log_hisparse_online_c128_mtp_state(model_runner)
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
+
+    def _log_hisparse_online_c128_mtp_state(self, model_runner: ModelRunner) -> None:
+        if not model_runner.enable_hisparse or not self.online_c128_mtp.enabled():
+            return
+
+        c128_state_layers = sum(
+            1
+            for pool in self.token_to_kv_pool.compress_state_pools
+            if pool is not None and pool.ratio == 128
+        )
+        state_slot_offset = (
+            self.token_to_kv_pool.get_online_c128_mtp_state_slot_offset()
+        )
+        max_draft_tokens = self.token_to_kv_pool.get_online_c128_mtp_max_draft_tokens()
+
+        if getattr(model_runner, "is_draft_worker", False):
+            logger.info(
+                "DSV4 HiSparse online C128 MTP draft runner initialized: "
+                "c128_state_layers=%d, draft_banks=%d.",
+                c128_state_layers,
+                max_draft_tokens,
+            )
+            return
+
+        if c128_state_layers > 0 and state_slot_offset <= 0:
+            raise RuntimeError(
+                "DSV4 HiSparse online C128 MTP target runner has C128 state "
+                "layers but no pending state-bank offset."
+            )
+        if max_draft_tokens <= 0:
+            raise RuntimeError(
+                "DSV4 HiSparse online C128 MTP target runner has no draft banks."
+            )
+
+        logger.warning(
+            "DSV4 HiSparse online C128 MTP target runner initialized: "
+            "c128_state_layers=%d, state_slot_offset=%d, draft_banks=%d. "
+            "C4 host mirror remains handled by HiSparseCoordinator.",
+            c128_state_layers,
+            state_slot_offset,
+            max_draft_tokens,
+        )
+
+    @staticmethod
+    def _active_batch_size(
+        forward_batch: ForwardBatch,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> int:
+        raw_bs = _get_target_verify_bs(forward_batch)
+        return min(raw_bs, int(req_pool_indices.shape[0]), int(seq_lens.shape[0]))
 
     def _make_target_verify_c128_metadata(
         self,
@@ -1001,7 +1053,9 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=out_cache_loc_padded,
             )
         elif bucket == _GraphBucket.TARGET_VERIFY:
-            verify_bs = _get_target_verify_bs(forward_batch)
+            verify_bs = self._active_batch_size(
+                forward_batch, req_pool_indices, seq_lens
+            )
             if self.online_c128_mtp.enabled() and verify_bs == 0:
                 self.online_c128_mtp.clear()
                 self.forward_metadata = self.cuda_graph_metadata_of_bucket_and_bs[
@@ -1107,7 +1161,7 @@ class DeepseekV4AttnBackend(
             if max_seq_len_override is None
             else max_seq_len_override
         )
-        verify_bs = _get_target_verify_bs(forward_batch)
+        verify_bs = self._active_batch_size(forward_batch, req_pool_indices, seq_lens)
         online_c128_state_slot_offset = self.online_c128_mtp.prepare_forward(
             logical_forward_mode,
             req_pool_indices,

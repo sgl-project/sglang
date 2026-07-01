@@ -36,11 +36,13 @@ def get_compress_state_ring_size(
 ) -> int:
     assert compress_ratio in [4, 128], f"Unsupported {compress_ratio = }"
     # Online c128 keeps a single (max, sum, kv) state per index instead of a
-    # 128-slot ring buffer of raw tokens, so ring_size collapses to 1. Online
-    # is incompatible with speculative decode for now.
+    # 128-slot ring buffer of raw tokens, so ring_size collapses to 1. The
+    # experimental MTP path uses online C128 state banks for EAGLE.
     if compress_ratio == 128 and ONLINE_C128:
         if is_speculative and not envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
-            raise AssertionError("online c128 does not support MTP")
+            raise AssertionError(
+                "online c128 MTP requires SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1"
+            )
         return 1
     if is_speculative:
         return 16 if compress_ratio == 4 else 256

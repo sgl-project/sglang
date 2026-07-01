@@ -576,19 +576,18 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             target_layers = self.num_layers_total
             self.bytes_per_full_token *= (target_layers + draft_layers) / target_layers
 
-        # Online c128 keeps a single in-progress (max, sum, kv) state per index
-        # and assumes a strict forward-only schedule. Speculative decode (MTP)
-        # would need rollback / replay across draft and verify, which the
-        # online path doesn't support yet.
+        # Online c128 keeps a single in-progress (max, sum, kv) state per index.
+        # Speculative decode is only supported for the experimental EAGLE path
+        # that uses online state banks for draft/verify replay.
         if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
             allow_experimental_online_c128_mtp = (
                 envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
                 and mr.spec_algorithm.is_eagle()
             )
             assert mr.spec_algorithm.is_none() or allow_experimental_online_c128_mtp, (
-                "SGLANG_OPT_USE_ONLINE_COMPRESS does not support speculative decode "
-                "(MTP) yet, except the experimental EAGLE topk=1 path gated by "
-                "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1"
+                "SGLANG_OPT_USE_ONLINE_COMPRESS with speculative decode requires "
+                "the experimental EAGLE topk=1 path gated by "
+                "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1."
             )
             if allow_experimental_online_c128_mtp:
                 assert self.online_c128_mtp_max_draft_tokens > 0, (
