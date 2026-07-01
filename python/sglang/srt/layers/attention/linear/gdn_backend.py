@@ -150,7 +150,13 @@ def torch_chunk_gated_delta_rule(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0
     )
 
-    g = g.cumsum(dim=-1)
+    # Per-chunk cumsum. torch.cumsum on the full [b, h, num_chunks, chunk_size] tensor
+    # batches all num_chunks rows into one reduction whose fp32 accumulation order depends
+    # on the row count, so a longer sequence (more chunks) shifts chunk 0 by ~1 bf16 ULP
+    # (7.6e-6) and propagates through g.exp() to core_attn_out (1.5e-5). Running cumsum per
+    # chunk keeps the reduction row count constant, making it independent of sequence length
+    # so sglang (short prefill) and Megatron (full teacher-forced sequence) match bit-exactly.
+    g = torch.stack([g[:, :, i].cumsum(dim=-1) for i in range(g.shape[2])], dim=2)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
     attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
     for i in range(1, chunk_size):
