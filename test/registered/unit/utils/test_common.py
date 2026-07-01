@@ -1,9 +1,11 @@
 import unittest
 from array import array
+from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.utils.common import (
+    _get_fastapi_request_path,
     flatten_arrays_to_int64_tensor,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
@@ -48,6 +50,52 @@ class TestFlattenArraysToInt64Tensor(CustomTestCase):
             array("q", [1000]),
         ]
         self._check(parts, [10, 20, 30, 100, 200, 1000])
+
+
+class TestGetFastapiRequestPath(CustomTestCase):
+    """`_get_fastapi_request_path` resolves the templated route path for the
+    Prometheus HTTP middleware. FastAPI >=0.137 no longer flattens included
+    routers into ``app.routes`` -- they become wrapper objects without a
+    ``.path`` -- which used to raise AttributeError -> HTTP 500 on every
+    request (#28887).
+    """
+
+    @staticmethod
+    def _request(app, path):
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": path,
+            "headers": [],
+            "query_string": b"",
+            "root_path": "",
+        }
+        return SimpleNamespace(app=app, scope=scope, url=SimpleNamespace(path=path))
+
+    def test_included_router_path_is_resolved(self):
+        from fastapi import APIRouter, FastAPI
+
+        app = FastAPI()
+        router = APIRouter()
+
+        @router.get("/v1/chat/completions")
+        def _endpoint():
+            return {}
+
+        app.include_router(router)
+        path, handled = _get_fastapi_request_path(
+            self._request(app, "/v1/chat/completions")
+        )
+        self.assertEqual(path, "/v1/chat/completions")
+        self.assertTrue(handled)
+
+    def test_unmatched_path_falls_back(self):
+        from fastapi import FastAPI
+
+        app = FastAPI()
+        path, handled = _get_fastapi_request_path(self._request(app, "/nope"))
+        self.assertEqual(path, "/nope")
+        self.assertFalse(handled)
 
 
 class TestNvidiaDriverVersionStr(CustomTestCase):
