@@ -1999,6 +1999,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         else:
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
+            # w13/w2_input_scale are loaded globally (_sglang_require_global_experts);
+            # slice to this rank's local experts so shapes line up with
+            # w13_weight_scale_2 / w2_weight_scale_2 which are already per-local-expert.
+            if layer.moe_ep_size > 1:
+                assert layer.moe_ep_size * layer.num_local_experts == layer.num_experts
+                lo = layer.moe_ep_rank * layer.num_local_experts
+                hi = lo + layer.num_local_experts
+                w13_input_scale = w13_input_scale[lo:hi]
+                w2_input_scale = w2_input_scale[lo:hi]
 
         if self.quant_config.use_per_token_activation:
             # FlashInfer computes activation scales dynamically per token, so
