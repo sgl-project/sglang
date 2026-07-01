@@ -858,7 +858,6 @@ ONE_GPU_5090_PERF_CASE_IDS = frozenset(
 )
 ONE_GPU_5090_SKIP_CONSISTENCY_CASE_IDS = frozenset(
     {
-        "wan2_1_t2v_1.3b",
         "turbo_wan2_1_t2v_1.3b",
     }
 )
