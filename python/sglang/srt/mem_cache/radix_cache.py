@@ -342,6 +342,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.root_node.hash_value = []
         self.evictable_size_ = 0
         self.protected_size_ = 0
+        # Structural node count (excludes root), maintained incrementally so
+        # get_cache_stats() stays O(1) on the metrics path.
+        self.entry_count_ = 0
         self.evictable_leaves.clear()
         self._empty_match_result = MatchResult(
             device_indices=torch.empty(
@@ -628,17 +631,14 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         return self.protected_size_
 
     def get_cache_stats(self) -> Tuple[int, int]:
-        """Return (entry_count, total_tokens) currently held in the radix tree."""
-        total_tokens = self.evictable_size_ + self.protected_size_
-        entry_count = 0
-        stack = list(self.root_node.children.values())
-        while stack:
-            current_node = stack.pop()
-            if current_node.evicted:
-                continue
-            entry_count += 1
-            stack.extend(current_node.children.values())
-        return entry_count, total_tokens
+        """Return (entry_count, total_tokens) currently held in the radix tree.
+
+        ``entry_count`` is the number of tree nodes (excluding root), tracked
+        incrementally; ``total_tokens`` is the device-resident token count
+        (evictable + protected). Both are O(1) so this is safe to call on the
+        throttled metrics path.
+        """
+        return self.entry_count_, self.evictable_size_ + self.protected_size_
 
     def all_values_flatten(self):
         values = []
@@ -693,6 +693,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
         new_node.parent.children[key.child_key(self.page_size)] = new_node
+        # A split turns one node into two (new_node -> child): net +1 node.
+        self.entry_count_ += 1
 
         # Split hash_value if it was already computed, otherwise leave as None
         new_node.hash_value, child.hash_value = split_node_hash_value(
@@ -757,6 +759,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
+            self.entry_count_ += 1
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
@@ -786,6 +789,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
+        self.entry_count_ -= 1
         self.evictable_size_ -= len(node.key)
         if node in self.evictable_leaves:
             self.evictable_leaves.remove(node)
