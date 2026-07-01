@@ -45,11 +45,31 @@ if _is_cuda:
 elif _is_musa:
     from sgl_kernel import concat_mla_k
 
+# Opt-in (default off): fuse the bf16 kv_b_proj GEMM with its nope/v split,
+# k_pe cat, and fp8 cast into a single Triton kernel (the bf16 analog of the
+# MXFP4 fused_gemm_afp4wfp4_split_cat path). Requires a recent aiter exposing
+# fused_gemm_a16w16_split_cat; falls back to the unfused path if not present.
+_has_fused_gemm_a16w16_split_cat = False
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
     from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
+
+    try:
+        from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_split_cat import (
+            fused_gemm_a16w16_split_cat,
+        )
+
+        _has_fused_gemm_a16w16_split_cat = True
+    except ImportError:
+        pass
+
+_use_fused_kvb_split_cat = (
+    envs.SGLANG_AITER_FUSED_KVB_SPLIT_CAT.get()
+    and _use_aiter_gfx95
+    and _has_fused_gemm_a16w16_split_cat
+)
 
 
 def _resolve_attn_backend(forward_batch: ForwardBatch):
@@ -308,6 +328,23 @@ class DeepseekMHAForwardMixin:
                     fp8_dtype,
                 )
             )[0]
+        elif (
+            _use_fp8_prefill_attn
+            and _use_fused_kvb_split_cat
+            and self.kv_b_proj.weight.dtype in (torch.bfloat16, torch.float16)
+        ):
+            # BF16 weights + FP8 prefill: fuse the kv_b_proj GEMM, nope/v split,
+            # and k_pe cat into a single kernel (fused_gemm_a16w16_split_cat)
+            # that writes k and v directly in FP8, avoiding separate split / cat
+            # / float8_copy passes.
+            k, v = fused_gemm_a16w16_split_cat(
+                x=kv_a,
+                w=self.kv_b_proj.weight,
+                y=k_pe.expand(-1, self.num_local_heads, -1),
+                S1=self.qk_nope_head_dim,
+                S2=self.v_head_dim,
+                dtype=fp8_dtype,
+            )
         else:
             if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
                 kv = self.kv_b_proj(kv_a_quanted)[0]
