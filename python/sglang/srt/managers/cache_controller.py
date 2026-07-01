@@ -839,11 +839,57 @@ class HiCacheController:
         self.has_draft = True
         self.mem_pool_device_draft = draft_device_pool
         self.mem_pool_host_draft = draft_host_pool
+        self.draft_registered_in_storage = False
         logger.info(
             "HiCache draft KV registered: %s (host %d slots)",
             type(draft_device_pool).__name__,
             draft_host_pool.size,
         )
+
+        # Try to register draft pool with storage backend (best-effort)
+        self._maybe_register_draft_with_storage()
+
+    def _maybe_register_draft_with_storage(self) -> None:
+        """Try to register draft host pool with storage backend.
+
+        When using EAGLE with Mooncake L3 in standalone (dummy client) mode,
+        the draft host pool may use a different allocator (mmap) than the main
+        host pool (MooncakeHostTensorAllocator). This causes register_buffer()
+        to fail because the buffer is outside Mooncake's shared memory segment.
+
+        This method attempts registration but gracefully handles failures,
+        allowing L2 (host DRAM) operations to continue while skipping
+        L3 (storage backend) operations for draft.
+        """
+        if not self.enable_storage or not self.has_draft:
+            return
+
+        # Check if storage backend supports draft pool registration
+        if not hasattr(self.storage_backend, "register_mem_host_pool_v2"):
+            logger.debug(
+                "Storage backend %s does not support register_mem_host_pool_v2, "
+                "draft L3 operations will be skipped",
+                self.storage_backend_type,
+            )
+            return
+
+        try:
+            from sglang.srt.mem_cache.memory_pool_host import PoolName
+
+            self.storage_backend.register_mem_host_pool_v2(
+                self.mem_pool_host_draft, PoolName.DRAFT
+            )
+            self.draft_registered_in_storage = True
+            logger.info(
+                "Successfully registered draft host pool with storage backend"
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to register draft host pool with storage backend: %s. "
+                "Draft L3 (storage backend) operations will be skipped, "
+                "but L2 (host DRAM) operations will continue.",
+                str(e),
+            )
 
     def prefetch(
         self,
