@@ -142,6 +142,10 @@ jobs:
           # Manual dispatch input wins; otherwise use the latest image resolved
           # by the setup job; otherwise the launcher falls back to the recipe default.
           IMAGE_OVERRIDE: ${{ inputs.image != '' && inputs.image || needs.setup.outputs.image }}
+          # Keep the scheduler off mia1-p01-g20: its ionic RDMA driver ABI
+          # mismatches the container, so MORI reports "no active RDMA device"
+          # and the disagg server dies on init. Remove once the node is fixed.
+          SLURM_EXCLUDE: mia1-p01-g20
         run: bash scripts/ci/slurm/launch_mi355x.sh
 
       - name: Process results
