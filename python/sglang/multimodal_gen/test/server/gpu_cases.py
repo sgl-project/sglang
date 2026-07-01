@@ -860,6 +860,36 @@ def _select_5090_canary_cases(case_ids: tuple[str, ...]) -> list[DiffusionTestCa
     return [replace(cases_by_id[case_id], run_perf_check=False) for case_id in case_ids]
 
 
+def _make_5090_flux_layerwise_cpu_offload_case() -> DiffusionTestCase:
+    base_case = next(case for case in ONE_GPU_CASES if case.id == "flux_image_t2i")
+
+    return replace(
+        base_case,
+        id="flux_image_t2i_layerwise_cpu_offload_5090",
+        server_args=replace(
+            base_case.server_args,
+            dit_layerwise_offload=True,
+            dit_offload_prefetch_size=5,
+            text_encoder_cpu_offload=True,
+            extras=[
+                *base_case.server_args.extras,
+                "--dit-cpu-offload",
+                "--pin-cpu-memory",
+            ],
+        ),
+        sampling_params=replace(
+            T2I_sampling_params,
+            output_size="512x512",
+            extras={"num_inference_steps": 4, "seed": 0},
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    )
+
+
 ONE_GPU_5090_CASES = _select_5090_canary_cases(
     (
         "zimage_image_t2i",
@@ -868,6 +898,7 @@ ONE_GPU_5090_CASES = _select_5090_canary_cases(
         "turbo_wan2_1_t2v_1.3b",
     )
 )
+ONE_GPU_5090_CASES.append(_make_5090_flux_layerwise_cpu_offload_case())
 
 
 def _discover_unit_tests() -> list[str]:
