@@ -260,6 +260,7 @@ async def init_multi_tokenizer() -> ServerArgs:
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
     grpc_handle = None
+    warmup_thread = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
@@ -375,36 +376,38 @@ async def lifespan(fast_api_app: FastAPI):
         )
         logger.info("Warmup ended")
 
-    # Start the native gRPC server alongside HTTP when enabled (via --grpc-port
-    # or SGLANG_GRPC_PORT). Only the single-tokenizer process is gRPC-capable;
-    # __post_init__ already rejects --tokenizer-worker-num > 1 with native gRPC.
-    if (
-        getattr(fast_api_app, "is_single_tokenizer_mode", False)
-        and server_args.grpc_port is not None
-        and not (server_args.smg_grpc_mode or server_args.grpc_mode)
-    ):
-        grpc_handle = _start_native_grpc_server_for_runtime(
-            server_args=server_args,
-            tokenizer_manager=_global_state.tokenizer_manager,
-            template_manager=_global_state.template_manager,
-            scheduler_info=_global_state.scheduler_info,
-        )
-
-    # Execute the general warmup
-    warmup_thread = threading.Thread(
-        target=_wait_and_warmup,
-        kwargs=warmup_thread_kwargs,
-    )
-    warmup_thread.start()
-
-    # Start the HTTP server
+    # Start the native gRPC server and warmup inside the try so a failure in
+    # either still runs the finally cleanup below. Native gRPC is enabled via
+    # --grpc-port / SGLANG_GRPC_PORT; only the single-tokenizer process is
+    # gRPC-capable (__post_init__ rejects --tokenizer-worker-num > 1).
     try:
+        if (
+            getattr(fast_api_app, "is_single_tokenizer_mode", False)
+            and server_args.grpc_port is not None
+            and not (server_args.smg_grpc_mode or server_args.grpc_mode)
+        ):
+            grpc_handle = _start_native_grpc_server_for_runtime(
+                server_args=server_args,
+                tokenizer_manager=_global_state.tokenizer_manager,
+                template_manager=_global_state.template_manager,
+                scheduler_info=_global_state.scheduler_info,
+            )
+
+        # Execute the general warmup
+        warmup_thread = threading.Thread(
+            target=_wait_and_warmup,
+            kwargs=warmup_thread_kwargs,
+        )
+        warmup_thread.start()
+
+        # Start the HTTP server
         yield
     finally:
         _shutdown_native_grpc_server(grpc_handle)
         if tool_server is not None and hasattr(tool_server, "aclose"):
             await tool_server.aclose()
-        warmup_thread.join()
+        if warmup_thread is not None:
+            warmup_thread.join()
 
 
 # Fast API
@@ -2504,7 +2507,6 @@ def _start_native_grpc_server_for_runtime(
         port=server_args.grpc_port,
         runtime_handle=runtime_handle,
         worker_threads=server_args.grpc_worker_threads,
-        max_prefill_tokens=server_args.grpc_max_prefill_tokens,
     )
     logger.info(
         f"Native gRPC server started on {server_args.host}:{server_args.grpc_port}"

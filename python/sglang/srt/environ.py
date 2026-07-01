@@ -791,11 +791,10 @@ class Envs:
 
     # Native gRPC server. SGLANG_GRPC_PORT is the env fallback for the
     # --grpc-port CLI flag; setting either enables the native server alongside
-    # HTTP. The worker-threads / max-prefill-tokens knobs stay env-only (internal
-    # tuning, no CLI surface).
+    # HTTP. The worker-threads knob stays env-only (internal tuning, no CLI
+    # surface).
     SGLANG_GRPC_PORT = EnvInt(None)
     SGLANG_GRPC_WORKER_THREADS = EnvInt(4)
-    SGLANG_GRPC_MAX_PREFILL_TOKENS = EnvInt(None)
 
     # External models
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")

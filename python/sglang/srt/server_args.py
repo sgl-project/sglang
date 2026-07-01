@@ -2916,21 +2916,16 @@ class ServerArgs:
 
         # --grpc-mode is a deprecated alias for --smg-grpc-mode.
         if self.grpc_mode and not self.smg_grpc_mode:
-            import warnings
-
-            warnings.warn(
+            logger.warning(
                 "--grpc-mode is deprecated and will be removed in a future "
                 "version. Use --smg-grpc-mode for the legacy SMG gRPC server, "
-                "or --grpc-port for the native gRPC server.",
-                DeprecationWarning,
-                stacklevel=2,
+                "or --grpc-port for the native gRPC server."
             )
             self.smg_grpc_mode = True
 
-        # Native gRPC tuning knobs are env-only; --grpc-port (CLI) enables the
+        # Native gRPC tuning knob is env-only; --grpc-port (CLI) enables the
         # native server, falling back to SGLANG_GRPC_PORT.
         self.grpc_worker_threads = envs.SGLANG_GRPC_WORKER_THREADS.get()
-        self.grpc_max_prefill_tokens = envs.SGLANG_GRPC_MAX_PREFILL_TOKENS.get()
 
         grpc_port_env = envs.SGLANG_GRPC_PORT.get()
         if self.grpc_port is None and grpc_port_env is not None:

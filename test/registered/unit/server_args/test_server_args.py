@@ -1383,9 +1383,10 @@ class TestGrpcServerArgs(CustomTestCase):
 
     def test_grpc_mode_is_deprecated_alias_for_smg_grpc_mode(self):
         sa = self._args(grpc_mode=True)
-        with self.assertWarns(DeprecationWarning):
+        with self.assertLogs(server_args_module.logger, level="WARNING") as cm:
             sa._handle_deprecated_args()
         self.assertTrue(sa.smg_grpc_mode)
+        self.assertTrue(any("--grpc-mode is deprecated" in line for line in cm.output))
 
     def test_legacy_smg_takes_precedence_over_grpc_port(self):
         sa = self._args(grpc_port=50051, smg_grpc_mode=True)
@@ -1408,6 +1409,43 @@ class TestGrpcServerArgs(CustomTestCase):
         with envs.SGLANG_GRPC_WORKER_THREADS.override(0):
             with self.assertRaises(ValueError):
                 sa._handle_deprecated_args()
+
+    def test_start_server_call_site_matches_native_signature(self):
+        """Regression for the startup blocker: the native start_server binding
+        only accepts (host, port, runtime_handle, worker_threads, ...). The
+        arg-parsing tests above never call start_server, so a stray kwarg (e.g.
+        the removed max_prefill_tokens) would only surface as a TypeError at
+        launch. This mocks the native extension and locks the kwarg set."""
+        import sys
+
+        from sglang.srt.entrypoints import http_server
+
+        fake_core = SimpleNamespace(start_server=MagicMock(return_value="handle"))
+        fake_bridge = SimpleNamespace(RuntimeHandle=MagicMock(return_value="rt"))
+        server_args = SimpleNamespace(
+            host="127.0.0.1", grpc_port=50051, grpc_worker_threads=4
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.grpc": SimpleNamespace(_core=fake_core),
+                "sglang.srt.grpc._core": fake_core,
+                "sglang.srt.entrypoints.grpc_bridge": fake_bridge,
+            },
+        ):
+            handle = http_server._start_native_grpc_server_for_runtime(
+                server_args=server_args,
+                tokenizer_manager=MagicMock(),
+                template_manager=MagicMock(),
+                scheduler_info={},
+            )
+
+        self.assertEqual(handle, "handle")
+        _, kwargs = fake_core.start_server.call_args
+        self.assertEqual(
+            set(kwargs), {"host", "port", "runtime_handle", "worker_threads"}
+        )
+        self.assertNotIn("max_prefill_tokens", kwargs)
 
 
 if __name__ == "__main__":
