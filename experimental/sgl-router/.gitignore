@@ -1,3 +1,5 @@
 target/
 *.rs.bk
 .DS_Store
+# examples/tokenize_bench.rs's own output
+tokenize_bench_flamegraph.svg

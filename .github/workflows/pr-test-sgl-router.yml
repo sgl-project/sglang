@@ -175,6 +175,10 @@ jobs:
         working-directory: experimental/sgl-router
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: cargo clippy --features profiling
+        working-directory: experimental/sgl-router
+        run: cargo clippy --features profiling --all-targets -- -D warnings
+
       - name: cargo fmt
         working-directory: experimental/sgl-router
         run: |
