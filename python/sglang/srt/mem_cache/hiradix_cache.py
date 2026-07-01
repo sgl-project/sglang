@@ -1118,9 +1118,7 @@ class HiRadixCache(RadixCache):
         return num_evicted
 
     def _observe_l1_eviction_age(self, node: TreeNode) -> None:
-        # L1 (GPU) residency lifetime: record how long an entry stayed in GPU
-        # before leaving L1 (freed outright, or demoted to host on write_back).
-        # The true L2 end-of-life age is recorded separately in evict_host().
+        # L1 (GPU) residency at eviction; L2 end-of-life is recorded in evict_host().
         if self.metrics_collector is None:
             return
         now = time.monotonic()
@@ -1203,9 +1201,7 @@ class HiRadixCache(RadixCache):
         ]
         heapq.heapify(eviction_heap)
 
-        # L2 (host/CPU DRAM) eviction observability: previously this tier had no
-        # metrics at all. Record host-tier evicted tokens and entry age so "how
-        # long does L2 survive" is answerable alongside the L1 lifetime histograms.
+        # L2 (host) eviction observability: record host-tier tokens and entry age.
         collect_lifetime = self.metrics_collector is not None
         now = time.monotonic() if collect_lifetime else 0.0
 
@@ -1226,7 +1222,6 @@ class HiRadixCache(RadixCache):
             self._record_remove_event(x, medium=StorageMedium.CPU)
             host_evicted = self.cache_controller.evict_host(x.host_value)
             num_evicted += host_evicted
-            # Only record lifetime once the host entry actually left L2.
             if collect_lifetime and host_evicted > 0:
                 self.metrics_collector.observe_host_eviction_age(now - x.creation_time)
                 self.metrics_collector.increment_host_eviction_num_tokens(host_evicted)

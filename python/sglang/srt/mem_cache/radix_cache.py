@@ -572,9 +572,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         ]
         heapq.heapify(eviction_heap)
 
-        # Capture lifetime stats per evicted entry so operators can answer
-        # "how long does a cache entry actually live / can it survive 1h".
-        # TreeNode.creation_time/last_access_time are time.monotonic() based.
+        # Capture lifetime stats per evicted entry (time.monotonic() based).
         collect_lifetime = self.metrics_collector is not None
         now = time.monotonic() if collect_lifetime else 0.0
 
@@ -586,7 +584,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             num_evicted += len(x.value)
             self._delete_leaf(x)
 
-            # Record lifetime only after the entry has actually left L1.
             if collect_lifetime:
                 self.metrics_collector.observe_eviction_age(
                     age_seconds=now - x.creation_time,

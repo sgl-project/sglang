@@ -1855,9 +1855,8 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
         self.labels = labels
 
-        # Buckets for "how long did a cache entry live / sit idle before eviction",
-        # in seconds. Spans sub-second to 2h so the 1h question is directly readable
-        # from the 3600s bucket (p50/p90 of cache_eviction_age_seconds).
+        # Buckets (seconds) for entry age/idle at eviction; the 3600s bucket makes
+        # the "survives 1h?" question directly readable.
         bucket_cache_age = get_histogram_conf_from_env("SGLANG_BUCKET_CACHE_AGE")
         if bucket_cache_age is None:
             bucket_cache_age = [
@@ -1874,7 +1873,7 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
                 3600.0,
                 7200.0,
             ]
-        # Buckets for "how many times was an entry reused before it was evicted".
+        # Buckets for entry reuse count before eviction.
         bucket_cache_reuses = get_histogram_conf_from_env("SGLANG_BUCKET_CACHE_REUSES")
         if bucket_cache_reuses is None:
             bucket_cache_reuses = [
@@ -1963,15 +1962,12 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
-        # --- Cache lifetime / eviction-age observability ---------------------
-        # These answer "how long does a KV cache entry actually live" and "can it
-        # survive 1 hour" without relying on any TTL: they are recorded at the
-        # moment an entry is evicted, using TreeNode.creation_time/last_access_time.
+        # L1 (GPU) cache lifetime, recorded at eviction.
         self.cache_eviction_age_seconds = Histogram(
             name="sglang:cache_eviction_age_seconds",
             documentation=(
-                "Age (now - creation_time) of a GPU (L1) cache entry when it is "
-                "evicted, in seconds. p50/p90 answer how long cache survives."
+                "Age (now - creation_time) of an L1 (GPU) cache entry at eviction, "
+                "in seconds."
             ),
             labelnames=labels.keys(),
             buckets=bucket_cache_age,
@@ -1979,33 +1975,28 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.cache_eviction_idle_seconds = Histogram(
             name="sglang:cache_eviction_idle_seconds",
             documentation=(
-                "Idle time (now - last_access_time) of a GPU (L1) cache entry when "
-                "it is evicted, in seconds."
+                "Idle time (now - last_access_time) of an L1 (GPU) cache entry at "
+                "eviction, in seconds."
             ),
             labelnames=labels.keys(),
             buckets=bucket_cache_age,
         )
-        # Named "reuses" (not "hit_count") so the histogram base name does not end
-        # in the reserved _count suffix (Prometheus appends _count/_sum/_bucket).
+        # Named "reuses" to avoid the reserved _count histogram suffix.
         self.cache_eviction_reuses = Histogram(
             name="sglang:cache_eviction_reuses",
             documentation=(
-                "How many times a GPU (L1) cache entry was reused (matched) before "
-                "it was evicted."
+                "Number of times an L1 (GPU) cache entry was reused before eviction."
             ),
             labelnames=labels.keys(),
             buckets=bucket_cache_reuses,
         )
         self.cache_eviction_events = Counter(
             name="sglang:cache_eviction_events_total",
-            documentation=(
-                "Number of eviction passes (evict() calls that freed at least one "
-                "entry). Rate of this answers how often eviction happens."
-            ),
+            documentation="Number of eviction passes that freed at least one entry.",
             labelnames=labels.keys(),
         )
 
-        # --- L2 (host / CPU DRAM) eviction observability ---------------------
+        # L2 (host) eviction observability.
         self.host_eviction_num_tokens = Counter(
             name="sglang:hicache_host_evicted_tokens_total",
             documentation="The number of tokens evicted from the host (L2) cache.",
@@ -2014,8 +2005,8 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.host_eviction_age_seconds = Histogram(
             name="sglang:hicache_host_eviction_age_seconds",
             documentation=(
-                "Age (now - creation_time) of a host (L2) cache entry when it is "
-                "evicted, in seconds."
+                "Age (now - creation_time) of an L2 (host) cache entry at eviction, "
+                "in seconds."
             ),
             labelnames=labels.keys(),
             buckets=bucket_cache_age,
