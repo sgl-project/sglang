@@ -65,6 +65,11 @@ class KVArgs:
     # layer-indexed layout (e.g. DeepSeek V4's buffer-type-organized flat
     # list).
     prefill_end_layer: Optional[int]
+    # Total number of main-model (full-attention) KV layers across all PP
+    # stages, i.e. model_config.num_hidden_layers. Lets the MHA PP transfer
+    # tell a genuine draft/MTP-augmented decode layout apart from a plain
+    # uneven PP split (issue #27740).
+    prefill_num_total_layers: Optional[int]
     # For DeepSeek V4 (and other compressed-MLA) memory pools only.
     # Full-model compression ratio per layer (entries are 0/4/128). Used by
     # the connection layer to slice the buffer-type-organized flat list in a
