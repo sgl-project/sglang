@@ -40,7 +40,7 @@ class W4AFp8Config(QuantizationConfig):
         is_checkpoint_fp8_serialized: bool = True,
         is_checkpoint_w4afp8_serialized: bool = True,
         linear_activation_scheme: str = "dynamic",
-        moe_activation_scheme: str = "static",
+        moe_activation_scheme: str = "dynamic",
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: Optional[List[int]] = None,
         group_size: int = 128,
@@ -64,7 +64,7 @@ class W4AFp8Config(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.bfloat16, torch.float8_e4m3fn]
+        return [torch.bfloat16, torch.float16, torch.float8_e4m3fn]
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -80,7 +80,7 @@ class W4AFp8Config(QuantizationConfig):
         is_checkpoint_fp8_serialized = "fp8" in quant_method
         is_checkpoint_w4afp8_serialized = "w4afp8" in quant_method
         linear_activation_scheme = "dynamic"
-        moe_activation_scheme = "static"
+        moe_activation_scheme = "dynamic"
         weight_block_size = [128, 128]
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
@@ -180,7 +180,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
 
         w2_weight_scale = torch.nn.Parameter(
@@ -192,7 +192,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
         # Input scales
@@ -254,34 +254,67 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         return
 
+    @property
+    def load_up_proj_weight_first(self) -> bool:
+        # FlashInfer SM90 W4A8 expects fused W13 as [up_proj, gate_proj].
+        return True
+
+    @staticmethod
+    def _get_flashinfer_w4a8_helpers():
+        try:
+            from flashinfer.fused_moe import (
+                cutlass_fused_moe,
+                interleave_moe_weights_for_sm90_mixed_gemm,
+            )
+            from flashinfer.fused_moe.core import ActivationType
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "W4AFP8 MoE requires flashinfer>=0.6.12 with PR 3084 "
+                "SM90 mixed-input helpers."
+            ) from exc
+
+        return cutlass_fused_moe, interleave_moe_weights_for_sm90_mixed_gemm, ActivationType
+
+    @staticmethod
+    def _to_flashinfer_scale_dtype(scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        if scale.dtype == dtype:
+            return scale
+        return scale.to(torch.bfloat16).view(dtype)
+
+    @staticmethod
+    def _dynamic_per_tensor_fp8_scale(x: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda:
+            from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8_scale
+
+            scale = torch.empty(1, dtype=torch.float32, device=x.device)
+            per_tensor_quant_fp8_scale(x.contiguous(), scale)
+        else:
+            scale = x.abs().max().to(torch.float32).reshape(1) / 448.0
+        return torch.clamp(scale, min=1.0e-12)
+
     def process_weights_after_loading(self, layer: Module) -> None:
-        dtype = torch.bfloat16
-        device = layer.w2_weight.device
+        _, interleave_moe_weights, _ = self._get_flashinfer_w4a8_helpers()
 
-        # Interleave w13_weight_scale (gate_up_proj)
-        w13_weight_scale = layer.w13_weight_scale_inv.to(dtype)
-        w13_weight_scale = interleave_scales(w13_weight_scale)
-        layer.w13_weight_scale_inv = Parameter(w13_weight_scale, requires_grad=False)
+        if not layer.w13_weight.is_cuda or not layer.w2_weight.is_cuda:
+            raise RuntimeError("FlashInfer W4AFP8 MoE requires CUDA weights.")
 
-        # Interleave w2_weight_scale (down_proj)
-        w2_weight_scale = layer.w2_weight_scale_inv.to(dtype)
-        w2_weight_scale = interleave_scales(w2_weight_scale)
-        layer.w2_weight_scale_inv = Parameter(w2_weight_scale, requires_grad=False)
-
-        # Process input scales
-        w13_input_scale_max = layer.w13_input_scale.max().to(torch.float32).item()
-        new_w13_input_scale = torch.tensor(
-            [w13_input_scale_max],
-            dtype=torch.float32,
-            device=device,
+        w13_weight = interleave_moe_weights(
+            layer.w13_weight.detach().contiguous().view(torch.uint8), "int4"
         )
-        layer.w13_input_scale = Parameter(new_w13_input_scale, requires_grad=False)
-
-        w2_input_scale_max = layer.w2_input_scale.max().to(torch.float32).item()
-        new_w2_input_scale = torch.tensor(
-            [w2_input_scale_max], dtype=torch.float32, device=device
+        w2_weight = interleave_moe_weights(
+            layer.w2_weight.detach().contiguous().view(torch.uint8), "int4"
         )
-        layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
+        layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+        layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+
+        w13_weight_scale = interleave_scales(layer.w13_weight_scale.to(torch.float32))
+        w2_weight_scale = interleave_scales(layer.w2_weight_scale.to(torch.float32))
+        layer.w13_weight_scale = Parameter(
+            w13_weight_scale.to(torch.bfloat16).contiguous(), requires_grad=False
+        )
+        layer.w2_weight_scale = Parameter(
+            w2_weight_scale.to(torch.bfloat16).contiguous(), requires_grad=False
+        )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -294,35 +327,79 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 
-        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        flashinfer_cutlass_fused_moe, _, ActivationType = (
+            self._get_flashinfer_w4a8_helpers()
+        )
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
 
-        output = cutlass_w4a8_moe(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            layer.w13_weight_scale_inv,
-            layer.w2_weight_scale_inv,
-            topk_weights,
-            topk_ids,
-            self.a_strides1,
-            self.b_strides1,
-            self.c_strides1,
-            self.a_strides2,
-            self.b_strides2,
-            self.c_strides2,
-            self.s_strides13,
-            self.s_strides2,
-            self.expert_offsets,
-            self.problem_sizes1,
-            self.problem_sizes2,
-            layer.w13_input_scale,
-            layer.w2_input_scale,
-            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor or 1.0,
+        routed_scaling_factor = self.moe_runner_config.routed_scaling_factor or 1.0
+        if routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * routed_scaling_factor
+
+        num_experts = layer.w13_weight.shape[0]
+        hidden_size = x.shape[-1]
+        intermediate_size = layer.w2_weight.shape[-1] * 2
+        output_dtype = torch.bfloat16 if x.dtype == torch.bfloat16 else x.dtype
+
+        # Runtime per-tensor scale for the first FP8 activation. FlashInfer's
+        # W4A8 fused API also needs a GEMM2 activation scale before entering the
+        # kernel; the true dynamic GEMM2 scale depends on the internal SwiGLU
+        # result, so use neutral scale 1.0 for this smoke-test path.
+        a1_scale = self._dynamic_per_tensor_fp8_scale(x)
+        a2_scale = torch.ones_like(a1_scale)
+
+        fc31_act_scale = (
+            torch.ones(
+                (num_experts, hidden_size),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            / a1_scale
+        ).contiguous()
+        fc2_act_scale = (
+            torch.ones(
+                (num_experts, intermediate_size, 1),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            / a2_scale
+        ).contiguous()
+
+        empty = torch.empty(0, dtype=x.dtype, device=x.device)
+        quant_scales = (
+            self._to_flashinfer_scale_dtype(layer.w13_weight_scale, x.dtype),
+            self._to_flashinfer_scale_dtype(layer.w2_weight_scale, x.dtype),
+            self._to_flashinfer_scale_dtype(fc31_act_scale, x.dtype),
+            self._to_flashinfer_scale_dtype(fc2_act_scale, x.dtype),
+            empty,
+            empty,
+            a1_scale.expand(num_experts).contiguous(),
+            a2_scale.expand(num_experts).contiguous(),
+        )
+
+        output = torch.empty(
+            (x.shape[0], hidden_size),
+            dtype=output_dtype,
+            device=x.device,
+        )
+        flashinfer_cutlass_fused_moe(
+            input=x,
+            token_selected_experts=topk_ids.to(torch.int32),
+            token_final_scales=topk_weights,
+            fc1_expert_weights=layer.w13_weight,
+            fc2_expert_weights=layer.w2_weight,
+            output_dtype=output_dtype,
+            quant_scales=quant_scales,
+            output=output,
+            use_w4_group_scaling=True,
+            use_packed_weights=True,
+            activation_type=ActivationType.Swiglu,
+            tune_max_num_tokens=max(1, int(x.shape[0])),
         )
         return StandardCombineInput(hidden_states=output)
 
@@ -331,77 +408,17 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer: DeepEPMoE,
         dispatch_output: DeepEPLLDispatchOutput,
     ) -> torch.Tensor:
-
-        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe_deepep_ll
-
-        hidden_states, hidden_scales, topk_ids, _, masked_m, _ = dispatch_output
-
-        output = cutlass_w4a8_moe_deepep_ll(
-            hidden_states,
-            hidden_scales,
-            layer.w13_weight,
-            layer.w2_weight,
-            layer.w13_weight_scale_inv,
-            layer.w2_weight_scale_inv,
-            topk_ids,
-            masked_m,
-            layer.quant_method.a_strides1,
-            layer.quant_method.b_strides1,
-            layer.quant_method.c_strides1,
-            layer.quant_method.a_strides2,
-            layer.quant_method.b_strides2,
-            layer.quant_method.c_strides2,
-            layer.quant_method.s_strides13,
-            layer.quant_method.s_strides2,
-            layer.quant_method.expert_offsets,
-            layer.quant_method.problem_sizes1,
-            layer.quant_method.problem_sizes2,
-            layer.w13_input_scale,
-            layer.w2_input_scale,
+        raise NotImplementedError(
+            "W4AFP8 FlashInfer SM90 mixed-input MoE currently supports only "
+            "standard dispatch. Disable DeepEP for this checkpoint."
         )
-
-        return output
 
     def apply_deepep_normal(
         self,
         layer: DeepEPMoE,
         dispatch_output: DeepEPNormalDispatchOutput,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.cutlass_w4a8_moe import (
-            cutlass_w4a8_moe_deepep_normal,
+        raise NotImplementedError(
+            "W4AFP8 FlashInfer SM90 mixed-input MoE currently supports only "
+            "standard dispatch. Disable DeepEP for this checkpoint."
         )
-
-        hidden_states, topk_idx, topk_weights = (
-            dispatch_output.hidden_states,
-            dispatch_output.topk_ids,
-            dispatch_output.topk_weights,
-        )
-        if isinstance(hidden_states, tuple):
-            hidden_states = hidden_states[0]
-
-        num_tokens = hidden_states.shape[0]
-        if num_tokens > 0:
-            return cutlass_w4a8_moe_deepep_normal(
-                hidden_states,
-                layer.w13_weight,
-                layer.w2_weight,
-                layer.w13_weight_scale_inv,
-                layer.w2_weight_scale_inv,
-                topk_weights,
-                topk_idx,
-                self.a_strides1,
-                self.b_strides1,
-                self.c_strides1,
-                self.a_strides2,
-                self.b_strides2,
-                self.c_strides2,
-                self.s_strides13,
-                self.s_strides2,
-                self.expert_offsets,
-                self.problem_sizes1,
-                self.problem_sizes2,
-                layer.w13_input_scale,
-                layer.w2_input_scale,
-            )
-        else:
-            return hidden_states
