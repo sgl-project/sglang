@@ -842,10 +842,8 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         # Fetch weight scale from self (the method instance)
         weight_scale = getattr(self, f"{weight_prefix}_weight_scale", None)
 
-        print('weight_scale', weight_scale)
-
         if weight_scale is not None:
-            print('self.hidden_states_quantize', self.hidden_states_quantize)
+            print('self.hidden_states_quantizer', self.hidden_states_quantizer)
             # Quantize activations only if the quantizer is available
             if self.hidden_states_quantizer is not None and pertoken_scale is None:
                 hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
