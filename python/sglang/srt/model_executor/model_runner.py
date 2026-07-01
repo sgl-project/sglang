@@ -2604,7 +2604,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         role = "draft" if self.is_draft_worker else "target"
         if self.spec_algorithm.is_speculative():
-            capture_name = f"{role} verify"
+            capture_name = "draft" if self.is_draft_worker else "target verify"
             num_tokens_per_bs = (
                 self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
                     self.server_args.speculative_num_draft_tokens,

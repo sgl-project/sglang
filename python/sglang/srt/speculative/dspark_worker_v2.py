@@ -1,5 +1,6 @@
 import logging
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import torch
@@ -9,6 +10,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -140,6 +142,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._markov_refine_buffer_cap: int = 0
         self._markov_candidates_buf: Optional[torch.Tensor] = None
         self._markov_embeds_buf: Optional[torch.Tensor] = None
+        self._stacked_wqkv_fp8_proj = None
+        self._stacked_wqkv_kv_offsets: list[tuple[int, int]] = []
+        self._stacked_wqkv_out_sizes: list[int] = []
+        self._init_fp8_wqkv_stack()
 
         if self.tp_rank == 0:
             logger.info(
@@ -153,6 +159,151 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self.markov_rank,
                 self.confidence_threshold,
             )
+
+    def _init_fp8_wqkv_stack(self) -> None:
+        if not envs.SGLANG_DSPARK_FP8_WQKV_STACK.get():
+            return
+
+        layers = getattr(self._draft_inner, "layers", None)
+        if not layers:
+            return
+
+        weights = []
+        scales = []
+        biases = []
+        kv_offsets = []
+        out_sizes = []
+        first_proj = None
+        scale_name = None
+        for layer in layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is None:
+                self._log_fp8_wqkv_stack_disabled("missing self_attn")
+                return
+
+            if getattr(attn, "fuse_wqa_wkv", False):
+                proj = getattr(attn, "wqkv_a", None)
+                kv_start = int(attn.q_lora_rank)
+                kv_end = kv_start + int(attn.head_dim)
+            else:
+                proj = getattr(attn, "wkv", None)
+                kv_start = 0
+                kv_end = int(attn.head_dim)
+
+            cur_scale_name, scale = self._get_fp8_wqkv_scale(proj)
+            if (
+                proj is None
+                or not hasattr(proj, "weight")
+                or proj.weight.dtype
+                not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+                or scale is None
+                or proj.weight.dim() != 2
+                or scale.dim() != 2
+                or kv_end > proj.weight.shape[0]
+                or getattr(proj, "skip_bias_add", False)
+            ):
+                reason = (
+                    "unsupported wqkv FP8 layout: "
+                    f"weight_dtype={getattr(getattr(proj, 'weight', None), 'dtype', None)}, "
+                    f"weight_shape={tuple(proj.weight.shape) if hasattr(proj, 'weight') else None}, "
+                    f"scale_dtype={getattr(scale, 'dtype', None)}, "
+                    f"scale_shape={tuple(scale.shape) if scale is not None else None}"
+                )
+                self._log_fp8_wqkv_stack_disabled(reason)
+                return
+
+            if first_proj is None:
+                first_proj = proj
+                scale_name = cur_scale_name
+            elif (
+                proj.weight.shape[1] != first_proj.weight.shape[1]
+                or proj.weight.dtype != first_proj.weight.dtype
+                or proj.quant_method.__class__ is not first_proj.quant_method.__class__
+                or cur_scale_name != scale_name
+                or scale.shape[1:] != scales[0].shape[1:]
+            ):
+                self._log_fp8_wqkv_stack_disabled("mixed wqkv FP8 layouts")
+                return
+
+            weights.append(proj.weight.detach())
+            scales.append(scale.detach())
+            kv_offsets.append((kv_start, kv_end))
+            out_sizes.append(int(proj.weight.shape[0]))
+
+            bias = getattr(proj, "bias", None)
+            if bias is not None:
+                biases.append(bias.detach())
+            else:
+                biases.append(None)
+
+        if not weights:
+            return
+
+        has_bias = [bias is not None for bias in biases]
+        if any(has_bias) and not all(has_bias):
+            self._log_fp8_wqkv_stack_disabled("mixed wqkv bias layout")
+            return
+
+        stacked_weight = torch.cat(weights, dim=0).contiguous()
+        stacked_scale = torch.cat(scales, dim=0).contiguous()
+        stacked_bias = torch.cat(biases, dim=0).contiguous() if all(has_bias) else None
+
+        stacked_proj = SimpleNamespace()
+        for name in (
+            "input_size",
+            "input_size_per_partition",
+            "params_dtype",
+            "quant_config",
+            "quant_method",
+            "skip_bias_add",
+            "weight_block_size",
+        ):
+            if hasattr(first_proj, name):
+                setattr(stacked_proj, name, getattr(first_proj, name))
+        stacked_proj.output_size = int(stacked_weight.shape[0])
+        stacked_proj.output_size_per_partition = int(stacked_weight.shape[0])
+        stacked_proj.weight = stacked_weight
+        stacked_proj.bias = stacked_bias
+        setattr(stacked_proj, scale_name, stacked_scale)
+
+        self._stacked_wqkv_fp8_proj = stacked_proj
+        self._stacked_wqkv_kv_offsets = kv_offsets
+        self._stacked_wqkv_out_sizes = out_sizes
+
+        if self.tp_rank == 0:
+            logger.info(
+                "Enabled DSpark FP8 wqkv stack. layers=%s, weight_shape=%s, "
+                "scale_shape=%s, scale_name=%s, kv_offsets=%s, "
+                "env=SGLANG_DSPARK_FP8_WQKV_STACK",
+                len(weights),
+                tuple(stacked_weight.shape),
+                tuple(stacked_scale.shape),
+                scale_name,
+                self._stacked_wqkv_kv_offsets,
+            )
+
+    def _log_fp8_wqkv_stack_disabled(self, reason: str) -> None:
+        if self.tp_rank == 0:
+            logger.warning("DSpark FP8 wqkv stack disabled: %s", reason)
+
+    @staticmethod
+    def _get_fp8_wqkv_scale(proj) -> tuple[Optional[str], Optional[torch.Tensor]]:
+        if proj is None:
+            return None, None
+        for name in ("weight_scale_inv", "weight_scale", "scale"):
+            scale = getattr(proj, name, None)
+            if scale is None:
+                continue
+            dtype = getattr(scale, "dtype", None)
+            if dtype in (
+                torch.uint8,
+                torch.float32,
+                torch.bfloat16,
+                torch.float16,
+                getattr(torch, "float8_e8m0fnu", None),
+            ):
+                return name, scale
+        return None, None
 
     def _get_dp_decode_global_num_tokens(
         self, batch: ScheduleBatch
@@ -248,10 +399,52 @@ class DSparkWorkerV2(BaseSpecWorker):
             torch.inference_mode(),
         ):
             main_x = self.draft_model.project_main_hidden(main_hidden)
-            for layer in self._draft_inner.layers:
-                layer.self_attn.kv_from_hidden(
-                    main_x, positions, cache_loc, attn_backend
+            if self._stacked_wqkv_fp8_proj is None:
+                for layer in self._draft_inner.layers:
+                    layer.self_attn.kv_from_hidden(
+                        main_x, positions, cache_loc, attn_backend
+                    )
+            else:
+                stacked_out = self._stacked_wqkv_fp8_proj.quant_method.apply(
+                    self._stacked_wqkv_fp8_proj,
+                    main_x,
+                    self._stacked_wqkv_fp8_proj.bias,
                 )
+                layer_outputs = torch.split(
+                    stacked_out, self._stacked_wqkv_out_sizes, dim=-1
+                )
+                for layer_idx, layer in enumerate(self._draft_inner.layers):
+                    kv_start, kv_end = self._stacked_wqkv_kv_offsets[layer_idx]
+                    self._write_draft_kv_from_projected_kv(
+                        attn=layer.self_attn,
+                        kv=layer_outputs[layer_idx][..., kv_start:kv_end],
+                        positions=positions,
+                        cache_loc=cache_loc,
+                        attn_backend=attn_backend,
+                    )
+
+    def _write_draft_kv_from_projected_kv(
+        self,
+        *,
+        attn,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc: torch.Tensor,
+        attn_backend,
+    ) -> None:
+        token_to_kv_pool = attn_backend.token_to_kv_pool
+        swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(cache_loc).to(
+            torch.int32
+        )
+        token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
+            layer_id=attn.layer_id,
+            swa_loc=swa_loc,
+            kv=kv,
+            kv_weight=attn.kv_norm.weight.data,
+            eps=attn.eps,
+            freqs_cis=attn.freqs_cis,
+            positions=positions,
+        )
 
     def _run_draft_block(
         self,

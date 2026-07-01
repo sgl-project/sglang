@@ -999,10 +999,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.load_batch(forward_batch, pp_proxy_tensors)
             # Publish a read-done event for the WAR barrier: a cuda-graph forward
             # finishes its shared req_to_token / SWA reads at this pre-replay
-            # snapshot, so plain DECODE and DFLASH TARGET_VERIFY both qualify.
+            # snapshot, so plain DECODE and fixed-block TARGET_VERIFY graphs qualify.
             if forward_batch.forward_mode.is_decode() or (
                 forward_batch.forward_mode.is_target_verify()
-                and self.model_runner.spec_algorithm.is_dflash()
+                and (
+                    self.model_runner.spec_algorithm.is_dflash()
+                    or self.model_runner.spec_algorithm.is_dspark()
+                )
             ):
                 read_done = self.device_module.Event()
                 read_done.record()

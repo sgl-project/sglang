@@ -835,6 +835,7 @@ class Envs:
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
+    SGLANG_DSPARK_FP8_WQKV_STACK = EnvBool(False)
 
     # CUDA kernels
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
