@@ -636,7 +636,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
-            if is_batch_invariant_mode_enabled():
+            ran_torch_chunk = is_batch_invariant_mode_enabled()
+            if ran_torch_chunk:
                 g, beta = torch_gdn_gating(layer.A_log, a, b, layer.dt_bias)
                 core_attn_out, last_recurrent_state, h = torch_chunk_gated_delta_rule(
                     query, key, value, g=g, beta=beta,
@@ -657,21 +658,31 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     query_start_loc=query_start_loc,
                 )
 
-            # Persist the SSM recurrent state so decode can continue the recurrence.
-            # The non-BI CUDA extend kernel writes ssm_states in place (it receives
-            # ssm_states as initial_state with cache_indices), but torch_chunk_gated_delta_rule
-            # only READS ssm_states and returns the final state, so in batch-invariant
-            # mode on CUDA it must be written back explicitly. Without this the first
-            # decode tokens start from a stale SSM state (layer 0 decode core_attn_out
-            # diverged ~1.5, decaying over steps as the gated decay washed out the error).
-            write_back = (
-                is_npu() or is_cpu() or is_batch_invariant_mode_enabled()
-            )
-            if write_back and last_recurrent_state is not None:
+            if (is_npu() or is_cpu()) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )
                 ssm_states[cache_indices] = last_recurrent_state
+            elif ran_torch_chunk and last_recurrent_state is not None:
+                # Persist the SSM recurrent state so decode can continue the recurrence.
+                # The non-BI CUDA extend kernel writes ssm_states in place (it receives
+                # ssm_states as initial_state with cache_indices), but
+                # torch_chunk_gated_delta_rule (batch-invariant path) only READS ssm_states
+                # and returns the final state, so on CUDA it must be written back explicitly.
+                # Without this the first decode tokens start from a stale SSM state (layer 0
+                # decode core_attn_out diverged ~1.5, decaying over steps as the gated decay
+                # washed out the error).
+                #
+                # torch_chunk_gated_delta_rule builds the state as [B, HV, K, V]
+                # (k_i^T @ v_new), but the ssm_states pool is [slots, HV, V, K]. K==V==128 so
+                # a shape check would pass but the last two dims are transposed; the read at
+                # initial_state never exposed this because disable_radix_cache means prefill
+                # always starts from zeros. Transpose to the pool layout on write.
+                ssm_states[cache_indices] = (
+                    last_recurrent_state.transpose(-1, -2)
+                    .to(ssm_states.dtype, copy=False)
+                    .contiguous()
+                )
 
             if h is not None:
                 self._track_mamba_state_extend(
