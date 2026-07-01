@@ -65,6 +65,7 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
@@ -1353,10 +1354,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.server_args.disaggregation_decode_enable_radix_cache
             and self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens
         ):
-            num_to_evict = (
-                required_alloc_tokens - self.token_to_kv_pool_allocator.available_size()
-            )
-            result = self.tree_cache.evict(EvictParams(num_tokens=num_to_evict))
+            # Hybrid SWA: full and swa are separate rings; available_size = min(...).
+            # Each sub-pool must be evicted against its own deficit, otherwise
+            # internal SWA tombstones (the majority of swa_evictable) are left
+            # untouched — Full.drive_eviction only cascades SWA on leaves.
+            allocator = self.token_to_kv_pool_allocator
+            num_to_evict = required_alloc_tokens - allocator.available_size()
+            if isinstance(allocator, SWATokenToKVPoolAllocator):
+                full_num_to_evict = max(
+                    0, required_alloc_tokens - allocator.full_available_size()
+                )
+                swa_num_to_evict = max(
+                    0, required_alloc_tokens - allocator.swa_available_size()
+                )
+                params = EvictParams(
+                    num_tokens=full_num_to_evict,
+                    swa_num_tokens=swa_num_to_evict,
+                )
+            else:
+                params = EvictParams(num_tokens=num_to_evict)
+            result = self.tree_cache.evict(params)
             if self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens:
                 logger.warning(
                     f"Eviction insufficient: needed {required_alloc_tokens} tokens, "
