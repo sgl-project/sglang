@@ -3919,6 +3919,16 @@ class ServerArgs:
                     )
 
                 if (
+                    self.attention_backend is None
+                    and self.decode_attention_backend is None
+                    and importlib.util.find_spec("aiter")
+                ):
+                    self.decode_attention_backend = "aiter"
+                    logger.info(
+                        f"Use aiter as decode attention backend on ROCm for {model_arch} (MLA)"
+                    )
+
+                if (
                     self.quantization == "modelopt_fp4"
                     and self.speculative_algorithm == "EAGLE"
                     and (
