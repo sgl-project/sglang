@@ -165,6 +165,19 @@ def parse_args():
         help="API format to use: 'sglang' for native /generate endpoint, "
         "'openai' for OpenAI-compatible /v1/chat/completions endpoint.",
     )
+    parser.add_argument(
+        "--flush-between-rounds",
+        action="store_true",
+        help="If set, flush the radix cache between each round (requires --enable-round-barrier). "
+        "Forces subsequent rounds to prefetch KV from storage backend (e.g. Mooncake).",
+    )
+    parser.add_argument(
+        "--flush-url",
+        type=str,
+        default="",
+        help="URL for flush_cache endpoint (default: http://host:port/flush_cache). "
+        "Set to prefill server URL (e.g. http://localhost:30000/flush_cache) in PD mode.",
+    )
     return parser.parse_args()
 
 
@@ -212,6 +225,8 @@ class WorkloadGenerator:
     def __init__(self, args):
         self.api_format = args.api_format
         self.model_path = args.model_path
+        self.flush_between_rounds = args.flush_between_rounds
+        self.flush_url = args.flush_url or f"http://{args.host}:{args.port}/flush_cache"
 
         # Construct the base URL and select request/payload functions
         if self.api_format == "openai":
@@ -530,6 +545,13 @@ class WorkloadGenerator:
                             f"requests for round {current_barrier_round + 1}"
                         )
                         self._send_heartbeat(input_len=100, output_len=100)
+                        if self.flush_between_rounds:
+                            try:
+                                resp = requests.post(self.flush_url, timeout=10)
+                                print(f"  Flush cache: {resp.status_code}")
+                                time.sleep(1)
+                            except Exception as e:
+                                print(f"  Flush cache failed: {e}")
                         time.sleep(10)
                         for req in next_round_reqs:
                             self.ready_queue.append(req)
