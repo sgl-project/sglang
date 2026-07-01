@@ -511,10 +511,26 @@ class CompressorBackendMixin:
             elif is_unified_kv_triton():
                 kv_cache = token_to_kv_pool.get_unified_kv(layer_id)
                 page_size = 1
-                out_loc = getattr(
-                    self.forward_metadata.core_metadata.unified,
-                    f"c{compressor.ratio}_out_loc",
-                )
+                if token_to_kv_pool.unified_hisparse and compressor.ratio == 4:
+                    # ROCm HiSparse unified-KV: the C4 compressed region is a hot
+                    # device buffer backed by a host cold pool. Remap the RAW
+                    # compressed slot (core_metadata.c4_out_loc, no swa offset --
+                    # the remap table is keyed by raw compressed index) to its hot
+                    # device row, then add the swa_pages offset into the unified
+                    # compressed region. Only C4 layers are offloaded; C128 (HCA)
+                    # layers keep the dense compressed slot via the swa-offset
+                    # unified out_loc below.
+                    out_loc = (
+                        token_to_kv_pool.c4_kv_pool._translate_loc_to_hisparse_device(
+                            self.forward_metadata.core_metadata.c4_out_loc
+                        )
+                    )
+                    out_loc = out_loc + token_to_kv_pool.unified_swa_pages
+                else:
+                    out_loc = getattr(
+                        self.forward_metadata.core_metadata.unified,
+                        f"c{compressor.ratio}_out_loc",
+                    )
                 bf16_store = True
             else:
                 _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
