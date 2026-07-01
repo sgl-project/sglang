@@ -714,10 +714,16 @@ jobs:
           # AMD CI: All 1-GPU tests except FLUX.2 (FLUX.1 covers same code path)
           # Tests: T2V, T2I, I2V, LoRA
           #
+          # Enable the ROCm FlyDSL fused norm/scale-shift path (PR #22786) so the
+          # forward_hip integration in multimodal_gen layernorm gets real e2e
+          # coverage. The kernel engages when the DiT hidden dim is a multiple of
+          # 5120 (e.g. Wan 14B) and otherwise falls back to native. See #27521.
+          #
           # HF download env vars:
           # - HF_HUB_ENABLE_HF_TRANSFER=1: Use faster hf_transfer for downloads (if available)
           # - HF_HUB_DISABLE_SYMLINKS_WARNING=1: Suppress symlink warnings
           docker exec \
+            -e SGLANG_USE_ROCM_FLYDSL=1 \
             -e SGLANG_E2E_TOLERANCE=0.3 \
             -e SGLANG_STAGE_TIME_TOLERANCE=0.2 \
             -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
@@ -853,10 +859,17 @@ jobs:
           # AMD CI: All 2-GPU tests including LoRA
           # Tests: T2V, T2I, I2V, LoRA
           #
+          # Enable the ROCm FlyDSL fused norm/scale-shift path (PR #22786) so the
+          # forward_hip integration in multimodal_gen layernorm gets real e2e
+          # coverage. The Wan 14B models in this suite have hidden dim 5120, so
+          # they actually exercise the kernel; other dims fall back to native.
+          # See #27521.
+          #
           # HF download env vars:
           # - HF_HUB_ENABLE_HF_TRANSFER=1: Use faster hf_transfer for downloads (if available)
           # - HF_HUB_DISABLE_SYMLINKS_WARNING=1: Suppress symlink warnings
           docker exec \
+            -e SGLANG_USE_ROCM_FLYDSL=1 \
             -e SGLANG_E2E_TOLERANCE=0.3 \
             -e SGLANG_STAGE_TIME_TOLERANCE=0.2 \
             -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
