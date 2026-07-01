@@ -156,6 +156,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV bf16: q_type = bf16, out_type=model_runner.dtype
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
+        if (
+            hasattr(torch, "float4_e2m1fn_x2")
+            and self.data_type == torch.float4_e2m1fn_x2
+            and not self.is_nvfp4_kvcache
+        ):
+            raise ValueError(
+                "trtllm_mha FP4 KV cache decode supports nvfp4 only. "
+                "Use --kv-cache-dtype=nvfp4 or choose another decode backend "
+                "for fp4_mx_block16."
+            )
 
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
@@ -737,6 +747,43 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         self.forward_metadata = metadata
 
+    def _reshape_paged_kv_cache(
+        self,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        layer: RadixAttention,
+        head_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        k_cache = k_cache.view(
+            -1, self.page_size, layer.tp_k_head_num, head_dim
+        ).permute(0, 2, 1, 3)
+        v_cache = v_cache.view(
+            -1, self.page_size, layer.tp_v_head_num, head_dim
+        ).permute(0, 2, 1, 3)
+        if layer.tp_k_head_num == 1:
+            k_cache = canonicalize_stride(k_cache)
+        if layer.tp_v_head_num == 1:
+            v_cache = canonicalize_stride(v_cache)
+        return k_cache, v_cache
+
+    def _get_nvfp4_bmm_scales(self, layer: RadixAttention) -> tuple[float, float]:
+        return self.kv_cache_quant_method.get_bmm_scales(layer.layer_id)
+
+    def _get_nvfp4_decode_kv_cache(self, layer: RadixAttention) -> tuple[
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+    ]:
+        k_fp4, v_fp4, k_scale, v_scale = self.token_to_kv_pool.get_raw_fp4_kv_buffer(
+            layer.layer_id
+        )
+        kv_cache = self._reshape_paged_kv_cache(
+            k_fp4, v_fp4, layer, layer.head_dim // 2
+        )
+        kv_cache_block_scales = self._reshape_paged_kv_cache(
+            k_scale, v_scale, layer, layer.head_dim // 16
+        )
+        return kv_cache, kv_cache_block_scales
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -751,6 +798,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         cache_loc = forward_batch.out_cache_loc
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
+        pool = self.token_to_kv_pool
 
         if use_fused_fp8_path:
             # Use fused FP8 quantization + KV cache write path
@@ -764,48 +812,39 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             k = None
             v = None
         else:
-            # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
                     KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
                     k,
                     v,
-                    layer.k_scale,
-                    layer.v_scale,
+                    *self._kv_write_scales(layer),
                 )
 
-        # For XQA, q_dtype should be bf16. For trtllm-gen,
-        # q_dtype should be FP8 when KV is in FP8.
-        q_scale = 1.0
         if self.data_type == torch.float8_e4m3fn and not self.is_xqa_impl:
             q = q.to(torch.float8_e4m3fn)
-        q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        # shape conversion:
-        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
+        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
 
-        if layer.tp_k_head_num == 1:
-            k_cache = canonicalize_stride(k_cache)
-        if layer.tp_v_head_num == 1:
-            v_cache = canonicalize_stride(v_cache)
+        if self.is_nvfp4_kvcache:
+            kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
+        else:
+            k_cache, v_cache = pool.get_kv_buffer(layer.layer_id)
+            kv_cache = self._reshape_paged_kv_cache(
+                k_cache, v_cache, layer, layer.head_dim
+            )
+            kv_cache_block_scales = None
 
-        kv_cache = (k_cache, v_cache)
-
-        bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
-        # sink: additional value per head in the denominator of the softmax.
+        q_scale = 1.0
+        if self.is_nvfp4_kvcache:
+            k_scale, v_scale = self._get_nvfp4_bmm_scales(layer)
+            bmm1_scale = q_scale * k_scale * layer.scaling
+            bmm2_scale = v_scale
+        else:
+            bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
         attention_sink = kwargs.get("sinks", None)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 
-        # Call TRT-LLM kernel
-        # raw_out: like q, [bs, acc_q_len, num_q_heads, head_dim] but with output dtype
         o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q,
             kv_cache=kv_cache,
@@ -819,7 +858,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             sinks=attention_sink,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             out_dtype=self.q_data_type,  # model_runner.dtype
+            kv_cache_sf=kv_cache_block_scales,
         )
+        if self.is_nvfp4_kvcache and o.dtype != self.q_data_type:
+            o = o.to(self.q_data_type)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -833,6 +875,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
+        if self.is_nvfp4_kvcache:
+            raise RuntimeError(
+                "TRTLLM MHA with NVFP4 KV cache supports decode only; "
+                "use a separate prefill backend such as flashinfer or triton."
+            )
+
         cache_loc = forward_batch.out_cache_loc
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)

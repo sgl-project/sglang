@@ -44,6 +44,9 @@ from sglang.srt.layers.attention.dsa.quant_k_cache import (
     quantize_k_cache_separate,
 )
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    UnquantizedKVCacheMethod,
+)
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.dcp_utils import (
@@ -75,6 +78,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
     next_power_of_2,
@@ -1275,6 +1279,7 @@ class MHATokenToKVPool(KVCache):
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
         kv_cache_layout: Optional[str] = None,
+        quant_method=None,
     ):
         super().__init__(
             size,
@@ -1337,6 +1342,10 @@ class MHATokenToKVPool(KVCache):
                     )
                     assert self.head_dim % self._kv_vector_x == 0
                     assert self.v_head_dim % self._kv_vector_x == 0
+
+        self.quant_method = (
+            quant_method if quant_method is not None else UnquantizedKVCacheMethod()
+        )
 
         self._create_buffers()
 
@@ -1414,93 +1423,147 @@ class MHATokenToKVPool(KVCache):
             num_stages=2,
         )
 
-    def _create_buffers(self):
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            with (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.enable_custom_mem_pool
-                else nullcontext()
-            ):
-                # The padded page (slot 0's page) absorbs dummy padded-token writes.
-                if self.use_hnd:
-                    k_shape = (
-                        self.num_pages,
-                        self.head_num,
-                        self.page_size,
-                        self.head_dim,
-                    )
-                    v_shape = (
-                        self.num_pages,
-                        self.head_num,
-                        self.page_size,
-                        self.v_head_dim,
-                    )
-                    self.k_buffer = [
-                        torch.zeros(k_shape, dtype=self.store_dtype, device=self.device)
-                        for _ in range(self.layer_num)
-                    ]
-                    self.v_buffer = [
-                        torch.zeros(v_shape, dtype=self.store_dtype, device=self.device)
-                        for _ in range(self.layer_num)
-                    ]
-                elif self.kv_cache_layout == "vectorized_5d":
-                    total_slots = self.size + self.page_size
-                    num_blocks = total_slots // self.page_size
-                    x = self._kv_vector_x
-                    # K: (num_blocks, H, D_k // X, page, X)
-                    self.k_buffer = [
-                        torch.zeros(
-                            (
-                                num_blocks,
-                                self.head_num,
-                                self.head_dim // x,
-                                self.page_size,
-                                x,
-                            ),
-                            dtype=self.store_dtype,
-                            device=self.device,
-                        )
-                        for _ in range(self.layer_num)
-                    ]
-                    # V: (num_blocks, H, page // X, D_v, X)
-                    self.v_buffer = [
-                        torch.zeros(
-                            (
-                                num_blocks,
-                                self.head_num,
-                                self.page_size // x,
-                                self.v_head_dim,
-                                x,
-                            ),
-                            dtype=self.store_dtype,
-                            device=self.device,
-                        )
-                        for _ in range(self.layer_num)
-                    ]
-                else:
-                    # [size, head_num, head_dim] for each layer
-                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                    self.k_buffer = [
-                        torch.zeros(
-                            (self.size + self.page_size, self.head_num, self.head_dim),
-                            dtype=self.store_dtype,
-                            device=self.device,
-                        )
-                        for _ in range(self.layer_num)
-                    ]
-                    self.v_buffer = [
-                        torch.zeros(
-                            (
-                                self.size + self.page_size,
-                                self.head_num,
-                                self.v_head_dim,
-                            ),
-                            dtype=self.store_dtype,
-                            device=self.device,
-                        )
-                        for _ in range(self.layer_num)
-                    ]
+    @property
+    def is_quantized_kv_cache(self) -> bool:
+        return not isinstance(self.quant_method, UnquantizedKVCacheMethod)
 
+    def _create_buffers(self):
+        if not isinstance(self.quant_method, UnquantizedKVCacheMethod):
+            # Quantized recipes own packed-data, scale, and workspace shapes.
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                with (
+                    torch.cuda.use_mem_pool(self.custom_mem_pool)
+                    if self.enable_custom_mem_pool
+                    else nullcontext()
+                ):
+                    buf = self.quant_method.create_buffers(
+                        self.size + self.page_size,
+                        self.head_num,
+                        self.head_dim,
+                        self.layer_num,
+                        self.device,
+                    )
+            self.k_buffer = buf["k_buffer"]
+            self.v_buffer = buf["v_buffer"]
+            self.k_scale_buffer = buf.get("k_scale_buffer")
+            self.v_scale_buffer = buf.get("v_scale_buffer")
+            self.dq_k_buffer = buf.get("dq_k_buffer")
+            self.dq_v_buffer = buf.get("dq_v_buffer")
+            self.store_dtype = buf.get("store_dtype", torch.uint8)
+        else:
+            self.k_scale_buffer = None
+            self.v_scale_buffer = None
+            self.dq_k_buffer = None
+            self.dq_v_buffer = None
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                with (
+                    torch.cuda.use_mem_pool(self.custom_mem_pool)
+                    if self.enable_custom_mem_pool
+                    else nullcontext()
+                ):
+                    # The padded page (slot 0's page) absorbs dummy padded-token writes.
+                    if self.use_hnd:
+                        k_shape = (
+                            self.num_pages,
+                            self.head_num,
+                            self.page_size,
+                            self.head_dim,
+                        )
+                        v_shape = (
+                            self.num_pages,
+                            self.head_num,
+                            self.page_size,
+                            self.v_head_dim,
+                        )
+                        self.k_buffer = [
+                            torch.zeros(
+                                k_shape, dtype=self.store_dtype, device=self.device
+                            )
+                            for _ in range(self.layer_num)
+                        ]
+                        self.v_buffer = [
+                            torch.zeros(
+                                v_shape, dtype=self.store_dtype, device=self.device
+                            )
+                            for _ in range(self.layer_num)
+                        ]
+                    elif self.kv_cache_layout == "vectorized_5d":
+                        total_slots = self.size + self.page_size
+                        num_blocks = total_slots // self.page_size
+                        x = self._kv_vector_x
+                        # K: (num_blocks, H, D_k // X, page, X)
+                        self.k_buffer = [
+                            torch.zeros(
+                                (
+                                    num_blocks,
+                                    self.head_num,
+                                    self.head_dim // x,
+                                    self.page_size,
+                                    x,
+                                ),
+                                dtype=self.store_dtype,
+                                device=self.device,
+                            )
+                            for _ in range(self.layer_num)
+                        ]
+                        # V: (num_blocks, H, page // X, D_v, X)
+                        self.v_buffer = [
+                            torch.zeros(
+                                (
+                                    num_blocks,
+                                    self.head_num,
+                                    self.page_size // x,
+                                    self.v_head_dim,
+                                    x,
+                                ),
+                                dtype=self.store_dtype,
+                                device=self.device,
+                            )
+                            for _ in range(self.layer_num)
+                        ]
+                    else:
+                        # [size, head_num, head_dim] for each layer
+                        # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                        self.k_buffer = [
+                            torch.zeros(
+                                (
+                                    self.size + self.page_size,
+                                    self.head_num,
+                                    self.head_dim,
+                                ),
+                                dtype=self.store_dtype,
+                                device=self.device,
+                            )
+                            for _ in range(self.layer_num)
+                        ]
+                        self.v_buffer = [
+                            torch.zeros(
+                                (
+                                    self.size + self.page_size,
+                                    self.head_num,
+                                    self.v_head_dim,
+                                ),
+                                dtype=self.store_dtype,
+                                device=self.device,
+                            )
+                            for _ in range(self.layer_num)
+                        ]
+
+        self._init_data_ptrs_and_strides()
+
+    def _slot_move_buffers(self):
+        """Buffers that must move together when KV slots are remapped.
+
+        FP4 KV cache stores data and per-block scales separately, so slot moves
+        must update both. This list feeds data_ptrs/data_strides; it does not
+        copy tensor contents by itself.
+        """
+        buffers = [*self.k_buffer, *self.v_buffer]
+        if getattr(self, "k_scale_buffer", None) is not None:
+            buffers.extend([*self.k_scale_buffer, *self.v_scale_buffer])
+        return buffers
+
+    def _init_data_ptrs_and_strides(self):
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
             dtype=torch.uint64,
@@ -1511,28 +1574,40 @@ class MHATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
-        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        slot_move_buffers = self._slot_move_buffers()
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in slot_move_buffers],
+            dtype=torch.uint64,
+            device=self.device,
+        )
         self.data_strides = torch.tensor(
-            [
-                np.prod(x.shape[1:]) * x.dtype.itemsize
-                for x in self.k_buffer + self.v_buffer
-            ],
+            [np.prod(x.shape[1:]) * x.dtype.itemsize for x in slot_move_buffers],
             device=self.device,
         )
 
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
+        if hasattr(self, "k_scale_buffer") and self.k_scale_buffer is not None:
+            del self.k_scale_buffer
+        if hasattr(self, "v_scale_buffer") and self.v_scale_buffer is not None:
+            del self.v_scale_buffer
+        if hasattr(self, "dq_k_buffer") and self.dq_k_buffer is not None:
+            del self.dq_k_buffer
+        if hasattr(self, "dq_v_buffer") and self.dq_v_buffer is not None:
+            del self.dq_v_buffer
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
         assert hasattr(self, "v_buffer")
-        k_size_bytes = 0
-        for k_cache in self.k_buffer:
-            k_size_bytes += get_tensor_size_bytes(k_cache)
-        v_size_bytes = 0
-        for v_cache in self.v_buffer:
-            v_size_bytes += get_tensor_size_bytes(v_cache)
+        k_size_bytes = get_tensor_size_bytes(self.k_buffer)
+        v_size_bytes = get_tensor_size_bytes(self.v_buffer)
+        if getattr(self, "k_scale_buffer", None) is not None:
+            k_size_bytes += get_tensor_size_bytes(self.k_scale_buffer)
+            v_size_bytes += get_tensor_size_bytes(self.v_scale_buffer)
+        if getattr(self, "dq_k_buffer", None) is not None:
+            k_size_bytes += get_tensor_size_bytes(self.dq_k_buffer)
+            v_size_bytes += get_tensor_size_bytes(self.dq_v_buffer)
         return k_size_bytes, v_size_bytes
 
     # for disagg
@@ -1652,10 +1727,25 @@ class MHATokenToKVPool(KVCache):
         # Catch stale slot ids here instead of as illegal-addr / silent KV
         # corruption in the store_kvcache write (gated on SGLANG_ENABLE_ASYNC_ASSERT).
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA)")
-        if layer_id_override is not None:
-            layer_id = layer_id_override
-        else:
-            layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
+        global_layer_id = layer.layer_id if layer is not None else layer_id
+
+        if self.is_quantized_kv_cache:
+            if dcp_kv_mask is not None:
+                raise RuntimeError("dcp_kv_mask is not supported for FP4 KV cache.")
+            self._set_quantized_kv_buffer(
+                layer_id,
+                global_layer_id,
+                loc,
+                cache_k,
+                cache_v,
+                k_scale,
+                v_scale,
+            )
+            return
+
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
@@ -1748,6 +1838,127 @@ class MHATokenToKVPool(KVCache):
             alt_stream=self.alt_stream,
             same_kv_dim=self.same_kv_dim,
         )
+
+    def _quantized_scales(self, global_layer_id: int, k_scale, v_scale):
+        if k_scale is None and hasattr(self.quant_method, "k_scales_gpu"):
+            k_scale = self.quant_method.k_scales_gpu[
+                global_layer_id : global_layer_id + 1
+            ]
+            v_scale = self.quant_method.v_scales_gpu[
+                global_layer_id : global_layer_id + 1
+            ]
+        return k_scale, v_scale
+
+    def _set_quantized_kv_buffer(
+        self,
+        layer_id: int,
+        global_layer_id: int,
+        loc_info,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale=None,
+        v_scale=None,
+    ) -> None:
+        loc, _ = unwrap_write_loc(loc_info)
+        local_layer_id = layer_id - self.start_layer
+        k_scale, v_scale = self._quantized_scales(global_layer_id, k_scale, v_scale)
+        self.quant_method.quantize_and_store(
+            self.k_buffer[local_layer_id],
+            self.v_buffer[local_layer_id],
+            (
+                self.k_scale_buffer[local_layer_id]
+                if self.k_scale_buffer is not None
+                else None
+            ),
+            (
+                self.v_scale_buffer[local_layer_id]
+                if self.v_scale_buffer is not None
+                else None
+            ),
+            loc,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
+        )
+
+    def get_raw_fp4_kv_buffer(
+        self, layer_id: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        local_layer_id = layer_id - self.start_layer
+        if self.k_scale_buffer is None or self.v_scale_buffer is None:
+            raise RuntimeError("Raw FP4 KV cache requested from a non-FP4 KV pool.")
+        return (
+            self.k_buffer[local_layer_id],
+            self.v_buffer[local_layer_id],
+            self.k_scale_buffer[local_layer_id].view(torch.float8_e4m3fn),
+            self.v_scale_buffer[local_layer_id].view(torch.float8_e4m3fn),
+        )
+
+    def get_fp8_workspace(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.dq_k_buffer is None or self.dq_v_buffer is None:
+            raise RuntimeError(
+                "Dequant workspace requested from a KV pool without FP4 dequant buffers."
+            )
+        return self.dq_k_buffer, self.dq_v_buffer
+
+    def prepare_fp8_extend_workspace(
+        self,
+        layer_id: int,
+        global_layer_id: int,
+        req_to_token: torch.Tensor,
+        req_pool_indices_cpu,
+        extend_prefix_lens_cpu,
+        extend_seq_lens_cpu,
+        page_size: int,
+        k_cur_fp8: Optional[torch.Tensor] = None,
+        v_cur_fp8: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the shared FP8 workspace used by FlashInfer extend attention.
+
+        Cached prefix tokens are stored as packed FP4 plus per-block scales, so
+        paged prefill dequantizes those prefix tokens into the FP8 workspace.
+        The current extend chunk can already be FP8 and is copied into the same
+        workspace after the prefix region.
+        """
+        k_fp4, v_fp4, k_scales, v_scales = self.get_raw_fp4_kv_buffer(layer_id)
+        dq_k, dq_v = self.get_fp8_workspace()
+
+        cur_batch_start_loc_cpu = 0
+        cur_token_idx_dq = page_size
+
+        for i in range(len(req_pool_indices_cpu)):
+            req_idx = int(req_pool_indices_cpu[i])
+            prev_len = int(extend_prefix_lens_cpu[i])
+            extend_len = int(extend_seq_lens_cpu[i])
+
+            if prev_len > 0:
+                prev_indices = req_to_token[req_idx, :prev_len]
+                k_prev_fp8, v_prev_fp8 = self.quant_method.dequantize_prev_kv(
+                    k_fp4[prev_indices],
+                    k_scales[prev_indices],
+                    v_fp4[prev_indices],
+                    v_scales[prev_indices],
+                    global_layer_id,
+                )
+                dq_k[cur_token_idx_dq : cur_token_idx_dq + prev_len] = k_prev_fp8
+                dq_v[cur_token_idx_dq : cur_token_idx_dq + prev_len] = v_prev_fp8
+
+            if k_cur_fp8 is not None:
+                cur_end = cur_batch_start_loc_cpu + extend_len
+                dst_start = cur_token_idx_dq + prev_len
+                dst_end = dst_start + extend_len
+                dq_k[dst_start:dst_end] = k_cur_fp8[cur_batch_start_loc_cpu:cur_end]
+                dq_v[dst_start:dst_end] = v_cur_fp8[cur_batch_start_loc_cpu:cur_end]
+                cur_batch_start_loc_cpu = cur_end
+
+            cur_token_idx_dq = (
+                (cur_token_idx_dq + prev_len + extend_len + page_size - 1)
+                // page_size
+                * page_size
+            )
+
+        return dq_k, dq_v
 
     def set_kv_buffer_prefix_valid(
         self,
@@ -1860,6 +2071,10 @@ class MHATokenToKVPool(KVCache):
         # per-layer buffers here ignore page_size in move_kv_cache_native.
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
+            if getattr(self, "k_scale_buffer", None) is not None:
+                move_kv_cache_native(
+                    self.k_scale_buffer, self.v_scale_buffer, tgt_loc, src_loc
+                )
             return
 
         N = tgt_loc.numel()
@@ -2346,6 +2561,7 @@ class HybridLinearKVPool(KVCache):
         qk_rope_head_dim: int = None,
         start_layer: Optional[int] = None,
         full_kv_pool_class: Optional[type] = None,
+        quant_method=None,
     ):
         self.size = size
         self.dtype = dtype
@@ -2359,21 +2575,28 @@ class HybridLinearKVPool(KVCache):
         self.mamba_pool = mamba_pool
         self.use_mla = use_mla
         if not use_mla:
-            TokenToKVPoolClass = MHATokenToKVPool
+            quant_method_kwarg = {"quant_method": quant_method}
 
             if current_platform.is_out_of_tree():
                 TokenToKVPoolClass = current_platform.get_mha_kv_pool_cls()
+                quant_method_kwarg = {}
             elif _is_npu:
+                assert not is_float4_e2m1fn_x2(
+                    dtype
+                ), "FP4 is not supported on NPU yet."
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMHATokenToKVPool,
                 )
 
                 TokenToKVPoolClass = NPUMHATokenToKVPool
+                quant_method_kwarg = {}
             elif full_kv_pool_class is not None:
                 # Caller-selected MHA layout variant (e.g. the page-major
                 # PageMajorMHATokenToKVPool). NPU / out-of-tree classes keep
                 # priority since they don't understand alternate layouts.
                 TokenToKVPoolClass = full_kv_pool_class
+            else:
+                TokenToKVPoolClass = MHATokenToKVPool
 
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,
@@ -2385,6 +2608,7 @@ class HybridLinearKVPool(KVCache):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 enable_kv_cache_copy=enable_kv_cache_copy,
+                **quant_method_kwarg,
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
@@ -2453,20 +2677,43 @@ class HybridLinearKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-    def get_key_buffer(self, layer_id: int):
+    def get_key_buffer(self, layer_id: int, scale: Optional[float] = None):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
+        if scale is not None:
+            return self.full_kv_pool.get_key_buffer(layer_id, scale)
         return self.full_kv_pool.get_key_buffer(layer_id)
 
-    def get_value_buffer(self, layer_id: int):
+    def get_value_buffer(self, layer_id: int, scale: Optional[float] = None):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
+        if scale is not None:
+            return self.full_kv_pool.get_value_buffer(layer_id, scale)
         return self.full_kv_pool.get_value_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id)
+
+    def get_raw_fp4_kv_buffer(
+        self, layer_id: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_raw_fp4_kv_buffer(layer_id)
+
+    def get_fp8_workspace(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.full_kv_pool.get_fp8_workspace()
+
+    def prepare_fp8_extend_workspace(
+        self, layer_id: int, global_layer_id: int, *args, **kwargs
+    ):
+        self._wait_for_layer(layer_id)
+        local_layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.prepare_fp8_extend_workspace(
+            local_layer_id, global_layer_id, *args, **kwargs
+        )
 
     @contextmanager
     def _transfer_id_context(self, layer: RadixAttention):
@@ -2494,6 +2741,20 @@ class HybridLinearKVPool(KVCache):
     ):
         layer_id = self._transfer_full_attention_id(layer.layer_id)
         if not self.use_mla:
+            if self.full_kv_pool.is_quantized_kv_cache:
+                if dcp_kv_mask is not None:
+                    raise RuntimeError("dcp_kv_mask is not supported for FP4 KV cache.")
+                self.full_kv_pool._set_quantized_kv_buffer(
+                    layer_id,
+                    layer.layer_id,
+                    loc,
+                    cache_k,
+                    cache_v,
+                    k_scale,
+                    v_scale,
+                )
+                return
+
             self.full_kv_pool.set_kv_buffer(
                 None,
                 loc,

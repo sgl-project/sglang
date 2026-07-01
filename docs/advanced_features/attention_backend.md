@@ -101,7 +101,8 @@ The GDN linear attention layers have their own kernel backends, selected via `--
 
 ```{important}
 GDN models are hybrid: the full-attention layers still require a standard `--attention-backend`. Platform constraints for the full-attention backend on hybrid GDN models:
-- **Blackwell (e.g., B200)**: `triton`, `trtllm_mha`, or `fa4` only.
+- **Blackwell SM120 (e.g., RTX PRO 6000 Blackwell)**: `triton` or `flashinfer` for prefill/full attention; `trtllm_mha` is supported for `--decode-attention-backend` only.
+- **Other Blackwell variants (including SM100 B200/GB200)**: `triton`, `trtllm_mha`, or `fa4` only.
 - **NPU (Ascend)**: `ascend` only.
 - **AMD (ROCm)**: `triton` recommended.
 - **Other CUDA (Hopper, Ampere, etc.)**: auto-selection works; no special constraints.

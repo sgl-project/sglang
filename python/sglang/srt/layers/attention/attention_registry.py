@@ -267,7 +267,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.layers.attention.linear.utils import (
             initialize_linear_attn_config,
         )
-        from sglang.srt.utils import is_blackwell, is_npu
+        from sglang.srt.utils import (
+            is_blackwell,
+            is_npu,
+            is_sm120_supported,
+        )
 
         if not is_npu():
             from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -290,13 +294,25 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         initialize_linear_attn_config(runner.server_args)
         if runner.hybrid_gdn_config is not None:
             if is_blackwell():
-                assert (
-                    runner.server_args.attention_backend == "triton"
-                    or runner.server_args.attention_backend == "trtllm_mha"
-                    or runner.server_args.attention_backend == "fa4"
-                    or runner.server_args.attention_backend == "flashinfer"
-                ), "triton, trtllm_mha, fa4, or flashinfer backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend to specify the backend."
-            if is_npu():
+                if is_sm120_supported():
+                    allowed = {"triton", "trtllm_mha", "flashinfer"}
+                else:
+                    allowed = {"triton", "trtllm_mha", "fa4"}
+                attn_be = runner.server_args.attention_backend
+                prefill_be = runner.server_args.prefill_attention_backend
+                decode_be = runner.server_args.decode_attention_backend
+                # When using split prefill/decode backends, check each individually
+                if prefill_be and decode_be:
+                    assert prefill_be in allowed and decode_be in allowed, (
+                        f"Only {allowed} backends are supported on Blackwell GPUs for hybrid GDN models. "
+                        f"Got prefill={prefill_be}, decode={decode_be}."
+                    )
+                else:
+                    assert attn_be in allowed, (
+                        f"Only {allowed} backends are supported on Blackwell GPUs for hybrid GDN models. "
+                        f"Got attention_backend={attn_be}."
+                    )
+            elif is_npu():
                 assert (
                     runner.server_args.attention_backend == "ascend"
                 ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."

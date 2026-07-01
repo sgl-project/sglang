@@ -20,6 +20,10 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    get_kv_cache_quant_method,
+    resolve_kv_cache_quant,
+)
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -40,7 +44,6 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
-    MHATokenToKVPoolFP4,
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
@@ -338,7 +341,7 @@ class ModelRunnerKVCacheMixin:
                 f"{unsupported_pool_family}. Supported configurations today: plain MHA "
                 "models on CUDA with the FA (fa3/fa4) prefill backend, --is-embedding, "
                 "--chunked-prefill-size=-1, --disable-radix-cache, no context-parallel "
-                "attention, no HiSparse, and --kv-cache-dtype != fp4_e2m1."
+                "attention, no HiSparse, and --kv-cache-dtype not in {nvfp4, fp4_mx_block16}."
             )
 
     def _init_pools(self: ModelRunner):
@@ -778,6 +781,26 @@ class ModelRunnerKVCacheMixin:
                         "kv_lora_rank": self.model_config.kv_lora_rank,
                         "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
                     }
+                hybrid_full_layer_ids = (
+                    [0]
+                    if self.is_draft_worker
+                    else [
+                        i
+                        for i in config.full_attention_layer_ids
+                        if self.start_layer <= i < self.end_layer
+                    ]
+                )
+                hybrid_quant_method = None
+                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                    quant_name = resolve_kv_cache_quant(
+                        self.server_args.kv_cache_dtype
+                    )
+                    if quant_name is not None:
+                        hybrid_quant_method = get_kv_cache_quant_method(
+                            quant_name,
+                            num_layers=len(hybrid_full_layer_ids),
+                            device=self.device,
+                        )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,
@@ -786,16 +809,7 @@ class ModelRunnerKVCacheMixin:
                         get_attention_tp_size()
                     ),
                     head_dim=self.model_config.head_dim,
-                    # if draft worker, we only need 1 attention layer's kv pool
-                    full_attention_layer_ids=(
-                        [0]
-                        if self.is_draft_worker
-                        else [
-                            i
-                            for i in config.full_attention_layer_ids
-                            if self.start_layer <= i < self.end_layer
-                        ]
-                    ),
+                    full_attention_layer_ids=hybrid_full_layer_ids,
                     device=self.device,
                     mamba_pool=self.req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,
@@ -805,57 +819,54 @@ class ModelRunnerKVCacheMixin:
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
                     full_kv_pool_class=mha_pool_class,
+                    quant_method=hybrid_quant_method,
                     **extra_args,
                 )
+                if hybrid_quant_method is not None:
+                    hybrid_quant_method.load_scales_from_model(self)
             else:
+                quant_method = None
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     assert (
                         not enable_page_major
                     ), "page-major KV layout is not supported with fp4 KV cache"
-                    self.token_to_kv_pool = MHATokenToKVPoolFP4(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        head_num=self.model_config.get_num_kv_heads(
-                            get_attention_tp_size()
-                        ),
-                        head_dim=self.model_config.head_dim,
-                        v_head_dim=self.model_config.v_head_dim,
-                        layer_num=self.num_effective_layers,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        start_layer=self.start_layer,
-                        end_layer=self.end_layer,
-                        enable_alt_stream=not self.server_args.enable_pdmux,
-                        enable_kv_cache_copy=(
-                            self.server_args.speculative_algorithm is not None
-                        ),
+                    quant_name = resolve_kv_cache_quant(
+                        self.server_args.kv_cache_dtype
                     )
-                else:
-                    pool_cls = (
-                        NoOpMHATokenToKVPool
-                        if self.server_args.prefill_only_disable_kv_cache
-                        else mha_pool_class
-                    )
-                    self.token_to_kv_pool = pool_cls(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        head_num=self.model_config.get_num_kv_heads(
-                            get_attention_tp_size()
-                        ),
-                        head_dim=self.model_config.head_dim,
-                        v_head_dim=self.model_config.v_head_dim,
-                        layer_num=self.num_effective_layers,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        start_layer=self.start_layer,
-                        end_layer=self.end_layer,
-                        enable_alt_stream=not self.server_args.enable_pdmux,
-                        enable_kv_cache_copy=(
-                            self.server_args.speculative_algorithm is not None
-                        ),
-                    )
+                    if quant_name is not None:
+                        quant_method = get_kv_cache_quant_method(
+                            quant_name,
+                            num_layers=self.num_effective_layers,
+                            device=self.device,
+                        )
+
+                pool_cls = (
+                    NoOpMHATokenToKVPool
+                    if self.server_args.prefill_only_disable_kv_cache
+                    else MHATokenToKVPool
+                )
+                self.token_to_kv_pool = pool_cls(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    v_head_dim=self.model_config.v_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    enable_alt_stream=not self.server_args.enable_pdmux,
+                    enable_kv_cache_copy=(
+                        self.server_args.speculative_algorithm is not None
+                    ),
+                    quant_method=quant_method,
+                )
+                if quant_method is not None:
+                    quant_method.load_scales_from_model(self)
 
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
@@ -1007,7 +1018,7 @@ class ModelRunnerKVCacheMixin:
                 "Supported configurations today: plain MHA models on CUDA with the FA "
                 "(fa3/fa4) prefill backend, --is-embedding, --chunked-prefill-size=-1, "
                 "--disable-radix-cache, no context-parallel attention, no HiSparse, "
-                "and --kv-cache-dtype != fp4_e2m1."
+                "and --kv-cache-dtype not in {nvfp4, fp4_mx_block16}."
             )
 
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
