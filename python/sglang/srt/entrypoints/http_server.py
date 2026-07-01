@@ -881,7 +881,9 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
 
 @app.post("/release_ref")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def release_ref_request(obj: ReleaseRefReqInput, request: Request):
+async def release_ref_request(
+    obj: Annotated[ReleaseRefReqInput, Body()], request: Request
+):
     """Release ref tracking for a completed multi-turn rollout."""
     success, message = await _global_state.tokenizer_manager.release_ref(obj)
     return ORJSONResponse({"success": success, "message": message})
@@ -889,7 +891,9 @@ async def release_ref_request(obj: ReleaseRefReqInput, request: Request):
 
 @app.post("/update_ref")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def update_ref_request(obj: UpdateRefReqInput, request: Request):
+async def update_ref_request(
+    obj: Annotated[UpdateRefReqInput, Body()], request: Request
+):
     """Update priority class for a tracked multi-turn rollout."""
     success, message = await _global_state.tokenizer_manager.update_ref(obj)
     return ORJSONResponse({"success": success, "message": message})
