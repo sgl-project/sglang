@@ -1076,6 +1076,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable or len(key) == 0:
             return None
 
+        key = key.page_aligned(self.page_size)
+        if len(key) == 0:
+            return None
+
         return key
 
     def _match_post_processor(
@@ -1145,6 +1149,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
+        assert (
+            0 < split_len < len(child.key)
+        ), f"split_len must create non-empty nodes, {split_len=}, {len(child.key)=}"
         # new_node -> child
         new_node = TreeNode()
         new_node.children = {key[split_len:].child_key(self.page_size): child}
@@ -1153,6 +1160,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.full_lock_ref = child.full_lock_ref
         new_node.mamba_lock_ref = 0
         new_node.key = child.key[:split_len]
+        assert len(new_node.key) > 0, f"new_node.key should not be empty"
         new_node.value = child.value[:split_len].clone()
 
         # child time should be later than parent's time for mamba tombstone
@@ -1163,6 +1171,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.mamba_lru_list.remove_node(child)
         child.parent = new_node
         child.key = child.key[split_len:]
+        assert len(child.key) > 0, f"child.key should not be empty"
         child.value = child.value[split_len:].clone()
         new_node.parent.children[key.child_key(self.page_size)] = new_node
         new_node.hash_value, child.hash_value = split_node_hash_value(
