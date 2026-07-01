@@ -16,6 +16,9 @@ from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
     CausalLingBotWorldTransformerBlock,
     LingBotWorldCamConditioner,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
+    CausalDMDCachePolicy,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
     LingBotWorldCausalDMDDenoisingStage,
 )
@@ -257,6 +260,40 @@ def test_lingbot_interactive_kv_window_samples_base_moving_and_still():
     cache_state.chunk_idx = 2
     stage._set_lingbot_kv_sample_tokens(cache_state, batch, server_args)
     assert batch.realtime_causal_kv_sample_tokens == 30
+
+
+def test_lingbot_interactive_kv_window_allocates_expected_cache_size():
+    stage = LingBotWorldCausalDMDDenoisingStage.__new__(
+        LingBotWorldCausalDMDDenoisingStage
+    )
+    stage.num_transformer_blocks = 1
+    stage.local_attn_size = -1
+    stage.sink_size = 9
+    stage.num_token_per_frame = 10
+    stage.num_frames_per_block = 3
+    stage.sliding_window_num_frames = 18
+    stage.transformer = SimpleNamespace(num_attention_heads=1, attention_head_dim=1)
+    policy = CausalDMDCachePolicy(
+        sequence_shard_enabled=False,
+        num_attention_heads=1,
+        expected_cache_tokens=240,
+        expected_sink_tokens=90,
+        kv_cache_kwargs={},
+    )
+
+    stage._initialize_kv_cache(
+        batch_size=1,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        **stage._causal_kv_cache_kwargs(policy),
+    )
+
+    assert stage.causal_kv_cache is not None
+    cache = stage.causal_kv_cache[0]
+    assert cache.cache_size == 240
+    assert cache.k.shape[1] == 240
+    assert cache.sink_tokens == 90
+    assert cache.attention_window_size == 240
 
 
 def test_lingbot_i2v_model_input_writer_reuses_buffer():

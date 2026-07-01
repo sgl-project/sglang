@@ -3,6 +3,8 @@
 
 """LingBot-World causal DMD denoising stage."""
 
+from typing import Any
+
 import torch
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -76,8 +78,11 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
     def _causal_kv_cache_kwargs(
         self,
         policy: CausalDMDCachePolicy,
-    ) -> dict[str, bool]:
-        return {"sequence_shard_enabled": policy.sequence_shard_enabled}
+    ) -> dict[str, Any]:
+        return {
+            "sequence_shard_enabled": policy.sequence_shard_enabled,
+            "kv_cache_size": policy.expected_cache_tokens,
+        }
 
     def _use_causal_cache_int_indices(
         self,
