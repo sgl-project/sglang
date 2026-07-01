@@ -64,6 +64,9 @@ def _make_model_runner(
     disaggregation_mode="null",
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
+    kv_lora_rank=512,
+    qk_rope_head_dim=64,
+    mla_kv_cache_dim=None,
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -82,6 +85,8 @@ def _make_model_runner(
     mc = SimpleNamespace()
     mc.head_dim = head_dim
     mc.v_head_dim = v_head_dim
+    mc.kv_lora_rank = kv_lora_rank
+    mc.qk_rope_head_dim = qk_rope_head_dim
     mc.is_hybrid_swa = is_hybrid_swa
     mc.full_attention_layer_ids = (
         full_attention_layer_ids
@@ -97,6 +102,11 @@ def _make_model_runner(
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
     mr.model_config = mc
+    mr.calculate_mla_kv_cache_dim.return_value = (
+        mla_kv_cache_dim
+        if mla_kv_cache_dim is not None
+        else kv_lora_rank + qk_rope_head_dim
+    )
 
     mr.kv_cache_dtype = "fake_bf16"
 
@@ -201,6 +211,41 @@ class TestDefaultConfigurator(unittest.TestCase):
         _, _, config = self._run(10_000_000)
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
+
+    @patch(
+        "sglang.srt.model_executor.pool_configurator.get_dsa_index_head_dim",
+        return_value=128,
+    )
+    @patch(
+        "sglang.srt.model_executor.pool_configurator.is_deepseek_dsa",
+        return_value=True,
+    )
+    def test_dsa_mla_cell_size_uses_backend_kv_layout(
+        self, _mock_is_dsa, _mock_index_head_dim
+    ):
+        num_layers = 2
+        raw = _make_model_runner(
+            num_layers=num_layers,
+            use_mla_backend=True,
+            mla_kv_cache_dim=576,
+        )
+        packed = _make_model_runner(
+            num_layers=num_layers,
+            use_mla_backend=True,
+            mla_kv_cache_dim=656,
+        )
+
+        with mock_cpu_env(kv_size=1):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            raw_configurator = DefaultPoolConfigurator(raw)
+            packed_configurator = DefaultPoolConfigurator(packed)
+
+        # The DSA indexer adds 128 FP8 values and one FP32 scale (4 bytes).
+        self.assertEqual(raw_configurator._cell_size, (576 + 132) * num_layers)
+        self.assertEqual(packed_configurator._cell_size, (656 + 132) * num_layers)
 
 
 class TestHybridSWAConfigurator(unittest.TestCase):

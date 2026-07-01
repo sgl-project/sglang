@@ -137,6 +137,7 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
 
 # Reuse this workspace buffer across all DSA backend instances
 global_workspace_buffer = None
+global_flashinfer_sparse_workspace_buffer = None
 
 # Control whether to use fused metadata copy kernel for cuda graph replay (default: enabled)
 # Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
@@ -323,7 +324,14 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse",
+    "flashmla_kv",
+    "flashmla_auto",
+    "flashinfer_sparse_mla",
+    "fa3",
+    "tilelang",
+    "aiter",
+    "trtllm",
 ]
 
 
@@ -440,8 +448,37 @@ class DeepseekSparseAttnBackend(
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
+        uses_flashinfer_sparse_mla = "flashinfer_sparse_mla" in (
+            self.dsa_prefill_impl,
+            self.dsa_decode_impl,
+        )
+        if uses_flashinfer_sparse_mla:
+            from sglang.srt.layers.attention.dsa.flashinfer_sparse_mla import (
+                get_flashinfer_sparse_mla_op,
+                validate_flashinfer_sparse_mla_skip_softmax,
+            )
+
+            if self.dsa_prefill_impl == "flashinfer_sparse_mla":
+                validate_flashinfer_sparse_mla_skip_softmax(
+                    "prefill",
+                    envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                )
+            if self.dsa_decode_impl == "flashinfer_sparse_mla":
+                validate_flashinfer_sparse_mla_skip_softmax(
+                    "decode",
+                    envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                )
+            get_flashinfer_sparse_mla_op()
+            global global_flashinfer_sparse_workspace_buffer
+            if global_flashinfer_sparse_workspace_buffer is None:
+                global_flashinfer_sparse_workspace_buffer = torch.zeros(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                )
+            self.workspace_buffer = global_flashinfer_sparse_workspace_buffer
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
-        if self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
+        elif self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
             global global_workspace_buffer
             if global_workspace_buffer is None:
                 global_workspace_buffer = torch.empty(
@@ -1880,6 +1917,17 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
+        elif dsa_impl == "flashinfer_sparse_mla":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_flashinfer_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                seq_lens=metadata.dsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -2020,6 +2068,17 @@ class DeepseekSparseAttnBackend(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
+        elif self.dsa_decode_impl == "flashinfer_sparse_mla":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_flashinfer_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                seq_lens=metadata.dsa_cache_seqlens_int32,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
@@ -2166,6 +2225,35 @@ class DeepseekSparseAttnBackend(
             o = o[:, :num_heads, :]
 
         return o
+
+    def _forward_flashinfer_sparse_mla(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        seq_lens: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.dsa.flashinfer_sparse_mla import (
+            flashinfer_sparse_mla_forward,
+        )
+
+        assert self.workspace_buffer is not None
+        return flashinfer_sparse_mla_forward(
+            q=q_all,
+            kv_cache=kv_cache,
+            indices=page_table_1,
+            seq_lens=seq_lens,
+            workspace_buffer=self.workspace_buffer,
+            page_size=self.real_page_size,
+            kv_cache_dim=self.kv_cache_dim,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            sm_scale=sm_scale,
+        )
 
     def _forward_flashmla_kv(
         self,
