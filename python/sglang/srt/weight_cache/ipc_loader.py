@@ -17,7 +17,6 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import (
     BaseModelLoader,
     _initialize_model,
-    _post_load_weights,
 )
 from sglang.srt.utils import MultiprocessingSerializer
 
@@ -110,8 +109,17 @@ class IpcModelLoader(BaseModelLoader):
             quant_config,
         )
 
-        # Post-load hooks (e.g., model-specific finalization)
-        _post_load_weights(model)
+        # Skip _post_load_weights: the daemon already ran
+        # process_weights_after_loading on the weights before exporting
+        # IPC handles. Running it again would double-process (e.g.,
+        # re-quantize already-quantized weights), corrupting tensor data.
+
+        # Rebuild stale tensor views. Some modules store tensor views as
+        # plain attributes (not parameters/buffers) during __init__. When
+        # the model is initialized on meta device and then weights are
+        # replaced via IPC mapping, these views still point to the old
+        # meta storage. We must recreate them from the now-valid tensors.
+        self._rebuild_stale_views(model)
 
         logger.info(
             f"[IpcModelLoader] Loaded model via IPC (mode={self.weight_cache_mode}), "
@@ -119,6 +127,36 @@ class IpcModelLoader(BaseModelLoader):
         )
 
         return model.eval()
+
+    @staticmethod
+    def _rebuild_stale_views(model):
+        """Rebuild tensor views that went stale after IPC weight replacement.
+
+        RadixLinearAttention.conv_weights is a view of conv1d.weight created
+        during __init__. After IPC mapping replaces conv1d.weight with a new
+        tensor, the old view still points to meta-device storage. Recreate
+        it from the now-valid parameter.
+        """
+        try:
+            from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+        except ImportError:
+            return
+
+        count = 0
+        for _, module in model.named_modules():
+            conv1d = getattr(module, "conv1d", None)
+            attn = getattr(module, "attn", None)
+            if conv1d is not None and isinstance(attn, RadixLinearAttention):
+                if hasattr(conv1d, "weight") and conv1d.weight is not None:
+                    attn.conv_weights = conv1d.weight.view(
+                        conv1d.weight.size(0), conv1d.weight.size(2)
+                    )
+                    if hasattr(conv1d, "bias") and conv1d.bias is not None:
+                        attn.bias = conv1d.bias
+                    count += 1
+
+        if count > 0:
+            logger.info(f"[IpcModelLoader] Rebuilt {count} stale conv_weights views")
 
     @staticmethod
     def _set_module_tensor(model, name, tensor, is_param=True):
@@ -146,6 +184,14 @@ class IpcModelLoader(BaseModelLoader):
                 new_param = nn.Parameter(tensor, requires_grad=False)
             setattr(obj, leaf_name, new_param)
         else:
+            # register_buffer raises KeyError if the name already exists as a
+            # parameter or plain attribute (not a buffer). This happens when
+            # process_weights_after_loading converts a parameter to a buffer
+            # (e.g. Mamba's A_log). Remove the old attribute first.
+            if leaf_name in obj._parameters:
+                del obj._parameters[leaf_name]
+            elif hasattr(obj, leaf_name) and leaf_name not in obj._buffers:
+                delattr(obj, leaf_name)
             obj.register_buffer(leaf_name, tensor)
 
     def _load_zero_copy_mode(
