@@ -844,6 +844,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             hisparse_top_k = getattr(
                 self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
             )
+            # Prefetch with IndexShare (auto-enabled for models that support it, e.g. GLM-5.2)
+            shared_index_layers = None
+            hf_text_config = self.model_config.hf_text_config
+            if is_deepseek_dsa(hf_text_config):
+                pattern = [
+                    dsa_layer_skips_topk(hf_text_config, i)
+                    for i in range(hf_text_config.num_hidden_layers)
+                ]
+                if any(pattern):
+                    if self.pp_size == 1 and self.spec_algorithm.is_none():
+                        shared_index_layers = pattern
+                    else:
+                        logger.warning(
+                            "HiSparse shared-index prefetch is unsupported under "
+                            "pipeline parallelism / speculative decoding; falling "
+                            "back to synchronous swap-in."
+                        )
             self.hisparse_coordinator = HiSparseCoordinator(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -857,6 +874,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                 swap_in_block_size=hisparse_cfg.swap_in_block_size,
+                shared_index_layers=shared_index_layers,
             )
 
         self.init_routed_experts_capturer()
