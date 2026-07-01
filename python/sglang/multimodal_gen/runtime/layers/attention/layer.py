@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
 from contextlib import nullcontext
+from collections.abc import Sequence
 from typing import Type
 
 import torch
@@ -89,6 +90,84 @@ def build_varlen_mask_meta(
         "indices": indices,
         "inv_indices": inv_indices,
         "max_seqlen": seq,  # upper bound; FA varlen uses cu_seqlens for actual ranges
+    }
+
+
+def build_varlen_mask_meta_from_lengths(
+    lengths: Sequence[int],
+    max_seqlen: int,
+    device: torch.device,
+) -> dict:
+    """Build varlen FA metadata for prefix-valid masks without CUDA nonzero.
+
+    This is equivalent to ``build_varlen_mask_meta`` for masks where row ``i`` is
+    true on ``[:lengths[i]]`` and false afterwards. Keeping the lengths on the
+    host lets callers avoid a GPU ``nonzero``/dynamic-shape path while still
+    producing the same packed indices.
+    """
+
+    return build_varlen_mask_meta_from_ranges(
+        [[(0, int(length))] for length in lengths],
+        max_seqlen=max_seqlen,
+        device=device,
+    )
+
+
+def build_varlen_mask_meta_from_ranges(
+    valid_ranges: Sequence[Sequence[tuple[int, int]]],
+    max_seqlen: int,
+    device: torch.device,
+) -> dict:
+    """Build varlen FA metadata from host-side valid token ranges.
+
+    ``valid_ranges[i]`` contains half-open intervals in row-local coordinates.
+    The intervals are packed in the provided order, matching the flattened
+    ``nonzero`` order for ordinary left-to-right masks.
+    """
+
+    range_values = [
+        [(int(start), int(end)) for start, end in row_ranges]
+        for row_ranges in valid_ranges
+    ]
+    if any(
+        start < 0 or end < start or end > max_seqlen
+        for row_ranges in range_values
+        for start, end in row_ranges
+    ):
+        raise ValueError(
+            f"All ranges must be within [0, {max_seqlen}], got {range_values}"
+        )
+
+    bs = len(range_values)
+    length_values = [
+        sum(end - start for start, end in row_ranges) for row_ranges in range_values
+    ]
+    valid_lens = torch.as_tensor(length_values, dtype=torch.int32, device=device)
+    cu_seqlens = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+    cu_seqlens[1:] = torch.cumsum(valid_lens, dim=0)
+
+    index_parts = [
+        torch.arange(
+            row * max_seqlen + start,
+            row * max_seqlen + end,
+            dtype=torch.long,
+            device=device,
+        )
+        for row, row_ranges in enumerate(range_values)
+        for start, end in row_ranges
+        if end > start
+    ]
+    if index_parts:
+        indices = torch.cat(index_parts, dim=0)
+    else:
+        indices = torch.empty((0,), dtype=torch.long, device=device)
+    inv_indices = build_inv_indices(indices, bs * max_seqlen)
+
+    return {
+        "cu_seqlens": cu_seqlens,
+        "indices": indices,
+        "inv_indices": inv_indices,
+        "max_seqlen": max_seqlen,
     }
 
 
