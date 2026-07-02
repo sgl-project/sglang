@@ -1,11 +1,16 @@
 import logging
 import math
 from copy import deepcopy
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
-from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+    tensor_model_parallel_all_gather,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -37,6 +42,9 @@ from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_loc
 from sglang.srt.speculative.triton_ops.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
+)
+from sglang.srt.speculative.triton_ops.dspark import (
+    _compute_dspark_accept_bonus_triton_unchecked,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
@@ -286,6 +294,28 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+
+        self._use_qwen3_dspark = (
+            getattr(self.draft_model, "markov_head", None) is not None
+            and getattr(self.draft_model, "lm_head", None) is not None
+        )
+        self._draft_confidence: Optional[torch.Tensor] = None
+        self._markov_refine_buffer_cap: int = 0
+        self._markov_candidates_buf: Optional[torch.Tensor] = None
+        self._markov_embeds_buf: Optional[torch.Tensor] = None
+        if self._use_qwen3_dspark:
+            self._draft_vocab_size = int(getattr(self.draft_model, "vocab_size", 0))
+            self._draft_markov_rank = int(getattr(self.draft_model, "markov_rank", 0))
+            self.confidence_threshold = float(
+                getattr(server_args, "speculative_dspark_confidence_threshold", 0.0)
+                or 0.0
+            )
+            if self.tp_rank == 0:
+                logger.info(
+                    "Qwen3 DSpark heads enabled (Markov rank=%s, confidence_threshold=%s).",
+                    self._draft_markov_rank,
+                    self.confidence_threshold,
+                )
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -692,6 +722,99 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         return int(resolved_id)
+
+    def _ensure_markov_refine_buffers(self, bs: int, device: torch.device) -> None:
+        cap = self._markov_refine_buffer_cap
+        if (
+            cap >= int(bs)
+            and self._markov_candidates_buf is not None
+            and self._markov_embeds_buf is not None
+            and self._markov_candidates_buf.device == device
+            and self._markov_embeds_buf.device == device
+        ):
+            return
+
+        new_cap = max(int(bs), cap * 2 if cap > 0 else int(bs))
+        markov_weight = getattr(
+            self.draft_model.markov_head.markov_w1, "weight", None
+        )
+        markov_dtype = (
+            markov_weight.dtype
+            if markov_weight is not None
+            else self.draft_model.lm_head.weight.dtype
+        )
+        self._markov_candidates_buf = torch.empty(
+            (new_cap, int(self.block_size)), dtype=torch.int64, device=device
+        )
+        self._markov_embeds_buf = torch.empty(
+            (new_cap, int(self.block_size), int(self._draft_markov_rank)),
+            dtype=markov_dtype,
+            device=device,
+        )
+        self._markov_refine_buffer_cap = new_cap
+
+    def _refine_block_markov(
+        self,
+        *,
+        block_hidden: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        bs = int(block_hidden.shape[0])
+        block_size = int(self.block_size)
+        device = block_hidden.device
+
+        self._ensure_markov_refine_buffers(bs, device)
+        assert self._markov_candidates_buf is not None
+        assert self._markov_embeds_buf is not None
+        candidates = self._markov_candidates_buf[:bs]
+        markov_embeds = self._markov_embeds_buf[:bs]
+
+        markov_head = self.draft_model.markov_head
+        confidence_head = self.draft_model.confidence_head
+        lm_head = self.draft_model.lm_head
+        tp_size = get_tensor_model_parallel_world_size()
+        vocab_size = int(self._draft_vocab_size)
+
+        def _gather_full_vocab(logits_shard: torch.Tensor) -> torch.Tensor:
+            if logits_shard.shape[-1] >= vocab_size:
+                return logits_shard[..., :vocab_size]
+            if tp_size == 1:
+                return logits_shard
+            return tensor_model_parallel_all_gather(logits_shard, dim=-1)[
+                ..., :vocab_size
+            ]
+
+        if bonus_tokens.numel() == bs:
+            first_tokens = bonus_tokens.view(-1).to(torch.int64)
+        else:
+            first_tokens = bonus_tokens[:, 0].to(torch.int64)
+        candidates[:, 0].copy_(first_tokens)
+
+        with torch.inference_mode():
+            base_logits = _gather_full_vocab(F.linear(block_hidden, lm_head.weight))
+            prev_tokens = candidates[:, 0]
+            for i in range(block_size):
+                prev_embed = markov_head.get_prev_embeddings(prev_tokens)
+                markov_embeds[:, i].copy_(prev_embed)
+                bias = _gather_full_vocab(markov_head.project_bias(prev_embed))
+                bias.add_(base_logits[:, i])
+                next_tokens = torch.argmax(bias, dim=-1)
+                if i + 1 < block_size:
+                    candidates[:, i + 1].copy_(next_tokens)
+                prev_tokens = next_tokens
+
+            if confidence_head is not None:
+                confidence = confidence_head(block_hidden, markov_embeds)
+            else:
+                confidence = torch.ones(
+                    (bs, block_size), dtype=torch.float32, device=device
+                )
+
+        return candidates, confidence
+
+    def _confident_prefix(self, confidence: torch.Tensor) -> torch.Tensor:
+        keep = torch.sigmoid(confidence) >= self.confidence_threshold
+        return keep.to(torch.int32).cumprod(dim=1).sum(dim=1)
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -1543,10 +1666,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        if self._draft_sampler is not None and draft_out.can_run_graph:
+        draft_tokens = self._draft_block_tokens_buf[:bs]
+        if self._use_qwen3_dspark:
+            draft_hidden = draft_logits_output.hidden_states
+            if draft_hidden is None:
+                raise RuntimeError("DFLASH draft model returned no hidden states.")
+            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+            draft_tokens, self._draft_confidence = self._refine_block_markov(
+                block_hidden=draft_hidden,
+                bonus_tokens=block_ids[:, 0],
+            )
+        elif self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
+            draft_tokens[:, 0].copy_(block_ids[:, 0])
+            draft_tokens[:, 1:].copy_(draft_next)
+            self._draft_confidence = None
         else:
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
@@ -1558,10 +1694,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ),
                 lm_head=lm_head,
             ).view(bs, int(self.block_size) - 1)
-
-        draft_tokens = self._draft_block_tokens_buf[:bs]
-        draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
+            draft_tokens[:, 0].copy_(block_ids[:, 0])
+            draft_tokens[:, 1:].copy_(draft_next)
+            self._draft_confidence = None
 
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
@@ -1645,7 +1780,58 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
             )
-            if self._use_triton_accept_bonus:
+            use_dspark_accept = (
+                self._use_qwen3_dspark and self._draft_confidence is not None
+            )
+            dspark_accept_done = False
+            if use_dspark_accept and self._use_triton_accept_bonus:
+                try:
+                    (
+                        accept_len,
+                        commit_lens,
+                        bonus,
+                        out_tokens,
+                        new_seq_lens,
+                    ) = self._next_accept_bonus_buffers(bs)
+                    _compute_dspark_accept_bonus_triton_unchecked(
+                        candidates=candidates,
+                        target_top1=target_predict,
+                        confidence=self._draft_confidence,
+                        commit_lens_out=commit_lens,
+                        bonus_ids_out=bonus,
+                        out_tokens_out=out_tokens,
+                        prefix_lens=prefix_lens,
+                        new_seq_lens_out=new_seq_lens,
+                        confidence_threshold=self.confidence_threshold,
+                    )
+                    accept_len.copy_(commit_lens - 1)
+                    dspark_accept_done = True
+                except Exception as e:
+                    self._use_triton_accept_bonus = False
+                    logger.warning(
+                        "Qwen3 DSpark Triton accept/bonus failed; falling back to eager path: %s",
+                        e,
+                    )
+            if use_dspark_accept and not dspark_accept_done:
+                match_len, bonus = compute_dflash_correct_drafts_and_bonus(
+                    candidates=candidates,
+                    target_predict=target_predict,
+                )
+                confident_prefix = self._confident_prefix(self._draft_confidence)
+                accept_len = torch.minimum(
+                    match_len.to(torch.int64), confident_prefix.to(torch.int64)
+                )
+                commit_lens = accept_len.to(torch.int32) + 1
+                out_tokens = torch.empty(
+                    (bs, int(self.block_size)), dtype=torch.int64, device=device
+                )
+                if int(self.block_size) > 1:
+                    out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
+                out_tokens[:, int(self.block_size) - 1].fill_(0)
+                out_tokens.scatter_(
+                    1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                )
+            elif self._use_triton_accept_bonus:
                 try:
                     (
                         accept_len,
@@ -1688,7 +1874,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     out_tokens.scatter_(
                         1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                     )
-            else:
+            elif not use_dspark_accept:
                 accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
                     candidates=candidates,
                     target_predict=target_predict,

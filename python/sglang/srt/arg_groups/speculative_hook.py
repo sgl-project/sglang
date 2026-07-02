@@ -20,6 +20,7 @@ def _resolve_speculative_algorithm_alias(
     """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
 
     is_gemma4_draft = False
+    is_qwen3_dspark_draft = False
     if speculative_draft_model_path:
         from sglang.srt.utils.hf_transformers_utils import get_config
 
@@ -30,6 +31,9 @@ def _resolve_speculative_algorithm_alias(
         is_gemma4_draft = any(
             arch in ("Gemma4AssistantForCausalLM", "Gemma4UnifiedAssistantForCausalLM")
             for arch in draft_archs
+        )
+        is_qwen3_dspark_draft = any(
+            arch == "Qwen3DSparkDraftModel" for arch in draft_archs
         )
 
     if speculative_algorithm == "EAGLE3" and is_gemma4_draft:
@@ -47,6 +51,13 @@ def _resolve_speculative_algorithm_alias(
             )
             return "FROZEN_KV_MTP"
         return "EAGLE"
+
+    if speculative_algorithm == "DSPARK" and is_qwen3_dspark_draft:
+        logger.info(
+            "Detected Qwen3DSparkDraftModel draft; "
+            "routing --speculative-algorithm DSPARK to DFLASH."
+        )
+        return "DFLASH"
 
     return speculative_algorithm
 
@@ -129,6 +140,14 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
 
 def _handle_dflash(server_args: ServerArgs) -> None:
+    if (
+        server_args.speculative_dflash_block_size is None
+        and server_args.speculative_dspark_block_size is not None
+    ):
+        server_args.speculative_dflash_block_size = (
+            server_args.speculative_dspark_block_size
+        )
+
     if server_args.enable_dp_attention:
         raise ValueError(
             "Currently DFLASH speculative decoding does not support dp attention."
