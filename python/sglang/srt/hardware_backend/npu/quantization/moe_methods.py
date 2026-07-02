@@ -16,10 +16,7 @@ if TYPE_CHECKING:
 
 import logging
 
-from sglang.srt.hardware_backend.npu.moe.hidden_states_quant import (
-    HiddenStatesDynamicQuant,
-    HiddenStatesMXFPDynamicQuant,
-)
+from sglang.srt.hardware_backend.npu.moe.hidden_states_quant import HiddenStatesDynamicQuant
 from sglang.srt.hardware_backend.npu.moe.matmul import GroupedMatmul
 
 logger = logging.getLogger(__name__)
@@ -273,7 +270,7 @@ class NPUW4A4Mxfp4MoEMethod(_NPUMoEMethodBase):
         self.group_size = group_size
         self.matmul = GroupedMatmul()
         # Activation quantizer for float4
-        self.hidden_states_quantizer = HiddenStatesMXFP4DynamicQuant(group_size=group_size)
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.float4_e2m1fn_x2)
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
@@ -323,8 +320,8 @@ class NPUW4A4Mxfp4MoEMethod(_NPUMoEMethodBase):
         scale_args: Dict[str, Any] = {
             "scale": [weight_scale],
             "per_token_scale": [pertoken_scale],
-            "scale_dtype": torch_npu.float8_e8m0fnu,         # 293
-            "per_token_scale_dtype": torch_npu.float8_e8m0fnu,
+            "scale_dtype": torch.float8_e8m0fnu,
+            "per_token_scale_dtype": torch.float8_e8m0fnu,
         }
 
         return self.matmul.forward(
@@ -503,7 +500,7 @@ class NPUW4A8Mxfp4MoEMethod(_NPUMoEMethodBase):
         self.group_size = group_size
         self.matmul = GroupedMatmul()
         # Activation quantizer stays the same – we still quantize to float8_e4m3fn
-        self.hidden_states_quantizer = HiddenStatesMXFP8DynamicQuant()
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.float8_e4m3fn)
 
 
     def process_weights_after_loading(
@@ -518,11 +515,11 @@ class NPUW4A8Mxfp4MoEMethod(_NPUMoEMethodBase):
         # 2) Cast weight to a hardware format that treats each byte as
         #    two float4_e2m1fn values, but presents as float8_e4m3fn.
         #    Format 29 is the Ascend ND format for this packed layout.
-        weight.data = torch_npu.npu_format_cast(
+        weight.data = torch.ops.npu.npu_format_cast(
             weight.data,
             29,
             customize_dtype=torch.float8_e4m3fn,
-            input_dtype=torch_npu.float4_e2m1fn_x2,
+            input_dtype=torch.float4_e2m1fn_x2,
         )
 
         # 3) Transpose weight: [E, N, K_packed] -> [E, K_packed, N]
@@ -571,10 +568,8 @@ class NPUW4A8Mxfp4MoEMethod(_NPUMoEMethodBase):
         scale_args: Dict[str, Any] = {
             "scale": [weight_scale],
             "per_token_scale": [pertoken_scale],
-            "scale_dtype": torch_npu.float8_e8m0fnu,
-            "per_token_scale_dtype": torch_npu.float8_e8m0fnu,
-            # If the kernel needs to know the weight is 4‑bit, uncomment:
-            # "weight_quant_type": torch_npu.float4_e2m1fn_x2,
+            "scale_dtype": torch.float8_e8m0fnu,
+            "per_token_scale_dtype": torch.float8_e8m0fnu,
         }
 
         return self.matmul.forward(
@@ -702,7 +697,7 @@ class NPUW8A8Mxfp8MoEMethod(_NPUMoEMethodBase):
         super().__init__(quant_config=None)
         self.group_size = group_size
         self.matmul = GroupedMatmul()
-        self.hidden_states_quantizer = HiddenStatesMXFP8DynamicQuant()
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.float8_e4m3fn)
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
@@ -756,8 +751,8 @@ class NPUW8A8Mxfp8MoEMethod(_NPUMoEMethodBase):
         scale_args: Dict[str, Any] = {
             "scale": [weight_scale],
             "per_token_scale": [pertoken_scale],
-            "scale_dtype": getattr(torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None)),
-            "per_token_scale_dtype": getattr(torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None)),
+            "scale_dtype": torch.float8_e8m0fnu,
+            "per_token_scale_dtype": torch.float8_e8m0fnu,
         }
     
         return self.matmul.forward(
@@ -979,8 +974,8 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         weight_fp = getattr(layer, weight_name)
         # … dtype & device checks …
     
-        qw, w_scale = torch_npu.npu_dynamic_mx_quant(
-            weight_fp, dst_type=torch_npu.float8_e4m3fn
+        qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            weight_fp, dst_type=torch.float8_e4m3fn
         )
         # qw:        [E, N, K]   (float8_e4m3fn)
         # w_scale:   [E, N, ceil(K/64), 2]   (uint8)
@@ -1022,8 +1017,8 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         scale_args = {
             "scale": [weight_scale],
             "per_token_scale": [pertoken_scale],
-            "scale_dtype": torch_npu.float8_e8m0fnu,
-            "per_token_scale_dtype": torch_npu.float8_e8m0fnu,
+            "scale_dtype": torch.float8_e8m0fnu,
+            "per_token_scale_dtype": torch.float8_e8m0fnu,
         }
         return self.matmul.forward(
             quant_info, weight_prefix, hidden_states, expert_tokens,
