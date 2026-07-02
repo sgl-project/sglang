@@ -69,9 +69,36 @@ class StreamingASRState:
                 self.emitted_text = delta
         return delta
 
+    def _trim_cjk_emitted_overlap(self, delta: str) -> str:
+        """Drop a leading all-CJK run of ``delta`` that duplicates the tail of
+        ``emitted_text``.
+
+        The whitespace-word path (``str.split``) and the CJK char path store
+        ``confirmed_text`` in incompatible encodings (space-delimited words vs a
+        spaceless char run). When a stream flips between them -- code-switching
+        CJK<->Latin, or a slicing item disarming back to the cumulative path --
+        the reconciler yields ``common_count == 0`` and re-emits an already-sent
+        CJK prefix. Only ever trims an all-CJK overlap ending on a CJK/space
+        boundary, so Latin word extension ("world"->"worldly") and legitimate
+        repeats (reconciled with ``common_count > 0``) are never touched.
+        """
+        if not delta or not self.emitted_text:
+            return delta
+        max_k = min(len(delta), len(self.emitted_text))
+        for k in range(max_k, 0, -1):
+            if self.emitted_text[-k:] != delta[:k]:
+                continue
+            # Require the overlap to be all-CJK. That alone guarantees the cut is
+            # a valid boundary (CJK chars are self-delimiting, so delta[k] -- even
+            # a glued Latin token like "abc" in "你好abc" -- starts a fresh unit),
+            # while a Latin overlap ("cat"/"cats") is rejected and never trimmed.
+            if all(_is_cjk(c) for c in delta[:k]):
+                return delta[k:].lstrip()
+        return delta
+
     def update(self, new_transcript: str, *, cumulative: bool = True) -> str:
         if _is_cjk_no_whitespace(new_transcript):
-            return self._update_chars(new_transcript, cumulative=cumulative)
+            return self._update_chars(new_transcript)
 
         old_confirmed = self.confirmed_text
         words = new_transcript.split()
@@ -86,66 +113,86 @@ class StreamingASRState:
         # "worldly" emitted "ly").
         old_words = old_confirmed.split()
         new_words = self.confirmed_text.split()
-        common_count = 0
-        for ow, nw in zip(old_words, new_words):
-            if ow != nw:
-                break
-            common_count += 1
-        if common_count == 0 and cumulative and old_words and new_words:
-            # Cumulative snapshots may revise early casing/punctuation. In that
-            # case, keep streaming append-only instead of re-emitting everything.
-            return self._record_emit(" ".join(new_words[len(old_words) :]))
-        return self._record_emit(" ".join(new_words[common_count:]))
+        if cumulative:
+            # Normalized compare so recasing/repunctuation of an already-emitted
+            # word (He->he, But->but, .->,) does not reset the common prefix.
+            # Emit from the first genuinely-different word: this can re-send an
+            # early word the model revised, but never DROPS a new one (all new
+            # words are at the tail, at index >= common_count).
+            common_count = _norm_common_prefix_len(old_words, new_words)
+        else:
+            # Sliced path: each slice is a disjoint audio window and
+            # dedupe_overlap already removed the emitted overlap, so a word
+            # prefix match against the previous slice's confirmed_text is
+            # spurious -- it would drop held-back words that merely share a
+            # leading function word ("the"/"a"/"I"). Emit all of the new content.
+            common_count = 0
+        delta = " ".join(new_words[common_count:])
+        if common_count == 0:
+            # Full re-emit: guard against re-sending an already-emitted CJK
+            # prefix when the char<->word encoding flipped.
+            delta = self._trim_cjk_emitted_overlap(delta)
+        return self._record_emit(delta)
 
-    def _update_chars(self, new_transcript: str, *, cumulative: bool) -> str:
+    def _update_chars(self, new_transcript: str) -> str:
         """Use character rollback when whitespace cannot define stable words."""
         old_confirmed = self.confirmed_text
         holdback = max(0, self.unfixed_token_num)
         if holdback == 0:
-            self.confirmed_text = new_transcript
+            cut = len(new_transcript)
         elif len(new_transcript) > holdback:
-            self.confirmed_text = new_transcript[:-holdback]
+            cut = len(new_transcript) - holdback
         else:
-            self.confirmed_text = ""
+            cut = 0
+        # Never split a Latin/alnum run embedded in CJK text. Back the cut up to
+        # the nearest boundary between two word characters.
+        while (
+            0 < cut < len(new_transcript)
+            and _is_word_char(new_transcript[cut - 1])
+            and _is_word_char(new_transcript[cut])
+        ):
+            cut -= 1
+        self.confirmed_text = new_transcript[:cut]
         self.full_transcript = new_transcript
         self.chunk_index += 1
 
+        # Character common prefix: emit from the first differing char so a
+        # rewritten early character never drops the new characters after it.
+        # (No case folding -- CJK text has no case.)
         common_count = _common_prefix_len(old_confirmed, self.confirmed_text)
-        if common_count == 0 and cumulative and old_confirmed and self.confirmed_text:
-            # Same append-only guard as the word path, but with character spans.
-            return self._record_emit(self.confirmed_text[len(old_confirmed) :])
-        return self._record_emit(self.confirmed_text[common_count:])
+        delta = self.confirmed_text[common_count:]
+        if common_count == 0:
+            # Full re-emit (e.g. a sliced->cumulative flip re-transcribed the
+            # tail window): drop an already-emitted CJK prefix.
+            delta = self._trim_cjk_emitted_overlap(delta)
+        return self._record_emit(delta)
 
     def finalize(self, *, cumulative: bool = True) -> str:
         if _is_cjk_no_whitespace(self.full_transcript):
             old_confirmed = self.confirmed_text
             self.confirmed_text = self.full_transcript
+            # Emit from the first differing char; never drop the finalized tail.
             common_count = _common_prefix_len(old_confirmed, self.full_transcript)
-            if (
-                common_count == 0
-                and cumulative
-                and old_confirmed
-                and self.full_transcript
-            ):
-                # Final cumulative snapshots can also revise the beginning.
-                return self._record_emit(self.full_transcript[len(old_confirmed) :])
-            return self._record_emit(self.full_transcript[common_count:])
+            delta = self.full_transcript[common_count:]
+            if common_count == 0:
+                delta = self._trim_cjk_emitted_overlap(delta)
+            return self._record_emit(delta)
 
         confirmed_words = self.confirmed_text.split()
         all_words = self.full_transcript.split()
-        # Use word level common prefix to handle punctuation differences
-        # between intermediate chunks and the final full transcription.
-        common_count = 0
-        for cw, aw in zip(confirmed_words, all_words):
-            if cw != aw:
-                break
-            common_count += 1
+        # Word-level common prefix (normalized on the cumulative path) absorbs
+        # casing/punctuation differences between the last chunk and the final
+        # transcription without dropping any newly-finalized word.
+        if cumulative:
+            common_count = _norm_common_prefix_len(confirmed_words, all_words)
+        else:
+            # Sliced path: dedupe_overlap is the only intended dedup (see update).
+            common_count = 0
         self.confirmed_text = self.full_transcript
-        if common_count == 0 and cumulative and confirmed_words and all_words:
-            # Avoid duplicating already-emitted words when finalization rewrites
-            # the beginning of a cumulative transcript.
-            return self._record_emit(" ".join(all_words[len(confirmed_words) :]))
-        return self._record_emit(" ".join(all_words[common_count:]))
+        delta = " ".join(all_words[common_count:])
+        if common_count == 0:
+            delta = self._trim_cjk_emitted_overlap(delta)
+        return self._record_emit(delta)
 
 
 def split_audio_chunks(audio_data: bytes, chunk_size_sec: float) -> List[bytes]:
@@ -196,6 +243,13 @@ def _is_cjk(c: str) -> bool:
     )
 
 
+def _is_word_char(c: str) -> bool:
+    """A Latin/alphanumeric character that forms a contiguous word (not CJK,
+    which is self-delimiting). Used to avoid splitting an embedded word at the
+    char-rollback holdback boundary."""
+    return c.isalnum() and not _is_cjk(c)
+
+
 def _is_cjk_no_whitespace(text: str) -> bool:
     return (
         bool(text)
@@ -243,6 +297,22 @@ def _dedupe_norm(word: str) -> str:
     while hi > lo and unicodedata.category(word[hi - 1])[0] == "P":
         hi -= 1
     return word[lo:hi].lower()
+
+
+def _norm_common_prefix_len(left_words: List[str], right_words: List[str]) -> int:
+    """Word-level common-prefix length using normalized-token comparison.
+
+    Normalization (casefold + edge-punctuation strip, via ``_dedupe_norm``)
+    means recasing or repunctuation of an already-emitted word (``He``->``he``,
+    ``.``->``,``) does not reset the prefix. Cumulative snapshots therefore stay
+    append-only and never drop a genuinely-new word from the delta.
+    """
+    count = 0
+    for lw, rw in zip(left_words, right_words):
+        if _dedupe_norm(lw) != _dedupe_norm(rw):
+            break
+        count += 1
+    return count
 
 
 def _dedupe_by_word(committed_text: str, candidate_out: str) -> str:

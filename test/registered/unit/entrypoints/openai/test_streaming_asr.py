@@ -20,6 +20,7 @@ from sglang.srt.entrypoints.openai.realtime.session import (
 )
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
+    dedupe_overlap,
     process_asr_chunk,
 )
 from sglang.srt.utils import get_or_create_event_loop
@@ -148,6 +149,92 @@ class TestProcessAsrChunk(CustomTestCase):
 
         self._chunk(state, "你好世界好")
         self.assertEqual(state.emitted_text, "你好世界")
+
+    def test_cumulative_early_revision_does_not_drop_new_words(self):
+        # Regression: on the cumulative (HTTP SSE / pre-gate WS) path, when a
+        # snapshot recases word 0 and shifts the confirmed word count (here the
+        # model drops "nation"), the reconciler must not skip a genuinely-new
+        # word. The old len(old_words) tail-slice dropped "and" between "up"
+        # and "live" -- the "missing words" the reviewer saw.
+        state = self._state(unfixed_chunk_num=0, unfixed_token_num=5)
+        snapshots = [
+            "The nation will rise",
+            "The nation will rise up and",
+            "The nation will rise up and live out the true",
+            "the will rise up and live out the true meaning of its creed today",
+        ]
+        for snap in snapshots:
+            self._chunk(state, snap)
+        self._chunk(
+            state,
+            "the will rise up and live out the true meaning of its creed today done",
+            is_last=True,
+        )
+        emitted = state.emitted_text.split()
+        # Every distinct new word from the stream must survive (no drop).
+        for word in ("rise", "up", "and", "live", "out", "meaning", "creed", "done"):
+            self.assertIn(word, emitted, f"dropped new word: {word!r}")
+
+    def test_cjk_char_to_word_flip_does_not_duplicate(self):
+        # Regression: a CJK->Latin code-switch flips the spaceless char path to
+        # the whitespace word path; str.split collapses the prior CJK run into
+        # one token, so the word reconciler must not re-emit the already-emitted
+        # CJK prefix ("我今天很...我今天很...").
+        state = StreamingASRState(
+            chunk_size_sec=2.0, unfixed_chunk_num=2, unfixed_token_num=5
+        )
+        state.update("我今天很高兴认识你", cumulative=True)  # char path
+        state.update("我今天很高兴认识你 Anna", cumulative=True)  # word path (flip)
+        state.full_transcript = "我今天很高兴认识你 Anna 你叫什么名字"
+        state.finalize(cumulative=True)
+        self.assertEqual(state.emitted_text, "我今天很高兴认识你 Anna 你叫什么名字")
+
+    def test_sliced_path_keeps_held_back_words_sharing_leading_token(self):
+        # Regression: on the sliced path (cumulative=False) dedupe_overlap is the
+        # only intended dedup. A word-prefix match against the previous slice's
+        # confirmed_text must not drop a held-back word that merely shares a
+        # leading function word ("the").
+        state = StreamingASRState(
+            chunk_size_sec=2.0, unfixed_chunk_num=2, unfixed_token_num=2
+        )
+        state.confirmed_text = "the dog saw"
+        state.emitted_text = "the dog saw"
+        deduped = dedupe_overlap("the dog saw", "saw the cat ran up")
+        self.assertEqual(deduped, "the cat ran up")
+        state.update(deduped, cumulative=False)
+        self.assertEqual(state.emitted_text, "the dog saw the cat")
+
+    def test_legit_cjk_repeat_is_preserved(self):
+        # Guard the fix's boundary: a genuine adjacent CJK repeat reconciles with
+        # common_count > 0, so it must NOT be trimmed as a flip-duplication.
+        state = StreamingASRState(
+            chunk_size_sec=2.0, unfixed_chunk_num=2, unfixed_token_num=0
+        )
+        state.update("你好", cumulative=True)
+        state.update("你好你好", cumulative=True)
+        self.assertEqual(state.emitted_text, "你好你好")
+
+    def test_glued_cjk_latin_flip_does_not_duplicate(self):
+        # Regression: CJK glued directly to a Latin token ("你好abc", no space).
+        # The trim must still cut the already-emitted CJK prefix even though the
+        # char after the overlap is Latin.
+        state = StreamingASRState(
+            chunk_size_sec=1.0, unfixed_chunk_num=0, unfixed_token_num=1
+        )
+        state.update("你好世", cumulative=True)  # char path -> emits 你好
+        state.update("你好abc def", cumulative=True)  # word path, glued
+        self.assertEqual(state.emitted_text.count("你"), 1)
+
+    def test_char_path_does_not_split_embedded_latin_word(self):
+        # Regression: a Latin word embedded in whitespace-free CJK text must not
+        # be split across the char-rollback holdback boundary.
+        state = StreamingASRState(
+            chunk_size_sec=1.0, unfixed_chunk_num=0, unfixed_token_num=2
+        )
+        state.update("中world中", cumulative=True)
+        state.update("中world中中", cumulative=True)
+        self.assertNotIn("wor" + "l d", state.emitted_text)
+        self.assertNotIn("wor ld", state.emitted_text)
 
 
 class _SlicingAdapter:
