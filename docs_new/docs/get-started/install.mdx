@@ -22,14 +22,14 @@ It is recommended to use uv for faster installation:
 ```bash Command
 pip install --upgrade pip
 pip install uv
-uv pip install sglang
+uv pip install --prerelease=allow sglang
 ```
 
 The major version of Cuda is 13 by default. To install sglang under Cuda 12 with pip or uv, please try the following commands:
 ```bash Command
 pip install --upgrade pip
 pip install uv
-uv pip install sglang
+uv pip install --prerelease=allow sglang
 uv pip install --force-reinstall  torch==2.11.0 torchaudio==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu129
 uv pip install --force-reinstall sglang-kernel --index-url https://docs.sglang.ai/whl/cu129/
 uv pip install --force-reinstall sgl-deep-gemm --index-url https://docs.sglang.ai/whl/cu129/ --no-deps

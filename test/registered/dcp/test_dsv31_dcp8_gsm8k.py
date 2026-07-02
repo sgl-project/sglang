@@ -73,7 +73,7 @@ _COMMON_SERVER_ARGS = [
     "16384",
     "--max-running-requests",
     "256",
-    "--cuda-graph-max-bs",
+    "--cuda-graph-max-bs-decode",
     "256",
     "--attention-backend",
     "flashinfer",

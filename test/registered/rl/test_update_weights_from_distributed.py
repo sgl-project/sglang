@@ -334,7 +334,7 @@ def init_process_sgl(
                 str(base_gpu_id),
                 "--tp-size",
                 str(tp_size),
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 2,
             ),
         )
