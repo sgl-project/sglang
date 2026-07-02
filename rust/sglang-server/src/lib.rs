@@ -146,6 +146,20 @@ impl Server {
         Ok((headers, ids_buf, cols.lengths))
     }
 
+    /// Park up to `timeout_ms` for an incoming request so the idle scheduler loop
+    /// sleeps instead of spinning at 100% CPU. Returns `True` when a request is
+    /// ready (the next `recv_requests` includes it). The GIL is released while
+    /// parked, and `flume` wakes the moment a request is pushed, so this adds no
+    /// latency to real requests — only the idle wait is bounded by `timeout_ms`.
+    #[pyo3(signature = (timeout_ms = 1000))]
+    fn wait_ingress(&self, py: Python<'_>, timeout_ms: u64) -> bool {
+        py.detach(|| {
+            self.rt
+                .ingress
+                .wait(std::time::Duration::from_millis(timeout_ms))
+        })
+    }
+
     /// Push a whole decode batch as ONE frame: a columnar msgpack `header`
     /// (per-request scalars + numeric-column length metadata) plus one
     /// concatenated raw `data` buffer (token ids, and — when any request wants
