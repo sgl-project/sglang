@@ -392,6 +392,18 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             if len(layers) == 0:
                 fused_disable_reason = "no layers found"
+            elif not getattr(self.draft_model, "supports_fused_context_kv", True):
+                fused_disable_reason = "draft model does not support fused context KV"
+
+            if fused_disable_reason is not None:
+                if self.tp_rank == 0:
+                    logger.info(
+                        "DFLASH fused KV materialization disabled: %s",
+                        fused_disable_reason,
+                    )
+                self._use_fused_kv_materialize = False
+                self._fused_kv_helper = None
+                return
 
             for layer_idx, layer in enumerate(layers):
                 attn = layer.self_attn
@@ -1008,7 +1020,10 @@ class DFlashWorkerV2(BaseSpecWorker):
 
                 for layer in self.draft_model.layers:
                     attn = layer.self_attn
-                    k, v = attn.kv_proj_only(ctx_hidden)
+                    layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
+                        layer, ctx_hidden
+                    )
+                    k, v = attn.kv_proj_only(layer_ctx_hidden)
                     k = attn.apply_k_norm(k)
                     k = attn.apply_k_rope(positions, k)
                     k = k.view(-1, attn.num_kv_heads, attn.head_dim)
@@ -1055,10 +1070,13 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> None:
         for layer in self.draft_model.layers:
             attn = layer.self_attn
+            layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
+                layer, ctx_hidden
+            )
             if _is_npu:
-                _, k, v = attn.forward_prepare_npu(ctx_positions, ctx_hidden)
+                _, k, v = attn.forward_prepare_npu(ctx_positions, layer_ctx_hidden)
             else:
-                k, v = attn.kv_proj_only(ctx_hidden)
+                k, v = attn.kv_proj_only(layer_ctx_hidden)
                 k = attn.apply_k_norm(k)
                 k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)

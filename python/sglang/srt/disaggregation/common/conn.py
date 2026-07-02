@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVArgs,
     KVPoll,
     KVTransferMetric,
+    StateType,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -541,7 +542,10 @@ class CommonKVManager(BaseKVManager):
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
 
     def get_mla_kv_ptrs_with_pp(
-        self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
+        self,
+        src_kv_ptrs: List[int],
+        dst_kv_ptrs: List[int],
+        state_type: Optional[StateType] = None,
     ) -> Tuple[List[int], List[int], int]:
         # Fast path: both sides use exactly the same PP layout
         if len(src_kv_ptrs) == len(dst_kv_ptrs):
@@ -554,7 +558,7 @@ class CommonKVManager(BaseKVManager):
             # layer, so we locate the sub-range for this PP stage inside each
             # section of the dst flat list.
             sliced_src_kv_ptrs, sliced_dst_kv_ptrs = self._mla_slice_ptrs_for_pp(
-                src_kv_ptrs, dst_kv_ptrs, mla_ratios
+                src_kv_ptrs, dst_kv_ptrs, mla_ratios, state_type
             )
             return (
                 sliced_src_kv_ptrs,
@@ -574,6 +578,7 @@ class CommonKVManager(BaseKVManager):
         src_kv_ptrs: List[int],
         dst_kv_ptrs: List[int],
         mla_ratios: List[int],
+        state_type: Optional[StateType] = None,
     ) -> Tuple[List[int], List[int]]:
         """Produce aligned (src, dst) pointer lists for compressed-MLA
         pools (e.g. DeepSeek V4) under PP.
@@ -588,15 +593,18 @@ class CommonKVManager(BaseKVManager):
           Each section is indexed by compressed-layer id within that
           compression bucket.
 
-        - state_data layout, length = swa_L + 2 * c4_L + c128_L:
+        - SWA state_data layout, length = swa_L + 2 * c4_L:
             [swa_layer_{0..swa_L-1},
-             compress_state_{non-None, c4_L + c128_L},
-             indexer_compress_state_{non-None, c4_L}]
+             c4_compress_state_{0..c4_L-1},
+             c4_indexer_compress_state_{0..c4_L-1}]
           ``swa_L`` is the SWA pool's actual buffer count
           (``num_effective_layers``), which can be smaller than
           ``len(mla_ratios)`` when the HF config's ``compress_ratios``
           list contains entries for layers not materialized into the SWA
           pool (e.g. an MTP/nextn slot at the tail).
+
+        - C128_STATE layout, length = c128_L:
+            [c128_compress_state_{0..c128_L-1}]
 
         src is already PP-filtered on the prefill side. dst is the
         decode-side full-model list (when decode is PP=1). We slice dst to
@@ -619,7 +627,18 @@ class CommonKVManager(BaseKVManager):
         c128_off_s = sum(1 for r in mla_ratios[:start_layer] if r == 128)
         c128_off_e = sum(1 for r in mla_ratios[:end_layer] if r == 128)
 
-        if len(dst_kv_ptrs) == kv_layout_len:
+        if state_type == StateType.C128_STATE:
+            return src_kv_ptrs, list(dst_kv_ptrs[c128_off_s:c128_off_e])
+
+        if state_type == StateType.SWA_RING:
+            swa_s = min(start_layer, len(dst_kv_ptrs))
+            swa_e = min(end_layer, len(dst_kv_ptrs))
+            return src_kv_ptrs, list(dst_kv_ptrs[swa_s:swa_e])
+
+        if (
+            state_type not in (StateType.SWA, StateType.SWA_RING, StateType.C128_STATE)
+            and len(dst_kv_ptrs) == kv_layout_len
+        ):
             sliced_dst = (
                 list(dst_kv_ptrs[c4_off_s:c4_off_e])
                 + list(dst_kv_ptrs[c4_full + c4_off_s : c4_full + c4_off_e])
@@ -627,39 +646,33 @@ class CommonKVManager(BaseKVManager):
             )
             return src_kv_ptrs, sliced_dst
 
-        # State-data layout. ``swa_L`` is derived from the actual dst
-        # length so we tolerate cases where the SWA pool has fewer
-        # buffers than ``len(mla_ratios)`` (e.g. nextn padding).
-        swa_L = len(dst_kv_ptrs) - 2 * c4_full - c128_full
+        # SWA state-data layout. ``swa_L`` is derived from the actual dst
+        # length so we tolerate cases where the SWA pool has fewer buffers
+        # than ``len(mla_ratios)`` (e.g. nextn padding). C128 state ships as
+        # a separate StateType.C128_STATE component and must not be counted
+        # here.
+        swa_L = len(dst_kv_ptrs) - 2 * c4_full
         if swa_L < 0 or swa_L > len(mla_ratios):
             raise ValueError(
                 f"Unexpected compressed-MLA dst_kv_ptrs length "
                 f"{len(dst_kv_ptrs)}; expected either {kv_layout_len} "
-                f"(kv_data) or swa_L + {2 * c4_full + c128_full} "
+                f"(kv_data) or swa_L + {2 * c4_full} "
                 f"(state_data) given compression_ratios "
                 f"(c4={c4_full}, c128={c128_full}, "
                 f"total={len(mla_ratios)})."
             )
-        # Guard against asking the prefill side to read past the SWA
-        # pool boundary.
-        assert end_layer <= swa_L, (
-            f"prefill_end_layer ({end_layer}) exceeds dst SWA pool "
-            f"buffer count ({swa_L}); compression_ratios may include "
-            f"layers (e.g. nextn) that the SWA pool does not cover."
-        )
 
-        # compress_state non-None count up to L = count(r != 0).
-        c_non_zero_s = sum(1 for r in mla_ratios[:start_layer] if r != 0)
-        c_non_zero_e = sum(1 for r in mla_ratios[:end_layer] if r != 0)
+        swa_s = min(start_layer, swa_L)
+        swa_e = min(end_layer, swa_L)
         compress_section_start = swa_L
-        indexer_section_start = swa_L + (c4_full + c128_full)
+        indexer_section_start = swa_L + c4_full
         sliced_dst = (
-            list(dst_kv_ptrs[start_layer:end_layer])
+            list(dst_kv_ptrs[swa_s:swa_e])
             + list(
                 dst_kv_ptrs[
                     compress_section_start
-                    + c_non_zero_s : compress_section_start
-                    + c_non_zero_e
+                    + c4_off_s : compress_section_start
+                    + c4_off_e
                 ]
             )
             + list(
@@ -1149,6 +1162,7 @@ class CommonKVReceiver(BaseKVReceiver):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        decode_prefix_len: Optional[int] = None,
     ):
         raise NotImplementedError
 

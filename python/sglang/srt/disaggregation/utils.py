@@ -13,7 +13,7 @@ import torch.distributed as dist
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -30,6 +30,31 @@ if TYPE_CHECKING:
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+_IS_HIP = is_hip()
+
+
+def is_dsv4_c128_online_enabled() -> bool:
+    """Return whether DSV4 C128 uses request-scoped online state."""
+    return not _IS_HIP and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+
+
+def get_dsv4_c128_state_indices(
+    req_pool_idx: int,
+    seq_len: int,
+    *,
+    online: bool,
+    ring_size: int,
+) -> np.ndarray:
+    """Return the PD transfer row/page indices for DSV4 C128 state."""
+    if seq_len == 0 or seq_len % 128 == 0:
+        return np.empty((0,), dtype=np.int32)
+    if online:
+        return np.array([int(req_pool_idx)], dtype=np.int32)
+
+    assert ring_size % 128 == 0, f"C128 ring_size must be 128-aligned, got {ring_size}"
+    pages_per_req = ring_size // 128
+    page = int(req_pool_idx) * pages_per_req + ((seq_len - 1) % ring_size) // 128
+    return np.array([page], dtype=np.int32)
 
 
 class DisaggregationMode(Enum):
@@ -689,6 +714,18 @@ def setup_state_kv_args(
                         ring_ptrs,
                         ring_lens,
                         ring_item_lens,
+                    )
+            if hasattr(token_to_kv_pool, "get_c128_state_buf_infos"):
+                c128_ptrs, c128_lens, c128_item_lens = (
+                    token_to_kv_pool.get_c128_state_buf_infos()
+                )
+                if c128_ptrs:
+                    append_state_component(
+                        kv_args,
+                        StateType.C128_STATE,
+                        c128_ptrs,
+                        c128_lens,
+                        c128_item_lens,
                     )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (
