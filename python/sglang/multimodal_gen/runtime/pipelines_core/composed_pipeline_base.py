@@ -36,9 +36,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
-    layerwise_component_matches_any_selection,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
 )
@@ -983,11 +980,9 @@ class ComposedPipelineBase(ABC):
             and not batch.is_warmup
             and not self._offload_during_compile_done
         ):
-            keep = server_args._offload_during_compile_keep
-            for name, module in self.modules.items():
-                if is_layerwise_offloaded_module(
-                    module
-                ) and not layerwise_component_matches_any_selection(name, keep):
+            for name in ("transformer", "transformer_2"):
+                module = self.get_module(name)
+                if module is not None and is_layerwise_offloaded_module(module):
                     module.disable_offload()
             self._offload_during_compile_done = True
 
