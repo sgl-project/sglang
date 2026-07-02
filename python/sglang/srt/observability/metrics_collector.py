@@ -168,6 +168,50 @@ class SchedulerStats:
 
 
 ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 3, 5, 7, 10, 20, 50, 100, 200]
+FORWARD_PASS_DURATION_BUCKETS = [
+    0.001,
+    0.002,
+    0.005,
+    0.010,
+    0.020,
+    0.050,
+    0.100,
+    0.200,
+    0.500,
+    1.0,
+    2.0,
+    5.0,
+]
+
+
+def bucket_prefill_tokens(n: int) -> str:
+    if n <= 0:
+        return "0"
+    if n < 1024:
+        return "1_1k"
+    if n < 4096:
+        return "1k_4k"
+    if n < 16384:
+        return "4k_16k"
+    if n < 65536:
+        return "16k_64k"
+    return "64k_plus"
+
+
+def bucket_decode_reqs(n: int) -> str:
+    if n <= 0:
+        return "0"
+    if n == 1:
+        return "1"
+    if n <= 4:
+        return "2_4"
+    if n <= 8:
+        return "5_8"
+    if n <= 16:
+        return "9_16"
+    if n <= 32:
+        return "17_32"
+    return "33_plus"
 
 
 def compute_routing_key_stats(routing_keys: List[Optional[str]]) -> tuple:
@@ -748,6 +792,40 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             buckets=exponential_buckets(start=0.001, width=1.62, length=30),
             labelnames=list(labels.keys()) + ["stage"],
         )
+        self.forward_pass_duration_seconds = Histogram(
+            name="sglang:forward_pass_duration_seconds",
+            documentation=(
+                "Histogram of the device-measured duration of a single model "
+                "forward pass in seconds. Bounded by the batch's own forward, "
+                "so it never includes scheduler or launch work."
+            ),
+            labelnames=list(labels.keys())
+            + ["phase", "prefill_tokens_bucket", "decode_reqs_bucket"],
+            buckets=FORWARD_PASS_DURATION_BUCKETS,
+        )
+        self.decode_step_latency_seconds = Histogram(
+            name="sglang:decode_step_latency_seconds",
+            documentation=(
+                "Histogram of the device-measured forward pass duration in "
+                "seconds, restricted to passes that include decode requests."
+            ),
+            labelnames=list(labels.keys())
+            + ["phase", "co_scheduled_prefill_bucket", "decode_reqs_bucket"],
+            buckets=FORWARD_PASS_DURATION_BUCKETS,
+        )
+        self.schedule_to_result_latency_seconds = Histogram(
+            name="sglang:schedule_to_result_latency_seconds",
+            documentation=(
+                "Histogram of the wall-clock interval in seconds from the start "
+                "of a batch's scheduling decision to the end of its result "
+                "processing. In overlap mode this deliberately spans the next "
+                "batch's scheduling and launch, so it is an engine-step "
+                "pipeline latency and not forward pass time."
+            ),
+            labelnames=list(labels.keys())
+            + ["phase", "prefill_tokens_bucket", "decode_reqs_bucket"],
+            buckets=FORWARD_PASS_DURATION_BUCKETS,
+        )
 
         # =================================================================
         # Grammar
@@ -1213,6 +1291,63 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
+
+    def observe_forward_pass_interference(
+        self,
+        duration_seconds: float,
+        phase: str,
+        prefill_tokens: int,
+        decode_reqs: int,
+    ) -> None:
+        """Record one forward pass duration and its decode-side view.
+
+        `duration_seconds` must be the duration of the batch's own forward pass
+        (the device timer's interval), not a scheduler-loop interval: these two
+        series are read as "how long did the model take on this pass", so
+        folding scheduling or launch work into them would misattribute engine
+        time to the forward.
+        """
+        prefill_tokens_bucket = bucket_prefill_tokens(prefill_tokens)
+        decode_reqs_bucket = bucket_decode_reqs(decode_reqs)
+
+        self.forward_pass_duration_seconds.labels(
+            **self.labels,
+            phase=phase,
+            prefill_tokens_bucket=prefill_tokens_bucket,
+            decode_reqs_bucket=decode_reqs_bucket,
+        ).observe(duration_seconds)
+
+        if decode_reqs <= 0:
+            return
+
+        decode_phase = "mixed" if prefill_tokens > 0 else "decode_only"
+        self.decode_step_latency_seconds.labels(
+            **self.labels,
+            phase=decode_phase,
+            co_scheduled_prefill_bucket=prefill_tokens_bucket,
+            decode_reqs_bucket=decode_reqs_bucket,
+        ).observe(duration_seconds)
+
+    def observe_schedule_to_result_latency(
+        self,
+        duration_seconds: float,
+        phase: str,
+        prefill_tokens: int,
+        decode_reqs: int,
+    ) -> None:
+        """Record the schedule-to-result interval of one engine step.
+
+        This is the pipeline-level companion of
+        `observe_forward_pass_interference`: it spans from the start of the
+        batch's scheduling decision to the end of its result processing, which
+        under overlap also covers the next batch's scheduling and launch.
+        """
+        self.schedule_to_result_latency_seconds.labels(
+            **self.labels,
+            phase=phase,
+            prefill_tokens_bucket=bucket_prefill_tokens(prefill_tokens),
+            decode_reqs_bucket=bucket_decode_reqs(decode_reqs),
+        ).observe(duration_seconds)
 
     def observe_weight_load(self, duration_seconds: float, source: str) -> None:
         # Edge-triggered: engine is paused during the update, so log_stats

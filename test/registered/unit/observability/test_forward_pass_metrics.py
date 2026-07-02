@@ -83,7 +83,54 @@ def _publish_server_args(test, **fields):
     return server_args
 
 
-def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
+class _CollectingMetricsCollector:
+    def __init__(self):
+        self.forward_pass_interference = []
+        self.schedule_to_result = []
+
+    def observe_forward_pass_interference(self, **kwargs):
+        self.forward_pass_interference.append(kwargs)
+
+    def observe_schedule_to_result_latency(self, **kwargs):
+        self.schedule_to_result.append(kwargs)
+
+    def increment_forward_execution_seconds(self, **kwargs):
+        pass
+
+
+class _FakeDeviceTimer:
+    """CPU stand-in for the CUDA-event device timer.
+
+    `record` queues the device time of one forward segment; `_report` hands the
+    queued values to every registered reporter, which is what the real timer
+    does once the segment's end event completes.
+    """
+
+    def __init__(self, reporter):
+        self._reporters = [reporter]
+        self._pending = []
+
+    def add_reporter(self, reporter):
+        self._reporters.append(reporter)
+
+    def record(self, seconds, category="decode"):
+        self._pending.append((seconds, category))
+
+    def _report(self):
+        pending, self._pending = self._pending, []
+        for seconds, category in pending:
+            for reporter in self._reporters:
+                reporter(t=seconds, category=category)
+
+
+def _make_reporter(
+    test,
+    scheduler,
+    *,
+    metrics_collector=None,
+    current_scheduler_metrics_enabled=False,
+    is_stats_logging_rank=True,
+) -> SchedulerMetricsReporter:
     if not hasattr(scheduler, "server_args"):
         scheduler.server_args = _publish_server_args(
             test,
@@ -108,11 +155,11 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
     if not hasattr(scheduler, "draft_worker"):
         scheduler.draft_worker = None
     context = types.SimpleNamespace(
-        enable_metrics=False,
-        is_stats_logging_rank=True,
-        current_scheduler_metrics_enabled=False,
+        enable_metrics=current_scheduler_metrics_enabled,
+        is_stats_logging_rank=is_stats_logging_rank,
+        current_scheduler_metrics_enabled=current_scheduler_metrics_enabled,
         enable_kv_cache_events=False,
-        collector=None,
+        collector=metrics_collector,
     )
     return SchedulerMetricsReporter(
         scheduler=scheduler,
@@ -120,7 +167,7 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
         pp_rank=0,
         dp_rank=0,
         metrics_collector_context=context,
-        metrics_collector=None,
+        metrics_collector=metrics_collector,
     )
 
 
@@ -238,6 +285,230 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertAlmostEqual(
             self.scheduler._fpm_publisher.metrics[0].wall_time, 0.035, places=4
         )
+
+    def _make_mixed_batch(self, fpm_start_time=100.0):
+        prefill_req = _FakeReq(10, prefix_len=2)
+        decode_req = _FakeReq(8, output_len=3)
+        return self._make_batch(
+            forward_mode=_FakeForwardMode(is_mixed=True, is_extend=True),
+            reqs=[prefill_req, decode_req],
+            decoding_reqs=[decode_req],
+            prefill_stats=PrefillStats(
+                log_input_tokens=1200,
+                log_hit_tokens=0,
+                new_token_ratio=1.0,
+                num_running_reqs=types.SimpleNamespace(),
+                num_new_seqs=1,
+            ),
+            seq_lens_cpu=[decode_req.seqlen],
+            fpm_start_time=fpm_start_time,
+        )
+
+    def _make_device_timed_reporter(self, metrics_collector):
+        """Build a reporter whose forward timing comes from a fake device timer."""
+        self.scheduler.enable_fpm = False
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
+                True,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.DeviceTimer",
+                _FakeDeviceTimer,
+            ),
+        ):
+            return _make_reporter(
+                self,
+                self.scheduler,
+                metrics_collector=metrics_collector,
+                current_scheduler_metrics_enabled=True,
+            )
+
+    def test_schedule_to_result_observation_does_not_require_fpm(self):
+        self.scheduler.enable_fpm = False
+        metrics_collector = _CollectingMetricsCollector()
+        self.reporter = _make_reporter(
+            self,
+            self.scheduler,
+            metrics_collector=metrics_collector,
+            current_scheduler_metrics_enabled=True,
+        )
+        batch = self._make_mixed_batch()
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
+            return_value=100.075,
+        ):
+            self.reporter.observe_forward_pass_interference(batch)
+
+        self.assertEqual(len(metrics_collector.schedule_to_result), 1)
+        observation = metrics_collector.schedule_to_result[0]
+        self.assertAlmostEqual(observation["duration_seconds"], 0.075, places=4)
+        self.assertEqual(observation["phase"], "mixed")
+        self.assertEqual(observation["prefill_tokens"], 1200)
+        self.assertEqual(observation["decode_reqs"], 1)
+        # No device timer, so there is no interval bounded by this batch's own
+        # forward pass; nothing is exported rather than a loop-bounded stand-in.
+        self.assertEqual(metrics_collector.forward_pass_interference, [])
+
+    def test_forward_duration_excludes_next_batch_scheduling_and_launch(self):
+        """`event_loop_overlap` selects (and on the steady-state branch also
+        launches) batch n+1 before it processes n's result, so a wall interval
+        started at n's selection absorbs n+1's scheduler work. The forward-pass
+        duration must stay pinned to n's own forward; only schedule-to-result
+        latency may grow with that extra work.
+        """
+
+        def run_step(next_batch_overhead: float) -> _CollectingMetricsCollector:
+            metrics_collector = _CollectingMetricsCollector()
+            reporter = self._make_device_timed_reporter(metrics_collector)
+            batch = self._make_mixed_batch(fpm_start_time=100.0)
+            # Batch n's own forward: 10 ms on device.
+            reporter.forward_pass_device_timer.record(0.010)
+            # The loop then picks and launches batch n+1 before popping n's
+            # result off the queue, which is what the extra overhead stands for.
+            with patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
+                return_value=100.020 + next_batch_overhead,
+            ):
+                reporter.observe_forward_pass_interference(batch)
+            return metrics_collector
+
+        without_overhead = run_step(0.0)
+        with_overhead = run_step(0.050)
+
+        for metrics_collector in (without_overhead, with_overhead):
+            self.assertEqual(len(metrics_collector.forward_pass_interference), 1)
+
+        # The forward pass took 10 ms in both steps; the next batch's work must
+        # not show up here.
+        self.assertAlmostEqual(
+            without_overhead.forward_pass_interference[0]["duration_seconds"],
+            0.010,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            with_overhead.forward_pass_interference[0]["duration_seconds"],
+            0.010,
+            places=6,
+        )
+
+        # It shows up here instead, under a name that says so.
+        for metrics_collector in (without_overhead, with_overhead):
+            self.assertEqual(len(metrics_collector.schedule_to_result), 1)
+        self.assertAlmostEqual(
+            without_overhead.schedule_to_result[0]["duration_seconds"],
+            0.020,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            with_overhead.schedule_to_result[0]["duration_seconds"],
+            0.070,
+            places=6,
+        )
+
+    def test_prometheus_drain_still_feeds_fpm(self):
+        """Draining the device timer for Prometheus must not starve FPM.
+
+        `observe_forward_pass_interference` calls `DeviceTimer._report()` one
+        statement before `_emit_forward_pass_metrics` runs, so FPM's own
+        accumulator is fed by the same drain. `_report()` fans out to every
+        registered reporter, so both must see the interval — if the drain ever
+        became single-subscriber, FPM would silently read zero GPU time.
+        """
+        metrics_collector = _CollectingMetricsCollector()
+        self.reporter = self._make_device_timed_reporter(metrics_collector)
+
+        # Register an FPM-style accumulator on the same timer, the way
+        # `_init_fpm` does when both FPM and Prometheus metrics are enabled.
+        self.scheduler._fpm_gpu_time_acc = 0.0
+
+        def _fpm_reporter(t, **_kwargs):
+            self.scheduler._fpm_gpu_time_acc += t
+
+        self.reporter.forward_pass_device_timer.add_reporter(_fpm_reporter)
+
+        batch = self._make_mixed_batch()
+        self.reporter.forward_pass_device_timer.record(0.012)
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
+            return_value=100.050,
+        ):
+            self.reporter.observe_forward_pass_interference(batch)
+
+        # Prometheus got the forward duration ...
+        self.assertEqual(len(metrics_collector.forward_pass_interference), 1)
+        self.assertAlmostEqual(
+            metrics_collector.forward_pass_interference[0]["duration_seconds"],
+            0.012,
+            places=6,
+        )
+        # ... and FPM saw the same interval from the same drain.
+        self.assertAlmostEqual(self.scheduler._fpm_gpu_time_acc, 0.012, places=6)
+
+    def test_forward_pass_device_time_is_not_carried_into_the_next_batch(self):
+        metrics_collector = _CollectingMetricsCollector()
+        reporter = self._make_device_timed_reporter(metrics_collector)
+
+        reporter.forward_pass_device_timer.record(0.010)
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
+            return_value=100.020,
+        ):
+            reporter.observe_forward_pass_interference(self._make_mixed_batch())
+        # Second step: the device timer reported nothing new, so no forward
+        # duration is exported and the first step's time is not reused.
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
+            return_value=100.030,
+        ):
+            reporter.observe_forward_pass_interference(self._make_mixed_batch())
+
+        self.assertEqual(len(metrics_collector.forward_pass_interference), 1)
+        self.assertEqual(len(metrics_collector.schedule_to_result), 2)
+
+    def test_forward_pass_metrics_emit_from_one_canonical_pp_rank(self):
+        """One logical engine step must produce exactly one sample.
+
+        FPM already gates to attention TP rank 0 on the final PP stage; the
+        Prometheus series follow the same rank, otherwise every stage of a
+        pp_size=N deployment exports its own stage-local timing under the same
+        series name.
+        """
+        cases = [
+            # pp_rank, pp_size, attn_tp_rank, emits
+            (0, 1, 0, True),  # no pipeline parallelism: unchanged
+            (0, 2, 0, False),  # earlier PP stage stays silent
+            (1, 2, 0, True),  # final PP stage is the canonical rank
+            (1, 2, 1, False),  # non-zero attention TP rank stays silent
+            (2, 4, 0, False),
+            (3, 4, 0, True),
+        ]
+        for pp_rank, pp_size, attn_tp_rank, emits in cases:
+            with self.subTest(pp_rank=pp_rank, pp_size=pp_size, attn_tp=attn_tp_rank):
+                self.scheduler.ps = _make_ps(
+                    pp_rank=pp_rank, pp_size=pp_size, attn_tp_rank=attn_tp_rank
+                )
+                metrics_collector = _CollectingMetricsCollector()
+                reporter = _make_reporter(
+                    self,
+                    self.scheduler,
+                    metrics_collector=metrics_collector,
+                    current_scheduler_metrics_enabled=True,
+                    is_stats_logging_rank=attn_tp_rank == 0,
+                )
+                with patch(
+                    "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
+                    return_value=100.075,
+                ):
+                    reporter.observe_forward_pass_interference(self._make_mixed_batch())
+
+                observed = len(metrics_collector.forward_pass_interference) + len(
+                    metrics_collector.schedule_to_result
+                )
+                self.assertEqual(observed, 1 if emits else 0)
+                self.assertEqual(reporter.forward_pass_metrics_enabled, emits)
 
     def test_disagg_prefill_queued_metrics_include_compute_waiting_queue(self):
         self.scheduler.disaggregation_mode = DisaggregationMode.PREFILL

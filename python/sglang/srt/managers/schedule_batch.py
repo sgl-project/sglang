@@ -2229,7 +2229,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # not read by ForwardBatch), stale in spec draft window
     req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
 
-    # Forward-pass metrics
+    # Forward-pass metrics. Stamped when this batch's scheduling decision
+    # starts, so it bounds the schedule-to-result interval, not the forward
+    # pass itself (the device timer measures that).
     fpm_start_time: float = 0.0
 
     # hicache pointer for synchronizing data loading from CPU to GPU
