@@ -176,6 +176,20 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._accept_anomaly_streaks: dict[tuple[int, object], int] = {}
         self._accept_anomaly_dumped: set[tuple[int, object]] = set()
         self._accept_anomaly_dump_count = 0
+        self._zero_draft_recovery_threshold = max(
+            1,
+            _env_int(
+                "SGLANG_DSPARK_ZERO_DRAFT_RECOVERY_THRESHOLD",
+                self._accept_anomaly_threshold,
+            ),
+        )
+        self._zero_draft_recovery_rounds = max(
+            0, _env_int("SGLANG_DSPARK_ZERO_DRAFT_RECOVERY_ROUNDS", 32)
+        )
+        self._zero_draft_recovery_log_count = 0
+        self._zero_draft_recovery_max_logs = max(
+            1, _env_int("SGLANG_DSPARK_ZERO_DRAFT_RECOVERY_MAX_LOGS", 64)
+        )
         self._stacked_wqkv_fp8_proj = None
         self._stacked_wqkv_kv_offsets: list[tuple[int, int]] = []
         self._stacked_wqkv_out_sizes: list[int] = []
@@ -765,14 +779,32 @@ class DSparkWorkerV2(BaseSpecWorker):
         verify_out_cache_loc: torch.Tensor,
         prefix_lens: torch.Tensor,
         new_seq_lens: torch.Tensor,
+        force_no_spec_mask: Optional[torch.Tensor] = None,
+        next_force_no_spec_rounds: Optional[torch.Tensor] = None,
     ) -> None:
-        if not self._accept_anomaly_enabled or commit_lens.numel() == 0:
+        recovery_enabled = (
+            self._zero_draft_recovery_rounds > 0
+            and next_force_no_spec_rounds is not None
+        )
+        if (
+            (not self._accept_anomaly_enabled and not recovery_enabled)
+            or commit_lens.numel() == 0
+        ):
             return
 
         bs, block_size = candidates.shape
         commit_lens_cpu = commit_lens.detach().cpu().tolist()
+        force_mask_cpu = (
+            force_no_spec_mask.detach().cpu().tolist()
+            if force_no_spec_mask is not None and force_no_spec_mask.numel() == bs
+            else None
+        )
         if (
-            not any(int(commit_len) <= 1 for commit_len in commit_lens_cpu)
+            not any(
+                int(commit_len) <= 1
+                and not (force_mask_cpu is not None and bool(force_mask_cpu[i]))
+                for i, commit_len in enumerate(commit_lens_cpu)
+            )
             and not self._accept_anomaly_histories
         ):
             return
@@ -810,6 +842,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             confidence_row = confidence_cpu[i]
             cache_row = verify_cache[i]
             commit_len = int(commit_lens_cpu[i])
+            force_no_spec = (
+                bool(force_mask_cpu[i]) if force_mask_cpu is not None else False
+            )
             history = self._accept_anomaly_histories.setdefault(key, [])
             history.append(
                 {
@@ -863,6 +898,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                     "next_bonus": int(next_bonus[i]),
                     "accept_len": commit_len,
+                    "force_no_spec": force_no_spec,
                     "verify_cache_first": int(cache_row[0]) if block_size > 0 else None,
                     "verify_cache_last": (
                         int(cache_row[-1]) if block_size > 0 else None
@@ -872,12 +908,34 @@ class DSparkWorkerV2(BaseSpecWorker):
             if len(history) > self._accept_anomaly_history_size:
                 del history[: len(history) - self._accept_anomaly_history_size]
 
+            if force_no_spec:
+                continue
             if commit_len <= 1:
                 streak = self._accept_anomaly_streaks.get(key, 0) + 1
                 self._accept_anomaly_streaks[key] = streak
             else:
                 self._accept_anomaly_streaks[key] = 0
                 continue
+
+            if recovery_enabled and streak >= self._zero_draft_recovery_threshold:
+                next_force_no_spec_rounds[i] = self._zero_draft_recovery_rounds
+                if (
+                    self._zero_draft_recovery_log_count
+                    < self._zero_draft_recovery_max_logs
+                ):
+                    self._zero_draft_recovery_log_count += 1
+                    logger.warning(
+                        "DSpark zero-draft recovery triggered: dp_rank=%s "
+                        "tp_rank=%s ep_rank=%s req_pool_idx=%s rid=%s "
+                        "zero_draft_streak=%s rounds=%s",
+                        self.dp_rank,
+                        self.tp_rank,
+                        self.moe_ep_rank,
+                        int(req_pool_idx),
+                        rid,
+                        streak,
+                        self._zero_draft_recovery_rounds,
+                    )
 
             if (
                 streak >= self._accept_anomaly_threshold
@@ -927,6 +985,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             int(self.block_size),
         )
 
+    def _get_force_no_spec_rounds(
+        self, draft_input: DSparkDraftInputV2, bs: int, device: torch.device
+    ) -> torch.Tensor:
+        rounds = draft_input.force_no_spec_rounds
+        if rounds.numel() == bs:
+            return rounds.to(device=device, dtype=torch.int32)
+        return torch.zeros((bs,), dtype=torch.int32, device=device)
+
     def _make_next_draft_input_prefill(
         self,
         *,
@@ -938,6 +1004,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=bonus_tokens.to(dtype=torch.int64),
             new_seq_lens=seq_lens.to(dtype=torch.int64),
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
+            force_no_spec_rounds=torch.zeros_like(seq_lens, dtype=torch.int32),
         )
 
     def _make_next_draft_input_decode(
@@ -946,11 +1013,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         bonus_tokens: torch.Tensor,
         new_seq_lens: torch.Tensor,
         cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None,
+        force_no_spec_rounds: Optional[torch.Tensor] = None,
     ) -> DSparkDraftInputV2:
+        if force_no_spec_rounds is None:
+            force_no_spec_rounds = torch.zeros_like(new_seq_lens, dtype=torch.int32)
         return DSparkDraftInputV2(
             bonus_tokens=bonus_tokens.to(dtype=torch.int64),
             new_seq_lens=new_seq_lens.to(dtype=torch.int64),
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
+            force_no_spec_rounds=force_no_spec_rounds.to(dtype=torch.int32),
         )
 
     def forward_batch_generation(
@@ -1077,6 +1148,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         block_size = int(self.block_size)
         prefix_lens = model_worker_batch.seq_lens
         req_pool_indices = model_worker_batch.req_pool_indices
+        force_no_spec_rounds = self._get_force_no_spec_rounds(draft_input, bs, device)
+        force_no_spec_mask = force_no_spec_rounds > 0
+        next_force_no_spec_rounds = torch.clamp(force_no_spec_rounds - 1, min=0)
 
         block_ids = torch.full(
             (bs, block_size), self.noise_token_id, dtype=torch.int64, device=device
@@ -1203,6 +1277,18 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+        if bs > 0 and torch.any(force_no_spec_mask):
+            target_bonus = target_predict[:, 0].to(torch.int64)
+            forced_commit_lens = torch.ones_like(commit_lens)
+            commit_lens = torch.where(
+                force_no_spec_mask, forced_commit_lens, commit_lens
+            )
+            bonus_tokens = torch.where(force_no_spec_mask, target_bonus, bonus_tokens)
+            out_tokens = out_tokens.clone()
+            out_tokens[force_no_spec_mask] = 0
+            out_tokens[force_no_spec_mask, 0] = target_bonus[force_no_spec_mask]
+            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+
         self._maybe_log_accept_anomaly(
             model_worker_batch=model_worker_batch,
             draft_input=draft_input,
@@ -1214,6 +1300,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_out_cache_loc=verify_out_cache_loc,
             prefix_lens=prefix_lens,
             new_seq_lens=new_seq_lens,
+            force_no_spec_mask=force_no_spec_mask,
+            next_force_no_spec_rounds=next_force_no_spec_rounds,
         )
 
         hidden = logits_output.hidden_states
@@ -1259,6 +1347,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
             cur_allocated_seq_lens_cpu=draft_input.reserved_seq_lens_cpu,
+            force_no_spec_rounds=next_force_no_spec_rounds,
         )
         next_draft_input.carry_prepare_buffers_from(draft_input)
         verify_done = torch.get_device_module(device).Event()

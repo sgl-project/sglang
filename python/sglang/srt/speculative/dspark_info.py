@@ -216,6 +216,9 @@ class DSparkDraftInputV2(SpecInput):
     hidden_states: torch.Tensor = field(
         default_factory=lambda: torch.empty((0, 0), dtype=torch.float16)
     )
+    force_no_spec_rounds: torch.Tensor = field(
+        default_factory=lambda: torch.empty((0,), dtype=torch.int32)
+    )
     direct_carry_valid: bool = True
     future_indices: Optional[torch.Tensor] = None
     _prepare_batch_seq_lens_cpu_buf: Optional[torch.Tensor] = None
@@ -236,6 +239,7 @@ class DSparkDraftInputV2(SpecInput):
         self.topk_p = move_empty_to_device(self.topk_p)
         self.topk_index = move_empty_to_device(self.topk_index)
         self.hidden_states = move_empty_to_device(self.hidden_states)
+        self.force_no_spec_rounds = move_empty_to_device(self.force_no_spec_rounds)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return 1, 1
@@ -291,6 +295,7 @@ class DSparkDraftInputV2(SpecInput):
             topk_p=torch.empty((0, 0), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, 0), device=device, dtype=torch.int64),
             hidden_states=torch.empty((0, 0), device=device, dtype=torch.float16),
+            force_no_spec_rounds=torch.empty((0,), device=device, dtype=torch.int32),
             verify_done=None,
         )
 
@@ -390,6 +395,8 @@ class DSparkDraftInputV2(SpecInput):
         if self.reserved_seq_lens_cpu is not None:
             self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[cpu_indices]
             self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
+        if self.force_no_spec_rounds.numel() > 0:
+            self.force_no_spec_rounds = self.force_no_spec_rounds[new_indices]
 
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
@@ -431,6 +438,10 @@ class DSparkDraftInputV2(SpecInput):
         else:
             self.reserved_seq_lens_cpu = None
             self.reserved_seq_lens_sum = None
+
+        self.force_no_spec_rounds = torch.cat(
+            [self.force_no_spec_rounds, spec_info.force_no_spec_rounds], dim=0
+        )
 
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
