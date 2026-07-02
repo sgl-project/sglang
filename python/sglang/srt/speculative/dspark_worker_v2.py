@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.distributed import (
+    get_tp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
@@ -39,6 +40,7 @@ from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.speculative.triton_ops.dspark import (
     _compute_dspark_accept_bonus_triton_unchecked,
+    _compute_dspark_vocab_argmax_triton_unchecked,
 )
 from sglang.srt.utils import is_cuda, is_hip
 from sglang.srt.utils.common import empty_context
@@ -142,6 +144,22 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._markov_refine_buffer_cap: int = 0
         self._markov_candidates_buf: Optional[torch.Tensor] = None
         self._markov_embeds_buf: Optional[torch.Tensor] = None
+        self._use_triton_vocab_argmax = is_cuda() or is_hip()
+        self._vocab_argmax_local_token_ids: Optional[torch.Tensor] = None
+        self._vocab_argmax_local_token_ids_key: Optional[tuple] = None
+        self._vocab_argmax_partial_cap: int = 0
+        self._vocab_argmax_partial_chunks: int = 0
+        self._vocab_argmax_partial_scores: Optional[torch.Tensor] = None
+        self._vocab_argmax_partial_tokens: Optional[torch.Tensor] = None
+        self._vocab_argmax_local_scores: Optional[torch.Tensor] = None
+        self._vocab_argmax_local_tokens: Optional[torch.Tensor] = None
+        self._vocab_argmax_gather_cap: int = 0
+        self._vocab_argmax_gathered_scores: Optional[torch.Tensor] = None
+        self._vocab_argmax_gathered_tokens: Optional[torch.Tensor] = None
+        self._vocab_argmax_index_cap: int = 0
+        self._vocab_argmax_best_rank: Optional[torch.Tensor] = None
+        self._vocab_argmax_rank_index: Optional[torch.Tensor] = None
+        self._vocab_argmax_selected_tokens: Optional[torch.Tensor] = None
         self._stacked_wqkv_fp8_proj = None
         self._stacked_wqkv_kv_offsets: list[tuple[int, int]] = []
         self._stacked_wqkv_out_sizes: list[int] = []
@@ -522,6 +540,239 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         self._markov_refine_buffer_cap = new_cap
 
+    def _get_vocab_argmax_local_token_ids(
+        self, lm_head, vocab_shard: int, device: torch.device
+    ) -> torch.Tensor:
+        shard = getattr(lm_head, "shard_indices", None)
+        if shard is None:
+            key = (
+                "full",
+                str(device),
+                int(vocab_shard),
+                int(self._draft_inner.vocab_size),
+            )
+        else:
+            key = (
+                "shard",
+                str(device),
+                int(vocab_shard),
+                int(shard.org_vocab_start_index),
+                int(shard.org_vocab_end_index),
+                int(shard.num_org_elements),
+                int(shard.num_org_elements_padded),
+                int(shard.added_vocab_start_index),
+                int(shard.added_vocab_end_index),
+                int(shard.num_added_elements),
+            )
+        if (
+            self._vocab_argmax_local_token_ids is not None
+            and self._vocab_argmax_local_token_ids_key == key
+            and self._vocab_argmax_local_token_ids.device == device
+        ):
+            return self._vocab_argmax_local_token_ids
+
+        token_ids = torch.full((int(vocab_shard),), -1, dtype=torch.int64, device=device)
+        if shard is None:
+            valid = min(int(vocab_shard), int(self._draft_inner.vocab_size))
+            if valid > 0:
+                token_ids[:valid] = torch.arange(valid, dtype=torch.int64, device=device)
+        else:
+            num_org = min(int(shard.num_org_elements), int(vocab_shard))
+            if num_org > 0:
+                token_ids[:num_org] = torch.arange(
+                    int(shard.org_vocab_start_index),
+                    int(shard.org_vocab_start_index) + num_org,
+                    dtype=torch.int64,
+                    device=device,
+                )
+            num_added = int(shard.num_added_elements)
+            added_offset = int(shard.num_org_elements_padded)
+            if num_added > 0 and added_offset < int(vocab_shard):
+                num_added = min(num_added, int(vocab_shard) - added_offset)
+                token_ids[added_offset : added_offset + num_added] = torch.arange(
+                    int(shard.added_vocab_start_index),
+                    int(shard.added_vocab_start_index) + num_added,
+                    dtype=torch.int64,
+                    device=device,
+                )
+
+        self._vocab_argmax_local_token_ids = token_ids
+        self._vocab_argmax_local_token_ids_key = key
+        return token_ids
+
+    def _ensure_vocab_argmax_buffers(
+        self,
+        *,
+        bs: int,
+        vocab_shard: int,
+        device: torch.device,
+    ) -> None:
+        bs = int(bs)
+        vocab_shard = int(vocab_shard)
+        num_chunks = (vocab_shard + 1023) // 1024
+        if (
+            self._vocab_argmax_partial_cap >= bs
+            and self._vocab_argmax_partial_chunks >= num_chunks
+            and self._vocab_argmax_partial_scores is not None
+            and self._vocab_argmax_partial_tokens is not None
+            and self._vocab_argmax_local_scores is not None
+            and self._vocab_argmax_local_tokens is not None
+            and self._vocab_argmax_partial_scores.device == device
+            and self._vocab_argmax_partial_tokens.device == device
+        ):
+            return
+
+        new_cap = max(
+            bs,
+            (
+                self._vocab_argmax_partial_cap * 2
+                if self._vocab_argmax_partial_cap > 0
+                else bs
+            ),
+        )
+        new_chunks = max(num_chunks, self._vocab_argmax_partial_chunks)
+        self._vocab_argmax_partial_scores = torch.empty(
+            (new_cap, new_chunks), dtype=torch.float32, device=device
+        )
+        self._vocab_argmax_partial_tokens = torch.empty(
+            (new_cap, new_chunks), dtype=torch.int64, device=device
+        )
+        self._vocab_argmax_local_scores = torch.empty(
+            (new_cap,), dtype=torch.float32, device=device
+        )
+        self._vocab_argmax_local_tokens = torch.empty(
+            (new_cap,), dtype=torch.int64, device=device
+        )
+        self._vocab_argmax_partial_cap = new_cap
+        self._vocab_argmax_partial_chunks = new_chunks
+
+    def _select_global_vocab_top1(
+        self, local_scores: torch.Tensor, local_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size == 1:
+            return local_tokens
+
+        bs = int(local_scores.shape[0])
+        device = local_scores.device
+        needed = int(tp_size) * bs
+        if (
+            self._vocab_argmax_gather_cap < needed
+            or self._vocab_argmax_gathered_scores is None
+            or self._vocab_argmax_gathered_tokens is None
+            or self._vocab_argmax_gathered_scores.device != device
+            or self._vocab_argmax_gathered_tokens.device != device
+        ):
+            self._vocab_argmax_gathered_scores = torch.empty(
+                (needed,), dtype=torch.float32, device=device
+            )
+            self._vocab_argmax_gathered_tokens = torch.empty(
+                (needed,), dtype=torch.int64, device=device
+            )
+            self._vocab_argmax_gather_cap = needed
+
+        if (
+            self._vocab_argmax_index_cap < bs
+            or self._vocab_argmax_best_rank is None
+            or self._vocab_argmax_rank_index is None
+            or self._vocab_argmax_selected_tokens is None
+            or self._vocab_argmax_best_rank.device != device
+            or self._vocab_argmax_selected_tokens.device != device
+        ):
+            self._vocab_argmax_best_rank = torch.empty(
+                (bs,), dtype=torch.int64, device=device
+            )
+            self._vocab_argmax_rank_index = torch.empty(
+                (1, bs), dtype=torch.int64, device=device
+            )
+            self._vocab_argmax_selected_tokens = torch.empty(
+                (1, bs), dtype=torch.int64, device=device
+            )
+            self._vocab_argmax_index_cap = bs
+
+        gathered_scores = self._vocab_argmax_gathered_scores[:needed]
+        gathered_tokens = self._vocab_argmax_gathered_tokens[:needed]
+        get_tp_group().all_gather_into_tensor(
+            gathered_scores, local_scores.contiguous()
+        )
+        get_tp_group().all_gather_into_tensor(
+            gathered_tokens, local_tokens.contiguous()
+        )
+        gathered_scores = gathered_scores.view(tp_size, bs)
+        gathered_tokens = gathered_tokens.view(tp_size, bs)
+
+        best_rank = self._vocab_argmax_best_rank[:bs]
+        torch.argmax(gathered_scores, dim=0, out=best_rank)
+        rank_index = self._vocab_argmax_rank_index[:, :bs]
+        rank_index[0].copy_(best_rank)
+        selected_tokens = self._vocab_argmax_selected_tokens[:, :bs]
+        torch.gather(gathered_tokens, 0, rank_index, out=selected_tokens)
+        return selected_tokens.view(-1)
+
+    def _local_vocab_argmax_eager(
+        self,
+        *,
+        base_logits: torch.Tensor,
+        bias: torch.Tensor,
+        local_token_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = base_logits + bias
+        invalid = local_token_ids < 0
+        if torch.any(invalid):
+            logits = logits.masked_fill(invalid.unsqueeze(0), -float("inf"))
+        local_scores, local_indices = torch.max(logits, dim=-1)
+        local_tokens = local_token_ids.gather(0, local_indices)
+        return local_scores.to(torch.float32), local_tokens
+
+    def _local_vocab_argmax(
+        self,
+        *,
+        base_logits: torch.Tensor,
+        bias: torch.Tensor,
+        lm_head,
+    ) -> torch.Tensor:
+        local_token_ids = self._get_vocab_argmax_local_token_ids(
+            lm_head, int(base_logits.shape[-1]), base_logits.device
+        )
+        if self._use_triton_vocab_argmax:
+            try:
+                self._ensure_vocab_argmax_buffers(
+                    bs=int(base_logits.shape[0]),
+                    vocab_shard=int(base_logits.shape[1]),
+                    device=base_logits.device,
+                )
+                assert self._vocab_argmax_partial_scores is not None
+                assert self._vocab_argmax_partial_tokens is not None
+                assert self._vocab_argmax_local_scores is not None
+                assert self._vocab_argmax_local_tokens is not None
+                bs = int(base_logits.shape[0])
+                num_chunks = (int(base_logits.shape[1]) + 1023) // 1024
+                local_scores = self._vocab_argmax_local_scores[:bs]
+                local_tokens = self._vocab_argmax_local_tokens[:bs]
+                _compute_dspark_vocab_argmax_triton_unchecked(
+                    base_logits=base_logits,
+                    bias=bias,
+                    local_token_ids=local_token_ids,
+                    partial_scores=self._vocab_argmax_partial_scores[:bs, :num_chunks],
+                    partial_tokens=self._vocab_argmax_partial_tokens[:bs, :num_chunks],
+                    scores_out=local_scores,
+                    tokens_out=local_tokens,
+                )
+                return self._select_global_vocab_top1(local_scores, local_tokens)
+            except Exception as e:
+                self._use_triton_vocab_argmax = False
+                logger.warning(
+                    "DSPARK Triton vocab argmax failed; falling back to eager path: %s",
+                    e,
+                )
+
+        local_scores, local_tokens = self._local_vocab_argmax_eager(
+            base_logits=base_logits,
+            bias=bias,
+            local_token_ids=local_token_ids,
+        )
+        return self._select_global_vocab_top1(local_scores, local_tokens)
+
     def _refine_block_markov(
         self,
         *,
@@ -572,14 +823,31 @@ class DSparkWorkerV2(BaseSpecWorker):
         candidates[:, 0].copy_(first_tokens)
 
         with torch.inference_mode():
-            base_logits = _gather_full_vocab(F.linear(block_hidden, lm_head.weight))
+            base_logits = F.linear(block_hidden, lm_head.weight)
             prev_tokens = candidates[:, 0]
+            use_vocab_parallel_argmax = True
             for i in range(block_size):
                 prev_embed = markov_head.get_prev_embeddings(prev_tokens)
                 markov_embeds[:, i].copy_(prev_embed)
-                bias = _gather_full_vocab(markov_head.project_bias(prev_embed))
-                bias.add_(base_logits[:, i])
-                next_tokens = torch.argmax(bias, dim=-1)
+                bias = markov_head.project_bias(prev_embed)
+                if use_vocab_parallel_argmax and bias.shape[-1] == base_logits.shape[-1]:
+                    next_tokens = self._local_vocab_argmax(
+                        base_logits=base_logits[:, i],
+                        bias=bias,
+                        lm_head=lm_head,
+                    )
+                else:
+                    if use_vocab_parallel_argmax and self.tp_rank == 0:
+                        logger.warning(
+                            "DSPARK vocab-parallel argmax disabled due to shard "
+                            "shape mismatch: base=%s bias=%s",
+                            tuple(base_logits.shape),
+                            tuple(bias.shape),
+                        )
+                    use_vocab_parallel_argmax = False
+                    full_bias = _gather_full_vocab(bias)
+                    full_bias.add_(_gather_full_vocab(base_logits[:, i]))
+                    next_tokens = torch.argmax(full_bias, dim=-1)
                 if i + 1 < block_size:
                     candidates[:, i + 1].copy_(next_tokens)
                 prev_tokens = next_tokens

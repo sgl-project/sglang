@@ -140,3 +140,146 @@ def _compute_dspark_accept_bonus_triton_unchecked(
         BLOCK_SIZE=block,
         num_warps=num_warps,
     )
+
+
+@triton.jit
+def _dspark_vocab_argmax_partial_kernel(
+    base_logits_ptr,
+    bias_ptr,
+    local_token_ids_ptr,
+    partial_scores_ptr,
+    partial_tokens_ptr,
+    base_row_stride,
+    bias_row_stride,
+    partial_row_stride,
+    vocab_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    chunk = tl.program_id(1)
+    offs = chunk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < vocab_size
+
+    token_ids = tl.load(local_token_ids_ptr + offs, mask=mask, other=-1)
+    valid = mask & (token_ids >= 0)
+    base = tl.load(
+        base_logits_ptr + row * base_row_stride + offs,
+        mask=mask,
+        other=-float("inf"),
+    )
+    bias = tl.load(
+        bias_ptr + row * bias_row_stride + offs,
+        mask=mask,
+        other=0.0,
+    )
+    scores = base.to(tl.float32) + bias.to(tl.float32)
+    scores = tl.where(valid, scores, -float("inf"))
+
+    max_score = tl.max(scores, axis=0)
+    large_token = tl.full((), 2147483647, tl.int64)
+    best_token = tl.min(
+        tl.where((scores == max_score) & valid, token_ids, large_token), axis=0
+    )
+    best_token = tl.where(best_token == large_token, -1, best_token)
+
+    out = partial_scores_ptr + row * partial_row_stride + chunk
+    tl.store(out, max_score)
+    tl.store(partial_tokens_ptr + row * partial_row_stride + chunk, best_token)
+
+
+@triton.jit
+def _dspark_vocab_argmax_reduce_kernel(
+    partial_scores_ptr,
+    partial_tokens_ptr,
+    scores_out_ptr,
+    tokens_out_ptr,
+    partial_row_stride,
+    num_chunks,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < num_chunks
+
+    scores = tl.load(
+        partial_scores_ptr + row * partial_row_stride + offs,
+        mask=mask,
+        other=-float("inf"),
+    )
+    tokens = tl.load(
+        partial_tokens_ptr + row * partial_row_stride + offs, mask=mask, other=-1
+    )
+    valid = mask & (tokens >= 0)
+    scores = tl.where(valid, scores, -float("inf"))
+
+    max_score = tl.max(scores, axis=0)
+    large_token = tl.full((), 2147483647, tl.int64)
+    best_token = tl.min(
+        tl.where((scores == max_score) & valid, tokens, large_token), axis=0
+    )
+    best_token = tl.where(best_token == large_token, -1, best_token)
+
+    tl.store(scores_out_ptr + row, max_score)
+    tl.store(tokens_out_ptr + row, best_token)
+
+
+def _compute_dspark_vocab_argmax_triton_unchecked(
+    base_logits: torch.Tensor,
+    bias: torch.Tensor,
+    local_token_ids: torch.Tensor,
+    partial_scores: torch.Tensor,
+    partial_tokens: torch.Tensor,
+    scores_out: torch.Tensor,
+    tokens_out: torch.Tensor,
+) -> None:
+    if base_logits.ndim != 2 or bias.ndim != 2:
+        raise ValueError("DSPARK Triton vocab argmax requires 2D logits and bias.")
+    if base_logits.shape != bias.shape:
+        raise ValueError("DSPARK Triton vocab argmax requires matching logits and bias.")
+    if base_logits.stride(-1) != 1 or bias.stride(-1) != 1:
+        raise ValueError(
+            "DSPARK Triton vocab argmax requires contiguous vocab dimension."
+        )
+    if local_token_ids.ndim != 1 or local_token_ids.shape[0] != base_logits.shape[1]:
+        raise ValueError("DSPARK Triton vocab argmax got invalid token-id mapping.")
+    if local_token_ids.dtype != torch.int64:
+        raise ValueError("DSPARK Triton vocab argmax requires int64 token ids.")
+
+    batch_size, vocab_size = base_logits.shape
+    if batch_size == 0:
+        return
+
+    block = 1024
+    num_chunks = triton.cdiv(vocab_size, block)
+    if partial_scores.shape[0] < batch_size or partial_scores.shape[1] < num_chunks:
+        raise ValueError("DSPARK Triton vocab argmax partial score buffer is too small.")
+    if partial_tokens.shape[0] < batch_size or partial_tokens.shape[1] < num_chunks:
+        raise ValueError("DSPARK Triton vocab argmax partial token buffer is too small.")
+    if scores_out.shape[0] < batch_size or tokens_out.shape[0] < batch_size:
+        raise ValueError("DSPARK Triton vocab argmax output buffer is too small.")
+
+    _dspark_vocab_argmax_partial_kernel[(batch_size, num_chunks)](
+        base_logits,
+        bias,
+        local_token_ids,
+        partial_scores,
+        partial_tokens,
+        base_logits.stride(0),
+        bias.stride(0),
+        partial_scores.stride(0),
+        vocab_size,
+        BLOCK_SIZE=block,
+        num_warps=8,
+    )
+
+    reduce_block = triton.next_power_of_2(num_chunks)
+    _dspark_vocab_argmax_reduce_kernel[(batch_size,)](
+        partial_scores,
+        partial_tokens,
+        scores_out,
+        tokens_out,
+        partial_scores.stride(0),
+        num_chunks,
+        BLOCK_SIZE=reduce_block,
+        num_warps=_pick_num_warps(reduce_block),
+    )
