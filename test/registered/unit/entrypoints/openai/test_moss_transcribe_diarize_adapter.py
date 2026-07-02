@@ -65,6 +65,27 @@ class TestMossTranscribeDiarizeAdapter(CustomTestCase):
         self.assertEqual(resp.segments[1].end, 13.82)
         self.assertEqual(resp.segments[1].text, "[S02]生意行吗你们哥俩")
 
+    def test_verbose_response_parses_segments_with_optional_whitespace(self):
+        text = (
+            "[0.41] [S01] 有一个人前来买瓜 [1.65]\n"
+            "[12.24] [S02] 生意行吗你们哥俩 [13.82]"
+        )
+        resp = MossTranscribeDiarizeAdapter().build_verbose_response(
+            TranscriptionRequest(audio_duration_s=13.9),
+            text,
+            ret={},
+            tokenizer=Mock(),
+            usage=TranscriptionUsage(seconds=14),
+        )
+
+        self.assertEqual(len(resp.segments), 2)
+        self.assertEqual(resp.segments[0].start, 0.41)
+        self.assertEqual(resp.segments[0].end, 1.65)
+        self.assertEqual(resp.segments[0].text, "[S01]有一个人前来买瓜")
+        self.assertEqual(resp.segments[1].start, 12.24)
+        self.assertEqual(resp.segments[1].end, 13.82)
+        self.assertEqual(resp.segments[1].text, "[S02]生意行吗你们哥俩")
+
     def test_verbose_response_keeps_empty_segments_when_format_missing(self):
         resp = MossTranscribeDiarizeAdapter().build_verbose_response(
             TranscriptionRequest(audio_duration_s=1.0),
