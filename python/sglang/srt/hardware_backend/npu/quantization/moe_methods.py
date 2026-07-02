@@ -1076,8 +1076,8 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         scale_args = {
             "scale": [weight_scale],
             "per_token_scale": [pertoken_scale],
-            "scale_dtype": torch_npu.float8_e8m0fnu if pertoken_scale.dtype == torch_npu.float8_e8m0fnu else None,
-            "per_token_scale_dtype": torch_npu.float8_e8m0fnu if pertoken_scale.dtype == torch_npu.float8_e8m0fnu else None,
+            "scale_dtype": torch_npu.float8_e8m0fnu,
+            "per_token_scale_dtype": torch_npu.float8_e8m0fnu,
         }
         return self.matmul.forward(
             quant_info, weight_prefix, hidden_states, expert_tokens,
