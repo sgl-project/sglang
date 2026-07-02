@@ -1,6 +1,6 @@
 //! Runtime bootstrap: wires channels, pins CPU-bound pools, starts the tokio
 //! API server, and returns a handle the Python boundary uses for
-//! `recv_requests` (ingress drain) and `push_chunk` (egress push).
+//! `recv_requests` (ingress drain) and `push_batch` (egress push).
 //!
 //! Thread layout:
 //!   * API server   — tokio multi-thread runtime (I/O bound), pinned core set A
@@ -52,11 +52,6 @@ pub struct RuntimeConfig {
     pub tokenizer_path: Option<String>,
     /// HF revision used only when `tokenizer_path` is a repo id. `None` → main.
     pub revision: Option<String>,
-    /// Headless mode (`dp_size > 1`): when `Some(addr)`, the HTTP api-server is
-    /// replaced by a TCP transport listening on `addr`. A standalone api-server
-    /// process connects and drives this rank's pipeline over two connections
-    /// (ingress / egress). `None` → embedded HTTP api-server on `bind` (today).
-    pub headless: Option<SocketAddr>,
     /// Static server metadata (server_args + model_config) for config endpoints.
     /// `Arc` so cloning the config (and, downstream, each `AppState`) is cheap;
     /// `ServerArgs` itself is immutable after construction.
@@ -77,7 +72,6 @@ impl Default for RuntimeConfig {
             cores: None,
             tokenizer_path: None,
             revision: None,
-            headless: None,
             server_args: Arc::new(ServerArgs::default()),
         }
     }
@@ -159,10 +153,6 @@ impl ServerArgs {
             .map(str::to_owned)
     }
 
-    pub fn dp_size(&self) -> usize {
-        self.usize_field("dp_size").unwrap_or(1)
-    }
-
     /// `tokenizer_worker_num` — pinned tokenizer threads (server_args default 1).
     pub fn tokenizer_worker_num(&self) -> usize {
         self.usize_field("tokenizer_worker_num").unwrap_or(1)
@@ -173,43 +163,14 @@ impl ServerArgs {
         self.usize_field("detokenizer_worker_num").unwrap_or(1)
     }
 
-    /// for embedded HTTP api-server and headless TCP transport:
-    /// pinned API threads (server_args default 4).
+    /// Pinned API threads for the embedded HTTP api-server (server_args
+    /// default 4).
     pub fn api_worker_num(&self) -> usize {
         let default_worker_num = 4
             .max(self.tokenizer_worker_num())
             .max(self.detokenizer_worker_num());
         self.usize_field("api_worker_num")
             .unwrap_or(default_worker_num)
-    }
-
-    pub fn standalone_api_server_num(&self) -> usize {
-        let default_worker_num = self.api_worker_num() * self.dp_size();
-        self.usize_field("standalone_api_server_num")
-            .unwrap_or(default_worker_num)
-    }
-
-    // Headless TCP transport pool sizes (connections per rank), scaled to the
-    // api/TCP worker count — the pipeline's throughput bound — so a busy rank has
-    // enough independent connections to avoid head-of-line blocking. The
-    // directions are asymmetric: ingress carries the large one-shot `input_ids`
-    // writes (more HOL-prone → 2×), egress carries small streamed frames (1×).
-    // With `max(tok, detok) = 128` that's 256 + 128 = 384 sockets per rank.
-    //
-    // `egress_pool_size` is the egress shard count, so the rank (which binds) and
-    // the api-server (which connects) must agree — both derive it from the same
-    // `server_args`. `ingress_pool_size` only sizes the api-server's write
-    // fan-out (the rank accepts any number), so it needn't match. Both are
-    // bounded so the handshake index fits a `u8`.
-
-    /// Ingress connections per rank (api-server write fan-out): 2× workers.
-    pub fn ingress_pool_size(&self) -> usize {
-        (2 * self.api_worker_num()).clamp(2, 256)
-    }
-
-    /// Egress connections / shards per rank: 1× workers. Agreed by both ends.
-    pub fn egress_pool_size(&self) -> usize {
-        self.api_worker_num().clamp(1, 128)
     }
 
     /// `skip_tokenizer_init`: when set the server neither tokenizes input nor
@@ -222,25 +183,6 @@ impl ServerArgs {
             .get("skip_tokenizer_init")
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
-    }
-
-    /// `reasoning_parser` family name (e.g. `deepseek-r1`, `qwen3`, `gpt-oss`).
-    /// `None` → `/v1/chat/completions` returns content without splitting out a
-    /// `reasoning_content`. `dynamo-parsers` normalizes the name and falls back
-    /// to a basic `<think>…</think>` parser for unknown families.
-    pub fn reasoning_parser(&self) -> Option<String> {
-        self.str_field("reasoning_parser")
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-    }
-
-    /// `tool_call_parser` family name (e.g. `qwen`, `pythonic`, `llama3`). `None`
-    /// → no tool-call extraction; chat output stays plain content. Only consulted
-    /// when the request actually carries `tools`.
-    pub fn tool_call_parser(&self) -> Option<String> {
-        self.str_field("tool_call_parser")
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
     }
 
     fn str_field(&self, key: &str) -> Option<&str> {
@@ -393,6 +335,9 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let senders = senders.clone();
         let id_gen = id_gen.clone();
+        // Shared (Arc-backed) with the detok shards; used to decode logprob token
+        // text at frame time.
+        let api_tokenizer = dyn_tokenizer.clone();
         let handle = std::thread::Builder::new()
             .name("api-runtime".into())
             .spawn(move || {
@@ -408,24 +353,16 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     });
                 }
                 let rt = builder.build().expect("build api runtime");
-                match cfg.headless {
-                    // dp_size > 1: a standalone api-server process drives this
-                    // rank over TCP; no embedded HTTP server here.
-                    Some(tcp_bind) => rt.block_on(crate::transport::serve_headless(
-                        tcp_bind,
-                        senders,
-                        cfg.channel_cap,
-                        cfg.server_args.egress_pool_size(),
-                    )),
-                    // Embedded (dp_size == 1): HTTP api-server in-process.
-                    None => rt.block_on(api_server::serve(
-                        cfg.bind,
-                        api_server::Transport::Local(senders),
-                        id_gen,
-                        cfg.channel_cap,
-                        cfg.server_args.clone(),
-                    )),
-                }
+                rt.block_on(api_server::serve(
+                    cfg.bind,
+                    senders,
+                    id_gen,
+                    cfg.channel_cap,
+                    // Shared with detok/tokenizer pool — decodes logprob token
+                    // text when `return_text_in_logprobs` is set.
+                    cfg.server_args.clone(),
+                    api_tokenizer,
+                ))
             })
             .expect("spawn api runtime");
         threads.push(handle);
