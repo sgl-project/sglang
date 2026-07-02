@@ -928,7 +928,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
         weight_name = f"{weight_prefix}_weight"
 
-        online_quant = "w8a8_mxfp8"   # or from server_args / env
+        online_quant = "w4a8_mxfp8"   # or from server_args / env
 
         if online_quant == "w8a8_int8":
             self._apply_online_w8a8(layer, weight_prefix, weight_name)
