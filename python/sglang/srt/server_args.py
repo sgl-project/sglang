@@ -1286,7 +1286,7 @@ class ServerArgs:
     ] = False
     kv_events_config: A[
         Optional[str],
-        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
+        "Config in json format for NVIDIA Dynamo KV event publishing. Publishing will be enabled if this flag is used. HiCache L3 backup acknowledgements are published as BlockStored events with medium=EXTERNAL.",
     ] = None
     enable_forward_pass_metrics: A[
         bool,

@@ -4,6 +4,7 @@ import json
 import shutil
 import tempfile
 import time
+import types
 import unittest
 from array import array
 from dataclasses import dataclass, replace
@@ -154,6 +155,70 @@ class _FakeFullComponent(TreeComponent):
 
     def release_component_lock(self, node, params):
         return None
+
+
+def _fake_mooncake_modules(fake_store_cls):
+    mooncake = types.ModuleType("mooncake")
+    mooncake_store = types.ModuleType("mooncake.store")
+    mooncake_store.MooncakeDistributedStore = fake_store_cls
+    return {
+        "mooncake": mooncake,
+        "mooncake.store": mooncake_store,
+    }
+
+
+def _fake_mooncake_store_class():
+    class FakeMooncakeDistributedStore:
+        instances = []
+
+        def __init__(self):
+            self.existing_keys = set()
+            self.objects = {}
+            self.batch_put_calls = []
+            type(self).instances.append(self)
+
+        def setup(self, *args, **kwargs):
+            return 0
+
+        def register_buffer(self, *args, **kwargs):
+            return 0
+
+        def put(self, key, value, *args):
+            self.objects[key] = value
+            return 0
+
+        def is_exist(self, key):
+            return 1 if key in self.objects or key in self.existing_keys else 0
+
+        def get(self, key):
+            return self.objects.get(key)
+
+        def batch_is_exist(self, keys):
+            return [1 if key in self.existing_keys else 0 for key in keys]
+
+        def batch_put_from(self, keys, ptrs, sizes, *args):
+            self.batch_put_calls.append(
+                {
+                    "keys": list(keys),
+                    "ptrs": list(ptrs),
+                    "sizes": list(sizes),
+                    "args": args,
+                }
+            )
+            self.existing_keys.update(keys)
+            return [0] * len(keys)
+
+        def batch_get_into(self, keys, ptrs, sizes):
+            return [
+                size if key in self.existing_keys else -1
+                for key, size in zip(keys, sizes)
+            ]
+
+        def remove_all(self):
+            self.existing_keys.clear()
+            self.objects.clear()
+
+    return FakeMooncakeDistributedStore
 
 
 class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
@@ -2258,7 +2323,9 @@ class UnifiedRadixCacheSuite:
         storage_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
 
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        cache, allocator, req_to_token_pool = build_fixture(
+            self.cfg, enable_kv_cache_events=True
+        )
         self._init_hicache(
             cache,
             storage_backend="file",
@@ -2274,6 +2341,7 @@ class UnifiedRadixCacheSuite:
         # D->H first, then H->L3.
         self._backup_node(cache, leaf)
         self.assertTrue(leaf.hash_value)
+        cache.take_events()
         self._write_path_to_l3(cache, leaf)
         self._flush_l3_backups(cache)
 
@@ -2282,6 +2350,65 @@ class UnifiedRadixCacheSuite:
         page_hashes = self._all_page_hashes(cache, leaf)
         self.assertEqual(len(page_hashes), len(seq) // self.cfg.page_size)
         self.assertEqual(backend.batch_exists(page_hashes), len(page_hashes))
+        stored_external = [
+            e
+            for e in cache.take_events()
+            if isinstance(e, BlockStored) and e.medium == StorageMedium.EXTERNAL
+        ]
+        self.assertEqual(
+            [list(e.token_ids) for e in stored_external],
+            [
+                list(seq[i : i + self.cfg.page_size])
+                for i in range(0, len(seq), self.cfg.page_size)
+            ],
+        )
+        cache.sanity_check()
+
+    def test_hicache_l3_write_storage_mooncake_mock_publishes_external_events(self):
+        """D->H->L3 offload publishes EXTERNAL events with a mocked Mooncake store."""
+        if self._skip_unsupported_hicache_test():
+            return
+        if self.cfg.components != (ComponentType.FULL,):
+            self.skipTest("Mooncake mock coverage only needs the full-KV path")
+
+        cache, allocator, req_to_token_pool = build_fixture(
+            self.cfg, enable_kv_cache_events=True
+        )
+        self._init_hicache(
+            cache,
+            storage_backend="mooncake",
+            prefetch_threshold=1,
+        )
+
+        seq = self._make_seq(1, 4)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        leaf = m.last_device_node
+
+        self._backup_node(cache, leaf)
+        self.assertTrue(leaf.hash_value)
+        cache.take_events()
+        self._write_path_to_l3(cache, leaf)
+        self._flush_l3_backups(cache)
+
+        page_hashes = self._all_page_hashes(cache, leaf)
+        self.assertEqual(len(page_hashes), len(seq) // self.cfg.page_size)
+        self.assertEqual(
+            cache.cache_controller.storage_backend.batch_exists(page_hashes),
+            len(page_hashes),
+        )
+        stored_external = [
+            e
+            for e in cache.take_events()
+            if isinstance(e, BlockStored) and e.medium == StorageMedium.EXTERNAL
+        ]
+        self.assertEqual(
+            [list(e.token_ids) for e in stored_external],
+            [
+                list(seq[i : i + self.cfg.page_size])
+                for i in range(0, len(seq), self.cfg.page_size)
+            ],
+        )
         cache.sanity_check()
 
     def test_hicache_l3_prefetch(self):
@@ -2572,18 +2699,18 @@ class UnifiedRadixCacheSuite:
             self.addCleanup(patcher.stop)
 
         storage_extra_config = None
-        if storage_backend == "file":
+        if storage_backend in ("file", "mooncake"):
             from sglang.srt.runtime_context import get_parallel
 
-            # The file-backend storage config records TP/PP rank/size. These unit
-            # fixtures run without initializing distributed parallel state, so
-            # force the local single-rank topology the fixture represents.
+            # Storage backends record TP/PP rank/size. These unit fixtures run
+            # without distributed parallel state, so force the local topology.
             parallel_override = get_parallel().override(
                 tp_rank=0, tp_size=1, pp_rank=0, pp_size=1
             )
             parallel_override.__enter__()
             self.addCleanup(parallel_override.__exit__, None, None, None)
 
+        if storage_backend == "file":
             assert storage_dir is not None, "file backend needs a storage_dir"
             # HiCacheFile reads the directory from this env var.
             cm = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(storage_dir)
@@ -2593,6 +2720,21 @@ class UnifiedRadixCacheSuite:
             if prefetch_threshold is not None:
                 extra["prefetch_threshold"] = prefetch_threshold
             storage_extra_config = json.dumps(extra) if extra else None
+        elif storage_backend == "mooncake":
+            fake_store_cls = _fake_mooncake_store_class()
+            mooncake_patcher = mock.patch.dict(
+                "sys.modules", _fake_mooncake_modules(fake_store_cls)
+            )
+            mooncake_patcher.start()
+            self.addCleanup(mooncake_patcher.stop)
+            extra = {
+                "master_server_address": "127.0.0.1:50051",
+                "check_server": False,
+                "global_segment_size": 1024 * 1024,
+            }
+            if prefetch_threshold is not None:
+                extra["prefetch_threshold"] = prefetch_threshold
+            storage_extra_config = json.dumps(extra)
 
         server_args = ServerArgs(
             model_path="dummy",

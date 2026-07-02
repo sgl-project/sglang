@@ -3,6 +3,8 @@
 import os
 import unittest
 from array import array
+from queue import Queue
+from types import SimpleNamespace
 
 import torch
 
@@ -96,6 +98,13 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
             if isinstance(e, BlockStored) and e.medium == StorageMedium.CPU
         ]
 
+    def _stored_external_events(self, cache):
+        return [
+            e
+            for e in cache.take_events()
+            if isinstance(e, BlockStored) and e.medium == StorageMedium.EXTERNAL
+        ]
+
     def test_split_pending_write_through_publishes_fragments(self):
         cache, allocator = self._build_cache()
         cache.take_events()
@@ -119,6 +128,47 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
         )
         self.assertIsNone(stored_cpu[0].parent_block_hash)
         self.assertEqual(stored_cpu[1].parent_block_hash, stored_cpu[0].block_hashes[0])
+
+    def test_storage_backup_ack_publishes_external_event(self):
+        cache, allocator = self._build_cache()
+        cache.take_events()
+
+        tokens = [1, 2, 3, 4]
+        self._insert(cache, allocator, tokens)
+        node = self._leaf_for(cache, tokens)
+        cache.take_events()
+
+        ack_id = 7
+        node.protect_host()
+        cache.ongoing_backup[ack_id] = (node, [node])
+        ack_backup_queue = Queue()
+        ack_backup_queue.put(
+            SimpleNamespace(id=ack_id, completed_tokens=len(tokens), token_ids=tokens)
+        )
+        cache.cache_controller = SimpleNamespace(
+            prefetch_revoke_queue=Queue(),
+            ack_backup_queue=ack_backup_queue,
+            host_mem_release_queue=Queue(),
+        )
+
+        cache._drain_storage_control_queues_impl(
+            n_revoke=0,
+            n_backup=1,
+            n_release=0,
+            log_metrics=False,
+        )
+
+        stored_external = self._stored_external_events(cache)
+        self.assertEqual(
+            [list(e.token_ids) for e in stored_external],
+            [[1, 2], [3, 4]],
+        )
+        self.assertIsNone(stored_external[0].parent_block_hash)
+        self.assertEqual(
+            stored_external[1].parent_block_hash,
+            stored_external[0].block_hashes[0],
+        )
+        self.assertNotIn(ack_id, cache.ongoing_backup)
 
 
 if __name__ == "__main__":

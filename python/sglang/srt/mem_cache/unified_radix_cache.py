@@ -2164,6 +2164,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 entry = self.ongoing_backup.pop(operation.id, None)
                 if entry is not None:
                     node, lock_params = entry
+                    # Non-owner ranks can receive a zero-token ack when L3
+                    # backup is skipped. Partial writes must not publish the
+                    # whole node as externally stored.
+                    if operation.completed_tokens >= len(operation.token_ids):
+                        self._record_store_event(node, medium=StorageMedium.EXTERNAL)
                     self.dec_host_lock_ref(node, lock_params)
                 if (
                     log_metrics

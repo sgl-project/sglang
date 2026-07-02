@@ -15,6 +15,8 @@ metadata:
 
 ## Non-negotiables
 
+- **Run pre-commit before every commit.**
+  Do not create a commit until `pre-commit run --all-files` has completed successfully, or until you have clearly documented the local environment blocker and the narrower checks that passed.
 - **Do not guess flags, defaults, or behavior.**
   If you’re documenting CLI args, env vars, APIs, or performance behavior, verify against:
   - the upstream codebase (`sgl-project/sglang`)

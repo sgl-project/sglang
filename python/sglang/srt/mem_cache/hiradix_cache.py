@@ -551,7 +551,8 @@ class HiRadixCache(RadixCache):
 
         # Force release leftover backup ops: drop host protection on nodes.
         try:
-            for ack_id, node in list(self.ongoing_backup.items()):
+            for ack_id, entry in list(self.ongoing_backup.items()):
+                node, _publish_nodes = entry
                 try:
                     node.release_host()
                 except Exception:
@@ -609,7 +610,16 @@ class HiRadixCache(RadixCache):
                 ack_id = operation.id
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
-                    entry.release_host()
+                    node, publish_nodes = entry
+                    # Non-owner ranks can receive a zero-token ack when L3
+                    # backup is skipped. Partial writes must not publish the
+                    # whole node as externally stored.
+                    if operation.completed_tokens >= len(operation.token_ids):
+                        for publish_node in publish_nodes:
+                            self._record_store_event(
+                                publish_node, medium=StorageMedium.EXTERNAL
+                            )
+                    node.release_host()
                 if log_metrics and self.enable_storage_metrics:
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
@@ -865,8 +875,9 @@ class HiRadixCache(RadixCache):
                 node.hash_value,
                 node.host_value,
             )
+            publish_nodes = [node]
         else:
-            top, key, hash_value, host_value = self._concat_split_chain(
+            top, key, hash_value, host_value, publish_nodes = self._concat_split_chain(
                 node, backup_len
             )
 
@@ -879,7 +890,7 @@ class HiRadixCache(RadixCache):
         operation_id = self.cache_controller.write_storage(
             host_value, key, hash_value, prefix_keys, **self._get_extra_pools()
         )
-        self.ongoing_backup[operation_id] = node
+        self.ongoing_backup[operation_id] = (node, publish_nodes)
         node.protect_host()
 
     def _concat_split_chain(self, node: TreeNode, backup_len: int):
@@ -914,7 +925,7 @@ class HiRadixCache(RadixCache):
         else:
             hash_value = None
         host_value = torch.cat([n.host_value for n in chain])
-        return top, key, hash_value, host_value
+        return top, key, hash_value, host_value, chain
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         # skip the hit count update for chunked requests
