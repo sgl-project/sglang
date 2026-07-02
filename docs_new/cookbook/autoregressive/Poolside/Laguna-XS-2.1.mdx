@@ -10,7 +10,7 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Laguna-XS-2.1 needs two fixes that are now both **merged to SGLang `main`**: [PR #29446](https://github.com/sgl-project/sglang/pull/29446) (DFlash speculative-decoding support, plus the `SGLANG_SHARED_EXPERT_TP1` shared-expert fix used by the FP8 8-GPU recipe) and [PR #29761](https://github.com/sgl-project/sglang/pull/29761) (INT4 mixed-precision MoE load fix). Any build at or past their merge covers every cell below — no branch checkout needed. The Python tab below pins a known-good [nightly wheel](https://github.com/sgl-project/whl/releases/tag/nightly-2026-07-02-0ae76117ef) for a fast, reproducible install; any newer nightly or a from-source build off current `main` also works.
+Laguna-XS-2.1 needs two fixes that are now both **merged to SGLang `main`**: [PR #29446](https://github.com/sgl-project/sglang/pull/29446) (DFlash speculative-decoding support, plus the `SGLANG_SHARED_EXPERT_TP1` shared-expert fix used by the FP8 8-GPU recipe) and [PR #29761](https://github.com/sgl-project/sglang/pull/29761) (INT4 mixed-precision MoE load fix). Any build at or past their merge covers every cell below — no branch checkout needed.
 
 The model ships custom config code on the Hub, so `--trust-remote-code` is required (included in the launch commands).
 
@@ -20,12 +20,14 @@ The model ships custom config code on the Hub, so `--trust-remote-code` is requi
 
 ```bash Command
 pip install -U uv
-uv venv --python 3.10 && source .venv/bin/activate
+uv venv --python 3.12 && source .venv/bin/activate
 
-pip install https://github.com/sgl-project/whl/releases/download/nightly-2026-07-02-0ae76117ef/sglang-0.5.15.dev20260702+g0ae76117ef-cp310-cp310-linux_x86_64.whl
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+uv pip install -e python
 ```
 
-Then run the **Python** output of the command panel below in that environment. To build from source instead: `git clone https://github.com/sgl-project/sglang.git && cd sglang && uv pip install -e python`.
+Then run the **Python** output of the command panel below in that environment.
 
 </Tab>
 
