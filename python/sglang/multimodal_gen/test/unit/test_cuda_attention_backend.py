@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -77,6 +78,18 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
         FakeCudaPlatform.supports_flash_attention = False
 
         self.assertEqual(self.resolve(None), SDPA_BACKEND_CLS_STR)
+
+    def test_blackwell_falls_back_when_flash_attention_prepare_fails(self):
+        FakeCudaPlatform.is_blackwell_device = True
+
+        with patch.object(
+            FakeCudaPlatform,
+            "_prepare_flash_attention_for_blackwell",
+            return_value=False,
+        ) as prepare_flash_attention:
+            self.assertEqual(self.resolve(None), SDPA_BACKEND_CLS_STR)
+
+        prepare_flash_attention.assert_called_once_with()
 
     def test_invalid_backend_raises(self):
         with self.assertRaisesRegex(ValueError, "Invalid attention backend"):

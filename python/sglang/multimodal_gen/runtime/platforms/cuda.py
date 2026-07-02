@@ -441,23 +441,30 @@ class CudaPlatformBase(Platform):
         return AttentionBackendEnum.FA
 
     @classmethod
-    def _set_flash_attention_version_for_blackwell(cls) -> None:
+    def _prepare_flash_attention_for_blackwell(cls) -> bool:
         if not cls.is_blackwell():
-            return
+            return True
 
-        from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-            set_fa_ver,
-        )
+        try:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+                set_fa_ver,
+            )
+        except ImportError:
+            logger.info(
+                "Cannot use FlashAttention backend because the "
+                "flash_attn package is not found. "
+                "Make sure that flash_attn was built and installed "
+                "(on by default)."
+            )
+            return False
 
         set_fa_ver(4)
+        return True
 
     @classmethod
     def _resolve_flash_attention_backend_cls_str(
         cls, target_backend: AttentionBackendEnum, head_size: int, dtype: torch.dtype
     ) -> str:
-        if target_backend == AttentionBackendEnum.FA:
-            cls._set_flash_attention_version_for_blackwell()
-
         if not cls.has_device_capability(80):
             logger.info("Cannot use FlashAttention backend for Volta and Turing GPUs.")
             target_backend = AttentionBackendEnum.TORCH_SDPA
@@ -466,6 +473,12 @@ class CudaPlatformBase(Platform):
                 "Cannot use FlashAttention backend for dtype other than "
                 "torch.float16 or torch.bfloat16."
             )
+            target_backend = AttentionBackendEnum.TORCH_SDPA
+
+        if (
+            target_backend == AttentionBackendEnum.FA
+            and not cls._prepare_flash_attention_for_blackwell()
+        ):
             target_backend = AttentionBackendEnum.TORCH_SDPA
 
         if target_backend == AttentionBackendEnum.FA:
