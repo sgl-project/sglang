@@ -1412,7 +1412,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         return latents
 
-    def _maybe_offload_for_torch_compile_warmup(self, batch: Req, server_args: ServerArgs):
+    def _maybe_offload_for_torch_compile_warmup(
+        self, batch: Req, server_args: ServerArgs
+    ):
         if not self._offloaded_dit_modules_for_compile:
             return None
         # if the dits are offloaded in preparation stage
