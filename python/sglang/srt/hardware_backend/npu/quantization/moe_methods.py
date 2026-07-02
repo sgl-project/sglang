@@ -241,7 +241,7 @@ class NPUW4A4Int4MoEMethod(_NPUMoEMethodBase):
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         if pertoken_scale is None:
-            hidden_states, pertoken_scale = self.hidden_states_quantizer.__call__(
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(
                 hidden_states
             )
         scale_args: Dict[str, Any] = {
@@ -313,7 +313,7 @@ class NPUW4A4Mxfp4MoEMethod(_NPUMoEMethodBase):
         weight_scale = getattr(self, f"{weight_prefix}_weight_scale", None)
 
         if pertoken_scale is None:
-            hidden_states, pertoken_scale = self.hidden_states_quantizer.__call__(
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(
                 hidden_states
             )
 
@@ -464,7 +464,7 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         if pertoken_scale is None:
-            hidden_states, pertoken_scale = self.hidden_states_quantizer.__call__(
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(
                 hidden_states
             )
         scale_args: Dict[str, Any] = {
@@ -561,7 +561,7 @@ class NPUW4A8Mxfp4MoEMethod(_NPUMoEMethodBase):
 
         # Dynamic MXFP8 activation quantisation
         if pertoken_scale is None:
-            hidden_states, pertoken_scale = self.hidden_states_quantizer.__call__(
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(
                 hidden_states
             )
 
@@ -669,7 +669,7 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         if pertoken_scale is None:
-            hidden_states, pertoken_scale = self.hidden_states_quantizer.__call__(
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(
                 hidden_states
             )
         scale_args: Dict[str, Any] = {
@@ -744,7 +744,7 @@ class NPUW8A8Mxfp8MoEMethod(_NPUMoEMethodBase):
         weight_scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
     
         if pertoken_scale is None:
-            hidden_states, pertoken_scale = self.hidden_states_quantizer.__call__(
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(
                 hidden_states
             )
     
