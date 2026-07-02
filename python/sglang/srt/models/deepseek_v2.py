@@ -603,9 +603,9 @@ class DeepseekV2MoE(nn.Module):
             mla_enable_prefill_cp=mla_enable_prefill_cp,
         )
 
-        # scaling factor for fused shared experts on AMD/standard platforms.
-        # DeepEP/MegaMOE doesn't need this: shared expert is only computed on
-        # home rank, so no 1/ep_size correction is needed.
+        # scaling factor for fused shared experts on AMD-platform.
+        # DeepEP/MegaMOE doesn't need this: shared expert is only computed on home rank
+        # (not all-reduced), so no 1/ep_size correction is needed.
         fused_shared_experts_scaling_factor = None
         if (
             self.moe_ep_size > 1
