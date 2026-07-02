@@ -3,13 +3,14 @@
 //! `RequestId`. Routing is a pure function of the rid, so it matches the shard
 //! the request registered with on ingress — no shared map, no lock.
 //!
-//! The ring carries a 1-byte frame tag: `CHUNK` (a generation `ChunkEvent`) or
-//! `RESULT` (a single control-request JSON payload, e.g. `/server_info`).
+//! The ring carries a 1-byte frame tag: `BATCH` (a whole decode batch, fanned
+//! out here into per-request chunks) or `RESULT` (a single control-request JSON
+//! payload, e.g. `/server_info`).
 
 use bytes::Bytes;
 
 use crate::ids::RequestId;
-use crate::message::{ChunkEvent, EGRESS_TAG_CHUNK, EGRESS_TAG_RESULT};
+use crate::message::{EGRESS_TAG_BATCH, EGRESS_TAG_RESULT, decode_batch_frame};
 use crate::runtime::Runnable;
 use crate::runtime::channels::{DetokMsg, Senders};
 use crate::runtime::ring::EgressConsumer;
@@ -33,35 +34,40 @@ impl Runnable for Egress {
             let Some((&tag, body)) = bytes.split_first() else {
                 continue;
             };
-            let routed = match tag {
-                EGRESS_TAG_CHUNK => decode_chunk(body),
-                EGRESS_TAG_RESULT => decode_result(body),
-                other => {
-                    tracing::warn!(tag = other, "egress: unknown frame tag");
-                    continue;
+            match tag {
+                // A whole decode batch: fan out into per-request chunks here,
+                // routing each by rid (the seq/load-balance the Python side used
+                // to track is now implicit in this rid-based routing).
+                EGRESS_TAG_BATCH => {
+                    let Some(events) = decode_batch_frame(body) else {
+                        tracing::warn!("egress: bad batch frame");
+                        continue;
+                    };
+                    for ev in events {
+                        let Some(rid) = parse_rid(&ev.rid) else {
+                            continue;
+                        };
+                        self.route(rid, DetokMsg::Chunk(ev));
+                    }
                 }
-            };
-            let Some((rid, msg)) = routed else {
-                continue;
-            };
-            if self.senders.detok_for(rid).send(msg).is_err() {
-                tracing::error!("egress: detok shard closed");
+                EGRESS_TAG_RESULT => {
+                    if let Some((rid, msg)) = decode_result(body) {
+                        self.route(rid, msg);
+                    }
+                }
+                other => tracing::warn!(tag = other, "egress: unknown frame tag"),
             }
         }
     }
 }
 
-/// Generation chunk: `[rid, seq, token_ids, finish]` → detok shard.
-fn decode_chunk(body: &[u8]) -> Option<(RequestId, DetokMsg)> {
-    let ev: ChunkEvent = match rmp_serde::from_slice(body) {
-        Ok(ev) => ev,
-        Err(e) => {
-            tracing::warn!(error = %e, "egress: bad chunk msgpack");
-            return None;
+impl Egress {
+    #[inline]
+    fn route(&self, rid: RequestId, msg: DetokMsg) {
+        if self.senders.detok_for(rid).send(msg).is_err() {
+            tracing::error!("egress: detok shard closed");
         }
-    };
-    let rid = parse_rid(&ev.rid)?;
-    Some((rid, DetokMsg::Chunk(ev)))
+    }
 }
 
 /// Control result: `[rid, payload]` → single non-streamed delivery to the sink.
