@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 from collections import deque
 from typing import Callable, Deque, Generic, List, Optional, TypeVar
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -31,6 +34,7 @@ class FanOutCommunicator(Generic[T]):
         self._mode = mode
         self._result_event: Optional[asyncio.Event] = None
         self._result_values: Optional[List[T]] = None
+        self._result_fan_out: Optional[int] = None
         self._ready_queue: Deque[asyncio.Event] = deque()
 
         assert mode in ["queueing", "watching"]
@@ -48,9 +52,11 @@ class FanOutCommunicator(Generic[T]):
 
         self._result_event = asyncio.Event()
         self._result_values = []
+        self._result_fan_out = self._fan_out
         await self._result_event.wait()
         result_values = self._result_values
         self._result_event = self._result_values = None
+        self._result_fan_out = None
 
         if len(self._ready_queue) > 0:
             self._ready_queue.popleft().set()
@@ -62,6 +68,7 @@ class FanOutCommunicator(Generic[T]):
             assert self._result_values is None
             self._result_values = []
             self._result_event = asyncio.Event()
+            self._result_fan_out = self._fan_out
 
             if obj is not None:
                 self._send(obj)
@@ -75,6 +82,7 @@ class FanOutCommunicator(Generic[T]):
         result_values = copy.deepcopy(values)
         if self._result_event is event:
             self._result_event = self._result_values = None
+            self._result_fan_out = None
         return result_values
 
     async def __call__(self, obj):
@@ -83,9 +91,22 @@ class FanOutCommunicator(Generic[T]):
         else:
             return await self.watching_call(obj)
 
+    def set_fan_out(self, fan_out: int):
+        self._fan_out = fan_out
+
     def handle_recv(self, recv_obj: T):
+        if (
+            self._result_values is None
+            or self._result_event is None
+            or self._result_fan_out is None
+        ):
+            logger.debug(
+                "Dropping communicator response without active waiter: %s",
+                type(recv_obj).__name__,
+            )
+            return
         self._result_values.append(recv_obj)
-        if len(self._result_values) == self._fan_out:
+        if len(self._result_values) == self._result_fan_out:
             self._result_event.set()
 
     @staticmethod
