@@ -17,6 +17,7 @@ from humming.schema import (
     HummingWeightSchema,
 )
 from humming.utils.weight import quantize_weight
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.moe import (
@@ -162,6 +163,7 @@ class HummingConfig(QuantizationConfig):
 
     def __init__(self, full_config: dict[str, Any] | None = None):
         self.full_config: dict[str, Any] = full_config or {}
+        self.is_fp4_experts: bool = False
 
     @classmethod
     def get_name(cls) -> str:
@@ -318,6 +320,18 @@ class HummingConfig(QuantizationConfig):
             layer_type = "moe"
         elif isinstance(layer, LinearBase):
             layer_type = "linear"
+
+        if (
+            isinstance(layer, FusedMoE)
+            and self.full_config.get("quant_method") == "fp8"
+            and self.is_fp4_experts
+        ):
+            from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+            fp8_config = Fp8Config.from_config(self.full_config)
+            fp8_config.is_fp4_experts = True
+            return fp8_config.get_quant_method(layer, prefix)
+
         quant_config = self.get_quant_config_for_layer(prefix, layer_type)
         if quant_config is None:
             if isinstance(layer, FusedMoE):
@@ -341,6 +355,7 @@ class HummingLayerQuantizationConfig(HummingConfig):
         is_online_quant: bool = False,
     ):
         self.weight_schema = weight_schema
+        self.weight_block_size = getattr(weight_schema, "weight_block_size", None)
         if input_schema is None:
             input_schema = HummingInputSchema()
         self.input_schema = input_schema
@@ -838,7 +853,13 @@ class HummingMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         moe_runner_config: MoeRunnerConfig,
     ):
-        assert get_moe_runner_backend().is_auto()
+        moe_runner_backend = get_moe_runner_backend()
+        if not (moe_runner_backend.is_auto() or moe_runner_backend.is_humming()):
+            raise ValueError(
+                "Humming quantization for MoE only supports "
+                f"moe_runner_backend='auto' or 'humming', got "
+                f"{moe_runner_backend.value!r}."
+            )
         moe_runner_config = dataclasses.replace(moe_runner_config, layer=layer)
         self.runner = MoeRunner(MoeRunnerBackend.HUMMING, moe_runner_config)
 
