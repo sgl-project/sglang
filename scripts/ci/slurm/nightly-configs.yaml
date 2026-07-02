@@ -320,3 +320,272 @@ dsv4pro-fp4-mi355x-dp8ep8-mtp-sglang:
       search-space:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4pro/1k1k/1p1d-dp8ep8-mtp.yaml
+
+# AMD MI355X 2-node 1P1D disaggregation over **mooncake** KV transfer, on the
+# same four DeepSeek-V4 model x precision combos as the base MORI blocks above
+# (TP8, no MTP). Each recipe's runtime.transfer_backend=mooncake switches
+# launch_mi355x.sh off MORI onto mooncake's transport engine (same RoCE HCAs, no
+# UCX). Requires an image carrying the AMD multi-protocol fix (mooncake
+# 45b84d36, #2724/#2725; ROCm Dockerfile bumped in #30051); the base #2682
+# multi-protocol commit (01d1eb2a) alone SIGSEGVs on AMD cross-node transfer.
+dsv4flash-fp8-mi355x-mooncake-sglang:
+  model: sgl-project/DeepSeek-V4-Flash-FP8
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4flash/1k1k/1p1d-mooncake.yaml
+
+dsv4pro-fp8-mi355x-mooncake-sglang:
+  model: sgl-project/DeepSeek-V4-Pro-FP8
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d-mooncake.yaml
+
+dsv4flash-fp4-mi355x-mooncake-sglang:
+  model: deepseek-ai/DeepSeek-V4-Flash
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4flash/1k1k/1p1d-mooncake.yaml
+
+dsv4pro-fp4-mi355x-mooncake-sglang:
+  model: deepseek-ai/DeepSeek-V4-Pro
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4pro/1k1k/1p1d-mooncake.yaml
+
+# mooncake KV-transfer legs for the MTP / DP8+EP8 / DP8+EP8+MTP topology variants
+# (mirrors the MORI mtp/dp8ep8/dp8ep8-mtp blocks above, transfer_backend=mooncake).
+# Same image requirement as the base mooncake blocks (mooncake 45b84d36, #30051).
+
+dsv4flash-fp8-mi355x-mtp-mooncake-sglang:
+  model: sgl-project/DeepSeek-V4-Flash-FP8
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4flash/1k1k/1p1d-mtp-mooncake.yaml
+
+dsv4flash-fp8-mi355x-dp8ep8-mooncake-sglang:
+  model: sgl-project/DeepSeek-V4-Flash-FP8
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4flash/1k1k/1p1d-dp8ep8-mooncake.yaml
+
+dsv4flash-fp8-mi355x-dp8ep8-mtp-mooncake-sglang:
+  model: sgl-project/DeepSeek-V4-Flash-FP8
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4flash/1k1k/1p1d-dp8ep8-mtp-mooncake.yaml
+
+dsv4pro-fp8-mi355x-mtp-mooncake-sglang:
+  model: sgl-project/DeepSeek-V4-Pro-FP8
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        # conc256 excluded: disagg-decode SWA hybrid pool retract->get_cpu_copy
+        # is an upstream NotImplementedError (crashes decode). See recipe.
+        - conc-list: [1, 8, 16, 32, 64, 128]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d-mtp-mooncake.yaml
+
+dsv4pro-fp8-mi355x-dp8ep8-mooncake-sglang:
+  model: sgl-project/DeepSeek-V4-Pro-FP8
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d-dp8ep8-mooncake.yaml
+
+dsv4pro-fp8-mi355x-dp8ep8-mtp-mooncake-sglang:
+  model: sgl-project/DeepSeek-V4-Pro-FP8
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d-dp8ep8-mtp-mooncake.yaml
+
+dsv4flash-fp4-mi355x-mtp-mooncake-sglang:
+  model: deepseek-ai/DeepSeek-V4-Flash
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4flash/1k1k/1p1d-mtp-mooncake.yaml
+
+dsv4flash-fp4-mi355x-dp8ep8-mooncake-sglang:
+  model: deepseek-ai/DeepSeek-V4-Flash
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4flash/1k1k/1p1d-dp8ep8-mooncake.yaml
+
+dsv4flash-fp4-mi355x-dp8ep8-mtp-mooncake-sglang:
+  model: deepseek-ai/DeepSeek-V4-Flash
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4flash/1k1k/1p1d-dp8ep8-mtp-mooncake.yaml
+
+dsv4pro-fp4-mi355x-mtp-mooncake-sglang:
+  model: deepseek-ai/DeepSeek-V4-Pro
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4pro/1k1k/1p1d-mtp-mooncake.yaml
+
+dsv4pro-fp4-mi355x-dp8ep8-mooncake-sglang:
+  model: deepseek-ai/DeepSeek-V4-Pro
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4pro/1k1k/1p1d-dp8ep8-mooncake.yaml
+
+dsv4pro-fp4-mi355x-dp8ep8-mtp-mooncake-sglang:
+  model: deepseek-ai/DeepSeek-V4-Pro
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4pro/1k1k/1p1d-dp8ep8-mtp-mooncake.yaml

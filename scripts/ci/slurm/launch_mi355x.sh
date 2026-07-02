@@ -91,6 +91,11 @@ def emit(k, v): print(f"{k}={v}")
 emit("IMAGE", rt["image"])
 emit("ATTN", rt["attention_backend"])
 emit("IB", rt["ib_devices"])
+# KV transfer backend: mori (default) or mooncake. mooncake needs an image with
+# the AMD multi-protocol fix (mooncake 45b84d36, #2724/#2725; ROCm Dockerfile
+# bumped in #30051). The base #2682 multi-protocol commit (01d1eb2a) alone
+# SIGSEGVs on AMD cross-node KV transfer.
+emit("XFER", rt.get("transfer_backend", "mori"))
 emit("PPORT", rt["prefill_port"])
 emit("DPORT", rt["decode_port"])
 emit("PBOOT", rt["prefill_bootstrap_port"])
@@ -134,7 +139,7 @@ eval "$RECIPE_VARS"
 if [[ -n "${IMAGE_OVERRIDE:-}" ]]; then
     IMAGE="$IMAGE_OVERRIDE"
 fi
-echo "recipe: image=$IMAGE attn=$ATTN ib=$IB ptp=$PTP dtp=$DTP concs=$CONCS isl=$ISL osl=$OSL"
+echo "recipe: image=$IMAGE attn=$ATTN xfer=$XFER ib=$IB ptp=$PTP dtp=$DTP concs=$CONCS isl=$ISL osl=$OSL"
 
 # ---------------------------------------------------------------------------
 # Shared NFS scratch (visible to login node + compute nodes). Raw bench output
@@ -182,7 +187,21 @@ DSV4_ENV=(
   -e AITER_BF16_FP8_MOE_BOUND=0 -e SGLANG_DSV4_FP4_EXPERTS=$FP4_EXPERTS
 )
 DSV4_ENV_STR="${DSV4_ENV[*]}"
-MORI_ENV="-e MORI_DISABLE_AUTO_XGMI=1 -e NCCL_IB_HCA=ionic -e NCCL_IB_GID_INDEX=1 -e NCCL_CROSS_NIC=1"
+
+# KV-transfer env, keyed off the recipe's transfer_backend. Both backends drive
+# the same RoCE HCAs (NCCL_IB_HCA=ionic) for the cross-node control plane; only
+# mori needs the MORI-specific XGMI auto-disable toggle. mooncake moves KV over
+# its own transport engine on the same RDMA verbs (no UCX, no extra mounts). On
+# AMD multi-protocol builds it needs MC_DISABLE_HIP=1 so the cross-node path
+# selects the rdma transport instead of the intra-node-only hip (GPU-IPC) one,
+# and MC_GID_INDEX=1 so the QP uses the routable RoCEv2 IPv4 GID on this routed
+# (L3) fabric rather than a non-routable link-local GID.
+NCCL_RDMA_ENV="-e NCCL_IB_HCA=ionic -e NCCL_IB_GID_INDEX=1 -e NCCL_CROSS_NIC=1"
+if [[ "$XFER" == "mori" ]]; then
+    XFER_ENV="-e MORI_DISABLE_AUTO_XGMI=1 $NCCL_RDMA_ENV"
+else
+    XFER_ENV="-e MC_DISABLE_HIP=1 -e MC_GID_INDEX=1 $NCCL_RDMA_ENV"
+fi
 
 # Optional topology / speculative-decode flags driven by the recipe. Base recipes
 # (EP1/DP1, no mtp) leave EXTRA_FLAGS empty, preserving prior behavior exactly.
@@ -201,7 +220,7 @@ COMMON_FLAGS="--trust-remote-code --tp $PTP --disable-radix-cache \
 --mem-fraction-static $MEMFRAC --swa-full-tokens-ratio $SWA \
 --chunked-prefill-size $CHUNK --disable-shared-experts-fusion \
 --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
---disaggregation-transfer-backend mori --disaggregation-ib-device $IB$EXTRA_FLAGS"
+--disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$EXTRA_FLAGS"
 
 DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \
 --security-opt seccomp=unconfined \
@@ -215,7 +234,7 @@ cat > "$WORKDIR/prefill.sh" <<EOF
 #!/bin/bash
 docker rm -f mi355x_prefill 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_prefill \
-  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR \
+  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $XFER_ENV $DSV4_ENV_STR \
   $IMAGE python3 -m sglang.launch_server \
   --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
   $COMMON_FLAGS --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
@@ -225,7 +244,7 @@ cat > "$WORKDIR/decode.sh" <<EOF
 #!/bin/bash
 docker rm -f mi355x_decode 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_decode \
-  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR \
+  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $XFER_ENV $DSV4_ENV_STR \
   $IMAGE python3 -m sglang.launch_server \
   --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
   $COMMON_FLAGS --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
