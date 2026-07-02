@@ -55,7 +55,11 @@ class MpsPlatform(Platform):
     @classmethod
     @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
-
+        # Metal cannot use all of system RAM: cap at the recommended max
+        # working set so callers do not overcommit the GPU budget (#21443).
+        total = int(torch.mps.recommended_max_memory())
+        if total > 0:
+            return total
         return psutil.virtual_memory().total
 
     @classmethod
@@ -87,8 +91,13 @@ class MpsPlatform(Platform):
         if empty_cache:
             torch.mps.empty_cache()
 
-        # For MPS, available memory is essentially the system available memory
+        # Unified memory: cap at Metal's remaining working-set headroom
+        # instead of treating all free system RAM as GPU-available (#21443).
         free_memory = psutil.virtual_memory().available
+        max_working_set = int(torch.mps.recommended_max_memory())
+        if max_working_set > 0:
+            headroom = max_working_set - torch.mps.driver_allocated_memory()
+            free_memory = min(free_memory, max(headroom, 0))
 
         if distributed:
             import torch.distributed as dist
