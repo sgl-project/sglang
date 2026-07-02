@@ -81,6 +81,16 @@ _SERVER_FATAL_LOG_PATTERNS = (
     "Segmentation fault",
     "Aborted (core dumped)",
 )
+_CASE_LOG_SEPARATOR = "=" * 88
+
+
+def _print_case_log_separator(case_id: str, state: str) -> None:
+    print(
+        f"\n{_CASE_LOG_SEPARATOR}\n"
+        f"[server-test] {state}: {case_id}\n"
+        f"{_CASE_LOG_SEPARATOR}",
+        flush=True,
+    )
 
 
 @pytest.fixture
@@ -88,6 +98,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
     _fixture_start_time = time.perf_counter()
     server_args = case.server_args
+    _print_case_log_separator(case.id, "BEGIN diffusion testcase")
 
     # Skip ring attention tests on AMD/ROCm - Ring Attention requires Flash Attention
     # which is not available on AMD. Use Ulysses parallelism instead.
@@ -203,6 +214,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
                 f"is not available in the installed version. "
                 f"Upgrade diffusers to enable this test."
             )
+        _print_case_log_separator(case.id, "FAILED during server startup")
         raise
 
     try:
@@ -241,6 +253,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
                 f"    }}\n"
                 f'{"=" * 60}\n'
             )
+        _print_case_log_separator(case.id, "END diffusion testcase")
 
 
 class DiffusionServerBase:
@@ -1199,6 +1212,24 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         - test_diffusion_generation[qwen_image_edit]
         - etc.
         """
+        try:
+            self._test_diffusion_generation_impl(case, diffusion_server)
+        except pytest.skip.Exception:
+            _print_case_log_separator(case.id, "SKIPPED diffusion testcase")
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            _print_case_log_separator(case.id, "FAILED diffusion testcase")
+            raise
+        else:
+            _print_case_log_separator(case.id, "PASSED diffusion testcase")
+
+    def _test_diffusion_generation_impl(
+        self,
+        case: DiffusionTestCase,
+        diffusion_server: ServerContext,
+    ):
         # Check if we're in GT generation mode
         is_gt_gen_mode = os.environ.get("SGLANG_GEN_GT", "0") == "1"
 

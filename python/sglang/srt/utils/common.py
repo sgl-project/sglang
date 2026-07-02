@@ -1865,7 +1865,7 @@ def get_npu_memory_capacity():
             return envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get()  # unit: MB
         else:
             return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
-    except ImportError as e:
+    except ImportError:
         raise ImportError("torch_npu is required when run on npu device.")
 
 
@@ -2218,7 +2218,7 @@ def get_compiler_backend(mode=None) -> str:
             import torchair
             import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
             from torchair.configs.compiler_config import CompilerConfig
-        except ImportError as e:
+        except ImportError:
             raise ImportError(
                 "NPU detected, but torchair package is not installed. "
                 "Please install torchair for torch.compile support on NPU."
