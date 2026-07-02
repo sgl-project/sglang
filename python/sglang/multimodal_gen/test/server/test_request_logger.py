@@ -1,270 +1,235 @@
-import io
+"""
+Test request logging for diffusion models.
+
+Tests the --log-requests CLI flags for diffusion model serving,
+verifying that request logs are correctly written to stdout and files.
+"""
+
 import json
 import os
+import shutil
 import tempfile
 import time
-import unittest
 from pathlib import Path
 
-import requests
+import pytest
+from openai import OpenAI
 
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
+from sglang.multimodal_gen.test.server.test_server_utils import ServerManager
+from sglang.multimodal_gen.test.test_utils import get_dynamic_server_port
+
+# Test models and prompts
+IMAGE_MODEL = (
+    "/root/.cache/modelscope/hub/models/Efficient-Large-Model/Sana_600M_512px_diffusers"
 )
+IMAGE_PROMPT = "A beautiful sunset over mountains, oil painting style"
+VIDEO_MODEL = "/root/.cache/modelscope/hub/models/Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+VIDEO_PROMPT = "A cat playing with a ball"
 
-DIFFUSION_TEST_MODEL_NAME = "Efficient-Large-Model/Sana_600M_512px_diffusers"
-DIFFUSION_TEST_IMAGE_PROMPT = "A beautiful sunset over mountains, oil painting style"
-DIFFUSION_VIDEO_TEST_MODEL_NAME = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-DIFFUSION_TEST_VIDEO_PROMPT = "A cat playing with a ball"
+# Timeout settings
+BASE_TIMEOUT = float(os.environ.get("SGLANG_TEST_OPENAI_REQUEST_TIMEOUT_SECS", "600"))
+POLL_INTERVAL = 1.0
 
 
-class BaseTestDiffusionRequestLogger:
-    """Base test class for Diffusion model request logging."""
+def _start_server(model: str, log_format: str):
+    """Start server with request logging enabled."""
+    temp_dir = tempfile.mkdtemp()
+    port = get_dynamic_server_port()
+    extra_args = (
+        f"--log-requests "
+        f"--log-requests-level 2 "
+        f"--log-requests-format {log_format} "
+        f"--log-requests-target stdout {temp_dir} "
+        f"--strict-ports"
+    )
+    wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200"))
+    manager = ServerManager(
+        model=model,
+        port=port,
+        wait_deadline=wait_deadline,
+        extra_args=extra_args,
+    )
+    ctx = manager.start()
+    ctx.temp_dir = temp_dir
+    return ctx
 
-    log_requests_format = None
-    model_name = None
-    endpoint = None
-    prompt = None
-    request_body = None
-    timeout = 60.0
-    verify_fields = None
-    env_vars: dict[str, str] = {}
 
-    @classmethod
-    def setUpClass(cls):
-        cls._temp_dir_obj = tempfile.TemporaryDirectory()
-        cls.temp_dir = cls._temp_dir_obj.name
-        cls.stdout = io.StringIO()
-        cls.stderr = io.StringIO()
-        other_args = [
-            "--log-requests",
-            "--log-requests-level",
-            "2",
-            "--log-requests-format",
-            cls.log_requests_format,
-            "--log-requests-target",
-            "stdout",
-            cls.temp_dir,
-        ]
-        cls._old_env_vars = {}
-        for key, value in cls.env_vars.items():
-            cls._old_env_vars[key] = os.environ.get(key)
-            os.environ[key] = value
+def _cleanup_server(ctx):
+    """Cleanup server and temp directory."""
+    ctx.cleanup()
+    shutil.rmtree(ctx.temp_dir, ignore_errors=True)
 
-        cls.process = popen_launch_server(
-            cls.model_name,
-            DEFAULT_URL_FOR_TEST,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
-            return_stdout_stderr=(cls.stdout, cls.stderr),
-            skip_device_arg=True,  # Diffusion models don't support --device
+
+def _create_client(ctx) -> OpenAI:
+    """Create OpenAI client for the server."""
+    return OpenAI(
+        api_key="test",
+        base_url=f"http://localhost:{ctx.port}/v1",
+        timeout=BASE_TIMEOUT,
+    )
+
+
+def _wait_for_video_completion(client: OpenAI, video_id: str, timeout: float):
+    """Poll video job until completion."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        page = client.videos.list()
+        item = next((v for v in page.data if v.id == video_id), None)
+        status = getattr(item, "status", None) if item else None
+
+        if status == "completed":
+            return True
+        if status in ("failed", "cancelled", "deleted"):
+            pytest.fail(f"Video job {video_id} ended with status={status}")
+
+        time.sleep(POLL_INTERVAL)
+
+    pytest.fail(f"Video job {video_id} did not complete in {timeout}s")
+
+
+def _verify_json_logs(content: str):
+    """Verify JSON logs contain request.received and request.finished events."""
+    has_received = False
+    has_finished = False
+
+    for line in content.splitlines():
+        idx = line.find("{")
+        if idx == -1:
+            continue
+        try:
+            data = json.loads(line[idx:])
+        except json.JSONDecodeError:
+            continue
+
+        if data.get("event") == "request.received":
+            has_received = True
+        elif data.get("event") == "request.finished":
+            has_finished = True
+
+    assert has_received, "request.received event not found"
+    assert has_finished, "request.finished event not found"
+
+
+def _verify_text_logs(content: str, prompt: str):
+    """Verify text logs contain Receive, prompt, and Finish markers."""
+    assert "Receive:" in content, "'Receive:' not found"
+    assert prompt in content, f"Prompt '{prompt}' not found"
+    assert "Finish:" in content, "'Finish:' not found"
+
+
+@pytest.fixture(scope="class")
+def image_text_server():
+    """Server with text-format logging for image model."""
+    ctx = _start_server(IMAGE_MODEL, "text")
+    yield ctx
+    _cleanup_server(ctx)
+
+
+@pytest.fixture(scope="class")
+def image_json_server():
+    """Server with JSON-format logging for image model."""
+    ctx = _start_server(IMAGE_MODEL, "json")
+    yield ctx
+    _cleanup_server(ctx)
+
+
+@pytest.fixture(scope="class")
+def video_text_server():
+    """Server with text-format logging for video model."""
+    ctx = _start_server(VIDEO_MODEL, "text")
+    yield ctx
+    _cleanup_server(ctx)
+
+
+@pytest.fixture(scope="class")
+def video_json_server():
+    """Server with JSON-format logging for video model."""
+    ctx = _start_server(VIDEO_MODEL, "json")
+    yield ctx
+    _cleanup_server(ctx)
+
+
+class TestImageRequestLoggerText:
+    """Test text-format request logging for image models."""
+
+    def test_request_logging(self, image_text_server):
+        ctx = image_text_server
+        client = _create_client(ctx)
+
+        # Image generation is synchronous, waits for completion
+        client.images.generate(prompt=IMAGE_PROMPT, size="256x256", n=1)
+
+        # Verify stdout and file logs
+        stdout = ctx.log_tail(lines=500)
+        _verify_text_logs(stdout, IMAGE_PROMPT[:30])
+
+        logs = list(Path(ctx.temp_dir).glob("*.log"))
+        assert logs, "No log files found"
+        _verify_text_logs("".join(f.read_text() for f in logs), IMAGE_PROMPT[:30])
+
+
+class TestImageRequestLoggerJson:
+    """Test JSON-format request logging for image models."""
+
+    def test_request_logging(self, image_json_server):
+        ctx = image_json_server
+        client = _create_client(ctx)
+
+        # Image generation is synchronous, waits for completion
+        client.images.generate(prompt=IMAGE_PROMPT, size="256x256", n=1)
+
+        # Verify stdout and file logs
+        stdout = ctx.log_tail(lines=500)
+        _verify_json_logs(stdout)
+
+        logs = list(Path(ctx.temp_dir).glob("*.log"))
+        assert logs, "No log files found"
+        _verify_json_logs("".join(f.read_text() for f in logs))
+
+
+class TestVideoRequestLoggerText:
+    """Test text-format request logging for video models."""
+
+    def test_request_logging(self, video_text_server):
+        ctx = video_text_server
+        client = _create_client(ctx)
+
+        # Video generation is async - create job and poll until completion
+        job = client.videos.create(
+            prompt=VIDEO_PROMPT,
+            size="832x480",
+            extra_body={"num_frames": 5, "num_inference_steps": 10},
         )
+        _wait_for_video_completion(client, job.id, BASE_TIMEOUT * 2)
 
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-        cls.stdout.close()
-        cls.stderr.close()
-        cls._temp_dir_obj.cleanup()
-        for key, old_value in cls._old_env_vars.items():
-            if old_value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = old_value
+        # Verify stdout and file logs
+        stdout = ctx.log_tail(lines=500)
+        _verify_text_logs(stdout, VIDEO_PROMPT[:20])
 
-    def _verify_logs(self, content: str, source_name: str):
-        raise NotImplementedError
+        logs = list(Path(ctx.temp_dir).glob("*.log"))
+        assert logs, "No log files found"
+        _verify_text_logs("".join(f.read_text() for f in logs), VIDEO_PROMPT[:20])
 
-    def _verify_json_request_logs(
-        self, content: str, source_name: str, *, expect_num_frames: bool = False
-    ):
-        """
-        Verifies one ``request.received`` and one ``request.finished`` record:
-        ``obj`` carries the sampling config (+ prompt at level 2); ``out`` is
-        result-only (``e2e_latency`` + ``error``). ``expect_num_frames`` adds the
-        video-specific ``num_frames`` check inside ``obj.sampling_params``.
-        """
-        received_found = False
-        finished_found = False
-        for line in content.splitlines():
-            idx = line.find("{")
-            if idx == -1:
-                continue
-            try:
-                data = json.loads(line[idx:])
-            except json.JSONDecodeError:
-                continue
-            rid = data.get("rid", "")
-            if rid.startswith(HEALTH_CHECK_RID_PREFIX):
-                continue
-            if data.get("event") == "request.received":
-                self.assertIn("rid", data)
-                self.assertIn("obj", data)
-                # Level 2 logs the sampling config and prompt inside obj.
-                obj = data["obj"]
-                self.assertIn("sampling_params", obj)
-                self.assertIn("prompt", obj)
-                if expect_num_frames:
-                    # Video-specific config lives in obj.sampling_params.
-                    self.assertIn("num_frames", obj["sampling_params"])
-                received_found = True
-            elif data.get("event") == "request.finished":
-                self.assertIn("rid", data)
-                self.assertIn("obj", data)
-                self.assertIn("out", data)
-                # out is result-only: latency + error (None on a success).
-                out = data.get("out", {})
-                self.assertIn("e2e_latency", out.get("meta_info", {}))
-                self.assertIsNone(out.get("error"))
-                finished_found = True
 
-        self.assertTrue(
-            received_found, f"request.received event not found in {source_name}"
+class TestVideoRequestLoggerJson:
+    """Test JSON-format request logging for video models."""
+
+    def test_request_logging(self, video_json_server):
+        ctx = video_json_server
+        client = _create_client(ctx)
+
+        # Video generation is async - create job and poll until completion
+        job = client.videos.create(
+            prompt=VIDEO_PROMPT,
+            size="832x480",
+            extra_body={"num_frames": 5, "num_inference_steps": 10},
         )
-        self.assertTrue(
-            finished_found, f"request.finished event not found in {source_name}"
-        )
+        _wait_for_video_completion(client, job.id, BASE_TIMEOUT * 2)
 
-    def _wait_until_verified(
-        self,
-        verify_fn,
-        get_content_fn,
-        source_name: str,
-        timeout: float = 60.0,
-        interval: float = 0.5,
-    ):
-        deadline = time.time() + timeout
-        last_error = None
-        while time.time() < deadline:
-            content = get_content_fn()
-            try:
-                verify_fn(content, source_name)
-                return
-            except AssertionError as err:
-                last_error = err
-                time.sleep(interval)
-        if last_error is not None:
-            raise last_error
+        # Verify stdout and file logs
+        stdout = ctx.log_tail(lines=500)
+        _verify_json_logs(stdout)
 
-    def test_generation_logging(self):
-        """Test that generation requests are logged."""
-        response = requests.post(
-            DEFAULT_URL_FOR_TEST + self.endpoint,
-            json=self.request_body,
-            timeout=self.timeout,
-        )
-        self.assertEqual(response.status_code, 200)
-        # Verify logs
-        self._wait_until_verified(
-            self._verify_logs,
-            lambda: self.stdout.getvalue() + self.stderr.getvalue(),
-            "stdout",
-            timeout=self.timeout,
-        )
-        self._wait_until_verified(
-            self._verify_logs,
-            lambda: "".join(f.read_text() for f in Path(self.temp_dir).glob("*.log")),
-            "log files",
-            timeout=self.timeout,
-        )
-        log_files = list(Path(self.temp_dir).glob("*.log"))
-        self.assertGreater(len(log_files), 0, "No log files found in temp directory")
-
-
-class TestImageRequestLoggerText(BaseTestDiffusionRequestLogger, CustomTestCase):
-    """Test request logging with text format for image models."""
-
-    log_requests_format = "text"
-    model_name = DIFFUSION_TEST_MODEL_NAME
-    endpoint = "/v1/images/generations"
-    prompt = DIFFUSION_TEST_IMAGE_PROMPT
-    request_body = {"prompt": DIFFUSION_TEST_IMAGE_PROMPT, "size": "256x256"}
-    timeout = 60.0
-
-    def _verify_logs(self, content: str, source_name: str):
-        # Verify Receive log contains expected content
-        self.assertIn("Receive:", content, f"'Receive:' not found in {source_name}")
-        self.assertIn(
-            self.prompt[:30],
-            content,
-            f"Prompt not found in {source_name}",
-        )
-        # Verify Finish log is present
-        self.assertIn("Finish:", content, f"'Finish:' not found in {source_name}")
-        # Verify meta_info contains expected fields
-        self.assertIn("e2e_latency", content, f"e2e_latency not found in {source_name}")
-
-
-class TestImageRequestLoggerJson(BaseTestDiffusionRequestLogger, CustomTestCase):
-    """Test request logging with JSON format for image models."""
-
-    log_requests_format = "json"
-    model_name = DIFFUSION_TEST_MODEL_NAME
-    endpoint = "/v1/images/generations"
-    prompt = DIFFUSION_TEST_IMAGE_PROMPT
-    request_body = {"prompt": DIFFUSION_TEST_IMAGE_PROMPT, "size": "256x256"}
-    timeout = 60.0
-
-    def _verify_logs(self, content: str, source_name: str):
-        self._verify_json_request_logs(content, source_name)
-
-
-class TestVideoRequestLoggerText(BaseTestDiffusionRequestLogger, CustomTestCase):
-    """Test request logging with text format for Diffusion video models."""
-
-    log_requests_format = "text"
-    model_name = DIFFUSION_VIDEO_TEST_MODEL_NAME
-    endpoint = "/v1/videos"
-    prompt = DIFFUSION_TEST_VIDEO_PROMPT
-    request_body = {
-        "prompt": DIFFUSION_TEST_VIDEO_PROMPT,
-        "size": "832x480",
-        # Keep the clip tiny: 5 frames (smallest valid Wan count, 4k+1) × few steps.
-        "num_frames": 5,
-        "num_inference_steps": 10,
-    }
-    timeout = 120.0
-
-    def _verify_logs(self, content: str, source_name: str):
-        # Verify Receive log contains expected content
-        self.assertIn("Receive:", content, f"'Receive:' not found in {source_name}")
-        self.assertIn(
-            self.prompt[:20],
-            content,
-            f"Prompt not found in {source_name}",
-        )
-        # Verify Finish log is present
-        self.assertIn("Finish:", content, f"'Finish:' not found in {source_name}")
-        # Verify meta_info contains expected fields
-        self.assertIn("e2e_latency", content, f"e2e_latency not found in {source_name}")
-        # Video-specific fields
-        self.assertIn("num_frames", content, f"num_frames not found in {source_name}")
-
-
-class TestVideoRequestLoggerJson(BaseTestDiffusionRequestLogger, CustomTestCase):
-    """Test request logging with JSON format for Diffusion video models."""
-
-    log_requests_format = "json"
-    model_name = DIFFUSION_VIDEO_TEST_MODEL_NAME
-    endpoint = "/v1/videos"
-    prompt = DIFFUSION_TEST_VIDEO_PROMPT
-    request_body = {
-        "prompt": DIFFUSION_TEST_VIDEO_PROMPT,
-        "size": "832x480",
-        # Keep the clip tiny: 5 frames (smallest valid Wan count, 4k+1) × few steps.
-        "num_frames": 5,
-        "num_inference_steps": 10,
-    }
-    timeout = 120.0
-
-    def _verify_logs(self, content: str, source_name: str):
-        self._verify_json_request_logs(content, source_name, expect_num_frames=True)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        logs = list(Path(ctx.temp_dir).glob("*.log"))
+        assert logs, "No log files found"
+        _verify_json_logs("".join(f.read_text() for f in logs))
