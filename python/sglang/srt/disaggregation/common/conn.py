@@ -196,6 +196,8 @@ class CommonKVManager(BaseKVManager):
                 raw_mode,
             )
 
+        self._validate_cp_transfer_shard_mode()
+
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
@@ -1224,6 +1226,60 @@ class CommonKVManager(BaseKVManager):
             and self.enable_all_cp_ranks_for_transfer
             and self.attn_cp_size > 1
             and self.cp_transfer_shard_mode == "layer"
+        )
+
+    def rank_owns_no_main_groups_for_transfer(self) -> bool:
+        """Whether this CP rank owns zero main layer groups under layer-shard."""
+        if not self.use_layer_cp_shard_for_transfer():
+            return False
+        group_size = self.layer_group_size
+        if group_size <= 0:
+            return False
+        num_main_kv_layers = getattr(
+            self.kv_args, "prefill_num_main_kv_layers", None
+        )
+        if num_main_kv_layers is None or num_main_kv_layers <= 0:
+            # No reliable main-layer count: keep the guard strict.
+            num_main_kv_layers = self.local_num_kv_layers()
+            if num_main_kv_layers <= 0:
+                return False
+        total_main_groups = (num_main_kv_layers + group_size - 1) // group_size
+        return self.attn_cp_rank >= total_main_groups
+
+    def _validate_cp_transfer_shard_mode(self) -> None:
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return
+
+        ready_for_layer = (
+            self.layer_pipeline_enabled
+            and self.enable_all_cp_ranks_for_transfer
+            and self.attn_cp_size > 1
+            and self._has_nsa_prefill_cp()
+        )
+        if self.cp_transfer_shard_mode == "page":
+            if ready_for_layer:
+                logger.warning(
+                    "Layer pipeline with all-CP-ranks transfer and NSA/DSA CP "
+                    "should use --disaggregation-cp-transfer-shard-mode=layer."
+                )
+            return
+
+        if not ready_for_layer:
+            raise ValueError(
+                "--disaggregation-cp-transfer-shard-mode=layer requires "
+                "--enable-disagg-layer-pipeline, "
+                "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1, attention CP "
+                "size > 1, and NSA/DSA prefill CP."
+            )
+
+    def _has_nsa_prefill_cp(self) -> bool:
+        sa = self.server_args
+        return bool(
+            getattr(sa, "enable_dsa_prefill_context_parallel", False)
+            or (
+                getattr(sa, "enable_prefill_cp", False)
+                and getattr(sa, "attention_backend", None) in ("nsa", "dsa", "dsv4")
+            )
         )
 
     @staticmethod

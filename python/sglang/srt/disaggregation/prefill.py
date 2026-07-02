@@ -1140,12 +1140,21 @@ class SchedulerDisaggregationPrefillMixin:
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
-        # Draft (MTP/EAGLE NEXTN) KV transfer; must precede sender.send so the
-        # draft chunk enqueues ahead of any aux finalizer. Skipped when LP is
-        # off (would be a no-op) to keep the LP-off path identical to pre-LP.
+        # Draft KV must enqueue before the aux finalizer. Only send it after
+        # the main LP hook fired, or on empty-main-owner CP ranks; otherwise
+        # the draft bump could mask a missing main hook.
         kv_mgr = getattr(self.disagg_prefill_bootstrap_queue, "kv_manager", None)
-        if kv_mgr is not None and getattr(kv_mgr, "layer_pipeline_enabled", False):
-            req.disagg_kv_sender.send_draft_kv(page_indices)
+        sender = req.disagg_kv_sender
+        main_hook_fired = getattr(sender, "_hook_enqueued_chunks", 0) > getattr(
+            sender, "_hook_chunks_at_last_send", 0
+        )
+        hook_layer_shard = getattr(sender, "_hook_layer_shard_active", False)
+        if (
+            kv_mgr is not None
+            and getattr(kv_mgr, "layer_pipeline_enabled", False)
+            and (main_hook_fired or hook_layer_shard)
+        ):
+            sender.send_draft_kv(page_indices)
         req.disagg_kv_sender.send(page_indices, state_indices)
         req.start_send_idx = end_idx
 
@@ -1185,7 +1194,7 @@ class SchedulerDisaggregationPrefillMixin:
                 continue
             last_chunk = req.inflight_middle_chunks <= 0
             start_idx = req.start_send_idx
-            end_idx = min(req.fill_len, len(req.origin_input_ids))
+            end_idx = min(req.extend_range.end, len(req.origin_input_ids))
             if not last_chunk:
                 end_idx -= end_idx % page_size
             if end_idx <= start_idx:
@@ -1217,6 +1226,7 @@ class SchedulerDisaggregationPrefillMixin:
 
                     page_indices, index_slice = filter_kv_indices_for_cp_rank(
                         kv_mgr, page_indices, index_slice,
+                        total_pages=sender.num_kv_indices,
                     )
                     if len(page_indices) == 0:
                         continue  # this CP rank has no share of the current chunk

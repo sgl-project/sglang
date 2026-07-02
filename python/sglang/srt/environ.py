@@ -355,10 +355,6 @@ class Envs:
     SGLANG_DISAGG_LAYER_PIPELINE_HASH_LOG = EnvBool(False)
     # Debug: per-request KV hash verification logs on both prefill and decode.
     SGLANG_DISAGG_KV_HASH_VERIFY = EnvBool(False)
-    # Extra slots in req_to_token_pool for decode workers (only effective when
-    # max_num_reqs > 32). Increases pool capacity so more KV cache transfers
-    # can overlap with decode execution without raising max_running_requests.
-    SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS = EnvInt(0)
 
     # Scheduler: others:
     # in seconds. Set if you observe high memory accumulation over a long serving period.

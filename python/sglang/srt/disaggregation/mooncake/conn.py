@@ -2540,11 +2540,12 @@ class MooncakeKVManager(CommonKVManager):
                 # aux-only fallback (in send()) knows state was hook-shipped
                 # in some prior round even after the per-send flag is cleared.
                 sender._hook_handles_state_persistent = True
-            # Layer-shard mode: empty-owner CP ranks legitimately enqueue
-            # zero hook chunks. send() uses this flag to relax the
-            # "hook fired but counter didn't move" contract guard.
+            # Layer-shard: relax send()'s "hook fired but counter didn't move"
+            # guard only for a rank that owns ZERO main groups this request.
+            # Ranks that own groups keep the strict guard (an unmoved counter
+            # there is a real missed-hook bug, maskable by a draft-chunk bump).
             sender._hook_layer_shard_active = getattr(
-                self, "use_layer_cp_shard_for_transfer", lambda: False
+                self, "rank_owns_no_main_groups_for_transfer", lambda: False
             )()
             dispatches.append(
                 _LayerPipelineRequestDispatch(
@@ -3396,6 +3397,7 @@ class MooncakeKVSender(CommonKVSender):
                 self.kv_mgr,
                 kv_indices,
                 index_slice,
+                total_pages=self.num_kv_indices,
             )
             if len(kv_indices) == 0:
                 return
@@ -3472,6 +3474,7 @@ class MooncakeKVSender(CommonKVSender):
                 self.kv_mgr,
                 kv_indices,
                 index_slice,
+                total_pages=self.num_kv_indices,
             )
         elif self.kv_mgr.is_dummy_cp_rank:
             if not is_last_chunk:
@@ -3487,11 +3490,11 @@ class MooncakeKVSender(CommonKVSender):
                 # of the whole request needs the trailing aux/state
                 # finalizer.
                 if self._hook_enqueued_chunks <= self._hook_chunks_at_last_send:
-                    # Layer-shard mode: empty-owner CP ranks legitimately
-                    # never bumped the counter (they own zero layer
-                    # groups this round). The aux-only finalizer still
-                    # needs to fire so the receiver's chunk-count
-                    # watermark closes.
+                    # Empty-main-owner CP rank (layer-shard): legitimately
+                    # never bumped the counter. hook_layer_shard is set only
+                    # for such ranks; ranks that own groups keep the strict
+                    # guard. Aux-only finalizer still fires to close the
+                    # receiver's chunk-count watermark.
                     if not hook_layer_shard:
                         # Fail-loud: scheduler told us to expect hook-driven
                         # enqueue this round, but no hook fire bumped the
