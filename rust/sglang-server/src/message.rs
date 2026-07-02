@@ -129,7 +129,7 @@ pub enum RequestKind {
 }
 
 /// Body of a `/generate` request.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct GenerateRequest {
     /// Decoded HTTP body (the `GenerateReqInput` view we need for tokenization).
     pub payload: GeneratePayload,
@@ -138,6 +138,9 @@ pub struct GenerateRequest {
     pub input_ids: Option<Vec<i32>>,
     /// Whether the client asked for SSE streaming.
     pub stream: bool,
+    /// Internal `/health_generate` probe: the scheduler skips it when busy so it
+    /// never occupies a waiting-queue slot. Never set from the client wire.
+    pub is_health_check: bool,
 }
 
 /// Body of a control request. `tag` is the scheduler request-struct name
@@ -275,6 +278,8 @@ pub struct TokenizedReqPayload {
     pub top_logprobs_num: i64,
     pub token_ids_logprob: Option<rmpv::Value>,
     pub return_hidden_states: bool,
+    /// Health-check probe marker (scheduler skips it when busy).
+    pub is_health_check: bool,
     pub stream: bool,
 }
 
@@ -320,10 +325,10 @@ impl TokenizedReqPayload {
         let token_ids_logprob_val = self.token_ids_logprob.clone().unwrap_or(Value::Nil);
 
         // Tagged array in TokenizedGenerateReqInput declaration order (BaseReq
-        // fields first), truncated at `return_hidden_states`. msgspec requires
-        // the array to be at least as long as the last non-defaulted field
-        // (`stream`, index 13), so `input_embeds` and `token_type_ids` must be
-        // present even though we always send them Nil.
+        // fields first), truncated at `is_health_check`. msgspec requires the
+        // array to be at least as long as the last non-defaulted field (`stream`,
+        // index 13), so `input_embeds` and `token_type_ids` must be present even
+        // though we always send them Nil.
         let arr = Value::Array(vec![
             Value::from("TokenizedGenerateReqInput"), // 0  tag
             Value::from(self.rid.as_str()),           // 1  rid
@@ -340,6 +345,7 @@ impl TokenizedReqPayload {
             token_ids_logprob_val,                    // 12 token_ids_logprob
             Value::from(self.stream),                 // 13 stream
             Value::from(self.return_hidden_states),   // 14 return_hidden_states
+            Value::from(self.is_health_check),        // 15 is_health_check
         ]);
 
         let mut buf = Vec::new();
@@ -859,12 +865,13 @@ mod ingress_header_tests {
             top_logprobs_num: 3,
             token_ids_logprob: None,
             return_hidden_states: false,
+            is_health_check: true,
             stream: true,
         };
         let bytes = payload.to_header_msgpack().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
-        // msgspec requires >= 14 (through `stream`); we emit 15.
+        // msgspec requires >= 14 (through `stream`); we emit 16.
         assert!(
             arr.len() >= 14,
             "header must have >=14 elements, got {}",
@@ -878,5 +885,6 @@ mod ingress_header_tests {
         assert_eq!(arr[9].as_bool(), Some(true), "return_logprob at idx 9");
         assert_eq!(arr[11].as_u64(), Some(3), "top_logprobs_num at idx 11");
         assert_eq!(arr[13].as_bool(), Some(true), "stream at idx 13");
+        assert_eq!(arr[15].as_bool(), Some(true), "is_health_check at idx 15");
     }
 }

@@ -308,6 +308,10 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         );
     }
 
+    // Egress heartbeat: bumped per drained frame, watched by `/health_generate`.
+    let egress_activity: tokenizer_manager::ActivityCounter =
+        Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     // --- Egress dispatcher: drains egress ring → routes chunks to shards ---
     {
         // First TM core; egress is the hotter router (every output token). One
@@ -318,8 +322,13 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             .and_then(|p| p.tm.first().copied())
             .map(|c| vec![c]);
         let mut egress_rx = Some(egress_rx); // moved into the single worker
+        let activity = egress_activity.clone();
         spawn_pool("tm-egress", cores, 1, &mut threads, |_| {
-            tokenizer_manager::Egress::new(egress_rx.take().unwrap(), senders.clone())
+            tokenizer_manager::Egress::new(
+                egress_rx.take().unwrap(),
+                senders.clone(),
+                activity.clone(),
+            )
         });
     }
 
@@ -347,6 +356,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         // Shared (Arc-backed) with the detok shards; used to decode logprob token
         // text at frame time.
         let api_tokenizer = dyn_tokenizer.clone();
+        let api_activity = egress_activity.clone();
         let handle = std::thread::Builder::new()
             .name("api-runtime".into())
             .spawn(move || {
@@ -367,10 +377,12 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     senders,
                     id_gen,
                     cfg.channel_cap,
+                    cfg.server_args.clone(),
                     // Shared with detok/tokenizer pool — decodes logprob token
                     // text when `return_text_in_logprobs` is set.
-                    cfg.server_args.clone(),
                     api_tokenizer,
+                    // Egress heartbeat watched by `/health_generate`.
+                    api_activity,
                 ))
             })
             .expect("spawn api runtime");
