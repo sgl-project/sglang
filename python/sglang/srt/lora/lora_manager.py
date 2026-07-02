@@ -778,6 +778,18 @@ class LoRAManager:
 
             self.load_lora_weights_from_tensors(lora_ref, tensors)
 
+            if is_update and getattr(self, "memory_pool", None) is not None:
+                uid = lora_ref.lora_id
+                if uid in self.memory_pool.uid_to_buffer_id:
+                    self.memory_pool.load_lora_weight_to_buffer(
+                        uid,
+                        self.memory_pool.uid_to_buffer_id[uid],
+                        self.loras[uid],
+                        self.lora_modules,
+                        self.embed_tokens_module,
+                        self.lm_head_module,
+                    )
+
             self.lora_refs[lora_ref.lora_id] = lora_ref
             if not is_update:
                 self.num_pinned_loras += int(lora_ref.pinned)
