@@ -177,7 +177,10 @@ if _HAVE_TRITON:
         gd = tl.where(kept, gcum[:, None] - gcum[None, :], 0.0)
         decay = tl.where(kept, libdevice.exp(gd), 0.0)
 
-        A = -tl.dot(kb, tl.trans(kn)) * decay
+        # input_precision="ieee": every tl.dot uses true fp32 (no tf32), matching torch_chunk's
+        # bmm (which routes through the batch_invariant persistent kernel, also ieee) and Megatron
+        # bit-for-bit. Default tl.dot would use tf32 and diverge ~1.5e-2.
+        A = -tl.dot(kb, tl.trans(kn), input_precision="ieee") * decay
         A = tl.where(r[:, None] > r[None, :], A, 0.0)
         # forward substitution (mirrors _fwd_sub_kernel exactly)
         T = A
@@ -191,12 +194,12 @@ if _HAVE_TRITON:
             T = tl.where(r[:, None] == i, new_row[None, :], T)
         T = T + tl.where(r[:, None] == r[None, :], 1.0, 0.0)
 
-        val = tl.dot(T, vb)
+        val = tl.dot(T, vb, input_precision="ieee")
         kg = kb * libdevice.exp(gcum)[:, None]
-        kcd = tl.dot(T, kg)
+        kcd = tl.dot(T, kg, input_precision="ieee")
 
         S = tl.load(S_ptr + (bt * HV + h) * Dk * Dv + dk[:, None] * Dv + dv[None, :])
-        attn2 = tl.dot(qn, tl.trans(kn)) * decay
+        attn2 = tl.dot(qn, tl.trans(kn), input_precision="ieee") * decay
         attn2 = tl.where(r[:, None] >= r[None, :], attn2, 0.0)
         # Materialize every tl.dot output that is then added/subtracted to another tensor via
         # tl.where. Triton otherwise keeps the dot accumulator in fused wide registers and rounds
@@ -204,10 +207,12 @@ if _HAVE_TRITON:
         # class). The tl.where forces an fp32 register round-trip, matching torch bit-for-bit.
         # (mul-by-decay above does NOT need this; only add/sub of a dot triggers the fusion.)
         keep = r[:, None] >= 0
-        v_prime = tl.where(keep, tl.dot(kcd, S), 0.0)
+        v_prime = tl.where(keep, tl.dot(kcd, S, input_precision="ieee"), 0.0)
         v_new = val - v_prime
-        attn_inter = tl.where(keep, tl.dot(qn * libdevice.exp(gcum)[:, None], S), 0.0)
-        intra = tl.where(keep, tl.dot(attn2, v_new), 0.0)
+        attn_inter = tl.where(
+            keep, tl.dot(qn * libdevice.exp(gcum)[:, None], S, input_precision="ieee"), 0.0
+        )
+        intra = tl.where(keep, tl.dot(attn2, v_new, input_precision="ieee"), 0.0)
         core = attn_inter + intra
 
         last = W - 1
@@ -217,7 +222,9 @@ if _HAVE_TRITON:
         if COMMIT:
             glast = tl.sum(tl.where(r == (CS - 1), gcum, 0.0), 0)
             kdec = kn * libdevice.exp(glast - gcum)[:, None]
-            upd = tl.where(dk[:, None] >= 0, tl.dot(tl.trans(kdec), v_new), 0.0)
+            upd = tl.where(
+                dk[:, None] >= 0, tl.dot(tl.trans(kdec), v_new, input_precision="ieee"), 0.0
+            )
             Snew = S * libdevice.exp(glast) + upd
             tl.store(
                 Snew_ptr + (bt * HV + h) * Dk * Dv + dk[:, None] * Dv + dv[None, :], Snew

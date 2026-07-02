@@ -141,7 +141,11 @@ def matmul_kernel_persistent(
             b = tl.load(
                 b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0
             )
-            accumulator = tl.dot(a, b, accumulator)
+            # input_precision="ieee": true fp32 accumulation (no tf32). Matches Megatron's
+            # persistent kernel (batch_invariant_kernels.py, also ieee) bit-for-bit and equals
+            # cuBLAS fp32. Default tl.dot uses tf32 for fp32 inputs (~1.5e-2 off), which made
+            # every GDN core_attn_out diverge from Megatron. bf16 inputs ignore this flag.
+            accumulator = tl.dot(a, b, accumulator, input_precision="ieee")
 
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -696,7 +700,11 @@ def bmm_kernel_persistent(
             b = tl.load(
                 b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0
             )
-            accumulator = tl.dot(a, b, accumulator)
+            # input_precision="ieee": true fp32 accumulation (no tf32). Matches Megatron's
+            # persistent kernel (batch_invariant_kernels.py, also ieee) bit-for-bit and equals
+            # cuBLAS fp32. Default tl.dot uses tf32 for fp32 inputs (~1.5e-2 off), which made
+            # every GDN core_attn_out diverge from Megatron. bf16 inputs ignore this flag.
+            accumulator = tl.dot(a, b, accumulator, input_precision="ieee")
 
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -737,13 +745,13 @@ def bmm_batch_invariant(a, b, *, out=None):
         N = b.shape[2]
         dtype = a.dtype
 
-        # NOTE: fp32 must NOT short-circuit to torch.baddbmm (cuBLAS). cuBLAS is neither
-        # batch- nor M-invariant: its fp32 output for one query row (M=1, decode) differs
-        # from the same row inside an M=64 batch (prefill) by ~1e-5, and Megatron's
-        # bmm_batch_invariant (batch_invariant_kernels.py) routes fp32 through the Triton
-        # persistent kernel with no such short-circuit. Routing fp32 here through the same
-        # Triton kernel makes sglang decode reproduce Megatron's chunked delta rule per token
-        # bit-for-bit (the GDN incremental chunk-replay depends on this M-invariance).
+        # NOTE: fp32 must NOT short-circuit to torch.baddbmm (cuBLAS). cuBLAS is not
+        # M-invariant: its fp32 output for one query row (M=1, decode) differs from the same
+        # row inside an M=64 batch (prefill), so a decode row would not match its position in a
+        # batched prefill. Route fp32 through the persistent kernel below, which with
+        # input_precision="ieee" is M-invariant AND equals Megatron's bmm_batch_invariant
+        # (also ieee) and cuBLAS fp32 bit-for-bit. This M-invariance + Megatron-match is what
+        # lets the GDN incremental chunk-replay reproduce Megatron's delta rule per token.
 
         # Allocate output
         if out is None:
