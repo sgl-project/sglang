@@ -23,11 +23,11 @@ v0.5.13 or a later version.
 |-------------------------------|-----------------------------------------------------------------------------------------------|
 | Tensor Parallelism            | `--tp-size 8` (prefill) or `--tp-size 16` (decode)                                            |
 | Data Parallelism              | `--dp-size 2`                                                                                 |
-| Expert Parallelism            | `--moe-a2a-backend deepep \`<br/>`--deepep-mode low_latency`                                   |
-| PD Disaggregation             | `--disaggregation-mode prefill \`<br/>`--disaggregation-transfer-backend ascend`              |
+| Expert Parallelism            | `--moe-a2a-backend deepep `<br/>`--deepep-mode low_latency`                                   |
+| PD Disaggregation             | `--disaggregation-mode prefill `<br/>`--disaggregation-transfer-backend ascend`              |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs`; e.g. `--cuda-graph-bs 1 2 4 8 12 16 20 24 28 32` |
-| Speculative Decoding          | `--speculative-algorithm EAGLE \`<br/>`--speculative-num-steps 3 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 4 \`<br/>`--enable-multi-layer-eagle` |
+| Speculative Decoding          | `--speculative-algorithm EAGLE `<br/>`--speculative-num-steps 3 `<br/>`--speculative-eagle-topk 1 `<br/>`--speculative-num-draft-tokens 4 `<br/>`--enable-multi-layer-eagle` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0`                                                  |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
 | DP Attention                  | `--enable-dp-attention`                                                                       |
@@ -147,7 +147,7 @@ quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
 PD disaggregation splits the prefill and decode stages onto separate nodes, reducing interference and improving
 throughput for high-concurrency scenarios. This scenario is already covered in the best practice. For the complete, optimized
 deployment commands and benchmark data, see
-[MiMo-V2-Flash Best Practice — W8A8 24P PD Disaggregation On A3](/docs/hardware-platforms/ascend-npus/best_practice/mimo-v2-flash#pd-disaggregation).
+[MiMo-V2-Flash Best Practice — W8A8 24P PD Disaggregation On A3](/docs/hardware-platforms/ascend-npus/best_practice/mimo_v2_flash#pd-disaggregation).
 
 ## Functional verification
 
@@ -190,7 +190,7 @@ For performance data and benchmark commands, see [Performance Testing on Ascend 
 ### Best practice configuration reference
 
 For complete optimal configurations with deployment scripts and benchmark commands, see the
-[MiMo-V2-Flash Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/mimo-v2-flash) page.
+[MiMo-V2-Flash Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/mimo_v2_flash) page.
 
 ## Performance tuning
 
