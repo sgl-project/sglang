@@ -861,8 +861,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            # fp32 sigmoid + multiply to match Megatron's _apply_output_gate
+            # (x * torch.sigmoid(gate.float())). A bf16 sigmoid here diverged
+            # dense_pre_o_proj by one bf16 quantum (1.56e-2).
+            gate = torch.sigmoid(gate.float())
+            attn_output = (attn_output * gate).to(attn_output.dtype)
 
         output, _ = self.o_proj(attn_output)
         return output
