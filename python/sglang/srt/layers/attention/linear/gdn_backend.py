@@ -76,6 +76,84 @@ def _causal_depthwise_conv1d(
     return out
 
 
+try:
+    import triton
+    import triton.language as tl
+
+    _HAVE_TRITON = True
+except ImportError:
+    _HAVE_TRITON = False
+
+
+if _HAVE_TRITON:
+
+    @triton.jit
+    def _fwd_sub_kernel(A, C: tl.constexpr):
+        # One program per (batch*head*chunk). A points at a [C, C] row-major fp32 matrix
+        # holding the strictly-lower A_strict (zeros on/above the diagonal). The whole
+        # matrix is loaded into a register tile M once; the substitution runs entirely
+        # in registers (no global read-after-write across loop iterations, which would
+        # be an unordered hazard), then M is stored once.
+        #
+        # Forward substitution:
+        #   for i in 1..C-1: M[i, :i] += sum_{m<i} M[i, m] * M[m, :i]
+        # The reduction over m is a fixed tree order (tl.sum), deterministic and
+        # independent of the number of chunks. It is NOT bit-identical to the Python
+        # loop's `(row.unsqueeze(-1) * sub).sum(-2)` (that path is ~1 fp32 ULP different),
+        # which is fine: Megatron prefill and SGLang both call this same kernel, so they
+        # stay identical to each other, and gradients still flow (see _SolveFwdSub).
+        pid = tl.program_id(0)
+        base = A + pid * C * C
+        r = tl.arange(0, C)
+        M = tl.load(base + r[:, None] * C + r[None, :])  # [C, C] fp32 in registers
+        for i in range(1, C):
+            # a_im[m] = M[i, m] for m < i else 0 ; broadcast over columns j
+            a_im = tl.where((r < i), tl.sum(tl.where(r[:, None] == i, M, 0.0), 0), 0.0)  # [C], row i
+            # prod[m, j] = a_im[m] * M[m, j]
+            prod = a_im[:, None] * M  # [C(m), C(j)]
+            acc = tl.sum(prod, 0)  # [C(j)], reduce over m
+            row_i = tl.sum(tl.where(r[:, None] == i, M, 0.0), 0)  # current M[i, :]
+            new_row = tl.where(r < i, row_i + acc, row_i)  # update only cols < i
+            M = tl.where(r[:, None] == i, new_row[None, :], M)
+        tl.store(base + r[:, None] * C + r[None, :], M)
+
+
+def _solve_fwd_sub(attn: torch.Tensor) -> torch.Tensor:
+    """Forward-substitution triangular solve, replacing the 64-iteration Python loop.
+
+    `attn` is `[..., C, C]` holding strictly-lower A_strict (zeros on/above diagonal).
+    Returns the substituted matrix (strictly-lower part updated) BEFORE the `+ eye` at
+    the call site, i.e. `(I - A_strict)^-1 - I`. Deterministic and length-invariant (one
+    independent program per (b, h, chunk), so Megatron prefill and SGLang match each
+    other), and differentiable via the analytic VJP grad_A = tril(T^T @ grad @ T^T, -1)
+    with T = (I - A_strict)^-1. ~1 fp32 ULP off the old Python loop (different reduction
+    order), which does not matter since both engines share this kernel.
+    """
+    return _SolveFwdSub.apply(attn)
+
+
+class _SolveFwdSub(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, attn):
+        C = attn.shape[-1]
+        A = attn.detach().reshape(-1, C, C).contiguous().float()
+        _fwd_sub_kernel[(A.shape[0],)](A, C=C)
+        sub = A.reshape(attn.shape).to(attn.dtype)
+        if ctx.needs_input_grad[0]:
+            eye = torch.eye(C, dtype=sub.dtype, device=sub.device)
+            ctx.save_for_backward(sub + eye)  # T = (I - A_strict)^-1
+        return sub
+
+    @staticmethod
+    def backward(ctx, grad_sub):
+        (T,) = ctx.saved_tensors
+        C = T.shape[-1]
+        Tt = T.transpose(-1, -2)
+        grad_A = Tt @ grad_sub @ Tt
+        mask = torch.tril(torch.ones(C, C, dtype=torch.bool, device=T.device), diagonal=-1)
+        return grad_A * mask
+
+
 def torch_gdn_gating(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -159,10 +237,13 @@ def torch_chunk_gated_delta_rule(
     g = torch.stack([g[:, :, i].cumsum(dim=-1) for i in range(g.shape[2])], dim=2)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
     attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
-    for i in range(1, chunk_size):
-        row = attn[..., i, :i].clone()
-        sub = attn[..., :i, :i].clone()
-        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    # Forward-substitution triangular solve. One Triton launch (one program per
+    # (b, h, chunk)) replaces the 64 sequential iterations of the Python loop:
+    #   for i in range(1, chunk_size):
+    #       row = attn[..., i, :i]; sub = attn[..., :i, :i]
+    #       attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    # Deterministic, length-invariant, differentiable (~1 fp32 ULP off the loop).
+    attn = _solve_fwd_sub(attn)
     attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
     value = attn @ v_beta
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
