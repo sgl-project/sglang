@@ -342,6 +342,42 @@ class LoRAManager:
                 lora = self.loras[uid]
                 lora_ranks[weight_indices[i]] = lora.config.r
                 scalings[weight_indices[i]] = lora.scaling
+
+        local_active = any(lora_ranks[wi] > 0 for wi in weight_indices)
+
+        # Idle-rank fix for MoE-expert LoRA under --enable-dp-attention: when this rank has no local
+        # requests using an adapter (local_active is False) but the MoE runs on DP-gathered tokens
+        # from OTHER ranks that DO use one, this rank must still apply that adapter to its LOCAL
+        # experts, or foreign tokens routed here get base-only expert output (silently dropping the
+        # LoRA delta). This is only unambiguous under Tier-1 (exactly one adapter loaded, the colocate
+        # RL case). Inject that adapter into lora_ranks/scalings BEFORE building the batch tensors and
+        # record its buffer id (host int, no GPU sync -> cuda-graph safe) so the backend stamps it
+        # across the gathered tail. No-op without dp-attention (global_dp_buffer_len is None) or when
+        # 0 / >1 adapters are loaded (falls back to the existing -1 tail).
+        idle_rank_active_buffer_id = None
+        if (
+            self.lora_backend.is_moe_lora
+            and not local_active
+            and getattr(forward_batch, "global_dp_buffer_len", None) is not None
+        ):
+            loaded = [
+                (uid, bid)
+                for uid, bid in self.memory_pool.uid_to_buffer_id.items()
+                if uid is not None
+                and uid in self.loras
+                and self.loras[uid].config.r > 0
+            ]
+            if len(loaded) == 1:
+                uid, bid = loaded[0]
+                lora = self.loras[uid]
+                lora_ranks[bid] = lora.config.r
+                scalings[bid] = lora.scaling
+                idle_rank_active_buffer_id = bid
+
+        # Pass the idle-rank active buffer id to the backend (read in _add_moe_lora_info); reset each
+        # batch so a previous idle batch never leaks into a later active one.
+        self.lora_backend._idle_rank_active_buffer_id = idle_rank_active_buffer_id
+
         # Do in-place updates when CUDA graph is enabled and the batch forward mode
         # could use CUDA graph.
         self.lora_backend.prepare_lora_batch(
@@ -351,8 +387,8 @@ class LoRAManager:
             scalings=scalings,
             use_cuda_graph=use_cuda_graph,
         )
-        self.lora_backend.batch_info.has_active_lora = any(
-            lora_ranks[wi] > 0 for wi in weight_indices
+        self.lora_backend.batch_info.has_active_lora = local_active or (
+            idle_rank_active_buffer_id is not None
         )
 
     def update_lora_info(self):

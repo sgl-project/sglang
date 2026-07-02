@@ -335,10 +335,23 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         # the per-rank adapter id across the tail so every gathered token gets the adapter (uniform
         # under a single adapter; padding rows are discarded in the dp-scatter). Multi-adapter batches
         # are not covered by Tier-1 and keep the -1 tail.
-        if moe_num_tokens > num_tokens and num_tokens > 0:
-            token_lora_mapping[num_tokens:moe_num_tokens].copy_(
-                token_lora_mapping[num_tokens - 1]
-            )
+        if moe_num_tokens > num_tokens:
+            if num_tokens > 0:
+                token_lora_mapping[num_tokens:moe_num_tokens].copy_(
+                    token_lora_mapping[num_tokens - 1]
+                )
+            else:
+                # Idle rank: this rank has NO local requests (num_tokens == 0), so there is no local
+                # adapter id to broadcast and _compute_moe_lora_info left the whole gathered mapping
+                # -1 / adapter_enabled all-0. But this rank still runs its local experts over the
+                # DP-gathered foreign tokens, so those tokens would silently get base-only expert
+                # output. Under Tier-1 the LoRA manager records the single active adapter's HOST-side
+                # buffer id (no GPU sync -> cuda-graph safe); stamp the whole gathered buffer with it
+                # and enable it so foreign tokens routed to this rank's experts get the LoRA delta.
+                idle_bid = getattr(self, "_idle_rank_active_buffer_id", None)
+                if idle_bid is not None:
+                    token_lora_mapping.fill_(idle_bid)
+                    adapter_enabled[idle_bid] = 1
 
         batch_info.moe_lora_info = MoELoRABatchInfo(
             seg_indptr=seg_indptr,
