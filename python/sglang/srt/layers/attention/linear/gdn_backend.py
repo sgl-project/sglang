@@ -86,6 +86,7 @@ except ImportError:
 
 
 if _HAVE_TRITON:
+    from triton.language.extra import libdevice
 
     @triton.jit
     def _fwd_sub_kernel(A, C: tl.constexpr):
@@ -116,6 +117,188 @@ if _HAVE_TRITON:
             new_row = tl.where(r < i, row_i + acc, row_i)  # update only cols < i
             M = tl.where(r[:, None] == i, new_row[None, :], M)
         tl.store(base + r[:, None] * C + r[None, :], M)
+
+    @triton.jit
+    def _gdn_fused_replay_kernel(
+        qn_ptr,
+        kn_ptr,
+        kb_ptr,
+        vb_ptr,
+        gcum_ptr,  # qn,kn,kb [w,HV,Dk]; vb [w,HV,Dv]; gcum [w,HV]
+        S_ptr,
+        out_ptr,
+        Snew_ptr,
+        W,
+        B,
+        HV: tl.constexpr,
+        Dk: tl.constexpr,
+        Dv: tl.constexpr,
+        CS: tl.constexpr,
+        COMMIT: tl.constexpr,
+    ):
+        """One program per (batch, value-head). Replays a single (<=64-token) partial chunk
+        seeded by boundary state S, reproducing row w-1 of torch_chunk_gated_delta_rule
+        bit-for-bit. When COMMIT (w==64) it also writes the new boundary state Snew.
+
+        The elementwise reductions torch.cumsum / l2norm-sum are NOT done here (tl.cumsum and
+        tl.sum diverge from torch's reduction order); they are precomputed in _gdn_replay_prep
+        and passed in as qn/kn/kb/vb/gcum. The kernel does only tl.dot matmuls, libdevice.exp,
+        and the shared forward-sub solve, all proven bit-exact vs torch under batch_invariant.
+        """
+        pid = tl.program_id(0)
+        bt = pid // HV
+        h = pid % HV
+        r = tl.arange(0, CS)
+        dk = tl.arange(0, Dk)
+        dv = tl.arange(0, Dv)
+        valid = r < W
+
+        qn = tl.load(
+            qn_ptr + (r[:, None] * HV + h) * Dk + dk[None, :], mask=valid[:, None], other=0.0
+        )
+        kn = tl.load(
+            kn_ptr + (r[:, None] * HV + h) * Dk + dk[None, :], mask=valid[:, None], other=0.0
+        )
+        kb = tl.load(
+            kb_ptr + (r[:, None] * HV + h) * Dk + dk[None, :], mask=valid[:, None], other=0.0
+        )
+        vb = tl.load(
+            vb_ptr + (r[:, None] * HV + h) * Dv + dv[None, :], mask=valid[:, None], other=0.0
+        )
+        gcum = tl.load(gcum_ptr + r * HV + h, mask=valid, other=0.0)
+
+        # Mask the EXPONENT before exp (matches torch_chunk's `(g[:,None]-g[None,:]).tril().exp()`).
+        # Two overflow sources to guard, both -> exp(+large)=inf -> inf*0=NaN in a later tl.dot:
+        #  (1) upper triangle i<j (discarded): raw diff can be large-positive.
+        #  (2) PADDED rows i>=W: gcum there is loaded as 0, which is > any valid row's negative
+        #      gcum, so gcum[pad_i]-gcum[valid_j] is large-positive and IS in the kept lower
+        #      triangle. Restrict the kept mask to valid rows AND cols; zero the exponent elsewhere.
+        kept = (r[:, None] >= r[None, :]) & valid[:, None] & valid[None, :]
+        gd = tl.where(kept, gcum[:, None] - gcum[None, :], 0.0)
+        decay = tl.where(kept, libdevice.exp(gd), 0.0)
+
+        A = -tl.dot(kb, tl.trans(kn)) * decay
+        A = tl.where(r[:, None] > r[None, :], A, 0.0)
+        # forward substitution (mirrors _fwd_sub_kernel exactly)
+        T = A
+        for i in range(1, CS):
+            a_im = tl.where(
+                (r < i), tl.sum(tl.where(r[:, None] == i, T, 0.0), 0), 0.0
+            )
+            acc = tl.sum(a_im[:, None] * T, 0)
+            row_i = tl.sum(tl.where(r[:, None] == i, T, 0.0), 0)
+            new_row = tl.where(r < i, row_i + acc, row_i)
+            T = tl.where(r[:, None] == i, new_row[None, :], T)
+        T = T + tl.where(r[:, None] == r[None, :], 1.0, 0.0)
+
+        val = tl.dot(T, vb)
+        kg = kb * libdevice.exp(gcum)[:, None]
+        kcd = tl.dot(T, kg)
+
+        S = tl.load(S_ptr + (bt * HV + h) * Dk * Dv + dk[:, None] * Dv + dv[None, :])
+        attn2 = tl.dot(qn, tl.trans(kn)) * decay
+        attn2 = tl.where(r[:, None] >= r[None, :], attn2, 0.0)
+        # Materialize every tl.dot output that is then added/subtracted to another tensor via
+        # tl.where. Triton otherwise keeps the dot accumulator in fused wide registers and rounds
+        # `x +/- tl.dot(...)` differently from torch's materialize-then-add (2.9e-6, bf16-ULP
+        # class). The tl.where forces an fp32 register round-trip, matching torch bit-for-bit.
+        # (mul-by-decay above does NOT need this; only add/sub of a dot triggers the fusion.)
+        keep = r[:, None] >= 0
+        v_prime = tl.where(keep, tl.dot(kcd, S), 0.0)
+        v_new = val - v_prime
+        attn_inter = tl.where(keep, tl.dot(qn * libdevice.exp(gcum)[:, None], S), 0.0)
+        intra = tl.where(keep, tl.dot(attn2, v_new), 0.0)
+        core = attn_inter + intra
+
+        last = W - 1
+        core_last = tl.sum(tl.where(r[:, None] == last, core, 0.0), 0)
+        tl.store(out_ptr + (bt * HV + h) * Dv + dv, core_last)
+
+        if COMMIT:
+            glast = tl.sum(tl.where(r == (CS - 1), gcum, 0.0), 0)
+            kdec = kn * libdevice.exp(glast - gcum)[:, None]
+            upd = tl.where(dk[:, None] >= 0, tl.dot(tl.trans(kdec), v_new), 0.0)
+            Snew = S * libdevice.exp(glast) + upd
+            tl.store(
+                Snew_ptr + (bt * HV + h) * Dk * Dv + dk[:, None] * Dv + dv[None, :], Snew
+            )
+
+
+def _gdn_replay_prep(
+    qh: torch.Tensor,
+    kh: torch.Tensor,
+    vh: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+) -> tuple:
+    """Precompute the elementwise prep for the fused replay kernel, bit-identical to
+    torch_chunk_gated_delta_rule's per-token math (l2norm, GQA repeat, scale, gating, per-chunk
+    cumsum). tl.cumsum / tl.sum diverge from torch's reduction order, so these reductions run in
+    torch and only tl.dot matmuls go into the kernel.
+
+    qh,kh: [w,HK,Dk]; vh: [w,HV,Dv]; a,b: [w,HV]. Returns qn,kn,kb [w,HV,Dk], vb [w,HV,Dv],
+    gcum [w,HV], all fp32 contiguous.
+    """
+    w, HK, Dk = qh.shape
+    HV = vh.shape[1]
+    rep = HV // HK
+    scale = 1.0 / (Dk**0.5)
+    # l2norm in fp32 -> bf16 round-trip (matches torch_chunk), on HK heads, then repeat to HV.
+    qf = qh.float()
+    kf = kh.float()
+    qn = (qf * torch.rsqrt((qf * qf).sum(-1, keepdim=True) + 1e-6)).to(torch.bfloat16).float()
+    kn = (kf * torch.rsqrt((kf * kf).sum(-1, keepdim=True) + 1e-6)).to(torch.bfloat16).float()
+    qn = qn.repeat_interleave(rep, dim=1) * scale  # [w,HV,Dk]
+    kn = kn.repeat_interleave(rep, dim=1)
+    g, beta = torch_gdn_gating(A_log, a, b, dt_bias)  # g [1,w,HV] fp32, beta [1,w,HV] bf16
+    g = g[0].contiguous()  # [w,HV]
+    beta = beta[0].contiguous().float()  # [w,HV]
+    kb = kn * beta[..., None]
+    vb = vh.float() * beta[..., None]
+    # Per-chunk cumsum in torch_chunk's exact layout: it transposes to [b,h,s] so the cumsum runs
+    # over the CONTIGUOUS seq dim. Doing cumsum(0) on [w,HV] (HV contiguous) reduces in a different
+    # memory order -> 3e-5 gcum diff. Transpose to [HV,w], cumsum(-1), transpose back.
+    gcum = g.transpose(0, 1).contiguous().cumsum(-1).transpose(0, 1).contiguous()  # [w,HV]
+    return (
+        qn.contiguous(),
+        kn.contiguous(),
+        kb.contiguous(),
+        vb.contiguous(),
+        gcum.contiguous(),
+    )
+
+
+def _gdn_fused_replay(
+    qh: torch.Tensor,
+    kh: torch.Tensor,
+    vh: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    S: torch.Tensor,
+    commit: bool,
+) -> tuple:
+    """Fused single-launch chunk-replay for one decode token, over the partial-chunk buffer.
+
+    qh,kh: [w,HK,Dk]; vh: [w,HV,Dv]; a,b: [w,HV]; S: [B,HV,Dk,Dv] boundary state. Returns
+    (out [B,HV,Dv] fp32 = row w-1 of torch_chunk, Snew [B,HV,Dk,Dv] new boundary if commit else S).
+    """
+    qn, kn, kb, vb, gcum = _gdn_replay_prep(qh, kh, vh, a, b, A_log, dt_bias)
+    w = qh.shape[0]
+    HV = vh.shape[1]
+    Dk = qh.shape[2]
+    Dv = vh.shape[2]
+    B = S.shape[0]
+    out = torch.empty(B, HV, Dv, device=S.device, dtype=torch.float32)
+    Snew = torch.empty_like(S) if commit else S
+    _gdn_fused_replay_kernel[(B * HV,)](
+        qn, kn, kb, vb, gcum, S, out, Snew,
+        w, B, HV=HV, Dk=Dk, Dv=Dv, CS=FLA_CHUNK_SIZE, COMMIT=commit, num_warps=4,
+    )
+    return out, Snew
 
 
 def _solve_fwd_sub(attn: torch.Tensor) -> torch.Tensor:
@@ -539,16 +722,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         cache_indices: torch.Tensor,
     ) -> torch.Tensor:
-        """Differentiable incremental chunk-replay decode (batch-invariant path).
+        """Incremental chunk-replay decode (batch-invariant path), single fused Triton launch.
 
         Reproduces Megatron's full-sequence torch_chunk_gated_delta_rule output for each decode
         token bit-for-bit. For every active slot we keep, since the last completed 64-boundary:
         the recurrent boundary state and the raw post-conv q/k/v + pre-gating a/b of each token
-        in the partial chunk. Each step appends the new token and re-runs torch_chunk over the
-        partial chunk (width = tokens-since-boundary) seeded by the boundary state, returning the
-        last row. When the partial chunk reaches 64 tokens we fold a fresh boundary and clear the
-        buffer. Uses the exact production torch_chunk math, so it is autograd-differentiable via
-        the same graph (including the _solve_fwd_sub analytic VJP).
+        in the partial chunk. Each step appends the new token and replays the partial chunk
+        (width = tokens-since-boundary) seeded by the boundary state via _gdn_fused_replay, which
+        is bit-identical to torch_chunk's row w-1 (elementwise prep in torch, matmuls + solve in
+        one Triton kernel). When the partial chunk reaches 64 tokens we fold a fresh boundary
+        (the kernel's commit path) and clear the buffer. Decode is inference-only, so the fused
+        kernel carries no autograd (unlike the eager torch_chunk path it replaced).
 
         mixed_qkv: [B, q_dim+k_dim+v_dim] post-conv, one decode token per row.
         a, b: [B, HV] pre-gating inputs. Returns [1, B, HV, head_v_dim].
@@ -587,22 +771,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
             entry["a"].append(a[j])
             entry["b"].append(b[j])
             w = len(entry["q"])
-            q_seq = torch.stack(entry["q"], dim=0).unsqueeze(0)  # [1, w, HK, Dk]
-            k_seq = torch.stack(entry["k"], dim=0).unsqueeze(0)
-            v_seq = torch.stack(entry["v"], dim=0).unsqueeze(0)  # [1, w, HV, Dv]
+            q_seq = torch.stack(entry["q"], dim=0)  # [w, HK, Dk]
+            k_seq = torch.stack(entry["k"], dim=0)
+            v_seq = torch.stack(entry["v"], dim=0)  # [w, HV, Dv]
             a_seq = torch.stack(entry["a"], dim=0)  # [w, HV]
             b_seq = torch.stack(entry["b"], dim=0)
-            g_seq, beta_seq = torch_gdn_gating(layer.A_log, a_seq, b_seq, layer.dt_bias)
-            qsl = torch.tensor([0, w], dtype=torch.int32, device=mixed_qkv.device)
-            core, last, boundary = torch_chunk_gated_delta_rule(
-                q_seq, k_seq, v_seq, g=g_seq, beta=beta_seq,
-                ssm_states=entry["boundary"], cache_indices=zero_cidx,
-                query_start_loc=qsl, return_boundary_state=True,
+            commit = w == FLA_CHUNK_SIZE
+            core, last = _gdn_fused_replay(
+                q_seq, k_seq, v_seq, a_seq, b_seq,
+                layer.A_log, layer.dt_bias, entry["boundary"], commit,
             )
-            outputs[j] = core[0, -1]
-            if w == FLA_CHUNK_SIZE:
+            outputs[j] = core[0]
+            if commit:
                 # Completed a 64-chunk: fold it into a fresh boundary and reset the token buffer.
-                entry["boundary"] = last.detach()
+                entry["boundary"] = last
                 entry["q"].clear(); entry["k"].clear(); entry["v"].clear()
                 entry["a"].clear(); entry["b"].clear()
 

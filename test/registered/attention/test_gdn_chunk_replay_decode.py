@@ -5,6 +5,7 @@ import torch
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import set_batch_invariant_mode
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
+    _gdn_fused_replay,
     torch_chunk_gated_delta_rule,
     torch_gdn_gating,
 )
@@ -36,13 +37,14 @@ class _FakeLayer:
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGDNChunkReplayDecode(unittest.TestCase):
-    """Differentiable incremental chunk-replay decode (batch-invariant GDN path).
+    """Fused single-launch chunk-replay decode (batch-invariant GDN path).
 
     Each decode token must reproduce, bit-for-bit, row `position` of a single full-sequence
-    `torch_chunk_gated_delta_rule` forward (what Megatron computes when teacher-forcing the
-    whole prompt+response). This depends on the fp32 bmm routing to the M-invariant Triton
-    kernel (no cuBLAS short-circuit). Also verifies gradients flow (autograd through the same
-    production graph) with no NaNs.
+    `torch_chunk_gated_delta_rule` forward (what Megatron computes when teacher-forcing the whole
+    prompt+response). This depends on the fp32 bmm routing to the M-invariant Triton kernel (no
+    cuBLAS short-circuit); the fused kernel does only tl.dot matmuls + libdevice.exp + the shared
+    forward-sub solve, with the divergent elementwise reductions precomputed in torch. Decode is
+    inference-only so the fused path carries no autograd.
     """
 
     def _make_backend(self):
@@ -104,9 +106,43 @@ class TestGDNChunkReplayDecode(unittest.TestCase):
                             layer, mixed[p : p + 1], a[p : p + 1], b[p : p + 1], cidx
                         )
                         self.assertTrue(
-                            torch.equal(out[0, 0], ref[p]),
+                            torch.equal(out[0, 0].to(torch.bfloat16), ref[p]),
                             msg=f"pl={pl} nd={nd} seed={seed} token={p} not bit-identical",
                         )
+
+    def test_fused_replay_matches_torch_chunk_seeded(self):
+        """Direct fused-kernel vs torch_chunk replay over a single partial chunk seeded by a
+        nonzero boundary state S (the misaligned-prompt path decode continues from)."""
+        with set_batch_invariant_mode(True):
+            HV, HK, K, V = 12, 4, 128, 128
+            torch.manual_seed(0)
+            A_log = torch.randn(HV, device="cuda")
+            dt_bias = torch.randn(HV, device="cuda")
+            for w in [1, 5, 32, 63]:
+                torch.manual_seed(w + 100)
+                qh = torch.randn(w, HK, K, device="cuda", dtype=torch.bfloat16)
+                kh = torch.randn(w, HK, K, device="cuda", dtype=torch.bfloat16)
+                vh = torch.randn(w, HV, V, device="cuda", dtype=torch.bfloat16)
+                a = torch.randn(w, HV, device="cuda", dtype=torch.bfloat16)
+                b = torch.randn(w, HV, device="cuda", dtype=torch.bfloat16)
+                S = torch.randn(1, HV, K, V, device="cuda", dtype=torch.float32) * 0.2
+
+                out, _ = _gdn_fused_replay(qh, kh, vh, a, b, A_log, dt_bias, S, w == C)
+                g, beta = torch_gdn_gating(A_log, a, b, dt_bias)
+                ref, _, _ = torch_chunk_gated_delta_rule(
+                    qh.view(1, w, HK, K),
+                    kh.view(1, w, HK, K),
+                    vh.view(1, w, HV, V),
+                    g=g,
+                    beta=beta,
+                    ssm_states=S,
+                    cache_indices=torch.zeros(1, dtype=torch.long, device="cuda"),
+                    query_start_loc=torch.tensor([0, w], dtype=torch.int32, device="cuda"),
+                )
+                self.assertTrue(
+                    torch.equal(out[0].to(torch.bfloat16), ref[0, -1]),
+                    msg=f"w={w} fused replay not bit-identical to torch_chunk",
+                )
 
     def test_pad_slot_returns_zeros(self):
         with set_batch_invariant_mode(True):
@@ -125,47 +161,6 @@ class TestGDNChunkReplayDecode(unittest.TestCase):
             )
             self.assertTrue(bool((out == 0).all()))
             self.assertEqual(len(be.gdn_replay_cache), 0)
-
-    def test_differentiable(self):
-        with set_batch_invariant_mode(True):
-            HV, HK, K, V = 4, 2, 128, 128
-            A_log = torch.randn(HV, device="cuda")
-            dt_bias = torch.randn(HV, device="cuda")
-            layer = _FakeLayer(HV, HK, K, V, A_log, dt_bias)
-            dim = layer.q_dim + layer.k_dim + layer.v_dim
-            pl, nd = 60, 6
-            T = pl + nd
-            torch.manual_seed(0)
-            base = torch.randn(T, dim, device="cuda", dtype=torch.float32)
-            a = torch.randn(T, HV, device="cuda", dtype=torch.float32)
-            b = torch.randn(T, HV, device="cuda", dtype=torch.float32)
-
-            mixed = base.clone().requires_grad_(True)
-            be = self._make_backend()
-            cidx = torch.tensor([3], dtype=torch.long, device="cuda")
-            be._seed_gdn_replay_cache(
-                layer,
-                mixed[:pl].to(torch.bfloat16),
-                a[:pl],
-                b[:pl],
-                torch.tensor([0, pl], dtype=torch.int32, device="cuda"),
-                cidx,
-                None,
-            )
-            p_target = pl + 3
-            out = None
-            for p in range(pl, p_target + 1):
-                o = be._gdn_chunk_replay_decode(
-                    layer, mixed[p : p + 1].to(torch.bfloat16), a[p : p + 1], b[p : p + 1], cidx
-                )
-                if p == p_target:
-                    out = o
-            out.float().pow(2).sum().backward()
-            self.assertIsNotNone(mixed.grad)
-            self.assertFalse(torch.isnan(mixed.grad).any())
-            # gradient reaches the partial-chunk rows since the last 64-boundary
-            comp = (pl // C) * C
-            self.assertGreater((mixed.grad[comp : p_target + 1].abs().sum(-1) > 0).sum().item(), 0)
 
 
 if __name__ == "__main__":
