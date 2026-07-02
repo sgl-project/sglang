@@ -11,7 +11,7 @@
 //
 // Attention backend (IMPORTANT — Laguna is hybrid-SWA and backend-sensitive):
 //   - Dense (High-Throughput): leave --attention-backend UNSET. Auto-select is correct:
-//     fa3 on Hopper (H200), trtllm_mha on Blackwell (B200/GB300).
+//     fa3 on Hopper (H200), trtllm_mha on Blackwell (B300/GB300).
 //   - DFlash (Low-Latency): auto-select is NOT safe — with a speculative algorithm active
 //     the resolver falls back to flashinfer, which on Blackwell HALVES greedy GSM8K at
 //     tp=4 (76.2% -> 28%, reproduced+bisected on GB300). Every LL cell therefore PINS the
@@ -29,7 +29,7 @@
 // fraction OOMs in the draft vocab all-gather ("Failed to CUDA calloc"); 0.7 is validated.
 // Dense cells use the default heuristic (validated at defaults on GB300).
 //
-// TP/EP on the 8-GPU HGX platforms (H200/B200): plain --tp 8 works for BF16, but the
+// TP/EP on the 8-GPU HGX platforms (H200/B300): plain --tp 8 works for BF16, but the
 // quantized checkpoints cap PLAIN TP at 4 — moe_intermediate_size=512 with FP8 block
 // [128,128] / INT4 group_size=128 scales cannot shard 8-way (512/8 = 64 < 128 granularity
 // → FP8 ValueError at weight create, INT4 Marlin scale-contiguity crash; reproduced on
@@ -44,15 +44,17 @@
 //
 // NVFP4 is Blackwell-only → no h200×nvfp4 cells (same rule as Laguna-M.1).
 //
-// verified:true = ran that command shape on that hardware and it served correctly + passed
-// full GSM8K (see laguna-xs21-benchmarks.jsx). GB300 cells verified (4×GB300, tp 4); H200
-// cells verified (8×H200: bf16 tp8, fp8/int4 tp8+ep8); B200 cells are command-correct
-// (same merged fix, arch-independent quant checks) but pending measurement.
+// verified:true = ran that command shape and it served correctly + passed full GSM8K
+// (see laguna-xs21-benchmarks.jsx). GB300 cells verified (4×GB300, tp 4); H200 cells
+// verified (8×H200: bf16 tp8, fp8/int4 tp8+ep8). B300 cells verified with the identical
+// commands run as tp8 across 2×(4×GB300) over MNNVL — same GPU (GB300/B300 = Blackwell
+// Ultra, 288GB), same shard math, so the accuracy measurement carries; single-node B300
+// re-timing (perf) is the only thing not covered by that setup.
 
 export const config = {
   modelName: "Laguna-XS-2.1",
 
-  supportedHardware: ["h200", "b200", "gb300"],
+  supportedHardware: ["h200", "b300", "gb300"],
 
   variants: [
     { id: "default", label: "Default" },
@@ -130,7 +132,7 @@ sgl-eval run gsm8k \\
   // Dedicated image built for this cookbook page (PR #29446 + #29761 preinstalled on cu13).
   dockerImages: {
     h200:  "lmsysorg/sglang:dev-cu13-laguna-xs-2-1",
-    b200:  "lmsysorg/sglang:dev-cu13-laguna-xs-2-1",
+    b300:  "lmsysorg/sglang:dev-cu13-laguna-xs-2-1",
     gb300: "lmsysorg/sglang:dev-cu13-laguna-xs-2-1",
   },
 
@@ -161,7 +163,7 @@ sgl-eval run gsm8k \\
     },
   },
 
-  // Cells: (h200 × {bf16,fp8,int4} + b200/gb300 × {bf16,fp8,nvfp4,int4}) × {low-latency, high-throughput}.
+  // Cells: (h200 × {bf16,fp8,int4} + b300/gb300 × {bf16,fp8,nvfp4,int4}) × {low-latency, high-throughput}.
   // Draft model precision always matches the target's.
   cells: [
 
@@ -288,12 +290,16 @@ sgl-eval run gsm8k \\
       ],
     },
 
-    // ══════════════ NVIDIA Blackwell B200 (8-GPU HGX) — BF16 / FP8 / NVFP4 / INT4 ══════════════
+    // ══════════════ NVIDIA Blackwell Ultra B300 (8-GPU HGX) — BF16 / FP8 / NVFP4 / INT4 ══════════════
     // Dense auto-selects trtllm_mha on Blackwell (no flag). LL MUST pin trtllm_mha —
     // with DFlash active, auto falls back to flashinfer, which is broken for this
     // hybrid-SWA model at tp≥4 (GSM8K 28% vs 76%; reproduced + bisected on GB300).
+    // VERIFIED: these exact command shapes ran as tp8 across 2×(4×GB300)/MNNVL — identical
+    // silicon + shard math to one 8-GPU B300 node — with full-GSM8K accuracy per cell
+    // (dense 75.59/71.19/78.01/67.25, DFlash 75.36/71.87/77.79/66.72 for bf16/fp8/nvfp4/int4).
     {
-      match: { hw: "b200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -306,7 +312,8 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -327,7 +334,8 @@ sgl-eval run gsm8k \\
       // Plain tp 8 fails at weight load (quantized MoE TP cap, arch-independent — see
       // header comment); tp 8 + ep 8 uses all 8 GPUs instead (verified on 8×H200, same
       // merged fix — pending measurement on this hardware).
-      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_SHARED_EXPERT_TP1=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -341,7 +349,8 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_SHARED_EXPERT_TP1=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -360,7 +369,8 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -373,7 +383,8 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -394,7 +405,8 @@ sgl-eval run gsm8k \\
       // INT4 (mixed 4/8-bit compressed-tensors MoE) — needs a build ≥ PR #29761 (merged).
       // tp 8 + ep 8 uses all 8 GPUs (verified on 8×H200 — pending measurement on this
       // hardware); no SGLANG_SHARED_EXPERT_TP1 needed, INT4's shared expert stays bf16.
-      match: { hw: "b200", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "b300", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -408,7 +420,8 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b200", variant: "default", quant: "int4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b300", variant: "default", quant: "int4", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",

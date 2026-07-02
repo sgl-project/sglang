@@ -45,14 +45,25 @@
 //   sidestepping the shard-granularity wall entirely, so both quantizations use all 8 GPUs
 //   on one instance. FP8 additionally needs SGLANG_SHARED_EXPERT_TP1=1 (its shared expert
 //   is also block-quantized; INT4's stays bf16, no flag needed). The checks that make plain
-//   tp 8 fail are pure shard arithmetic with no arch branch → B200 tp 8 fails the same way,
-//   hence the B200 fp8/int4 cells also carry tp8+ep8.
+//   tp 8 fail are pure shard arithmetic with no arch branch → any 8-way plain-TP fails the
+//   same way, hence the B300 fp8/int4 cells also carry tp8+ep8.
 //
 // sglang_version = PR #29446 (DFlash + SGLANG_SHARED_EXPERT_TP1 fix) + PR #29761 (INT4
 // mixed-precision MoE load fix) — BOTH MERGED to main as of 2026-07-02.
 //
-// B200: command-correct per the backend rules (trtllm_mha) and the same merged EP=8 fix,
-// measurements pending.
+// REAL GSM8K for the B300 column (sgl-eval `run gsm8k`, FULL 1319 questions, greedy/
+// non-thinking): the B300 cells' exact command shapes were run at tp8 as 2x(4xGB300)
+// over MNNVL (NCCL_MNNVL_ENABLE/NCCL_CUMEM_ENABLE/MC_FORCE_MNNVL) — GB300 and B300 are
+// the same Blackwell-Ultra 288GB GPU and the shard math (tp8; ep8 for fp8/int4) is
+// identical to a single 8-GPU B300 node, so the accuracy measurement carries. Perf
+// numbers (TTFT/throughput) were NOT taken from that topology and are left pending.
+//
+//   high-throughput (dense): BF16 75.59% (tp8) | FP8 71.19% (tp8+ep8+flag) |
+//                            NVFP4 78.01% (tp8) | INT4 67.25% (tp8+ep8)
+//   low-latency (DFlash, trtllm_mha): BF16 75.36% (4.08) | FP8 71.87% (4.05) |
+//                            NVFP4 77.79% (4.04) | INT4 66.72% (4.01)
+//   Every cell at parity with its tp4-GB300 and H200 references; NVFP4 needs NO escape
+//   (group_size=16 divides the 64-wide tp8 shard — unlike FP8 [128,128] / INT4 gs=128).
 
 export const benchmarks = [
   // ===== H200 (8-GPU HGX; bf16 tp 8, fp8/int4 tp8+ep8) — ✅ REAL, full GSM8K =====
@@ -105,15 +116,64 @@ export const benchmarks = [
     accuracy: { gsm8k_pct: 66.57 },
   },
 
-  // ===== B200 (8-GPU HGX) — pending measurement =====
-  { match: { hw: "b200", variant: "default", quant: "bf16",  strategy: "high-throughput", nodes: "single" } },
-  { match: { hw: "b200", variant: "default", quant: "bf16",  strategy: "low-latency",     nodes: "single" } },
-  { match: { hw: "b200", variant: "default", quant: "fp8",   strategy: "high-throughput", nodes: "single" } },
-  { match: { hw: "b200", variant: "default", quant: "fp8",   strategy: "low-latency",     nodes: "single" } },
-  { match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },
-  { match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "low-latency",     nodes: "single" } },
-  { match: { hw: "b200", variant: "default", quant: "int4",  strategy: "high-throughput", nodes: "single" } },
-  { match: { hw: "b200", variant: "default", quant: "int4",  strategy: "low-latency",     nodes: "single" } },
+  // ===== B300 (8-GPU HGX; bf16/nvfp4 tp 8, fp8/int4 tp8+ep8) — REAL, full GSM8K =====
+  // (accuracy measured as 2x(4xGB300) tp8/MNNVL — same GPU + shard math as one B300 node)
+  {
+    // REAL — BF16 dense, tp8, backend auto->trtllm_mha.
+    match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    verified: true,
+    sglang_version: "PR #29446 + #29761 (both merged to main; run @ main 0543246184)",
+    accuracy: { gsm8k_pct: 75.59 },
+  },
+  {
+    // REAL — BF16 + DFlash (matched bf16 draft), tp8, trtllm_mha. Accept-len 4.08.
+    match: { hw: "b300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    verified: true,
+    sglang_version: "PR #29446 + #29761 (both merged to main; run @ main 0543246184)",
+    accuracy: { gsm8k_pct: 75.36 },
+  },
+  {
+    // REAL — FP8 dense, tp8+ep8+SGLANG_SHARED_EXPERT_TP1=1 (plain tp8 impossible: block-FP8 scale granularity).
+    match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    verified: true,
+    sglang_version: "PR #29446 + #29761 (both merged to main; run @ main 0543246184)",
+    accuracy: { gsm8k_pct: 71.19 },
+  },
+  {
+    // REAL — FP8 + DFlash (matched fp8-calibrated draft), tp8+ep8+flag, trtllm_mha. Accept-len 4.05.
+    match: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    verified: true,
+    sglang_version: "PR #29446 + #29761 (both merged to main; run @ main 0543246184)",
+    accuracy: { gsm8k_pct: 71.87 },
+  },
+  {
+    // REAL — NVFP4 dense, tp8 — NO escape needed (group_size=16 shards 8-way cleanly).
+    match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+    verified: true,
+    sglang_version: "PR #29446 + #29761 (both merged to main; run @ main 0543246184)",
+    accuracy: { gsm8k_pct: 78.01 },
+  },
+  {
+    // REAL — NVFP4 + DFlash (matched nvfp4-calibrated draft), tp8, trtllm_mha. Accept-len 4.04.
+    match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+    verified: true,
+    sglang_version: "PR #29446 + #29761 (both merged to main; run @ main 0543246184)",
+    accuracy: { gsm8k_pct: 77.79 },
+  },
+  {
+    // REAL — INT4 dense (mixed 4/8-bit MoE), tp8+ep8 (plain tp8 impossible: Marlin gs=128 'scales is not contiguous', same signature as H200).
+    match: { hw: "b300", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
+    verified: true,
+    sglang_version: "PR #29446 + #29761 (both merged to main; run @ main 0543246184)",
+    accuracy: { gsm8k_pct: 67.25 },
+  },
+  {
+    // REAL — INT4 + DFlash (matched int4-calibrated draft), tp8+ep8, trtllm_mha. Accept-len 4.01.
+    match: { hw: "b300", variant: "default", quant: "int4", strategy: "low-latency", nodes: "single" },
+    verified: true,
+    sglang_version: "PR #29446 + #29761 (both merged to main; run @ main 0543246184)",
+    accuracy: { gsm8k_pct: 66.72 },
+  },
 
   // ===== GB300 (4-GPU single node, tp 4) — ✅ REAL, full GSM8K =====
   {
