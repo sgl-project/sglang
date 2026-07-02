@@ -1785,7 +1785,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_aiter()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
+            or moe_runner_backend.is_hpc()
         ):
+            if moe_runner_backend.is_hpc():
+                import sglang.srt.layers.moe.moe_runner.hpc  # noqa: F401 – triggers @register_fused_func
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             # TODO(cwan): refactor other backends
@@ -2041,6 +2044,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         elif self.runner.runner_backend.is_triton():
             quant_info = self.get_triton_quant_info(layer)
+        elif self.runner.runner_backend.is_hpc():
+            from sglang.srt.layers.moe.moe_runner.hpc import HpcMoeQuantInfo
+
+            if self.block_quant:
+                quant_info = HpcMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    is_block_quantized=True,
+                    w13_weight_scale=layer.w13_weight_scale_inv,
+                    w2_weight_scale=layer.w2_weight_scale_inv,
+                )
+            else:
+                quant_info = HpcMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    is_block_quantized=False,
+                    w13_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    act_and_mul_scale=getattr(layer, "w13_input_scale", None),
+                )
         else:
             raise NotImplementedError(
                 "Unsupported runner backend: %s" % self.runner.runner_backend
