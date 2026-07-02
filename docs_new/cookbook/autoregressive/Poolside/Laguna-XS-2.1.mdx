@@ -1,0 +1,232 @@
+---
+title: Laguna-XS-2.1
+description: "Deploy poolside's Laguna-XS-2.1 — a 33B-parameter hybrid-SWA Mixture-of-Experts model (3B active) for agentic coding — with SGLang on NVIDIA H200, B200, and GB300, across BF16, FP8, NVFP4, and INT4, with a DFlash speculative-decoding low-latency mode."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+Laguna-XS-2.1 splits across two build requirements, matching the **Strategy** toggle in the command panel:
+
+- **High-Throughput (dense)** runs on SGLang `main`. The **INT4** checkpoint is a *mixed-precision* compressed-tensors MoE (4-bit + 8-bit config groups) and needs [PR #29761](https://github.com/sgl-project/sglang/pull/29761) (**merged**) — any build at or past that commit loads it.
+- **Low-Latency (DFlash speculative decoding)** needs [PR #29446](https://github.com/sgl-project/sglang/pull/29446) (Laguna XS-2.1 DFlash support — **open** at the time of writing). Install from that branch until it merges.
+
+The model ships custom config code on the Hub, so `--trust-remote-code` is required (included in the launch commands).
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+```bash Command
+pip install -U uv
+uv venv --python 3.12 && source .venv/bin/activate
+
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+# High-Throughput cells: main is enough (INT4 fix #29761 is merged).
+# Low-Latency (DFlash) cells: check out the PR #29446 branch until it merges:
+#   git fetch origin pull/29446/head:laguna-dflash && git checkout laguna-dflash
+uv pip install -e python
+```
+
+Then run the **Python** output of the command panel below in that environment.
+
+</Tab>
+
+<Tab title="Docker">
+
+```bash Command
+# Dense (High-Throughput) cells work on any current nightly at or past PR #29761's merge:
+docker pull lmsysorg/sglang:latest
+```
+
+For Low-Latency (DFlash) cells, build from the [PR #29446](https://github.com/sgl-project/sglang/pull/29446) branch until it merges — no published image carries it yet. For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Pick your hardware + quantization + strategy to generate the launch command. Laguna-XS-2.1 ships **two operating points** per cell:
+
+- **Low-Latency (DFlash)** — speculative decoding with a matched-precision DFlash draft. The draft proposes a block, the target verifies it in one forward pass (measured accept-length ~4 at tp 4, ~6 at tp 1), cutting per-token latency for interactive / few-stream serving. Accuracy-neutral (verification-based).
+- **High-Throughput** — plain serving. At batch-saturated load the GPU is compute-bound and speculation's draft + rejected-token overhead costs more than it saves, so the dense path wins on aggregate tokens/sec.
+
+The 8-GPU HGX platforms (H200 / B200) use `--tp 8`; the 4-GPU Grace-Blackwell GB300 node uses `--tp 4`.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/poolside/laguna-xs21.jsx";
+import { benchmarks } from "/src/snippets/configs/poolside/laguna-xs21-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations that have been signed off; the Playground lets you turn on additional knobs (TP degree, parsers) on top of whichever cell the Deploy panel is currently showing.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+[Laguna-XS-2.1](https://huggingface.co/poolside/Laguna-XS-2.1) is an open-weight **33B-parameter** hybrid sliding-window-attention Mixture-of-Experts model (**~3B activated per token**) from [poolside](https://poolside.ai), built for agentic coding and long-horizon software-engineering work — the extra-small sibling of [Laguna-M.1](./Laguna-M.1).
+
+**Key Features:**
+
+- **Sparse MoE**: 40-layer transformer with **256 routed experts, top-8 routing**.
+- **Hybrid sliding-window attention**: 30 sliding-window layers (window 512) interleaved with 10 full-attention layers; 48 Q-heads / 8 KV-heads (head dim 128).
+- **Long context**: 262,144 tokens, RoPE with YaRN on the full-attention layers.
+- **DFlash speculative decoding**: poolside ships **matched-precision DFlash draft models** (5-layer, ~0.9 GB) calibrated per quantization for low-latency serving.
+- **Hybrid reasoning**: `<think>…</think>` segments toggled per request via `chat_template_kwargs={"enable_thinking": …}`.
+
+**Available Quantizations (targets) and their matched DFlash drafts:**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "14%"}} />
+    <col style={{width: "43%"}} />
+    <col style={{width: "43%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Precision</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Target model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>DFlash draft (Low-Latency)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500}}><strong>BF16</strong></td>
+      <td style={{padding: "9px 12px"}}>[`poolside/Laguna-XS-2.1`](https://huggingface.co/poolside/Laguna-XS-2.1)</td>
+      <td style={{padding: "9px 12px"}}>[`poolside/Laguna-XS-2.1-DFlash`](https://huggingface.co/poolside/Laguna-XS-2.1-DFlash)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500}}><strong>FP8</strong></td>
+      <td style={{padding: "9px 12px"}}>[`poolside/Laguna-XS-2.1-FP8`](https://huggingface.co/poolside/Laguna-XS-2.1-FP8)</td>
+      <td style={{padding: "9px 12px"}}>[`poolside/Laguna-XS-2.1-DFlash-FP8`](https://huggingface.co/poolside/Laguna-XS-2.1-DFlash-FP8)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500}}><strong>NVFP4</strong></td>
+      <td style={{padding: "9px 12px"}}>[`poolside/Laguna-XS-2.1-NVFP4`](https://huggingface.co/poolside/Laguna-XS-2.1-NVFP4)</td>
+      <td style={{padding: "9px 12px"}}>[`poolside/Laguna-XS-2.1-DFlash-NVFP4`](https://huggingface.co/poolside/Laguna-XS-2.1-DFlash-NVFP4)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500}}><strong>INT4</strong></td>
+      <td style={{padding: "9px 12px"}}>[`poolside/Laguna-XS-2.1-INT4`](https://huggingface.co/poolside/Laguna-XS-2.1-INT4)</td>
+      <td style={{padding: "9px 12px"}}>[`poolside/Laguna-XS-2.1-DFlash-INT4`](https://huggingface.co/poolside/Laguna-XS-2.1-DFlash-INT4)</td>
+    </tr>
+  </tbody>
+</table>
+
+The `-DFlash-*` drafts are **not themselves quantized** — each is a small bf16 model *calibrated against the matching quantized target*. **Always pair a target with its matched draft** (mixing precisions degrades accept-length, i.e. the speculative speedup).
+
+**License:** Apache 2.0
+
+**Resources:** [Hugging Face](https://huggingface.co/poolside/Laguna-XS-2.1) · [Release blog post](https://poolside.ai/blog/laguna-a-deeper-dive) · [API platform](https://platform.poolside.ai).
+
+## 2. Configuration Tips
+
+- **Trust remote code** (`--trust-remote-code`): Laguna-XS-2.1 ships custom modeling/config code on the Hugging Face Hub, so this flag is required.
+- **Attention backend — leave it alone for dense, pin it for DFlash.** Laguna is hybrid-SWA and backend-sensitive:
+  - **High-Throughput (dense)**: do **not** pass `--attention-backend`. Auto-select resolves the correct kernel per platform (`fa3` on Hopper, `trtllm_mha` on Blackwell).
+  - **Low-Latency (DFlash)**: with a speculative algorithm active, auto-select falls back to **flashinfer**, which is broken for this model at `tp ≥ 4` on Blackwell (greedy GSM8K collapses 76% → 28%). The generated Low-Latency commands therefore pin the target backend explicitly (`trtllm_mha` on Blackwell, `fa3` on H200). The DFlash *draft* worker is fine on its automatic fallback — leave `--speculative-draft-attention-backend` unset.
+  - **Never** use `--attention-backend triton` with Laguna — its SWA handling is broken for this model (GSM8K 13%).
+- **DFlash memory**: the Low-Latency cells carry `--mem-fraction-static 0.7`. At `tp 4` on GB300 the default fraction OOMs in the draft vocab all-gather (`Failed to CUDA calloc`); 0.7 is validated. Dense cells use the default heuristic.
+- **INT4 is mixed-precision**: the INT4 checkpoint quantizes MoE layers in *mixed* 4-bit / 8-bit config groups (regex targets, no `"Linear"` group). Builds older than [PR #29761](https://github.com/sgl-project/sglang/pull/29761) crash at load with `KeyError: 'Linear'` — use a build at or past its merge.
+- **Chat template**: on transformers ≥ 5.10 the standalone `chat_template.jinja` auto-loads — no `--chat-template` flag needed (the server logs `Auto-detected template features: reasoning_parser=poolside_v1, tool_call_parser=poolside_v1` when it resolves correctly). On older pinned transformers (≤ ~5.8) the `{% include %}` stub in `tokenizer_config.json` cannot resolve and the server silently falls back to a generic template — there, pass `--chat-template <model-dir>/chat_template.jinja` explicitly.
+- **Thinking default**: thinking is **off by default**; opt in per request with `extra_body={"chat_template_kwargs": {"enable_thinking": True}}`. The template gates on `enable_thinking` — the generic `thinking` key is ignored.
+- **Served model id**: the server registers the model under whatever you pass to `--model-path`, so a client's `model` field must match it — `poolside/Laguna-XS-2.1` (BF16) or the `-FP8` / `-NVFP4` / `-INT4` id for the quantized cells.
+- **TP degree**: 48 Q-heads / 8 KV-heads shard cleanly at `tp` 1 / 2 / 4 / 8. Accuracy is TP-independent on the shipped backends (verified `tp 1` ≡ `tp 4` on GB300).
+
+## 3. Advanced Usage
+
+### 3.1 DFlash Speculative Decoding (Low-Latency strategy)
+
+DFlash is a block-wise speculative decoder: the 5-layer draft proposes a block of tokens, the target model verifies the whole block in a single forward pass, and only target-approved tokens are emitted — so **output quality is the target's, by construction** (measured: GSM8K matches dense within noise on every quantization). The speedup lever is **accept-length** — how many draft tokens survive verification per target step:
+
+- ~**6** tokens/step at `tp 1`, ~**4** at `tp 4` (measured on GB300, matched-precision pairs) — versus 1 token/step dense.
+- Best for **interactive / few-stream** serving where the GPU has idle compute. Under batch-saturated load prefer the High-Throughput cells: speculation's draft + rejected-token overhead costs aggregate throughput once the GPU is compute-bound.
+- **Match the draft to the target precision** (the generated commands do) — each draft is calibrated against its specific quantized target.
+
+### 3.2 Reasoning
+
+Launch with `--reasoning-parser poolside_v1` (baked into every generated command). Reasoning is **opt-in**: the Laguna chat template gates it on `enable_thinking=True` via `chat_template_kwargs`. The `<think>` trace lands in `message.reasoning_content`, separate from the final answer in `message.content`.
+
+<Accordion title="Reasoning Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="poolside/Laguna-XS-2.1",
+    messages=[{"role": "user", "content": "What is 15% of 240? Explain briefly."}],
+    max_tokens=2048,
+    extra_body={"chat_template_kwargs": {"enable_thinking": True}},
+)
+
+message = response.choices[0].message
+print("=============== Reasoning ===============")
+print(message.reasoning_content)
+print("=============== Answer ==================")
+print(message.content)
+```
+
+</Accordion>
+
+<Note>
+XS-2.1 is an extra-small model — give it generous `max_tokens` when thinking is enabled
+(AIME-class problems regularly reason for thousands of tokens), and keep thinking **off**
+for short-form tasks where it isn't needed.
+</Note>
+
+### 3.3 Tool Calling
+
+Launch with `--tool-call-parser poolside_v1` (baked into every generated command). The parser converts Laguna's `<tool_call>` output into the standard OpenAI `tool_calls` structure. Tool calling works with reasoning off (the default).
+
+<Accordion title="Tool Calling Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "The city name"},
+                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                },
+                "required": ["location"],
+            },
+        },
+    }
+]
+
+response = client.chat.completions.create(
+    model="poolside/Laguna-XS-2.1",
+    messages=[{"role": "user", "content": "What's the weather in Beijing?"}],
+    tools=tools,
+)
+
+message = response.choices[0].message
+if message.tool_calls:
+    for call in message.tool_calls:
+        print(f"Tool: {call.function.name}")
+        print(f"Args: {call.function.arguments}")
+```
+
+</Accordion>
