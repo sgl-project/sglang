@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_sm90_supported, is_sm100_supported
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -71,6 +72,22 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             "Use flashinfer_trtllm_routed as MoE runner backend for "
             f"{model_arch} hybrid FP8+NVFP4 checkpoint."
         )
+
+    if (
+        server_args.moe_runner_backend == "auto"
+        and server_args.moe_a2a_backend == "none"
+        and server_args.get_model_config().is_fp4_experts
+    ):
+        if is_sm100_supported():
+            server_args.moe_runner_backend = "flashinfer_mxfp4"
+            logger.info(
+                f"Use flashinfer_mxfp4 as MoE runner backend on SM100 for {model_arch} FP4 experts."
+            )
+        elif is_sm90_supported():
+            server_args.moe_runner_backend = "marlin"
+            logger.info(
+                f"Use marlin as MoE runner backend on SM90 for {model_arch} FP4 experts."
+            )
 
 
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
