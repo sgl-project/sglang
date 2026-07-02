@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
 )
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
 )
@@ -984,6 +985,22 @@ class ComposedPipelineBase(ABC):
                 module = self.get_module(name)
                 if module is not None and is_layerwise_offloaded_module(module):
                     module.disable_offload()
+            restore = server_args._offload_during_compile_restore
+            server_args.text_encoder_cpu_offload = restore["text_encoder"]
+            server_args.image_encoder_cpu_offload = restore["image_encoder"]
+            server_args.vae_cpu_offload = restore["vae"]
+            device = get_local_torch_device()
+            for name, module in self.modules.items():
+                for prefix, was_offloaded in restore.items():
+                    if (
+                        name.startswith(prefix)
+                        and not was_offloaded
+                        and isinstance(module, torch.nn.Module)
+                    ):
+                        if is_layerwise_offloaded_module(module):
+                            module.disable_offload()
+                        else:
+                            module.to(device)
             self._offload_during_compile_done = True
 
         if self.is_lora_set() and not self.is_lora_effective():
