@@ -6482,6 +6482,17 @@ class ServerArgs:
                 f"MoRI MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
+            if self.ep_dispatch_algorithm == "lp":
+                assert not self.enable_waterfill, (
+                    "ep_dispatch_algorithm='lp' (LPLB) and --enable-waterfill "
+                    "are mutually exclusive load balancers; enable only one."
+                )
+                logger.info(
+                    "LPLB (ep_dispatch_algorithm='lp') is enabled on the MoRI "
+                    "backend. Per-layer LP solving uses the pure-torch fallback "
+                    "on ROCm; routed tokens are dispatched to the least-loaded "
+                    "physical replica through MoRI."
+                )
             # Check chunked prefill for mori
             # Skip validation if chunked prefill is disabled (i.e., size <= 0).
             # Skip validation if disaggregation mode is decode.

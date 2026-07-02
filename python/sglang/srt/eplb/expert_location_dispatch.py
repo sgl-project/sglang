@@ -129,17 +129,30 @@ def _topk_ids_logical_to_physical_probability(
     info: ExpertLocationDispatchInfo,
     log2phy_prob: torch.Tensor,
 ) -> torch.Tensor:
-    """Select physical experts via the JIT-compiled CUDA dispatch kernel.
+    """Select physical experts from the LP probabilities.
 
-    Raises if ``topk_ids`` isn't on CUDA — the LP path requires the fused
-    kernel and there is no torch reference fallback at runtime.
+    Uses the JIT-compiled CUDA dispatch kernel when the fused cuBLASDx backend
+    is available (Hopper+ NVIDIA), otherwise the pure-torch reference — which is
+    the production path on ROCm/HIP (e.g. MI355X) where the fused kernel cannot
+    build.
     """
     if not topk_ids.is_cuda:
         raise RuntimeError(
             "LP dispatch requires CUDA tensors; got topk_ids on " f"{topk_ids.device}."
         )
     from sglang.kernels.ops.lplb import cuda_solver
+    from sglang.kernels.ops.lplb.torch_solver import fused_backend_available
 
-    return cuda_solver.dispatch_probability(
-        topk_ids, log2phy_prob, info.partial_logical_to_all_physical_map
+    if fused_backend_available():
+        return cuda_solver.dispatch_probability(
+            topk_ids, log2phy_prob, info.partial_logical_to_all_physical_map
+        )
+
+    n = topk_ids.numel()
+    random_vals = torch.rand(n, dtype=torch.float32, device=topk_ids.device)
+    return cuda_solver.dispatch_probability_torch_reference(
+        topk_ids,
+        log2phy_prob,
+        info.partial_logical_to_all_physical_map,
+        random_vals,
     )

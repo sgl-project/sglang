@@ -41,6 +41,18 @@ def _init_fused_backend() -> None:
         logger.info("LPLB fused solver disabled: CUDA not available")
         return
 
+    # cuBLASDx / Math-DX is CUDA-only. On a ROCm/HIP build torch still reports
+    # cuda.is_available()==True and a >=9 device capability, and the cuda_solver
+    # module imports fine (the kernel is only JIT-compiled lazily), so without
+    # this guard the fused backend would look available and then fail at
+    # load_jit time. Force the pure-torch fallback on HIP.
+    if getattr(torch.version, "hip", None) is not None:
+        logger.info(
+            "LPLB fused solver disabled: ROCm/HIP build detected "
+            "(cuBLASDx is CUDA-only); using the pure-torch LP fallback."
+        )
+        return
+
     cap = torch.cuda.get_device_capability()
     if cap[0] < 9:
         logger.info(
@@ -66,6 +78,18 @@ def _init_fused_backend() -> None:
     _FUSED_ASSERT_FITS = assert_fits
     _FUSED_AVAILABLE = True
     logger.info("LPLB fused solver enabled (CUDA C++ via load_jit, cuBLASDx)")
+
+
+def fused_backend_available() -> bool:
+    """Return whether the fused cuBLASDx IPM backend can be used.
+
+    Resolves and caches the backend on first call (same detection as
+    ``warmup``/``solve_ipm``) but never raises — callers use this to pick
+    between the fused CUDA path and the pure-torch fallback (ROCm/HIP or any
+    non-Hopper GPU where cuBLASDx is unavailable).
+    """
+    _init_fused_backend()
+    return _FUSED_AVAILABLE
 
 
 def _unavailable_reason() -> str:

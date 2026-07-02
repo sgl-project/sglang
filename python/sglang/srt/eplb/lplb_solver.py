@@ -180,14 +180,29 @@ class LPLBSolver:
         # without per-call .long() casts (Tier 1 optimization).
         self.log2phy = log2phy.to(torch.int64).contiguous()
 
+        # Pick the LP backend once. The fused cuBLASDx IPM kernel needs a
+        # Hopper+ NVIDIA GPU with Math-DX headers; on ROCm/HIP (e.g. MI355X) or
+        # any non-Hopper GPU it is unavailable, so we fall back to the pure-torch
+        # solver. The per-layer LP is tiny (NC/NV ~= a few hundred), so the torch
+        # path's extra launches are negligible next to the MoE GEMMs.
+        from sglang.kernels.ops.lplb.torch_solver import fused_backend_available
+
+        self._use_fused = fused_backend_available()
+
         # Pre-JIT-compile the fused IPM kernel for this (NC, NV) shape so the
         # 20-40s compile cost happens once at startup rather than on the first
-        # real request. No-op when the fused backend is unavailable.
+        # real request. Skipped (no-op) on the torch fallback path.
         nc = self.A_base.shape[0]
         nv = self.A_base.shape[1] + 1  # +1 for Big-M column added in solve()
-        from sglang.kernels.ops.lplb.torch_solver import warmup as _ipm_warmup
+        if self._use_fused:
+            from sglang.kernels.ops.lplb.torch_solver import warmup as _ipm_warmup
 
-        _ipm_warmup(nc, nv, num_iters=5, device=device)
+            _ipm_warmup(nc, nv, num_iters=5, device=device)
+        else:
+            logger.info(
+                "LPLBSolver: fused cuBLASDx IPM backend unavailable; using the "
+                "pure-torch LP solver fallback (ROCm/HIP or non-Hopper GPU)."
+            )
 
         # Pre-compute A_base row sum (used in every prep call).
         self._A_base_row_sum = self.A_base.sum(dim=1).contiguous()  # (NC,)
@@ -259,8 +274,12 @@ class LPLBSolver:
 
         Pipeline (all writes go into pre-allocated buffers from __init__):
             prep_lp_inputs → solve_ipm → extract_log2phy_prob
-        Raises if the JIT CUDA backend is unavailable.
+        Falls back to the pure-torch pipeline when the fused cuBLASDx backend
+        is unavailable (ROCm/HIP or non-Hopper GPU).
         """
+        if not self._use_fused:
+            return self._solve_torch(global_counts)
+
         from sglang.kernels.ops.lplb import cuda_solver
 
         cuda_solver.prep_lp_inputs(
@@ -283,3 +302,84 @@ class LPLBSolver:
             self.log2phy,
         )
         return self._log2phy_prob
+
+    def _solve_torch(self, global_counts: torch.Tensor) -> torch.Tensor:
+        """Pure-torch equivalent of the fused prep → IPM → post pipeline.
+
+        Used when the fused cuBLASDx backend is unavailable (ROCm/HIP or
+        non-Hopper GPUs). Mirrors the three JIT kernels op-for-op using the
+        Python equivalents documented in their ``.cuh`` headers, with a
+        production-hardened IPM (see ``_ipm_solve_robust``). Correct — not
+        micro-optimized; the per-layer LP is negligible next to the MoE GEMMs.
+        """
+        device = global_counts.device
+
+        # ---- prep (lp_prep.cuh: ~8 torch ops) ----
+        total = global_counts.sum().clamp(min=1.0)
+        counts_norm = global_counts / total
+        t1 = counts_norm[self.log_single]  # (num_single,)
+        b1 = counts_norm[self.log_replicated]  # (num_red_log,)
+        b2 = -(self.B1 @ t1).flatten()  # (num_gpus,)
+        b = torch.cat([b1, b2])  # (nc,)
+        # A = [A_base | Big-M column], where the Big-M column = b - A_base_row_sum.
+        A = torch.cat(
+            [self.A_base, (b - self._A_base_row_sum).unsqueeze(1)], dim=1
+        )  # (nc, nv)
+
+        # ---- IPM solve (ipm.cuh barrier method, hardened) ----
+        x = self._ipm_solve_robust(A, b, self.c_vec)  # (nv,)
+
+        # ---- post (lp_post.cuh: ~5 torch ops) ----
+        x_ratios = x[: self.num_red_phy].clamp(min=0)
+        # phy_prob has a trailing always-zero "sink" slot; log2phy's -1 padding
+        # is routed there via torch.take's negative-index wrap-around.
+        phy_prob = torch.zeros(
+            self.num_single + self.num_red_phy + 1, dtype=torch.float32, device=device
+        )
+        phy_prob[self.phy_replicated] = x_ratios
+        phy_prob[self.phy_single] = t1
+        return torch.take(phy_prob, self.log2phy)  # (num_logical, max_copies)
+
+    def _ipm_solve_robust(
+        self, A: torch.Tensor, b: torch.Tensor, c: torch.Tensor, num_iters: int = 5
+    ) -> torch.Tensor:
+        """Barrier-method IPM for ``min c^T x s.t. Ax=b, x>=0`` — HIP fallback.
+
+        Same iteration as ``ipm.cuh`` / ``solve_ipm_torch_reference`` but
+        production-hardened for the runtime path: the fused kernel factors the
+        KKT system with a block Cholesky that clamps tiny pivots and silently
+        returns 0.5 on non-convergence, whereas ``torch.linalg.solve`` raises on
+        a singular/rank-deficient KKT matrix. Per-batch expert counts routinely
+        make ``A @ A^T`` rank-deficient, so we (1) add a larger diagonal
+        regularizer than the reference's 1e-12 and (2) fall back to the
+        all-0.5 "no LP signal" vector on any LinAlg failure — the downstream
+        dispatch then samples uniformly over valid replicas, matching the fused
+        kernel's non-convergence behavior.
+        """
+        nc, nv = A.shape
+        x = torch.ones(nv, device=A.device, dtype=torch.float32)
+        eye = torch.eye(nc, device=A.device, dtype=torch.float32)
+        d_max = torch.tensor(0.0, device=A.device, dtype=torch.float32)
+        try:
+            for _ in range(num_iters):
+                ax2 = A * (x * x).unsqueeze(0)  # (nc, nv)
+                ax2a = ax2 @ A.t() + 1e-6 * eye  # (nc, nc) regularized KKT
+                ax2c = ax2 @ c  # (nc,)
+                delta = torch.linalg.solve(ax2a, ax2c)  # (nc,)
+                r = A.t() @ delta  # (nv,)
+                d = x * (c - r)  # (nv,)
+                d_max = d.max()
+                alpha = (
+                    0.999 / d_max
+                    if d_max > 1e-9
+                    else torch.tensor(1.0, device=A.device)
+                )
+                x = x * (1.0 - alpha * d)
+        except torch._C._LinAlgError:
+            return torch.full((nv,), 0.5, device=A.device, dtype=torch.float32)
+
+        max_residual = (A @ x - b).abs().max()
+        converged = (d_max < 0.1) and (0 <= x[-1] < 1e-4) and (max_residual < 0.05)
+        if not converged:
+            return torch.full((nv,), 0.5, device=A.device, dtype=torch.float32)
+        return x
