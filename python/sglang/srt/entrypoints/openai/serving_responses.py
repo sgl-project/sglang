@@ -1689,7 +1689,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
 
         async def empty_async_generator():
-            if False:
+            for _ in ():
                 yield
 
         final_response = await self.responses_full_generator(

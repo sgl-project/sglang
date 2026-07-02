@@ -348,6 +348,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
 
+    def _next_token_logits_buffer(self, rows: int) -> Optional[torch.Tensor]:
+        if not self.model_runner.pp_group.is_last_rank:
+            return None
+        graph_shared_output = self.model_runner.graph_shared_output
+        # Fall back to eager logits when the shared buffer can't hold prefill rows.
+        if graph_shared_output is None or rows > graph_shared_output.max_rows:
+            return None
+        return graph_shared_output.get_logits_buffer(
+            self.model_runner.model_config.vocab_size, rows=rows
+        )
+
     _aiter_chip_info_cached = False
 
     @classmethod
@@ -627,7 +638,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 ),
                 req_pool_indices=shape_inputs["req_pool_indices"],
                 seq_lens=shape_inputs["seq_lens"],
-                next_token_logits_buffer=None,
+                next_token_logits_buffer=self._next_token_logits_buffer(bs),
                 orig_seq_lens=shape_inputs["orig_seq_lens"],
                 seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 out_cache_loc=_slot("out_cache_loc"),
@@ -823,7 +834,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             input_embeds=input_embeds,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
-            next_token_logits_buffer=None,
+            next_token_logits_buffer=self._next_token_logits_buffer(bs),
             orig_seq_lens=forward_batch.orig_seq_lens,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
             out_cache_loc=out_cache_loc,
