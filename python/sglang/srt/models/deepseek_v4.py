@@ -406,6 +406,11 @@ class MQALayer(nn.Module):
                 )
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
+        # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
+        # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
+        # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
+        # this rank and padded to match.
+        self.padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
         self._attn_sink_local: Optional[torch.Tensor] = (
             self.attn_sink if attn_tp_size == 1 else None
         )
@@ -488,6 +493,19 @@ class MQALayer(nn.Module):
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
         # has no effect here -- the fused path is on by default.
+
+    def refresh_attn_sink_cache(self):
+        if self._attn_sink_local is self.attn_sink:
+            return
+        if self._attn_sink_local is None:
+            self._attn_sink_local = self.attn_sink.new_zeros(self.padded_num_heads)
+        self._attn_sink_local[: self.n_local_heads].copy_(
+            self.attn_sink[
+                self.tp_rank
+                * self.n_local_heads : (self.tp_rank + 1)
+                * self.n_local_heads
+            ]
+        )
 
     def _compute_q_a(
         self,
@@ -955,30 +973,17 @@ class MQALayer(nn.Module):
 
         tp_slice, q_padded, q_out = slice(None), None, None
         if self.tp_size > 1:
-            # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
-            # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
-            # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
-            # this rank and padded to match.
-            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
             # Only [0:n_local_heads] is written below. Uninitialized padded TP
             # heads inject NaN into attention on gfx942 (fnuz), so zero-init
             # there; other archs tolerate new_empty and skip the per-forward
             # memset.
             if _is_gfx942_supported:
-                q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
+                q_padded = x.new_zeros(x.shape[0], self.padded_num_heads, self.head_dim)
             else:
-                q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+                q_padded = x.new_empty(x.shape[0], self.padded_num_heads, self.head_dim)
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
-            if self._attn_sink_local is None:
-                # Build once on the first forward (post weight load); a per-call
-                # rebuild would replay a fill+copy per layer in the decode graph.
-                rank = self.tp_rank
-                sink = self.attn_sink.new_zeros(padded_num_heads)
-                sink[: self.n_local_heads] = self.attn_sink[
-                    rank * self.n_local_heads : (rank + 1) * self.n_local_heads
-                ]
-                self._attn_sink_local = sink
+            assert self._attn_sink_local is not None
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
@@ -2094,6 +2099,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             ):
                 self_attn.indexer.compressor.apply_ape_hotfix()
             layer.refresh_mhc_norm_weight_cache()
+            self_attn.refresh_attn_sink_cache()
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
