@@ -221,6 +221,13 @@ impl Ingress {
         let input_text = g.payload.text.take();
         let sampling_params = g.payload.sampling_params.take();
         let stream = g.stream;
+        // Replicate TokenizerManager's scalar normalization of the logprob
+        // options (this path bypasses it): absent → the scheduler defaults.
+        let return_logprob = g.payload.return_logprob.unwrap_or(false);
+        let logprob_start_len = g.payload.logprob_start_len.unwrap_or(-1);
+        let top_logprobs_num = g.payload.top_logprobs_num.unwrap_or(0);
+        let token_ids_logprob = g.payload.token_ids_logprob.take();
+        let return_hidden_states = g.payload.return_hidden_states.unwrap_or(false);
 
         let input_ids = match input_ids {
             Some(ids) if !ids.is_empty() => ids,
@@ -235,6 +242,11 @@ impl Ingress {
             input_text,
             input_ids,
             sampling_params,
+            return_logprob,
+            logprob_start_len,
+            top_logprobs_num,
+            token_ids_logprob,
+            return_hidden_states,
             stream,
         };
 

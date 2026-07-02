@@ -12,30 +12,20 @@ use crate::fsm::RequestState;
 use crate::ids::RequestId;
 
 /// Where the egress side (detok shard) writes a request's generation/control
-/// frames. The detok calls [`EgressSink::try_send`] without caring which kind it
-/// is:
-///   * `Local` — the in-process per-request channel the API handler drains for
-///     SSE. One per request, bounded for backpressure; dropping the receiver
-///     (client disconnect) is observed as stream end.
-///   * `Net` — headless mode: each item is tagged with its `rid` and funneled to
-///     the shared TCP egress writer that multiplexes one connection per DP rank.
+/// frames — the in-process per-request `Local` channel the API handler drains
+/// for SSE. One per request, bounded for backpressure; dropping the receiver
+/// (client disconnect) is observed as stream end.
 #[derive(Clone, Debug)]
 pub enum EgressSink {
     Local(mpsc::Sender<EgressItem>),
-    #[allow(dead_code)] // wired by the headless TCP transport (next step).
-    Net {
-        rid: RequestId,
-        tx: mpsc::Sender<(RequestId, EgressItem)>,
-    },
 }
 
 impl EgressSink {
     /// Non-blocking send. `Err(())` means the consumer is gone (client
-    /// disconnected / writer closed); callers treat that as an abort signal.
+    /// disconnected); callers treat that as an abort signal.
     pub fn try_send(&self, item: EgressItem) -> Result<(), ()> {
         match self {
             EgressSink::Local(tx) => tx.try_send(item).map_err(|_| ()),
-            EgressSink::Net { rid, tx } => tx.try_send((*rid, item)).map_err(|_| ()),
         }
     }
 }
@@ -46,10 +36,8 @@ pub type EgressSource = mpsc::Receiver<EgressItem>;
 /// Protocol-neutral output for one generation step — a **per-chunk delta**. The
 /// detok shard emits one per decode step (it keeps no cumulative buffer); a
 /// consumer that needs the cumulative view folds them with `OutputAccumulator`
-/// (every unary response and the cumulative SGLang `/generate` stream). OpenAI
-/// streaming forwards the deltas directly. Each API handler formats the result
-/// into its own wire shape — SGLang `/generate`, OpenAI `/v1/completions`,
-/// `/v1/chat/completions`.
+/// (every unary response and the cumulative SGLang `/generate` stream). The
+/// `/generate` handler formats the result into the SGLang wire shape.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GenerationOutput {
     pub rid: String,
@@ -65,6 +53,49 @@ pub struct GenerationOutput {
     pub completion_tokens: u64,
     /// `Some(reason)` on the final step, `None` while streaming.
     pub finish_reason: Option<String>,
+    /// Output-token logprobs (delta for this chunk; the accumulator concatenates
+    /// them). Parallel `val`/`idx` buffers. Empty unless `return_logprob`.
+    #[serde(default)]
+    pub out_lp_val: Vec<f32>,
+    #[serde(default)]
+    pub out_lp_idx: Vec<i32>,
+    /// Input (prefill) token logprobs — set once, on the first chunk.
+    #[serde(default)]
+    pub in_lp_val: Vec<f32>,
+    #[serde(default)]
+    pub in_lp_idx: Vec<i32>,
+    /// Top-k logprobs (2-level ragged): flat `val`/`idx` + per-position `lens`.
+    #[serde(default)]
+    pub out_top_val: Vec<f32>,
+    #[serde(default)]
+    pub out_top_idx: Vec<i32>,
+    #[serde(default)]
+    pub out_top_lens: Vec<u32>,
+    #[serde(default)]
+    pub in_top_val: Vec<f32>,
+    #[serde(default)]
+    pub in_top_idx: Vec<i32>,
+    #[serde(default)]
+    pub in_top_lens: Vec<u32>,
+    /// Token-ids logprobs (same 2-level ragged layout).
+    #[serde(default)]
+    pub out_tid_val: Vec<f32>,
+    #[serde(default)]
+    pub out_tid_idx: Vec<i32>,
+    #[serde(default)]
+    pub out_tid_lens: Vec<u32>,
+    #[serde(default)]
+    pub in_tid_val: Vec<f32>,
+    #[serde(default)]
+    pub in_tid_idx: Vec<i32>,
+    #[serde(default)]
+    pub in_tid_lens: Vec<u32>,
+    /// Hidden states (dense f32): flat buffer + per-row lengths. Last-writer-wins
+    /// across chunks (mirrors Python's non-cumulative `meta_info` assignment).
+    #[serde(default)]
+    pub hidden_val: Vec<f32>,
+    #[serde(default)]
+    pub hidden_lens: Vec<u32>,
 }
 
 /// What the connection handler receives on the egress stream. Generation output
@@ -179,6 +210,23 @@ pub struct GeneratePayload {
     /// Opaque sampling params, carried through to the scheduler untouched.
     #[serde(default)]
     pub sampling_params: Option<rmpv::Value>,
+    /// Logprob / hidden-state request options. This path bypasses the Python
+    /// `TokenizerManager`, so the ingress replicates its scalar normalization
+    /// (see [`TokenizedReqPayload`]) before handing them to the scheduler.
+    #[serde(default)]
+    pub return_logprob: Option<bool>,
+    #[serde(default)]
+    pub logprob_start_len: Option<i64>,
+    #[serde(default)]
+    pub top_logprobs_num: Option<i64>,
+    #[serde(default)]
+    pub token_ids_logprob: Option<rmpv::Value>,
+    #[serde(default)]
+    pub return_hidden_states: Option<bool>,
+    /// Decode logprob token ids to text in each `[logprob, token_id, text]`
+    /// tuple (the api-server does this at frame time; default leaves text null).
+    #[serde(default)]
+    pub return_text_in_logprobs: Option<bool>,
     /// Any other fields on the request body, preserved for re-serialization.
     #[serde(flatten)]
     pub extra: BTreeMap<String, rmpv::Value>,
@@ -221,6 +269,12 @@ pub struct TokenizedReqPayload {
     pub input_text: Option<String>,
     pub input_ids: Vec<i32>,
     pub sampling_params: Option<rmpv::Value>,
+    /// Scalar-normalized logprob options (defaults already applied at ingress).
+    pub return_logprob: bool,
+    pub logprob_start_len: i64,
+    pub top_logprobs_num: i64,
+    pub token_ids_logprob: Option<rmpv::Value>,
+    pub return_hidden_states: bool,
     pub stream: bool,
 }
 
@@ -263,21 +317,29 @@ impl TokenizedReqPayload {
             _ => Value::Map(Vec::new()),
         };
 
+        let token_ids_logprob_val = self.token_ids_logprob.clone().unwrap_or(Value::Nil);
+
         // Tagged array in TokenizedGenerateReqInput declaration order (BaseReq
-        // fields first), truncated at `stream`.
+        // fields first), truncated at `return_hidden_states`. msgspec requires
+        // the array to be at least as long as the last non-defaulted field
+        // (`stream`, index 13), so `input_embeds` and `token_type_ids` must be
+        // present even though we always send them Nil.
         let arr = Value::Array(vec![
-            Value::from("TokenizedGenerateReqInput"), // tag
-            Value::from(self.rid.as_str()),           // rid
-            Value::Nil,                               // http_worker_ipc
-            input_text_val,                           // input_text
-            input_ids_val,                            // input_ids
-            Value::Nil,                               // mm_inputs
-            sampling_params_val,                      // sampling_params
-            Value::from(false),                       // return_logprob
-            Value::from(-1i64),                       // logprob_start_len
-            Value::from(0i64),                        // top_logprobs_num
-            Value::Nil,                               // token_ids_logprob
-            Value::from(self.stream),                 // stream
+            Value::from("TokenizedGenerateReqInput"), // 0  tag
+            Value::from(self.rid.as_str()),           // 1  rid
+            Value::Nil,                               // 2  http_worker_ipc
+            input_text_val,                           // 3  input_text
+            input_ids_val,                            // 4  input_ids (columnar)
+            Value::Nil,                               // 5  input_embeds
+            Value::Nil,                               // 6  mm_inputs
+            Value::Nil,                               // 7  token_type_ids
+            sampling_params_val,                      // 8  sampling_params
+            Value::from(self.return_logprob),         // 9  return_logprob
+            Value::from(self.logprob_start_len),      // 10 logprob_start_len
+            Value::from(self.top_logprobs_num),       // 11 top_logprobs_num
+            token_ids_logprob_val,                    // 12 token_ids_logprob
+            Value::from(self.stream),                 // 13 stream
+            Value::from(self.return_hidden_states),   // 14 return_hidden_states
         ]);
 
         let mut buf = Vec::new();
@@ -287,18 +349,286 @@ impl TokenizedReqPayload {
 }
 
 /// Egress-ring frame discriminator (first byte). Internal to the Rust egress
-/// ring: Python pushes raw payloads via `push_chunk` / `push_result` and the
+/// ring: Python pushes raw payloads via `push_batch` / `push_result` and the
 /// tag is prepended on the Rust side, so the Python wire format is unchanged.
-pub const EGRESS_TAG_CHUNK: u8 = 0;
 pub const EGRESS_TAG_RESULT: u8 = 1;
+/// A whole decode batch in one frame: columnar scalars + numeric-column length
+/// metadata (msgpack header) plus one concatenated raw buffer (token ids +
+/// optional logprob/hidden columns). The tm-egress dispatcher decodes it into
+/// per-request [`ChunkEvent`]s and routes each by rid — no per-request FFI /
+/// msgpack from Python.
+pub const EGRESS_TAG_BATCH: u8 = 2;
 
-/// Frame a generation chunk for the egress ring (msgpack already built by
-/// Python's `push_chunk`; just prepend the tag).
-pub fn frame_egress_chunk(chunk: &[u8]) -> Bytes {
-    let mut buf = Vec::with_capacity(1 + chunk.len());
-    buf.push(EGRESS_TAG_CHUNK);
-    buf.extend_from_slice(chunk);
+/// Read `n` little-endian f32s from `data` at `*off`, advancing `*off`.
+fn take_f32(data: &[u8], off: &mut usize, n: usize) -> Vec<f32> {
+    let end = (*off + n * 4).min(data.len());
+    let out = data[*off..end]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    *off = end;
+    out
+}
+
+/// Read `n` little-endian i32s from `data` at `*off`, advancing `*off`.
+fn take_i32(data: &[u8], off: &mut usize, n: usize) -> Vec<i32> {
+    let end = (*off + n * 4).min(data.len());
+    let out = data[*off..end]
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    *off = end;
+    out
+}
+
+/// Frame a whole decode batch: `[EGRESS_TAG_BATCH][u32 header_len][header][data]`.
+/// `header` is the msgpack [`BatchHeader`] (columnar scalars + lens); `data` is
+/// the concatenated raw little-endian numeric buffer.
+pub fn frame_egress_batch(header: &[u8], data: &[u8]) -> Bytes {
+    let mut buf = Vec::with_capacity(1 + 4 + header.len() + data.len());
+    buf.push(EGRESS_TAG_BATCH);
+    buf.extend_from_slice(&(header.len() as u32).to_le_bytes());
+    buf.extend_from_slice(header);
+    buf.extend_from_slice(data);
     Bytes::from(buf)
+}
+
+/// Columnar scalar header for a whole decode batch. The bulk token ids ride as a
+/// single concatenated i32 buffer alongside (split per request by `tok_lens`),
+/// mirroring the ingress `input_ids` split. Logprob/hidden columns are NOT on
+/// this path — requests that need them use the per-request `push_chunk` frame.
+/// Columnar header for a whole batch. Scalars are per-request lists; the numeric
+/// columns ride in `data` (concatenated across all requests, one global column
+/// at a time) and are split back out using these length vectors. Flat logprob
+/// families carry a per-request element count (`*_lens`, len N); ragged families
+/// and hidden states carry a per-request position/row count (`*_reqlens`, len N)
+/// plus a flat per-position length stream (`*_poslens`). All numeric fields are
+/// `#[serde(default)]`, so the hot path (no extras) emits just the first four.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct BatchHeader {
+    pub rids: Vec<String>,
+    pub finish_reasons: Vec<Option<String>>,
+    pub prompt_tokens: Vec<u32>,
+    /// Per-request output-token count; splits the concatenated id buffer.
+    pub tok_lens: Vec<u32>,
+    #[serde(default)]
+    pub out_lp_lens: Vec<u32>,
+    #[serde(default)]
+    pub in_lp_lens: Vec<u32>,
+    #[serde(default)]
+    pub out_top_reqlens: Vec<u32>,
+    #[serde(default)]
+    pub out_top_poslens: Vec<u32>,
+    #[serde(default)]
+    pub in_top_reqlens: Vec<u32>,
+    #[serde(default)]
+    pub in_top_poslens: Vec<u32>,
+    #[serde(default)]
+    pub out_tid_reqlens: Vec<u32>,
+    #[serde(default)]
+    pub out_tid_poslens: Vec<u32>,
+    #[serde(default)]
+    pub in_tid_reqlens: Vec<u32>,
+    #[serde(default)]
+    pub in_tid_poslens: Vec<u32>,
+    #[serde(default)]
+    pub hidden_reqlens: Vec<u32>,
+    #[serde(default)]
+    pub hidden_poslens: Vec<u32>,
+}
+
+/// Slice request `i`'s flat logprob column (parallel val/idx) out of the global
+/// buffers, advancing `cur` by this request's element count.
+fn take_flat(
+    val_all: &[f32],
+    idx_all: &[i32],
+    lens: &[u32],
+    i: usize,
+    cur: &mut usize,
+) -> (Vec<f32>, Vec<i32>) {
+    let l = lens.get(i).copied().unwrap_or(0) as usize;
+    let end = (*cur + l).min(val_all.len()).min(idx_all.len());
+    let start = (*cur).min(end);
+    let out = (val_all[start..end].to_vec(), idx_all[start..end].to_vec());
+    *cur = end;
+    out
+}
+
+/// Slice request `i`'s ragged logprob column (per-position val/idx + poslens) out
+/// of the global buffers, advancing both the position cursor (`pcur`, into
+/// `poslens`) and the value cursor (`vcur`, into val/idx).
+fn take_ragged(
+    val_all: &[f32],
+    idx_all: &[i32],
+    poslens: &[u32],
+    reqlens: &[u32],
+    i: usize,
+    pcur: &mut usize,
+    vcur: &mut usize,
+) -> (Vec<f32>, Vec<i32>, Vec<u32>) {
+    let np = reqlens.get(i).copied().unwrap_or(0) as usize;
+    let pe = (*pcur + np).min(poslens.len());
+    let lens = poslens[(*pcur).min(pe)..pe].to_vec();
+    *pcur = pe;
+    let nv: usize = lens.iter().map(|&x| x as usize).sum();
+    let ve = (*vcur + nv).min(val_all.len()).min(idx_all.len());
+    let vs = (*vcur).min(ve);
+    let out = (val_all[vs..ve].to_vec(), idx_all[vs..ve].to_vec(), lens);
+    *vcur = ve;
+    out
+}
+
+/// Like [`take_ragged`] but for hidden states — a val column + row `poslens`,
+/// no idx column.
+fn take_hidden(
+    val_all: &[f32],
+    poslens: &[u32],
+    reqlens: &[u32],
+    i: usize,
+    pcur: &mut usize,
+    vcur: &mut usize,
+) -> (Vec<f32>, Vec<u32>) {
+    let nr = reqlens.get(i).copied().unwrap_or(0) as usize;
+    let pe = (*pcur + nr).min(poslens.len());
+    let lens = poslens[(*pcur).min(pe)..pe].to_vec();
+    *pcur = pe;
+    let nv: usize = lens.iter().map(|&x| x as usize).sum();
+    let ve = (*vcur + nv).min(val_all.len());
+    let vs = (*vcur).min(ve);
+    let out = (val_all[vs..ve].to_vec(), lens);
+    *vcur = ve;
+    out
+}
+
+/// Decode a batch egress frame (tag stripped) into per-request [`ChunkEvent`]s.
+/// Reads each global column fully from `data` (order must match Python's
+/// `push_generation`), then distributes it per request using the header's length
+/// vectors.
+pub fn decode_batch_frame(body: &[u8]) -> Option<Vec<ChunkEvent>> {
+    if body.len() < 4 {
+        return None;
+    }
+    let hlen = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let header = body.get(4..4 + hlen)?;
+    let data = &body[4 + hlen..];
+    let h: BatchHeader = rmp_serde::from_slice(header).ok()?;
+
+    let n = h.rids.len();
+    let sum = |v: &[u32]| v.iter().map(|&x| x as usize).sum::<usize>();
+    let mut off = 0usize;
+    // Global columns, in the exact order Python concatenates them.
+    let ids_all = take_i32(data, &mut off, sum(&h.tok_lens));
+    let out_lp_val_all = take_f32(data, &mut off, sum(&h.out_lp_lens));
+    let out_lp_idx_all = take_i32(data, &mut off, sum(&h.out_lp_lens));
+    let in_lp_val_all = take_f32(data, &mut off, sum(&h.in_lp_lens));
+    let in_lp_idx_all = take_i32(data, &mut off, sum(&h.in_lp_lens));
+    let out_top_val_all = take_f32(data, &mut off, sum(&h.out_top_poslens));
+    let out_top_idx_all = take_i32(data, &mut off, sum(&h.out_top_poslens));
+    let in_top_val_all = take_f32(data, &mut off, sum(&h.in_top_poslens));
+    let in_top_idx_all = take_i32(data, &mut off, sum(&h.in_top_poslens));
+    let out_tid_val_all = take_f32(data, &mut off, sum(&h.out_tid_poslens));
+    let out_tid_idx_all = take_i32(data, &mut off, sum(&h.out_tid_poslens));
+    let in_tid_val_all = take_f32(data, &mut off, sum(&h.in_tid_poslens));
+    let in_tid_idx_all = take_i32(data, &mut off, sum(&h.in_tid_poslens));
+    let hidden_val_all = take_f32(data, &mut off, sum(&h.hidden_poslens));
+
+    // Per-column cursors advanced inside the per-request loop.
+    let (mut c_tok, mut c_olp, mut c_ilp) = (0usize, 0usize, 0usize);
+    let (mut p_ot, mut v_ot) = (0usize, 0usize);
+    let (mut p_it, mut v_it) = (0usize, 0usize);
+    let (mut p_od, mut v_od) = (0usize, 0usize);
+    let (mut p_id, mut v_id) = (0usize, 0usize);
+    let (mut p_h, mut v_h) = (0usize, 0usize);
+
+    let mut events = Vec::with_capacity(n);
+    for i in 0..n {
+        let tl = h.tok_lens.get(i).copied().unwrap_or(0) as usize;
+        let te = (c_tok + tl).min(ids_all.len());
+        let token_ids = ids_all[c_tok.min(te)..te].to_vec();
+        c_tok = te;
+
+        let (out_lp_val, out_lp_idx) = take_flat(
+            &out_lp_val_all,
+            &out_lp_idx_all,
+            &h.out_lp_lens,
+            i,
+            &mut c_olp,
+        );
+        let (in_lp_val, in_lp_idx) =
+            take_flat(&in_lp_val_all, &in_lp_idx_all, &h.in_lp_lens, i, &mut c_ilp);
+        let (out_top_val, out_top_idx, out_top_lens) = take_ragged(
+            &out_top_val_all,
+            &out_top_idx_all,
+            &h.out_top_poslens,
+            &h.out_top_reqlens,
+            i,
+            &mut p_ot,
+            &mut v_ot,
+        );
+        let (in_top_val, in_top_idx, in_top_lens) = take_ragged(
+            &in_top_val_all,
+            &in_top_idx_all,
+            &h.in_top_poslens,
+            &h.in_top_reqlens,
+            i,
+            &mut p_it,
+            &mut v_it,
+        );
+        let (out_tid_val, out_tid_idx, out_tid_lens) = take_ragged(
+            &out_tid_val_all,
+            &out_tid_idx_all,
+            &h.out_tid_poslens,
+            &h.out_tid_reqlens,
+            i,
+            &mut p_od,
+            &mut v_od,
+        );
+        let (in_tid_val, in_tid_idx, in_tid_lens) = take_ragged(
+            &in_tid_val_all,
+            &in_tid_idx_all,
+            &h.in_tid_poslens,
+            &h.in_tid_reqlens,
+            i,
+            &mut p_id,
+            &mut v_id,
+        );
+        // Hidden: ragged val + row lens, no idx column.
+        let (hidden_val, hidden_lens) = take_hidden(
+            &hidden_val_all,
+            &h.hidden_poslens,
+            &h.hidden_reqlens,
+            i,
+            &mut p_h,
+            &mut v_h,
+        );
+
+        events.push(ChunkEvent {
+            rid: h.rids[i].clone(),
+            token_ids,
+            finish_reason: h.finish_reasons.get(i).cloned().flatten(),
+            prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
+            out_lp_val,
+            out_lp_idx,
+            in_lp_val,
+            in_lp_idx,
+            out_top_val,
+            out_top_idx,
+            out_top_lens,
+            in_top_val,
+            in_top_idx,
+            in_top_lens,
+            out_tid_val,
+            out_tid_idx,
+            out_tid_lens,
+            in_tid_val,
+            in_tid_idx,
+            in_tid_lens,
+            hidden_val,
+            hidden_lens,
+            ..Default::default()
+        });
+    }
+    Some(events)
 }
 
 /// Frame a control result `[rid, payload]` for the egress ring (tag prepended).
@@ -313,7 +643,7 @@ pub fn frame_egress_result(rid: &str, payload: &[u8]) -> Bytes {
 
 /// One scheduler output increment for a request, pushed from Python via
 /// `push_chunk` into the egress ring. Decoded on a Rust detok shard.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ChunkEvent {
     pub rid: String,
     pub seq: u64,
@@ -325,6 +655,160 @@ pub struct ChunkEvent {
     /// `#[serde(default)]` keeps the wire backward-compatible with 4-field frames.
     #[serde(default)]
     pub prompt_tokens: u32,
+    /// Output-token logprobs for this step (columnar: parallel `val`/`idx`
+    /// buffers, one entry per new output token). Empty unless `return_logprob`.
+    #[serde(default)]
+    pub out_lp_val: Vec<f32>,
+    #[serde(default)]
+    pub out_lp_idx: Vec<i32>,
+    /// Input (prefill) token logprobs, sent once on the first chunk. Empty
+    /// otherwise.
+    #[serde(default)]
+    pub in_lp_val: Vec<f32>,
+    #[serde(default)]
+    pub in_lp_idx: Vec<i32>,
+    /// Top-k logprobs (2-level ragged): flat `val`/`idx` buffers plus a
+    /// per-position `lens` (top-k count at each position; 0 = null position).
+    /// Output = per-step delta; input = once on the first chunk. Empty unless
+    /// `top_logprobs_num > 0`.
+    #[serde(default)]
+    pub out_top_val: Vec<f32>,
+    #[serde(default)]
+    pub out_top_idx: Vec<i32>,
+    #[serde(default)]
+    pub out_top_lens: Vec<u32>,
+    #[serde(default)]
+    pub in_top_val: Vec<f32>,
+    #[serde(default)]
+    pub in_top_idx: Vec<i32>,
+    #[serde(default)]
+    pub in_top_lens: Vec<u32>,
+    /// Token-ids logprobs (same 2-level ragged layout). Empty unless
+    /// `token_ids_logprob` was set on the request.
+    #[serde(default)]
+    pub out_tid_val: Vec<f32>,
+    #[serde(default)]
+    pub out_tid_idx: Vec<i32>,
+    #[serde(default)]
+    pub out_tid_lens: Vec<u32>,
+    #[serde(default)]
+    pub in_tid_val: Vec<f32>,
+    #[serde(default)]
+    pub in_tid_idx: Vec<i32>,
+    #[serde(default)]
+    pub in_tid_lens: Vec<u32>,
+    /// Hidden states (dense f32): flat buffer + per-row lengths (one row per
+    /// output position). Last-writer-wins across chunks (the final message
+    /// carries the full set). Empty unless `return_hidden_states`.
+    #[serde(default)]
+    pub hidden_val: Vec<f32>,
+    #[serde(default)]
+    pub hidden_lens: Vec<u32>,
+}
+
+#[cfg(test)]
+mod chunk_event_tests {
+    use super::*;
+
+    /// A batch frame (the fast path) decodes into per-request ChunkEvents, with
+    /// token ids sliced from the single concatenated buffer by `tok_lens`. The
+    /// header is a msgspec-style positional array (what Python emits).
+    #[test]
+    fn decodes_batch_frame() {
+        use rmpv::Value;
+        // 3 requests: rids "1","2","3"; finish [nil, "stop", nil];
+        // prompt_tokens [4,5,6]; tok_lens [2,0,1] -> ids [10,11 | (none) | 12].
+        let header_arr = Value::Array(vec![
+            Value::Array(vec![Value::from("1"), Value::from("2"), Value::from("3")]),
+            Value::Array(vec![Value::Nil, Value::from("stop"), Value::Nil]),
+            Value::Array(vec![
+                Value::from(4u32),
+                Value::from(5u32),
+                Value::from(6u32),
+            ]),
+            Value::Array(vec![
+                Value::from(2u32),
+                Value::from(0u32),
+                Value::from(1u32),
+            ]),
+        ]);
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+        let data: Vec<u8> = [10i32, 11, 12]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+
+        let framed = frame_egress_batch(&header, &data);
+        assert_eq!(framed[0], EGRESS_TAG_BATCH);
+        let events = decode_batch_frame(&framed[1..]).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].rid, "1");
+        assert_eq!(events[0].token_ids, vec![10, 11]);
+        assert_eq!(events[0].prompt_tokens, 4);
+        assert!(events[0].finish_reason.is_none());
+        assert_eq!(events[1].rid, "2");
+        assert!(events[1].token_ids.is_empty());
+        assert_eq!(events[1].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(events[2].rid, "3");
+        assert_eq!(events[2].token_ids, vec![12]);
+        assert_eq!(events[2].prompt_tokens, 6);
+    }
+
+    /// A batch frame carrying the numeric columns (extras path): 2 requests,
+    /// req0 with output logprobs + top-k + hidden, req1 empty. Verifies the
+    /// column-major data split by the header's reqlens/poslens.
+    #[test]
+    fn decodes_batch_frame_with_extras() {
+        use rmpv::Value;
+        let f = |xs: &[f32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let i = |xs: &[i32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let arr_u = |xs: &[u32]| Value::Array(xs.iter().map(|&x| Value::from(x)).collect());
+        // header: rids, finish, prompt, tok_lens, out_lp_lens, in_lp_lens,
+        //   out_top_reqlens, out_top_poslens, in_top_*, out_tid_*, in_tid_*,
+        //   hidden_reqlens, hidden_poslens
+        let header_arr = Value::Array(vec![
+            Value::Array(vec![Value::from("1"), Value::from("2")]), // rids
+            Value::Array(vec![Value::Nil, Value::Nil]),             // finish
+            arr_u(&[3, 4]),                                         // prompt
+            arr_u(&[1, 1]),                                         // tok_lens
+            arr_u(&[2, 0]),                                         // out_lp_lens
+            arr_u(&[0, 0]),                                         // in_lp_lens
+            arr_u(&[1, 0]),                                         // out_top_reqlens (req0: 1 pos)
+            arr_u(&[2]),    // out_top_poslens (that pos: k=2)
+            arr_u(&[0, 0]), // in_top_reqlens
+            arr_u(&[]),     // in_top_poslens
+            arr_u(&[0, 0]), // out_tid_reqlens
+            arr_u(&[]),     // out_tid_poslens
+            arr_u(&[0, 0]), // in_tid_reqlens
+            arr_u(&[]),     // in_tid_poslens
+            arr_u(&[1, 0]), // hidden_reqlens (req0: 1 row)
+            arr_u(&[3]),    // hidden_poslens (dim 3)
+        ]);
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+        let mut data = Vec::new();
+        data.extend(i(&[10, 20])); // token_ids: req0=[10], req1=[20]
+        data.extend(f(&[-0.5, -0.6])); // out_lp_val (req0, 2)
+        data.extend(i(&[10, 99])); // out_lp_idx
+        data.extend(f(&[-0.1, -0.2])); // out_top_val (1 pos, k=2)
+        data.extend(i(&[10, 11])); // out_top_idx
+        data.extend(f(&[0.1, 0.2, 0.3])); // hidden_val (1 row, dim 3)
+
+        let framed = frame_egress_batch(&header, &data);
+        let events = decode_batch_frame(&framed[1..]).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].token_ids, vec![10]);
+        assert_eq!(events[0].out_lp_val, vec![-0.5, -0.6]);
+        assert_eq!(events[0].out_lp_idx, vec![10, 99]);
+        assert_eq!(events[0].out_top_val, vec![-0.1, -0.2]);
+        assert_eq!(events[0].out_top_lens, vec![2]);
+        assert_eq!(events[0].hidden_val, vec![0.1, 0.2, 0.3]);
+        assert_eq!(events[0].hidden_lens, vec![3]);
+        // req1 has token id but no numeric columns.
+        assert_eq!(events[1].token_ids, vec![20]);
+        assert!(events[1].out_lp_val.is_empty() && events[1].hidden_val.is_empty());
+    }
 }
 
 #[cfg(test)]
