@@ -97,6 +97,7 @@ from typing_extensions import Literal
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
+from sglang.srt.platforms.device_mixin import DeviceMixin
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
@@ -524,9 +525,15 @@ def get_available_gpu_memory(
                 "If this is an OOT platform, ensure it is properly registered "
                 "via the 'sglang.platform_plugins' entry point."
             )
-        total_mem = current_platform.get_device_total_memory(gpu_id)
-        used_mem = current_platform.get_current_memory_usage()
-        free_gpu_memory = total_mem - used_mem
+        if (
+            type(current_platform).get_available_memory
+            is not DeviceMixin.get_available_memory
+        ):
+            free_gpu_memory, _ = current_platform.get_available_memory(gpu_id)
+        else:
+            total_mem = current_platform.get_device_total_memory(gpu_id)
+            used_mem = current_platform.get_current_memory_usage()
+            free_gpu_memory = total_mem - used_mem
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
