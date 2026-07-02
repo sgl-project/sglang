@@ -286,12 +286,14 @@ _BYTES_PER_DST_PAGE_PADDED = math.ceil(_BYTES_PER_DST_PAGE / 576) * 576  # 37440
 
 # Pre-allocated buffer for page-split output per device (lazily sized).
 _split_buf = {}  # device -> tensor
+_ref_mask_buf = {}  # device -> per-source-page referenced mask
 
 
 @triton.jit
 def _page_split_kernel(
     src_ptr,
     dst_ptr,
+    ref_mask_ptr,
     N_pages,
     src_stride0: tl.constexpr,
     dst_stride0: tl.constexpr,
@@ -308,6 +310,11 @@ def _page_split_kernel(
     sub = pid % RATIO
 
     if page_idx >= N_pages:
+        return
+    # Dirty-skip: only copy pages referenced by this step's sparse indices.
+    # The persistent dst buffer keeps prior contents for unreferenced pages,
+    # which are never read by this call (identity index mapping preserved).
+    if tl.load(ref_mask_ptr + page_idx) == 0:
         return
 
     src_base = src_ptr + page_idx * src_stride0
@@ -330,7 +337,9 @@ def _page_split_kernel(
         tl.store(dst_base + DST_SCALE_OFF + offs, vals, mask=mask)
 
 
-def _split_kv_pages_to_64(kv_u8: torch.Tensor, src_pbs: int) -> torch.Tensor:
+def _split_kv_pages_to_64(
+    kv_u8: torch.Tensor, src_pbs: int, ref_mask: torch.Tensor
+) -> torch.Tensor:
     """Split pbs=N footer-format pages into pbs=64 footer-format pages.
 
     Uses a fused Triton kernel to do all sub-page copies in a single launch
@@ -368,6 +377,7 @@ def _split_kv_pages_to_64(kv_u8: torch.Tensor, src_pbs: int) -> torch.Tensor:
     _page_split_kernel[grid](
         src_2d,
         out,
+        ref_mask,
         N,
         src_stride0,
         _BYTES_PER_DST_PAGE_PADDED,
@@ -413,7 +423,26 @@ def _flash_mla_flashinfer(
     # --- Page-split: convert pbs=N kv_cache to pbs=64 view ---
     kv_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
     src_pbs = k_cache.shape[1] if k_cache.ndim >= 3 else _PBS_SRC
-    kv_64 = _split_kv_pages_to_64(kv_u8, src_pbs) if src_pbs != _PBS_DST else kv_u8
+    idx = indices.squeeze(1) if indices.dim() == 3 else indices
+    if src_pbs != _PBS_DST:
+        # Only split the source pages actually referenced by the sparse
+        # indices this step (mark them in a fixed-size mask so the split
+        # kernel can skip the rest). Avoids re-copying the whole KV pool
+        # (~105MB/layer) every decode step. Static shapes -> CUDA-graph safe.
+        N_src = kv_u8.shape[0]
+        rmask = _ref_mask_buf.get(kv_u8.device)
+        if rmask is None or rmask.shape[0] < N_src:
+            rmask = torch.zeros(N_src, dtype=torch.uint8, device=kv_u8.device)
+            _ref_mask_buf[kv_u8.device] = rmask
+        rmask = rmask[:N_src]
+        rmask.zero_()
+        ref_pages = torch.clamp(idx.reshape(-1) // src_pbs, min=0, max=N_src - 1).to(
+            torch.long
+        )
+        rmask.index_fill_(0, ref_pages, 1)
+        kv_64 = _split_kv_pages_to_64(kv_u8, src_pbs, rmask)
+    else:
+        kv_64 = kv_u8
 
     extra_kv_u8 = (
         extra_k_cache.view(torch.uint8)
