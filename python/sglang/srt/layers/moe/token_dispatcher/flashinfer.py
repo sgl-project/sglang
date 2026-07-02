@@ -21,7 +21,11 @@ from sglang.srt.layers.moe.token_dispatcher import (
 from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
     TorchDistributedCommBackend,
 )
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    TopKOutput,
+    TopKOutputChecker,
+)
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -176,6 +180,8 @@ class FlashinferDispatcher(BaseDispatcher):
         output_dtype = hidden_states.dtype
         x = hidden_states
         x_sf = None
+        if TopKOutputChecker.format_is_bypassed(topk_output):
+            topk_output = topk_output.to_standard()
         topk_ids = topk_output.topk_ids.to(torch.int32)
         topk_weights = topk_output.topk_weights
 
