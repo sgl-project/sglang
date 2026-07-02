@@ -5,13 +5,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-try:
-    from sglang.test.ci.ci_register import register_cpu_ci
-except ModuleNotFoundError:
-    register_cpu_ci = None
+from sglang.test.ci.ci_register import register_cpu_ci
 
-if register_cpu_ci is not None:
-    register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 MODELSLIM_PATH = (

@@ -11,6 +11,7 @@ Implements swiglu_oai (MiniMax-M3 variant) fused with optional per-row int8 quan
 where x = [gate | up] is concatenated along the last dimension.
 When quantization is enabled, each row is scaled to int8 with per-row scale.
 """
+
 import torch
 import triton
 import triton.language as tl
@@ -37,7 +38,9 @@ def _swiglu_oai_quant_kernel_moe(
     SCALE: tl.constexpr,
 ):
     # calc real total_rows
-    if GROUP_LIST_TYPE == 0:  # cusum (group_list length = NUM_EXPERTS, last element = total)
+    if (
+        GROUP_LIST_TYPE == 0
+    ):  # cusum (group_list length = NUM_EXPERTS, last element = total)
         total_rows = tl.load(group_list_ptr + NUM_EXPERTS - 1).to(tl.int32)
     else:
         gl_offsets = tl.arange(0, NUM_EXPERTS_ALGIN)
@@ -60,8 +63,8 @@ def _swiglu_oai_quant_kernel_moe(
         up = al.extract_slice(
             cur_x, offsets=(HALF_COLS,), sizes=(HALF_COLS,), strides=(1,)
         )
-        gate = tl.minimum(gate, limit)                    # clamp(-inf, limit]
-        up = tl.minimum(tl.maximum(up, -limit), limit)    # clamp[-limit, limit]
+        gate = tl.minimum(gate, limit)  # clamp(-inf, limit]
+        up = tl.minimum(tl.maximum(up, -limit), limit)  # clamp[-limit, limit]
         out = gate * tl.sigmoid(gate * alpha) * (up + 1.0)
 
         # quant
@@ -120,8 +123,8 @@ def _swiglu_oai_quant_kernel_dense(
         up = al.extract_slice(
             cur_x, offsets=(HALF_COLS,), sizes=(HALF_COLS,), strides=(1,)
         )
-        gate = tl.minimum(gate, limit)                    # clamp(-inf, limit]
-        up = tl.minimum(tl.maximum(up, -limit), limit)    # clamp[-limit, limit]
+        gate = tl.minimum(gate, limit)  # clamp(-inf, limit]
+        up = tl.minimum(tl.maximum(up, -limit), limit)  # clamp[-limit, limit]
         out = gate * tl.sigmoid(gate * alpha) * (up + 1.0)
 
         # quant
@@ -147,7 +150,9 @@ def _swiglu_oai_quant_kernel_dense(
             tl.store(out_ptr + o_offsets, out.to(out_ptr.dtype.element_ty))
 
 
-def swiglu_oai_quant(x, alpha, limit, need_quant=True, group_list=None, group_list_type=None):
+def swiglu_oai_quant(
+    x, alpha, limit, need_quant=True, group_list=None, group_list_type=None
+):
     """swiglu_oai activation with optional int8 quantization.
 
     Supports two dispatch modes:

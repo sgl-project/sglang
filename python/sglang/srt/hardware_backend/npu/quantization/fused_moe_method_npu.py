@@ -765,11 +765,16 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         )[0]
 
         if use_swiglu_oai:
-            from sglang.srt.layers.triton_ops.npu_swiglu_oai_quant import swiglu_oai_quant
+            from sglang.srt.layers.triton_ops.npu_swiglu_oai_quant import (
+                swiglu_oai_quant,
+            )
 
             hidden_states, swiglu_out_scale = swiglu_oai_quant(
-                hidden_states, swiglu_alpha, swiglu_limit,
-                group_list=group_list, group_list_type=group_list_type,
+                hidden_states,
+                swiglu_alpha,
+                swiglu_limit,
+                group_list=group_list,
+                group_list_type=group_list_type,
             )
         else:
             hidden_states = torch.ops.npu.npu_swiglu(hidden_states)

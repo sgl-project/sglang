@@ -765,13 +765,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
-        _log_low_latency_dispatch_inputs(
-            "_dispatch_core -> buffer.low_latency_dispatch (crash site)",
-            hidden_states=hidden_states,
-            topk_ids=topk_ids,
-            num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
-            num_experts=self.num_experts,
-        )
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,

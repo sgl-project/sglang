@@ -5,8 +5,8 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.memory_pool import (
-    MHATokenToKVPool,
     MHATokenToKOnlyPool,
+    MHATokenToKVPool,
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
     get_tensor_size_bytes,
@@ -198,9 +198,11 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
-        flat_k_slots = self.k_buffer[layer_id - self.start_layer].view(
-            -1, self.head_num, self.head_dim
-        ).shape[0]
+        flat_k_slots = (
+            self.k_buffer[layer_id - self.start_layer]
+            .view(-1, self.head_num, self.head_dim)
+            .shape[0]
+        )
         maybe_detect_oob(loc, 0, flat_k_slots, "NPU set_kv_buffer")
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
@@ -364,7 +366,7 @@ class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
         loc_info,
         cache_k: torch.Tensor,
     ) -> None:
-        loc, _ = unwrap_write_loc(loc_info)
+        loc, _, _ = unwrap_write_loc(loc_info)
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:

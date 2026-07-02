@@ -10,7 +10,7 @@ GLM-4.6V NPU patches.
 """
 
 import math
-from typing import List, Optional
+from typing import List
 
 import torch
 from torchvision.transforms import InterpolationMode
@@ -97,7 +97,9 @@ def npu_wrapper_minimax_m3_image_preprocess(func):
             height, width = stacked_images.shape[-2:]
             if do_resize:
                 resized_height, resized_width = _smart_resize(
-                    height, width, factor=factor,
+                    height,
+                    width,
+                    factor=factor,
                     max_pixels=max_pixels,
                 )
                 stacked_images = self.resize(
@@ -204,8 +206,11 @@ def npu_wrapper_minimax_m3_video_preprocess(func):
             resized_height, resized_width = height, width
             if do_resize:
                 resized_height, resized_width = _smart_resize(
-                    height, width, factor=factor,
-                    min_pixels=min_pixels, max_pixels=max_pixels,
+                    height,
+                    width,
+                    factor=factor,
+                    min_pixels=min_pixels,
+                    max_pixels=max_pixels,
                 )
                 stacked_videos = stacked_videos.view(
                     batch_size * num_frames, channels, height, width

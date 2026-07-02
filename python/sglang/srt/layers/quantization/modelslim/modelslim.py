@@ -215,9 +215,7 @@ class ModelSlimConfig(QuantizationConfig):
             return ModelSlimFusedMoEMethod(self)
         return None
 
-    def get_packed_modules_mapping_subset(
-        self, key: str
-    ) -> Mapping[str, List[str]]:
+    def get_packed_modules_mapping_subset(self, key: str) -> Mapping[str, List[str]]:
         default_mapping = _DEFAULT_PACKED_MODULES_MAPPING.get(key, {})
         configured_mapping = self.packed_modules_mapping.get(key, {})
         if not default_mapping:

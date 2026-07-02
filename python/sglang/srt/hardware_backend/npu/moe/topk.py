@@ -34,6 +34,7 @@ def _mask_padded_tokens(
     topk_ids.masked_fill_(padding_mask, -1)
     topk_weights.masked_fill_(padding_mask, 0.0)
 
+
 def _biased_sigmoid_topk_torch_npu(
     router_logits: torch.Tensor,
     topk_config: "TopKConfig",

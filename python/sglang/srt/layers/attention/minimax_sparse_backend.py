@@ -34,9 +34,7 @@ def _npu_use_triton_sparse() -> bool:
     """
     import os
 
-    return is_npu() and bool(
-        int(os.environ.get("SGLANG_MINIMAX_NPU_TRITON", "1"))
-    )
+    return is_npu() and bool(int(os.environ.get("SGLANG_MINIMAX_NPU_TRITON", "1")))
 
 
 if TYPE_CHECKING:
@@ -312,8 +310,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             local = (query_positions // block_size).clamp(
                 min=0, max=max(num_blocks - 1, 0)
             )
-            local = local.to(topk_blocks.dtype).view(q_len, 1, 1).expand(
-                -1, num_idx_heads, -1
+            local = (
+                local.to(topk_blocks.dtype)
+                .view(q_len, 1, 1)
+                .expand(-1, num_idx_heads, -1)
             )
             valid_topk = (topk_blocks >= 0) & (topk_blocks < num_blocks)
             valid_topk = valid_topk & (topk_blocks * block_size <= qcol)
@@ -321,9 +321,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 dim=-1, keepdim=True
             )
             valid_local = (local >= 0) & (local < num_blocks)
-            valid_local = (
-                valid_local & (local * block_size <= qcol) & ~local_duplicate
-            )
+            valid_local = valid_local & (local * block_size <= qcol) & ~local_duplicate
             return torch.cat(
                 [
                     torch.where(
@@ -385,9 +383,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             device=topk_blocks.device,
         )
         overflow_rank = torch.full_like(ranks, total)
-        scatter_index = torch.where(
-            keep & (ranks < total), ranks, overflow_rank
-        ).long()
+        scatter_index = torch.where(keep & (ranks < total), ranks, overflow_rank).long()
         scatter_src = torch.where(keep, sorted_candidates, -1)
         output.scatter_(2, scatter_index, scatter_src)
         return output[:, :, :total]
@@ -569,19 +565,17 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         main_scale = head_dim**-0.5
         out = q_seq.new_zeros(q_seq.shape)
         for kv_head in range(num_kv_heads):
-            q_group = q_seq[
-                :, kv_head * group_size : (kv_head + 1) * group_size, :
-            ]
-            out[
-                :, kv_head * group_size : (kv_head + 1) * group_size, :
-            ] = self._sparse_attention_group(
-                q_group,
-                k_seq[:, kv_head, :],
-                v_seq[:, kv_head, :],
-                main_token_idx[:, kv_head, :],
-                query_positions,
-                seq_len,
-                main_scale,
+            q_group = q_seq[:, kv_head * group_size : (kv_head + 1) * group_size, :]
+            out[:, kv_head * group_size : (kv_head + 1) * group_size, :] = (
+                self._sparse_attention_group(
+                    q_group,
+                    k_seq[:, kv_head, :],
+                    v_seq[:, kv_head, :],
+                    main_token_idx[:, kv_head, :],
+                    query_positions,
+                    seq_len,
+                    main_scale,
+                )
             )
 
         idx_out = None
@@ -608,9 +602,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         k_slots = self._cache_as_slots(k_cache)
         v_slots = self._cache_as_slots(v_cache)
         idx_k_slots = self._cache_as_slots(idx_k_cache)
-        idx_v_slots = (
-            None if idx_v_cache is None else self._cache_as_slots(idx_v_cache)
-        )
+        idx_v_slots = None if idx_v_cache is None else self._cache_as_slots(idx_v_cache)
         out = q.new_zeros(q.shape)
         idx_out = None if idx_v_slots is None else idx_q.new_zeros(idx_q.shape)
 
@@ -632,18 +624,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             # pool, so when ``locs`` is contiguous a direct slice (a zero-copy
             # view) replaces the scattered gather and the GatherV3 cost
             # vanishes. Fall back to index_select for fragmented allocations.
-            is_contig = total_len <= 1 or bool(
-                (locs[1:] - locs[:-1] == 1).all().item()
-            )
+            is_contig = total_len <= 1 or bool((locs[1:] - locs[:-1] == 1).all().item())
             if is_contig:
                 sl = slice(int(locs[0].item()), int(locs[0].item()) + total_len)
                 k_seq = k_slots[sl]
                 v_seq = v_slots[sl]
                 idx_k_seq = idx_k_slots[sl, 0, :]
-                idx_v_seq = (
-                    None if idx_v_slots is None else idx_v_slots[sl, 0, :]
-                )
-                
+                idx_v_seq = None if idx_v_slots is None else idx_v_slots[sl, 0, :]
+
             else:
                 k_seq = k_slots.index_select(0, locs)
                 v_seq = v_slots.index_select(0, locs)
@@ -687,9 +675,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         k_slots = self._cache_as_slots(k_cache)
         v_slots = self._cache_as_slots(v_cache)
         idx_k_slots = self._cache_as_slots(idx_k_cache)
-        idx_v_slots = (
-            None if idx_v_cache is None else self._cache_as_slots(idx_v_cache)
-        )
+        idx_v_slots = None if idx_v_cache is None else self._cache_as_slots(idx_v_cache)
         out = q.new_zeros(q.shape)
         idx_out = None if idx_v_slots is None else idx_q.new_zeros(idx_q.shape)
 
@@ -705,17 +691,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             # pool, so when ``locs`` is contiguous a direct slice (a zero-copy
             # view) replaces the scattered gather and the GatherV3 cost
             # vanishes. Fall back to index_select for fragmented allocations.
-            is_contig = total_len <= 1 or bool(
-                (locs[1:] - locs[:-1] == 1).all().item()
-            )
+            is_contig = total_len <= 1 or bool((locs[1:] - locs[:-1] == 1).all().item())
             if is_contig:
                 sl = slice(int(locs[0].item()), int(locs[0].item()) + total_len)
                 k_seq = k_slots[sl]
                 v_seq = v_slots[sl]
                 idx_k_seq = idx_k_slots[sl, 0, :]
-                idx_v_seq = (
-                    None if idx_v_slots is None else idx_v_slots[sl, 0, :]
-                )
+                idx_v_seq = None if idx_v_slots is None else idx_v_slots[sl, 0, :]
             else:
                 k_seq = k_slots.index_select(0, locs)
                 v_seq = v_slots.index_select(0, locs)
@@ -745,12 +727,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
     def _forward_npu_triton_decode(
         self,
-        q: torch.Tensor,                       # [B, num_q_heads, head_dim]
-        k_cache: torch.Tensor,                 # [num_slots, num_kv_heads, head_dim] (NHD)
-        v_cache: torch.Tensor,                 # [num_slots, num_kv_heads, head_dim]
-        idx_q: torch.Tensor,                   # [B, num_idx_heads, idx_dim]
-        idx_k_cache: torch.Tensor,             # [num_slots, idx_kv_heads, idx_dim]
-        idx_v_cache: Optional[torch.Tensor],   # [num_slots, idx_kv_heads, idx_dim] or None
+        q: torch.Tensor,  # [B, num_q_heads, head_dim]
+        k_cache: torch.Tensor,  # [num_slots, num_kv_heads, head_dim] (NHD)
+        v_cache: torch.Tensor,  # [num_slots, num_kv_heads, head_dim]
+        idx_q: torch.Tensor,  # [B, num_idx_heads, idx_dim]
+        idx_k_cache: torch.Tensor,  # [num_slots, idx_kv_heads, idx_dim]
+        idx_v_cache: Optional[
+            torch.Tensor
+        ],  # [num_slots, idx_kv_heads, idx_dim] or None
         forward_batch: ForwardBatch,
     ):
         """NPU decode via the ported vLLM-ascend triton kernels (BNSD paged).
@@ -853,7 +837,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             topk=self.topk_blocks,
             init_blocks=0,
             local_blocks=0,
-            sm_scale=idx_dim ** -0.5,
+            sm_scale=idx_dim**-0.5,
             score_type=self.score_type,
             disable_index_value=disable_index_value,
         )
@@ -877,7 +861,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # Decode: each query sits at the last token of its sequence.
         query_positions = (seq_lens.to(torch.long) - 1).clamp(min=0)
         topk_merged = self._merge_sparse_blocks(topk_2d, query_positions, max_blocks)
-        topk_idx = topk_merged.permute(1, 0, 2).contiguous()  # [num_kv_heads, B, topk+init+local]
+        topk_idx = topk_merged.permute(
+            1, 0, 2
+        ).contiguous()  # [num_kv_heads, B, topk+init+local]
 
         # 4) main sparse attention over the selected blocks
         o = flash_decode_bnsd_with_gqa_share_sparse(
@@ -889,7 +875,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             seq_lens=seq_lens,
             block_size=page_size,
             topk_idx=topk_idx,
-            sm_scale=head_dim ** -0.5,
+            sm_scale=head_dim**-0.5,
         )
 
         # DEBUG (opt-in, MINIMAX_NPU_TRITON_DEBUG_DIFF=1): also run the validated
@@ -906,7 +892,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 self._dbg_diff_count += 1
                 try:
                     _idx_o_ref, _o_ref = self._forward_npu_sparse_decode(
-                        q, k_cache, v_cache, idx_q, idx_k_cache, idx_v_cache, forward_batch
+                        q,
+                        k_cache,
+                        v_cache,
+                        idx_q,
+                        idx_k_cache,
+                        idx_v_cache,
+                        forward_batch,
                     )
                     _d = (o.float() - _o_ref.float()).abs().max().item()
                     _r = _d / max(_o_ref.float().abs().max().item(), 1e-6)
@@ -921,7 +913,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     )
                 except Exception as _e:  # noqa: BLE001
                     logger.warning(
-                        "[MiniMax/NPU triton-vs-pytorch] reference compute failed: %s", _e
+                        "[MiniMax/NPU triton-vs-pytorch] reference compute failed: %s",
+                        _e,
                     )
         return idx_o, o
 

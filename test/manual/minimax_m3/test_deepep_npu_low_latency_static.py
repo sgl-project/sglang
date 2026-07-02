@@ -4,12 +4,11 @@ import os
 import sys
 import types
 import unittest
-from unittest import mock
 from enum import Enum
 from pathlib import Path
+from unittest import mock
 
 import torch
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEEPEP_PATH = "python/sglang/srt/layers/moe/token_dispatcher/deepep.py"
@@ -73,9 +72,7 @@ def _install_fake_modules():
         ENABLE_JIT_DEEPGEMM=False,
         DEEPGEMM_BLACKWELL=False,
     )
-    sys.modules["sglang.srt.layers.dp_attention"].get_is_extend_in_batch = (
-        lambda: False
-    )
+    sys.modules["sglang.srt.layers.dp_attention"].get_is_extend_in_batch = lambda: False
 
     base = sys.modules["sglang.srt.layers.moe.token_dispatcher.base"]
 
