@@ -594,6 +594,22 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
   constexpr int barrier_bytes = (stage_cnt * 16 + 1023) / 1024 * 1024;  // 4096
   constexpr int smem_bytes = ((tile_m * 2 + tile_n * 2) * tile_k * stage_cnt + barrier_bytes + 1023) / 1024 * 1024;
 
+  // The pipeline depth is sized against Hopper's 192 KB shared-memory
+  // budget; on devices with a smaller opt-in limit (99 KB on SM120-class
+  // parts) the launch below can never succeed. Check up front so callers
+  // get an actionable error instead of a bare invalid-argument failure:
+  // SGLang routes such devices to the CuteDSL implementation
+  // (sglang.jit_kernel.fused_a_gemm with backend="auto").
+  size_t const smem_optin = at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin;
+  TORCH_CHECK(
+      static_cast<size_t>(smem_bytes) <= smem_optin,
+      "dsv3_fused_a_gemm needs ",
+      smem_bytes,
+      " bytes of dynamic shared memory but this device's opt-in limit is ",
+      smem_optin,
+      " bytes; use the CuteDSL dsv3 fused-A GEMM on this architecture "
+      "(sglang fused_a_gemm backend=\"auto\" selects it automatically)");
+
   dim3 grid(cta_m_cnt, cta_n_cnt, 1);
   dim3 block_size(256);
   cudaLaunchConfig_t config;
@@ -607,10 +623,10 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
   config.numAttrs = 1;
   config.attrs = attrs;
   if (smem_bytes >= (48 * 1024)) {
-    cudaFuncSetAttribute(
+    CHECK_CUDA_SUCCESS(cudaFuncSetAttribute(
         fused_a_gemm_kernel<batch_size, gemm_m, gemm_k, tile_m, tile_n, tile_k, stage_cnt>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
-        smem_bytes);
+        smem_bytes));
   }
   cudaLaunchKernelEx(
       &config,
