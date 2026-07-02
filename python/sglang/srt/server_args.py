@@ -315,7 +315,7 @@ MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 
-LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer"]
+LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer", "flashkda"]
 
 
 # Allow external code to add more choices
@@ -5133,6 +5133,26 @@ class ServerArgs:
 
         # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
         decode = self.linear_attn_decode_backend or self.linear_attn_backend
+
+        # FlashKDA is a prefill-only KDA kernel (no decode kernel) but shares the
+        # backend choice list, so guard it from being selected for decode: error
+        # on an explicit --linear-attn-decode-backend flashkda, and fall back to
+        # triton decode when it was only inherited from base=flashkda (prefill
+        # keeps FlashKDA).
+        if decode == "flashkda":
+            if self.linear_attn_decode_backend == "flashkda":
+                raise ValueError(
+                    "--linear-attn-decode-backend flashkda is not supported: "
+                    "FlashKDA is prefill-only. Use "
+                    "--linear-attn-prefill-backend flashkda (decode stays on triton)."
+                )
+            self.linear_attn_decode_backend = "triton"
+            decode = "triton"
+            logger.info(
+                "FlashKDA is prefill-only; using triton for KDA decode "
+                "(FlashKDA stays on prefill)."
+            )
+
         if (
             decode == "flashinfer"
             and self.mamba_ssm_dtype != "bfloat16"
