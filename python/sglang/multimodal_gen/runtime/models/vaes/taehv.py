@@ -34,10 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.multimodal_gen.runtime.models.dits.omnidreams_cuda_graph import (
-    CUDAGraphWrapper,
-    set_or_copy,
-)
+from sglang.multimodal_gen.runtime.models.vaes._streaming_cache import set_or_copy
 
 # --------------------------------------------------------------------------- #
 # Checkpoint state-dict transforms (ported from recipes/taehv/checkpoint.py)   #
@@ -121,7 +118,7 @@ class TAEHVCache:
 
     Each slot holds the last input frame of the previous chunk (rolled-in left
     context). Slot storage addresses are stable after the first chunk so
-    CUDA-graph replay (if enabled) can write through them in place.
+    subsequent chunks reuse the buffer in place (no realloc churn).
     """
 
     dec_state: Dict[int, torch.Tensor] = field(default_factory=dict)
@@ -306,9 +303,6 @@ class TAEHV(nn.Module):
         latent_channels: int = 16,
         channels: tuple[int, int, int, int] = _LIGHTTAE_CHANNELS,
         clamp_output: bool = True,
-        use_cuda_graph: bool = False,
-        use_compile: bool = False,
-        warmup_iters: int = 2,
         state_dict_transform: StateDictTransform | None = lighttae_state_dict_transform,
     ):
         super().__init__()
@@ -334,11 +328,6 @@ class TAEHV(nn.Module):
                 act_func=act_func,
             )
 
-        self._use_cuda_graph = use_cuda_graph
-        self._use_compile = use_compile
-        self._warmup_iters = warmup_iters
-        self._decoder_wrapper: CUDAGraphWrapper | None = None
-
         if checkpoint_path is not None:
             self.load_from_checkpoint(
                 checkpoint_path, state_dict_transform=state_dict_transform
@@ -361,25 +350,7 @@ class TAEHV(nn.Module):
         self.load_state_dict(sd, strict=False, assign=True)
         self.eval().requires_grad_(False)
 
-        if self._use_compile:
-            self.decoder = torch.compile(
-                self.decoder, mode="max-autotune-no-cudagraphs"
-            )
-        self._decoder_wrapper = (
-            CUDAGraphWrapper(self.decoder, warmup_iters=self._warmup_iters)
-            if self._use_cuda_graph
-            else None
-        )
-
-    @property
-    def _decoder_call(self) -> Callable[..., torch.Tensor]:
-        return (
-            self._decoder_wrapper if self._decoder_wrapper is not None else self.decoder
-        )
-
     def prepare_cache(self) -> TAEHVCache:
-        if self._use_cuda_graph and self._decoder_wrapper is not None:
-            self._decoder_wrapper.reset()
         return TAEHVCache()
 
     @torch.inference_mode()
@@ -392,8 +363,8 @@ class TAEHV(nn.Module):
         """Streaming decode of an ``[N, T, C_z, H, W]`` latent -> ``[N, T_out, C_img, H, W]``.
 
         First call (empty cache) runs eagerly and trims the leading
-        ``frames_to_trim`` frames; same-shape body chunks replay the captured
-        graph thereafter (only when ``use_cuda_graph``).
+        ``frames_to_trim`` frames; subsequent same-shape body chunks decode
+        eagerly against the streaming cache.
         """
         if cache is None:
             cache = self.prepare_cache()
@@ -404,12 +375,7 @@ class TAEHV(nn.Module):
             self.decoder.initialize_state(
                 (b, t, c_z, h_z, w_z), z.dtype, z.device, state
             )
-        if self._use_cuda_graph and self._decoder_wrapper is not None:
-            decoder = (
-                self._decoder_wrapper.drain if first_decode else self._decoder_call
-            )
-        else:
-            decoder = self.decoder
+        decoder = self.decoder
 
         b = z.shape[0]
         x = decoder(z, state, b)
@@ -463,15 +429,11 @@ class LightTAEDecoder(nn.Module):
         checkpoint_path: str,
         dtype: torch.dtype = torch.bfloat16,
         channels: tuple[int, int, int, int] = _LIGHTTAE_CHANNELS,
-        use_cuda_graph: bool = False,
-        use_compile: bool = False,
     ) -> None:
         super().__init__()
         self.taehv = TAEHV(
             checkpoint_path=checkpoint_path,
             channels=channels,
-            use_cuda_graph=use_cuda_graph,
-            use_compile=use_compile,
         ).to(dtype=dtype)
         self.register_buffer(
             "mean",

@@ -36,7 +36,6 @@ import PIL.Image
 import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
 )
@@ -45,9 +44,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 )
 from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
     RotaryPositionEmbedding3D,
-)
-from sglang.multimodal_gen.runtime.models.dits.omnidreams_cuda_graph import (
-    CUDAGraphWrapper,
 )
 from sglang.multimodal_gen.runtime.models.encoders.omnidreams_text import (
     full_concat_embeddings,
@@ -1202,23 +1198,10 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         # Loop-invariant context-noise timestep tensor (same scalar every chunk).
         ctx_noise_t = torch.tensor(context_noise, device=device, dtype=dit_dtype)
 
-        # CUDA-graph capture of the steady-state DiT calls. The 3 calls per
-        # chunk (2 self-forcing denoise steps + 1 context re-forward) share
-        # identical tensor shapes once the KV window is steady, so a single
-        # captured graph replays for all of them. ``_dit_call`` binds the
-        # loop-invariant args (text/caches/cross_attn_kv/view_indices); the
-        # per-call-varying tensors (noisy, timestep, cond_mask, rope, hdmap) are
-        # passed positionally so the wrapper stages them into static buffers and
-        # copies them in per replay. Fill-phase chunks run eager because
-        # BlockKVCache.cached_k() returns a variable-length slice until the
-        # window is full (a graph captured then would bake the wrong shape).
-        use_cuda_graph = (
-            getattr(config, "enable_cuda_graph", False)
-            or envs.SGLANG_OMNIDREAMS_CUDA_GRAPH
-        ) and device.type == "cuda"
-
+        # Eager DiT call binding the loop-invariant args (text/caches/
+        # cross_attn_kv/view_indices); the per-call-varying tensors (noisy,
+        # timestep, cond_mask, rope, hdmap) are passed positionally.
         def _dit_call(hidden_states, timestep, cond_mask_t, rope_t, hdmap_t):
-            # Eager path: rope_t is the [L, D] cos|sin cache (shift_t).
             return self.transformer(
                 hidden_states=hidden_states,
                 encoder_hidden_states=text,
@@ -1231,15 +1214,6 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                 view_indices=view_indices,
             )
 
-        cuda_graph_runner = (
-            CUDAGraphWrapper(
-                _dit_call,
-                warmup_iters=getattr(config, "cuda_graph_warmup_iters", 2),
-            )
-            if use_cuda_graph
-            else None
-        )
-
         # FP8 modes (Phase 1): ``weight_only_fp8`` dequantizes pre-quantized FP8
         # weights to bf16 and runs the standard eager PyTorch DiT; ``disabled``
         # runs the raw bf16 checkpoint. The native FP8 DiT
@@ -1251,12 +1225,6 @@ class OmniDreamsDenoisingStage(DenoisingStage):
 
         if mode == "weight_only_fp8":
             # ---- Weight-only FP8: dequantize FP8→bf16, use eager PyTorch path ----
-            if cuda_graph_runner is not None:
-                logger.warning(
-                    "OmniDreams: weight_only_fp8 mode disables CUDA graph "
-                    "(uses standard PyTorch eager forward)."
-                )
-                cuda_graph_runner = None
             # Resolve fp8_prepared_path
             model_path = server_args.model_path
             fp8_prepared_path = getattr(config, "native_dit_fp8_prepared_path", None)
@@ -1309,34 +1277,18 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                 )
 
         elif mode == "fp8_compute":
-            # ---- Phase 2: FP8-compute linears (torch._scaled_mm) + optional sage3 ----
+            # ---- Phase 2: FP8-compute linears (torch._scaled_mm) ----
             # Swap the DiT linears to FP8-compute in place (post-load). On non-FP8
             # HW (CPU) install_fp8_compute_on_dit is a no-op -> eager bf16. The AR
             # loop below runs unchanged; the swapped quant_method/linears make the
             # matmuls FP8-compute. Idempotent (guarded by _fp8_compute_applied).
-            if cuda_graph_runner is not None:
-                logger.warning(
-                    "OmniDreams: fp8_compute mode disables CUDA graph "
-                    "(uses standard PyTorch eager forward)."
-                )
-                cuda_graph_runner = None
             from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
                 install_fp8_compute_on_dit,
             )
 
             installed = install_fp8_compute_on_dit(self.transformer)
-            # Self-attn backend: explicit env override wins, else config field.
-            # (envs.SGLANG_OMNIDREAMS_ATTN_BACKEND defaults to "sdpa", so read the
-            # raw env var to distinguish "unset" from "explicitly sdpa".)
-            attn_backend = os.environ.get("SGLANG_OMNIDREAMS_ATTN_BACKEND") or getattr(
-                config, "omnidreams_attn_backend", "sdpa"
-            )
-            if not installed:
-                attn_backend = "sdpa"
-            for block in self.transformer.blocks:
-                block.self_attn._attn_backend = attn_backend
             if installed:
-                logger.info("OmniDreams: fp8_compute active (attn=%s).", attn_backend)
+                logger.info("OmniDreams: fp8_compute active.")
             elif device.type == "cuda":
                 logger.info(
                     "OmniDreams: fp8_compute requested but unavailable; eager bf16."
@@ -1390,31 +1342,16 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                 hdmap_chunk = hdmap_zero
             pin = is_first and image_full is not None
 
-            # Roll the per-block KV window BEFORE deciding capture eligibility:
-            # is_steady_state() then reflects whether this chunk reads a full
-            # (fixed-shape) window -- the capture precondition. Once steady it
-            # stays steady, so the graph captured on the first steady chunk
-            # replays for every chunk after.
+            # Roll the per-block KV window before the forward.
             for c in caches:
                 c.before_update(chunk_idx)
-            steady_now = cuda_graph_runner is not None and caches[0].is_steady_state()
-
-            def _call_dit(hidden_states, timestep):
-                if steady_now:
-                    return cuda_graph_runner(
-                        hidden_states, timestep, cond_mask, rope_cos_sin, hdmap_chunk
-                    )
-                return _dit_call(
-                    hidden_states, timestep, cond_mask, rope_cos_sin, hdmap_chunk
-                )
 
             def predict_flow(noisy: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-                # The first-frame ``pin`` injection stays EAGER (outside the
-                # captured graph) so ``image_full`` is not baked in. pin is only
-                # true on chunk 0, which is always fill-phase (eager) anyway.
+                # The first-frame ``pin`` injection stays eager so ``image_full``
+                # is not baked in. pin is only true on chunk 0.
                 if pin:
                     noisy = noisy * (1.0 - inject_mask) + image_full * inject_mask
-                return _call_dit(noisy, t)
+                return _dit_call(noisy, t, cond_mask, rope_cos_sin, hdmap_chunk)
 
             noise = torch.empty(
                 B, chunk_tokens, in_d, device=device, dtype=dit_dtype
@@ -1433,8 +1370,8 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             if pin:
                 ctx_latent = ctx_latent * (1.0 - inject_mask) + image_full * inject_mask
             # Return ignored: this forward exists for its in-cache K/V write
-            # side effect (captured inside the graph at steady-state).
-            _call_dit(ctx_latent, ctx_noise_t)
+            # side effect.
+            _dit_call(ctx_latent, ctx_noise_t, cond_mask, rope_cos_sin, hdmap_chunk)
 
             for c in caches:
                 c.after_update(chunk_idx)
@@ -1652,29 +1589,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
 
         ctx_noise_t = torch.tensor(context_noise, device=device, dtype=dit_dtype)
 
-        # CUDA-graph + FP8 mode resolution (same as offline). cuda_graph_runner
-        # and fp8 state persist as instance attrs; in realtime the steady-state
-        # graph captures once the KV window fills (same as offline).
-        use_cuda_graph = (
-            getattr(config, "enable_cuda_graph", False)
-            or envs.SGLANG_OMNIDREAMS_CUDA_GRAPH
-        ) and device.type == "cuda"
-        # weight_only_fp8 / fp8_compute disable CUDA graph (same as offline).
-        mode = getattr(config, "native_dit_acceleration", "disabled")
-        if mode in ("weight_only_fp8", "fp8_compute"):
-            use_cuda_graph = False
-
-        # Per-call runner: in realtime we cannot persist a captured graph
-        # across calls via a local closure (the captured graph references the
-        # call-scoped caches/text tensors which are now session-persistent, so
-        # a fresh wrapper per call is safe and matches the offline capture
-        # semantics once steady-state is reached). The wrapper's internal
-        # warmup counter resets each call, which is acceptable: the graph is
-        # only captured when is_steady_state() is true, and a fresh capture on
-        # the first steady chunk of each call replays correctly for that
-        # chunk's 3 DiT calls.
-        # TODO(realtime): a session-persistent cuda_graph_runner would avoid
-        # re-warming each call; deferred until correctness is verified.
+        # Eager DiT call binding the session-persistent args.
         def _dit_call(hidden_states, timestep, cond_mask_t, rope_t, hdmap_t):
             return self.transformer(
                 hidden_states=hidden_states,
@@ -1687,15 +1602,6 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                 cross_attn_kv=cross_attn_kv,
                 view_indices=view_indices,
             )
-
-        cuda_graph_runner = (
-            CUDAGraphWrapper(
-                _dit_call,
-                warmup_iters=getattr(config, "cuda_graph_warmup_iters", 2),
-            )
-            if use_cuda_graph
-            else None
-        )
 
         # ---- per-chunk body (IDENTICAL math to the offline loop body) ---- #
         rope_cos_sin = rope.shift_t(chunk_idx)
@@ -1741,28 +1647,14 @@ class OmniDreamsDenoisingStage(DenoisingStage):
 
         pin = is_first and image_full is not None
 
-        # Roll the per-block KV window BEFORE deciding capture eligibility.
+        # Roll the per-block KV window before the forward.
         for c in caches:
             c.before_update(chunk_idx)
-        steady_now = cuda_graph_runner is not None and caches[0].is_steady_state()
-
-        def _call_dit(hidden_states, timestep):
-            if steady_now:
-                return cuda_graph_runner(
-                    hidden_states,
-                    timestep,
-                    cond_mask,
-                    rope_cos_sin,
-                    hdmap_chunk,
-                )
-            return _dit_call(
-                hidden_states, timestep, cond_mask, rope_cos_sin, hdmap_chunk
-            )
 
         def predict_flow(noisy: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
             if pin:
                 noisy = noisy * (1.0 - inject_mask) + image_full * inject_mask
-            return _call_dit(noisy, t)
+            return _dit_call(noisy, t, cond_mask, rope_cos_sin, hdmap_chunk)
 
         noise = torch.empty(
             B, chunk_tokens, in_d, device=device, dtype=dit_dtype
@@ -1776,7 +1668,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         ctx_latent = scheduler.add_noise(clean, ctx_noise_t, rng=gen)
         if pin:
             ctx_latent = ctx_latent * (1.0 - inject_mask) + image_full * inject_mask
-        _call_dit(ctx_latent, ctx_noise_t)
+        _dit_call(ctx_latent, ctx_noise_t, cond_mask, rope_cos_sin, hdmap_chunk)
 
         for c in caches:
             c.after_update(chunk_idx)
@@ -1859,15 +1751,8 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         )
 
         installed = install_fp8_compute_on_dit(self.transformer)
-        attn_backend = os.environ.get("SGLANG_OMNIDREAMS_ATTN_BACKEND") or getattr(
-            config, "omnidreams_attn_backend", "sdpa"
-        )
-        if not installed:
-            attn_backend = "sdpa"
-        for block in self.transformer.blocks:
-            block.self_attn._attn_backend = attn_backend
         if installed:
-            logger.info("OmniDreams: fp8_compute active (attn=%s).", attn_backend)
+            logger.info("OmniDreams: fp8_compute active.")
         elif device.type == "cuda":
             logger.info(
                 "OmniDreams: fp8_compute requested but unavailable; eager bf16."

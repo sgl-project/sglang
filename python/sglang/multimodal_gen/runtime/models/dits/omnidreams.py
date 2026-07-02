@@ -48,70 +48,6 @@ def _sp_size() -> int:
 
 
 # --------------------------------------------------------------------------- #
-# Phase 2: optional sage3 self-attention backend (Blackwell FP4 kernel)        #
-# --------------------------------------------------------------------------- #
-# Two sage3 backends, tried in order:
-#   1. standalone ``sageattn3_blackwell`` (bf16 drop-in) — not on PyPI mirrors;
-#   2. sgl-kernel low-level FP4 ops (``omnidreams_sage3_attn.sage3_self_attn``).
-# Both fall back to F.sdpa on CPU / unsupported head_dim / GQA / missing kernel.
-_SAGE3_IMPL = None  # cached: ("standalone", fn) | ("sgl_kernel", fn) | False
-_SAGE3_HEAD_DIMS = (64, 128, 256)
-
-
-def _resolve_sage3_impl():
-    """Resolve a sage3 callable; cache the result. Returns False if unavailable."""
-    global _SAGE3_IMPL
-    if _SAGE3_IMPL is not None:
-        return _SAGE3_IMPL
-    try:
-        from sageattn3 import sageattn3_blackwell
-
-        _SAGE3_IMPL = ("standalone", sageattn3_blackwell)
-        return _SAGE3_IMPL
-    except Exception:
-        pass
-    try:
-        _SAGE3_IMPL = ("sgl_kernel", sage3_self_attn)
-        return _SAGE3_IMPL
-    except Exception:
-        pass
-    _SAGE3_IMPL = False
-    return _SAGE3_IMPL
-
-
-def _sage3_self_attn(q: Tensor, k: Tensor, v: Tensor, backend: str) -> Tensor | None:
-    """Run sage3 self-attention, or return None to fall back to ``F.sdpa``.
-
-    ``q``/``k``/``v`` are ``[B, n, S, d]`` (post-RoPE, post-cache-assemble), the
-    same shapes ``F.scaled_dot_product_attention`` sees. sage3 is bidirectional
-    (``is_causal=False``), matching OmniDreams self-attn (no mask over the window).
-    Falls back (returns None) on CPU, unsupported head_dim, GQA, or missing kernel.
-    """
-    if backend != "sage3":
-        return None
-    if not q.is_cuda:
-        return None
-    if q.shape[-1] not in _SAGE3_HEAD_DIMS:
-        return None
-    if q.shape[1] != k.shape[1]:  # GQA (Hq != Hkv) unsupported by sage3
-        return None
-    impl = _resolve_sage3_impl()
-    if impl is False:
-        return None
-    try:
-        if impl[0] == "standalone":
-            return impl[1](q, k, v, is_causal=False)
-        # sgl-kernel low-level FP4 path.
-        import math
-
-        scale = 1.0 / math.sqrt(q.shape[-1])
-        return impl[1](q, k, v, scale=scale, is_causal=False)
-    except Exception:
-        # Shape/stride the kernel can't handle -> caller falls back to sdpa.
-        return None
-
-
-# --------------------------------------------------------------------------- #
 # Building blocks (checkpoint-exact module names)                             #
 # --------------------------------------------------------------------------- #
 class GPT2FeedForward(nn.Module):
@@ -293,9 +229,6 @@ class OmniDreamsAttention(nn.Module):
         self.n_heads = n_heads
         self.head_dim = head_dim
         self.local_num_heads = divide(n_heads, get_tp_world_size())
-        # Phase 2: self-attn backend ("sdpa" | "sage3"). Set by the denoising
-        # stage from config/env; cross-attn always uses sdpa regardless.
-        self._attn_backend: str = "sdpa"
 
         inner_dim_full = head_dim * n_heads
         if self.is_self_attn:
@@ -397,13 +330,7 @@ class OmniDreamsAttention(nn.Module):
         q_t = q.transpose(1, 2)
         k_t = k.transpose(1, 2)
         v_t = v.transpose(1, 2)
-        # Phase 2: route self-attn through sage3 when enabled (bidirectional, no
-        # mask -- matches the sdpa call above). Cross-attn always uses sdpa.
-        out = None
-        if self.is_self_attn:
-            out = _sage3_self_attn(q_t, k_t, v_t, self._attn_backend)
-        if out is None:
-            out = F.scaled_dot_product_attention(q_t, k_t, v_t)
+        out = F.scaled_dot_product_attention(q_t, k_t, v_t)
         out = out.transpose(1, 2).reshape(B, L, n * d)
         out, _ = self.output_proj(out)
         return out
@@ -1425,140 +1352,3 @@ class BlockKVCache:
         self._n_cached = 0
         self._curr_chunk_idx = None
 
-
-# ============================================================================
-# SageAttention-3 self-attention (folded from omnidreams_sage3_attn.py)
-# ============================================================================
-"""Phase 2: SageAttention-3 Blackwell FP4 self-attention via sgl-kernel.
-
-Pure-Python port of the old vendored ``sage3_attention.cu``::
-``run_sage3_fmha_packed_qkv`` glue — bf16 q/k/v in, bf16 out — calling the
-generic sgl-kernel ops ``sgl_kernel.sage3.sage3_mha_fwd`` and
-``scaled_fp4_quant``. This avoids the standalone ``sageattn3_blackwell`` pip
-package (not on any PyPI mirror) by using the FP4 kernel already shipped in
-sgl-kernel (sm_120a build).
-
-Algorithm (mirrors ``run_sage3_fmha_packed_qkv``):
-  1. Pad Mq/Mk up to a multiple of 128.
-  2. Center K per-head (subtract mean over Mk); center Q per 128-token block
-     (``subtract_group_mean``), retaining the per-block mean ``qm``.
-  3. ``delta_s = qm @ k_padded.T`` (float32) — the FP4 per-block scale-correction
-     matrix SageAttention-3 applies inside its FP4 attention.
-  4. FP4-quantize q (plain), k (permute), v (trans) via ``scaled_fp4_quant``.
-  5. ``sage3_mha_fwd(q_fp4, k_fp4, v_fp4, sfq, sfk, sfv, delta_s, unpadded_k=Mk,
-     softmax_scale=1/sqrt(D), is_causal=False, per_block_mean=True, is_bf16=True)``.
-
-OmniDreams self-attention is bidirectional over the AR window (no mask), so
-``is_causal=False`` matches the existing ``F.sdpa`` call. head_dim must be 64 or
-128 (OmniDreams uses 128). Falls back to the caller's sdpa path on any error.
-"""
-
-
-import math
-
-import torch
-
-_SAGE3_BLOCK = 128
-_SAGE3_SGL_KERNEL_HEAD_DIMS = (64, 128)
-
-try:
-    from sgl_kernel.sage3 import sage3_mha_fwd, scaled_fp4_quant
-
-    _SAGE3_AVAILABLE = True
-except Exception:
-    _SAGE3_AVAILABLE = False
-
-
-def _pad_to_block(x: torch.Tensor, block: int = _SAGE3_BLOCK) -> torch.Tensor:
-    """Pad dim 2 of ``[B, H, M, D]`` up to a multiple of ``block`` (zero pad)."""
-    m = x.size(2)
-    m_round = ((m + block - 1) // block) * block
-    if m == m_round:
-        return x.contiguous()
-    out = torch.zeros(
-        x.size(0), x.size(1), m_round, x.size(3), dtype=x.dtype, device=x.device
-    )
-    out[:, :, :m].copy_(x)
-    return out
-
-
-def sage3_self_attn(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    scale: float | None = None,
-    is_causal: bool = False,
-) -> torch.Tensor:
-    """SageAttention-3 FP4 self-attention (sgl-kernel, Blackwell sm_120a).
-
-    Args:
-        q, k, v: ``[B, H, M, D]`` bf16, post-RoPE / post-cache-assemble. D in
-            {64, 128}. Mq and Mk may differ (Q attends over the cached K window).
-        scale: softmax scale; defaults to ``1/sqrt(D)`` (matches ``F.sdpa``).
-        is_causal: False for OmniDreams bidirectional self-attn.
-
-    Returns: ``[B, H, Mq, D]`` bf16.
-    """
-    if not _SAGE3_AVAILABLE:
-        raise RuntimeError("sgl_kernel.sage3 ops not available")
-    B, H, Mq, D = q.shape
-    Mk = k.size(2)
-    if D not in _SAGE3_SGL_KERNEL_HEAD_DIMS:
-        raise ValueError(f"sage3 head_dim must be 64 or 128, got {D}")
-    if (
-        q.dtype != torch.bfloat16
-        or k.dtype != torch.bfloat16
-        or v.dtype != torch.bfloat16
-    ):
-        raise ValueError("sage3_self_attn requires bfloat16 q/k/v")
-    softmax_scale = scale if scale and scale > 0 else 1.0 / math.sqrt(D)
-
-    q_padded = _pad_to_block(q)
-    k_centered = k - k.mean(dim=2, keepdim=True)
-    k_padded = _pad_to_block(k_centered)
-    v_padded = _pad_to_block(v)
-
-    QL = q_padded.size(2)
-    KL = k_padded.size(2)
-    groups = QL // _SAGE3_BLOCK  # QL is a multiple of 128
-    # subtract_group_mean (per_block_mean=True): one mean per 128-token block.
-    q_blocks = q_padded.view(B, H, groups, _SAGE3_BLOCK, D)
-    qm = q_blocks.mean(dim=3)  # [B, H, groups, D]
-    q_centered = q_padded - qm.unsqueeze(3).expand(
-        B, H, groups, _SAGE3_BLOCK, D
-    ).reshape(B, H, QL, D)
-
-    # delta_s: per-block FP4 scale-correction matrix, float32 [B, H, groups, KL].
-    delta_s = (qm @ k_padded.transpose(-2, -1)).to(torch.float32).contiguous()
-
-    u8, f8 = torch.uint8, torch.float8_e4m3fn
-    dev = q.device
-    q_fp4 = torch.empty(B, H, QL, D // 2, dtype=u8, device=dev)
-    q_sf = torch.empty(B, H, QL, D // 16, dtype=f8, device=dev)
-    k_fp4 = torch.empty(B, H, KL, D // 2, dtype=u8, device=dev)
-    k_sf = torch.empty(B, H, KL, D // 16, dtype=f8, device=dev)
-    v_fp4 = torch.empty(B, H, D, KL // 2, dtype=u8, device=dev)
-    v_sf = torch.empty(B, H, D, KL // 16, dtype=f8, device=dev)
-    scaled_fp4_quant(q_centered, q_fp4, q_sf, 1, 0)  # plain
-    scaled_fp4_quant(k_padded.contiguous(), k_fp4, k_sf, 1, 1)  # permute (K)
-    scaled_fp4_quant(v_padded.contiguous(), v_fp4, v_sf, 1, 2)  # trans (V)
-
-    out = sage3_mha_fwd(
-        q_fp4,
-        k_fp4,
-        v_fp4,
-        q_sf,
-        k_sf,
-        v_sf,
-        delta_s,
-        Mk,
-        None,
-        softmax_scale,
-        is_causal,
-        True,
-        True,
-    )[
-        0
-    ]  # [B, H, QL, D]
-    return out[:, :, :Mq].contiguous()

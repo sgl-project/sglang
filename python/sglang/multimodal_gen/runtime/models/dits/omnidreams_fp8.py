@@ -344,16 +344,25 @@ class OmniDreamsFP8ComputeLinear(nn.Module):
 def install_fp8_compute_on_dit(dit: nn.Module) -> bool:
     """Swap the DiT's linears to FP8-compute in place (post-load).
 
-    Returns True if installed, False if skipped (non-CUDA / no ``_scaled_mm`` ->
-    the DiT keeps running eager bf16). Idempotent: re-installing is a no-op
-    (guarded by ``dit._fp8_compute_applied``).
+    Returns True if installed, False if skipped (non-CUDA DiT / no
+    ``_scaled_mm`` -> the DiT keeps running eager bf16). Idempotent:
+    re-installing is a no-op (guarded by ``dit._fp8_compute_applied``).
     """
     if getattr(dit, "_fp8_compute_applied", False):
         return True
-    if not _scaled_mm_available():
+    # FP8 _scaled_mm needs the DiT's params on CUDA; check the actual device,
+    # not just global cuda availability, so a CPU/meta-placed DiT on a GPU host
+    # still falls back to eager bf16 (e.g. cpu-offload before install, or the
+    # meta-built unit-test DiT).
+    try:
+        dev = next(dit.parameters()).device
+    except StopIteration:
+        dev = torch.device("meta")
+    if dev.type != "cuda" or not _scaled_mm_available():
         logger.info(
             "OmniDreams fp8_compute: torch._scaled_mm (FP8 e4m3) unavailable on "
-            "this device; keeping eager bf16 DiT."
+            "device %s; keeping eager bf16 DiT.",
+            dev,
         )
         return False
 

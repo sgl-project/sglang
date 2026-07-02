@@ -68,16 +68,6 @@ class OmniDreamsPipelineConfig(PipelineConfig):
     denoising_timesteps: tuple[int, ...] = (1000, 450)
     sigma_min: float = 0.0
 
-    # Capture the steady-state AR-rollout DiT calls into a CUDA graph and
-    # replay (eliminates per-launch CPU overhead across the repeated
-    # identical-shape calls). Numerically lossless. Default off until GPU
-    # verification; env SGLANG_OMNIDREAMS_CUDA_GRAPH force-enables. The fill-phase
-    # chunks (before the KV window is steady) always run eager.
-    enable_cuda_graph: bool = False
-    # Eager warmup iterations before graph capture (drains lazy allocs +
-    # torch.compile autotune when --enable-torch-compile is also on).
-    cuda_graph_warmup_iters: int = 2
-
     # ===== Unified nested Config architecture (replaces flat bool fields) =====
     text_encoder_config: OmniDreamsTextEncoderConfig | None = field(
         default_factory=OmniDreamsTextEncoderConfig
@@ -96,10 +86,8 @@ class OmniDreamsPipelineConfig(PipelineConfig):
     # Phase 1 honors ``disabled`` (eager bf16, default) and ``weight_only_fp8``
     # (dequantize pre-quantized FP8 → bf16, eager PyTorch forward).
     # Phase 2 adds ``fp8_compute``: swap the DiT linears to FP8-compute via
-    # ``torch._scaled_mm`` (per-channel weight + per-token activation) and route
-    # self-attn through the sage3 Blackwell kernel when
-    # ``omnidreams_attn_backend="sage3"``. Falls back to eager bf16 on non-FP8
-    # HW (CPU) or when ``sageattn3`` is unavailable.
+    # ``torch._scaled_mm`` (per-channel weight + per-token activation). Falls
+    # back to eager bf16 on non-FP8 HW (CPU).
     # ``auto``/``required`` are accepted as inert back-compat aliases mapped to
     # ``disabled``/``weight_only_fp8`` (see __post_init__).
     native_dit_acceleration: NativeAccelerationMode = "disabled"
@@ -107,11 +95,6 @@ class OmniDreamsPipelineConfig(PipelineConfig):
     # exporter).  When None the DenoisingStage infers a default alongside the
     # raw checkpoint (omnidreams_fp8_dit.pt).
     native_dit_fp8_prepared_path: str | None = None
-    # Phase 2: self-attention backend for the AR DiT ("sdpa" | "sage3"). Only
-    # applies when ``native_dit_acceleration="fp8_compute"`` (sage3 is most
-    # useful alongside FP8-compute). Cross-attn always uses sdpa. Overridden by
-    # env ``SGLANG_OMNIDREAMS_ATTN_BACKEND``. Default "sdpa".
-    omnidreams_attn_backend: str = "sdpa"
 
     def __post_init__(self):
         """Detect removed fields and guide migration to new Config structure."""

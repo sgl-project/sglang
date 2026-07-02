@@ -32,7 +32,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.multimodal_gen.runtime.models.dits.omnidreams_cuda_graph import set_or_copy
+from sglang.multimodal_gen.runtime.models.vaes._streaming_cache import set_or_copy
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)

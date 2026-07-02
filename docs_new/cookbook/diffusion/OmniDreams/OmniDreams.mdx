@@ -42,7 +42,7 @@ This differs from offline diffusion video models such as Wan or LTX, which denoi
 
 **References:** [NVIDIA OmniDreams blog](https://research.nvidia.com/labs/sil/projects/omnidreams-blog/) · [FlashDreams model page](https://nvidia.github.io/flashdreams/main/models/omnidreams.html) · [FlashDreams latency tuning](https://nvidia.github.io/flashdreams/main/developer_guides/latency_tuning.html) · model card `nvidia/omni-dreams-models` · sample clips `nvidia/omni-dreams-samples` (gated).
 
-**Requirements:** ≥ 48 GB VRAM, PyTorch ≥ 2.11, Blackwell (SM 12.x) for the SageAttention-3 / FP8-compute paths; older GPUs fall back to eager bf16 + SDPA.
+**Requirements:** ≥ 48 GB VRAM, PyTorch ≥ 2.11, Blackwell (SM 12.x) for the FP8-compute path; older GPUs fall back to eager bf16 + SDPA.
 
 ## 2. Deployment
 
@@ -198,12 +198,11 @@ Set `native_dit_acceleration` in a pipeline-config JSON (passed via `--pipeline-
 | --- | --- | --- | --- |
 | `disabled` (default) | eager bf16 | SDPA | Runs everywhere; baseline. |
 | `weight_only_fp8` | eager bf16 on dequantized FP8 weights | SDPA | Pre-quantized E4M3 weights dequantized to bf16 once (first request), then cached. Same steady-state latency as eager; ~first-request dequant cost. |
-| `fp8_compute` | FP8-compute GEMM via `torch._scaled_mm` | SageAttention-3 (sgl-kernel FP4) | Blackwell (SM 12.x) only. Set `omnidreams_attn_backend: "sage3"`. Falls back to SDPA on CPU / unsupported head-dim / GQA. |
+| `fp8_compute` | FP8-compute GEMM via `torch._scaled_mm` | SDPA | Blackwell (SM 12.x) only. Falls back to eager bf16 on non-FP8 HW. |
 
 ```json pipeline_config.json
 {
   "native_dit_acceleration": "weight_only_fp8",
-  "omnidreams_attn_backend": "sdpa",
   "image_encoder_config": {"impl": "lightvae"},
   "encoder_config": {"impl": "lightvae"},
   "decoder_config": {"impl": "lighttae"}
