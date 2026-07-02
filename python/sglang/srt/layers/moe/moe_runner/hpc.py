@@ -130,8 +130,10 @@ def fused_experts_none_to_hpc(
         x_reshaped = hidden_states.view(num_seq, -1, block_k)
         x_max = x_reshaped.abs().amax(dim=-1).clamp(min=1e-12)
         x_scale = (x_max / _FP8_E4M3_MAX).to(torch.float32)
-        x_fp8 = (x_reshaped / x_scale.unsqueeze(-1)).to(torch.float8_e4m3fn).view_as(
-            hidden_states
+        x_fp8 = (
+            (x_reshaped / x_scale.unsqueeze(-1))
+            .to(torch.float8_e4m3fn)
+            .view_as(hidden_states)
         )
 
         output = hpc_fuse_moe_blockwise(
@@ -154,9 +156,11 @@ def fused_experts_none_to_hpc(
         if quant_info.act_and_mul_scale is not None:
             x_scale = quant_info.act_and_mul_scale
         else:
-            x_scale = (hidden_states.abs().max() / _FP8_E4M3_MAX).clamp(
-                min=1e-12
-            ).to(torch.float32)
+            x_scale = (
+                (hidden_states.abs().max() / _FP8_E4M3_MAX)
+                .clamp(min=1e-12)
+                .to(torch.float32)
+            )
         x_fp8 = (hidden_states / x_scale).to(torch.float8_e4m3fn)
 
         # GEMM1 dequantization: output = x_fp8 @ w13_fp8 * (x_scale * w13_scale)

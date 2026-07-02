@@ -11,9 +11,6 @@ Usage:
 
 import argparse
 import math
-import os
-import sys
-import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -40,6 +37,7 @@ DEFAULT_REPEATS = 50
 
 # ── Batch spec parsing ──────────────────────────────────────────────────────
 
+
 @dataclass
 class BatchSpec:
     """Parsed batch specification.
@@ -50,6 +48,7 @@ class BatchSpec:
     ``cached_kv=0``.
     For mixed: ``prefill_specs`` + ``decode_specs`` lists.
     """
+
     name: str
     batch_type: str  # "prefill" | "decode" | "extend" | "spec-decode" | "mixed"
     batch_size: int
@@ -58,13 +57,19 @@ class BatchSpec:
     new_tokens: int = 0
     cached_kv: int = 0
     # Mixed specs
-    prefill_reqs: List[Tuple[int, int]] = field(default_factory=list)  # (new_tokens, cached_kv)
-    decode_reqs: List[Tuple[int, int]] = field(default_factory=list)  # (new_tokens, cached_kv)
+    prefill_reqs: List[Tuple[int, int]] = field(
+        default_factory=list
+    )  # (new_tokens, cached_kv)
+    decode_reqs: List[Tuple[int, int]] = field(
+        default_factory=list
+    )  # (new_tokens, cached_kv)
 
     @property
     def total_q_tokens(self) -> int:
         if self.batch_type == "mixed":
-            return sum(n for n, _ in self.prefill_reqs) + sum(n for n, _ in self.decode_reqs)
+            return sum(n for n, _ in self.prefill_reqs) + sum(
+                n for n, _ in self.decode_reqs
+            )
         return self.num_reqs * self.new_tokens
 
 
@@ -74,22 +79,40 @@ def parse_batch_specs() -> List[BatchSpec]:
 
     # Prefill (1 request, N tokens, no cached KV)
     for n, label in [(512, "q512"), (2048, "q2k"), (4096, "q4k"), (8192, "q8k")]:
-        specs.append(BatchSpec(
-            name=label, batch_type="prefill", batch_size=1,
-            num_reqs=1, new_tokens=n, cached_kv=0,
-        ))
+        specs.append(
+            BatchSpec(
+                name=label,
+                batch_type="prefill",
+                batch_size=1,
+                num_reqs=1,
+                new_tokens=n,
+                cached_kv=0,
+            )
+        )
 
     # Extend (1 request, 1k new tokens, 2k cached)
-    specs.append(BatchSpec(
-        name="q1ks2k", batch_type="extend", batch_size=1,
-        num_reqs=1, new_tokens=1024, cached_kv=2048,
-    ))
+    specs.append(
+        BatchSpec(
+            name="q1ks2k",
+            batch_type="extend",
+            batch_size=1,
+            num_reqs=1,
+            new_tokens=1024,
+            cached_kv=2048,
+        )
+    )
 
     # Extend (2 requests, 1k new tokens each, 4k cached each)
-    specs.append(BatchSpec(
-        name="2q1ks4k", batch_type="extend", batch_size=2,
-        num_reqs=2, new_tokens=1024, cached_kv=4096,
-    ))
+    specs.append(
+        BatchSpec(
+            name="2q1ks4k",
+            batch_type="extend",
+            batch_size=2,
+            num_reqs=2,
+            new_tokens=1024,
+            cached_kv=4096,
+        )
+    )
 
     # Decode (N requests, 1 new token each, K cached)
     for n, k, label in [
@@ -98,10 +121,16 @@ def parse_batch_specs() -> List[BatchSpec]:
         (32, 1024, "32q1s1k"),
         (64, 4096, "64q1s4k"),
     ]:
-        specs.append(BatchSpec(
-            name=label, batch_type="decode", batch_size=n,
-            num_reqs=n, new_tokens=1, cached_kv=k,
-        ))
+        specs.append(
+            BatchSpec(
+                name=label,
+                batch_type="decode",
+                batch_size=n,
+                num_reqs=n,
+                new_tokens=1,
+                cached_kv=k,
+            )
+        )
 
     # Spec-decode (N requests, M new tokens each, K cached)
     for n, m, k, label in [
@@ -111,36 +140,56 @@ def parse_batch_specs() -> List[BatchSpec]:
         (16, 8, 1024, "16q8s1k"),
         (32, 4, 2048, "32q4s2k"),
     ]:
-        specs.append(BatchSpec(
-            name=label, batch_type="spec-decode", batch_size=n,
-            num_reqs=n, new_tokens=m, cached_kv=k,
-        ))
+        specs.append(
+            BatchSpec(
+                name=label,
+                batch_type="spec-decode",
+                batch_size=n,
+                num_reqs=n,
+                new_tokens=m,
+                cached_kv=k,
+            )
+        )
 
     # Mixed (prefill + decode)
-    specs.append(BatchSpec(
-        name="2q2k_8q1s1k", batch_type="mixed", batch_size=10,
-        prefill_reqs=[(2048, 0)],
-        decode_reqs=[(1, 1024)] * 8,
-    ))
-    specs.append(BatchSpec(
-        name="4q1k_16q1s2k", batch_type="mixed", batch_size=20,
-        prefill_reqs=[(1024, 0)],
-        decode_reqs=[(1, 2048)] * 16,
-    ))
-    specs.append(BatchSpec(
-        name="2q4k_32q1s1k", batch_type="mixed", batch_size=34,
-        prefill_reqs=[(4096, 0)],
-        decode_reqs=[(1, 1024)] * 32,
-    ))
+    specs.append(
+        BatchSpec(
+            name="2q2k_8q1s1k",
+            batch_type="mixed",
+            batch_size=10,
+            prefill_reqs=[(2048, 0)],
+            decode_reqs=[(1, 1024)] * 8,
+        )
+    )
+    specs.append(
+        BatchSpec(
+            name="4q1k_16q1s2k",
+            batch_type="mixed",
+            batch_size=20,
+            prefill_reqs=[(1024, 0)],
+            decode_reqs=[(1, 2048)] * 16,
+        )
+    )
+    specs.append(
+        BatchSpec(
+            name="2q4k_32q1s1k",
+            batch_type="mixed",
+            batch_size=34,
+            prefill_reqs=[(4096, 0)],
+            decode_reqs=[(1, 1024)] * 32,
+        )
+    )
 
     return specs
 
 
 # ── KV cache & input preparation ────────────────────────────────────────────
 
+
 @dataclass
 class AttentionInputs:
     """Prepared inputs for a batch spec, shared across backends."""
+
     # Q: [total_q_tokens, num_q_heads, head_dim]
     q: torch.Tensor
     # K/V new: [total_new_kv_tokens, num_kv_heads, head_dim]
@@ -187,8 +236,12 @@ def _prepare_simple_inputs(spec: BatchSpec) -> AttentionInputs:
     # Allocate paged KV cache
     num_pages_needed = (total_kv + PAGE_SIZE - 1) // PAGE_SIZE
     k_cache = torch.randn(
-        max(num_pages_needed, NUM_PAGES), PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM,
-        dtype=DTYPE, device=DEVICE,
+        max(num_pages_needed, NUM_PAGES),
+        PAGE_SIZE,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        dtype=DTYPE,
+        device=DEVICE,
     )
     v_cache = torch.randn_like(k_cache)
 
@@ -224,7 +277,9 @@ def _prepare_simple_inputs(spec: BatchSpec) -> AttentionInputs:
             # token index = base_page * PAGE_SIZE + j
             triton_kv_indices_list.append(base_page * PAGE_SIZE + j)
         triton_kv_indptr.append(len(triton_kv_indices_list))
-    triton_kv_indices = torch.tensor(triton_kv_indices_list, dtype=torch.int32, device=DEVICE)
+    triton_kv_indices = torch.tensor(
+        triton_kv_indices_list, dtype=torch.int32, device=DEVICE
+    )
     triton_kv_indptr = torch.tensor(triton_kv_indptr, dtype=torch.int32, device=DEVICE)
 
     # For flashinfer: kv_indptr and kv_indices — PAGE indices
@@ -241,7 +296,9 @@ def _prepare_simple_inputs(spec: BatchSpec) -> AttentionInputs:
     last_page_len = max_seq_len % PAGE_SIZE
     if last_page_len == 0:
         last_page_len = PAGE_SIZE
-    fi_kv_last_page_len = torch.full((bs,), last_page_len, dtype=torch.int32, device=DEVICE)
+    fi_kv_last_page_len = torch.full(
+        (bs,), last_page_len, dtype=torch.int32, device=DEVICE
+    )
 
     # For extend: cu_seqlens_q
     cu_seqlens_q = None
@@ -256,14 +313,22 @@ def _prepare_simple_inputs(spec: BatchSpec) -> AttentionInputs:
         max_q = 1
 
     return AttentionInputs(
-        q=q, k_new=k_new, v_new=v_new,
-        k_cache=k_cache, v_cache=v_cache,
-        block_table=block_table, seq_lens=seq_lens,
-        cu_seqlens_q=cu_seqlens_q, max_seqlens_q=max_q,
-        triton_kv_indptr=triton_kv_indptr, triton_kv_indices=triton_kv_indices,
-        fi_kv_indptr=fi_kv_indptr, fi_kv_indices=fi_kv_indices,
+        q=q,
+        k_new=k_new,
+        v_new=v_new,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        block_table=block_table,
+        seq_lens=seq_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlens_q=max_q,
+        triton_kv_indptr=triton_kv_indptr,
+        triton_kv_indices=triton_kv_indices,
+        fi_kv_indptr=fi_kv_indptr,
+        fi_kv_indices=fi_kv_indices,
         fi_kv_last_page_len=fi_kv_last_page_len,
-        batch_size=bs, total_q_tokens=total_q,
+        batch_size=bs,
+        total_q_tokens=total_q,
         is_decode=(spec.batch_type == "decode"),
     )
 
@@ -285,8 +350,12 @@ def _prepare_mixed_inputs(spec: BatchSpec) -> AttentionInputs:
     total_kv = sum(n + c for n, c in all_reqs)
     num_pages_needed = (total_kv + PAGE_SIZE - 1) // PAGE_SIZE
     k_cache = torch.randn(
-        max(num_pages_needed, NUM_PAGES), PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM,
-        dtype=DTYPE, device=DEVICE,
+        max(num_pages_needed, NUM_PAGES),
+        PAGE_SIZE,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        dtype=DTYPE,
+        device=DEVICE,
     )
     v_cache = torch.randn_like(k_cache)
 
@@ -322,7 +391,9 @@ def _prepare_mixed_inputs(spec: BatchSpec) -> AttentionInputs:
             triton_kv_indices_list.append(base_page * PAGE_SIZE + j)
         triton_kv_indptr.append(len(triton_kv_indices_list))
 
-    triton_kv_indices = torch.tensor(triton_kv_indices_list, dtype=torch.int32, device=DEVICE)
+    triton_kv_indices = torch.tensor(
+        triton_kv_indices_list, dtype=torch.int32, device=DEVICE
+    )
     triton_kv_indptr = torch.tensor(triton_kv_indptr, dtype=torch.int32, device=DEVICE)
 
     # FlashInfer: kv_indptr / kv_indices — PAGE indices
@@ -343,7 +414,9 @@ def _prepare_mixed_inputs(spec: BatchSpec) -> AttentionInputs:
         if lpl == 0:
             lpl = PAGE_SIZE
         fi_last_page_len_list.append(lpl)
-    fi_kv_last_page_len = torch.tensor(fi_last_page_len_list, dtype=torch.int32, device=DEVICE)
+    fi_kv_last_page_len = torch.tensor(
+        fi_last_page_len_list, dtype=torch.int32, device=DEVICE
+    )
 
     # cu_seqlens_q
     cu_seqlens_q = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
@@ -355,19 +428,28 @@ def _prepare_mixed_inputs(spec: BatchSpec) -> AttentionInputs:
     max_q = max(n for n, _ in all_reqs)
 
     return AttentionInputs(
-        q=q, k_new=k_new, v_new=v_new,
-        k_cache=k_cache, v_cache=v_cache,
-        block_table=block_table, seq_lens=seq_lens,
-        cu_seqlens_q=cu_seqlens_q, max_seqlens_q=max_q,
-        triton_kv_indptr=triton_kv_indptr, triton_kv_indices=triton_kv_indices,
-        fi_kv_indptr=fi_kv_indptr, fi_kv_indices=fi_kv_indices,
+        q=q,
+        k_new=k_new,
+        v_new=v_new,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        block_table=block_table,
+        seq_lens=seq_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlens_q=max_q,
+        triton_kv_indptr=triton_kv_indptr,
+        triton_kv_indices=triton_kv_indices,
+        fi_kv_indptr=fi_kv_indptr,
+        fi_kv_indices=fi_kv_indices,
         fi_kv_last_page_len=fi_kv_last_page_len,
-        batch_size=bs, total_q_tokens=total_q,
+        batch_size=bs,
+        total_q_tokens=total_q,
         is_decode=False,
     )
 
 
 # ── Timing utilities ────────────────────────────────────────────────────────
+
 
 def benchmark_kernel(fn, warmup=WARMUP_ITERS, repeats=DEFAULT_REPEATS):
     """Benchmark a kernel function using CUDA events."""
@@ -395,13 +477,17 @@ def benchmark_kernel(fn, warmup=WARMUP_ITERS, repeats=DEFAULT_REPEATS):
 
 # ── Backend implementations ─────────────────────────────────────────────────
 
+
 def bench_hpc(inputs: AttentionInputs, repeats: int) -> float:
     """Benchmark HPC attention backend."""
     import hpc
 
     o = torch.empty(
-        inputs.total_q_tokens, NUM_Q_HEADS, HEAD_DIM,
-        dtype=DTYPE, device=DEVICE,
+        inputs.total_q_tokens,
+        NUM_Q_HEADS,
+        HEAD_DIM,
+        dtype=DTYPE,
+        device=DEVICE,
     )
 
     if inputs.is_decode:
@@ -418,6 +504,7 @@ def bench_hpc(inputs: AttentionInputs, repeats: int) -> float:
                 splitk=True,
                 output=o,
             )
+
     else:
         # Prefill/extend path
         def fn():
@@ -457,22 +544,35 @@ def bench_triton(inputs: AttentionInputs, repeats: int) -> float:
         # Cap at 128 to limit buffer size
         max_kv_splits = min(max_kv_splits, 128)
         num_kv_splits = torch.full(
-            (inputs.batch_size,), max_kv_splits, dtype=torch.int32, device=DEVICE,
+            (inputs.batch_size,),
+            max_kv_splits,
+            dtype=torch.int32,
+            device=DEVICE,
         )
 
         # attn_logits: [bs, num_heads, max_kv_splits, v_head_dim]
         # attn_lse: [bs, num_heads, max_kv_splits]
         attn_logits = torch.empty(
-            inputs.batch_size, NUM_Q_HEADS, max_kv_splits, HEAD_DIM,
-            dtype=torch.float32, device=DEVICE,
+            inputs.batch_size,
+            NUM_Q_HEADS,
+            max_kv_splits,
+            HEAD_DIM,
+            dtype=torch.float32,
+            device=DEVICE,
         )
         attn_lse = torch.empty(
-            inputs.batch_size, NUM_Q_HEADS, max_kv_splits,
-            dtype=torch.float32, device=DEVICE,
+            inputs.batch_size,
+            NUM_Q_HEADS,
+            max_kv_splits,
+            dtype=torch.float32,
+            device=DEVICE,
         )
         o = torch.empty(
-            inputs.batch_size, NUM_Q_HEADS, HEAD_DIM,
-            dtype=DTYPE, device=DEVICE,
+            inputs.batch_size,
+            NUM_Q_HEADS,
+            HEAD_DIM,
+            dtype=DTYPE,
+            device=DEVICE,
         )
 
         q_3d = inputs.q.view(inputs.batch_size, NUM_Q_HEADS, HEAD_DIM)
@@ -494,11 +594,15 @@ def bench_triton(inputs: AttentionInputs, repeats: int) -> float:
                 v_scale=1.0,
                 page_size=PAGE_SIZE,
             )
+
     else:
         # Extend/prefill path
         o = torch.empty(
-            inputs.total_q_tokens, NUM_Q_HEADS, HEAD_DIM,
-            dtype=DTYPE, device=DEVICE,
+            inputs.total_q_tokens,
+            NUM_Q_HEADS,
+            HEAD_DIM,
+            dtype=DTYPE,
+            device=DEVICE,
         )
         max_extend_len = inputs.max_seqlens_q
 
@@ -554,9 +658,7 @@ def bench_flashinfer(inputs: AttentionInputs, repeats: int) -> float:
         raise RuntimeError("FlashInfer wrapper plan/begin_forward failed")
 
     if inputs.is_decode:
-        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-            workspace_buffer, "NHD"
-        )
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, "NHD")
         _call_plan(
             wrapper,
             inputs.fi_kv_indptr,
@@ -576,6 +678,7 @@ def bench_flashinfer(inputs: AttentionInputs, repeats: int) -> float:
                 paged_kv_cache,
                 sm_scale=SM_SCALE,
             )
+
     else:
         wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer, "NHD"
@@ -647,17 +750,24 @@ def bench_fa3(inputs: AttentionInputs, repeats: int) -> float:
                 softmax_scale=SM_SCALE,
                 causal=True,
             )
+
     else:
         # Prefill/extend path
         o = torch.empty(
-            inputs.total_q_tokens, NUM_Q_HEADS, HEAD_DIM,
-            dtype=DTYPE, device=DEVICE,
+            inputs.total_q_tokens,
+            NUM_Q_HEADS,
+            HEAD_DIM,
+            dtype=DTYPE,
+            device=DEVICE,
         )
         q_3d = inputs.q.view(-1, NUM_Q_HEADS, HEAD_DIM)
 
         # For pure prefill (no cached KV), use flash_attn_varlen_func
         # For extend, use flash_attn_with_kvcache with cu_seqlens_q
-        if inputs.cu_seqlens_q is not None and inputs.seq_lens.max().item() > inputs.max_seqlens_q:
+        if (
+            inputs.cu_seqlens_q is not None
+            and inputs.seq_lens.max().item() > inputs.max_seqlens_q
+        ):
             # Extend path
             def fn():
                 flash_attn_with_kvcache(
@@ -671,6 +781,7 @@ def bench_fa3(inputs: AttentionInputs, repeats: int) -> float:
                     softmax_scale=SM_SCALE,
                     causal=True,
                 )
+
         else:
             # Pure prefill path
             cu_seqlens_k = inputs.cu_seqlens_q.clone()
@@ -694,12 +805,16 @@ def bench_fa3(inputs: AttentionInputs, repeats: int) -> float:
 def bench_trtllm_mha(inputs: AttentionInputs, repeats: int) -> float:
     """Benchmark TensorRT-LLM MHA backend."""
     try:
-        from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+        import importlib
+
+        importlib.util.find_spec("sglang.srt.layers.attention.trtllm_mha_backend")
     except ImportError:
         print("  [SKIP] trtllm_mha not available")
         return float("inf")
 
-    print("  [SKIP] trtllm_mha requires full server context (not standalone benchmarkable)")
+    print(
+        "  [SKIP] trtllm_mha requires full server context (not standalone benchmarkable)"
+    )
     return float("inf")
 
 
@@ -724,8 +839,12 @@ BACKEND_DISPLAY = {
 
 # ── Table generation ────────────────────────────────────────────────────────
 
-def format_table(results: Dict[str, Dict[str, float]], specs: List[BatchSpec],
-                 backend_names: List[str]) -> str:
+
+def format_table(
+    results: Dict[str, Dict[str, float]],
+    specs: List[BatchSpec],
+    backend_names: List[str],
+) -> str:
     """Generate a comparison table like the vLLM PR."""
     display_names = [BACKEND_DISPLAY.get(b, b) for b in backend_names]
 
@@ -808,29 +927,38 @@ def format_table(results: Dict[str, Dict[str, float]], specs: List[BatchSpec],
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Benchmark attention backends (HPC vs Triton vs FlashInfer vs FA3)"
     )
     parser.add_argument(
-        "--backends", nargs="+", default=["hpc", "triton", "flashinfer", "fa3"],
+        "--backends",
+        nargs="+",
+        default=["hpc", "triton", "flashinfer", "fa3"],
         choices=list(BACKENDS.keys()),
         help="Backends to benchmark",
     )
     parser.add_argument(
-        "--repeats", type=int, default=DEFAULT_REPEATS,
+        "--repeats",
+        type=int,
+        default=DEFAULT_REPEATS,
         help="Number of timing iterations per benchmark",
     )
     parser.add_argument(
-        "--specs", nargs="+", default=None,
+        "--specs",
+        nargs="+",
+        default=None,
         help="Specific batch specs to run (default: all)",
     )
     args = parser.parse_args()
 
     print(f"Attention Backend Benchmark")
     print(f"  Device: {torch.cuda.get_device_name()}")
-    print(f"  Config: head_dim={HEAD_DIM}, num_q_heads={NUM_Q_HEADS}, "
-          f"num_kv_heads={NUM_KV_HEADS}, page_size={PAGE_SIZE}, dtype={DTYPE}")
+    print(
+        f"  Config: head_dim={HEAD_DIM}, num_q_heads={NUM_Q_HEADS}, "
+        f"num_kv_heads={NUM_KV_HEADS}, page_size={PAGE_SIZE}, dtype={DTYPE}"
+    )
     print(f"  Backends: {', '.join(args.backends)}")
     print(f"  Warmup: {WARMUP_ITERS} iters, Measure: {args.repeats} iters")
     print()
@@ -842,7 +970,11 @@ def main():
     results: Dict[str, Dict[str, float]] = {}
 
     for spec in specs:
-        print(f"Preparing {spec.name} ({spec.batch_type}, bs={spec.batch_size})...", end=" ", flush=True)
+        print(
+            f"Preparing {spec.name} ({spec.batch_type}, bs={spec.batch_size})...",
+            end=" ",
+            flush=True,
+        )
         inputs = prepare_inputs(spec)
         print(f"q_tokens={inputs.total_q_tokens}")
 
