@@ -54,6 +54,9 @@ def msgspec_to_builtins(obj: Any) -> Any:
     if isinstance(obj, set):
         return [msgspec_to_builtins(item) for item in obj]
 
+    if isinstance(obj, type):
+        return f"{obj.__module__}.{obj.__qualname__}"
+
     return obj
 
 
