@@ -3220,14 +3220,13 @@ class ServerArgs:
         """
         from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
-        def _uses_dense_mla_prefill() -> bool:
-            return self.use_mla_backend() and not is_deepseek_dsa(
-                self.get_model_config().hf_config
-            )
-
         rules = [
             # MLA prefill takes a different attn-forward path under BCG.
-            ("MLA attention", _uses_dense_mla_prefill),
+            (
+                "MLA attention",
+                lambda: self.use_mla_backend()
+                and not is_deepseek_dsa(self.get_model_config().hf_config),
+            ),
             # DSV4 is BCG-compatible but introduces heavy memory pressure: the
             # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
             (
