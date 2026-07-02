@@ -1249,6 +1249,9 @@ class KVCache(abc.ABC):
             )
             self.mem_usage = kv_size_GB
 
+    def get_key_buffer_shape(self) -> torch.Size:
+        return self.get_key_buffer(self.start_layer).shape
+
     @abc.abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
