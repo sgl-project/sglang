@@ -372,10 +372,7 @@ class RMSNorm(MultiPlatformOp):
                 residual is not None
                 or self.cast_x_before_out_mul
                 or get_global_server_args().rl_on_policy_target == "fsdp"
-                or (
-                    self._fused_pad_kernel is not None
-                    and self.x_pad_to_multiple > 0
-                )
+                or (self._fused_pad_kernel is not None and self.x_pad_to_multiple > 0)
             ):
                 return self.forward_native(x, residual, post_residual_addition)
             out = rms_norm_batch_invariant(
