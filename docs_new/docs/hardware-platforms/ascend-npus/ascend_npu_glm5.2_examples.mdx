@@ -338,7 +338,6 @@ do
     then
         echo "${D_IP[$i]}"
 
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export HCCL_BUFFSIZE=650
