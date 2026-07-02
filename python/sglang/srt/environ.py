@@ -331,6 +331,9 @@ class Envs:
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
+    SGLANG_DLLM_TP_LOCAL_VOCAB = EnvBool(False)
+    SGLANG_DLLM_TP_LOCAL_VOCAB_PACKED_GATHER = EnvBool(True)
+    SGLANG_CONSUMER_STATE_TRACE_JSONL = EnvStr("")
 
     # ===================================================================
     # HTTP server and health
