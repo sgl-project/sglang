@@ -234,7 +234,11 @@ class _Flux2Nvfp4FallbackAdapter(_TransformerQuantAdapter):
 
 
 class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
-    """Adapter for diffusion ModelOpt FP8 checkpoints."""
+    """Keeps the DiT resident when offload would break FP8-family quant.
+
+    modelopt_fp8 needs it for tensor strides; online quant needs it because
+    the load-time quant kernels are GPU/NPU-only.
+    """
 
     def __init__(
         self,
@@ -255,16 +259,30 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
 
         quant_name_getter = getattr(type(quant_config), "get_name", None)
         quant_name = quant_name_getter() if callable(quant_name_getter) else None
-        if quant_name != "modelopt_fp8":
+
+        # Online quant runs its weight-quant kernel during load, and that kernel
+        # is GPU/NPU-only. If the DiT sits on the host under dit_cpu_offload the
+        # kernel dies there and the loader quietly falls back to an unquantized
+        # native model.
+        is_online_quant = server_args.quantization is not None
+        if quant_name != "modelopt_fp8" and not is_online_quant:
             return
 
         if server_args.dit_cpu_offload:
             server_args.dit_cpu_offload = False
-            logger.warning(
-                "ModelOpt FP8 diffusion checkpoints currently keep dit_cpu_offload "
-                "disabled. Layerwise DiT offload stays enabled because the runtime "
-                "now preserves the restored FP8 tensor strides.",
-            )
+            if is_online_quant:
+                logger.warning(
+                    "Disabling dit_cpu_offload: online '%s' quantization needs the "
+                    "DiT on device at load time. Use --dit-layerwise-offload to save "
+                    "DiT memory.",
+                    server_args.quantization,
+                )
+            else:
+                logger.warning(
+                    "ModelOpt FP8 diffusion checkpoints currently keep dit_cpu_offload "
+                    "disabled. Layerwise DiT offload stays enabled because the runtime "
+                    "now preserves the restored FP8 tensor strides.",
+                )
 
     def prepare(self) -> None:
         _ModelOptFp8OffloadAdapter._maybe_disable_incompatible_dit_offload_modes(
