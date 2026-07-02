@@ -270,7 +270,21 @@ class FusedMoE(torch.nn.Module):
         self.quant_method: Optional[FusedMoEMethodBase] = None
         server_args = get_global_server_args()
         kt_config = create_kt_config_from_server_args(server_args, layer_id)
-        if kt_config is not None:
+        if server_args.enable_paged_experts:
+            from sglang.srt.layers.moe.paged_experts import make_for_layer
+
+            base_method = (
+                quant_config.get_quant_method(self, prefix)
+                if quant_config is not None
+                else UnquantizedFusedMoEMethod(self.use_triton_kernels)
+            )
+            self.quant_method = make_for_layer(
+                self,
+                base_method,
+                server_args,
+                num_resident=server_args.paged_experts_num_resident,
+            )
+        elif kt_config is not None:
             if quant_config is not None:
                 gpu_method = quant_config.get_quant_method(self, prefix)
             else:
