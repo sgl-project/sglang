@@ -275,9 +275,37 @@ class GlmImageAR(PipelineStage):
                     "max_new_tokens": max_new_tokens,
                 },
             }
-            response = requests.post(
-                server_args.srt_encoder_url + "/generate", json=payload
-            )
+            try:
+                response = requests.post(
+                    server_args.srt_encoder_url + "/generate", json=payload, timeout=(server_args.srt_encoder_connect_timeout, server_args.srt_encoder_timeout)
+                )
+            except requests.ConnectionError as e:
+                logger.error(
+                    "Failed to establish a connection to SGLang encoder server at %s. "
+                    "Verify that the AR model server is running and accessible. Error details: %s",
+                    server_args.srt_encoder_url, e
+                )
+                raise
+            except requests.ConnectTimeout as e:
+                logger.error(
+                    "Connection timeout to SGLang encoder (%s). Try to increase --srt-encoder-connection-timeout (current: %s sec). Details: %s",
+                    server_args.srt_encoder_url, server_args.srt_encoder_connect_timeout, e
+                )
+                raise
+            except requests.ReadTimeout as e:
+                logger.error(
+                    "Read timeout from SGLang encoder (%s). Try to increase --srt-encoder-timeout (current: %s sec). Details: %s",
+                    server_args.srt_encoder_url, server_args.srt_encoder_timeout, e
+                )
+                raise
+            except requests.RequestException as e:
+                logger.error(
+                    "An error occurred during communication with SGLang encoder server at %s. "
+                    "The server is reachable, but the request failed. Error type: %s, Details: %s",
+                    server_args.srt_encoder_url, type(e).__name__, e
+                )
+                raise
+
             data = response.json()
             generated_ids = data.get("output_ids")
         else:

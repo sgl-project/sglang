@@ -351,6 +351,8 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # SGLang backend for encoder stage
     srt_encoder_url: str | None = None
+    srt_encoder_connect_timeout: int = 3.05
+    srt_encoder_timeout: int = 100
 
     @property
     def broker_port(self) -> int:
@@ -1666,6 +1668,20 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.srt_encoder_url,
             help="Url of SGLang server for encoder stage",
+        )
+        parser.add_argument(
+            "--srt-encoder-connection-timeout",
+            type=int,
+            default=ServerArgs.srt_encoder_connect_timeout,
+            help="Timeout (in seconds) for establishing the initial TCP connection to the SGLang encoder server. "
+            "Default value is 3.05.",
+        )
+        parser.add_argument(
+            "--srt-encoder-timeout",
+            type=int,
+            default=ServerArgs.srt_encoder_timeout,
+            help="Timeout (in seconds) for HTTP requests to the SGLang encoder server. "
+            "Increase value if connection between diffusion server and AR model server is slow.",
         )
 
         return parser
