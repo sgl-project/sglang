@@ -273,11 +273,6 @@ class HiCacheController:
         ]:
             raise ValueError(f"Invalid write policy: {write_policy}")
 
-        if write_policy == "write_back":
-            logger.warning(
-                "write_back policy will be deprecated in future releases; please migrate to write_through_selective with appropriate configuration for better performance and reliability."
-            )
-
         # self.write_queue = PriorityQueue[CacheOperation]()
         self.load_queue: List[CacheOperation] = []
         self.write_queue: List[CacheOperation] = []
