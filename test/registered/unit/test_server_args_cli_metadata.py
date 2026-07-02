@@ -128,7 +128,7 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
         for option in ("--data-parallel-size", "--dp-size"):
             with self.subTest(option=option):
                 args = self.parser.parse_args(["--model", "dummy", option, "3"])
-                self.assertEqual(args.data_parallel_size, 3)
+                self.assertEqual(args.dp_size, 3)
                 self.assertEqual(ServerArgs.from_cli_args(args).dp_size, 3)
 
     def test_migrated_and_manual_options_parse_together(self):

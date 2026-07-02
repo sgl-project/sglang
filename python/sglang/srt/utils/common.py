@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import binascii
 import builtins
 import ctypes
 import functools
@@ -64,6 +65,7 @@ from typing import (
     Dict,
     Generic,
     List,
+    NamedTuple,
     Optional,
     Protocol,
     Sequence,
@@ -102,6 +104,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
+
+
+class Range(NamedTuple):
+    start: int
+    end: int
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start
 
 
 def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
@@ -166,6 +177,17 @@ def is_hpu() -> bool:
 @lru_cache(maxsize=1)
 def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
+
+
+def register_xpu_device_properties_for_dynamo() -> None:
+    if not is_xpu():
+        return
+
+    import torch._dynamo.utils as dynamo_utils
+
+    xpu_props_type = getattr(torch.xpu, "_XpuDeviceProperties", None)
+    if xpu_props_type is not None:
+        dynamo_utils.common_constant_types.add(xpu_props_type)
 
 
 @lru_cache(maxsize=1)
@@ -566,9 +588,11 @@ def get_available_gpu_memory(
         assert gpu_id < num_gpus
 
         if torch.cuda.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.cuda.current_device()}, ",
-                "which may cause useless memory allocation for torch CUDA context.",
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch CUDA context.",
+                gpu_id,
+                torch.cuda.current_device(),
             )
 
         if empty_cache:
@@ -588,25 +612,29 @@ def get_available_gpu_memory(
         assert gpu_id < num_gpus
 
         if torch.xpu.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.xpu.current_device()}, ",
-                "which may cause useless memory allocation for torch XPU context.",
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch XPU context.",
+                gpu_id,
+                torch.xpu.current_device(),
             )
 
         if empty_cache:
             empty_device_cache(torch.xpu)
-        used_memory = torch.xpu.memory_allocated()
-        total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
-        free_gpu_memory = total_gpu_memory - used_memory
+        # Use mem_get_info() to reflect true OS-level free memory
+        # including graph pool reservations; avoids KV-cache over-allocation.
+        free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info(gpu_id)
 
     elif device == "hpu":
         num_gpus = torch.hpu.device_count()
         assert gpu_id < num_gpus
 
         if torch.hpu.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.hpu.current_device()}, ",
-                "which may cause useless memory allocation for torch HPU context.",
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch HPU context.",
+                gpu_id,
+                torch.hpu.current_device(),
             )
 
         free_gpu_memory, total_gpu_memory = torch.hpu.mem_get_info()
@@ -621,9 +649,11 @@ def get_available_gpu_memory(
         assert gpu_id < num_gpus
 
         if torch.npu.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.npu.current_device()}, ",
-                "which may cause useless memory allocation for torch NPU context.",
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch NPU context.",
+                gpu_id,
+                torch.npu.current_device(),
             )
         if empty_cache:
             empty_device_cache(torch.npu)
@@ -642,9 +672,11 @@ def get_available_gpu_memory(
         assert gpu_id < num_gpus
 
         if torch.musa.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.musa.current_device()}, ",
-                "which may cause useless memory allocation for torch MUSA context.",
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch MUSA context.",
+                gpu_id,
+                torch.musa.current_device(),
             )
         if empty_cache:
             empty_device_cache(torch.musa)
@@ -1539,7 +1571,7 @@ def delete_directory(dirpath):
         # This will remove the directory and all its contents
         shutil.rmtree(dirpath)
     except OSError as e:
-        print(f"Warning: {dirpath} : {e.strerror}")
+        logger.warning("Failed to delete directory %s: %s", dirpath, e.strerror)
 
 
 # Temporary directory for prometheus multiprocess mode
@@ -1825,7 +1857,7 @@ def get_npu_memory_capacity():
             return envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get()  # unit: MB
         else:
             return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
-    except ImportError as e:
+    except ImportError:
         raise ImportError("torch_npu is required when run on npu device.")
 
 
@@ -2178,7 +2210,7 @@ def get_compiler_backend(mode=None) -> str:
             import torchair
             import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
             from torchair.configs.compiler_config import CompilerConfig
-        except ImportError as e:
+        except ImportError:
             raise ImportError(
                 "NPU detected, but torchair package is not installed. "
                 "Please install torchair for torch.compile support on NPU."
@@ -2376,6 +2408,39 @@ class MultiprocessingSerializer:
             data = pybase64.b64decode(data, validate=True)
 
         return SafeUnpickler(io.BytesIO(data)).load()
+
+
+SerializedTensorPayload = Union[str, bytes, bytearray, memoryview]
+
+
+def _looks_like_pickle_payload(data: bytes) -> bool:
+    return len(data) >= 2 and data[0] == 0x80 and data[1] <= pickle.HIGHEST_PROTOCOL
+
+
+def normalize_serialized_named_tensor_payload(data: SerializedTensorPayload) -> bytes:
+    """Normalize a serialized tensor payload to raw MultiprocessingSerializer bytes."""
+    if isinstance(data, str):
+        return pybase64.b64decode(data, validate=True)
+
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        data = bytes(data)
+        if _looks_like_pickle_payload(data):
+            return data
+        try:
+            return pybase64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            return data
+
+    raise TypeError(
+        "serialized_named_tensors entries must be base64 strings or bytes-like "
+        f"payloads, got {type(data).__name__}"
+    )
+
+
+def normalize_serialized_named_tensor_payloads(
+    payloads: List[SerializedTensorPayload],
+) -> List[bytes]:
+    return [normalize_serialized_named_tensor_payload(data) for data in payloads]
 
 
 class SafeUnpickler(pickle.Unpickler):
@@ -3848,7 +3913,7 @@ def get_nvidia_driver_version() -> tuple:
 
 
 @lru_cache(maxsize=1)
-def get_nvidia_driver_version_str() -> str:
+def get_nvidia_driver_version_str() -> str | None:
     """Return the NVIDIA driver version string, e.g. '595.58.03'.
     Returns None on failure."""
     try:
@@ -3930,7 +3995,7 @@ def get_device_sm_nvidia_smi():
 
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
         # Handle cases where nvidia-smi isn't available or output is unexpected
-        print(f"Error getting compute capability: {e}")
+        logger.error("Error getting compute capability: %s", e)
         return (0, 0)  # Default/fallback value
 
 
