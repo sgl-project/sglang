@@ -8,7 +8,9 @@ from sglang.jit_kernel.dsv4.topk import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, suite="base-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(
+    est_time=120, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
 
 # Compressed page size used by the DSA indexer (real value is 256 // 4 = 64).
 PAGE_SIZE = 64
