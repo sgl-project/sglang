@@ -68,28 +68,19 @@ def _get_dflash_layer_attention_params(
     )
 
 
-def _get_dflash_total_num_heads(config, layer_id: int) -> int:
-    """Let per-layer DFlash Q-heads override scalar num_attention_heads."""
-    heads_per_layer = getattr(config, "num_attention_heads_per_layer", None)
-    if heads_per_layer is not None:
-        if layer_id >= len(heads_per_layer):
-            expected = getattr(config, "num_hidden_layers", layer_id + 1)
-            raise ValueError(
-                "DFLASH config.num_attention_heads_per_layer must have one "
-                "entry per draft layer: "
-                f"expected num_hidden_layers={expected}, "
-                f"got {len(heads_per_layer)}."
-            )
-        return int(heads_per_layer[layer_id])
-    return int(config.num_attention_heads)
-
-
 class DFlashAttention(nn.Module):
     def __init__(self, config, layer_id: int, quant_config=None) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         tp_size = int(get_parallel().tp_size)
-        total_num_heads = _get_dflash_total_num_heads(config, layer_id)
+        # LagunaConfig synthesizes and validates num_attention_heads_per_layer;
+        # non-Laguna draft configs only carry the scalar.
+        heads_per_layer = getattr(config, "num_attention_heads_per_layer", None)
+        total_num_heads = int(
+            heads_per_layer[layer_id]
+            if heads_per_layer is not None
+            else config.num_attention_heads
+        )
         total_num_kv_heads = int(
             getattr(config, "num_key_value_heads", total_num_heads)
         )

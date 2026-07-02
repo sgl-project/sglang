@@ -163,6 +163,12 @@ class LagunaConfig(PretrainedConfig):
             if (num_attention_heads_per_layer)
             else [num_attention_heads] * num_hidden_layers
         )
+        if len(self.num_attention_heads_per_layer) != num_hidden_layers:
+            raise ValueError(
+                "num_attention_heads_per_layer must have one entry per layer: "
+                f"expected num_hidden_layers={num_hidden_layers}, "
+                f"got {len(self.num_attention_heads_per_layer)}."
+            )
 
         # SGLang's hybrid-SWA core reads `swa_*` KV/head_dim from hf_text_config.
         # Per-layer Q-head count is read directly from num_attention_heads_per_layer.
