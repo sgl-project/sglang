@@ -7,6 +7,9 @@
 //! out here into per-request chunks) or `RESULT` (a single control-request JSON
 //! payload, e.g. `/server_info`).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use bytes::Bytes;
 
 use crate::ids::RequestId;
@@ -15,16 +18,27 @@ use crate::runtime::Runnable;
 use crate::runtime::channels::{DetokMsg, Senders};
 use crate::runtime::ring::EgressConsumer;
 
+/// A monotonic counter bumped once per egress-ring frame the dispatcher drains.
+/// It's the rust-native equivalent of the Python `TokenizerManager`'s
+/// `last_receive_tstamp`: `/health_generate` watches it advance to confirm the
+/// scheduler → detok path is alive (the value itself is meaningless).
+pub type ActivityCounter = Arc<AtomicU64>;
+
 /// Egress dispatcher stage. Owns the egress-ring consumer + the detok-shard
 /// senders, so the runtime spawns it as a [`Runnable`].
 pub struct Egress {
     egress: EgressConsumer,
     senders: Senders,
+    activity: ActivityCounter,
 }
 
 impl Egress {
-    pub fn new(egress: EgressConsumer, senders: Senders) -> Self {
-        Self { egress, senders }
+    pub fn new(egress: EgressConsumer, senders: Senders, activity: ActivityCounter) -> Self {
+        Self {
+            egress,
+            senders,
+            activity,
+        }
     }
 }
 
@@ -49,6 +63,9 @@ impl Runnable for Egress {
                         };
                         self.route(rid, DetokMsg::Chunk(ev));
                     }
+                    // Any frame off the ring = the scheduler produced output → the
+                    // pipeline is alive. Bump the heartbeat before routing.
+                    self.activity.fetch_add(1, Ordering::Relaxed);
                 }
                 EGRESS_TAG_RESULT => {
                     if let Some((rid, msg)) = decode_result(body) {

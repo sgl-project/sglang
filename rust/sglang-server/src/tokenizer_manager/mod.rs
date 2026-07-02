@@ -13,5 +13,5 @@ mod egress;
 mod ingress;
 mod sampling;
 
-pub use egress::Egress;
+pub use egress::{ActivityCounter, Egress};
 pub use ingress::Ingress;
