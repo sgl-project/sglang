@@ -933,6 +933,9 @@ class GptOssForCausalLM(nn.Module):
         moe_ep_size = get_parallel().moe_ep_size
 
         intermediate_size = self.config.intermediate_size
+        original_intermediate_size = getattr(
+            self.config, "original_intermediate_size", intermediate_size
+        )
         assert (
             intermediate_size % mxfp4_block == 0
         ), f"{intermediate_size=} must be divisible by {mxfp4_block=}"
@@ -951,7 +954,7 @@ class GptOssForCausalLM(nn.Module):
 
         moe_tp_rank_start = moe_tp_rank * per_rank_intermediate_size
         moe_tp_rank_end = min(
-            (moe_tp_rank + 1) * per_rank_intermediate_size, intermediate_size
+            (moe_tp_rank + 1) * per_rank_intermediate_size, original_intermediate_size
         )
 
         moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
@@ -968,7 +971,7 @@ class GptOssForCausalLM(nn.Module):
                 # flat weight from (E, 2 * N, block_size, entry_per_block)
                 # to (E, 2 * N, -1), shouldn't trigger copy for contiguous
                 weight = weight.view(
-                    moe_num_global_experts, 2 * intermediate_size, -1
+                    moe_num_global_experts, 2 * original_intermediate_size, -1
                 ).contiguous()
 
                 narrow_weight = weight[
@@ -994,7 +997,7 @@ class GptOssForCausalLM(nn.Module):
                 # same flatten here, but since 2 mx4 value are packed in 1
                 # uint8, divide by 2
                 weight = weight.view(
-                    moe_num_global_experts, -1, intermediate_size // 2
+                    moe_num_global_experts, -1, original_intermediate_size // 2
                 ).contiguous()
                 narrow_weight = weight[
                     moe_ep_rank_start:moe_ep_rank_end,

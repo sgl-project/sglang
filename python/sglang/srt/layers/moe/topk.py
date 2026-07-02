@@ -195,7 +195,7 @@ if _use_aiter:
 if _is_musa:
     try:
         from mate import moe_fused_gate
-    except ImportError as e:
+    except ImportError:
         raise ImportError("mate is required for the biased grouped topk.")
 
     from sglang.srt.hardware_backend.musa.kernels.topk import topk_sigmoid, topk_softmax
