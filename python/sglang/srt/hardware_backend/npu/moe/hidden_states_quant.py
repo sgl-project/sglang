@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from typing import Optional, Tuple
 
 import torch
+import torch_npu
 
 
 class BaseHiddenStatesQuant(ABC):
@@ -25,17 +26,33 @@ class BaseHiddenStatesQuant(ABC):
 
 class HiddenStatesDynamicQuant(BaseHiddenStatesQuant):
     """
-    Dynamic per‑token quantisation of hidden states.
+    Unified dynamic per‑token quantisation for NPU MoE hidden states.
+
+    Supports three target dtypes by automatically routing to the correct
+    NPU operator:
+
+    - ``torch.int8``                              → `npu_dynamic_quant`
+    - ``torch.quint4x2``                          → `npu_dynamic_quant`
+    - ``torch.float8_e4m3fn``                     → `npu_dynamic_mx_quant`
+    - ``torch_npu.float4_e2m1fn_x2``              → `npu_dynamic_mx_quant`
 
     Returns ``(quantized_hidden_states, per‑token_scale)``.
     """
 
+    def __init__(self, quant_dtype: torch.dtype) -> None:
+        super().__init__(quant_dtype)
+        # Decide which operator to use based on the target type.
+        if quant_dtype in (torch_npu.float8_e4m3fn, torch_npu.float4_e2m1fn_x2):
+            self._op = torch.ops.npu.npu_dynamic_mx_quant
+        elif quant_dtype in (torch.int8, torch.quint4x2):
+            self._op = torch.ops.npu.npu_dynamic_quant
+        else:
+            raise ValueError(f"Unsupported dynamic quant dtype: {quant_dtype}")
+
     def __call__(
         self, hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        quantized, scale = torch.ops.npu.npu_dynamic_quant(
-            hidden_states, dst_type=self.quant_dtype
-        )
+        quantized, scale = self._op(hidden_states, dst_type=self.quant_dtype)
         return quantized, scale
 
 
@@ -69,26 +86,3 @@ class HiddenStatesStaticQuant(BaseHiddenStatesQuant):
             False,
         )
         return quantized, None
-
-
-class HiddenStatesMXFP8DynamicQuant(BaseHiddenStatesQuant):
-    """
-    Dynamic MXFP8 per‑token quantisation for NPU MoE hidden states.
-
-    Uses the NPU dynamic MX quantisation API to produce
-    ``float8_e4m3fn`` quantized activations and
-    ``float8_e8m0fnu`` per‑token scales.
-    """
-
-    def __init__(self) -> None:
-        # quant_dtype is not needed here because npu_dynamic_mx_quant
-        # will always output float8_e4m3fn
-        super().__init__(torch.float8_e4m3fn)
-
-    def __call__(
-        self, hidden_states: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        quantized, scale = torch.ops.npu.npu_dynamic_mx_quant(
-            hidden_states, dst_type=torch.float8_e4m3fn
-        )
-        return quantized, scale
