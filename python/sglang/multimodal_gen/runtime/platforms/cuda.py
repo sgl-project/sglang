@@ -27,22 +27,9 @@ from sglang.multimodal_gen.utils import import_pynvml
 
 logger = init_logger(__name__)
 
-_AITER_BACKEND_CLS_STR = (
-    "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
-)
-_FLASH_ATTN_BACKEND_CLS_STR = "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
-_FLASH_ATTN_2_BACKEND_CLS_STR = "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2.FlashAttention2Backend"
-_SAGE_ATTN_BACKEND_CLS_STR = "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
-_SAGE_ATTN_3_BACKEND_CLS_STR = "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend"
-_SAGE_SLA_BACKEND_CLS_STR = "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SageSparseLinearAttentionBackend"
 _SDPA_BACKEND_CLS_STR = (
     "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 )
-_SLIDING_TILE_BACKEND_CLS_STR = "sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn.SlidingTileAttentionBackend"
-_SLA_BACKEND_CLS_STR = "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SparseLinearAttentionBackend"
-_SPARSE_VIDEO_GEN_2_BACKEND_CLS_STR = "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn.SparseVideoGen2AttentionBackend"
-_VIDEO_SPARSE_BACKEND_CLS_STR = "sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn.VideoSparseAttentionBackend"
-_VMOBA_BACKEND_CLS_STR = "sglang.multimodal_gen.runtime.layers.attention.backends.vmoba.VMOBAAttentionBackend"
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -103,7 +90,9 @@ class _DirectCudaAttentionBackendResolver(_CudaAttentionBackendResolver):
 
 class _AITerAttentionBackendResolver(_DirectCudaAttentionBackendResolver):
     backend = AttentionBackendEnum.AITER
-    backend_cls_str = _AITER_BACKEND_CLS_STR
+    backend_cls_str = (
+        "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
+    )
 
 
 class _TorchSDPAAttentionBackendResolver(_DirectCudaAttentionBackendResolver):
@@ -113,12 +102,12 @@ class _TorchSDPAAttentionBackendResolver(_DirectCudaAttentionBackendResolver):
 
 class _SparseLinearAttentionBackendResolver(_DirectCudaAttentionBackendResolver):
     backend = AttentionBackendEnum.SLA_ATTN
-    backend_cls_str = _SLA_BACKEND_CLS_STR
+    backend_cls_str = "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SparseLinearAttentionBackend"
 
 
 class _SageSparseLinearAttentionBackendResolver(_DirectCudaAttentionBackendResolver):
     backend = AttentionBackendEnum.SAGE_SLA_ATTN
-    backend_cls_str = _SAGE_SLA_BACKEND_CLS_STR
+    backend_cls_str = "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SageSparseLinearAttentionBackend"
 
 
 class _SlidingTileAttentionBackendResolver(_CudaAttentionBackendResolver):
@@ -133,7 +122,7 @@ class _SlidingTileAttentionBackendResolver(_CudaAttentionBackendResolver):
                 SlidingTileAttentionBackend,
             )
 
-            return _SLIDING_TILE_BACKEND_CLS_STR
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn.SlidingTileAttentionBackend"
         except ImportError as e:
             logger.error("Failed to import Sliding Tile Attention backend: %s", str(e))
             raise ImportError(
@@ -153,7 +142,7 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
                 SageAttentionBackend,
             )
 
-            return _SAGE_ATTN_BACKEND_CLS_STR
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
         except ImportError as e:
             logger.info(e)
             logger.info(
@@ -172,7 +161,7 @@ class _SageAttention3BackendResolver(_CudaAttentionBackendResolver):
                 SageAttention3Backend,
             )
 
-            return _SAGE_ATTN_3_BACKEND_CLS_STR
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend"
         except ImportError as e:
             logger.info(e)
             logger.info(
@@ -193,7 +182,7 @@ class _VideoSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
                 VideoSparseAttentionBackend,
             )
 
-            return _VIDEO_SPARSE_BACKEND_CLS_STR
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn.VideoSparseAttentionBackend"
         except ImportError as e:
             logger.error("Failed to import Video Sparse Attention backend: %s", str(e))
             raise ImportError("Video Sparse Attention backend is not installed.") from e
@@ -220,7 +209,7 @@ class _SparseVideoGen2AttentionBackendResolver(_CudaAttentionBackendResolver):
                 SparseVideoGen2AttentionBackend,
             )
 
-            return _SPARSE_VIDEO_GEN_2_BACKEND_CLS_STR
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn.SparseVideoGen2AttentionBackend"
         except ImportError as e:
             logger.error(
                 "Failed to import Sparse Video Gen 2 (SAP) Attention backend: %s",
@@ -245,7 +234,7 @@ class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
                 VMOBAAttentionBackend,
             )
 
-            return _VMOBA_BACKEND_CLS_STR
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.vmoba.VMOBAAttentionBackend"
         except ImportError as e:
             logger.error("Failed to import Video MoBA Attention backend: %s", str(e))
             raise ImportError("Video MoBA Attention backend is not installed. ") from e
@@ -260,7 +249,7 @@ class _FlashAttention2BackendResolver(_CudaAttentionBackendResolver):
             FlashAttention2Backend,
         )
 
-        return _FLASH_ATTN_2_BACKEND_CLS_STR
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2.FlashAttention2Backend"
 
 
 class _FlashAttentionBackendResolver(_CudaAttentionBackendResolver):
@@ -504,7 +493,7 @@ class CudaPlatformBase(Platform):
         if target_backend == AttentionBackendEnum.TORCH_SDPA:
             return _SDPA_BACKEND_CLS_STR
 
-        return _FLASH_ATTN_BACKEND_CLS_STR
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
 
     @classmethod
     def get_attn_backend_cls_str(

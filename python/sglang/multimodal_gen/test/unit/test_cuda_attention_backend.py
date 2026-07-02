@@ -5,9 +5,6 @@ import torch
 from sglang.multimodal_gen.runtime.platforms.cuda import CudaPlatformBase
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 
-AITER_BACKEND_CLS_STR = (
-    "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
-)
 SDPA_BACKEND_CLS_STR = (
     "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 )
@@ -59,7 +56,8 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
 
     def test_direct_aiter_selection(self):
         self.assertEqual(
-            self.resolve(AttentionBackendEnum.AITER), AITER_BACKEND_CLS_STR
+            self.resolve(AttentionBackendEnum.AITER),
+            "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend",
         )
 
     def test_default_backend_uses_torch_sdpa_on_sm120(self):
