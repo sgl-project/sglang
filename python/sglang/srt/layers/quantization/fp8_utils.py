@@ -69,13 +69,14 @@ _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 # ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
 # gfx95 + ROCm < 7.2: bpreshuffle CK is disabled (above), and the non-bpreshuffle
-# fallback ck_gemm_a8w8_blockscale returns NaN for large M on these specific shapes
-# (e.g. Qwen3.5 (2560,4096)@M>=4096, (4096,1024)@M>=8192), corrupting prefill. Route
-# only these shapes to the numerically-correct Triton FP8 GEMM; every other shape
-# keeps its original (faster CK) path. Fixed in ROCm 7.2.
-_AITER_GFX95_CK_W8A8_NAN_SHAPES = {
-    (2560, 4096),
-    (4096, 1024),
+# fallback ck_gemm_a8w8_blockscale returns NaN above a per-shape M for some shapes
+# (measured NaN onset: (2560,4096)@M>=4096, (4096,1024)@M>=8192), corrupting prefill.
+# Map each affected (n, k) to the largest M for which CK is confirmed correct
+# (conservative = last verified-safe M). Keep the faster CK path at/below that M and
+# fall back to the numerically-correct Triton FP8 GEMM above it. Fixed in ROCm 7.2.
+_AITER_GFX95_CK_W8A8_MAX_SAFE_M = {
+    (2560, 4096): 2048,
+    (4096, 1024): 4096,
 }
 
 
@@ -840,11 +841,12 @@ def aiter_w8a8_block_fp8_linear(
     if _use_aiter_bpreshuffle_gfx95:
         use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
     elif _use_aiter_gfx95:
-        # gfx95 on ROCm < 7.2: route only the CK-NaN shapes to Triton; all other
-        # shapes keep the original (faster CK) decision. Fixed in ROCm 7.2.
-        use_triton = (
-            use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
-            or (n, k) in _AITER_GFX95_CK_W8A8_NAN_SHAPES
+        # gfx95 on ROCm < 7.2: keep the (faster) CK path at/below the per-shape
+        # CK-safe M bound; above it, ck_gemm_a8w8_blockscale returns NaN, so use
+        # Triton. Unlisted shapes keep their original decision. Fixed in ROCm 7.2.
+        _ck_safe_m = _AITER_GFX95_CK_W8A8_MAX_SAFE_M.get((n, k))
+        use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k) or (
+            _ck_safe_m is not None and input_2d.shape[0] > _ck_safe_m
         )
     else:
         use_triton = True
