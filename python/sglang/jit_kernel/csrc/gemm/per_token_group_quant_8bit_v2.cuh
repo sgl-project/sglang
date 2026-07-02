@@ -249,8 +249,9 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
         constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
         constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
-        const int64_t offset_num_groups = static_cast<int64_t>(expert_idx) * num_tokens_per_expert * hidden_dim_num_groups +
-                                          static_cast<int64_t>(token_idx) * hidden_dim_num_groups + hidden_dim_group_idx;
+        const int64_t offset_num_groups =
+            static_cast<int64_t>(expert_idx) * num_tokens_per_expert * hidden_dim_num_groups +
+            static_cast<int64_t>(token_idx) * hidden_dim_num_groups + hidden_dim_group_idx;
 
         int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
         T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
@@ -290,11 +291,11 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
             scale_expert_idx = token_idx % num_tokens_per_expert;
             scale_token_idx = token_idx / num_tokens_per_expert;
           }
-          scale_output = reinterpret_cast<scale_element_t*>(output_s) +
-                         (static_cast<int64_t>(scale_expert_idx) * scale_expert_stride * num_elems_per_pack +
-                          static_cast<int64_t>(hidden_idx_packed) * scale_hidden_stride * num_elems_per_pack +
-                          static_cast<int64_t>(scale_token_idx) * column_major_scale_token_stride * num_elems_per_pack +
-                          pack_idx);
+          scale_output =
+              reinterpret_cast<scale_element_t*>(output_s) +
+              (static_cast<int64_t>(scale_expert_idx) * scale_expert_stride * num_elems_per_pack +
+               static_cast<int64_t>(hidden_idx_packed) * scale_hidden_stride * num_elems_per_pack +
+               static_cast<int64_t>(scale_token_idx) * column_major_scale_token_stride * num_elems_per_pack + pack_idx);
         } else {
           static_assert(!SCALE_UE8M0 || std::is_same_v<scale_packed_t, float>);
           if (scale_expert_stride > 0) {
