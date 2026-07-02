@@ -1,7 +1,31 @@
 import copy
+import pickle
 import unittest
+from array import array
+from unittest.mock import patch
 
-from sglang.srt.managers.io_struct import GenerateReqInput
+import msgspec
+
+import sglang.srt.observability.req_time_stats as req_time_stats_module
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers import io_struct
+from sglang.srt.managers.io_struct import (
+    BatchEmbeddingOutput,
+    BatchTokenIDOutput,
+    BatchTokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
+    GenerateReqInput,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+    sock_recv,
+    sock_send,
+)
+from sglang.srt.observability.req_time_stats import (
+    APIServerReqTimeStats,
+    DPControllerReqTimeStats,
+    SchedulerReqTimeStats,
+)
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -16,6 +40,310 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+
+
+class _LoopbackSocket:
+    def send(self, data, flags=0):
+        self.data = data
+
+    def recv(self, flags=0):
+        return self.data
+
+    def send_pyobj(self, obj, flags=0, protocol=None):
+        self.data = pickle.dumps(obj, protocol=protocol)
+
+    def recv_pyobj(self, flags=0):
+        return pickle.loads(self.data)
+
+
+def _transport_round_trip(obj):
+    socket = _LoopbackSocket()
+    sock_send(socket, obj)
+    return sock_recv(socket)
+
+
+def _make_batch_token_id_output(time_stats):
+    return BatchTokenIDOutput(
+        rids=["rid"],
+        http_worker_ipcs=[None],
+        finished_reasons=[None],
+        decoded_texts=[""],
+        decode_ids=[array("i", [1])],
+        read_offsets=[0],
+        output_ids=[array("i", [1])],
+        skip_special_tokens=[True],
+        spaces_between_special_tokens=[True],
+        no_stop_trim=[False],
+        prompt_tokens=[1],
+        reasoning_tokens=[0],
+        completion_tokens=[1],
+        cached_tokens=[0],
+        input_token_logprobs_val=None,
+        input_token_logprobs_idx=None,
+        output_token_logprobs_val=None,
+        output_token_logprobs_idx=None,
+        input_top_logprobs_val=None,
+        input_top_logprobs_idx=None,
+        output_top_logprobs_val=None,
+        output_top_logprobs_idx=None,
+        input_token_ids_logprobs_val=None,
+        input_token_ids_logprobs_idx=None,
+        output_token_ids_logprobs_val=None,
+        output_token_ids_logprobs_idx=None,
+        output_token_entropy_val=None,
+        output_hidden_states=None,
+        routed_experts=None,
+        indexer_topk=None,
+        placeholder_tokens_idx=None,
+        placeholder_tokens_val=None,
+        time_stats=[time_stats],
+    )
+
+
+class TestReqTimeStatsTransport(CustomTestCase):
+    def test_tokenized_request_time_stats_round_trip(self):
+        for use_pickle in (False, True):
+            requests = [
+                (
+                    TokenizedEmbeddingReqInput(
+                        input_text="hello",
+                        input_ids=array("i", [1, 2, 3]),
+                        mm_inputs=None,
+                        token_type_ids=None,
+                        sampling_params=SamplingParams(),
+                        time_stats=APIServerReqTimeStats(
+                            disagg_mode=DisaggregationMode.PREFILL
+                        ).to_ipc(),
+                    ),
+                    BatchTokenizedEmbeddingReqInput,
+                    APIServerReqTimeStats,
+                ),
+                (
+                    TokenizedGenerateReqInput(
+                        input_text="hello",
+                        input_ids=array("i", [1, 2, 3]),
+                        input_embeds=None,
+                        mm_inputs=None,
+                        token_type_ids=None,
+                        sampling_params=SamplingParams(),
+                        return_logprob=False,
+                        logprob_start_len=0,
+                        top_logprobs_num=0,
+                        token_ids_logprob=None,
+                        stream=False,
+                        time_stats=DPControllerReqTimeStats(
+                            disagg_mode=DisaggregationMode.PREFILL
+                        ).to_ipc(),
+                    ),
+                    BatchTokenizedGenerateReqInput,
+                    DPControllerReqTimeStats,
+                ),
+            ]
+
+            for req, batch_type, expected_type in requests:
+                for batched in (False, True):
+                    with self.subTest(
+                        use_pickle=use_pickle,
+                        request_type=type(req).__name__,
+                        batched=batched,
+                    ):
+                        with patch.object(io_struct, "_USE_PICKLE_IPC", use_pickle):
+                            req.wrap_pickle_fields()
+                            payload = batch_type(batch=[req]) if batched else req
+                            decoded = _transport_round_trip(payload)
+                            decoded_req = decoded.batch[0] if batched else decoded
+                            decoded_req.unwrap_pickle_fields()
+
+                        self.assertIsInstance(decoded_req.time_stats, expected_type)
+                        self.assertEqual(
+                            decoded_req.time_stats.disagg_mode,
+                            DisaggregationMode.PREFILL,
+                        )
+                        self.assertFalse(
+                            decoded_req.time_stats.trace_ctx.tracing_enable
+                        )
+
+    def test_tracing_time_stats_with_128_bit_id_round_trip(self):
+        trace_state = {
+            "tracing_enable": True,
+            "last_span_context": {
+                "trace_id": (1 << 127) + 1,
+                "span_id": (1 << 63) + 1,
+            },
+        }
+
+        class FakeTraceContext:
+            tracing_enable = True
+
+            def __getstate__(self):
+                return trace_state
+
+        time_stats = APIServerReqTimeStats()
+        time_stats.trace_ctx = FakeTraceContext()
+        snapshot = time_stats.to_ipc()
+
+        request = TokenizedEmbeddingReqInput(
+            input_text="hello",
+            input_ids=array("i", [1, 2, 3]),
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(),
+            time_stats=snapshot,
+        )
+
+        for use_pickle in (False, True):
+            with self.subTest(use_pickle=use_pickle):
+                with patch.object(io_struct, "_USE_PICKLE_IPC", use_pickle):
+                    decoded = _transport_round_trip(request)
+
+                encoded_span_context = decoded.time_stats.trace_ctx_state[
+                    "last_span_context"
+                ]
+                self.assertEqual(len(encoded_span_context["trace_id"]), 32)
+                self.assertEqual(len(encoded_span_context["span_id"]), 16)
+
+                decoded_trace_state = APIServerReqTimeStats._decode_trace_ctx_ids(
+                    decoded.time_stats.trace_ctx_state
+                )
+                self.assertEqual(
+                    decoded_trace_state["last_span_context"],
+                    trace_state["last_span_context"],
+                )
+
+    def test_scheduler_time_stats_round_trip_converts_clock(self):
+        with patch.object(
+            req_time_stats_module, "global_diff_realtime_monotonic", 100.0
+        ):
+            time_stats = SchedulerReqTimeStats(
+                enable_metrics=True,
+                wait_queue_entry_time=10.0,
+                forward_entry_time=12.0,
+                prefill_finished_time=14.0,
+            )
+            output = BatchEmbeddingOutput(
+                rids=["rid"],
+                http_worker_ipcs=[None],
+                finished_reasons=[None],
+                embeddings=[1.0],
+                prompt_tokens=[3],
+                cached_tokens=[1],
+                placeholder_tokens_idx=None,
+                placeholder_tokens_val=None,
+                retraction_counts=[0],
+                time_stats=[time_stats.to_ipc()],
+            )
+            sockets = {}
+            for use_pickle in (False, True):
+                with patch.object(io_struct, "_USE_PICKLE_IPC", use_pickle):
+                    socket = _LoopbackSocket()
+                    sock_send(socket, output)
+                    sockets[use_pickle] = socket
+
+        for use_pickle, socket in sockets.items():
+            with self.subTest(use_pickle=use_pickle):
+                with patch.object(
+                    req_time_stats_module, "global_diff_realtime_monotonic", 90.0
+                ), patch.object(io_struct, "_USE_PICKLE_IPC", use_pickle):
+                    decoded = sock_recv(socket)
+
+                decoded_time_stats = decoded.time_stats[0]
+                self.assertIsInstance(decoded_time_stats, SchedulerReqTimeStats)
+                self.assertEqual(decoded_time_stats.wait_queue_entry_time, 20.0)
+                self.assertEqual(decoded_time_stats.forward_entry_time, 22.0)
+                self.assertEqual(decoded_time_stats.prefill_finished_time, 24.0)
+                self.assertEqual(decoded_time_stats.diff_realtime_monotonic, 90.0)
+
+    def test_batch_token_id_output_time_stats_round_trip(self):
+        for use_pickle in (False, True):
+            with self.subTest(use_pickle=use_pickle):
+                output = _make_batch_token_id_output(
+                    SchedulerReqTimeStats(
+                        enable_metrics=True, wait_queue_entry_time=1.0
+                    ).to_ipc()
+                )
+                with patch.object(io_struct, "_USE_PICKLE_IPC", use_pickle):
+                    decoded = _transport_round_trip(output)
+
+                self.assertIsInstance(decoded, BatchTokenIDOutput)
+                self.assertIsInstance(decoded.time_stats[0], SchedulerReqTimeStats)
+                self.assertEqual(decoded.time_stats[0].wait_queue_entry_time, 1.0)
+
+    def test_scheduler_time_stats_omit_defaults(self):
+        snapshot = SchedulerReqTimeStats(
+            enable_metrics=True,
+            wait_queue_entry_time=10.0,
+            forward_entry_time=12.0,
+            prefill_finished_time=14.0,
+        ).to_ipc()
+
+        msgpack_state = msgspec.msgpack.decode(msgspec.msgpack.encode(snapshot))
+        self.assertEqual(
+            set(msgpack_state),
+            {
+                "type",
+                "wait_queue_entry_time",
+                "forward_entry_time",
+                "prefill_finished_time",
+                "diff_realtime_monotonic",
+            },
+        )
+
+        _, restore_args = snapshot.__reduce_ex__(pickle.HIGHEST_PROTOCOL)
+        self.assertEqual(
+            set(restore_args[1]),
+            {
+                "wait_queue_entry_time",
+                "forward_entry_time",
+                "prefill_finished_time",
+                "diff_realtime_monotonic",
+            },
+        )
+
+    def test_scheduler_time_stats_disabled_metrics_snapshot_is_empty(self):
+        time_stats = SchedulerReqTimeStats(
+            wait_queue_entry_time=10.0,
+            forward_entry_time=12.0,
+            prefill_finished_time=14.0,
+        )
+
+        snapshot = time_stats.to_ipc()
+
+        self.assertFalse(snapshot.enable_metrics)
+        self.assertEqual(snapshot.wait_queue_entry_time, 0.0)
+        self.assertEqual(snapshot.forward_entry_time, 0.0)
+        self.assertEqual(snapshot.prefill_finished_time, 0.0)
+        self.assertEqual(
+            msgspec.msgpack.decode(msgspec.msgpack.encode(snapshot)),
+            {"type": "SchedulerReqTimeStats"},
+        )
+
+    def test_new_from_obj_copies_shared_and_runtime_state(self):
+        metrics_collector = object()
+        api_time_stats = APIServerReqTimeStats(
+            enable_metrics=True,
+            disagg_mode=DisaggregationMode.DECODE,
+            diff_realtime_monotonic=1.0,
+            created_time=11.0,
+            api_server_dispatch_time=12.0,
+        )
+        api_time_stats.metrics_collector = metrics_collector
+
+        dp_time_stats = DPControllerReqTimeStats.new_from_obj(api_time_stats)
+        dp_time_stats.dpc_dispatch_time = 13.0
+        dp_time_stats_copy = DPControllerReqTimeStats.new_from_obj(dp_time_stats)
+        scheduler_time_stats = SchedulerReqTimeStats.new_from_obj(dp_time_stats)
+
+        self.assertTrue(scheduler_time_stats.enable_metrics)
+        self.assertEqual(scheduler_time_stats.disagg_mode, DisaggregationMode.DECODE)
+        self.assertEqual(scheduler_time_stats.diff_realtime_monotonic, 1.0)
+        self.assertIs(scheduler_time_stats.metrics_collector, metrics_collector)
+        self.assertIs(scheduler_time_stats.trace_ctx, api_time_stats.trace_ctx)
+        self.assertEqual(dp_time_stats.created_time, 11.0)
+        self.assertEqual(dp_time_stats.api_server_dispatch_time, 12.0)
+        self.assertEqual(dp_time_stats_copy.dpc_dispatch_time, 13.0)
+        self.assertEqual(scheduler_time_stats.created_time, 11.0)
+        self.assertEqual(scheduler_time_stats.api_server_dispatch_time, 12.0)
+        self.assertEqual(scheduler_time_stats.dpc_dispatch_time, 13.0)
 
 
 class TestGenerateReqInputNormalization(CustomTestCase):

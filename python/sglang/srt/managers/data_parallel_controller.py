@@ -39,7 +39,6 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     sock_recv,
     sock_send,
-    unwrap_from_pickle,
     wrap_as_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
@@ -317,12 +316,10 @@ class DataParallelController:
         if refresh_load_budget and self.refresh_load_budget_on_dispatch:
             self.refresh_load_budget()
 
-        time_stats = DPControllerReqTimeStats.new_from_obj(
-            unwrap_from_pickle(req.time_stats)
-        )
+        time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
 
         time_stats.set_dp_dispatch_time()
-        req.time_stats = wrap_as_pickle(time_stats)
+        req.time_stats = time_stats.to_ipc()
         self.dispatching(req)
         req.time_stats = time_stats
         req.time_stats.set_dp_dispatch_finish_time()
