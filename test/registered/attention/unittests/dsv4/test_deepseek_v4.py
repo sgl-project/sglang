@@ -17,7 +17,6 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 
 import torch
 
@@ -267,27 +266,6 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
 class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
     """CPU-only checks for the DSV4 BCG metadata replay contract."""
 
-    @staticmethod
-    def _make_sparse_prefill_cache(max_seq_len):
-        from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
-            SparsePrefillChunkCache,
-        )
-
-        int32 = dict(dtype=torch.int32)
-        return SparsePrefillChunkCache(
-            num_reqs=2,
-            num_qo_tokens=2,
-            max_seq_len=max_seq_len,
-            swa_window_size=128,
-            swa_page_size=128,
-            seq_lens=torch.tensor([max_seq_len, max_seq_len], **int32),
-            query_start_loc=torch.tensor([0, 1, 2], **int32),
-            swa_token_ids=torch.empty(0, **int32),
-            swa_first_pos=torch.zeros(2, **int32),
-            swa_gather_lens=torch.zeros(2, **int32),
-            swa_offsets=torch.zeros(3, **int32),
-        )
-
     def _make_core_metadata(self, base: int):
         from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
 
@@ -422,7 +400,6 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         capture_metadata = DSV4Metadata(
             self._make_core_metadata(0), indexer_metadata=None
         )
-        capture_metadata.sparse_prefill_cache = object()
         replay_metadata = DSV4Metadata(
             self._make_core_metadata(1000), indexer_metadata=None
         )
@@ -450,67 +427,12 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertEqual(calls[0][1], backend.MAX_SEQ_LEN_FOR_CAPTURE)
         self.assertTrue(calls[0][2])
         self.assertIs(backend.forward_metadata, capture_metadata)
-        self.assertIsNone(capture_metadata.sparse_prefill_cache)
         self.assertTrue(
             torch.equal(
                 capture_metadata.core_attn_metadata.seq_lens_casual,
                 replay_metadata.core_attn_metadata.seq_lens_casual,
             )
         )
-
-    def test_sparse_prefill_workspace_reuses_and_grows(self):
-        from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
-            SparsePrefillWorkspace,
-        )
-
-        workspace = SparsePrefillWorkspace(torch.device("cpu"))
-        first = workspace.get(3)
-        reused = workspace.get(2)
-        grown = workspace.get(7)
-
-        self.assertEqual(first.shape, (3, 1, 512))
-        self.assertEqual(reused.data_ptr(), first.data_ptr())
-        self.assertEqual(grown.shape, (7, 1, 512))
-        self.assertNotEqual(grown.data_ptr(), first.data_ptr())
-        self.assertEqual(workspace._buffer.data_ptr(), grown.data_ptr())
-
-    def test_sparse_prefill_c4_uses_live_extent(self):
-        page_table = torch.zeros((2, 4096), dtype=torch.int32)
-        for max_seq_len in (3, 4, 255, 256, 259, 260):
-            with self.subTest(max_seq_len=max_seq_len):
-                cache = self._make_sparse_prefill_cache(max_seq_len)
-                cache.ensure_c4(page_table, c4_page_size=64)
-                expected_extent = max(max_seq_len // 4, 1)
-                self.assertEqual(cache.c4_flat_token_ids.numel(), 2 * expected_extent)
-                self.assertEqual(
-                    cache.c4_compressed_base.tolist(), [0, expected_extent]
-                )
-
-    def test_sparse_prefill_c128_uses_live_extent(self):
-        from sglang.srt.layers.attention.dsv4 import sparse_prefill_utils
-
-        page_indices = torch.full((2, 8192), -1, dtype=torch.int32)
-        for max_seq_len in (127, 128, 255, 256):
-            with self.subTest(max_seq_len=max_seq_len):
-                cache = self._make_sparse_prefill_cache(max_seq_len)
-                expected_extent = max(max_seq_len // 128, 1)
-                combined = (
-                    torch.empty((2, 256), dtype=torch.int32),
-                    torch.empty(2, dtype=torch.int32),
-                )
-                with mock.patch.object(
-                    sparse_prefill_utils,
-                    "combine_topk_swa_indices",
-                    return_value=combined,
-                ) as combine:
-                    cache.ensure_c128(page_indices)
-
-                self.assertEqual(cache.c128_flat_token_ids.numel(), 2 * expected_extent)
-                self.assertEqual(combine.call_args.kwargs["topk"], expected_extent)
-                self.assertEqual(
-                    combine.call_args.kwargs["topk_indices"].shape,
-                    (2, expected_extent),
-                )
 
 
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
