@@ -7,6 +7,37 @@ import triton.language as tl
 from sglang.srt.lora.backend.lmhead_mixing import LoRABackendLmHeadMixing
 from sglang.srt.lora.utils import LoRABatchInfo, MoELoRABatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils.common import ceil_align
+
+
+def get_gathered_moe_num_tokens(forward_batch: ForwardBatch, num_tokens: int) -> int:
+    """Token count the MoE-LoRA mapping must cover: gathered under --enable-dp-attention, else per-rank.
+
+    In the eager path prepare_lora_batch runs from ForwardBatch.init_new, BEFORE
+    prepare_mlp_sync_batch assigns forward_batch.global_dp_buffer_len (only the cuda-graph
+    capture path pre-sets it), so that field alone under-sizes the MoE-LoRA token mapping to the
+    per-rank length and the MoE-LoRA kernels index past it (sticky CUDA IMA). When it is unset,
+    derive an upper bound of the gathered length from global_num_tokens_cpu (assigned in
+    init_new before prepare_lora_batch runs), mirroring prepare_mlp_sync_batch's attn-tp/cp
+    alignment; max*n covers both SUM_LEN and MAX_LEN padding modes. Over-allocation is harmless:
+    the kernels index at most the actual gathered length.
+    """
+    if forward_batch.global_dp_buffer_len is not None:
+        return max(forward_batch.global_dp_buffer_len, num_tokens)
+    global_num_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
+    if not global_num_tokens:
+        return num_tokens
+    from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+    # Local import: a module-level cp_utils import here is circular (see forward_batch_info).
+    from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+
+    attn_tp_size = get_attention_tp_size()
+    cp_align_size = get_cp_padding_align_size()
+    upper = max(
+        ceil_align(ceil_align(t, attn_tp_size), cp_align_size) for t in global_num_tokens
+    ) * len(global_num_tokens)
+    return max(upper, num_tokens)
 
 
 class BaseLoRABackend(LoRABackendLmHeadMixing):
@@ -308,14 +339,17 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             req_to_lora = batch_info.weight_indices[:num_moe_segments]
 
         # --enable-dp-attention all-gathers tokens into the MoE, so the MoE-LoRA kernels index
-        # token_lora_mapping by the GATHERED token count (global_dp_buffer_len), not the per-rank
-        # num_tokens. Size the mapping to the gathered count so those reads stay in-bounds (the
-        # per-rank segments still fill only [0, num_tokens); the gathered tail stays -1).
-        moe_num_tokens = (
-            forward_batch.global_dp_buffer_len
-            if getattr(forward_batch, "global_dp_buffer_len", None) is not None
-            else num_tokens
-        )
+        # token_lora_mapping by the GATHERED token count, not the per-rank num_tokens. Size the
+        # mapping to (an upper bound of) the gathered count so those reads stay in-bounds — see
+        # get_gathered_moe_num_tokens for why global_dp_buffer_len alone is NOT enough in the
+        # eager path (the per-rank segments still fill only [0, num_tokens); the tail stays -1).
+        moe_num_tokens = get_gathered_moe_num_tokens(forward_batch, num_tokens)
+        if batch_info.use_cuda_graph:
+            # Static capture buffers hold max_bs*dp tokens; a REAL replay's gathered length never
+            # exceeds that (the captured graph could not address it), so cap the upper bound at
+            # the buffer size. Batches whose gathered bound exceeds it are demoted to the eager
+            # prep path in LoRAManager.prepare_lora_batch before we get here.
+            moe_num_tokens = min(moe_num_tokens, token_lora_mapping.shape[0])
 
         adapter_enabled, token_lora_mapping = _compute_moe_lora_info(
             num_tokens,

@@ -666,8 +666,17 @@ def _merged_experts_fused_moe_lora_add_impl(
     num_experts_b = lora_b_list[0].shape[1]
     half_out = lora_b_list[0].shape[2]
 
+    # The kernels index token_lora_mapping / intermediate by token ids up to
+    # topk_ids.shape[0] (the DP-gathered token count under --enable-dp-attention). An
+    # under-sized mapping means unmasked OOB reads/writes that surface as a sticky,
+    # hard-to-attribute CUDA IMA — fail loudly on the host instead.
+    assert token_lora_mapping.shape[0] >= topk_ids.shape[0], (
+        f"token_lora_mapping covers {token_lora_mapping.shape[0]} tokens but the MoE runs on "
+        f"{topk_ids.shape[0]} (DP-gathered?) tokens; mapping was sized before the dp gather "
+        f"length was known (see get_gathered_moe_num_tokens)"
+    )
     intermediate = torch.zeros(
-        [token_lora_mapping.shape[0], topk_ids.shape[1], max_lora_rank],
+        [topk_ids.shape[0], topk_ids.shape[1], max_lora_rank],
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )

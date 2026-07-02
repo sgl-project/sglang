@@ -330,6 +330,20 @@ class LoRAManager:
             and bs <= self.max_bs_in_cuda_graph
             and forward_batch.forward_mode.is_cuda_graph()
         )
+        if use_cuda_graph and self.lora_backend.is_moe_lora:
+            # This flag is a HEURISTIC computed before the runner's real replay decision. Under
+            # --enable-dp-attention a batch that is graph-eligible on THIS rank (small local bs)
+            # can still have a DP-gathered token count exceeding the static MoE capture buffers
+            # (max_bs*dp) when other ranks carry more tokens — such a batch cannot replay the
+            # captured graph and runs eager, so prep the eager (freshly sized) buffers for it
+            # instead of an under-sized static mapping.
+            from sglang.srt.lora.backend.base_backend import get_gathered_moe_num_tokens
+
+            moe_cg_buffers = getattr(self.lora_backend, "moe_cg_buffers", None)
+            if moe_cg_buffers is not None and get_gathered_moe_num_tokens(
+                forward_batch, bs
+            ) > moe_cg_buffers["token_lora_mapping"].shape[0]:
+                use_cuda_graph = False
 
         weight_indices = [0] * len(forward_batch.lora_ids)
         lora_ranks = [0] * self.max_loras_per_batch
@@ -352,13 +366,19 @@ class LoRAManager:
         # LoRA delta). This is only unambiguous under Tier-1 (exactly one adapter loaded, the colocate
         # RL case). Inject that adapter into lora_ranks/scalings BEFORE building the batch tensors and
         # record its buffer id (host int, no GPU sync -> cuda-graph safe) so the backend stamps it
-        # across the gathered tail. No-op without dp-attention (global_dp_buffer_len is None) or when
-        # 0 / >1 adapters are loaded (falls back to the existing -1 tail).
+        # across the gathered tail. No-op without dp-attention or when 0 / >1 adapters are loaded
+        # (falls back to the existing -1 tail). NOTE: gate on global_num_tokens_cpu too, not just
+        # global_dp_buffer_len — the eager path runs prepare_lora_batch from ForwardBatch.init_new
+        # BEFORE prepare_mlp_sync_batch assigns global_dp_buffer_len (only cuda-graph capture
+        # pre-sets it), so the old gate left this fix dead outside capture.
         idle_rank_active_buffer_id = None
         if (
             self.lora_backend.is_moe_lora
             and not local_active
-            and getattr(forward_batch, "global_dp_buffer_len", None) is not None
+            and (
+                getattr(forward_batch, "global_dp_buffer_len", None) is not None
+                or len(getattr(forward_batch, "global_num_tokens_cpu", None) or []) > 1
+            )
         ):
             loaded = [
                 (uid, bid)
