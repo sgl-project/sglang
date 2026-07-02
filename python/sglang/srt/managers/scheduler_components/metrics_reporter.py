@@ -894,6 +894,33 @@ class SchedulerMetricsReporter:
                 balancedness=m.eplb_balancedness.item(),
             )
 
+    def observe_forward_pass_interference(self, batch: ScheduleBatch):
+        if not self.current_scheduler_metrics_enabled or self.metrics_collector is None:
+            return
+        if batch.fpm_start_time <= 0:
+            return
+
+        duration_seconds = max(0.0, time.monotonic() - batch.fpm_start_time)
+        scheduled_requests = self._build_scheduled_request_metrics(batch)
+        prefill_tokens = scheduled_requests.sum_prefill_tokens
+        decode_reqs = scheduled_requests.num_decode_requests
+
+        if prefill_tokens > 0 and decode_reqs > 0:
+            phase = "mixed"
+        elif prefill_tokens > 0:
+            phase = "prefill_only"
+        elif decode_reqs > 0:
+            phase = "decode_only"
+        else:
+            phase = "other"
+
+        self.metrics_collector.observe_forward_pass_interference(
+            duration_seconds=duration_seconds,
+            phase=phase,
+            prefill_tokens=prefill_tokens,
+            decode_reqs=decode_reqs,
+        )
+
     def _emit_forward_pass_metrics(
         self,
         batch: ScheduleBatch,
