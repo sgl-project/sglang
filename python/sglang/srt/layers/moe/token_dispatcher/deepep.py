@@ -731,10 +731,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             buffer.low_latency_dispatch(
                 hidden_states,
                 topk_ids,
-                hidden_states.shape[0],
+                self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=self.use_fp8,
-                topk_weights=topk_weights,
+                **(dict(topk_weights=topk_weights) if _is_npu else dict()),
                 **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
                 **(
                     dict(x_global_scale=input_global_scale)
