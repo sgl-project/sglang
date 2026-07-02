@@ -19,7 +19,6 @@ from typing import Any
 import torch
 from torch import nn
 
-from sglang.srt.layers import dp_attention as _dp_attention
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
@@ -34,15 +33,16 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 
 from ..mock_server_args import make_mock_server_args
 
 # DSV4 backend pre-resolves attention TP at construction; pin to single-rank.
-_dp_attention.get_attention_tp_size = lambda: 1
-_dp_attention.get_attention_tp_rank = lambda: 0
-_dp_attention.get_attention_cp_size = lambda: 1
-_dp_attention.get_attention_cp_rank = lambda: 0
+_parallel_override = get_parallel().override(
+    attn_tp_size=1, attn_tp_rank=0, attn_cp_size=1, attn_cp_rank=0
+)
+_parallel_override.__enter__()
 
 # DSV4 hard-coded geometry. Do not change.
 DSV4_PAGE_SIZE = 256
@@ -265,6 +265,7 @@ class TinyDSV4ModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = False
         self.is_local_attention_model = False
         self.attention_chunk_size = None
@@ -390,7 +391,8 @@ class MockDSV4ModelRunner:
             page_size=case.page_size,
             swa_page_size=DSV4_SWA_WINDOW,
             dtype=torch.float8_e4m3fn,
-            state_dtype=dtype,
+            c4_state_dtype=dtype,
+            c128_state_dtype=dtype,
             qk_nope_head_dim=DSV4_QK_NOPE_HEAD_DIM,
             qk_rope_head_dim=DSV4_QK_ROPE_HEAD_DIM,
             indexer_head_dim=128,
@@ -411,6 +413,7 @@ class MockDSV4ModelRunner:
         self.sliding_window_size = DSV4_SWA_WINDOW
         self.use_mla_backend = True
         self.is_draft_worker = False
+        self._kernel_warmed_up = True
 
     @property
     def hybrid_gdn_config(self):
