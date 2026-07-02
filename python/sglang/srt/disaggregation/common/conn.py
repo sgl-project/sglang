@@ -153,6 +153,7 @@ class CommonKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
+        self._socket_send_locks: Dict[str, threading.Lock] = {}
         self._socket_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
@@ -487,7 +488,17 @@ class CommonKVManager(BaseKVManager):
             self._monitor_cache[endpoint] = sock.get_monitor_socket(
                 zmq.EVENT_DISCONNECTED
             )
+            self._socket_send_locks.setdefault(endpoint, threading.Lock())
             return sock
+
+    def _send_multipart_locked(
+        self, endpoint: str, parts: List[bytes], is_ipv6: bool = False
+    ):
+        # Cached sockets are shared across sender threads and zmq sockets are
+        # not thread-safe; serialize sends per endpoint.
+        sock = self._connect(endpoint, is_ipv6=is_ipv6)
+        with self._socket_send_locks[endpoint]:
+            sock.send_multipart(parts)
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
