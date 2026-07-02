@@ -1518,6 +1518,10 @@ class Req(ReqDllmMixin):
         overrides the sampled handoff with it), so it is intentionally not sent
         to the prefill here.
         """
+        # TODO: multi-modal requests are not supported here. The payload only
+        # carries token ``input_ids`` and drops any image/audio/video inputs, so
+        # the rebootstrap recompute would not reproduce the original prefix KV
+        # for multi-modal requests. Add multi-modal support before enabling it.
         sp = self.sampling_params
         return {
             "input_ids": [int(x) for x in self.origin_input_ids]
