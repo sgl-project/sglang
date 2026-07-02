@@ -75,7 +75,7 @@ the main branch. These tags will be switched to stable release images after the 
 ```bash Command
 docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.0.0-a3-glm5.2-20260615
 
-docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -110,7 +110,7 @@ swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:${TAG}
 ```bash Command
 docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.0.0-910b-glm5.2-20260615
 
-docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -443,7 +443,7 @@ do
         --load-balance-method round_robin \
         --enable-dp-lm-head --moe-dense-tp 1 \
         --speculative-draft-model-quantization unquant \
-        --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 \
+        --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2
 
         # cp
         #--enable-nsa-prefill-context-parallel \
