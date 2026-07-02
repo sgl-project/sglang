@@ -2854,6 +2854,52 @@ class ServerArgs:
                     "Use Uvicorn (the default) or handle certificate rotation externally."
                 )
 
+            uvicorn_only_flags = [
+                ("--timeout-keep-alive", self.timeout_keep_alive),
+                ("--http-limit-concurrency", self.http_limit_concurrency),
+                (
+                    "--http-timeout-graceful-shutdown",
+                    self.http_timeout_graceful_shutdown,
+                ),
+            ]
+            ignored = [name for name, val in uvicorn_only_flags if val is not None]
+            if ignored:
+                logger.warning(
+                    f"{', '.join(ignored)} only affect Uvicorn and have no effect "
+                    "with --enable-http2 (Granian); ignoring."
+                )
+
+            # RFC 7540 §6.5.2 (SETTINGS_MAX_FRAME_SIZE): valid range is
+            # 2^14..2^24-1. Granian's HTTP2Settings dataclass does not
+            # validate this itself -- an out-of-range value would otherwise
+            # only surface as a protocol error deep in Granian's Rust HTTP/2
+            # layer, after model weights have already loaded. Check here so
+            # a bad flag value fails immediately.
+            if self.http2_max_frame_size is not None and not (
+                16384 <= self.http2_max_frame_size <= 16777215
+            ):
+                raise ValueError(
+                    "--http2-max-frame-size must be between 16384 and 16777215 "
+                    "bytes (RFC 7540 SETTINGS_MAX_FRAME_SIZE range), got "
+                    f"{self.http2_max_frame_size}."
+                )
+            if (
+                self.http2_max_concurrent_streams is not None
+                and self.http2_max_concurrent_streams <= 0
+            ):
+                raise ValueError(
+                    "--http2-max-concurrent-streams must be a positive integer, "
+                    f"got {self.http2_max_concurrent_streams}."
+                )
+        elif (
+            self.http2_max_concurrent_streams is not None
+            or self.http2_max_frame_size is not None
+        ):
+            logger.warning(
+                "--http2-max-concurrent-streams/--http2-max-frame-size only affect "
+                "Granian and have no effect without --enable-http2; ignoring."
+            )
+
     def _handle_multimodal(self):
         """Validate mm_process_config structure before model loading."""
         if self.mm_process_config is not None:

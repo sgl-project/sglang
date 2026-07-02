@@ -200,5 +200,63 @@ class TestGranianHttp2Settings(unittest.TestCase):
         self.assertNotIn("http2_settings", kwargs)
 
 
+class TestHttp2FlagValidation(unittest.TestCase):
+    # __post_init__ -> _handle_ssl_validation cross-checks between
+    # --enable-http2 and the uvicorn-only / Granian-only tunables.
+
+    def test_http2_only_flags_without_enable_http2_warns(self):
+        with self.assertLogs("sglang.srt.server_args", level="WARNING") as cm:
+            ServerArgs(model_path="dummy", http2_max_concurrent_streams=256)
+        self.assertTrue(
+            any("--http2-max-concurrent-streams" in msg for msg in cm.output)
+        )
+
+    @unittest.skipUnless(
+        _HAS_GRANIAN, "granian not installed (pip install sglang[http2])"
+    )
+    def test_uvicorn_only_flags_with_enable_http2_warns(self):
+        with self.assertLogs("sglang.srt.server_args", level="WARNING") as cm:
+            ServerArgs(
+                model_path="dummy", enable_http2=True, http_limit_concurrency=500
+            )
+        self.assertTrue(any("--http-limit-concurrency" in msg for msg in cm.output))
+
+    @unittest.skipUnless(
+        _HAS_GRANIAN, "granian not installed (pip install sglang[http2])"
+    )
+    def test_max_frame_size_out_of_range_raises(self):
+        # Below the RFC 7540 SETTINGS_MAX_FRAME_SIZE minimum (2^14).
+        with self.assertRaises(ValueError):
+            ServerArgs(model_path="dummy", enable_http2=True, http2_max_frame_size=100)
+        # Above the RFC 7540 SETTINGS_MAX_FRAME_SIZE maximum (2^24-1).
+        with self.assertRaises(ValueError):
+            ServerArgs(
+                model_path="dummy",
+                enable_http2=True,
+                http2_max_frame_size=16777216,
+            )
+
+    @unittest.skipUnless(
+        _HAS_GRANIAN, "granian not installed (pip install sglang[http2])"
+    )
+    def test_max_concurrent_streams_non_positive_raises(self):
+        with self.assertRaises(ValueError):
+            ServerArgs(
+                model_path="dummy", enable_http2=True, http2_max_concurrent_streams=0
+            )
+
+    @unittest.skipUnless(
+        _HAS_GRANIAN, "granian not installed (pip install sglang[http2])"
+    )
+    def test_valid_http2_flags_with_enable_http2_do_not_raise(self):
+        # Should not raise -- values are within the valid HTTP/2 range.
+        ServerArgs(
+            model_path="dummy",
+            enable_http2=True,
+            http2_max_concurrent_streams=256,
+            http2_max_frame_size=65536,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
