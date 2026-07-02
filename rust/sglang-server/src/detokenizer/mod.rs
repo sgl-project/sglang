@@ -83,10 +83,31 @@ impl DetokenizerBackend {
             DetokenizerBackend::Skip => None,
         }
     }
+
+    /// Decode each logprob token id to its own text (one id at a time, matching
+    /// Python's `batch_decode([[id] for id in ids])`). Runs on this CPU-bound
+    /// shard, not the api-server I/O threads. `Skip` mode (no tokenizer) yields
+    /// no text, so the `[logprob, token_id, text]` tuple's text slot stays null.
+    fn decode_logprob_texts(&self, idxs: &[i32]) -> Vec<String> {
+        match self {
+            DetokenizerBackend::Dynamo(t) => idxs
+                .iter()
+                .map(|&id| {
+                    t.decode(&[id as u32], false)
+                        .map(String::from)
+                        .unwrap_or_default()
+                })
+                .collect(),
+            DetokenizerBackend::Skip => Vec::new(),
+        }
+    }
 }
 
 struct DetokState {
     sink: EgressSink,
+    /// `return_text_in_logprobs`: whether to decode this request's logprob token
+    /// ids to text (in this shard) for the `[logprob, token_id, text]` tuples.
+    decode_logprob_text: bool,
     /// Per-request incremental decoder; `None` in `skip_tokenizer_init` mode.
     /// This is the *only* per-request accumulation the shard keeps: the decoder's
     /// internal byte/UTF-8 buffer. Decoded **text deltas** are emitted per chunk
@@ -122,18 +143,23 @@ impl Runnable for DetokenizerWorker {
 
         while let Ok(msg) = self.rx.recv() {
             match msg {
-                DetokMsg::Register { id, sink } => {
+                DetokMsg::Register {
+                    id,
+                    sink,
+                    decode_logprob_text,
+                } => {
                     table.insert(
                         id,
                         DetokState {
                             sink,
+                            decode_logprob_text,
                             decoder: self.backend.new_decoder(),
                             // Registered == handed to the scheduler == Queued.
                             fsm: RequestState::Queued,
                         },
                     );
                 }
-                DetokMsg::Chunk(ev) => handle_chunk(&mut table, ev),
+                DetokMsg::Chunk(ev) => handle_chunk(&mut table, ev, &self.backend),
                 DetokMsg::Result { id, payload } => handle_result(&mut table, id, payload),
             }
         }
@@ -151,7 +177,11 @@ fn handle_result(table: &mut HashMap<RequestId, DetokState>, id: RequestId, payl
     }
 }
 
-fn handle_chunk(table: &mut HashMap<RequestId, DetokState>, mut ev: ChunkEvent) {
+fn handle_chunk(
+    table: &mut HashMap<RequestId, DetokState>,
+    mut ev: ChunkEvent,
+    backend: &DetokenizerBackend,
+) {
     let id = match ev.rid.parse::<u64>() {
         Ok(v) => RequestId(v),
         Err(_) => {
@@ -164,6 +194,7 @@ fn handle_chunk(table: &mut HashMap<RequestId, DetokState>, mut ev: ChunkEvent) 
         // Late chunk after completion/abort — drop.
         return;
     };
+    let decode_lp_text = st.decode_logprob_text;
 
     // Queued → Streaming on the first chunk (the scheduler picked it).
     if matches!(st.fsm, RequestState::Queued) {
@@ -191,6 +222,24 @@ fn handle_chunk(table: &mut HashMap<RequestId, DetokState>, mut ev: ChunkEvent) 
     let finished = ev.finish_reason.is_some();
     // Streaming → Streaming (finish:false) or Streaming → Finalizing (finish:true).
     let _ = st.fsm.apply(Event::Chunk { finish: finished });
+
+    // `return_text_in_logprobs`: decode each logprob token id to text HERE (this
+    // CPU-bound shard) rather than on the api-server I/O threads. Flat text
+    // columns stay parallel to the `idx` buffers, so `sglang_frame` just reads
+    // them. Read `ev.*_idx` before the `mem::take`s below move them.
+    let (out_lp_txt, in_lp_txt, out_top_txt, in_top_txt, out_tid_txt, in_tid_txt) =
+        if decode_lp_text {
+            (
+                backend.decode_logprob_texts(&ev.out_lp_idx),
+                backend.decode_logprob_texts(&ev.in_lp_idx),
+                backend.decode_logprob_texts(&ev.out_top_idx),
+                backend.decode_logprob_texts(&ev.in_top_idx),
+                backend.decode_logprob_texts(&ev.out_tid_idx),
+                backend.decode_logprob_texts(&ev.in_tid_idx),
+            )
+        } else {
+            Default::default()
+        };
 
     // Protocol-neutral **delta** snapshot for this chunk; the API handler formats
     // it (and accumulates when a cumulative view is required). `text`/`output_ids`
@@ -220,6 +269,12 @@ fn handle_chunk(table: &mut HashMap<RequestId, DetokState>, mut ev: ChunkEvent) 
         in_tid_lens: std::mem::take(&mut ev.in_tid_lens),
         hidden_val: std::mem::take(&mut ev.hidden_val),
         hidden_lens: std::mem::take(&mut ev.hidden_lens),
+        out_lp_txt,
+        in_lp_txt,
+        out_top_txt,
+        in_top_txt,
+        out_tid_txt,
+        in_tid_txt,
     };
 
     if finished {

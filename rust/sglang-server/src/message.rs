@@ -96,6 +96,21 @@ pub struct GenerationOutput {
     pub hidden_val: Vec<f32>,
     #[serde(default)]
     pub hidden_lens: Vec<u32>,
+    /// Decoded logprob token text (`return_text_in_logprobs`), flat and parallel
+    /// to the matching `*_idx` buffers. Decoded on the detok shard; empty when
+    /// the request didn't ask for text (the tuple's text slot stays null).
+    #[serde(default)]
+    pub out_lp_txt: Vec<String>,
+    #[serde(default)]
+    pub in_lp_txt: Vec<String>,
+    #[serde(default)]
+    pub out_top_txt: Vec<String>,
+    #[serde(default)]
+    pub in_top_txt: Vec<String>,
+    #[serde(default)]
+    pub out_tid_txt: Vec<String>,
+    #[serde(default)]
+    pub in_tid_txt: Vec<String>,
 }
 
 /// What the connection handler receives on the egress stream. Generation output
