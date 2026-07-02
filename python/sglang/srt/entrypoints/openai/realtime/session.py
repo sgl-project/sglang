@@ -702,6 +702,11 @@ class RealtimeConnection:
             and self.audio.state.chunk_index >= self.audio.slicing_min_chunk_index
         )
         if use_slicing:
+            if self.audio.state.confirmed_text != self.audio.state.full_transcript:
+                await self._emit_transcription_delta(
+                    self.audio.state.finalize(cumulative=True)
+                )
+                committed_text = self.audio.state.get_prefix_text()
             prompt: Optional[str] = self.adapter.prompt_template
             dedupe_against: Optional[str] = committed_text
             slice_start_global = max(

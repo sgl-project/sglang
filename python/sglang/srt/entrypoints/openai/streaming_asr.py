@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 # boundary jitter (" ," vs ",") doesn't leak into deltas. Covers both
 # ASCII punctuation and the CJK / fullwidth equivalents.
 _PUNCT_WS_RE = re.compile(r"\s+([,.;:!?，。！？；：、])")
+_SLICED_BOUNDARY_PUNCT = frozenset(".,;:!?")
 
 
 @dataclass
@@ -102,10 +103,14 @@ class StreamingASRState:
 
         old_confirmed = self.confirmed_text
         words = new_transcript.split()
-        if len(words) > self.unfixed_token_num:
-            self.confirmed_text = " ".join(words[: -self.unfixed_token_num])
+        holdback = self.unfixed_token_num if cumulative else 0
+        if holdback > 0:
+            if len(words) > holdback:
+                self.confirmed_text = " ".join(words[:-holdback])
+            else:
+                self.confirmed_text = ""
         else:
-            self.confirmed_text = ""
+            self.confirmed_text = new_transcript
         self.full_transcript = new_transcript
         self.chunk_index += 1
         # Word-level common prefix, not char-level startswith: startswith
@@ -124,8 +129,9 @@ class StreamingASRState:
             # Sliced path: each slice is a disjoint audio window and
             # dedupe_overlap already removed the emitted overlap, so a word
             # prefix match against the previous slice's confirmed_text is
-            # spurious -- it would drop held-back words that merely share a
-            # leading function word ("the"/"a"/"I"). Emit all of the new content.
+            # spurious. Sliced output is already acoustic-window bounded, so do
+            # not apply token-count holdback here; otherwise words at a slow
+            # boundary can be held back past the next overlap and disappear.
             common_count = 0
         delta = " ".join(new_words[common_count:])
         if common_count == 0:
@@ -364,6 +370,11 @@ def dedupe_overlap(committed_text: str, candidate_out: str) -> str:
     return _dedupe_by_word(committed_text, candidate_out)
 
 
+def _strip_sliced_boundary_punctuation(text: str) -> str:
+    """Drop punctuation the model adds only because a non-final slice ended."""
+    return text.rstrip("".join(_SLICED_BOUNDARY_PUNCT)).rstrip()
+
+
 async def process_asr_chunk(
     tokenizer_manager: TokenizerManager,
     adapter: TranscriptionAdapter,
@@ -416,6 +427,8 @@ async def process_asr_chunk(
     text = normalize_whitespace(adapter.postprocess_text(ret.get("text", "")))
     if dedupe_against is not None:
         text = dedupe_overlap(dedupe_against, text)
+        if not is_last:
+            text = _strip_sliced_boundary_punctuation(text)
 
     if is_last:
         state.full_transcript = text

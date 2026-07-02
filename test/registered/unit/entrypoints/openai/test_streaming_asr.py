@@ -189,11 +189,10 @@ class TestProcessAsrChunk(CustomTestCase):
         state.finalize(cumulative=True)
         self.assertEqual(state.emitted_text, "我今天很高兴认识你 Anna 你叫什么名字")
 
-    def test_sliced_path_keeps_held_back_words_sharing_leading_token(self):
+    def test_sliced_path_emits_deduped_window_without_token_holdback(self):
         # Regression: on the sliced path (cumulative=False) dedupe_overlap is the
-        # only intended dedup. A word-prefix match against the previous slice's
-        # confirmed_text must not drop a held-back word that merely shares a
-        # leading function word ("the").
+        # only intended dedup. Token-count holdback can drop words when their
+        # audio falls outside the next overlap, so the deduped window is emitted.
         state = StreamingASRState(
             chunk_size_sec=2.0, unfixed_chunk_num=2, unfixed_token_num=2
         )
@@ -202,7 +201,7 @@ class TestProcessAsrChunk(CustomTestCase):
         deduped = dedupe_overlap("the dog saw", "saw the cat ran up")
         self.assertEqual(deduped, "the cat ran up")
         state.update(deduped, cumulative=False)
-        self.assertEqual(state.emitted_text, "the dog saw the cat")
+        self.assertEqual(state.emitted_text, "the dog saw the cat ran up")
 
     def test_legit_cjk_repeat_is_preserved(self):
         # Guard the fix's boundary: a genuine adjacent CJK repeat reconciles with
