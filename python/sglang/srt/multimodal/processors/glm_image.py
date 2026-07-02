@@ -4,7 +4,7 @@ from typing import List, Union
 import torch
 
 from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
-from sglang.srt.models.glm_image import GlmImageForConditionalGeneration
+from sglang.srt.models.glm_image_vl import GlmImageForConditionalGeneration
 
 logger = logging.getLogger(__name__)
 from sglang.srt.multimodal.processors.base_processor import (
