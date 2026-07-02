@@ -20,10 +20,27 @@ def build_dspark_disagg_draft_input(
     future_map: FutureMap,
 ) -> DSparkDraftInputV2:
     del server_args
+    hidden_tensors = [
+        getattr(req, "hidden_states_tensor", None) for req in batch.reqs
+    ]
+    has_main_hidden = all(hidden is not None for hidden in hidden_tensors)
+    main_hidden = (
+        torch.stack(hidden_tensors, dim=0).to(batch.device)
+        if has_main_hidden and len(hidden_tensors) > 0
+        else None
+    )
 
     spec_info = DSparkDraftInputV2(
         bonus_tokens=last_tokens_tensor.to(dtype=torch.int64),
         new_seq_lens=batch.seq_lens.to(dtype=torch.int64),
+        main_hidden=main_hidden,
+        main_hidden_mask=(
+            torch.ones(
+                (len(hidden_tensors),), dtype=torch.bool, device=batch.device
+            )
+            if main_hidden is not None
+            else None
+        ),
         cur_allocated_seq_lens_cpu=batch.seq_lens_cpu,
         topk_p=torch.empty((0, 0), dtype=torch.float32, device=batch.device),
         topk_index=torch.empty((0, 0), dtype=torch.int64, device=batch.device),

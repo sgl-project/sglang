@@ -637,6 +637,16 @@ class SchedulerDisaggregationPrefillMixin:
                     req.hidden_states_tensor = (
                         batch.spec_info.hidden_states[i].cpu().clone()
                     )
+                elif (
+                    self.spec_algorithm.is_dspark()
+                    and batch.spec_info is not None
+                    and batch.spec_info.hidden_states.numel() > 0
+                ):
+                    req.output_topk_p = torch.empty((0,), dtype=torch.float32)
+                    req.output_topk_index = torch.empty((0,), dtype=torch.int64)
+                    req.hidden_states_tensor = (
+                        batch.spec_info.hidden_states[i].cpu().clone()
+                    )
                 else:
                     req.hidden_states_tensor = None
                 if req.return_logprob:

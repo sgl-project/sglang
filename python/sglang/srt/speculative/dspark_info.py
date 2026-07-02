@@ -202,6 +202,7 @@ class DSparkDraftInputV2(SpecInput):
     bonus_tokens: torch.Tensor
     new_seq_lens: torch.Tensor
     main_hidden: Optional[torch.Tensor] = None
+    main_hidden_mask: Optional[torch.Tensor] = None
     confidence: Optional[torch.Tensor] = None
     verify_done: Optional[torch.cuda.Event] = None
     cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None
@@ -383,6 +384,10 @@ class DSparkDraftInputV2(SpecInput):
 
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
+            if self.main_hidden is not None:
+                self.main_hidden = self.main_hidden[new_indices]
+            if self.main_hidden_mask is not None:
+                self.main_hidden_mask = self.main_hidden_mask[new_indices]
             self.direct_carry_valid = False
             return
 
@@ -390,6 +395,8 @@ class DSparkDraftInputV2(SpecInput):
         self.new_seq_lens = self.new_seq_lens[new_indices]
         if self.main_hidden is not None:
             self.main_hidden = self.main_hidden[new_indices]
+        if self.main_hidden_mask is not None:
+            self.main_hidden_mask = self.main_hidden_mask[new_indices]
         if self.confidence is not None:
             self.confidence = self.confidence[new_indices]
         if self.topk_p.numel() > 0:
@@ -398,6 +405,46 @@ class DSparkDraftInputV2(SpecInput):
             self.topk_index = self.topk_index[new_indices]
         if self.hidden_states.numel() > 0:
             self.hidden_states = self.hidden_states[new_indices]
+
+    def _merge_main_hidden(self, spec_info: DSparkDraftInputV2) -> None:
+        if self.main_hidden is None and spec_info.main_hidden is None:
+            return
+
+        lhs_len = len(self.bonus_tokens)
+        rhs_len = len(spec_info.bonus_tokens)
+        if self.main_hidden is None:
+            assert spec_info.main_hidden is not None
+            self.main_hidden = spec_info.main_hidden.new_zeros(
+                (lhs_len, spec_info.main_hidden.shape[-1])
+            )
+            self.main_hidden_mask = torch.zeros(
+                (lhs_len,), dtype=torch.bool, device=spec_info.main_hidden.device
+            )
+
+        if spec_info.main_hidden is None:
+            rhs_hidden = self.main_hidden.new_zeros(
+                (rhs_len, self.main_hidden.shape[-1])
+            )
+            rhs_mask = torch.zeros(
+                (rhs_len,), dtype=torch.bool, device=self.main_hidden.device
+            )
+        else:
+            rhs_hidden = spec_info.main_hidden
+            rhs_mask = (
+                spec_info.main_hidden_mask
+                if spec_info.main_hidden_mask is not None
+                else torch.ones((rhs_len,), dtype=torch.bool, device=rhs_hidden.device)
+            )
+
+        lhs_mask = (
+            self.main_hidden_mask
+            if self.main_hidden_mask is not None
+            else torch.ones(
+                (lhs_len,), dtype=torch.bool, device=self.main_hidden.device
+            )
+        )
+        self.main_hidden = torch.cat([self.main_hidden, rhs_hidden], dim=0)
+        self.main_hidden_mask = torch.cat([lhs_mask, rhs_mask], dim=0)
 
     def merge_batch(self, spec_info: DSparkDraftInputV2):
         if (
@@ -424,22 +471,20 @@ class DSparkDraftInputV2(SpecInput):
 
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
+            self._merge_main_hidden(spec_info)
             self.future_indices = torch.cat(
                 [self.future_indices, spec_info.future_indices]
             )
             self.direct_carry_valid = False
             return
 
+        self._merge_main_hidden(spec_info)
         self.bonus_tokens = torch.cat(
             [self.bonus_tokens, spec_info.bonus_tokens], dim=0
         )
         self.new_seq_lens = torch.cat(
             [self.new_seq_lens, spec_info.new_seq_lens], dim=0
         )
-        if self.main_hidden is not None and spec_info.main_hidden is not None:
-            self.main_hidden = torch.cat(
-                [self.main_hidden, spec_info.main_hidden], dim=0
-            )
         if self.confidence is not None and spec_info.confidence is not None:
             self.confidence = torch.cat([self.confidence, spec_info.confidence], dim=0)
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p], dim=0)
