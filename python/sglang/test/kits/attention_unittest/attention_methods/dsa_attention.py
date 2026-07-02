@@ -242,6 +242,7 @@ class TinyDSAModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = False
         self.attention_chunk_size = None
         self.sliding_window_size = None
@@ -306,6 +307,7 @@ class DSAMockModelRunner(ModelRunner):
         self.page_size = case.page_size
         self.model_config = model_config
         self.tp_size = 1
+        self._kernel_warmed_up = True
         self.dp_size = 1
         self.pp_size = 1
         self.server_args = make_mock_server_args(

@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.environ import envs
+
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
@@ -59,6 +61,17 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             f"Setting swa_full_tokens_ratio to {server_args.swa_full_tokens_ratio} for {model_arch}."
         )
 
+    # nvidia/DeepSeek-V4-Pro-NVFP4 uses flashinfer_trtllm_routed MoE runner backend.
+    if (
+        server_args.moe_runner_backend == "auto"
+        and server_args.get_model_config().nvfp4_moe_meta is not None
+    ):
+        server_args.moe_runner_backend = "flashinfer_trtllm_routed"
+        logger.info(
+            "Use flashinfer_trtllm_routed as MoE runner backend for "
+            f"{model_arch} hybrid FP8+NVFP4 checkpoint."
+        )
+
 
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
@@ -82,6 +95,11 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     assert (
         server_args.tp_size <= 8
     ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+    logger.warning(
+        "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
+        "context parallelism is enabled."
+    )
+    envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
     logger.warning(
         f"Enable Context Parallel for DeepSeekV4, "
         f"dp_size={server_args.dp_size}, moe_dense_tp_size={server_args.moe_dense_tp_size}, "

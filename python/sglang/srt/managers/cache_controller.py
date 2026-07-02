@@ -16,7 +16,7 @@ limitations under the License.
 import logging
 import threading
 import time
-from queue import Empty, Full, Queue
+from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
@@ -31,7 +31,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+    from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.distributed import (
     get_pipeline_model_parallel_rank,
@@ -149,45 +149,6 @@ class HiCacheAck(NamedTuple):
     node_ids: List[int]
 
 
-class TransferBuffer:
-    """
-    Overlapping buffer preparation and transfer operations to improve throughput.
-    """
-
-    def __init__(self, stop_event, buffer_count: int = 3) -> None:
-        self.stop_event = stop_event
-        self.buffers = Queue(maxsize=buffer_count)
-
-    def full(self) -> bool:
-        return self.buffers.full()
-
-    def empty(self) -> bool:
-        return self.buffers.empty()
-
-    def put(self, item, block=True, timeout=1) -> None:
-        while not self.stop_event.is_set():
-            try:
-                self.buffers.put(item, block=block, timeout=timeout)
-                break
-            except Full:
-                if not block:
-                    break
-                continue
-            except Exception as e:
-                logger.error(e)
-
-    def get(self, block=True, timeout=1) -> Optional[CacheOperation]:
-        try:
-            return self.buffers.get(block=block, timeout=timeout)
-        except Empty:
-            return None
-        except Exception as e:
-            logger.error(e)
-
-    def clear(self):
-        self.buffers.queue.clear()
-
-
 class StorageOperation:
     counter = 0
 
@@ -298,9 +259,6 @@ class HiCacheController:
         self.page_set_func = self._generic_page_set
 
         # Dedicated stop event for storage background threads (prefetch/backup).
-        # NOTE: Do NOT reuse `self.stop_event` here since it also guards core HiCache
-        # transfer buffers (CPU<->GPU). We want to allow runtime attach/detach of
-        # storage without stopping the whole controller.
         self.storage_stop_event = threading.Event()
 
         self.device = self.mem_pool_device.device
@@ -315,15 +273,16 @@ class HiCacheController:
         ]:
             raise ValueError(f"Invalid write policy: {write_policy}")
 
+        if write_policy == "write_back":
+            logger.warning(
+                "write_back policy will be deprecated in future releases; please migrate to write_through_selective with appropriate configuration for better performance and reliability."
+            )
+
         # self.write_queue = PriorityQueue[CacheOperation]()
         self.load_queue: List[CacheOperation] = []
         self.write_queue: List[CacheOperation] = []
         self.ack_load_queue: List[HiCacheAck] = []
         self.ack_write_queue: List[HiCacheAck] = []
-
-        self.stop_event = threading.Event()
-        self.write_buffer = TransferBuffer(self.stop_event)
-        self.load_buffer = TransferBuffer(self.stop_event, buffer_count=10)
 
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
@@ -419,7 +378,7 @@ class HiCacheController:
         # Always request stop. This is safe even when storage is already disabled,
         # and makes detach truly idempotent (previous partial detach may have left
         # threads alive).
-        # NOTE: do NOT clear stop_event unless threads have fully stopped; otherwise
+        # NOTE: do NOT clear storage_stop_event unless threads have fully stopped; otherwise
         # a still-alive thread may resume and touch released state.
         self.storage_stop_event.set()
 
@@ -509,9 +468,8 @@ class HiCacheController:
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
-            self.prefetch_capacity_limit = max(
-                0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
-            )
+            # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
+            self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
@@ -525,7 +483,7 @@ class HiCacheController:
 
             if (
                 self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm"]
+                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori"]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
@@ -671,13 +629,10 @@ class HiCacheController:
         )
 
     def reset(self):
-        self.stop_event.set()
         self.storage_stop_event.set()
 
         self.write_queue.clear()
         self.load_queue.clear()
-        self.write_buffer.clear()
-        self.load_buffer.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
         if self.enable_storage:
@@ -690,7 +645,6 @@ class HiCacheController:
             self.host_mem_release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
 
-        self.stop_event.clear()
         self.storage_stop_event.clear()
 
         if self.enable_storage:
@@ -726,10 +680,12 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        # For now, kernel write-back keeps host indices on CPU only for page_first.
-        # More layouts can use this path once their write-back kernels accept CPU
-        # destination indices.
-        if self.io_backend == "kernel" and self.mem_pool_host.layout == "page_first":
+        # Page-first write-back JIT kernels can keep destination host indices on CPU.
+        if (
+            self.io_backend == "kernel"
+            and self.mem_pool_host.layout == "page_first"
+            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+        ):
             host_indices, device_indices = op.host_indices, op.device_indices
         else:
             host_indices, device_indices = self.move_indices(
@@ -1046,18 +1002,12 @@ class HiCacheController:
 
         storage_query_count = 0
         hash_value = []
+        page_hashes = self.get_hash_str(
+            tokens_to_fetch, last_hash, page_size=self.page_size
+        )
 
-        for start in range(
-            0, len(tokens_to_fetch), self.page_size * STORAGE_BATCH_SIZE
-        ):
-            end = min(start + self.page_size * STORAGE_BATCH_SIZE, len(tokens_to_fetch))
-            batch_tokens = tokens_to_fetch[start:end]
-            batch_hashes = []
-            for i in range(0, len(batch_tokens), self.page_size):
-                last_hash = self.get_hash_str(
-                    batch_tokens[i : i + self.page_size], last_hash
-                )
-                batch_hashes.append(last_hash)
+        for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
+            batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])

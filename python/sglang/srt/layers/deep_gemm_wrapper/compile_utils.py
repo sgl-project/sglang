@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
@@ -279,7 +280,7 @@ def _empty_token_fp8(size):
     *dims, k = size
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
-        torch.empty(
+        torch.ones(
             (*dims, ceil_div(k, _BLOCK_SIZE)), device="cuda", dtype=torch.float32
         ),
     )
@@ -289,7 +290,7 @@ def _empty_block_fp8(size):
     *dims, n, k = size
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
-        torch.empty(
+        torch.ones(
             (*dims, ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)),
             device="cuda",
             dtype=torch.float32,
@@ -416,12 +417,17 @@ def _deep_gemm_execution_hook(
     yield
 
 
-def pp_parallel_deep_gemm_warmup(model_runner) -> None:
+def pp_parallel_deep_gemm_warmup(runner) -> None:
     """Run per-PP-rank dummy DECODE+EXTEND forwards so each rank's
     DeepGEMM JIT compiles in parallel instead of serially via the warmup
     /generate flowing through the pipeline. Opt-in via
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.
+
+    Driven from BaseRunner.warmup(), which passes the runner; the dummy
+    forwards go through runner._dummy_run (the autotune/dummy-run machinery now
+    lives on BaseRunner). ModelRunner state is read via runner.model_runner.
     """
+    model_runner = runner.model_runner
     # n_splits ~= n_sms / ceil(bs/block_m) with block_m=64; sweep 5 bs to
     # cover the brackets real /generate hits (smallest decode shape,
     # mid-low, two mid, and n_splits=1 for ~5K+ token prefill). Ceil-align
@@ -429,14 +435,28 @@ def pp_parallel_deep_gemm_warmup(model_runner) -> None:
     # in-seq-split). _dummy_run does not pad q/hidden like the real flow, so
     # an unaligned bs makes DSA's padded num_splits longer than the q tokens
     # and trips FlashMLA's "num_splits must have shape (b+1)" check.
+    from sglang.srt.layers.dp_attention import get_attention_tp_size
     from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+    from sglang.srt.utils.common import require_mlp_sync
 
     n_sms = torch.cuda.get_device_properties(model_runner.device).multi_processor_count
     block_m = 64
     cp = max(get_cp_padding_align_size(), 1)
+
+    attn_tp_size = get_attention_tp_size()
+    mlp_sync = require_mlp_sync(model_runner.server_args)
+
+    def _align(bs: int) -> int:
+        # Align to lcm(cp, attn_tp_size) so the CP multiple isn't undone by a
+        # later attn_tp align (e.g. cp=2, attn_tp=3: 128 -> 128 -> 129).
+        align = cp
+        if mlp_sync and attn_tp_size > 1:
+            align = math.lcm(cp, attn_tp_size)
+        return ceil_align(bs, align)
+
     batch_sizes = sorted(
         {
-            ceil_align(bs, cp)
+            _align(bs)
             for bs in (
                 1,
                 2 * block_m,
@@ -462,16 +482,24 @@ def pp_parallel_deep_gemm_warmup(model_runner) -> None:
         disagg_mode,
     )
 
+    # One buffer set sized to the largest shape, reused across the sweep
+    # (the decode runner's max_bs is too small for n_sms*block_m).
+    dummy_buffers = runner._alloc_dummy_decode_buffers(max(batch_sizes))
+
     t0 = time.perf_counter()
     with torch.inference_mode():
         for bs in batch_sizes:
             if run_decode:
-                model_runner._dummy_run(
-                    batch_size=bs, forward_mode_override=ForwardMode.DECODE
+                runner._dummy_run(
+                    batch_size=bs,
+                    forward_mode_override=ForwardMode.DECODE,
+                    buffers=dummy_buffers,
                 )
             if run_extend:
-                model_runner._dummy_run(
-                    batch_size=bs, forward_mode_override=ForwardMode.EXTEND
+                runner._dummy_run(
+                    batch_size=bs,
+                    forward_mode_override=ForwardMode.EXTEND,
+                    buffers=dummy_buffers,
                 )
 
     logger.info(
