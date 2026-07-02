@@ -1403,6 +1403,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         x, _ = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)
+        device = x.device
         x = self._replace_padding_with_token(x, x_valid_lens, self.x_pad_token)
         if len(input_images) > 1 and get_sp_world_size() == 1:
             freqs_cis = self._get_cached_batched_freqs_cis(
