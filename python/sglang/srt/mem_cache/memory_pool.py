@@ -671,18 +671,25 @@ class MambaPool:
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
-        need_size = len(indices)
-        for i in range(len(self.mamba_cache.conv)):
-            t = self.mamba_cache.conv[i]
+        if not _is_npu:
+            need_size = len(indices)
+            for i in range(len(self.mamba_cache.conv)):
+                t = self.mamba_cache.conv[i]
+                z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
+                    t.shape[0], need_size, *t.shape[2:]
+                )
+                t[:, indices] = z
+            t = self.mamba_cache.temporal
             z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
                 t.shape[0], need_size, *t.shape[2:]
             )
             t[:, indices] = z
-        t = self.mamba_cache.temporal
-        z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
-            t.shape[0], need_size, *t.shape[2:]
-        )
-        t[:, indices] = z
+        else:
+            for i in range(len(self.mamba_cache.conv)):
+                t = self.mamba_cache.conv[i]
+                t[:, indices] = 0
+            t = self.mamba_cache.temporal
+            t[:, indices] = 0
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         """Clone mamba state (conv + temporal) from src slots into dst slots.
@@ -974,6 +981,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
 
+    def translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
+        """Virtual->physical mamba-slot translate. Identity for a static pool
+        (slots are physical); UnifiedHybridReqToTokenPool overrides it for the
+        unified memory pool, where mamba slot ids are virtual. Callers translate
+        before calling the pool's physical-id state ops (copy_from / clear_slots
+        / get_cpu_copy / load_cpu_copy)."""
+        return mamba_indices
+
     def mamba2_layer_cache(self, layer_id: int):
         assert layer_id in self.mamba_map
         if self.layer_transfer_counter is not None:
@@ -1138,29 +1153,43 @@ class HybridReqToTokenPool(ReqToTokenPool):
 class KVWriteLoc:
     """Write target(s) for ``KVCache.set_kv_buffer``.
 
-    ``loc`` is the full-pool write location; ``swa_loc`` is the pre-translated
-    full->SWA location for hybrid SWA pools (``None`` otherwise). Bundling them
-    lets a backend issue one ``set_kv_buffer`` call regardless of pool type.
+    All location info lives here (in the attention metadata), NOT in the pool:
+    - ``loc``: the generic per-token write location (the allocated
+      ``out_cache_loc``). VIRTUAL under the unified memory pool (it indexes the
+      virtual slot space); already physical for a non-unified memory pool.
+    - ``swa_loc``: the pre-translated SWA-sub-pool PHYSICAL location for hybrid
+      SWA pools (``None`` otherwise).
+    - ``full_loc``: the pre-translated full-attention-sub-pool PHYSICAL location
+      for the unified memory pool (``None`` otherwise), computed once per forward in
+      attention metadata (``ForwardMetadata.out_cache_loc_full_physical``). The
+      shared full pool writes it directly; the pool never translates (replacing
+      the former per-layer v2p gather / ``set_full_loc`` pin).
+
+    ``swa_loc`` and ``full_loc`` are the parallel pair (each a pre-resolved
+    PHYSICAL loc into its sub-pool, mirroring ``swa_kv_pool`` / ``full_kv_pool``);
+    ``loc`` is the generic, possibly-virtual fallback. Bundling them lets a
+    backend issue one ``set_kv_buffer`` call regardless of pool type.
     """
 
     loc: torch.Tensor
     swa_loc: Optional[torch.Tensor] = None
+    full_loc: Optional[torch.Tensor] = None
 
     def __post_init__(self):
-        # swa_out_cache_loc is computed once at metadata-init time from the
-        # full (possibly padded) out_cache_loc. Piecewise CUDA graphs later
-        # narrow out_cache_loc to real_num_tokens per layer, so swa_loc can
-        # be longer than loc. Slice to match since both are in the same
-        # per-token order.
+        # swa_loc / full_loc are resolved once at metadata-init from the full
+        # (padded) out_cache_loc; piecewise/DP-padded paths later narrow loc per
+        # layer, so slice these pre-resolved locs to match (same per-token order).
         if self.swa_loc is not None and self.swa_loc.shape[0] != self.loc.shape[0]:
             self.swa_loc = self.swa_loc[: self.loc.shape[0]]
+        if self.full_loc is not None and self.full_loc.shape[0] != self.loc.shape[0]:
+            self.full_loc = self.full_loc[: self.loc.shape[0]]
 
 
 def unwrap_write_loc(loc_info):
-    """Return ``(loc, swa_loc)`` from a ``KVWriteLoc`` or a bare loc tensor."""
+    """Return ``(loc, swa_loc, full_loc)`` from a ``KVWriteLoc`` or a bare loc."""
     if isinstance(loc_info, KVWriteLoc):
-        return loc_info.loc, loc_info.swa_loc
-    return loc_info, None
+        return loc_info.loc, loc_info.swa_loc, loc_info.full_loc
+    return loc_info, None, None
 
 
 class KVCache(abc.ABC):
@@ -1723,7 +1752,7 @@ class MHATokenToKVPool(KVCache):
         layer_id_override: Optional[int] = None,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
-        loc, _ = unwrap_write_loc(loc_info)
+        loc, _, _ = unwrap_write_loc(loc_info)
         # Catch stale slot ids here instead of as illegal-addr / silent KV
         # corruption in the store_kvcache write (gated on SGLANG_ENABLE_ASYNC_ASSERT).
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA)")
@@ -2338,7 +2367,7 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
-        loc, _ = unwrap_write_loc(loc_info)
+        loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA-FP4)")
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
@@ -2566,6 +2595,9 @@ class HybridLinearKVPool(KVCache):
         start_layer: Optional[int] = None,
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
+        # When provided (shared-KV-pool path), use this pool for the
+        # full-attention layers instead of constructing one internally.
+        full_kv_pool: Optional[KVCache] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -2577,8 +2609,16 @@ class HybridLinearKVPool(KVCache):
         self.head_num = head_num
         self.head_dim = head_dim
         self.mamba_pool = mamba_pool
+        # virtual->physical mamba-slot translate for the HiCache offload path;
+        # identity for a static pool, the allocator's `translate` for the unified pool.
+        self._mamba_translate = lambda ids: ids
         self.use_mla = use_mla
-        if not use_mla:
+        if full_kv_pool is not None:
+            # Shared-KV-pool path: the caller built a UnifiedMHATokenToKVPool
+            # aliasing the shared byte buffer.
+            self.full_kv_pool = full_kv_pool
+        elif not use_mla:
+            TokenToKVPoolClass = MHATokenToKVPool
             quant_method_kwarg = {"quant_method": quant_method}
 
             if current_platform.is_out_of_tree():
@@ -2743,15 +2783,20 @@ class HybridLinearKVPool(KVCache):
         v_scale: float = 1.0,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
+        # Write-location info lives in the metadata (`KVWriteLoc`). `full_loc` is the
+        # unified pool's pre-translated PHYSICAL loc (None for a static pool, where
+        # `loc` is already physical) — either way the pool writes a PHYSICAL loc.
+        loc, _, full_loc = unwrap_write_loc(loc)
         layer_id = self._transfer_full_attention_id(layer.layer_id)
         if not self.use_mla:
+            write_loc = full_loc if full_loc is not None else loc
             if self.full_kv_pool.is_quantized_kv_cache:
                 if dcp_kv_mask is not None:
                     raise RuntimeError("dcp_kv_mask is not supported for FP4 KV cache.")
                 self.full_kv_pool._set_quantized_kv_buffer(
                     layer_id,
                     layer.layer_id,
-                    loc,
+                    write_loc,
                     cache_k,
                     cache_v,
                     k_scale,
@@ -2761,7 +2806,7 @@ class HybridLinearKVPool(KVCache):
 
             self.full_kv_pool.set_kv_buffer(
                 None,
-                loc,
+                write_loc,
                 cache_k,
                 cache_v,
                 k_scale,
@@ -2783,8 +2828,9 @@ class HybridLinearKVPool(KVCache):
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
+        # mamba_pool stores PHYSICAL ids; translate the (unified-pool virtual) ids first.
         mamba_cpu = (
-            self.mamba_pool.get_cpu_copy(mamba_indices)
+            self.mamba_pool.get_cpu_copy(self._mamba_translate(mamba_indices))
             if mamba_indices is not None
             else None
         )
@@ -2794,7 +2840,9 @@ class HybridLinearKVPool(KVCache):
         kv_cpu, mamba_cpu = cache_cpu
         self.full_kv_pool.load_cpu_copy(kv_cpu, indices)
         if mamba_cpu is not None and mamba_indices is not None:
-            self.mamba_pool.load_cpu_copy(mamba_cpu, mamba_indices)
+            self.mamba_pool.load_cpu_copy(
+                mamba_cpu, self._mamba_translate(mamba_indices)
+            )
 
     def get_v_head_dim(self):
         return self.full_kv_pool.get_value_buffer(0).shape[-1]
@@ -2941,7 +2989,7 @@ class MLATokenToKVPool(KVCache):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
-        loc, _ = unwrap_write_loc(loc_info)
+        loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
@@ -3147,7 +3195,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         cache_v: torch.Tensor,
     ):
         # loc_info may be a KVWriteLoc; MLA pools have no SWA target.
-        loc, _ = unwrap_write_loc(loc_info)
+        loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA-FP4)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
