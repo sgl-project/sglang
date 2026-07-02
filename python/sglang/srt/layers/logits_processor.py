@@ -21,7 +21,24 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.dllm.consumer_state_trace import (
+    emit_compact_vocab_state_trace,
+    emit_full_vocab_trace,
+)
+from sglang.srt.dllm.tp_local_vocab_kernel import (
+    can_use_local_vocab_state_triton,
+    local_vocab_state_from_logits_triton,
+)
+from sglang.srt.dllm.tp_local_vocab_state import (
+    VocabState,
+    can_pack_vocab_ids_as_float32,
+    local_vocab_state_from_logits,
+    merge_gathered_packed_vocab_state,
+    merge_vocab_states,
+    pack_vocab_state_for_tp_gather,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -67,6 +84,83 @@ _is_cpu = is_cpu()
 # and its [batch * dp_size, vocab] output OOMs under DP attention with a
 # tight mem_fraction_static.
 _in_autotune_dummy_run = False
+
+
+def _should_pack_dllm_vocab_state_for_gather(max_vocab_id_inclusive: int) -> bool:
+    return envs.SGLANG_DLLM_TP_LOCAL_VOCAB_PACKED_GATHER.get() and (
+        can_pack_vocab_ids_as_float32(int(max_vocab_id_inclusive))
+    )
+
+
+def _global_max_vocab_id_for_dllm_tp_state(
+    lm_head: VocabParallelEmbedding,
+    fallback_vocab_size: int,
+) -> int:
+    vocab_size = getattr(lm_head, "org_vocab_size", fallback_vocab_size)
+    return int(vocab_size) - 1
+
+
+def _tp_rank_for_trace() -> int:
+    try:
+        return int(getattr(get_tp_group(), "rank_in_group", 0))
+    except Exception:
+        return 0
+
+
+def _merge_dllm_vocab_state_across_tp(
+    *,
+    local_state: VocabState,
+    tp_group,
+    tp_size: int,
+    global_max_vocab_id_inclusive: int,
+) -> VocabState:
+    num_rows = local_state.max_values.shape[0]
+
+    if _should_pack_dllm_vocab_state_for_gather(global_max_vocab_id_inclusive):
+        local_packed = pack_vocab_state_for_tp_gather(local_state)
+        gathered_packed = torch.empty(
+            (tp_size * num_rows, 3),
+            device=local_packed.device,
+            dtype=local_packed.dtype,
+        )
+        tp_group.all_gather_into_tensor(gathered_packed, local_packed)
+        return merge_gathered_packed_vocab_state(
+            gathered_packed.view(tp_size, num_rows, 3)
+        )
+
+    gathered_max = torch.empty(
+        (tp_size * num_rows,),
+        device=local_state.max_values.device,
+        dtype=local_state.max_values.dtype,
+    )
+    gathered_arg = torch.empty(
+        (tp_size * num_rows,),
+        device=local_state.argmax_ids.device,
+        dtype=local_state.argmax_ids.dtype,
+    )
+    gathered_lse = torch.empty(
+        (tp_size * num_rows,),
+        device=local_state.logsumexp.device,
+        dtype=local_state.logsumexp.dtype,
+    )
+    tp_group.all_gather_into_tensor(gathered_max, local_state.max_values.contiguous())
+    tp_group.all_gather_into_tensor(gathered_arg, local_state.argmax_ids.contiguous())
+    tp_group.all_gather_into_tensor(gathered_lse, local_state.logsumexp.contiguous())
+
+    gathered_max = gathered_max.view(tp_size, num_rows)
+    gathered_arg = gathered_arg.view(tp_size, num_rows)
+    gathered_lse = gathered_lse.view(tp_size, num_rows)
+    return merge_vocab_states(
+        [
+            VocabState(
+                max_values=gathered_max[rank],
+                argmax_ids=gathered_arg[rank],
+                logsumexp=gathered_lse[rank],
+                max_probs=torch.exp(gathered_max[rank] - gathered_lse[rank]),
+            )
+            for rank in range(tp_size)
+        ]
+    )
 
 
 def get_in_autotune_dummy_run() -> bool:
@@ -121,6 +215,7 @@ class LogitsProcessorOutput:
 
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
+    dllm_vocab_state: Optional[Any] = None
 
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
@@ -293,6 +388,7 @@ class LogitsProcessor(nn.Module):
 
         self.return_full_logits = return_full_logits
         self.enable_mis = get_global_server_args().enable_mis
+        self._dllm_tp_local_vocab_logged = False
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
@@ -996,11 +1092,136 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
     ) -> LogitsProcessorOutput:
         assert self.return_full_logits
+        if self._should_use_dllm_tp_local_vocab(lm_head):
+            return LogitsProcessorOutput(
+                full_logits=None,
+                next_token_logits=None,
+                dllm_vocab_state=self._get_dllm_vocab_state(
+                    hidden_states, lm_head, logits_metadata
+                ),
+            )
         full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
+        emit_full_vocab_trace(
+            component="sglang.logits_processor._get_dllm_logits",
+            full_logits=full_logits,
+            vocab_size=self.vocab_size,
+            tp_size=int(get_parallel().tp_size),
+            rank=_tp_rank_for_trace(),
+            consumer_contract="dllm_full_logits",
+        )
         return LogitsProcessorOutput(
             full_logits=full_logits,
             next_token_logits=None,
         )
+
+    def _should_use_dllm_tp_local_vocab(self, lm_head: VocabParallelEmbedding) -> bool:
+        if not envs.SGLANG_DLLM_TP_LOCAL_VOCAB.get():
+            return False
+        server_args = get_global_server_args()
+        if getattr(server_args, "dllm_algorithm", None) != "LowConfidence":
+            return False
+        if _is_npu:
+            return False
+        if self.use_attn_tp_group or self.do_tensor_parallel_all_gather_dp_attn:
+            return False
+        if not hasattr(lm_head, "weight"):
+            return False
+        if not hasattr(lm_head, "shard_indices"):
+            return False
+        return int(getattr(lm_head, "num_added_embeddings", 0)) == 0
+
+    def _get_dllm_vocab_state(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> VocabState:
+        hidden_states, _ = self._gather_dp_attn_hidden_states(
+            hidden_states, logits_metadata
+        )
+        local_logits = self._compute_lm_head(hidden_states, lm_head)
+
+        if self.logit_scale is not None:
+            local_logits.mul_(self.logit_scale)
+        local_logits = local_logits.float()
+
+        if self.final_logit_softcapping:
+            if not _is_npu:
+                fused_softcap(local_logits, self.final_logit_softcapping)
+            else:
+                local_logits = self.final_logit_softcapping * torch.tanh(
+                    local_logits / self.final_logit_softcapping
+                )
+
+        if hasattr(lm_head, "shard_indices"):
+            shard = lm_head.shard_indices
+            vocab_start = int(shard.org_vocab_start_index)
+            valid_vocab_size = int(shard.num_org_elements)
+        else:
+            vocab_start = 0
+            valid_vocab_size = int(self.vocab_size)
+        if not self._dllm_tp_local_vocab_logged:
+            self._dllm_tp_local_vocab_logged = True
+            logger.info(
+                "SGLANG_DLLM_TP_LOCAL_VOCAB enabled: local_logits=%s "
+                "vocab_start=%d valid_vocab_size=%d tp_size=%d",
+                tuple(local_logits.shape),
+                vocab_start,
+                valid_vocab_size,
+                int(get_parallel().tp_size),
+            )
+
+        if local_logits.is_cuda and can_use_local_vocab_state_triton(valid_vocab_size):
+            local_state = local_vocab_state_from_logits_triton(
+                local_logits=local_logits,
+                vocab_start=vocab_start,
+                valid_vocab_size=valid_vocab_size,
+            )
+        else:
+            local_state = local_vocab_state_from_logits(
+                local_logits=local_logits,
+                vocab_start=vocab_start,
+                valid_vocab_size=valid_vocab_size,
+            )
+
+        tp_size = int(get_parallel().tp_size)
+        global_max_vocab_id = _global_max_vocab_id_for_dllm_tp_state(
+            lm_head,
+            self.vocab_size,
+        )
+        packed_gather = _should_pack_dllm_vocab_state_for_gather(global_max_vocab_id)
+        if tp_size == 1:
+            emit_compact_vocab_state_trace(
+                component="sglang.logits_processor._get_dllm_vocab_state",
+                local_logits=local_logits,
+                state=local_state,
+                vocab_size=global_max_vocab_id + 1,
+                valid_vocab_size=valid_vocab_size,
+                tp_size=tp_size,
+                rank=_tp_rank_for_trace(),
+                packed_gather=packed_gather,
+                consumer_contract="dllm_low_confidence",
+            )
+            return local_state
+
+        merged_state = _merge_dllm_vocab_state_across_tp(
+            local_state=local_state,
+            tp_group=get_tp_group(),
+            tp_size=tp_size,
+            global_max_vocab_id_inclusive=global_max_vocab_id,
+        )
+        emit_compact_vocab_state_trace(
+            component="sglang.logits_processor._get_dllm_vocab_state",
+            local_logits=local_logits,
+            state=merged_state,
+            vocab_size=global_max_vocab_id + 1,
+            valid_vocab_size=valid_vocab_size,
+            tp_size=tp_size,
+            rank=_tp_rank_for_trace(),
+            packed_gather=packed_gather,
+            consumer_contract="dllm_low_confidence",
+        )
+        return merged_state
 
     def compute_logprobs_for_multi_item_scoring(
         self,

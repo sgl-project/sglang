@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.tp_local_vocab_state import argmax_max_prob_from_logits_output
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -73,24 +74,38 @@ class JointThreshold(DllmAlgorithm):
                 block_end = block_start + self.block_size
 
                 curr_input_ids = forward_batch.input_ids[block_start:block_end]
-                curr_logits = logits_output.full_logits[block_start:block_end]
                 curr_prompt_mask = prompt_masks[i]
 
-                if self.penalty_lambda > 0:
-                    prev_ids = curr_input_ids[:-1]
-                    curr_logits[1:, :].scatter_(
-                        1, prev_ids.unsqueeze(-1), -self.penalty_lambda, reduce="add"
+                if getattr(logits_output, "dllm_vocab_state", None) is not None:
+                    if self.penalty_lambda > 0:
+                        raise RuntimeError(
+                            "JointThreshold with penalty_lambda requires full logits."
+                        )
+                    x, p = argmax_max_prob_from_logits_output(
+                        logits_output,
+                        start=block_start,
+                        end=block_end,
                     )
+                else:
+                    curr_logits = logits_output.full_logits[block_start:block_end]
+                    if self.penalty_lambda > 0:
+                        prev_ids = curr_input_ids[:-1]
+                        curr_logits[1:, :].scatter_(
+                            1,
+                            prev_ids.unsqueeze(-1),
+                            -self.penalty_lambda,
+                            reduce="add",
+                        )
 
-                x = torch.argmax(curr_logits, dim=-1)
-                p = torch.squeeze(
-                    torch.gather(
-                        F.softmax(curr_logits, dim=-1),
-                        dim=-1,
-                        index=torch.unsqueeze(x, -1),
-                    ),
-                    -1,
-                )
+                    x = torch.argmax(curr_logits, dim=-1)
+                    p = torch.squeeze(
+                        torch.gather(
+                            F.softmax(curr_logits, dim=-1),
+                            dim=-1,
+                            index=torch.unsqueeze(x, -1),
+                        ),
+                        -1,
+                    )
 
                 mask_index = curr_input_ids == self.mask_id
                 has_mask = mask_index.any()

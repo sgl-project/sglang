@@ -231,6 +231,9 @@ class Envs:
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
+    SGLANG_DLLM_TP_LOCAL_VOCAB = EnvBool(False)
+    SGLANG_DLLM_TP_LOCAL_VOCAB_PACKED_GATHER = EnvBool(True)
+    SGLANG_CONSUMER_STATE_TRACE_JSONL = EnvStr("")
 
     # HTTP server
     # Decompress request bodies tagged with `x-body-compressed`.
