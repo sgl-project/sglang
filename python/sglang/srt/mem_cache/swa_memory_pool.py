@@ -160,7 +160,7 @@ class SWAKVPool(BaseSWAKVPool):
         v_scale: float = 1.0,
     ):
         # loc_info bundles the full loc and the pre-translated SWA loc.
-        loc, swa_loc = unwrap_write_loc(loc_info)
+        loc, swa_loc, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
