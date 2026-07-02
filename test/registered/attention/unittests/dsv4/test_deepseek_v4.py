@@ -183,13 +183,27 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
     )
 
     def test_compress_attention_cases(self):
+        # Pinned to the dense extend path; the sparse prefill path is covered
+        # by test_compress_attention_cases_sparse_prefill below.
         for case in self.COMPRESS_CASES:
             with self.subTest(
                 case=case.name,
                 backend=case.backend,
                 compress_ratio=case.compress_ratio,
             ):
-                run_dsv4_compress_attention_case(self, case)
+                run_dsv4_compress_attention_case(self, case, sparse_prefill=False)
+
+    def test_compress_attention_cases_sparse_prefill(self):
+        # `_forward_prefill_sparse` extend path; decode never reaches it.
+        for case in self.COMPRESS_CASES:
+            if not case.forward_mode.is_extend_without_speculative():
+                continue
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                compress_ratio=case.compress_ratio,
+            ):
+                run_dsv4_compress_attention_case(self, case, sparse_prefill=True)
 
     def test_eagle_target_verify_chain_cases(self):
         for case in self.TARGET_VERIFY_CASES:
