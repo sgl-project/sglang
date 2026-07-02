@@ -1417,7 +1417,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self, batch: Req, server_args: ServerArgs
     ):
         """deal with warmup req if torch-compile is enabled
-        Returns the result if req is a
+        Returns the result if req is a warmup request
         """
         if not self._offloaded_dit_modules_for_compile:
             return None
