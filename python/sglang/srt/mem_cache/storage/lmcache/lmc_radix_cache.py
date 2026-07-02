@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
@@ -118,15 +119,24 @@ class LMCRadixCache(RadixCache):
             # NOTE: The original implementation accessed private buffers via
             # `_kvcache.k_buffer` / `.v_buffer`. We prefer public accessors when
             # available; fall back to private fields if needed.
+            # NOTE: For MLA, only single `kv_buffer` exists, so `k_pool` is
+            # used to store `kv_buffer` under this circumstance.
             k_pool=getattr(
                 kvcache,
                 "k_buffer",
-                getattr(self.token_to_kv_pool_allocator._kvcache, "k_buffer"),
+                getattr(
+                    self.token_to_kv_pool_allocator._kvcache,
+                    (
+                        "kv_buffer"
+                        if model_config.attention_arch == AttentionArch.MLA
+                        else "k_buffer"
+                    ),
+                ),
             ),
             v_pool=getattr(
                 kvcache,
                 "v_buffer",
-                getattr(self.token_to_kv_pool_allocator._kvcache, "v_buffer"),
+                getattr(self.token_to_kv_pool_allocator._kvcache, "v_buffer", None),
             ),
             tp_group=tp_group.device_group if tp_group is not None else None,
         )
