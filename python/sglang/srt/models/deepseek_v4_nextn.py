@@ -276,6 +276,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
         super().post_load_weights(is_nextn=True, weight_names=weight_names)
+        self.model.decoder.self_attn.refresh_attn_sink_cache()
 
 
 EntryClass = [DeepseekV4ForCausalLMNextN]
