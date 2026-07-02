@@ -140,7 +140,12 @@ class SessionConfig:
 
 @dataclass
 class AudioState:
-    """Per-item PCM buffer and absolute offset state."""
+    """Per-item PCM buffer plus absolute byte offsets.
+
+    ``pcm_buffer`` stores only the resident bytes still needed for inference.
+    The offset fields stay absolute within the current item, so compaction can
+    drop old bytes without moving inference anchors backward.
+    """
 
     max_buffer_bytes: int
     chunk_size_bytes: int
@@ -156,11 +161,12 @@ class AudioState:
     last_sliced_buffer_end_bytes: int = 0
 
     def append_pcm(self, pcm: bytes) -> None:
+        """Append resident PCM and advance the absolute received-byte cursor."""
         self.pcm_buffer.extend(pcm)
         self.total_pcm_bytes_received += len(pcm)
 
     def compact_after_sliced_inference(self) -> None:
-        """Drop PCM no longer needed for the next overlap+chunk slice."""
+        """Retain only the next sliced inference's overlap+chunk tail."""
         keep_bytes = self.left_overlap_bytes + self.chunk_size_bytes
         keep_start = max(0, self.last_sliced_buffer_end_bytes - keep_bytes)
         drop_bytes = keep_start - self.pcm_buffer_base_offset_bytes
@@ -172,6 +178,7 @@ class AudioState:
         self.pcm_buffer_base_offset_bytes += drop_bytes
 
     def reset_pcm_offsets(self) -> None:
+        """Clear item-local audio and reset all absolute byte cursors."""
         self.pcm_buffer.clear()
         self.pcm_buffer_base_offset_bytes = 0
         self.total_pcm_bytes_received = 0
@@ -179,6 +186,7 @@ class AudioState:
         self.last_sliced_buffer_end_bytes = 0
 
     def global_to_local(self, global_offset: int) -> int:
+        """Translate an item-absolute byte offset into ``pcm_buffer`` space."""
         return global_offset - self.pcm_buffer_base_offset_bytes
 
 
@@ -698,8 +706,8 @@ class RealtimeConnection:
         # (e.g. emitted_text becomes CJK-no-whitespace, so get_prefix_text()
         # returns "" and slice_start_global drops to 0) would otherwise index
         # before the compacted base (negative local start) and crash the live
-        # session via slice_pcm_range. Slicing from the retained start is the
-        # only sane fallback once earlier bytes have been compacted away.
+        # session via slice_pcm_range. Use the retained start because earlier
+        # bytes are no longer resident.
         slice_start = max(0, self.audio.global_to_local(slice_start_global))
         slice_end = self.audio.global_to_local(slice_end_global)
 

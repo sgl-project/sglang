@@ -32,8 +32,8 @@ class StreamingASRState:
     Parameters are model-specific and should be provided via the
     adapter's ``chunked_streaming_config``.
 
-    CJK-style no-whitespace text uses character rollback as a conservative
-    fallback; token-level rollback is still needed for full alignment.
+    CJK-style no-whitespace text uses character rollback so partial deltas can
+    advance without whitespace-confirmed words.
     """
 
     chunk_size_sec: float
@@ -49,9 +49,8 @@ class StreamingASRState:
     def get_prefix_text(self) -> str:
         if self.chunk_index < self.unfixed_chunk_num or not self.emitted_text:
             return ""
-        # Word-level overlap dedupe is still the slicing guardrail; keep CJK
-        # char-rollback streams on the cumulative path until stronger alignment
-        # is available.
+        # Sliced overlap dedupe relies on whitespace-delimited words; CJK
+        # char-rollback streams stay cumulative instead of using word overlap.
         if _is_cjk_no_whitespace(self.emitted_text):
             return ""
         return self.emitted_text
@@ -90,10 +89,13 @@ class StreamingASRState:
                 break
             common_count += 1
         if common_count == 0 and cumulative and old_words and new_words:
+            # Cumulative snapshots may revise early casing/punctuation. In that
+            # case, keep streaming append-only instead of re-emitting everything.
             return self._record_emit(" ".join(new_words[len(old_words) :]))
         return self._record_emit(" ".join(new_words[common_count:]))
 
     def _update_chars(self, new_transcript: str, *, cumulative: bool) -> str:
+        """Character rollback for no-whitespace transcripts."""
         old_confirmed = self.confirmed_text
         holdback = max(0, self.unfixed_token_num)
         if holdback == 0:
@@ -107,6 +109,7 @@ class StreamingASRState:
 
         common_count = _common_prefix_len(old_confirmed, self.confirmed_text)
         if common_count == 0 and cumulative and old_confirmed and self.confirmed_text:
+            # Same append-only guard as the word path, but with character spans.
             return self._record_emit(self.confirmed_text[len(old_confirmed) :])
         return self._record_emit(self.confirmed_text[common_count:])
 
@@ -121,6 +124,7 @@ class StreamingASRState:
                 and old_confirmed
                 and self.full_transcript
             ):
+                # Final cumulative snapshots can also revise the beginning.
                 return self._record_emit(self.full_transcript[len(old_confirmed) :])
             return self._record_emit(self.full_transcript[common_count:])
 
@@ -135,6 +139,8 @@ class StreamingASRState:
             common_count += 1
         self.confirmed_text = self.full_transcript
         if common_count == 0 and cumulative and confirmed_words and all_words:
+            # Avoid duplicating already-emitted words when finalization rewrites
+            # the beginning of a cumulative transcript.
             return self._record_emit(" ".join(all_words[len(confirmed_words) :]))
         return self._record_emit(" ".join(all_words[common_count:]))
 
@@ -222,8 +228,11 @@ def needs_space(prev: str, cur: str) -> bool:
 
 
 def _dedupe_norm(word: str) -> str:
-    """Normalize a word for overlap matching: NFKC, lowercase, strip edge
-    punctuation (Unicode category P)."""
+    """Normalize one whitespace-delimited token for overlap matching.
+
+    NFKC handles fullwidth/compatibility forms, lowercasing handles casing
+    drift, and edge-punctuation stripping lets "word," match "word".
+    """
     word = unicodedata.normalize("NFKC", word)
     lo, hi = 0, len(word)
     while lo < hi and unicodedata.category(word[lo])[0] == "P":
@@ -234,8 +243,12 @@ def _dedupe_norm(word: str) -> str:
 
 
 def _dedupe_by_word(committed_text: str, candidate_out: str) -> str:
-    """Drop the longest prefix of ``candidate_out`` matching the suffix of
-    ``committed_text`` word-for-word (case- and punctuation-insensitive)."""
+    """Remove text repeated because a sliced audio request includes overlap.
+
+    The model may re-transcribe the committed tail from the left-overlap audio.
+    Compare the committed suffix with the candidate prefix, then drop the
+    longest word-level match from the candidate.
+    """
     candidate_words = candidate_out.split()
     if not candidate_words:
         return candidate_out
@@ -255,7 +268,7 @@ def _dedupe_by_word(committed_text: str, candidate_out: str) -> str:
         if committed_tail_norm[-overlap:] != candidate_norm[:overlap]:
             continue
         # Skip all-punctuation overlaps: lone "@"/"#" both normalize to "" and
-        # would match spuriously.
+        # would otherwise match.
         if not any(candidate_norm[:overlap]):
             continue
         return " ".join(candidate_words[overlap:])
@@ -263,11 +276,13 @@ def _dedupe_by_word(committed_text: str, candidate_out: str) -> str:
 
 
 def dedupe_overlap(committed_text: str, candidate_out: str) -> str:
-    """Trim words at the start of ``candidate_out`` that re-transcribe
-    ``committed_text``'s tail (word-level, case- and punctuation-insensitive).
+    """Word-level text dedupe for sliced ASR overlap.
 
-    CJK has no inter-word spaces, so the word-level matcher does not help there;
-    slicing stays on the cumulative path for CJK until stronger alignment exists."""
+    Trims words at the start of ``candidate_out`` that re-transcribe
+    ``committed_text``'s tail. It matches whitespace-delimited words only;
+    repeated-speech edge cases need timestamp/token alignment for exact handling.
+
+    CJK has no inter-word spaces, so those streams stay on the cumulative path."""
     if not committed_text or not candidate_out:
         return candidate_out
     return _dedupe_by_word(committed_text, candidate_out)
