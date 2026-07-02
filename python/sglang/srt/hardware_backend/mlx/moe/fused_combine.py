@@ -35,10 +35,12 @@ Eligibility
   promoted to fp32 for the accumulate. Real MoE routers emit fp32 routing
   scores, so the common production combo is fp16 y with fp32 scores.
 - y rank 3, scores rank 2, shapes aligned as [B, TOP_K, H] / [B, TOP_K]
+- B, TOP_K, H all nonzero
 - H divisible by 256 so each TG aligns on a row boundary and no thread
   straddles the [b, k, *] -> [b, k+1, *] boundary
 
-Outside this regime, fall back to ``(y * scores[..., None]).sum(axis=-2)``.
+Outside this regime, fall back to
+``(y * scores[..., None]).sum(axis=-2).astype(y.dtype)``.
 """
 
 from __future__ import annotations
@@ -139,6 +141,8 @@ def can_fuse(y: mx.array, scores: mx.array) -> bool:
     B, TOPK, H = y.shape
     if scores.shape != (B, TOPK):
         return False
+    if B == 0 or TOPK == 0 or H == 0:
+        return False
     if y.dtype not in _Y_DTYPES or scores.dtype not in _SCORES_DTYPES:
         return False
     if H % _OUTPUTS_PER_TG != 0:
@@ -161,11 +165,11 @@ def fused_combine(y: mx.array, scores: mx.array) -> mx.array:
     closer to the fp32 ground truth; the two paths can differ in the last
     fp16/bf16 ULPs on a given layer depending on which one can_fuse selects.
 
-    Falls back to the broadcast/sum reference when can_fuse(y, scores) is
-    False.
+    Falls back to the broadcast/sum reference, narrowed to ``y.dtype``, when
+    can_fuse(y, scores) is False; both paths return ``y.dtype``.
     """
     if not can_fuse(y, scores):
-        return (y * scores[..., None]).sum(axis=-2)
+        return (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
 
     B, TOPK, H = y.shape
     kernel = _get_kernel(y.dtype, scores.dtype)

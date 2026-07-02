@@ -13,8 +13,8 @@ What this proves
    common production combo (fp16 y with fp32 routing scores) and bf16 y both run
    on the fused path instead of falling back.
 3. The fused Metal kernel actually fires on every widened dtype case (a spy on
-   ``_get_kernel``), so a silent fallback cannot satisfy the test. A negative
-   control confirms ineligible inputs do take the fallback.
+   ``_get_kernel``), so a silent fallback cannot satisfy the test. Negative
+   controls confirm ineligible inputs do take the fallback.
 
 Acceptance standard (scores-dtype driven, and grounded in fp arithmetic)
 ------------------------------------------------------------------------
@@ -25,9 +25,9 @@ Acceptance standard (scores-dtype driven, and grounded in fp arithmetic)
 - ``scores`` fp32 -> correctly rounded to within a tight narrowing tolerance.
   fp32 scores make the product inexact in fp32, so the Metal compiler's FMA
   contraction diverges from a separate mul+add reference by a sub-fp32-ULP,
-  which tips <=2 fp16/bf16 ULP on a small fraction of elements. The fused path
-  is strictly closer to the true reduction, so this is correctly-rounded fp16,
-  not a defect.
+  which tips <=2 fp16 / <=1 bf16 ULP on a small fraction of elements. The
+  fused path is strictly closer to the true reduction, so this is
+  correctly-rounded fp16, not a defect.
 
 Hermetic: tensor fixtures only, no model download, no network. Skips on
 non-Apple-Silicon platforms and when ``mlx`` is missing.
@@ -96,6 +96,14 @@ _ROUNDED_TOL = {
     "bfloat16": 2**-6,
 }
 
+# Enforced integer-ULP ceiling for the fp32-scores cases, set to the observed
+# maxima with no headroom: FMA contraction accounts for at most 2 fp16 / 1 bf16
+# ULP, so anything past these means the kernel's arithmetic changed.
+_ROUNDED_MAX_ULP = {
+    "float16": 2,
+    "bfloat16": 1,
+}
+
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
 class TestFusedCombine(unittest.TestCase):
@@ -147,7 +155,8 @@ class TestFusedCombine(unittest.TestCase):
 
         Both are viewed as uint16 bit patterns; for finite same-sign values the
         IEEE encoding is monotone, so |int(a) - int(b)| is the ULP distance.
-        Used for reporting only; the pass/fail gate is array_equal / allclose.
+        The fp32-scores cases assert this against _ROUNDED_MAX_ULP; the
+        fp16-scores cases gate on array_equal.
         """
         ai = a.view(mx.uint16).astype(mx.int32)
         bi = b.view(mx.uint16).astype(mx.int32)
@@ -202,14 +211,18 @@ class TestFusedCombine(unittest.TestCase):
                         ).item()
                     )
                     ulp = self._low_precision_ulp(out, expected)
-                    self._results.append(
-                        (cname, shape, "rounded", ulp, fired, fired and close)
-                    )
+                    passed = fired and close and ulp <= _ROUNDED_MAX_ULP[y_name]
+                    self._results.append((cname, shape, "rounded", ulp, fired, passed))
                     self.assertTrue(fired, f"{cname} {shape}: fused path did not fire")
                     self.assertEqual(out.dtype, getattr(mx, y_name))
                     self.assertTrue(
                         close,
                         f"{cname} {shape}: exceeds narrowing tol {tol}, max ULP={ulp}",
+                    )
+                    self.assertLessEqual(
+                        ulp,
+                        _ROUNDED_MAX_ULP[y_name],
+                        f"{cname} {shape}: max ULP={ulp} > {_ROUNDED_MAX_ULP[y_name]}",
                     )
 
     def test_scores_dtype_reaches_kernel_independently(self):
@@ -236,7 +249,11 @@ class TestFusedCombine(unittest.TestCase):
         cases = [
             ("fp32_y_rejected", (1, 8, 2048), "float32", "float32"),
             ("H_not_mult_256", (1, 8, 500), "float16", "float16"),
+            ("H_not_mult_256_fp32s", (1, 8, 500), "float16", "float32"),
             ("scores_rank_bad", (1, 8, 2048), "float16", "float16"),  # mangled below
+            ("B_zero", (0, 8, 256), "float16", "float32"),
+            ("K_zero", (1, 0, 256), "float16", "float32"),
+            ("H_zero", (1, 8, 0), "float16", "float32"),
         ]
         for name, shape, y_name, s_name in cases:
             with self.subTest(case=name):
@@ -246,6 +263,7 @@ class TestFusedCombine(unittest.TestCase):
                 self.assertFalse(fc.can_fuse(y, scores))
                 out, fired = self._run_fused_traced(y, scores)
                 self.assertFalse(fired, f"{name}: fused path fired on ineligible input")
+                self.assertEqual(out.dtype, getattr(mx, y_name))
                 # Fallback still returns the correct reduction.
                 ref = (y * scores[..., None]).sum(axis=-2)
                 self.assertTrue(
