@@ -1027,7 +1027,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         # qw: [E, N, K//2] (packed FP4)
         # w_scale: [E, N, ceil(K/64), 2] (or 2D legacy shape)
 
-        qw_t = qw_nz.transpose(1, 2)                     # [E, K_packed, N]
+        qw_t = qw.transpose(1, 2)                     # [E, K_packed, N]
 
         # Pack scale to [E, K_groups//2, N, 2]
         g, n, k = w_scale.shape
