@@ -16,7 +16,7 @@ similar model to start with (e.g., starting from Llama). Also refer how
 to [port a Model from vLLM to SGLang](#port-a-model-from-vllm-to-sglang)
 
 NPU adaptations are embedded in existing model files (e.g., `llama.py`, `qwen3_vl.py`) through `_is_npu` conditional
-branches. The NPU hardware backend lives at `sglang/srt/hardware_backend/npu/`. Some ops may need to use `torch_npu`
+branches. The NPU hardware backend lives at `sglang/srt/hardware_backend/npu/`. Some ops may need to use `TorchNPU`
 APIs in place of CUDA equivalents.
 
 ## How to Support a New Multimodal Large Language Model
@@ -53,7 +53,7 @@ You can refer to [Qwen2VL](https://github.com/sgl-project/sglang/blob/main/pytho
 other mllm implementations. These models demonstrate how to correctly handle both multimodal and textual inputs.
 
 <Tip>
-On Ascend NPU, ensure vision processors and image feature extraction are compatible with the `torch_npu` backend.
+On Ascend NPU, ensure vision processors and image feature extraction are compatible with the `TorchNPU` backend.
 Refer to `vit_npu_graph_runner.py` under `hardware_backend/npu/graph_runner/` and `qwen_vl_processor.py` under
 `hardware_backend/npu/modules/` for NPU vision adaptation patterns.
 </Tip>
@@ -96,7 +96,7 @@ To port a model from vLLM to SGLang:
   - **Add `EntryClass`** at the end.
   - **Ensure that the new implementation uses only SGLang components** and does not rely on any vLLM components.
   - **For Ascend NPU**: Reference existing NPU-adapted models (e.g., `llama.py`, `deepseek_v2.py`) for NPU-specific
-    patterns, such as replacing CUDA kernels with `torch_npu` equivalents. The NPU backend is at
+    patterns, such as replacing CUDA kernels with `TorchNPU` equivalents. The NPU backend is at
     `sglang/srt/hardware_backend/npu/`.
 
 Note: make sure you add your new model to the supported models list in the supported models documentation.

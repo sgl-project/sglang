@@ -20,7 +20,7 @@ see [SGLang Benchmark and Profiling](/docs/developer_guide/benchmark_and_profili
 
 ## Ascend PyTorch Profiler
 
-SGLang has built-in PyTorch Profiler support. Through the Ascend `torch_npu`
+SGLang has built-in PyTorch Profiler support. Through the Ascend `TorchNPU`
 backend, you can directly collect NPU operator-level performance data. No
 additional packages are required — profiling start/stop is controlled via API
 requests.
@@ -489,10 +489,10 @@ For more details, see [Benchmark and Profiling](/docs/developer_guide/benchmark_
 
 If you need to **re-parse existing data** with different parameters, or if
 profiling was interrupted and `ASCEND_PROFILER_OUTPUT` was not auto-generated,
-use `torch_npu`'s `analyse()` tool:
+use `TorchNPU`'s `analyse()` tool:
 
 ```python
-from torch_npu.profiler.profiler import analyse
+from TorchNPU.profiler.profiler import analyse
 analyse("./sglang_profile/<hostname>_*_ascend_pt/")
 ```
 
