@@ -274,8 +274,9 @@ fn hidden_states_rows(vals: &[f32], lens: &[u32]) -> serde_json::Value {
 }
 
 /// Format a neutral [`GenerationOutput`] as one SGLang `/generate` frame. Lives
-/// in the handler now that the detok shard is protocol-neutral. `output_ids` is
-/// surfaced only in `skip_tokenizer_init` mode (cumulative, non-empty there).
+/// in the handler now that the detok shard is protocol-neutral. `output_ids`
+/// (the cumulative generated token ids) is returned by default, matching the
+/// Python server.
 fn sglang_frame(out: &GenerationOutput) -> Vec<u8> {
     let mut v = serde_json::json!({
         "text": out.text,

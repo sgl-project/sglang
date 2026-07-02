@@ -201,13 +201,15 @@ fn handle_chunk(
         let _ = st.fsm.apply(Event::SchedulerPicked);
     }
 
-    // Fully incremental: decode just this chunk's delta (or, in skip mode, take
-    // its raw ids). Nothing cumulative is kept here — the api-server's drain loop
-    // reassembles it where needed.
+    // Fully incremental: decode just this chunk's delta. The chunk's raw token
+    // ids are ALSO surfaced as `output_ids` (the Python `/generate` returns them
+    // by default alongside `text`), so keep them in both modes — decode for text
+    // *and* pass the ids through. Nothing cumulative is kept here — the
+    // api-server's drain loop reassembles it where needed.
     let n_tok = ev.token_ids.len() as u64;
     let (delta_text, delta_ids) = match &mut st.decoder {
         Some(decoder) => match decoder.step(&ev.token_ids) {
-            Ok(delta) => (delta, Vec::new()),
+            Ok(delta) => (delta, std::mem::take(&mut ev.token_ids)),
             Err(e) => {
                 let _ = st.fsm.apply(Event::Error(e.clone()));
                 let _ = st.sink.try_send(EgressItem::Error(e));
@@ -215,7 +217,7 @@ fn handle_chunk(
                 return;
             }
         },
-        // skip_tokenizer_init: pass the chunk's token ids through, no decode.
+        // skip_tokenizer_init: no decode, just pass the chunk's token ids through.
         None => (String::new(), std::mem::take(&mut ev.token_ids)),
     };
 
