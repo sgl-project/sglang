@@ -46,10 +46,6 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.modelopt_quant import (
-    ModelOptFp4Config,
-    ModelOptFp8Config,
-)
 from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
     ci_validate_and_cleanup_local_snapshot,
@@ -342,8 +338,16 @@ def get_quant_config(
                     )
                 return None
             elif quant_algo == "FP8" or model_config.quantization == "modelopt_fp8":
+                from sglang.srt.layers.quantization.modelopt_quant import (
+                    ModelOptFp8Config,
+                )
+
                 return ModelOptFp8Config.from_config(config)
             elif "FP4" in quant_algo:
+                from sglang.srt.layers.quantization.modelopt_quant import (
+                    ModelOptFp4Config,
+                )
+
                 return ModelOptFp4Config.from_config(config)
         return quant_cls.from_config(config)
 

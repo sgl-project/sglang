@@ -172,19 +172,19 @@ class FutureMap:
         self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
 
     def _lazy_init_forward_buf(self, payload: RelayPayload):
-        # Local import (see decide_needs_cpu_seq_lens): keep module-level deps leaf.
-        from sglang.srt.speculative.spec_utils import spec_need_hidden_states
-
         self._forward_buf_initialized = True
 
         # Spec extras are gated by spec_algo, not by the payload's shape, so a
         # non-spec stash allocates no extra bufs (only output_tokens_buf).
         self.need_topk = self.spec_algo.is_some() and self.spec_algo.need_topk()
-        self.need_hidden_states = (
-            self.spec_algo.is_some()
-            and spec_need_hidden_states()
-            and payload.hidden_states is not None
-        )
+        self.need_hidden_states = False
+        if self.spec_algo.is_some():
+            # Local import (see decide_needs_cpu_seq_lens): keep module-level deps leaf.
+            from sglang.srt.speculative.spec_utils import spec_need_hidden_states
+
+            self.need_hidden_states = (
+                spec_need_hidden_states() and payload.hidden_states is not None
+            )
 
         if self.need_topk:
             topk_p0 = payload.topk_p[0]

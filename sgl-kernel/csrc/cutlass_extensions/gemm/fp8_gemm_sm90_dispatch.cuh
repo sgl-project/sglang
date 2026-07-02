@@ -548,7 +548,7 @@ void cutlass_scaled_mm_sm90_fp8(
     torch::Tensor const& b,
     torch::Tensor const& a_scales,
     torch::Tensor const& b_scales,
-    std::optional<torch::Tensor> const& bias) {
+    const c10::optional<torch::Tensor>& bias) {
   TORCH_CHECK(a_scales.is_contiguous() && b_scales.is_contiguous());
   if (bias) {
     TORCH_CHECK(bias->dtype() == out.dtype(), "currently bias dtype must match output dtype ", out.dtype());

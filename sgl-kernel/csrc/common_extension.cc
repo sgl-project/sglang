@@ -15,8 +15,10 @@ limitations under the License.
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <torch/all.h>
 #include <torch/library.h>
+#include <torch/version.h>
 
 #include "sgl_kernel_ops.h"
+#include "sgl_kernel_torch_shim.h"
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
@@ -77,7 +79,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "rotary_embedding(Tensor positions, Tensor! query,"
       "                 Tensor!? key, int head_size,"
       "                 Tensor cos_sin_cache, bool is_neox) -> ()");
-  m.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
+  m.impl("rotary_embedding", torch::kCUDA, make_pytorch_shim(&rotary_embedding));
 
   m.def("copy_to_gpu_no_ce(Tensor input, Tensor! output) -> ()");
   m.impl("copy_to_gpu_no_ce", torch::kCUDA, &copy_to_gpu_no_ce);
@@ -88,15 +90,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("concat_mla_absorb_q", torch::kCUDA, &concat_mla_absorb_q);
 
   m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
-  m.impl("fast_topk", torch::kCUDA, &fast_topk_interface);
+  m.impl("fast_topk", torch::kCUDA, make_pytorch_shim(&fast_topk_interface));
   m.def(
       "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_page_table, Tensor src_page_table, Tensor "
       "cu_seqlens_q, Tensor? row_starts) -> ()");
-  m.impl("fast_topk_transform_fused", torch::kCUDA, &fast_topk_transform_interface);
+  m.impl("fast_topk_transform_fused", torch::kCUDA, make_pytorch_shim(&fast_topk_transform_interface));
   m.def(
       "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor topk_indices_ragged, Tensor "
       "topk_indices_offset, Tensor ? row_starts) -> ()");
-  m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, &fast_topk_transform_ragged_interface);
+  m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, make_pytorch_shim(&fast_topk_transform_ragged_interface));
 
   /*
    * From csrc/gemm
@@ -127,7 +129,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "sgl_per_token_group_quant_8bit_v2(Tensor input, Tensor! output_q, Tensor! output_s, int group_size,"
       " float eps, float fp8_min, float fp8_max, bool scale_ue8m0, bool fuse_silu_and_mul, Tensor? masked_m) -> ()");
-  m.impl("sgl_per_token_group_quant_8bit_v2", torch::kCUDA, &sgl_per_token_group_quant_8bit_v2);
+  m.impl("sgl_per_token_group_quant_8bit_v2", torch::kCUDA, make_pytorch_shim(&sgl_per_token_group_quant_8bit_v2));
 
   m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s) -> ()");
   m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
@@ -194,13 +196,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "prepare_moe_input(Tensor topk_ids, Tensor expert_offsets, Tensor? blockscale_offsets, Tensor problem_sizes1,"
       " Tensor problem_sizes2, Tensor input_permutation, Tensor output_permutation, int num_experts, int n, int k) -> "
       "()");
-  m.impl("prepare_moe_input", torch::kCUDA, &prepare_moe_input);
+  m.impl("prepare_moe_input", torch::kCUDA, make_pytorch_shim(&prepare_moe_input));
 
   m.def("shuffle_rows(Tensor input, Tensor dst2src_map, Tensor output) -> ()");
   m.impl("shuffle_rows", torch::kCUDA, &shuffle_rows);
 
   m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
-  m.impl("apply_shuffle_mul_sum", torch::kCUDA, &apply_shuffle_mul_sum);
+  m.impl("apply_shuffle_mul_sum", torch::kCUDA, make_pytorch_shim(&apply_shuffle_mul_sum));
 
   // DeepSeek-V4 fused norm + rope
   m.def(
@@ -348,17 +350,23 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From FlashInfer
    */
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 8)
   m.def(
       "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, "
       "int cublas_handle) -> ()",
       {at::Tag::needs_fixed_stride_order});
+#else
+  m.def(
+      "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, "
+      "int cublas_handle) -> ()");
+#endif
   m.impl("bmm_fp8", torch::kCUDA, &bmm_fp8);
 
   m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
-  m.impl("top_k_renorm_probs", torch::kCUDA, &top_k_renorm_probs);
+  m.impl("top_k_renorm_probs", torch::kCUDA, make_pytorch_shim(&top_k_renorm_probs));
 
   m.def("top_p_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_p_arr, float top_p_val) -> ()");
-  m.impl("top_p_renorm_probs", torch::kCUDA, &top_p_renorm_probs);
+  m.impl("top_p_renorm_probs", torch::kCUDA, make_pytorch_shim(&top_p_renorm_probs));
 
   /*
    * From Sparse Flash Attention
@@ -370,7 +378,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "float p_dropout, float softmax_scale, bool is_causal, "
       "float softcap, bool return_softmax, Generator? gen)"
       "-> Tensor[]");
-  m.impl("fwd_sparse", torch::kCUDA, &flash::mha_fwd_sparse);
+  m.impl("fwd_sparse", torch::kCUDA, make_pytorch_shim(&flash::mha_fwd_sparse));
 
   m.def(
       "varlen_fwd_sparse(Tensor! q, Tensor k, Tensor v, "
@@ -429,7 +437,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "ggml_dequantize(Tensor W, int type, SymInt m, SymInt n, ScalarType? "
       "dtype) -> Tensor");
-  m.impl("ggml_dequantize", torch::kCUDA, &ggml_dequantize);
+  m.impl("ggml_dequantize", torch::kCUDA, make_pytorch_shim(&ggml_dequantize));
 
   m.def(
       "ggml_mul_mat_vec_a8(Tensor W, Tensor X, int type, SymInt row) "
@@ -467,7 +475,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? cache_seqlens_,"
       "Tensor? conv_state_indices,"
       "int pad_slot_id) -> ()");
-  m.impl("causal_conv1d_update", torch::kCUDA, &causal_conv1d_update);
+  m.impl("causal_conv1d_update", torch::kCUDA, make_pytorch_shim(&causal_conv1d_update));
 
   m.def(
       "causal_conv1d_fwd(Tensor! x, Tensor! weight,"
@@ -478,7 +486,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? has_initial_state,"
       "bool silu_activation,"
       "int pad_slot_id) -> ()");
-  m.impl("causal_conv1d_fwd", torch::kCUDA, &causal_conv1d_fwd);
+  m.impl("causal_conv1d_fwd", torch::kCUDA, make_pytorch_shim(&causal_conv1d_fwd));
 
   /*
    * From csrc/expert_sepcialization
@@ -488,6 +496,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "stride_a, Tensor stride_b, Tensor stride_d, Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> "
       "()");
   m.impl("es_fp8_blockwise_scaled_grouped_mm", &es_fp8_blockwise_scaled_grouped_mm);
+#ifdef SGL_KERNEL_ENABLE_MXFP8_SM100
   m.def(
       "es_sm100_mxfp8_blockscaled_grouped_mm(Tensor a, Tensor b, Tensor sfa, Tensor sfb, Tensor d, Tensor "
       "problem_sizes, Tensor expert_offsets, Tensor blockscale_offsets) -> ()");
@@ -496,6 +505,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "es_sm100_mxfp8_blockscaled_grouped_quant(Tensor input, Tensor problem_sizes, Tensor expert_offsets, Tensor "
       "blockscale_offsets, Tensor quant_output, Tensor scale_factor) -> () ");
   m.impl("es_sm100_mxfp8_blockscaled_grouped_quant", &es_sm100_mxfp8_blockscaled_grouped_quant);
+#endif
 }
 
 REGISTER_EXTENSION(common_ops)

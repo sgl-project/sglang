@@ -25,11 +25,14 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 
 import psutil  # isort: skip
 import setproctitle
@@ -46,9 +49,6 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
-)
-from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
-    DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
@@ -80,9 +80,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
-from sglang.srt.lora.lora_drainer import LoRADrainer
-from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
-from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -242,7 +239,6 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
-from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -465,6 +461,10 @@ class Scheduler(
             self.server_args.disaggregation_mode == "decode"
             and self.server_args.disaggregation_decode_enable_offload_kvcache
         ):
+            from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+                DecodeKVCacheOffloadManager,
+            )
+
             self.decode_offload_manager = DecodeKVCacheOffloadManager(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -954,7 +954,7 @@ class Scheduler(
             )
 
     def init_hisparse_coordinator(self) -> None:
-        self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        self.hisparse_coordinator: Optional["HiSparseCoordinator"] = None
         if not self.enable_hisparse:
             return
 
@@ -1130,6 +1130,10 @@ class Scheduler(
         )
 
         if self.spec_algorithm.carries_draft_hidden_states():
+            from sglang.srt.speculative.eagle_utils import (
+                get_draft_recurrent_hidden_state_spec,
+            )
+
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
             # worker, so a single accessor covers both shapes.
             draft_runner = self.draft_worker.draft_worker.draft_runner
@@ -1695,6 +1699,8 @@ class Scheduler(
 
     def init_lora_drainer(self) -> None:
         if self.server_args.lora_drain_wait_threshold > 0.0:
+            from sglang.srt.lora.lora_drainer import LoRADrainer
+
             self.lora_drainer = LoRADrainer(
                 self.server_args.max_loras_per_batch,
                 self.server_args.lora_drain_wait_threshold,
@@ -1704,6 +1710,8 @@ class Scheduler(
 
     def init_lora_overlap_loader(self) -> None:
         if self.enable_lora_overlap_loading:
+            from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+
             self.lora_overlap_loader = LoRAOverlapLoader(
                 self.tp_worker.model_runner.lora_manager
             )

@@ -21,7 +21,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -33,7 +32,18 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
-from sglang.srt.layers.triton_ops.softcap import softcap_inplace_logits as fused_softcap
+try:
+    from sglang.srt.layers.triton_ops.softcap import (
+        softcap_inplace_logits as fused_softcap,
+    )
+except ImportError:
+
+    def fused_softcap(logits: torch.Tensor, final_logit_softcapping: float):
+        logits.copy_(
+            final_logit_softcapping * torch.tanh(logits / final_logit_softcapping)
+        )
+        return logits
+
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
     get_token_ids_logprobs_chunk,
@@ -67,6 +77,32 @@ _is_cpu = is_cpu()
 # and its [batch * dp_size, vocab] output OOMs under DP attention with a
 # tight mem_fraction_static.
 _in_autotune_dummy_run = False
+
+
+class _TensorParallelAllGatherer:
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        from sglang.srt.distributed import tensor_model_parallel_all_gather
+
+        return tensor_model_parallel_all_gather(x, dim=-1)
+
+
+def _create_logits_gatherer(enabled: bool, skip_entry_sync: bool):
+    if not enabled:
+        return _TensorParallelAllGatherer()
+
+    try:
+        from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+
+        return triton_symm_mem_ag.MultimemAllGatherer(
+            max_tokens=triton_symm_mem_ag.recommended_max_tokens(
+                include_prefill=False, floor=128
+            ),
+            enabled=True,
+            skip_entry_sync=skip_entry_sync,
+        )
+    except Exception as exc:
+        logger.warning("multimem logits all-gather disabled (%s)", exc)
+        return _TensorParallelAllGatherer()
 
 
 def get_in_autotune_dummy_run() -> bool:
@@ -294,10 +330,7 @@ class LogitsProcessor(nn.Module):
         self.return_full_logits = return_full_logits
         self.enable_mis = get_global_server_args().enable_mis
 
-        self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
-            max_tokens=triton_symm_mem_ag.recommended_max_tokens(
-                include_prefill=False, floor=128
-            ),
+        self._logits_gatherer = _create_logits_gatherer(
             enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
             skip_entry_sync=True,
         )

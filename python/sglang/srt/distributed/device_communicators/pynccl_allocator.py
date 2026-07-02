@@ -4,14 +4,24 @@ import os
 import tempfile
 import traceback
 from contextlib import nullcontext
+from typing import Any
 
 import torch
-from torch.cuda.memory import (
-    CUDAPluggableAllocator,
-    _cuda_beginAllocateCurrentThreadToPool,
-    _cuda_endAllocateToPool,
-    _cuda_releasePool,
-)
+try:
+    from torch.cuda.memory import CUDAPluggableAllocator
+except ImportError:
+    CUDAPluggableAllocator = None
+
+try:
+    from torch.cuda.memory import (
+        _cuda_beginAllocateCurrentThreadToPool,
+        _cuda_endAllocateToPool,
+        _cuda_releasePool,
+    )
+except ImportError:
+    _cuda_beginAllocateCurrentThreadToPool = None
+    _cuda_endAllocateToPool = None
+    _cuda_releasePool = None
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
@@ -19,6 +29,25 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import torch_release
 
 after_2_8_0 = torch_release >= (2, 8)
+_PYNCCL_ALLOCATOR_REQUIRED_APIS = (
+    CUDAPluggableAllocator is not None
+    and _cuda_beginAllocateCurrentThreadToPool is not None
+    and _cuda_endAllocateToPool is not None
+    and _cuda_releasePool is not None
+    and hasattr(torch.cuda, "MemPool")
+)
+
+
+def is_pynccl_allocator_supported() -> bool:
+    return _PYNCCL_ALLOCATOR_REQUIRED_APIS
+
+
+def _raise_pynccl_allocator_unsupported() -> None:
+    raise RuntimeError(
+        "NCCL symmetric-memory allocator requires PyTorch CUDA memory-pool APIs "
+        "that are not available in this PyTorch build. Disable symmetric memory "
+        "or use a newer PyTorch build."
+    )
 
 # C++ source for the NCCL allocator plugin
 # Key design:
@@ -182,7 +211,7 @@ def restore_symmetric_memory_context(saved_context):
         saved_context.__enter__()
 
 
-def get_nccl_mem_pool() -> torch.cuda.MemPool:
+def get_nccl_mem_pool() -> Any:
     """
     Get the shared MemPool for all groups.
 
@@ -190,6 +219,8 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
     Comm registration is handled at context exit time.
     """
     global _allocator, _mem_pool, _cur_device, _register_func
+    if not is_pynccl_allocator_supported():
+        _raise_pynccl_allocator_unsupported()
     if _allocator is None:
         import torch.utils.cpp_extension
 
@@ -328,6 +359,8 @@ def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = F
         or disabled
         or group_coordinator.world_size == 1
     )
+    if not disabled and not is_pynccl_allocator_supported():
+        _raise_pynccl_allocator_unsupported()
     return SymmetricMemoryContext(group_coordinator) if not disabled else nullcontext()
 
 

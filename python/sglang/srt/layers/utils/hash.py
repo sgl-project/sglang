@@ -4,7 +4,7 @@ import triton.language as tl
 
 
 @triton.jit
-def rotl32(x, r: tl.constexpr) -> tl.uint32:
+def rotl32(x, r: tl.constexpr):
     """
     rotate left 32-bit integer x by r bits
     e.g. x = 01110001, r = 2 -> 11000101
@@ -14,7 +14,7 @@ def rotl32(x, r: tl.constexpr) -> tl.uint32:
 
 
 @triton.jit
-def fmix32(h: tl.uint32) -> tl.uint32:
+def fmix32(h):
     """
     final mix of 32-bit hash value for MurmurHash
     """
@@ -27,16 +27,16 @@ def fmix32(h: tl.uint32) -> tl.uint32:
 
 
 @triton.jit
-def murmur3_mix(h: tl.uint32, k: tl.uint32) -> tl.uint32:
+def murmur3_mix(h, k):
     """
     Mixes a 32-bit key into the hash state.
     """
-    c1: tl.uint32 = 0xCC9E2D51
-    c2: tl.uint32 = 0x1B873593
-    r1: tl.constexpr = 15
-    r2: tl.constexpr = 13
-    mm: tl.uint32 = 5
-    nn: tl.uint32 = 0xE6546B64
+    c1 = 0xCC9E2D51
+    c2 = 0x1B873593
+    r1 = 15
+    r2 = 13
+    mm = 5
+    nn = 0xE6546B64
 
     k = (k * c1) & 0xFFFFFFFF
     k = rotl32(k, r1)
@@ -77,10 +77,10 @@ def murmur_hash32_kernel(
     pos = tl.load(positions_ptr + row_idx).to(tl.uint32)
     col = tl.load(col_indices_ptr + col_offsets, mask=mask, other=0).to(tl.uint32)
 
-    h: tl.uint32 = 0  # hash accumulator
+    h = 0  # hash accumulator
 
     # Process seed_low
-    k: tl.uint32 = (seed & 0xFFFFFFFF).to(tl.uint32)
+    k = (seed & 0xFFFFFFFF).to(tl.uint32)
     h = murmur3_mix(h, k)
 
     # Process seed_high

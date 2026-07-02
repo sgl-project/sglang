@@ -72,6 +72,8 @@ from typing import (
     Tuple,
     TypeVar,
     Union,
+    get_args,
+    get_origin,
 )
 from unittest import SkipTest
 from unittest.case import _ShouldStop
@@ -104,6 +106,52 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
+
+
+def _install_torch_get_device_module_compat() -> None:
+    if hasattr(torch, "get_device_module"):
+        return
+
+    def _get_device_module(device: Any = None):
+        if device is None:
+            if torch.cuda.is_available():
+                return torch.cuda
+            if hasattr(torch, "xpu") and torch.xpu.is_available():
+                return torch.xpu
+            if torch.backends.mps.is_available():
+                return torch.mps
+            return torch.cpu
+
+        device = torch.device(device)
+        if device.type == "cuda":
+            return torch.cuda
+        if device.type == "xpu" and hasattr(torch, "xpu"):
+            return torch.xpu
+        if device.type == "mps":
+            return torch.mps
+        if device.type == "cpu":
+            return torch.cpu
+        raise ValueError(f"Unknown device module: {device.type}")
+
+    torch.get_device_module = _get_device_module
+
+
+_install_torch_get_device_module_compat()
+
+
+def _get_fp8_e4m3_max() -> float:
+    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+    if fp8_dtype is None:
+        return 448.0
+    if torch_release < (2, 3):
+        return 448.0
+    try:
+        return torch.finfo(fp8_dtype).max
+    except RuntimeError:
+        # Older CUDA 12.x PyTorch builds expose torch.float8_e4m3fn but do not
+        # implement finfo for it. Keep import-time platform probing alive; code
+        # paths that actually use FP8 kernels still validate their requirements.
+        return 448.0
 
 
 class Range(NamedTuple):
@@ -145,7 +193,7 @@ if is_hip():
     HIP_FP8_E4M3_FNUZ_MAX = 224.0
     FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX
 else:
-    FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+    FP8_E4M3_MAX = _get_fp8_e4m3_max()
 
 FP8_E4M3_MIN = -FP8_E4M3_MAX
 
@@ -324,7 +372,7 @@ try:
     is_intel_amx_backend_available = hasattr(
         torch.ops.sgl_kernel, "convert_weight_packed"
     )
-except:
+except Exception:
     is_intel_amx_backend_available = False
 
 try:
@@ -363,7 +411,13 @@ def is_flashinfer_available():
     """
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
-    return importlib.util.find_spec("flashinfer") is not None and is_cuda()
+    if importlib.util.find_spec("flashinfer") is None or not is_cuda():
+        return False
+    try:
+        import flashinfer  # noqa: F401
+    except Exception:
+        return False
+    return True
 
 
 @lru_cache(maxsize=1)
@@ -810,7 +864,7 @@ def set_random_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    if torch.xpu.is_available():
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
         torch.xpu.manual_seed_all(seed)
 
 
@@ -2229,6 +2283,209 @@ def get_compiler_backend(mode=None) -> str:
 sglang_lib = Library("sglang", "FRAGMENT")  # noqa
 
 
+def _fallback_infer_schema(
+    op_func: Callable,
+    mutates_args: List[str],
+) -> str:
+    def _annotation_name(annotation: Any) -> Optional[str]:
+        return annotation if isinstance(annotation, str) else None
+
+    def _is_tensor_annotation(annotation: Any) -> bool:
+        annotation_name = _annotation_name(annotation)
+        return annotation is torch.Tensor or annotation_name in (
+            "Tensor",
+            "torch.Tensor",
+        )
+
+    def _is_optional_tensor_annotation(annotation: Any) -> bool:
+        annotation_name = _annotation_name(annotation)
+        if annotation_name in (
+            "Optional[Tensor]",
+            "Optional[torch.Tensor]",
+            "typing.Optional[torch.Tensor]",
+            "Union[torch.Tensor, None]",
+            "Union[None, torch.Tensor]",
+            "torch.Tensor | None",
+            "None | torch.Tensor",
+        ):
+            return True
+
+        origin = get_origin(annotation)
+        args = get_args(annotation)
+        if origin is Union and type(None) in args:
+            non_none_args = [arg for arg in args if arg is not type(None)]
+            return len(non_none_args) == 1 and _is_tensor_annotation(non_none_args[0])
+        return False
+
+    def _is_optional_scalar_annotation(
+        annotation: Any,
+        scalar_type: type,
+        scalar_names: tuple[str, ...],
+    ) -> bool:
+        annotation_name = _annotation_name(annotation)
+        if annotation_name in tuple(f"Optional[{name}]" for name in scalar_names) + tuple(
+            f"typing.Optional[{name}]" for name in scalar_names
+        ):
+            return True
+
+        origin = get_origin(annotation)
+        args = get_args(annotation)
+        if origin is Union and type(None) in args:
+            non_none_args = [arg for arg in args if arg is not type(None)]
+            return len(non_none_args) == 1 and non_none_args[0] is scalar_type
+        return False
+
+    def _is_dtype_annotation(annotation: Any) -> bool:
+        annotation_name = _annotation_name(annotation)
+        return annotation is torch.dtype or annotation_name in (
+            "dtype",
+            "torch.dtype",
+        )
+
+    def _is_device_annotation(annotation: Any) -> bool:
+        annotation_name = _annotation_name(annotation)
+        return annotation is torch.device or annotation_name in (
+            "device",
+            "torch.device",
+        )
+
+    def _is_tensor_list_annotation(annotation: Any) -> bool:
+        annotation_name = _annotation_name(annotation)
+        if annotation_name in (
+            "List[Tensor]",
+            "List[torch.Tensor]",
+            "list[Tensor]",
+            "list[torch.Tensor]",
+            "Sequence[Tensor]",
+            "Sequence[torch.Tensor]",
+            "typing.Sequence[torch.Tensor]",
+        ):
+            return True
+
+        origin = get_origin(annotation)
+        args = get_args(annotation)
+        return origin in (list, List) and args and _is_tensor_annotation(args[0])
+
+    def _format_tensor_tuple_return(annotation: Any) -> Optional[str]:
+        annotation_name = _annotation_name(annotation)
+        if annotation_name in (
+            "Tuple[Tensor, Tensor]",
+            "Tuple[torch.Tensor, torch.Tensor]",
+            "tuple[Tensor, Tensor]",
+            "tuple[torch.Tensor, torch.Tensor]",
+            "typing.Tuple[torch.Tensor, torch.Tensor]",
+        ):
+            return "(Tensor, Tensor)"
+
+        origin = get_origin(annotation)
+        args = get_args(annotation)
+        if origin in (tuple, Tuple) and args and all(
+            _is_tensor_annotation(arg) for arg in args
+        ):
+            return f"({', '.join('Tensor' for _ in args)})"
+        return None
+
+    def _format_type(annotation: Any, name: str) -> str:
+        alias = ""
+        if name in mutates_args:
+            alias = f"({chr(ord('a') + mutates_args.index(name))}!)"
+
+        if _is_tensor_annotation(annotation):
+            return f"Tensor{alias}"
+        if _is_tensor_list_annotation(annotation):
+            return f"Tensor[]{alias}"
+        if _is_optional_tensor_annotation(annotation):
+            return f"Tensor?{alias}"
+        if _is_optional_scalar_annotation(annotation, int, ("int",)):
+            return "SymInt?"
+        if _is_optional_scalar_annotation(annotation, float, ("float",)):
+            return "float?"
+        if _is_optional_scalar_annotation(annotation, bool, ("bool",)):
+            return "bool?"
+        if _is_optional_scalar_annotation(annotation, str, ("str",)):
+            return "str?"
+        if _is_dtype_annotation(annotation):
+            return "ScalarType"
+        if _is_optional_scalar_annotation(annotation, torch.dtype, ("torch.dtype",)):
+            return "ScalarType?"
+        if _is_device_annotation(annotation):
+            return "Device"
+        if _is_optional_scalar_annotation(annotation, torch.device, ("torch.device",)):
+            return "Device?"
+        if annotation is int or annotation == "int":
+            return "SymInt"
+        if annotation is float or annotation == "float":
+            return "float"
+        if annotation is bool or annotation == "bool":
+            return "bool"
+        if annotation is str or annotation == "str":
+            return "str"
+        raise TypeError(
+            f"Cannot infer custom op schema for argument {name!r} with "
+            f"annotation {annotation!r} on this PyTorch version."
+        )
+
+    def _format_return(annotation: Any) -> str:
+        if annotation is None or annotation is type(None) or annotation == "None":
+            return "()"
+        if _is_tensor_annotation(annotation):
+            return "Tensor"
+        if _is_tensor_list_annotation(annotation):
+            return "Tensor[]"
+        tensor_tuple_return = _format_tensor_tuple_return(annotation)
+        if tensor_tuple_return is not None:
+            return tensor_tuple_return
+        if _is_dtype_annotation(annotation):
+            return "ScalarType"
+        if _is_device_annotation(annotation):
+            return "Device"
+        if annotation is int or annotation == "int":
+            return "SymInt"
+        if annotation is float or annotation == "float":
+            return "float"
+        if annotation is bool or annotation == "bool":
+            return "bool"
+        raise TypeError(
+            f"Cannot infer custom op return schema for annotation {annotation!r} "
+            "on this PyTorch version."
+        )
+
+    def _format_default(default: Any) -> str:
+        if default is inspect.Parameter.empty:
+            return ""
+        if default is None:
+            return "=None"
+        if isinstance(default, bool):
+            return f"={default}"
+        if isinstance(default, (int, float)):
+            return f"={default}"
+        if isinstance(default, str):
+            return f"={default!r}"
+        return ""
+
+    signature = inspect.signature(op_func)
+    args_schema = []
+    inserted_kw_marker = False
+    for name, param in signature.parameters.items():
+        if param.annotation is inspect.Parameter.empty:
+            raise TypeError(
+                f"Cannot infer custom op schema for argument {name!r} without "
+                "a type annotation."
+            )
+        if param.kind is inspect.Parameter.KEYWORD_ONLY and not inserted_kw_marker:
+            args_schema.append("*")
+            inserted_kw_marker = True
+        args_schema.append(
+            f"{_format_type(param.annotation, name)} {name}"
+            f"{_format_default(param.default)}"
+        )
+
+    if signature.return_annotation is inspect.Signature.empty:
+        raise TypeError("Cannot infer custom op schema without a return annotation.")
+    return_schema = _format_return(signature.return_annotation)
+    return f"({', '.join(args_schema)}) -> {return_schema}"
+
+
 def direct_register_custom_op(
     op_name: str,
     op_func: Callable,
@@ -2279,10 +2536,16 @@ def direct_register_custom_op(
     if hasattr(torch.library, "infer_schema"):
         schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
     else:
-        # for pytorch 2.4
+        # for pytorch 2.4 and older
         import torch._custom_op.impl
 
-        schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
+        try:
+            schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
+        except TypeError:
+            try:
+                schema_str = torch._custom_op.impl.infer_schema(op_func)
+            except (TypeError, ValueError):
+                schema_str = _fallback_infer_schema(op_func, mutates_args)
 
     try:
         my_lib.define(op_name + schema_str)
@@ -2295,7 +2558,7 @@ def direct_register_custom_op(
             my_lib.impl(op_name, op_func, "MUSA")
         else:
             my_lib.impl(op_name, op_func, "CUDA")
-        if fake_impl is not None:
+        if fake_impl is not None and hasattr(my_lib, "_register_fake"):
             my_lib._register_fake(op_name, fake_impl)
     except RuntimeError as error:
         if "Tried to register an operator" in str(error) and "multiple times" in str(

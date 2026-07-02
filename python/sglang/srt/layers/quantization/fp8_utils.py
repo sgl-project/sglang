@@ -87,6 +87,13 @@ _AITER_GFX95_CK_W8A8_MAX_SAFE_M = {
 _FORCE_CK_W8A8: bool = False
 
 
+def _missing_sgl_kernel_op(*args, **kwargs):
+    raise ImportError(
+        "This FP8 matmul path requires sgl_kernel, but it is not installed "
+        "for the current PyTorch/CUDA environment."
+    )
+
+
 def set_force_ck_w8a8(enabled: bool = True) -> None:
     global _FORCE_CK_W8A8
     _FORCE_CK_W8A8 = enabled
@@ -129,7 +136,11 @@ if _use_aiter:
 
 
 if _is_cuda:
-    from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
+    try:
+        from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
+    except ImportError:
+        fp8_blockwise_scaled_mm = _missing_sgl_kernel_op
+        fp8_scaled_mm = _missing_sgl_kernel_op
 
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 

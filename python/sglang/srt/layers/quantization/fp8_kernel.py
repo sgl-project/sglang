@@ -31,6 +31,7 @@ except:
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
+    FP8_E4M3_MAX,
     ceil_align,
     get_bool_env_var,
     get_device_core_count,
@@ -54,8 +55,19 @@ _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+
+def _missing_sgl_kernel_op(*args, **kwargs):
+    raise ImportError(
+        "This FP8 quantization path requires sgl_kernel, but it is not installed "
+        "for the current PyTorch/CUDA environment."
+    )
+
+
 if _is_cuda or _is_musa:
-    from sgl_kernel import sgl_per_token_quant_fp8
+    try:
+        from sgl_kernel import sgl_per_token_quant_fp8
+    except ImportError:
+        sgl_per_token_quant_fp8 = _missing_sgl_kernel_op
 
     from sglang.jit_kernel.per_tensor_quant_fp8 import (
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
@@ -67,8 +79,10 @@ if _is_cuda or _is_musa:
 
         enable_sgl_per_token_group_quant_8bit = True
     except ImportError:
-        from sgl_kernel import sgl_per_token_group_quant_fp8
-
+        try:
+            from sgl_kernel import sgl_per_token_group_quant_fp8
+        except ImportError:
+            sgl_per_token_group_quant_fp8 = _missing_sgl_kernel_op
         enable_sgl_per_token_group_quant_8bit = False
 
     from sglang.jit_kernel.per_token_group_quant_8bit import (
@@ -132,7 +146,7 @@ if is_fp8_fnuz():
     fp8_max = 224.0
 else:
     fp8_dtype = torch.float8_e4m3fn
-    fp8_max = torch.finfo(fp8_dtype).max
+    fp8_max = FP8_E4M3_MAX
 fp8_min = -fp8_max
 
 

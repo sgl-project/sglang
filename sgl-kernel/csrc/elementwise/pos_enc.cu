@@ -5,6 +5,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
 
+#include <optional>
+
 #include "utils.h"
 
 template <typename scalar_t, bool IS_NEOX>

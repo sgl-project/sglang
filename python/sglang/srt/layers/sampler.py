@@ -25,15 +25,31 @@ from sglang.srt.utils.common import (
     is_npu,
 )
 
+
+def _missing_sampling_op(*args, **kwargs):
+    raise ImportError(
+        "FlashInfer/sgl_kernel sampling kernels are not installed for the "
+        "current PyTorch/CUDA environment. Use --sampling-backend pytorch."
+    )
+
+
 if is_cuda():
-    from flashinfer.sampling import (
-        min_p_sampling_from_probs,
-        top_k_top_p_sampling_from_probs,
-    )
-    from sgl_kernel import (
-        top_k_renorm_prob,
-        top_p_renorm_prob,
-    )
+    try:
+        from flashinfer.sampling import (
+            min_p_sampling_from_probs,
+            top_k_top_p_sampling_from_probs,
+        )
+    except ImportError:
+        min_p_sampling_from_probs = _missing_sampling_op
+        top_k_top_p_sampling_from_probs = _missing_sampling_op
+    try:
+        from sgl_kernel import (
+            top_k_renorm_prob,
+            top_p_renorm_prob,
+        )
+    except ImportError:
+        top_k_renorm_prob = _missing_sampling_op
+        top_p_renorm_prob = _missing_sampling_op
 
 if is_musa():
     from sgl_kernel import (

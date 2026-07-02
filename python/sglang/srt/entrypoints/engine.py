@@ -30,6 +30,7 @@ import signal
 import tempfile
 import threading
 import time
+from importlib.metadata import PackageNotFoundError, version
 from typing import (
     Any,
     AsyncIterator,
@@ -1309,11 +1310,20 @@ def _set_envs_and_config(server_args: ServerArgs):
                 "at https://docs.flashinfer.ai/installation.html.",
             )
         if _is_cuda:
-            assert_pkg_version(
-                "sglang-kernel",
-                "0.4.4",
-                "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
-            )
+            try:
+                version("sglang-kernel")
+            except PackageNotFoundError:
+                logger.warning(
+                    "sglang-kernel>=0.4.4 is not installed; CUDA paths that "
+                    "require sgl-kernel AOT ops will fail, but pure PyTorch/JIT "
+                    "fallback paths can still run."
+                )
+            else:
+                assert_pkg_version(
+                    "sglang-kernel",
+                    "0.4.4",
+                    "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
+                )
 
     # Signal handlers can only be registered from the main thread.
     if threading.current_thread() is threading.main_thread():

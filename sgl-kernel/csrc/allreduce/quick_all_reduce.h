@@ -2,6 +2,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <optional>
 #include <vector>
 
 #include "quick_all_reduce.cuh"

@@ -3,6 +3,8 @@
 #include <c10/cuda/CUDAStream.h>
 #include <torch/all.h>
 
+#include <optional>
+
 #ifdef USE_ROCM
 
 #include "quick_all_reduce.h"

@@ -1,20 +1,22 @@
+from __future__ import annotations
+
 import hashlib
 import logging
 import time
-from typing import Dict, Iterable, NamedTuple, Optional, Set
+from typing import TYPE_CHECKING, Dict, Iterable, NamedTuple, Optional, Set
 
 import torch
 import torch.distributed as dist
 from pydantic import BaseModel, ConfigDict
 
 from sglang.srt.managers.mm_utils import tensor_hash
-from sglang.srt.utils.weight_checker_comparator import (
-    CHUNK_NUMEL,
-    ComparableWeight,
-    RawComparable,
-    compare_weights,
-    select_comparable_weight,
-)
+
+if TYPE_CHECKING:
+    from sglang.srt.utils.weight_checker_comparator import ComparableWeight
+
+# Keep in sync with weight_checker_comparator.CHUNK_NUMEL without importing the
+# comparator module during server startup.
+CHUNK_NUMEL = 64 * 1024 * 1024
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +185,8 @@ def _check_tensors(
     actual_tensors: Iterable[CheckEntry],
     allow_quant_error: bool = False,
 ):
+    from sglang.srt.utils.weight_checker_comparator import compare_weights
+
     good_names = []
     error_messages = []
     info_messages = []
@@ -256,6 +260,8 @@ def _random_like(t: torch.Tensor):
 def _build_quantized_set(model) -> Dict[str, QuantizedWeight]:
     """Run the router over the model: {weight_name: QuantizedWeight} for each
     quantized weight; weights absent from the set compare raw."""
+    from sglang.srt.utils.weight_checker_comparator import select_comparable_weight
+
     quantized_set = {}
     for module_name, module in model.named_modules():
         comparable_cls = select_comparable_weight(getattr(module, "quant_method", None))
@@ -279,6 +285,8 @@ def _build_check_entries(
 ) -> Iterable[CheckEntry]:
     """Yields a CheckEntry per weight; quantized weights consume their scale, everything
     else is raw."""
+    from sglang.srt.utils.weight_checker_comparator import RawComparable
+
     skip_compare_names = set(skip_compare_names)
     quantized_set = quantized_set or {}
     scale_names = {qw.scale_name for qw in quantized_set.values()}

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <optional>
+
 #include "cutlass_extensions/epilogue/broadcast_load_epilogue_c3x.hpp"
 
 /*

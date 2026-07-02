@@ -34,6 +34,17 @@ import torch
 import triton
 import triton.language as tl
 
+_FLOAT8_KV_CACHE_DTYPES = tuple(
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+    )
+    if dtype is not None
+)
+_PTR_DTYPE = getattr(torch, "uint64", torch.int64)
+
 from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -1205,7 +1216,7 @@ class KVCache(abc.ABC):
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        if dtype in _FLOAT8_KV_CACHE_DTYPES:
             # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
         else:
@@ -1532,12 +1543,12 @@ class MHATokenToKVPool(KVCache):
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
-            dtype=torch.uint64,
+            dtype=_PTR_DTYPE,
             device=self.device,
         )
         self.v_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.v_buffer],
-            dtype=torch.uint64,
+            dtype=_PTR_DTYPE,
             device=self.device,
         )
         self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
@@ -1987,12 +1998,12 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
-            dtype=torch.uint64,
+            dtype=_PTR_DTYPE,
             device=self.device,
         )
         self.v_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.v_buffer],
-            dtype=torch.uint64,
+            dtype=_PTR_DTYPE,
             device=self.device,
         )
         self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
@@ -2279,12 +2290,12 @@ class PageMajorMHATokenToKVPool(MHATokenToKVPool):
         # views np.prod(shape[1:]) would not equal it, so compute it directly.
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
-            dtype=torch.uint64,
+            dtype=_PTR_DTYPE,
             device=self.device,
         )
         self.v_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.v_buffer],
-            dtype=torch.uint64,
+            dtype=_PTR_DTYPE,
             device=self.device,
         )
         self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
@@ -2650,7 +2661,7 @@ class MLATokenToKVPool(KVCache):
 
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.kv_buffer],
-            dtype=torch.uint64,
+            dtype=_PTR_DTYPE,
             device=self.device,
         )
         if not use_dsa:

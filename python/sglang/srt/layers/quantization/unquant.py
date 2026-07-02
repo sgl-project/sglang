@@ -14,15 +14,12 @@ from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
 )
-from sglang.srt.layers.moe import (
-    MoeRunner,
+from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
-    MoeRunnerConfig,
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
-from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -41,6 +38,8 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe import MoeRunner, MoeRunnerConfig
+    from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         DispatchOutput,
@@ -394,6 +393,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        from sglang.srt.layers.moe import MoeRunner
+
         self.moe_runner_config = moe_runner_config
         if self.use_flashinfer_trtllm_moe:
             backend = (
@@ -531,6 +532,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 )
                 return self._aiter_runner.run(dispatch_output, quant_info)
 
+            from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
@@ -594,6 +597,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             return StandardCombineInput(hidden_states=output)
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
+        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+
         return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,

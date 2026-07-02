@@ -5,6 +5,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include <optional>
+
 #include "causal_conv1d.h"
 #include <c10/util/BFloat16.h>
 #include <c10/util/Half.h>

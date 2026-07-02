@@ -1,6 +1,7 @@
 # Adapted from https://github.com/thinking-machines-lab/batch_invariant_ops/blob/main/batch_invariant_ops/batch_invariant_ops.py
 
 import contextlib
+import inspect
 from collections import namedtuple
 from collections.abc import Callable
 from typing import Any, Dict, Tuple
@@ -66,6 +67,17 @@ def _matmul_launch_metadata(
     return ret
 
 
+_TRITON_JIT_SUPPORTS_LAUNCH_METADATA = (
+    "launch_metadata" in inspect.signature(triton.jit).parameters
+)
+
+
+def _triton_jit_with_matmul_metadata(fn):
+    if _TRITON_JIT_SUPPORTS_LAUNCH_METADATA:
+        return triton.jit(launch_metadata=_matmul_launch_metadata)(fn)
+    return triton.jit(fn)
+
+
 @triton.jit
 def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
     group_id = tile_id // num_pid_in_group
@@ -76,7 +88,7 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
     return pid_m, pid_n
 
 
-@triton.jit(launch_metadata=_matmul_launch_metadata)
+@_triton_jit_with_matmul_metadata
 def matmul_kernel_persistent(
     a_ptr,
     b_ptr,

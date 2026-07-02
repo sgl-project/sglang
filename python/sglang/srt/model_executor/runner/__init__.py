@@ -1,48 +1,18 @@
 """Phase-aware CUDA graph runners.
 
-One concrete runner per phase. Each runner owns its phase-specific
-shape semantics (decode → batch size; prefill → token count) and
-delegates capture/replay mechanics to a pluggable
-BaseCudaGraphBackend chosen via cuda_graph_config.
-
-Public API:
-  - BaseRunner — minimal abstract base shared by the cuda-graph runners
-    and the eager runner (shared __init__ + warmup + abstract
-    can_run_graph/load_batch/execute).
-  - BaseCudaGraphRunner — abstract cuda-graph base; bucket padding +
-    capture-loop scaffolding on top of BaseRunner.
-  - DecodeCudaGraphRunner — concrete decode-phase runner.
-  - PrefillCudaGraphRunner — concrete prefill-phase runner.
-  - EagerRunner — no-cuda-graph runner; runs model.forward live (the
-    eager dual of the cuda-graph runners), mode-dispatched over decode +
-    extend + idle.
-  - Buffer dataclasses, capture-mode flags, the global memory pool,
-    and the DeepEP adapter live in
-    sglang.srt.model_executor.runner_utils; they are
-    re-exported here for the EAGLE / multi-step draft cuda graph
-    runners that were authored against the legacy public surface.
+Keep this package initializer light: many model modules import small runner
+helpers during normal eager execution. CUDA-graph and DeepEP-specific classes
+are loaded lazily so disabled backends do not pull optional kernels at import
+time.
 """
 
-from sglang.srt.model_executor.runner.base_cuda_graph_runner import (  # noqa: F401
-    BaseCudaGraphRunner,
-    freeze_gc,
-    get_batch_sizes_to_capture,
-)
+from importlib import import_module
+
 from sglang.srt.model_executor.runner.base_runner import BaseRunner  # noqa: F401
-from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
-    DecodeCudaGraphRunner,
-)
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner  # noqa: F401
-from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (  # noqa: F401
-    PrefillCudaGraphRunner,
-)
 from sglang.srt.model_executor.runner.shape_key import ShapeKey  # noqa: F401
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (  # noqa: F401
-    TCPCG_FAILURE_HINT,
-)
 from sglang.srt.model_executor.runner_utils import (  # noqa: F401
     DecodeInputBuffers,
-    DeepEPCudaGraphRunnerAdapter,
     PrefillInputBuffers,
     _grouped_foreach_copy_,
     _set_capture_lora_variant,
@@ -53,3 +23,39 @@ from sglang.srt.model_executor.runner_utils import (  # noqa: F401
     model_capture_mode,
     set_global_graph_memory_pool,
 )
+
+
+def __getattr__(name: str):
+    if name in {
+        "BaseCudaGraphRunner",
+        "freeze_gc",
+        "get_batch_sizes_to_capture",
+    }:
+        base_cuda_graph_runner = import_module(
+            "sglang.srt.model_executor.runner.base_cuda_graph_runner"
+        )
+
+        return getattr(base_cuda_graph_runner, name)
+    if name == "DecodeCudaGraphRunner":
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        return DecodeCudaGraphRunner
+    if name == "PrefillCudaGraphRunner":
+        from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+            PrefillCudaGraphRunner,
+        )
+
+        return PrefillCudaGraphRunner
+    if name == "DeepEPCudaGraphRunnerAdapter":
+        from sglang.srt.model_executor.runner_utils import DeepEPCudaGraphRunnerAdapter
+
+        return DeepEPCudaGraphRunnerAdapter
+    if name == "TCPCG_FAILURE_HINT":
+        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+            TCPCG_FAILURE_HINT,
+        )
+
+        return TCPCG_FAILURE_HINT
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

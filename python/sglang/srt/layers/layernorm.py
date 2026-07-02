@@ -45,6 +45,8 @@ from sglang.srt.utils import (
     is_xpu,
 )
 
+logger = logging.getLogger(__name__)
+
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
@@ -55,6 +57,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
+_sgl_kernel_norm_available = False
 
 if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
@@ -86,29 +89,54 @@ if _is_cuda or _is_xpu or _is_musa:
     else:
         _flashinfer_layernorm_available = False
 
-    from sgl_kernel import fused_add_rmsnorm as _sgl_fused_add_rmsnorm
-    from sgl_kernel import gemma_fused_add_rmsnorm as _sgl_gemma_fused_add_rmsnorm
-    from sgl_kernel import gemma_rmsnorm as _sgl_gemma_rmsnorm
-    from sgl_kernel import rmsnorm as _sgl_rmsnorm
+    def _register_sgl_kernel_norm_ops():
+        from sgl_kernel import fused_add_rmsnorm as _sgl_fused_add_rmsnorm
+        from sgl_kernel import gemma_fused_add_rmsnorm as _sgl_gemma_fused_add_rmsnorm
+        from sgl_kernel import gemma_rmsnorm as _sgl_gemma_rmsnorm
+        from sgl_kernel import rmsnorm as _sgl_rmsnorm
 
-    from sglang.srt.utils.custom_op import register_custom_op_from_extern
+        from sglang.srt.utils.custom_op import register_custom_op_from_extern
 
-    rmsnorm = register_custom_op_from_extern(
-        _sgl_rmsnorm, op_name="sgl_rmsnorm", out_shape="input"
-    )
-    fused_add_rmsnorm = register_custom_op_from_extern(
-        _sgl_fused_add_rmsnorm,
-        op_name="sgl_fused_add_rmsnorm",
-        mutates_args=["input", "residual"],
-    )
-    gemma_rmsnorm = register_custom_op_from_extern(
-        _sgl_gemma_rmsnorm, op_name="sgl_gemma_rmsnorm", out_shape="input"
-    )
-    gemma_fused_add_rmsnorm = register_custom_op_from_extern(
-        _sgl_gemma_fused_add_rmsnorm,
-        op_name="sgl_gemma_fused_add_rmsnorm",
-        mutates_args=["input", "residual"],
-    )
+        return (
+            register_custom_op_from_extern(
+                _sgl_rmsnorm, op_name="sgl_rmsnorm", out_shape="input"
+            ),
+            register_custom_op_from_extern(
+                _sgl_fused_add_rmsnorm,
+                op_name="sgl_fused_add_rmsnorm",
+                mutates_args=["input", "residual"],
+            ),
+            register_custom_op_from_extern(
+                _sgl_gemma_rmsnorm, op_name="sgl_gemma_rmsnorm", out_shape="input"
+            ),
+            register_custom_op_from_extern(
+                _sgl_gemma_fused_add_rmsnorm,
+                op_name="sgl_gemma_fused_add_rmsnorm",
+                mutates_args=["input", "residual"],
+            ),
+        )
+
+    if _is_cuda:
+        try:
+            (
+                rmsnorm,
+                fused_add_rmsnorm,
+                gemma_rmsnorm,
+                gemma_fused_add_rmsnorm,
+            ) = _register_sgl_kernel_norm_ops()
+            _sgl_kernel_norm_available = True
+        except ImportError:
+            logger.debug(
+                "sgl_kernel norm ops are unavailable; using native RMSNorm fallbacks."
+            )
+    else:
+        (
+            rmsnorm,
+            fused_add_rmsnorm,
+            gemma_rmsnorm,
+            gemma_fused_add_rmsnorm,
+        ) = _register_sgl_kernel_norm_ops()
+        _sgl_kernel_norm_available = True
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
 if _use_aiter:
@@ -152,8 +180,6 @@ if _is_cuda:
         is_supported_jit_fused_add_rmsnorm_hidden_size,
     )
 
-
-logger = logging.getLogger(__name__)
 
 if _is_npu:
     import torch_npu
@@ -311,6 +337,11 @@ class RMSNorm(MultiPlatformOp):
                 # Fallback: pure-Python HF semantics (already implemented in forward_native).
                 out = self.forward_native(x, None, None)
             if needs_reshape:
+                out = out.reshape(original_shape)
+            return out
+        if not _sgl_kernel_norm_available:
+            out = self.forward_native(x, residual, post_residual_addition)
+            if needs_reshape and residual is None:
                 out = out.reshape(original_shape)
             return out
         if residual is not None:
@@ -691,6 +722,9 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if not _sgl_kernel_norm_available:
+            return self.forward_native(x, residual, post_residual_addition)
+
         needs_reshape = x.dim() != 2 and residual is None
         if needs_reshape:
             original_shape = x.shape
@@ -919,6 +953,8 @@ class Gemma4RMSNorm(MultiPlatformOp):
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         if x.numel() == 0:
             return x
+        if not _sgl_kernel_norm_available:
+            return self.forward_native(x)
         needs_reshape = x.dim() != 2
         if needs_reshape:
             original_shape = x.shape

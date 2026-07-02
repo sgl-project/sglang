@@ -26,31 +26,14 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 from torch import nn
 
 from sglang.jit_kernel.ngram_embedding import update_token_table_decode
-from sglang.srt.configs import (
-    BailingHybridConfig,
-    FalconH1Config,
-    GraniteMoeHybridConfig,
-    InternS2PreviewConfig,
-    JetNemotronConfig,
-    JetVLMConfig,
-    KimiLinearConfig,
-    Lfm2Config,
-    Lfm2MoeConfig,
-    Lfm2VlConfig,
-    NemotronH_Nano_VL_V2_Config,
-    NemotronHConfig,
-    Qwen3_5Config,
-    Qwen3_5MoeConfig,
-    Qwen3NextConfig,
-    ZayaConfig,
-)
+from sglang.srt import configs as srt_configs
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
@@ -112,18 +95,12 @@ from sglang.srt.eplb.lplb_solver import (
     clear_global_lplb_solvers,
     set_global_lplb_solver,
 )
-from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
-from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
-from sglang.srt.kv_canary.api import install_canary
-from sglang.srt.kv_canary.runner.canary_manager import context_tuple
-from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
@@ -132,18 +109,13 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.hash_topk import HashTopK
-from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
-from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -166,11 +138,7 @@ from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.model_executor.runner import (
-    EagerRunner,
-    PrefillCudaGraphRunner,
-    get_batch_sizes_to_capture,
-)
+from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -279,12 +247,15 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "tokenspeed_mla",
 ]
 
-TORCH_DTYPE_TO_KV_CACHE_STR = {
-    torch.float8_e4m3fn: "fp8_e4m3",
-    torch.float8_e4m3fnuz: "fp8_e4m3",
-    torch.float8_e5m2: "fp8_e5m2",
-    torch.bfloat16: "bf16",
-}
+TORCH_DTYPE_TO_KV_CACHE_STR = {torch.bfloat16: "bf16"}
+for _torch_dtype_name, _kv_cache_dtype_name in (
+    ("float8_e4m3fn", "fp8_e4m3"),
+    ("float8_e4m3fnuz", "fp8_e4m3"),
+    ("float8_e5m2", "fp8_e5m2"),
+):
+    _torch_dtype = getattr(torch, _torch_dtype_name, None)
+    if _torch_dtype is not None:
+        TORCH_DTYPE_TO_KV_CACHE_STR[_torch_dtype] = _kv_cache_dtype_name
 
 
 def add_mla_attention_backend(backend_name):
@@ -306,6 +277,39 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.lora.lora_registry import LoRARef
+
+
+class _UnavailableConfig:
+    pass
+
+
+BailingHybridConfig = getattr(
+    srt_configs, "BailingHybridConfig", _UnavailableConfig
+)
+FalconH1Config = getattr(srt_configs, "FalconH1Config", _UnavailableConfig)
+GraniteMoeHybridConfig = getattr(
+    srt_configs, "GraniteMoeHybridConfig", _UnavailableConfig
+)
+InternS2PreviewConfig = getattr(
+    srt_configs, "InternS2PreviewConfig", _UnavailableConfig
+)
+JetNemotronConfig = getattr(srt_configs, "JetNemotronConfig", _UnavailableConfig)
+JetVLMConfig = getattr(srt_configs, "JetVLMConfig", _UnavailableConfig)
+KimiLinearConfig = getattr(srt_configs, "KimiLinearConfig", _UnavailableConfig)
+Lfm2Config = getattr(srt_configs, "Lfm2Config", _UnavailableConfig)
+Lfm2MoeConfig = getattr(srt_configs, "Lfm2MoeConfig", _UnavailableConfig)
+Lfm2VlConfig = getattr(srt_configs, "Lfm2VlConfig", _UnavailableConfig)
+NemotronH_Nano_VL_V2_Config = getattr(
+    srt_configs, "NemotronH_Nano_VL_V2_Config", _UnavailableConfig
+)
+NemotronHConfig = getattr(srt_configs, "NemotronHConfig", _UnavailableConfig)
+Qwen3_5Config = getattr(srt_configs, "Qwen3_5Config", _UnavailableConfig)
+Qwen3_5MoeConfig = getattr(srt_configs, "Qwen3_5MoeConfig", _UnavailableConfig)
+Qwen3NextConfig = getattr(srt_configs, "Qwen3NextConfig", _UnavailableConfig)
+ZayaConfig = getattr(srt_configs, "ZayaConfig", _UnavailableConfig)
 
 _UNSET: Any = object()
 
@@ -694,6 +698,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.elastic_ep_backend:
             ElasticEPStateManager.init(self.server_args)
+        from sglang.srt.kv_canary.token_oracle.install import (
+            install_token_oracle_from_env,
+        )
+
         self._token_oracle_manager = install_token_oracle_from_env(
             server_args=server_args,
             vocab_size=self.model_config.vocab_size,
@@ -835,6 +843,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def max_decode_logits_rows(self) -> int:
         """Rows the shared logits buffer needs."""
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
         num_tokens_per_bs = self.decode_num_tokens_per_bs()
         capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_bs)
         return max(capture_bs) * num_tokens_per_bs
@@ -849,6 +861,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
         # forwards captured into the graph see the patched pool methods.
+        from sglang.srt.kv_canary.api import install_canary
+
         self.canary_manager = install_canary(
             server_args=self.server_args,
             model_runner=self,
@@ -1641,6 +1655,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ) from None
 
     def _prepare_moe_topk(self):
+        if not self.server_args.enable_deepep_waterfill:
+            return
+
+        from sglang.srt.layers.moe.hash_topk import HashTopK
+        from sglang.srt.layers.moe.topk import TopK
+
         balancer_cls = None
         num_prepared = 0
         num_routed_experts = None
@@ -2227,6 +2247,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return None
 
     def init_lora_manager(self):
+        from sglang.srt.lora.lora_manager import LoRAManager
+
         self.lora_manager = LoRAManager(
             base_model=self.model,
             base_hf_config=self.model_config.hf_config,
@@ -2481,6 +2503,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.decode_attn_backend_group.append(self._get_attention_backend())
             self.decode_attn_backend = self.decode_attn_backend_group[0]
         elif self.server_args.enable_two_batch_overlap and not self.is_draft_worker:
+            from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+
             self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
         else:
             self.attn_backend = self._get_attention_backend()
@@ -2641,6 +2665,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             capture_name = f"{role} decode"
             num_tokens_per_bs = 1
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
         capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_bs)
         decode_backend = self.server_args.cuda_graph_config.decode.backend
         logger.info(
@@ -2659,12 +2687,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             graph_runners = defaultdict(
                 lambda: DecodeCudaGraphRunner,
-                {
-                    "cpu": CPUGraphRunner,
-                    "npu": NPUGraphRunner,
-                    "xpu": XPUGraphRunner,
-                },
             )
+            if self.device == "cpu":
+                from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
+
+                graph_runners["cpu"] = CPUGraphRunner
+            if self.device == "npu":
+                from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import (
+                    NPUGraphRunner,
+                )
+
+                graph_runners["npu"] = NPUGraphRunner
+            elif self.device == "xpu":
+                from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import (
+                    XPUGraphRunner,
+                )
+
+                graph_runners["xpu"] = XPUGraphRunner
             self.decode_cuda_graph_runner = graph_runners[self.device](self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -2828,6 +2867,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture {capture_name} CUDA graph begin. "
             f"backend={prefill_backend}, num_tokens={capture_num_tokens}, "
             f"avail mem={before_mem:.2f} GB"
+        )
+
+        from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+            PrefillCudaGraphRunner,
         )
 
         self.prefill_cuda_graph_runner = PrefillCudaGraphRunner(self)
@@ -3000,6 +3043,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Step span
         step_span_ctx = profile_range(_build_step_span_name(forward_batch))
+
+        if not self.is_draft_worker and self.canary_manager is not None:
+            from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 
         canary_ctx = (
             context_tuple(

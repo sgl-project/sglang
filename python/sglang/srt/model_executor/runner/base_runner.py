@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 
-from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
@@ -200,7 +199,13 @@ class BaseRunner(ABC):
         self.pp_size = model_runner.server_args.pp_size
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
-        self.tbo_plugin = TboCudaGraphRunnerPlugin()
+        self.tbo_plugin = None
+        if model_runner.server_args.enable_two_batch_overlap:
+            from sglang.srt.batch_overlap.two_batch_overlap import (
+                TboCudaGraphRunnerPlugin,
+            )
+
+            self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
     def warmup(self) -> None:
         """Run kernel warmup + autotune once, gated by mr._kernel_warmed_up."""

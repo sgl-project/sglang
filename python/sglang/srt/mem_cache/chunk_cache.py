@@ -7,9 +7,6 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from sglang.srt.mem_cache.allocator.hisparse import (
-    DeepSeekV4HiSparseTokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -30,6 +27,12 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _is_swa_chunk_cache_allocator(allocator: Any) -> bool:
+    return isinstance(allocator, SWATokenToKVPoolAllocator) or (
+        allocator.__class__.__name__ == "DeepSeekV4HiSparseTokenToKVPoolAllocator"
+    )
 
 
 class ChunkCache(BasePrefixCache):
@@ -115,13 +118,7 @@ class SWAChunkCache(ChunkCache):
 
     def __init__(self, params: CacheInitParams):
         # DeepSeek V4 HiSparse wraps SWATokenToKVPoolAllocator and exposes the same API.
-        assert isinstance(
-            params.token_to_kv_pool_allocator,
-            (
-                SWATokenToKVPoolAllocator,
-                DeepSeekV4HiSparseTokenToKVPoolAllocator,
-            ),
-        )
+        assert _is_swa_chunk_cache_allocator(params.token_to_kv_pool_allocator)
         super().__init__(params)
 
         self.sliding_window_size = params.sliding_window_size

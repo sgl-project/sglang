@@ -5,13 +5,8 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
-from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
-from sglang.srt.kv_canary.perturb.config import PerturbConfig
-from sglang.srt.kv_canary.pool_patcher.api import attach_canary_buffers
 from sglang.srt.kv_canary.pool_patcher.utils import wrap_method
-from sglang.srt.kv_canary.runner.canary_manager import CanaryManager
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -20,6 +15,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
+    from sglang.srt.kv_canary.runner.canary_manager import CanaryManager
     from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
@@ -36,6 +32,12 @@ def install_canary(
     config = CanaryConfig.from_env(server_args)
     if config.mode is CanaryMode.NONE:
         return None
+
+    from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
+    from sglang.srt.kv_canary.perturb.config import PerturbConfig
+    from sglang.srt.kv_canary.pool_patcher.api import attach_canary_buffers
+    from sglang.srt.kv_canary.runner.canary_manager import CanaryManager
+    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
     assert not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE), (
         "kv-canary: piecewise cuda graph is not supported by the current "

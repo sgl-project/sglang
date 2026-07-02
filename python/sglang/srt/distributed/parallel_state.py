@@ -1924,7 +1924,9 @@ def init_distributed_environment(
             "distributed_init_method must be provided when initializing "
             "distributed environment"
         )
-        if timeout is not None:
+        if timeout is None:
+            timeout = timedelta(seconds=1800)
+        else:
             assert isinstance(timeout, (int)), "timeout must be a number"
             assert timeout > 0, "timeout must be positive"
             timeout = timedelta(seconds=timeout)

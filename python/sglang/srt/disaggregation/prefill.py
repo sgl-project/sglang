@@ -61,7 +61,6 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
@@ -72,6 +71,10 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+
+
+def _is_deepseek_v4_token_to_kv_pool(token_to_kv_pool) -> bool:
+    return type(token_to_kv_pool).__name__ == "DeepSeekV4TokenToKVPool"
 
 
 def should_force_retry(req: Req) -> bool:
@@ -196,7 +199,7 @@ class PrefillBootstrapQueue:
             req_to_token_pool=req_to_token_pool,
         )
 
-        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+        if _is_deepseek_v4_token_to_kv_pool(self.token_to_kv_pool):
             # V4's KVCache is organized by compression-ratio
             # buckets rather than by layer.
             kv_args.mla_compression_ratios = list(

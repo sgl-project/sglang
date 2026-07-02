@@ -38,9 +38,6 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.mem_cache.allocator.hisparse import (
-    DeepSeekV4HiSparseTokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -86,6 +83,13 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
 
 
 IGNORE_EOS_RESERVE_TOKENS = 1
+
+
+def _is_deepseek_v4_hisparse_allocator(token_to_kv_pool_allocator) -> bool:
+    return (
+        type(token_to_kv_pool_allocator).__name__
+        == "DeepSeekV4HiSparseTokenToKVPoolAllocator"
+    )
 
 
 def match_prefix_for_req(
@@ -487,9 +491,14 @@ class PrefillAdder:
 
         # DeepSeek V4 HiSparse wraps an SWATokenToKVPoolAllocator internally and
         # exposes the full SWA allocator interface.
-        self.is_hybrid_swa = isinstance(
-            self.token_to_kv_pool_allocator,
-            (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
+        self.is_hybrid_swa = (
+            isinstance(
+                self.token_to_kv_pool_allocator,
+                SWATokenToKVPoolAllocator,
+            )
+            or _is_deepseek_v4_hisparse_allocator(
+                self.token_to_kv_pool_allocator,
+            )
         )
         self.is_all_swa = isinstance(
             self.token_to_kv_pool_allocator, PureSWATokenToKVPoolAllocator

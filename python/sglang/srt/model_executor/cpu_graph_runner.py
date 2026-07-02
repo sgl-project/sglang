@@ -144,6 +144,8 @@ _CPU_COMPILE_FAKE_OPS: set[str] = set()
 
 def register_cpu_compile_fake(op_name: str):
     _CPU_COMPILE_FAKE_OPS.add(op_name)
+    if not hasattr(torch.library, "register_fake"):
+        return lambda func: func
     return torch.library.register_fake(f"sgl_kernel::{op_name}")
 
 

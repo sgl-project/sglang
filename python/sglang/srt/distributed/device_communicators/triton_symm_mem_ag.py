@@ -12,7 +12,10 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-import torch.distributed._symmetric_memory as symm_mem
+try:
+    import torch.distributed._symmetric_memory as symm_mem
+except ModuleNotFoundError:
+    symm_mem = None
 import triton
 import triton.language as tl
 

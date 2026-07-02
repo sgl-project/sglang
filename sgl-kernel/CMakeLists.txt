@@ -28,6 +28,13 @@ enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
 set_property(GLOBAL PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
+if (NOT CUDA_VERSION)
+    if (DEFINED CUDAToolkit_VERSION_MAJOR AND DEFINED CUDAToolkit_VERSION_MINOR)
+        set(CUDA_VERSION "${CUDAToolkit_VERSION_MAJOR}.${CUDAToolkit_VERSION_MINOR}")
+    else()
+        string(REGEX MATCH "^[0-9]+\\.[0-9]+" CUDA_VERSION "${CUDAToolkit_VERSION}")
+    endif()
+endif()
 message(STATUS "Detected CUDA_VERSION=${CUDA_VERSION}")
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
     message("CUDA_VERSION ${CUDA_VERSION} >= 13.0")
@@ -77,6 +84,17 @@ FetchContent_Declare(
     URL_HASH SHA256=931dfd118f4b6de8c7d98702153c7c03840139170af21a07607693bd9749744d
 )
 FetchContent_Populate(repo-flashinfer)
+set(SGL_KERNEL_FLASHINFER_RENORM "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu")
+file(READ "${SGL_KERNEL_FLASHINFER_RENORM}" SGL_KERNEL_FLASHINFER_RENORM_CONTENT)
+if (NOT SGL_KERNEL_FLASHINFER_RENORM_CONTENT MATCHES "#include <optional>")
+    string(REPLACE
+        "#include <flashinfer/sampling.cuh>"
+        "#include <optional>\n\n#include <flashinfer/sampling.cuh>"
+        SGL_KERNEL_FLASHINFER_RENORM_CONTENT
+        "${SGL_KERNEL_FLASHINFER_RENORM_CONTENT}"
+    )
+    file(WRITE "${SGL_KERNEL_FLASHINFER_RENORM}" "${SGL_KERNEL_FLASHINFER_RENORM_CONTENT}")
+endif()
 
 # flash-attention
 FetchContent_Declare(
@@ -85,6 +103,29 @@ FetchContent_Declare(
     URL_HASH SHA256=418b5681584dc3efff496a1cab5ffd58d2728d89dcfe0ea16e6985d6ef35c68c
 )
 FetchContent_Populate(repo-flash-attention)
+set(SGL_KERNEL_FLASH_SPARSE_API "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp")
+file(READ "${SGL_KERNEL_FLASH_SPARSE_API}" SGL_KERNEL_FLASH_SPARSE_API_CONTENT)
+if (NOT SGL_KERNEL_FLASH_SPARSE_API_CONTENT MATCHES "#include <optional>")
+    string(REPLACE
+        "#include <torch/nn/functional.h>"
+        "#include <optional>\n\n#include <torch/nn/functional.h>"
+        SGL_KERNEL_FLASH_SPARSE_API_CONTENT
+        "${SGL_KERNEL_FLASH_SPARSE_API_CONTENT}"
+    )
+endif()
+string(REPLACE
+    "void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi_slopes_, int batch_size, int num_heads){"
+    "template <typename OptionalTensor>\nvoid set_params_alibi(Flash_fwd_params &params, const OptionalTensor &alibi_slopes_, int batch_size, int num_heads){"
+    SGL_KERNEL_FLASH_SPARSE_API_CONTENT
+    "${SGL_KERNEL_FLASH_SPARSE_API_CONTENT}"
+)
+string(REPLACE
+    "const_cast<std::optional<at::Tensor> &>(alibi_slopes_)"
+    "alibi_slopes_"
+    SGL_KERNEL_FLASH_SPARSE_API_CONTENT
+    "${SGL_KERNEL_FLASH_SPARSE_API_CONTENT}"
+)
+file(WRITE "${SGL_KERNEL_FLASH_SPARSE_API}" "${SGL_KERNEL_FLASH_SPARSE_API_CONTENT}")
 
 # ccache option
 option(ENABLE_CCACHE "Whether to use ccache" ON)
@@ -177,6 +218,12 @@ option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              ${DEFAULT_SG
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
 
+set(DEFAULT_SGL_KERNEL_ENABLE_SPATIAL OFF)
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
+    set(DEFAULT_SGL_KERNEL_ENABLE_SPATIAL ON)
+endif()
+option(SGL_KERNEL_ENABLE_SPATIAL          "Enable green-context spatial ops" ${DEFAULT_SGL_KERNEL_ENABLE_SPATIAL})
+
 if (SGL_KERNEL_ENABLE_BF16)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-DFLASHINFER_ENABLE_BF16"
@@ -242,6 +289,14 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
     )
 endif()
 
+set(SGL_KERNEL_ENABLE_MXFP8_SM100 OFF)
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
+    set(SGL_KERNEL_ENABLE_MXFP8_SM100 ON)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-DSGL_KERNEL_ENABLE_MXFP8_SM100"
+    )
+endif()
+
 # All source files
 # NOTE: Please sort the filenames alphabetically
 set(SOURCES
@@ -258,8 +313,6 @@ set(SOURCES
     "csrc/elementwise/pos_enc.cu"
     "csrc/elementwise/topk.cu"
     "csrc/expert_specialization/es_fp8_blockwise.cu"
-    "csrc/expert_specialization/es_sm100_mxfp8_blockscaled.cu"
-    "csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cu"
 
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
@@ -308,6 +361,13 @@ set(SOURCES
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
+
+if (SGL_KERNEL_ENABLE_MXFP8_SM100)
+    list(APPEND SOURCES
+        "csrc/expert_specialization/es_sm100_mxfp8_blockscaled.cu"
+        "csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cu"
+    )
+endif()
 
 set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/include
@@ -475,16 +535,21 @@ if (SGL_KERNEL_ENABLE_FA3)
     target_compile_definitions(flash_ops PRIVATE ${FLASH_OPS_COMPILE_DEFS})
 endif()
 
-# Build spatial_ops as a separate, optional extension for green contexts
-set(SPATIAL_SOURCES
-    "csrc/spatial/greenctx_stream.cu"
-    "csrc/spatial_extension.cc"
-)
+# Build spatial_ops as a separate, optional extension for green contexts.
+# CUDA green-context driver APIs are not available in CUDA 12.2 headers.
+if (SGL_KERNEL_ENABLE_SPATIAL)
+    set(SPATIAL_SOURCES
+        "csrc/spatial/greenctx_stream.cu"
+        "csrc/spatial_extension.cc"
+    )
 
-Python_add_library(spatial_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SPATIAL_SOURCES})
-target_compile_options(spatial_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
-target_link_libraries(spatial_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
-install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
+    Python_add_library(spatial_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SPATIAL_SOURCES})
+    target_compile_options(spatial_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
+    target_link_libraries(spatial_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+    install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
+else()
+    message(STATUS "Skipping spatial_ops because CUDA green-context APIs require CUDA >= 12.4")
+endif()
 
 # ============================ Extra Install: FLashMLA ============================= #
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)

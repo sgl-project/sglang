@@ -4,6 +4,7 @@
 
 #include <flashinfer/vec_dtypes.cuh>
 #include <iostream>
+#include <optional>
 
 #include "cutlass/array.h"
 #include "utils.h"
