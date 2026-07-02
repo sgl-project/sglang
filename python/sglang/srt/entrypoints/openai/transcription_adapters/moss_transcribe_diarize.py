@@ -42,11 +42,14 @@ class MossTranscribeDiarizeAdapter(TranscriptionAdapter):
         tokenizer,
         usage: TranscriptionUsage,
     ) -> TranscriptionVerboseResponse:
+        segments = self._parse_segments(text)
+        if not segments:
+            segments = self._build_fallback_segments(text, request.audio_duration_s)
         return TranscriptionVerboseResponse(
             language=request.language or "auto",
             duration=round(request.audio_duration_s, 2),
             text=text,
-            segments=self._parse_segments(text),
+            segments=segments,
             usage=usage,
         )
 
@@ -66,3 +69,23 @@ class MossTranscribeDiarizeAdapter(TranscriptionAdapter):
                 )
             )
         return segments
+
+    @staticmethod
+    def _build_fallback_segments(
+        text: str, audio_duration_s: float
+    ) -> list[TranscriptionSegment]:
+        text = text.strip()
+        if not text:
+            return []
+
+        if not re.match(r"^\[S\d{2,}\]", text):
+            text = f"[S01]{text}"
+
+        return [
+            TranscriptionSegment(
+                id=0,
+                start=0.0,
+                end=round(max(float(audio_duration_s), 0.0), 2),
+                text=text,
+            )
+        ]

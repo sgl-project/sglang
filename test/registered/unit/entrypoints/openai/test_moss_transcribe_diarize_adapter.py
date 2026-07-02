@@ -86,10 +86,34 @@ class TestMossTranscribeDiarizeAdapter(CustomTestCase):
         self.assertEqual(resp.segments[1].end, 13.82)
         self.assertEqual(resp.segments[1].text, "[S02]生意行吗你们哥俩")
 
-    def test_verbose_response_keeps_empty_segments_when_format_missing(self):
+    def test_verbose_response_falls_back_to_full_audio_segment(self):
+        resp = MossTranscribeDiarizeAdapter().build_verbose_response(
+            TranscriptionRequest(audio_duration_s=1.23),
+            "没有时间戳的文本",
+            ret={},
+            tokenizer=Mock(),
+            usage=TranscriptionUsage(seconds=1),
+        )
+        self.assertEqual(len(resp.segments), 1)
+        self.assertEqual(resp.segments[0].id, 0)
+        self.assertEqual(resp.segments[0].start, 0.0)
+        self.assertEqual(resp.segments[0].end, 1.23)
+        self.assertEqual(resp.segments[0].text, "[S01]没有时间戳的文本")
+
+    def test_verbose_response_fallback_preserves_existing_speaker(self):
+        resp = MossTranscribeDiarizeAdapter().build_verbose_response(
+            TranscriptionRequest(audio_duration_s=1.23),
+            "[S02]没有时间戳的文本",
+            ret={},
+            tokenizer=Mock(),
+            usage=TranscriptionUsage(seconds=1),
+        )
+        self.assertEqual(resp.segments[0].text, "[S02]没有时间戳的文本")
+
+    def test_verbose_response_keeps_empty_segments_for_empty_text(self):
         resp = MossTranscribeDiarizeAdapter().build_verbose_response(
             TranscriptionRequest(audio_duration_s=1.0),
-            "[S01]没有时间戳的文本",
+            "   ",
             ret={},
             tokenizer=Mock(),
             usage=TranscriptionUsage(seconds=1),
