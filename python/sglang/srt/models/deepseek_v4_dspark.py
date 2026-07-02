@@ -149,6 +149,10 @@ class DSparkAttention(MqaAttentionBase):
         kv, _ = self.wkv(x)
         return kv
 
+    def _local_attn_sink(self) -> torch.Tensor:
+        # DSpark pads Q to this width; keep the base helper's stable allocation.
+        return super()._local_attn_sink(max(self.n_local_heads, _PAD_NUM_HEADS))
+
     def _store_block_kv(
         self,
         *,
@@ -1100,6 +1104,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     def post_load_weights(self, is_nextn=False, weight_names=None):
         for stage in self.stages:
             stage.refresh_mhc_norm_weight_cache()
+        # The per-rank attn_sink slice is cached on first use; an RL weight update
+        # rewrites attn_sink in place, so re-slice it here or decode keeps serving
+        # the pre-update sink.
+        for module in self.modules():
+            if isinstance(module, DSparkAttention):
+                module.refresh_attn_sink_cache()
 
     def _assert_confidence_head_loaded(
         self, *, params_dict: dict, loaded_params: set
