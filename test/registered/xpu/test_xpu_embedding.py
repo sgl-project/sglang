@@ -34,7 +34,12 @@ class TestXPUEmbedding(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--is-embedding", "--device", "xpu"],
+            other_args=[
+                "--is-embedding",
+                "--device",
+                "xpu",
+                "--disable-decode-cuda-graph",
+            ],
         )
         cls.openai_url = cls.base_url + "/v1"
 
