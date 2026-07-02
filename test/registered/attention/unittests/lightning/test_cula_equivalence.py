@@ -16,6 +16,7 @@ from sglang.test.test_utils import CustomTestCase
 try:
     from cula.lightning import (
         linear_attention_state_update_kvbuffer,
+        linear_attention_state_update_kvbuffer_fused,
         linear_attention_verify_kvbuffer,
     )
 
@@ -23,7 +24,7 @@ try:
 except ImportError:
     CULA_AVAILABLE = False
 
-register_cuda_ci(est_time=120, suite="base-b-test-4-gpu-b200")
+register_cuda_ci(est_time=120, stage="base-b", runner_config="4-gpu-b200")
 
 
 def _skip_if_no_gpu():
@@ -93,9 +94,11 @@ class TestCulaKernelCorrectness(CustomTestCase):
         scale = D**-0.5
         decay = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
 
-        q = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
-        v = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
+        # fp32 q/k/v: the cuLA verify kernel now loads q/k into fp32 registers
+        # natively (no bf16 cast), matching the runtime path (Ling fp32 rotary).
+        q = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
+        k = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
+        v = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
         state_kmajor = (
             torch.randn(B, H, D, D, device="cuda", dtype=torch.float32) * 0.01
         )
@@ -106,7 +109,7 @@ class TestCulaKernelCorrectness(CustomTestCase):
         # cuLA
         pool_idx = torch.arange(B, device="cuda", dtype=torch.int32)
         s_cula = state_kmajor.transpose(-1, -2).contiguous()
-        out_cula = torch.zeros(B, T, H, D, device="cuda", dtype=torch.bfloat16)
+        out_cula = torch.zeros(B, T, H, D, device="cuda", dtype=torch.float32)
         linear_attention_verify_kvbuffer(
             q.view(B, T, H, D),
             k.view(B, T, H, D),
@@ -136,9 +139,9 @@ class TestCulaKernelCorrectness(CustomTestCase):
         scale = D**-0.5
         decay = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
 
-        q = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
-        v = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
+        q = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
+        k = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
+        v = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
         state_kmajor = (
             torch.randn(B, H, D, D, device="cuda", dtype=torch.float32) * 0.01
         )
@@ -181,9 +184,9 @@ class TestCulaKernelCorrectness(CustomTestCase):
         scale = D**-0.5
         decay = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
 
-        q = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
-        v = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
+        q = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
+        k = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
+        v = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
         state_kmajor = (
             torch.randn(B, H, D, D, device="cuda", dtype=torch.float32) * 0.01
         )
@@ -226,9 +229,9 @@ class TestCulaKernelCorrectness(CustomTestCase):
         scale = D**-0.5
         decay = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
 
-        q = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
-        v = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
+        q = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
+        k = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
+        v = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
         state_kmajor = (
             torch.randn(B, H, D, D, device="cuda", dtype=torch.float32) * 0.01
         )
@@ -249,6 +252,72 @@ class TestCulaKernelCorrectness(CustomTestCase):
         )
         self.assertTrue(
             torch.equal(s_cula, s_snapshot), "L=0 must leave state unchanged"
+        )
+
+    # ------------------------------------------------------------------
+    # Fused commit kernel: all-layer update matches per-layer reference
+    # ------------------------------------------------------------------
+    def test_cula_commit_fused_matches_pytorch(self):
+        _skip_if_no_gpu()
+        LAYERS, B, T, H, D = 3, 3, 4, 4, 128
+        torch.manual_seed(2026)
+        scale = D**-0.5
+        accepted_len = torch.tensor([T, 2, 0], device="cuda", dtype=torch.int32)
+        pool_idx = torch.arange(B, device="cuda", dtype=torch.int32)
+
+        k = torch.randn(LAYERS, B, T, H, D, device="cuda", dtype=torch.float32)
+        v = torch.randn(LAYERS, B, T, H, D, device="cuda", dtype=torch.float32)
+        state_kmajor = (
+            torch.randn(LAYERS, B, H, D, D, device="cuda", dtype=torch.float32) * 0.01
+        )
+        decay_all = torch.stack(
+            [
+                0.3
+                * (layer_idx + 1)
+                * torch.arange(H, device="cuda", dtype=torch.float32)
+                / H
+                for layer_idx in range(LAYERS)
+            ]
+        )
+
+        ref_layers = []
+        q_dummy = torch.zeros(B * T, H, D, device="cuda", dtype=torch.float32)
+        for layer_idx in range(LAYERS):
+            _, _, inter = _torch_la_mtp_ref(
+                q_dummy,
+                k[layer_idx].view(B * T, H, D),
+                v[layer_idx].view(B * T, H, D),
+                state_kmajor[layer_idx],
+                decay_all[layer_idx],
+                scale,
+                T,
+            )
+            ref = state_kmajor[layer_idx].clone()
+            for batch_idx, length in enumerate(accepted_len.tolist()):
+                if length > 0:
+                    ref[batch_idx] = inter[batch_idx, length - 1]
+            ref_layers.append(ref)
+        ref_state_kmajor = torch.stack(ref_layers)
+
+        s_cula = state_kmajor.transpose(-1, -2).contiguous()
+        linear_attention_state_update_kvbuffer_fused(
+            k,
+            v,
+            s_cula,
+            decay_all,
+            pool_idx,
+            accepted_len,
+            T,
+        )
+        cula_state_kmajor = s_cula.transpose(-1, -2).contiguous()
+
+        rel = (cula_state_kmajor - ref_state_kmajor).pow(2).mean().sqrt() / (
+            ref_state_kmajor.abs().max() + 1e-8
+        )
+        self.assertLess(
+            rel.item(),
+            1e-3,
+            f"fused commit state mismatch vs pytorch ref: {rel:.5f}",
         )
 
 

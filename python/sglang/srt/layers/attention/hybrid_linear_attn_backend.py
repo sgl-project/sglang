@@ -1077,37 +1077,45 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
 
     def _cula_commit(self, last_correct_step_indices: torch.Tensor):
-        from sglang.srt.layers.attention.linear.cula_entry import cula_commit
+        from sglang.srt.layers.attention.linear.cula_entry import cula_commit_fused
 
         request_number = last_correct_step_indices.shape[0]
+        if request_number == 0:
+            return
         cache_indices = self.linear_attn_backend.forward_metadata.mamba_cache_indices[
             :request_number
         ]
         mamba_caches = (
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
-        accepted_len = (last_correct_step_indices + 1).clamp(min=0).to(torch.int32)
+        accepted_len = (last_correct_step_indices + 1).clamp(min=0)
+        if accepted_len.dtype != torch.int32:
+            accepted_len = accepted_len.to(torch.int32)
         T = mamba_caches.draft_k.shape[2]
-        mamba_layer_ids = list(
-            self.linear_attn_backend.req_to_token_pool.mamba_map.keys()
-        )
-        decay_slopes = self.linear_attn_backend.tp_slope
-        mamba_map = self.linear_attn_backend.req_to_token_pool.mamba_map
-        # Gather the active slots for ALL layers in two launches instead of
-        # per-layer advanced indexing inside the loop (28 gathers -> 1).
-        dk_all = mamba_caches.draft_k[:, cache_indices]  # [L, B, T, H, K]
-        dv_all = mamba_caches.draft_v[:, cache_indices]  # [L, B, T, HV, V]
-        for layer_id in mamba_layer_ids:
-            layer_idx = mamba_map[layer_id]
-            cula_commit(
-                dk_all[layer_idx],
-                dv_all[layer_idx],
-                mamba_caches.temporal[layer_idx],
-                cache_indices,
-                accepted_len,
-                decay_slopes[layer_id],
-                T,
+        # Per-layer decay slopes stacked to [L, H] (cached; tp_slope is fixed).
+        decay_all = getattr(self, "_cula_decay_all", None)
+        if decay_all is None:
+            mamba_layer_ids = list(
+                self.linear_attn_backend.req_to_token_pool.mamba_map.keys()
             )
+            decay_all = torch.stack(
+                [
+                    self.linear_attn_backend.tp_slope[lid].view(-1).contiguous()
+                    for lid in mamba_layer_ids
+                ]
+            )
+            self._cula_decay_all = decay_all
+        # Single fused launch: advances ALL layers' temporal state in place,
+        # reading draft_k/draft_v pool-indexed (no gather, no per-layer loop).
+        cula_commit_fused(
+            mamba_caches.draft_k,
+            mamba_caches.draft_v,
+            mamba_caches.temporal,
+            cache_indices,
+            accepted_len,
+            decay_all,
+            T,
+        )
 
 
 class ShortConvHybridAttnBackend(HybridLinearAttnBackend):

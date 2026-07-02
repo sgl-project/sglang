@@ -128,22 +128,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         decay = self.tp_slope[0]
         scale = self.head_dim**-0.5
         temporal = self.req_to_token_pool.mamba_pool.mamba_cache.temporal[0]
-        # Fused commit operates on the full per-layer state pool. Set up the
-        # layer-fused warmup tensors once (bs-independent): real temporal_full
-        # (3.8GB, not copyable) + small dummy draft buffers + stacked decay.
         temporal_full = self.req_to_token_pool.mamba_pool.mamba_cache.temporal
-        num_layers = temporal_full.shape[0]
-        pool_size = temporal_full.shape[1]
-        mamba_layer_ids = list(self.req_to_token_pool.mamba_map.keys())
-        decay_all = torch.stack(
-            [self.tp_slope[lid].view(-1).contiguous() for lid in mamba_layer_ids]
-        )
-        dummy_dk_pool = torch.zeros(
-            (num_layers, pool_size, draft_token_num, self.num_heads, self.head_dim),
-            device=self.device,
-            dtype=torch.float32,
-        )
-        dummy_dv_pool = torch.zeros_like(dummy_dk_pool)
         # decode and verify both take fp32 q/k/v natively (kernels compute in
         # fp32/TF32). cute.compile bakes the dtype seen at first call, so warmup
         # dtype MUST match runtime dtype (fp32 for both).
@@ -157,6 +142,11 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             bs for bs in {1, 2, 4, 8, 16, 32, 33, 64, max_bs} if bs <= max_bs
         )
         eager_warmup = [1, 32]  # trigger the single compile for verify + commit
+        pool_size = temporal.shape[0]
+
+        def dummy_cache_indices(bs: int) -> torch.Tensor:
+            # Prefer distinct warmup slots, but stay in-bounds for tiny test pools.
+            return torch.arange(bs, dtype=torch.int32, device=self.device) % pool_size
 
         for bs in decode_warmup:
             dummy_q = torch.zeros(
@@ -167,11 +157,23 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             dummy_out = torch.zeros(
                 (bs, self.num_heads, self.head_dim), device=self.device, dtype=out_dtype
             )
-            dummy_idx = torch.zeros(bs, dtype=torch.int32, device=self.device)
+            dummy_idx = dummy_cache_indices(bs)
             cula_decode(
                 dummy_q, dummy_q, dummy_q, temporal, dummy_idx, decay, scale, dummy_out
             )
         if draft_token_num > 1:
+            # Fused commit operates on the full per-layer state pool. Reuse the
+            # preallocated draft buffers to avoid duplicating a large fp32 pool
+            # during warmup; runtime verify overwrites active slots before commit.
+            mamba_layer_ids = list(self.req_to_token_pool.mamba_map.keys())
+            decay_all = torch.stack(
+                [self.tp_slope[lid].view(-1).contiguous() for lid in mamba_layer_ids]
+            )
+            mamba_caches = (
+                self.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+            )
+            dummy_dk_pool = mamba_caches.draft_k
+            dummy_dv_pool = mamba_caches.draft_v
             for bs in eager_warmup:
                 total = bs * draft_token_num
                 dummy_qv = torch.zeros(
@@ -182,9 +184,9 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 dummy_outv = torch.zeros(
                     (total, self.num_heads, self.head_dim),
                     device=self.device,
-                    dtype=out_dtype,
+                    dtype=torch.float32,
                 )
-                dummy_idx = torch.zeros(bs, dtype=torch.int32, device=self.device)
+                dummy_idx = dummy_cache_indices(bs)
                 # Warm the write_kv=True variant (runtime uses fused draft writes).
                 # k_buf/v_buf are per-layer pool-indexed [pool, T, H, K] fp32 slices.
                 cula_verify(
@@ -202,8 +204,8 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 )
                 # Fused commit: one launch for ALL layers. draft_k/v dummies are
                 # pool-indexed (bs-independent, allocated once); only h0_indices/
-                # accepted_len vary with bs. Writes garbage into temporal_full slot
-                # 0, zeroed back after the loop.
+                # accepted_len vary with bs. Writes garbage into temporal_full warmup
+                # slots, zeroed back after the loop.
                 dummy_acc = torch.full(
                     (bs,), draft_token_num, dtype=torch.int32, device=self.device
                 )
@@ -479,7 +481,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 # cula_verify accepts fp32 q/k/v natively and fuses the draft_k/v
                 # writes (write_kv=True) -- no separate scatter kernels. draft_k/v
                 # are per-layer [pool, T, H, K] / [pool, T, HV, V] fp32 buffers.
-                out = torch.empty_like(v, dtype=torch.bfloat16)
+                out = torch.empty(v.shape, dtype=torch.float32, device=v.device)
                 o = cula_verify(
                     q,
                     k,
@@ -559,7 +561,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             scale = layer.head_dim**-0.5
             # Pass q/k/v through in native dtype (fp32); cula_decode computes in
             # fp32 internally. Pre-allocated bf16 out so no graph re-alloc.
-            out = torch.empty_like(v, dtype=torch.bfloat16)
+            out = torch.empty(v.shape, dtype=torch.bfloat16, device=v.device)
             o = cula_decode(q, k, v, ssm_states, cache_indices, decay, scale, out)
         else:
             raise ValueError(
