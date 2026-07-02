@@ -313,6 +313,15 @@ def get_moe_runner_backend() -> MoeRunnerBackend:
     return MOE_RUNNER_BACKEND
 
 
+def resolve_nvfp4_moe_runner_backend() -> MoeRunnerBackend:
+    backend = get_moe_runner_backend()
+    if backend.is_auto() and is_cuda():
+        major, minor = torch.cuda.get_device_capability()
+        if (8, 0) <= (major, minor) < (10, 0):
+            return MoeRunnerBackend.MARLIN
+    return backend
+
+
 def get_speculative_moe_runner_backend() -> MoeRunnerBackend:
     global SPECULATIVE_MOE_RUNNER_BACKEND
     if SPECULATIVE_MOE_RUNNER_BACKEND is None:
