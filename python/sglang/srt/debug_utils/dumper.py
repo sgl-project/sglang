@@ -22,7 +22,7 @@ import torch
 import torch.distributed as dist
 import zmq
 
-from sglang.srt.managers.io_struct import sock_recv, sock_send
+from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 
 # -------------------------------------- config base ------------------------------------------
 
@@ -1440,7 +1440,7 @@ def _create_zmq_rpc_broadcast(
             except Exception as e:
                 _log(f"[ZmqRpc] error inside handler: {e}")
                 resp = {"result": None, "error": str(e)}
-            sock_send(sock, resp)
+            sock_send(sock, wrap_as_pickle(resp))
 
     thread = threading.Thread(target=serve_loop, daemon=True)
     thread.start()
@@ -1479,11 +1479,13 @@ class _ZmqRpcHandle:
         def call(*args, **kwargs):
             sock_send(
                 self._socket,
-                {
-                    "method": method_name,
-                    "args": args,
-                    "kwargs": kwargs,
-                },
+                wrap_as_pickle(
+                    {
+                        "method": method_name,
+                        "args": args,
+                        "kwargs": kwargs,
+                    }
+                ),
             )
             response = sock_recv(self._socket)
             if response["error"]:

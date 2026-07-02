@@ -21,9 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_gather,
-)
+from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -295,6 +293,14 @@ class LogitsProcessor(nn.Module):
 
         self.return_full_logits = return_full_logits
         self.enable_mis = get_global_server_args().enable_mis
+
+        self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
+            max_tokens=triton_symm_mem_ag.recommended_max_tokens(
+                include_prefill=False, floor=128
+            ),
+            enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
+            skip_entry_sync=True,
+        )
 
         # enable chunked logprobs processing
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
@@ -853,7 +859,7 @@ class LogitsProcessor(nn.Module):
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
             else:
-                logits = tensor_model_parallel_all_gather(logits)
+                logits = self._logits_gatherer(logits)
 
         logits = self._scatter_dp_attn_logits(
             logits, local_hidden_states, logits_metadata
@@ -974,8 +980,10 @@ class LogitsProcessor(nn.Module):
     def _copy_logits_to_buffer(
         self, logits: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> torch.Tensor:
-        if logits_metadata.next_token_logits_buffer is not None:
-            logits_buffer = logits_metadata.next_token_logits_buffer
+        logits_buffer = logits_metadata.next_token_logits_buffer
+        # The shared logits buffer is keyed by vocab width; skip it when this
+        # model's vocab doesn't match (e.g. hot-vocab draft vs full-vocab target).
+        if logits_buffer is not None and logits_buffer.shape[-1] == self.vocab_size:
             assert logits_buffer.dtype == torch.float
             logits_buffer.copy_(logits[:, : self.vocab_size])
             logits = logits_buffer

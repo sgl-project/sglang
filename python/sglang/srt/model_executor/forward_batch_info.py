@@ -430,8 +430,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
-    # For NSA/DSA topk_indices reuse across forward calls (e.g., EAGLE draft)
-    topk_indices: Optional[torch.Tensor] = None
+    # Gate for reusing the first MTP draft step's indexer topk across steps;
+    # the carried topk lives on spec_info (see EagleDraftInput.mtp_topk_indices).
     reuse_mtp_topk_indices: Optional[bool] = False
 
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
@@ -1475,6 +1475,7 @@ def build_inner_fb_view(
         seq_lens_cpu=forward_batch.seq_lens_cpu,
         encoder_lens=encoder_lens,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
     )
 
