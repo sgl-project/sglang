@@ -1104,7 +1104,7 @@ def _seed_c4_if_needed(
     fixture: DSV4AttentionFixture, *, num_entries: int = _DSV4_EXTRA_ENTRIES
 ) -> None:
     """For compress_ratio=4, seed the C4 metadata the exercised path consumes
-    (the C4Indexer would normally populate it; the smoke fixture skips the
+    (the C4Indexer would normally populate it; the compact fixture skips the
     indexer): `c4_sparse_page_indices` for the dense extend path,
     `c4_sparse_raw_indices` for sparse prefill. No-op for other compress_ratios.
     """
@@ -1383,7 +1383,7 @@ def _seed_c4_sparse_indices(
 ) -> None:
     """For compress_ratio=4 the production `init_flashmla_related` initializes
     `c4_sparse_page_indices` to all `-1` (the C4Indexer fills it in later).
-    Since the smoke fixture does not run the indexer, the C4 path attends to
+    Since the compact fixture does not run the indexer, the C4 path attends to
     zero extra entries unless we seed the indices ourselves. Seed each query
     row to point to `[0, 1, ..., num_entries - 1]` so the backend reads the
     same `num_entries` C4 K's that the reference also reads, exercising the
@@ -1614,7 +1614,7 @@ def run_dsv4_compress_attention_case(
     assert case.compress_ratio in (
         4,
         128,
-    ), f"smoke runner requires compress_ratio in (4, 128); got {case.compress_ratio}"
+    ), f"DSV4 compact runner requires compress_ratio in (4, 128); got {case.compress_ratio}"
     if sparse_prefill:
         assert (
             case.forward_mode.is_extend_without_speculative()
