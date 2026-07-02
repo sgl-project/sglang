@@ -968,11 +968,11 @@ class ServerArgs(DisaggServerArgsMixin):
         )
 
     def _adjust_offload_during_compile(self):
-        # The DiT is layerwise-offloaded so each layer compiles with only itself
-        # resident; the VAE / image encoder are fully offloaded instead because
-        # they are not layer-stacked and layerwise streaming corrupts them. The
-        # DiT is restored to resident after the compile warmup
-        # (ComposedPipelineBase.forward).
+        # Layerwise-offload the DiT so each layer compiles with only itself
+        # resident (this is what caps the compile-time peak), then restore it
+        # after the compile warmup (ComposedPipelineBase.forward). Other
+        # components are left alone: changing their offload flags would change
+        # steady-state serving behavior.
         if (
             self.offload_during_compile
             and self.enable_torch_compile
@@ -982,8 +982,6 @@ class ServerArgs(DisaggServerArgsMixin):
             and os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() != "true"
         ):
             self.dit_layerwise_offload = True
-            self.vae_cpu_offload = True
-            self.image_encoder_cpu_offload = True
             self._offloaded_for_compile = True
 
     def _adjust_layerwise_offload_components(self):
@@ -1323,7 +1321,7 @@ class ServerArgs(DisaggServerArgsMixin):
             "--offload-during-compile",
             action=StoreBoolean,
             default=ServerArgs.offload_during_compile,
-            help="During the torch.compile warmup, layerwise-offload the DiT (so max-autotune fits on tighter-memory GPUs) and fully offload the VAE / image encoder, then restore the DiT to resident for fast serving. Skipped when the DiT is already layerwise-offloaded, or under cache-dit / FSDP.",
+            help="Layerwise-offload the DiT during the torch.compile warmup so max-autotune fits on tighter-memory GPUs, then restore it to resident for fast serving. Other components are untouched. Skipped when the DiT is already layerwise-offloaded, or under cache-dit / FSDP.",
         )
 
         parser.add_argument(
