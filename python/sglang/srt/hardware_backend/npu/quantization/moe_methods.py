@@ -1025,7 +1025,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         # w_scale: uint8 [E, N, ceil(K/64), 2]
 
         # 1. Transpose to [E, K//2, N] while still a regular tensor
-        qw_t = qw_f4.transpose(1, 2).contiguous()           # standard layout
+        qw_t = qw.transpose(1, 2).contiguous()           # standard layout
 
         # 2. Cast to FRACTAL_NZ with the correct input dtype hint
         qw_nz = torch_npu.npu_format_cast(
