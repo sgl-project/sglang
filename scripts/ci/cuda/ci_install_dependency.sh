@@ -576,6 +576,11 @@ main() {
     remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer
     install_sglang
+    # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
+    # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.
+    if [ "${SGLANG_CI_EARLY_LD_LIBRARY_PATH:-0}" = "1" ]; then
+        setup_ld_library_path
+    fi
     install_sglang_kernel
     install_sglang_router
     download_flashinfer_cache
