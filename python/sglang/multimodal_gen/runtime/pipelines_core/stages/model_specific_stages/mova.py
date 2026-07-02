@@ -14,16 +14,14 @@ from __future__ import annotations
 import functools
 import inspect
 import os
-from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
 from diffusers.utils.torch_utils import randn_tensor
-from tqdm.auto import tqdm
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
-    get_world_group,
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     cfg_model_parallel_all_reduce,
@@ -188,6 +186,10 @@ class MOVADenoisingStage(PipelineStage):
         return uses
 
     @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DENOISER
+
+    @property
     def parallelism_type(self) -> StageParallelismType:
         if get_global_server_args().enable_cfg_parallel:
             return StageParallelismType.CFG_PARALLEL
@@ -233,12 +235,24 @@ class MOVADenoisingStage(PipelineStage):
             partial = (1 - guidance_scale) * neg
         return cfg_model_parallel_all_reduce(partial)
 
-    def _maybe_enable_torch_compile(self, module: nn.Module, server_args: ServerArgs):
+    def _maybe_enable_torch_compile(
+        self,
+        module: nn.Module,
+        server_args: ServerArgs,
+        model_config: object | None = None,
+    ):
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object is not a nn.Module.
         """
         if not server_args.enable_torch_compile or not isinstance(module, nn.Module):
+            return
+        if current_platform.is_hip():
+            logger.warning(
+                "Skipping torch.compile for %s on ROCm because the current "
+                "HIPRTC/Inductor path can emit invalid bf16 kernels.",
+                module.__class__.__name__,
+            )
             return
         compile_kwargs: dict[str, object] = {"fullgraph": False, "dynamic": None}
 
@@ -257,8 +271,10 @@ class MOVADenoisingStage(PipelineStage):
                 _inductor_cfg.reorder_for_compute_comm_overlap = True
             except ImportError:
                 pass
-            mode = os.environ.get(
-                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+            mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE") or getattr(
+                model_config,
+                "torch_compile_mode",
+                "max-autotune-no-cudagraphs",
             )
             compile_kwargs["mode"] = mode
             logger.info("Compiling %s with mode: %s", module.__class__.__name__, mode)
@@ -269,8 +285,14 @@ class MOVADenoisingStage(PipelineStage):
     def _maybe_compile_dits(self, server_args: ServerArgs):
         if self._torch_compiled or not server_args.enable_torch_compile:
             return
-        for module in filter(None, [self.video_dit, self.video_dit_2, self.audio_dit]):
-            self._maybe_enable_torch_compile(module, server_args)
+        module_configs = [
+            (self.video_dit, server_args.pipeline_config.dit_config),
+            (self.video_dit_2, server_args.pipeline_config.dit_config),
+            (self.audio_dit, server_args.pipeline_config.audio_dit_config),
+        ]
+        for module, model_config in module_configs:
+            if module is not None:
+                self._maybe_enable_torch_compile(module, server_args, model_config)
         self._torch_compiled = True
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
@@ -306,16 +328,6 @@ class MOVADenoisingStage(PipelineStage):
         result.add_check("latents", batch.latents, V.is_tensor)
         result.add_check("audio_latents", batch.audio_latents, V.is_tensor)
         return result
-
-    def progress_bar(
-        self, iterable: Iterable | None = None, total: int | None = None
-    ) -> tqdm:
-        """
-        Create a progress bar for the denoising process.
-        """
-        local_rank = get_world_group().local_rank
-        disable = local_rank != 0
-        return tqdm(iterable=iterable, total=total, disable=disable)
 
     def step_profile(self):
         profiler = SGLDiffusionProfiler.get_instance()
@@ -468,7 +480,7 @@ class MOVADenoisingStage(PipelineStage):
         metrics = getattr(batch, "metrics", None)
         perf_dump_path_provided = getattr(batch, "perf_dump_path", None) is not None
 
-        with self.progress_bar(total=total_steps) as progress_bar:
+        with self.progress_bar(total=total_steps, batch=batch) as progress_bar:
             for idx_step in range(total_steps):
                 with StageProfiler(
                     f"denoising_step_{idx_step}",
@@ -876,7 +888,6 @@ class MOVADenoisingStage(PipelineStage):
         """
         min_layers = min(len(visual_dit.blocks), len(self.audio_dit.blocks))
         visual_layers = len(visual_dit.blocks)
-        sp_size = get_sp_world_size()
 
         # Build RoPE frequencies for cross-attention if needed (only used when SP == 1)
         # When SP > 1, we rebuild freqs inside the loop after gathering full sequences
@@ -953,6 +964,10 @@ class MOVADecodingStage(PipelineStage):
             ComponentUse(stage_name, "video_vae", target_dtype=vae_dtype),
             ComponentUse(stage_name, "audio_vae"),
         ]
+
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DECODER
 
     @property
     def parallelism_type(self) -> StageParallelismType:

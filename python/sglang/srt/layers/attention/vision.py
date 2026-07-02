@@ -14,28 +14,33 @@ from einops import rearrange
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm as can_use_jit_qk_norm
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
+    cpu_has_amx_support,
     get_bool_env_var,
     get_device_capability,
     is_blackwell_supported,
+    is_cpu,
     is_cuda,
     is_hip,
     is_musa,
     is_npu,
     is_xpu,
     print_info_once,
+    use_intel_xpu_backend,
 )
 from sglang.srt.utils.multi_stream_utils import (
     maybe_execute_in_parallel,
     with_multi_stream,
 )
 
+_is_cpu = is_cpu()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
 if _is_cuda:
@@ -45,11 +50,16 @@ if _is_cuda:
         flash_attn_varlen_func,
     )
 
+if _is_cpu and _is_cpu_amx_available:
+    flash_attn_varlen_func = torch.ops.sgl_kernel.flash_attn_varlen_func
+
 if _is_musa:
     from flash_attn_interface import flash_attn_varlen_func
 
 if _is_npu:
     import torch_npu
+if _is_xpu:
+    from sgl_kernel.flash_attn import flash_attn_varlen_func
 
 from sglang.srt.distributed import (
     split_tensor_along_last_dim,
@@ -98,9 +108,11 @@ FLASHINFER_MAX_SEQLEN_BUCKETS = [
 @dataclasses.dataclass
 class SingletonCache:
     data: Any = None
+    _max_seqlen: Optional[int] = None
 
     def set_data(self, value: Any) -> None:
         self.data = value
+        self._max_seqlen = None
 
     def get_data(self) -> Optional[Any]:
         return self.data
@@ -145,6 +157,21 @@ def resolve_seqlens(
         resolved_seqlens, torch.Tensor
     ), "cu_seqlens must be a torch.Tensor"
     return resolved_seqlens
+
+
+def resolve_max_seqlen(source, cu_seqlens: torch.Tensor) -> int:
+    """Return max segment length, caching it on a stable carrier so the
+    device->host sync (.item()) happens once per forward instead of once per layer.
+    """
+    if isinstance(source, SingletonCache) or isinstance(source, torch.Tensor):
+        cached = getattr(source, "_max_seqlen", None)
+        if cached is None:
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            cached = int(seq_lens.max().item())
+            source._max_seqlen = cached
+        return cached
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    return int(seq_lens.max().item())
 
 
 class VisionSdpaAttention(nn.Module):
@@ -320,7 +347,7 @@ class VisionTritonAttention(nn.Module):
         use_data_parallel = (
             kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
         )
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
+        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
 
     def forward(
         self,
@@ -393,7 +420,7 @@ class VisionFlash3Attention(nn.Module):
         use_data_parallel = (
             kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
         )
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
+        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
 
     def forward(
         self,
@@ -706,27 +733,129 @@ class VisionAscendAttention(nn.Module):
             seq_len_arg = cu_seqlens
         else:
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            if seq_lens.is_npu:
-                seq_lens = seq_lens.to("cpu")
-            output = torch.empty_like(q)
-            seq_len_arg = seq_lens.to(torch.int32)
+            seq_len_arg = cu_seqlens[1:].to(torch.int32)
 
         _, num_heads, head_size = q.shape
         num_kv_heads = k.shape[1]
 
         scale_value = softmax_scale if softmax_scale is not None else head_size**-0.5
 
-        torch_npu._npu_flash_attention_unpad(
+        seq_len_arg = seq_len_arg.tolist()
+        output = torch_npu.npu_fused_infer_attention_score(
             query=q,
             key=k,
             value=v,
-            seq_len=seq_len_arg,
-            scale_value=scale_value,
+            actual_seq_lengths=seq_len_arg,
+            actual_seq_lengths_kv=seq_len_arg,
+            scale=scale_value,
             num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            out=output,
+            num_key_value_heads=num_kv_heads,
+            sparse_mode=0,
+            input_layout="TND",
+        )[0]
+        return output
+
+
+class VisionAMXAttention(nn.Module):
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        if not _is_cpu or not _is_cpu_amx_available:
+            raise Exception(
+                "VisionAMXAttention is only available for cpu with amx support"
+            )
+        super().__init__()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | SingletonCache | None,
+        bsz: int,
+        seq_len: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+        if cu_seqlens is None:
+            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+        elif isinstance(cu_seqlens, SingletonCache):
+            if cu_seqlens.empty():
+                cu_seqlens.set_data(
+                    _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+                )
+            cu_seqlens = cu_seqlens.get_data()
+
+        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = seq_lens.max().item()
+
+        output = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            causal=False,
         )
+
+        return output
+
+
+class VisionIntelXPUAttention(nn.Module):
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        if not (_is_xpu):
+            raise Exception("VisionIntelXPUAttention is only available for Intel XPU")
+        super().__init__()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | SingletonCache | None,
+        bsz: int,
+        seq_len: int,
+        softmax_scale: Optional[float] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+        window_size = kwargs.get("window_size", (-1, -1))
+        s_aux = kwargs.get("s_aux", None)
+
+        cu_seqlens_source = cu_seqlens
+        cu_seqlens = resolve_seqlens(cu_seqlens_source, bsz, seq_len, device=q.device)
+        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+        max_seqlen = resolve_max_seqlen(cu_seqlens_source, cu_seqlens)
+
+        fa_kwargs = dict(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=softmax_scale,
+            window_size=window_size,
+        )
+        if s_aux is not None:
+            fa_kwargs["sinks"] = s_aux
+        output = flash_attn_varlen_func(q, k, v, **fa_kwargs)
+
         return output
 
 
@@ -738,6 +867,8 @@ QKV_BACKEND_IMPL = {
     "flashinfer_cudnn": VisionFlashInferAttention,
     "ascend_attn": VisionAscendAttention,
     "aiter_attn": VisionAiterAttention,
+    "amx_attn": VisionAMXAttention,
+    "xpu_attn": VisionIntelXPUAttention,
 }
 
 
@@ -794,8 +925,8 @@ class VisionAttention(nn.Module):
                 DeprecationWarning,
                 stacklevel=2,
             )
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
+        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
+        self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
         self.dropout = dropout
         num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_size = head_dim if head_dim is not None else embed_dim // num_heads
@@ -965,8 +1096,10 @@ class VisionAttention(nn.Module):
                 backend = "aiter_attn"
             else:
                 backend = "triton_attn"
+        elif _is_cpu and _is_cpu_amx_available:
+            backend = "amx_attn"
         elif _is_xpu:
-            backend = "triton_attn"
+            backend = "triton_attn" if not use_intel_xpu_backend() else "xpu_attn"
         else:
             backend = "sdpa"
         if backend == "fa3" and is_blackwell_supported():
@@ -1068,11 +1201,9 @@ class VisionAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
             # [b, s, embed_dim] --> [b * s, head, head_size]
-            q = q.reshape(bsz * s, head, -1).contiguous()
-            k = k.reshape(bsz * s, kv_head, -1).contiguous()
-            v = v.reshape(bsz * s, kv_head, -1).contiguous()
-            if self.qk_normalization_by_head_size:
-                q, k = self._apply_qk_norm_head_size(q, k)
+            q = q.reshape(bsz * s, head, -1)
+            k = k.reshape(bsz * s, kv_head, -1)
+            v = v.reshape(bsz * s, kv_head, -1)
         else:
             # [b, s, embed_dim] --> [s, b, embed_dim]
             x = rearrange(x, "b s ... -> s b ...")
@@ -1090,12 +1221,14 @@ class VisionAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
             # [s, b, head, head_size] --> [b, s, head, head_size]
-            q, k, v = [
-                rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v)
-            ]
+            q, k, v = [rearrange(x, "s b ... -> b s ...") for x in (q, k, v)]
 
-            if self.qk_normalization_by_head_size:
-                q, k = self._apply_qk_norm_head_size(q, k)
+        if not (_is_cpu and _is_cpu_amx_available):
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+        if self.qk_normalization_by_head_size:
+            q, k = self._apply_qk_norm_head_size(q, k)
 
         cos = None
         sin = None

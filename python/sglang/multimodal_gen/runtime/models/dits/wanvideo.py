@@ -624,6 +624,8 @@ class WanTransformerBlock_VSA(nn.Module):
         added_kv_proj_dim: int | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        attention_type: str = "original",
+        sla_topk: float = 0.0,
         quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
@@ -937,7 +939,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             config.out_channels * math.prod(config.patch_size),
             bias=True,
             gather_output=True,
-            prefix=f"proj_out",
+            prefix="proj_out",
             quant_config=quant_config,
         )
         self.scale_shift_table = nn.Parameter(

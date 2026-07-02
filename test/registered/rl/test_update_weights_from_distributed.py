@@ -315,7 +315,7 @@ def init_process_sgl(
             model_path=model_name,
             base_gpu_id=base_gpu_id,
             tp_size=tp_size,
-            cuda_graph_max_bs=2,
+            cuda_graph_max_bs_decode=2,
         )
     else:
         if rank == 1:
@@ -334,7 +334,7 @@ def init_process_sgl(
                 str(base_gpu_id),
                 "--tp-size",
                 str(tp_size),
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 2,
             ),
         )

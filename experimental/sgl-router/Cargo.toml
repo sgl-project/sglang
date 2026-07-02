@@ -1,0 +1,114 @@
+[workspace]
+resolver = "2"
+members = ["."]
+
+[package]
+name = "sgl-router"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Slim KV-aware OpenAI-compatible router for SGLang workers"
+publish = false  # binary-only; not published to crates.io
+
+[lib]
+name = "sgl_router"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "sgl-router"
+path = "src/main.rs"
+
+[lints.rust]
+unused_qualifications = "warn"
+
+[dependencies]
+# Dynamo crates — pinned by SHA. Bumps are manual PRs.
+dynamo-protocols = { git = "https://github.com/ai-dynamo/dynamo", rev = "1efdd4dcb901caeae636131321094090d252c8d6" }
+dynamo-tokenizers = { git = "https://github.com/ai-dynamo/dynamo", rev = "1efdd4dcb901caeae636131321094090d252c8d6" }
+dynamo-parsers = { git = "https://github.com/ai-dynamo/dynamo", rev = "1efdd4dcb901caeae636131321094090d252c8d6" }
+
+# Async runtime + http
+tokio = { version = "1.42", features = ["full"] }
+axum = { version = "0.8", features = ["macros", "tracing"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "request-id"] }
+reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Tokenizer auto-download from HuggingFace when --tokenizer-path is omitted.
+# Sync (`ureq`) API only — it runs once at startup; `ureq` is on rustls, so
+# this pulls no openssl/native-tls (matching reqwest's rustls-tls above).
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+
+# Chat-template rendering for cache-aware routing: the engine caches tokens
+# AFTER applying the model's chat template, so the router renders the same
+# template (from tokenizer_config.json) before hashing — otherwise its query
+# token_ids diverge from the engine's stored blocks. `pycompat` supplies the
+# Python str/dict methods HF chat templates rely on (.startswith, .items, ...).
+minijinja = { version = "2", features = ["loop_controls", "json"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+# `strftime_now` chat-template helper (some templates inject the current date).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Utilities
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+futures = "0.3"
+bytes = "1"
+rand = "0.8"
+tokio-stream = "0.1"
+dashmap = "6"
+kube = { version = "0.96", features = ["runtime", "derive"] }
+k8s-openapi = { version = "0.23", features = ["v1_31"] }
+tokio-util = "0.7"
+uuid = { version = "1", features = ["v4"] }
+
+# KV-event subsystem — msgpack-encoded events over ZMQ and sha256-based
+# block hashing matching SGLang's `radix_cache`.  Wire format authority is
+# `python/sglang/srt/disaggregation/kv_events.py`.
+parking_lot = "0.12"
+rmp-serde = "1"
+sha2 = "0.10"
+url = "2"
+zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
+
+[dev-dependencies]
+dirs = "5"
+http-body-util = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1.42", features = ["test-util"] }
+# Low-level msgpack encoder used to hand-construct wire bytes in
+# kv_events golden-bytes tests (decode-only path uses rmp-serde).
+rmp = "0.8"
+# Criterion benches that mirror the SMG `radix_tree_benchmark` +
+# `manual_policy_benchmark` so routing-decision latency can be compared
+# apples-to-apples against the gateway being deprecated.
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+
+[[test]]
+name = "component"
+path = "tests/component/main.rs"
+
+[[test]]
+name = "proxy"
+path = "tests/proxy/main.rs"
+
+[[bench]]
+name = "tree_lookup"
+harness = false
+path = "benches/tree_lookup.rs"
+
+[[bench]]
+name = "policy_select"
+harness = false
+path = "benches/policy_select.rs"

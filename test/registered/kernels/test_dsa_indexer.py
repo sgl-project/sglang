@@ -4,11 +4,12 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.layers import dp_attention as _dp_attn
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 
-# Patch DP-attention globals before importing backends
-_dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
+_parallel_override = get_parallel().override(attn_tp_size=1)
+_parallel_override.__enter__()
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
@@ -16,7 +17,15 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
     Indexer,
     rotate_activation,
 )
-from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+    DSATopKBackend,
+    TopkTransformMethod,
+)
+from sglang.srt.layers.attention.dsa_backend import (
+    DeepseekSparseAttnBackend,
+    DSAIndexerMetadata,
+    DSAMetadata,
+)
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -250,8 +259,10 @@ class MockModelRunner:
                 "enable_deterministic_inference": False,
                 "dsa_prefill_backend": "flashmla_sparse",
                 "dsa_decode_backend": "fa3",
+                "dsa_topk_backend": "sgl-kernel",
             },
         )()
+        self.hisparse_coordinator = None
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
@@ -310,8 +321,8 @@ class TestDSAIndexer(CustomTestCase):
         params.update(kwargs)
 
         torch.set_default_dtype(self.dtype)
-        indexer = Indexer(**params)
-        # Move indexer to CUDA device
+        with torch.device(self.device):
+            indexer = Indexer(**params)
         indexer = indexer.to(device=self.device)
 
         # Convert linear layer weights to bfloat16 (but preserve LayerNorm's float32
@@ -360,7 +371,6 @@ class TestDSAIndexer(CustomTestCase):
                 ),
                 extend_seq_lens=torch.tensor([q_len] * batch_size, device=self.device),
                 extend_seq_lens_cpu=torch.tensor([q_len] * batch_size, device="cpu"),
-                attn_backend=self.backend,
             )
         else:  # ForwardMode.DECODE
             decode_len = 1
@@ -379,12 +389,18 @@ class TestDSAIndexer(CustomTestCase):
                 req_pool_indices=torch.arange(batch_size, device=self.device),
                 seq_lens=torch.tensor([total_len] * batch_size, device=self.device),
                 seq_lens_cpu=torch.tensor([total_len] * batch_size, device="cpu"),
-                attn_backend=self.backend,
             )
 
-        # Add token pools
-        forward_batch.req_to_token_pool = self.model_runner.req_to_token_pool
-        forward_batch.token_to_kv_pool = self.model_runner.token_to_kv_pool
+        # Pool refs + attn_backend are now resolved via the ForwardContext;
+        # publish ``self.backend`` for the duration of this fixture call so
+        # ``get_attn_backend()`` / ``get_token_to_kv_pool()`` /
+        # ``get_req_to_token_pool()`` resolve correctly.
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            set_forward_context,
+        )
+
+        set_forward_context(ForwardContext(attn_backend=self.backend))
 
         # Mock write to req_to_token_pool
         page_size = self.model_runner.page_size
@@ -415,6 +431,271 @@ class TestDSAIndexer(CustomTestCase):
         self.assertTrue(
             has_padding or topk_indices.shape[1] == topk,
             "Output should have padding or exact topk size",
+        )
+
+    def _make_tie_free_logits(
+        self, batch_size: int, max_score_len: int
+    ) -> torch.Tensor:
+        perm = torch.argsort(
+            torch.randn(
+                batch_size, max_score_len, dtype=torch.float32, device=self.device
+            ),
+            dim=-1,
+        )
+        return torch.gather(
+            torch.arange(max_score_len, device=self.device, dtype=torch.float32)
+            .unsqueeze(0)
+            .expand(batch_size, -1),
+            dim=1,
+            index=perm,
+        )
+
+    def _run_unfused_topk_backend_validity_test(
+        self,
+        batch_size: int,
+        max_score_len: int,
+        topk: int,
+        topk_backend: DSATopKBackend,
+        with_row_starts: bool,
+    ):
+        logits = self._make_tie_free_logits(batch_size, max_score_len)
+
+        if with_row_starts:
+            row_starts = torch.randint(
+                0,
+                max_score_len - 1,
+                (batch_size,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            max_lengths = max_score_len - row_starts
+            random_lengths = torch.randint(
+                0,
+                max_score_len - 1,
+                (batch_size,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            seq_lens_expanded = torch.minimum(max_lengths, random_lengths)
+        else:
+            row_starts = None
+            seq_lens_expanded = torch.randint(
+                0,
+                max_score_len - 1,
+                (batch_size,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+
+        seq_lens_expanded = seq_lens_expanded.to(dtype=torch.int32, device=self.device)
+        max_seq_len_k = int(seq_lens_expanded.max().item())
+        cu_seqlens_q = torch.arange(
+            batch_size + 1, dtype=torch.int32, device=self.device
+        )
+        dsa_cu_seqlens_k = torch.zeros(
+            batch_size + 1, dtype=torch.int32, device=self.device
+        )
+        dsa_cu_seqlens_k[1:] = torch.cumsum(seq_lens_expanded, dim=0)
+        page_table_1 = (
+            torch.arange(max_seq_len_k, dtype=torch.int32, device=self.device)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+            .contiguous()
+        )
+        metadata = DSAIndexerMetadata(
+            attn_metadata=DSAMetadata(
+                page_size=1,
+                cache_seqlens_int32=seq_lens_expanded.clone(),
+                max_seq_len_q=1,
+                max_seq_len_k=max_seq_len_k,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_q.clone(),
+                page_table_1=page_table_1,
+                real_page_table=page_table_1,
+                dsa_cache_seqlens_int32=seq_lens_expanded.clone(),
+                dsa_cu_seqlens_q=cu_seqlens_q.clone(),
+                dsa_cu_seqlens_k=dsa_cu_seqlens_k,
+                dsa_extend_seq_lens_list=seq_lens_expanded.cpu().tolist(),
+                dsa_seqlens_expanded=seq_lens_expanded,
+            ),
+            topk_transform_method=TopkTransformMethod.PAGED,
+            topk_backend=topk_backend,
+        )
+
+        with envs.SGLANG_DSA_FUSE_TOPK.override(False):
+            topk_test = metadata.topk_transform(logits, topk, ks=row_starts)
+        self.assertEqual(topk_test.shape, (batch_size, topk))
+        self.assertEqual(topk_test.dtype, torch.int32)
+        expected_valid = torch.minimum(
+            seq_lens_expanded,
+            torch.full_like(seq_lens_expanded, topk),
+        )
+        actual_valid = (topk_test >= 0).sum(dim=-1).to(torch.int32)
+        self.assertTrue(torch.equal(actual_valid, expected_valid))
+
+        starts = (
+            row_starts.to(torch.int32)
+            if row_starts is not None
+            else torch.zeros(
+                (topk_test.shape[0],), dtype=torch.int32, device=topk_test.device
+            )
+        )
+        for row in range(topk_test.shape[0]):
+            test_row = topk_test[row]
+            valid_test = test_row[test_row >= 0]
+            expected_k = int(expected_valid[row].item())
+            self.assertEqual(valid_test.numel(), expected_k)
+            if expected_k == 0:
+                continue
+            start = int(starts[row].item())
+            row_len = int(seq_lens_expanded[row].item())
+            self.assertTrue(torch.all((valid_test >= 0) & (valid_test < row_len)))
+            self.assertEqual(torch.unique(valid_test).numel(), valid_test.numel())
+
+            row_scores = logits[row, start : start + row_len]
+            ref_topk = torch.topk(row_scores, expected_k, dim=-1, sorted=False).indices
+            self.assertTrue(
+                torch.equal(
+                    torch.sort(valid_test.to(torch.int32)).values,
+                    torch.sort(ref_topk.to(torch.int32)).values,
+                )
+            )
+
+    def _run_fused_topk_backend_equivalence_test(
+        self,
+        batch_size: int,
+        max_score_len: int,
+        topk: int,
+        topk_transform_method: TopkTransformMethod,
+        with_row_starts: bool,
+        query_lens: Optional[List[int]] = None,
+    ):
+        num_rows = sum(query_lens) if query_lens is not None else batch_size
+        logits = self._make_tie_free_logits(num_rows, max_score_len)
+
+        if with_row_starts:
+            row_starts = torch.randint(
+                0,
+                max_score_len - 1,
+                (num_rows,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            max_lengths = max_score_len - row_starts
+            random_lengths = torch.randint(
+                1,
+                max_score_len,
+                (num_rows,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            seq_lens_expanded = torch.minimum(max_lengths, random_lengths)
+        else:
+            row_starts = None
+            seq_lens_expanded = torch.randint(
+                1,
+                max_score_len,
+                (num_rows,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+
+        topk_indices_offset = (
+            torch.arange(num_rows, dtype=torch.int32, device=self.device)
+            * max_score_len
+        )
+        if query_lens is None:
+            cu_seqlens_q = torch.arange(
+                batch_size + 1, dtype=torch.int32, device=self.device
+            )
+            q_lens = None
+            batch_idx_list = None
+        else:
+            q_lens = torch.tensor(query_lens, dtype=torch.int32, device=self.device)
+            cu_seqlens_q = torch.zeros(
+                batch_size + 1, dtype=torch.int32, device=self.device
+            )
+            cu_seqlens_q[1:] = torch.cumsum(q_lens, dim=0)
+            batch_idx_list = list(range(batch_size))
+        cu_seqlens_k = torch.zeros(
+            batch_size + 1, dtype=torch.int32, device=self.device
+        )
+        dsa_cu_seqlens_k = torch.zeros(
+            num_rows + 1, dtype=torch.int32, device=self.device
+        )
+        dsa_cu_seqlens_k[1:] = torch.cumsum(seq_lens_expanded, dim=0)
+
+        page_table_1 = (
+            (
+                torch.arange(max_score_len, dtype=torch.int32, device=self.device)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+            )
+            + (
+                torch.arange(
+                    batch_size, dtype=torch.int32, device=self.device
+                ).unsqueeze(1)
+                * max_score_len
+            )
+        ).contiguous()
+
+        attn_metadata = DSAMetadata(
+            page_size=1,
+            cache_seqlens_int32=seq_lens_expanded.clone(),
+            max_seq_len_q=1,
+            max_seq_len_k=max_score_len,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            page_table_1=page_table_1,
+            real_page_table=page_table_1,
+            dsa_cache_seqlens_int32=seq_lens_expanded.clone(),
+            dsa_cu_seqlens_q=cu_seqlens_q.clone(),
+            dsa_cu_seqlens_k=dsa_cu_seqlens_k,
+            dsa_extend_seq_lens_list=seq_lens_expanded.cpu().tolist(),
+            dsa_seqlens_expanded=seq_lens_expanded,
+            topk_indices_offset=(
+                topk_indices_offset
+                if topk_transform_method == TopkTransformMethod.RAGGED
+                else None
+            ),
+        )
+
+        metadata_sgl = DSAIndexerMetadata(
+            attn_metadata=attn_metadata,
+            topk_transform_method=topk_transform_method,
+            topk_backend=DSATopKBackend.SGL_KERNEL,
+        )
+        metadata_flashinfer = DSAIndexerMetadata(
+            attn_metadata=attn_metadata,
+            topk_transform_method=topk_transform_method,
+            topk_backend=DSATopKBackend.FLASHINFER,
+        )
+
+        with envs.SGLANG_DSA_FUSE_TOPK.override(True):
+            out_sgl = metadata_sgl.topk_transform(
+                logits,
+                topk,
+                ks=row_starts,
+                cu_seqlens_q=q_lens,
+                batch_idx_list=batch_idx_list,
+            )
+            out_flashinfer = metadata_flashinfer.topk_transform(
+                logits,
+                topk,
+                ks=row_starts,
+                cu_seqlens_q=q_lens,
+                batch_idx_list=batch_idx_list,
+            )
+
+        self.assertEqual(out_sgl.shape, out_flashinfer.shape)
+        self.assertEqual(out_sgl.dtype, out_flashinfer.dtype)
+        self.assertEqual(out_sgl.dtype, torch.int32)
+
+        self.assertTrue(
+            torch.equal(
+                torch.sort(out_sgl, dim=-1).values,
+                torch.sort(out_flashinfer, dim=-1).values,
+            )
         )
 
     @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
@@ -625,6 +906,86 @@ class TestDSAIndexer(CustomTestCase):
         topk = 64
         topk_indices = metadata.topk_transform(logits, topk)
         self.assertEqual(topk_indices.shape, (batch_size, topk))
+
+    def test_topk_unfused_backends_valid_selection(self):
+        batch_size = 8
+        max_score_len = 16 * 1024
+        topk = 2048
+        for topk_backend in [
+            DSATopKBackend.SGL_KERNEL,
+            DSATopKBackend.TORCH,
+            DSATopKBackend.FLASHINFER,
+        ]:
+            tie_break_values = (
+                [None, "small", "large"]
+                if topk_backend == DSATopKBackend.FLASHINFER
+                else [None]
+            )
+            for tie_break in tie_break_values:
+                for with_row_starts in [False, True]:
+                    with self.subTest(
+                        topk_backend=topk_backend.value,
+                        tie_break=tie_break,
+                        with_row_starts=with_row_starts,
+                    ):
+                        with envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override(
+                            tie_break
+                        ):
+                            self._run_unfused_topk_backend_validity_test(
+                                batch_size,
+                                max_score_len,
+                                topk,
+                                topk_backend=topk_backend,
+                                with_row_starts=with_row_starts,
+                            )
+
+    def test_topk_fused_backends_equivalence(self):
+        batch_size = 8
+        max_score_len = 16 * 1024
+        topk = 2048
+        for tie_break in [None, "small", "large"]:
+            for topk_transform_method in [
+                TopkTransformMethod.PAGED,
+                TopkTransformMethod.RAGGED,
+            ]:
+                for with_row_starts in [False, True]:
+                    if (
+                        topk_transform_method == TopkTransformMethod.PAGED
+                        and with_row_starts
+                    ):
+                        # The synthetic paged fixture uses the decode-like row mapping.
+                        # Ragged fused and unfused cases cover shifted row windows.
+                        continue
+                    with self.subTest(
+                        tie_break=tie_break,
+                        topk_transform_method=topk_transform_method.name,
+                        with_row_starts=with_row_starts,
+                    ):
+                        with envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override(
+                            tie_break
+                        ):
+                            self._run_fused_topk_backend_equivalence_test(
+                                batch_size=batch_size,
+                                max_score_len=max_score_len,
+                                topk=topk,
+                                topk_transform_method=topk_transform_method,
+                                with_row_starts=with_row_starts,
+                            )
+            with self.subTest(
+                tie_break=tie_break,
+                topk_transform_method=TopkTransformMethod.PAGED.name,
+                with_row_starts=False,
+                query_lens="multi",
+            ):
+                with envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override(tie_break):
+                    self._run_fused_topk_backend_equivalence_test(
+                        batch_size=batch_size,
+                        max_score_len=max_score_len,
+                        topk=topk,
+                        topk_transform_method=TopkTransformMethod.PAGED,
+                        with_row_starts=False,
+                        query_lens=[1, 2, 3, 1, 2, 1, 3, 2],
+                    )
 
     # TODO: enable this test after indexer accuracy aligned
     # @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")

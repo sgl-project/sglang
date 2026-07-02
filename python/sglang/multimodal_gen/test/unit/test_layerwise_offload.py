@@ -204,6 +204,30 @@ def test_layerwise_offload_preserves_non_contiguous_stride(monkeypatch):
     assert torch.equal(reloaded_weight, original_weight)
 
 
+def test_layerwise_offload_uses_normal_tensors_under_inference_mode(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    model = _DummyModel()
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        pin_cpu_memory=False,
+        prefetch_size=1,
+    )
+
+    with torch.inference_mode():
+        manager.release_layer(0)
+        manager.prefetch_layer(0, non_blocking=False)
+
+    assert model.blocks[0].weight._version >= 0
+    assert model.blocks[0].bias._version >= 0
+
+
 def test_layerwise_offload_keeps_shared_buffers_resident(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule

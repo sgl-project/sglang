@@ -30,25 +30,26 @@ you encounter issues or have any questions, please [open an issue](https://githu
 
 ### Low Latency
 
-| Model           | Hardware      | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration                                                                  |
-|-----------------|---------------|-------|-------------|---------|------|--------------|--------------------------------------------------------------------------------|
-| Qwen3-235B-A22B | Atlas 800I A3 | 8     | PD Mixed    | 11K+1K  | 10ms | BF16         | [Optimal Configuration](#qwen3-235b-a22b-11k-1k-10ms-on-a3-8-cards-mixed-mode) |
-| Qwen3-32B       | Atlas 800I A3 | 4     | PD Mixed    | 6K+1.5K | 18ms | BF16         | [Optimal Configuration](#qwen3-32b-6k-1_5k-18ms-on-a3-4-cards-mixed-mode)      |
-| Qwen3-32B       | Atlas 800I A3 | 4     | PD Mixed    | 4K+1.5K | 11ms | BF16         | [Optimal Configuration](#qwen3-32b-4k-1_5k-11ms-on-a3-4-cards-mixed-mode)      |
-| Qwen3-32B       | Atlas 800I A3 | 8     | PD Mixed    | 18K+4K  | 6ms  | BF16         | [Optimal Configuration](#qwen3-32b-18k-4k-6ms-on-a3-8-cards-mixed-mode)        |
-| Qwen3-32B       | Atlas 800I A2 | 8     | PD Mixed    | 6K+1.5K | 18ms | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-6k-1_5k-18ms-on-a2-8-cards-mixed-mode)      |
-| Qwen3-32B       | Atlas 800I A2 | 8     | PD Mixed    | 4K+1.5K | 11ms | BF16         | [Optimal Configuration](#qwen3-32b-4k-1_5k-11ms-on-a2-8-cards-mixed-mode)      |
-| Qwen3-32B       | Atlas 800I A3 | 2     | PD Mixed    | 1K+0.3K | 12ms | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-1k-0_3k-12ms-on-a3-2-cards-mixed-mode)      |
-| Qwen3-32B       | Atlas 800I A3 | 2     | PD Mixed    | 6K+1.5K | 17ms | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-6k-1_5k-17ms-on-a3-2-cards-mixed-mode)      |
-| Qwen3-8B        | Atlas 800I A3 | 1     | PD Mixed    | 1K+0.3K | 7ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-1k-0_3k-7ms-on-a3-1-cards-mixed-mode)        |
-| Qwen3-8B        | Atlas 800I A3 | 1     | PD Mixed    | 6K+1.5K | 12ms | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-6k-1_5k-12ms-on-a3-1-cards-mixed-mode)       |
-| Qwen3-8B        | Atlas 800I A3 | 1     | PD Mixed    | 3.5K+1.5K | 5ms | W8A8 INT8   | [Optimal Configuration](#qwen3-8b-3_5k-1_5k-5ms-on-a3-1-cards-mixed-mode)      |
-| Qwen3-30B-A3B   | Atlas 800I A3 | 1     | PD Mixed    | 6K+1.5K | 10ms | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-6k-1_5k-10ms-on-a3-1-cards-mixed-mode)  |
-| Qwen3-30B-A3B   | Atlas 800I A3 | 1     | PD Mixed    | 1K+0.3K | 7ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-1k-0_3k-7ms-on-a3-1-cards-mixed-mode)   |
-| Qwen3-Next-A3B-Instruct       | Atlas 800I A3 | 2     | PD Mixed    | 1K+0.3K | 14.21ms | W8A8 INT8    | [Optimal Configuration](#qwen3-next-1k-0_3k-14_21ms-on-a3-2-cards-mixed-mode)      |
-| Qwen3-Next-A3B-Instruct       | Atlas 800I A3 | 2     | PD Mixed    | 6K+1.5K | 15.62ms | W8A8 INT8    | [Optimal Configuration](#qwen3-next-6k-1_5k-15_62ms-on-a3-2-cards-mixed-mode)      |
-| Qwen3-Next-A3B-Instruct       | Atlas 800I A3 | 2     | PD Mixed    | 3.5K+1.5K | 20ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-next-3_5k-1_5k-20ms-on-a3-2-cards-mixed-mode)       |
-| Qwen3-14B                     | Atlas 800I A3 | 1     | PD Mixed    | 3.5K+1.5K | 9ms   | W8A8 INT8    | [Optimal Configuration](#qwen3-14b-3_5k-1_5k-9ms-on-a3-1-cards-mixed-mode)         |
+| Model                   | Hardware      | Cards | Deploy Mode | Dataset   | TPOT    | Quantization | Configuration                                                                      |
+|-------------------------|---------------|-------|-------------|-----------|---------|--------------|------------------------------------------------------------------------------------|
+| Qwen3-235B-A22B         | Atlas 800I A3 | 8     | PD Mixed    | 11K+1K    | 10ms    | BF16         | [Optimal Configuration](#qwen3-235b-a22b-11k-1k-10ms-on-a3-8-cards-mixed-mode)     |
+| Qwen3-32B               | Atlas 800I A3 | 4     | PD Mixed    | 6K+1.5K   | 18ms    | BF16         | [Optimal Configuration](#qwen3-32b-6k-1_5k-18ms-on-a3-4-cards-mixed-mode)          |
+| Qwen3-32B               | Atlas 800I A3 | 4     | PD Mixed    | 4K+1.5K   | 11ms    | BF16         | [Optimal Configuration](#qwen3-32b-4k-1_5k-11ms-on-a3-4-cards-mixed-mode)          |
+| Qwen3-32B               | Atlas 800I A3 | 8     | PD Mixed    | 18K+4K    | 6ms     | BF16         | [Optimal Configuration](#qwen3-32b-18k-4k-6ms-on-a3-8-cards-mixed-mode)            |
+| Qwen3-32B               | Atlas 800I A2 | 8     | PD Mixed    | 6K+1.5K   | 18ms    | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-6k-1_5k-18ms-on-a2-8-cards-mixed-mode)          |
+| Qwen3-32B               | Atlas 800I A2 | 8     | PD Mixed    | 4K+1.5K   | 11ms    | BF16         | [Optimal Configuration](#qwen3-32b-4k-1_5k-11ms-on-a2-8-cards-mixed-mode)          |
+| Qwen3-32B               | Atlas 800I A3 | 2     | PD Mixed    | 1K+0.3K   | 12ms    | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-1k-0_3k-12ms-on-a3-2-cards-mixed-mode)          |
+| Qwen3-32B               | Atlas 800I A3 | 2     | PD Mixed    | 6K+1.5K   | 17ms    | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-6k-1_5k-17ms-on-a3-2-cards-mixed-mode)          |
+| Qwen3-8B                | Atlas 800I A3 | 1     | PD Mixed    | 1K+0.3K   | 7ms     | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-1k-0_3k-7ms-on-a3-1-cards-mixed-mode)            |
+| Qwen3-8B                | Atlas 800I A3 | 1     | PD Mixed    | 6K+1.5K   | 12ms    | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-6k-1_5k-12ms-on-a3-1-cards-mixed-mode)           |
+| Qwen3-8B                | Atlas 800I A3 | 1     | PD Mixed    | 3.5K+1.5K | 5ms     | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-3_5k-1_5k-5ms-on-a3-1-cards-mixed-mode)          |
+| Qwen3-30B-A3B           | Atlas 800I A3 | 1     | PD Mixed    | 6K+1.5K   | 10ms    | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-6k-1_5k-10ms-on-a3-1-cards-mixed-mode)      |
+| Qwen3-30B-A3B           | Atlas 800I A3 | 1     | PD Mixed    | 1K+0.3K   | 7ms     | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-1k-0_3k-7ms-on-a3-1-cards-mixed-mode)       |
+| Qwen3-Next-A3B-Instruct | Atlas 800I A3 | 2     | PD Mixed    | 1K+0.3K   | 14.21ms | W8A8 INT8    | [Optimal Configuration](#qwen3-next-1k-0_3k-14_21ms-on-a3-2-cards-mixed-mode)      |
+| Qwen3-Next-A3B-Instruct | Atlas 800I A3 | 2     | PD Mixed    | 6K+1.5K   | 15.62ms | W8A8 INT8    | [Optimal Configuration](#qwen3-next-6k-1_5k-15_62ms-on-a3-2-cards-mixed-mode)      |
+| Qwen3-Next-A3B-Instruct | Atlas 800I A3 | 2     | PD Mixed    | 3.5K+1.5K | 20ms    | W8A8 INT8    | [Optimal Configuration](#qwen3-next-3_5k-1_5k-20ms-on-a3-2-cards-mixed-mode)       |
+| Qwen3-14B               | Atlas 800I A3 | 1     | PD Mixed    | 3.5K+1.5K | 9ms     | W8A8 INT8    | [Optimal Configuration](#qwen3-14b-3_5k-1_5k-9ms-on-a3-1-cards-mixed-mode)         |
+| Qwen3.5-397B-A17B       | Atlas 800I A3 | 8     | PD Mixed    | 3.5K+1.5K | 22ms    | W4A8         | [Optimal Configuration](#qwen35-397B-a17b-3_5k-1_5k-22ms-on-a3-8-cards-mixed-mode) |
 
 ### High Throughput
 
@@ -70,6 +71,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
 | Qwen3-32B                      | Atlas 800I A2 | 8     | PD Mixed          | 2K+2K     | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-2k-2k-50ms-on-a2-8-cards-mixed-mode)                                    |
 | Qwen3-14B                      | Atlas 800I A3 | 1     | PD Mixed          | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-14b-3_5k-1_5k-50ms-on-a3-1-cards-mixed-mode)                                |
 | Qwen3-8B                       | Atlas 800I A3 | 1     | PD Mixed          | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-3_5k-1_5k-50ms-on-a3-1-cards-mixed-mode)                                 |
+| Qwen3.5-397B-A17B              | Atlas 800I A3 | 8     | PD Mixed          | 3.5K+1.5K | 50ms  | W4A8         | [Optimal Configuration](#qwen35-397B-a17b-3_5k-1_5k-50ms-on-a3-8-cards-mixed-mode)                         |
 
 ## Optimal Configuration
 
@@ -3743,4 +3745,178 @@ We tested it based on the `RANDOM` dataset.
 
 ```shell
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --random-range-ratio 1 --max-concurrency 1 --random-output-len 1500 --random-input-len 3500 --num-prompts 1
+```
+
+## Qwen3.5-397B-A17B 3_5K-1_5K 22ms on A3 8 Cards Mixed Mode
+
+Model: Qwen3.5-397B-A17B
+
+Hardware: Atlas 800I A3 8Card
+
+DeployMode: PD Mixed
+
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
+
+TPOT: 22ms
+
+#### Model Deployment
+
+```shell
+# high performance cpu
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+# bind cpu
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+export ASCEND_USE_FIA=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export HCCL_BUFFSIZE=3000
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
+export STREAMS_PER_DEVICE=32
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_NPU_USE_MULTI_STREAM=1
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=58624
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_ZBAL_BOOTSTRAP_URL="tcp://127.0.0.1:24669"
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+export ZBAL_ENABLE_GRAPH=1
+
+MODEL_PATH=xxx
+
+python3 -m sglang.launch_server \
+--model-path $MODEL_PATH \
+--attention-backend ascend \
+--device npu \
+--tp-size 16 \
+--chunked-prefill-size -1 --max-prefill-tokens 35000 \
+--disable-radix-cache \
+--trust-remote-code \
+--host 127.0.0.1 --max-running-requests 160 \
+--mem-fraction-static 0.8 \
+--port 6699 \
+--cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 \
+--quantization modelslim \
+--enable-multimodal --moe-a2a-backend deepep --deepep-mode auto \
+--mm-attention-backend ascend_attn \
+--dtype bfloat16 --mamba-ssm-dtype bfloat16 --max-total-tokens 128000 \
+--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+--speculative-draft-model-quantization unquant \
+--dp-size 8 --enable-dp-attention --enable-dp-lm-head \
+--enable-prefill-delayer --prefill-delayer-max-delay-passes 100
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell
+python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --random-range-ratio 1 --max-concurrency 120 --random-output-len 1500 --random-input-len 3500 --num-prompts 480
+```
+
+## Qwen3.5-397B-A17B 3_5K-1_5K 50ms on A3 8 Cards Mixed Mode
+
+Model: Qwen3.5-397B-A17B
+
+Hardware: Atlas 800I A3 8Card
+
+DeployMode: PD Mixed
+
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
+
+TPOT: 50ms
+
+#### Model Deployment
+
+```shell
+# high performance cpu
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+# bind cpu
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+export ASCEND_USE_FIA=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export HCCL_BUFFSIZE=3000
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
+export STREAMS_PER_DEVICE=32
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_NPU_USE_MULTI_STREAM=1
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=59648
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_ZBAL_BOOTSTRAP_URL="tcp://127.0.0.1:24669"
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+export ZBAL_ENABLE_GRAPH=1
+
+MODEL_PATH=xxx
+
+python3 -m sglang.launch_server \
+--model-path $MODEL_PATH \
+--attention-backend ascend \
+--device npu \
+--tp-size 16 \
+--chunked-prefill-size -1 --max-prefill-tokens 17500 \
+--disable-radix-cache \
+--trust-remote-code \
+--host 127.0.0.1 --max-running-requests 432 \
+--mem-fraction-static 0.75 \
+--port 6699 \
+--cuda-graph-bs 2 4 6 8 12 16 20 24 28 32 36 40 44 48 52 56 \
+--quantization modelslim \
+--enable-multimodal --moe-a2a-backend deepep --deepep-mode auto \
+--mm-attention-backend ascend_attn \
+--dtype bfloat16 --mamba-ssm-dtype bfloat16 --max-total-tokens 280000 \
+--dp-size 8 --enable-dp-attention --enable-dp-lm-head \
+--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+--speculative-draft-model-quantization unquant \
+--enable-prefill-delayer --prefill-delayer-max-delay-passes 200
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell
+python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --random-range-ratio 1 --max-concurrency 176 --random-output-len 1500 --random-input-len 3500 --num-prompts 352
 ```

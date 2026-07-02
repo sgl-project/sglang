@@ -4,7 +4,6 @@ from typing import Any, Callable, List
 
 import torch
 
-from sglang.multimodal_gen.runtime.distributed import get_sp_group
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -33,26 +32,6 @@ class ParallelExecutor(PipelineExecutor):
 
     """
 
-    def collect_from_main(self, batches: list[Req]):
-
-        # TODO: fix this condition
-        if self.server_args.sp_degree != 1:
-            sp_group = get_sp_group()
-            batches = broadcast_pyobj(
-                batches,
-                sp_group.rank,
-                sp_group.cpu_group,
-                src=sp_group.ranks[0],
-            )
-
-        if self.server_args.enable_cfg_parallel:
-            batches = broadcast_pyobj(
-                batches,
-                self.worker.cfg_group.rank,
-                self.worker.cfg_cpu_group,
-                src=self.worker.cfg_group.ranks[0],
-            )
-
     def _execute_stages(
         self,
         stages: List[PipelineStage],
@@ -68,8 +47,9 @@ class ParallelExecutor(PipelineExecutor):
         cfg_group = get_cfg_group()
         group = get_world_group()
 
-        self.begin_component_residency_request(stages, batch, server_args)
-        try:
+        use_nvtx = self._should_use_stage_nvtx(batch, server_args)
+
+        with self._component_residency_request(stages, batch, server_args):
             # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
             for stage_index, stage in enumerate(stages):
                 paradigm = stage.parallelism_type
@@ -77,38 +57,80 @@ class ParallelExecutor(PipelineExecutor):
                 if paradigm == StageParallelismType.MAIN_RANK_ONLY:
                     if rank == 0:
                         # Only main rank executes, others just wait
-                        self.before_stage(stage, stage_index, batch, server_args)
-                        batch = stage(batch, server_args)
-                        self.after_stage(stage_index)
+                        batch = self._run_stage_with_executor_hooks(
+                            stage,
+                            stage_index,
+                            batch,
+                            server_args,
+                            run_stage,
+                            use_nvtx,
+                        )
                     torch.distributed.barrier()
 
                 elif paradigm == StageParallelismType.CFG_PARALLEL:
-                    obj_list = [batch] if rank == 0 else []
-                    # `dist.broadcast(src=...)` expects a global rank for process groups.
-                    broadcasted_list = broadcast_pyobj(
-                        obj_list,
-                        rank=get_world_rank(),
-                        dist_group=cfg_group.cpu_group,
-                        src=cfg_group.ranks[0],
+                    local_batch = batch
+                    local_batch_fields = stage.cfg_parallel_local_batch_fields(
+                        batch, server_args
                     )
+                    # filter local batch fields from batch
+                    if rank == 0 and local_batch_fields:
+                        local_field_values = {
+                            name: getattr(batch, name) for name in local_batch_fields
+                        }
+                        for name in local_batch_fields:
+                            setattr(batch, name, None)
+                    else:
+                        local_field_values = {}
+
+                    obj_list = [batch] if rank == 0 else []
+                    try:
+                        # `dist.broadcast(src=...)` expects a global rank for process groups.
+                        broadcasted_list = broadcast_pyobj(
+                            obj_list,
+                            rank=get_world_rank(),
+                            dist_group=cfg_group.cpu_group,
+                            src=cfg_group.ranks[0],
+                        )
+                    finally:
+                        if rank == 0:
+                            # resume local batch fields on rank 0
+                            for name, value in local_field_values.items():
+                                setattr(batch, name, value)
                     if rank != 0:
                         batch = broadcasted_list[0]
-                    self.before_stage(stage, stage_index, batch, server_args)
-                    batch = stage(batch, server_args)
-                    self.after_stage(stage_index)
+                        for name in local_batch_fields:
+                            setattr(batch, name, getattr(local_batch, name))
+                    batch = self._run_stage_with_executor_hooks(
+                        stage,
+                        stage_index,
+                        batch,
+                        server_args,
+                        run_stage,
+                        use_nvtx,
+                    )
 
                     torch.distributed.barrier()
 
                 elif paradigm == StageParallelismType.REPLICATED:
-                    self.before_stage(stage, stage_index, batch, server_args)
-                    batch = stage(batch, server_args)
-                    self.after_stage(stage_index)
+                    batch = self._run_stage_with_executor_hooks(
+                        stage,
+                        stage_index,
+                        batch,
+                        server_args,
+                        run_stage,
+                        use_nvtx,
+                    )
                 elif paradigm == StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS:
                     if rank == 0:
                         # Only main rank executes, others just wait
-                        self.before_stage(stage, stage_index, batch, server_args)
-                        batch = stage(batch, server_args)
-                        self.after_stage(stage_index)
+                        batch = self._run_stage_with_executor_hooks(
+                            stage,
+                            stage_index,
+                            batch,
+                            server_args,
+                            run_stage,
+                            use_nvtx,
+                        )
                     torch.distributed.barrier()
 
                     # Send batch to other ranks
@@ -119,8 +141,6 @@ class ParallelExecutor(PipelineExecutor):
                     if rank != 0:
                         batch = broadcasted_list[0]
                     torch.distributed.barrier()
-        finally:
-            self.finish_component_residency_request()
         return batch
 
     def execute(

@@ -12,6 +12,7 @@ import random
 import statistics
 import time
 import unittest
+from array import array
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable
@@ -20,6 +21,7 @@ import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -36,9 +38,10 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import Compone
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=25, suite="stage-b-test-1-gpu-small-amd")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -176,10 +179,8 @@ def create_bench_cache(
 
     # --- KV pool + allocator ---
     if has_swa:
-        from sglang.srt.mem_cache.swa_memory_pool import (
-            SWAKVPool,
-            SWATokenToKVPoolAllocator,
-        )
+        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         pool = SWAKVPool(
             size=kv_size,
@@ -190,7 +191,6 @@ def create_bench_cache(
             head_dim=_HEAD_DIM,
             swa_attention_layer_ids=_non_full_layer_ids(),
             full_attention_layer_ids=_full_attention_layer_ids(),
-            enable_kvcache_transpose=False,
             device=device,
         )
         allocator = SWATokenToKVPoolAllocator(
@@ -210,7 +210,6 @@ def create_bench_cache(
             head_num=_HEAD_NUM,
             head_dim=_HEAD_DIM,
             full_attention_layer_ids=_full_attention_layer_ids(),
-            enable_kvcache_transpose=False,
             device=device,
             enable_memory_saver=False,
             mamba_pool=req_to_token_pool.mamba_pool if has_mamba else None,
@@ -246,7 +245,7 @@ def create_bench_cache(
         req = Req(
             rid=_rid[0],
             origin_input_text="",
-            origin_input_ids=[],
+            origin_input_ids=array("q"),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
         _rid[0] += 1
@@ -335,7 +334,7 @@ def _insert_seq(env, seq):
     if env.has_mamba:
         req = env.make_req()
         mamba_val = req.mamba_pool_idx.unsqueeze(0)
-    key = RadixKey(seq)
+    key = RadixKey(array("q", seq))
     env.tree.insert(InsertParams(key=key, value=v[: len(key)], mamba_value=mamba_val))
     return True
 
@@ -357,7 +356,7 @@ def _fill_no_evict(env):
         if env.has_mamba:
             req = env.make_req()
             mamba_val = req.mamba_pool_idx.unsqueeze(0)
-        key = RadixKey(seq)
+        key = RadixKey(array("q", seq))
         env.tree.insert(
             InsertParams(key=key, value=v[: len(key)], mamba_value=mamba_val)
         )
@@ -505,7 +504,7 @@ def bench_match_prefix(
             queries.append([rng.randint(1, 32000)] * rng.randint(50, 300))
 
     def verify_fn(q):
-        k = RadixKey(q)
+        k = RadixKey(array("q", q))
         r1 = env.tree.match_prefix(MatchPrefixParams(key=k))
         r2 = env.tree.match_prefix(MatchPrefixParams(key=k))
         assert len(r1.device_indices) == len(r2.device_indices), "match not idempotent"
@@ -514,7 +513,7 @@ def bench_match_prefix(
     return bench_api(
         "match_prefix",
         lambda: queries,
-        lambda q: env.tree.match_prefix(MatchPrefixParams(key=RadixKey(q))),
+        lambda q: env.tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", q)))),
         min(len(queries) - warmup, num_seqs),
         env.avg_tokens,
         warmup,
@@ -566,7 +565,7 @@ def bench_lock_unlock(
 
     nodes = []
     for seq in env.seqs[: num_seqs // 2]:
-        r = env.tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
+        r = env.tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
         if r.last_device_node != env.tree.root_node:
             nodes.append(r.last_device_node)
     if not nodes:
@@ -613,7 +612,7 @@ def bench_cache_finished(
     # Pre-build Req objects with token IDs filled into req_to_token
     req_items: list = []
     for seq in env.seqs:
-        key = RadixKey(seq)
+        key = RadixKey(array("q", seq))
         mr = env.tree.match_prefix(MatchPrefixParams(key=key))
         matched_len = len(mr.device_indices)
         node = mr.last_device_node
@@ -635,9 +634,12 @@ def bench_cache_finished(
             kv_indices = mr.device_indices
 
         req = env.make_req()
-        req.origin_input_ids = list(seq)
-        req.output_ids = []
-        req.fill_ids = list(seq)
+        req.origin_input_ids = array("q", seq)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", seq)
+        req.set_extend_range(
+            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+        )
         req.last_node = node
         req.cache_protected_len = matched_len
         req.kv_committed_len = len(seq)
@@ -690,9 +692,11 @@ def run_all_benchmarks(
     if benchmarks is None or "all" in benchmarks:
         benchmarks = list(ALL_BENCHMARKS.keys())
 
-    set_global_server_args_for_scheduler(
-        ServerArgs(model_path="dummy", page_size=page_size)
-    )
+    server_args = ServerArgs(model_path="dummy", page_size=page_size)
+    # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
+    # loads the HF config for self.model_path — impossible for the dummy model.
+    server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, page_size)
+    set_global_server_args_for_scheduler(server_args)
 
     impl_name = (tree_cls or UnifiedRadixCache).__name__
     results = []
@@ -779,9 +783,11 @@ class _BenchSuite:
 
     @classmethod
     def setUpClass(cls):
-        set_global_server_args_for_scheduler(
-            ServerArgs(model_path="dummy", page_size=cls.bench_cfg["page_size"])
-        )
+        page_size = cls.bench_cfg["page_size"]
+        server_args = ServerArgs(model_path="dummy", page_size=page_size)
+        # See run_all_benchmarks for why _mamba_cache_chunk_size is preset.
+        server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, page_size)
+        set_global_server_args_for_scheduler(server_args)
 
     def _run(self, bench_fn):
         cfg = self.bench_cfg
