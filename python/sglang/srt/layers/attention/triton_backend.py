@@ -636,15 +636,28 @@ class TritonAttnBackend(AttentionBackend):
         """
         if self._translate_kv_loc is None:
             return None
-        # Full-attention read path.
-        n_kv = int(self.kv_indptr[bs].item())
+        # Full-attention read path. kv_indptr[bs] == forward_batch.seq_lens_sum;
+        # read the CPU mirror to avoid a per-step D2H `.item()` sync.
+        n_kv = (
+            forward_batch.seq_lens_sum
+            if forward_batch.seq_lens_sum is not None
+            else int(self.kv_indptr[bs].item())
+        )
         if n_kv > 0:
             self.cuda_graph_kv_indices[:n_kv] = self._translate_kv_loc(
                 self.cuda_graph_kv_indices[:n_kv]
             )
-        # SWA window read path (hybrid-SWA unified pools only).
+        # SWA window read path (hybrid-SWA unified pools only). window_kv_indptr[bs]
+        # == sum(min(seq_len, window)); compute it from the CPU seq_lens mirror.
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
-            n_win = int(self.window_kv_indptr[bs].item())
+            if forward_batch.seq_lens_cpu is not None:
+                n_win = int(
+                    forward_batch.seq_lens_cpu[:bs]
+                    .clamp(max=self.sliding_window_size)
+                    .sum()
+                )
+            else:
+                n_win = int(self.window_kv_indptr[bs].item())
             if n_win > 0:
                 self.cuda_graph_window_kv_indices[:n_win] = (
                     self.token_to_kv_pool.translate_loc_from_full_to_swa(
