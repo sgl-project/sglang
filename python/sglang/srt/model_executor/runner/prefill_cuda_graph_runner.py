@@ -70,7 +70,11 @@ from sglang.srt.model_executor.runner_backend.utils import (
 from sglang.srt.model_executor.runner_backend_utils import (
     PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    BCG_FAILURE_HINT,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    TCPCG_FAILURE_HINT,
     set_tc_piecewise_forward_context,
 )
 from sglang.srt.model_executor.runner_utils.buffers import (
@@ -92,6 +96,27 @@ logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+
+def prefill_failure_msg(backend_name: str) -> str:
+    """Render PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG with a backend-specific
+    numbered suggestion list. The runner is only constructed for BREAKABLE
+    or TC_PIECEWISE; other values fall back to a generic OOM-style list."""
+    if backend_name == Backend.BREAKABLE:
+        hint = BCG_FAILURE_HINT
+    elif backend_name == Backend.TC_PIECEWISE:
+        hint = TCPCG_FAILURE_HINT
+    else:
+        hint = (
+            "1. disable the prefill CUDA graph by --cuda-graph-backend-prefill=disabled\n"
+            "2. if it is an OOM problem, set --mem-fraction-static to a smaller value "
+            "(e.g., 0.8 or 0.7) or set --cuda-graph-max-bs-prefill to a smaller value "
+            "(e.g., 2048)\n"
+        )
+    return PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG.format(
+        backend=backend_name, suggestions=hint
+    )
+
 
 # Names of the static prefill input tensors a Breakable-backed prefill
 # runner owns. Each is a 1-D int64 tensor of length max_bs; captured
@@ -157,6 +182,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         _prefill_backend_name = (
             _cg_cfg.prefill.backend if _cg_cfg is not None else Backend.TC_PIECEWISE
         )
+        self.prefill_backend_name = _prefill_backend_name
         if (
             _prefill_backend_name == Backend.BREAKABLE
             and model_runner.spec_algorithm.is_eagle()
@@ -225,10 +251,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         try:
             self.backend = resolve_prefill_backend(self)
         except RuntimeError as e:
-            if _prefill_backend_name == Backend.TC_PIECEWISE:
+            if _prefill_backend_name in (Backend.TC_PIECEWISE, Backend.BREAKABLE):
                 raise Exception(
                     f"Capture prefill CUDA graph failed: {e}\n"
-                    f"{PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                    f"{prefill_failure_msg(_prefill_backend_name)}"
                 )
             raise
         if isinstance(self.backend, BreakableCudaGraphBackend):
@@ -289,16 +315,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 language_model.model, "layers"
             ):
                 self.layer_model = language_model.model
-                params = list(inspect.signature(self.layer_model.forward).parameters)
-                self._input_embeds_arg_idx = (
-                    params.index("input_embeds") if "input_embeds" in params else None
-                )
+            elif hasattr(language_model, "layers"):
+                self.layer_model = language_model
             else:
                 raise RuntimeError(
                     f"BCG could not resolve inner layer_model on "
                     f"{type(language_model).__name__}; BCG is unsupported for "
                     f"this model architecture."
                 )
+            params = list(inspect.signature(self.layer_model.forward).parameters)
+            self._input_embeds_arg_idx = (
+                params.index("input_embeds") if "input_embeds" in params else None
+            )
 
         # --- aiter chip info pre-warming (AMD) -------------------------
         if _use_aiter:
@@ -307,13 +335,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         self.model_runner.tp_group.barrier()
-        try:
-            self.capture()
-        except RuntimeError as e:
-            raise Exception(
-                f"Capture prefill CUDA graph failed: {e}\n"
-                f"{PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
-            )
+        self.capture()
 
         self.raw_num_tokens = 0
 
@@ -326,6 +348,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
+
+    def _next_token_logits_buffer(self, rows: int) -> Optional[torch.Tensor]:
+        if not self.model_runner.pp_group.is_last_rank:
+            return None
+        graph_shared_output = self.model_runner.graph_shared_output
+        # Fall back to eager logits when the shared buffer can't hold prefill rows.
+        if graph_shared_output is None or rows > graph_shared_output.max_rows:
+            return None
+        return graph_shared_output.get_logits_buffer(
+            self.model_runner.model_config.vocab_size, rows=rows
+        )
 
     _aiter_chip_info_cached = False
 
@@ -592,12 +625,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_mode=ForwardMode.EXTEND,
                 batch_size=bs,
                 input_ids=_slot("input_ids"),
+                # BCG's graph is text-only, so it forces input_embeds=None;
+                # tc_piecewise keeps the slot so multimodal prefill keeps its
+                # image embeds (else NaN logits).
                 input_embeds=(
-                    _slot("input_embeds") if registry.has_slot("input_embeds") else None
+                    None
+                    if self.prefill_backend_name == Backend.BREAKABLE
+                    else (
+                        _slot("input_embeds")
+                        if registry.has_slot("input_embeds")
+                        else None
+                    )
                 ),
                 req_pool_indices=shape_inputs["req_pool_indices"],
                 seq_lens=shape_inputs["seq_lens"],
-                next_token_logits_buffer=None,
+                next_token_logits_buffer=self._next_token_logits_buffer(bs),
                 orig_seq_lens=shape_inputs["orig_seq_lens"],
                 seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 out_cache_loc=_slot("out_cache_loc"),
@@ -756,8 +798,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         input_ids = _slot("input_ids")
+        # BCG's graph is text-only, so it forces input_embeds=None; tc_piecewise
+        # keeps the slot so multimodal prefill keeps its image embeds (else NaN
+        # logits).
         input_embeds = (
-            _slot("input_embeds") if registry.has_slot("input_embeds") else None
+            None
+            if self.prefill_backend_name == Backend.BREAKABLE
+            else (_slot("input_embeds") if registry.has_slot("input_embeds") else None)
         )
         positions = _slot("positions")
         out_cache_loc = _slot("out_cache_loc")
@@ -788,7 +835,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             input_embeds=input_embeds,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
-            next_token_logits_buffer=None,
+            next_token_logits_buffer=self._next_token_logits_buffer(bs),
             orig_seq_lens=forward_batch.orig_seq_lens,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
             out_cache_loc=out_cache_loc,

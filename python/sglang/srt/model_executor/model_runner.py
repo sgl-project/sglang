@@ -83,6 +83,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     join_process_groups,
@@ -112,6 +113,7 @@ from sglang.srt.eplb.lplb_solver import (
     set_global_lplb_solver,
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
+from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
@@ -158,6 +160,7 @@ from sglang.srt.model_executor.forward_context import (
     forward_context,
     has_forward_context,
 )
+from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
@@ -842,6 +845,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return None
         return getattr(hf_config, "index_topk", None)
 
+    def decode_num_tokens_per_bs(
+        self, *, num_draft_tokens: Optional[int] = None
+    ) -> int:
+        """Logits rows per decode batch slot."""
+        if self.spec_algorithm.is_speculative():
+            if num_draft_tokens is None:
+                num_draft_tokens = self.server_args.speculative_num_draft_tokens
+            return self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                num_draft_tokens, self.is_draft_worker
+            )
+        dllm_config = DllmConfig.from_server_args(self.server_args)
+        return dllm_config.block_size if dllm_config is not None else 1
+
+    def max_decode_logits_rows(self) -> int:
+        """Rows the shared logits buffer needs."""
+        num_tokens_per_bs = self.decode_num_tokens_per_bs()
+        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_bs)
+        return max(capture_bs) * num_tokens_per_bs
+
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
         if memory_pool_config is not None:
@@ -893,6 +915,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.decode_cuda_graph_runner = None
         self.graph_mem_usage = 0
         self.prefill_cuda_graph_runner = None
+        self.graph_shared_output = None
 
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""
@@ -904,7 +927,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
-        elif self.device == "cpu":
+        elif self.device in ["cpu", "xpu"]:
             self.init_attention_backend()
         elif self.device == "npu":
             self.init_attention_backend()
@@ -929,6 +952,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         because they capture their own decode-style graphs separately.
         """
 
+        self.graph_shared_output = GraphSharedOutput.create_for_model_runner(self)
+
         # The eager (no-cuda-graph) phase runner, built AFTER the attention
         # backend so its __init__ can warm up kernels (run-once) and allocate the
         # fixed-max static buffer — both before the cuda-graph runners, so that
@@ -947,7 +972,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.graph_mem_usage = 0
 
         if capture_decode_cuda_graph:
-            if self.device in ("cuda", "musa", "cpu", "npu"):
+            if self.device in ("cuda", "musa", "cpu", "npu", "xpu"):
                 self.init_decode_cuda_graph()
             elif (
                 current_platform.is_out_of_tree()
@@ -1071,7 +1096,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def remote_instance_init_transfer_engine(self):
         try:
             from mooncake.engine import TransferEngine
-        except ImportError as e:
+        except ImportError:
             logger.warning(
                 "Please install mooncake for using remote instance transfer engine: pip install mooncake-transfer-engine"
             )
@@ -2633,6 +2658,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "musa": "CUDA graph",
                 "cpu": "CPU graph",
                 "npu": "NPU graph",
+                "xpu": "XPU graph",
             },
         )
         role = "draft" if self.is_draft_worker else "target"
@@ -2668,6 +2694,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 {
                     "cpu": CPUGraphRunner,
                     "npu": NPUGraphRunner,
+                    "xpu": XPUGraphRunner,
                 },
             )
             self.decode_cuda_graph_runner = graph_runners[self.device](self)
