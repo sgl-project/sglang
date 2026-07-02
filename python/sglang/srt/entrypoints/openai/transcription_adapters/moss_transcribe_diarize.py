@@ -28,7 +28,7 @@ class MossTranscribeDiarizeAdapter(TranscriptionAdapter):
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:
         return {
             "temperature": request.temperature,
-            "max_new_tokens": 2048,
+            "max_new_tokens": 20480,
         }
 
     def postprocess_text(self, text: str) -> str:
