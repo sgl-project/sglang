@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.linear.gdn_backend import _solve_fwd_sub
+from sglang.srt.layers.attention.linear.gdn_backend import _solve_fwd_sub, _SolveFwdSub
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="stage-b", runner_config="1-gpu-large")
@@ -43,6 +43,39 @@ class TestSolveForwardSubstitution(unittest.TestCase):
             T = _solve_fwd_sub(A.clone()) + eye
             ref = torch.linalg.inv(eye - A)
             self.assertLess((T - ref).abs().max().item(), 1e-5)
+
+    def test_forward_correlation(self):
+        # Forward is ~1 fp32 ULP off the old loop (different reduction order), so check
+        # it tracks the exact inverse: pearson corr == 1 and max abs err at fp32 noise.
+        C = 64
+        eye = torch.eye(C, device="cuda")
+        for seed in range(5):
+            A = self._rand_strict_lower((1, 48, 4), seed)
+            T = (_solve_fwd_sub(A.clone()) + eye).flatten().double()
+            ref = torch.linalg.inv(eye - A).flatten().double()
+            corr = torch.corrcoef(torch.stack([T, ref]))[0, 1].item()
+            self.assertGreater(corr, 1 - 1e-9)
+
+    def test_gradcheck(self):
+        # Formal finite-difference gradcheck of the analytic VJP (fp64 exact-inverse
+        # forward sharing _SolveFwdSub's backward). Confirms grad_A = tril(T^T g T^T, -1).
+        class _RefSolve(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, attn):
+                C = attn.shape[-1]
+                eye = torch.eye(C, dtype=attn.dtype, device=attn.device)
+                T = torch.linalg.inv(eye - attn.tril(-1))
+                ctx.save_for_backward(T)
+                return T - eye
+
+            @staticmethod
+            def backward(ctx, grad_sub):
+                return _SolveFwdSub.backward(ctx, grad_sub)
+
+        torch.manual_seed(0)
+        A = (torch.randn(2, 8, 8, device="cuda", dtype=torch.float64) * 0.1).tril(-1)
+        A.requires_grad_(True)
+        self.assertTrue(torch.autograd.gradcheck(_RefSolve.apply, (A,), atol=1e-6, rtol=1e-4))
 
     def test_gradients(self):
         C = 64
