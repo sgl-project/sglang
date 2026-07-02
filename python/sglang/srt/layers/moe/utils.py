@@ -8,13 +8,12 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
-    get_attention_dp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
 
@@ -91,6 +90,7 @@ class MoeRunnerBackend(Enum):
     TRITON = "triton"
     TRITON_KERNELS = "triton_kernel"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
+    EXPERIMENTAL_SGL_TRTLLM = "experimental_sgl_trtllm"
     FLASHINFER_TRTLLM_ROUTED = "flashinfer_trtllm_routed"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
@@ -112,7 +112,15 @@ class MoeRunnerBackend(Enum):
         return self == MoeRunnerBackend.TRITON_KERNELS
 
     def is_flashinfer_trtllm(self):
-        return self == MoeRunnerBackend.FLASHINFER_TRTLLM
+        # experimental_sgl_trtllm shares the TRT-LLM FP8 kernels + layout, so it inherits
+        # trtllm weight-prep here; divergent sites check is_experimental_sgl_trtllm() first.
+        return self in (
+            MoeRunnerBackend.FLASHINFER_TRTLLM,
+            MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM,
+        )
+
+    def is_experimental_sgl_trtllm(self):
+        return self == MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM
 
     def is_flashinfer_trtllm_routed(self):
         return self == MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
@@ -279,7 +287,7 @@ def initialize_moe_config(server_args: ServerArgs):
     DEEPEP_CONFIG = server_args.deepep_config or ""
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
     IS_SBO_ENABLED = server_args.enable_single_batch_overlap
-    if IS_SBO_ENABLED and torch.cuda.is_available():
+    if IS_SBO_ENABLED and is_cuda():
         if torch.cuda.get_device_capability()[0] == 9:
             raise ValueError(
                 "SBO (single batch overlap) is not supported on SM90 GPUs with latest sgl-deep-gemm wheel. Please try removing --enable-single-batch-overlap argument."
@@ -400,7 +408,7 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
         and get_moe_runner_backend().is_flashinfer_cutlass()
         and is_dp_attention_enabled()
         and MOE_QUANTIZATION == "modelopt_fp4"
-        and get_moe_expert_parallel_world_size() == get_attention_dp_size()
+        and get_parallel().moe_ep_size == get_parallel().attn_dp_size
     )
 
 
@@ -414,8 +422,8 @@ def should_use_dp_reduce_scatterv():
         not should_use_flashinfer_cutlass_moe_fp4_allgather()
         and get_moe_a2a_backend().is_none()
         and is_dp_attention_enabled()
-        and get_attention_dp_size() > 1
-        and get_moe_expert_parallel_world_size() == get_attention_dp_size()
+        and get_parallel().attn_dp_size > 1
+        and get_parallel().moe_ep_size == get_parallel().attn_dp_size
     )
 
 
@@ -438,6 +446,12 @@ def should_skip_post_experts_all_reduce(
       - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
         the flashinfer cutlass FP4 kernel performs an all-gather that absorbs
         the post-experts TP all-reduce. Not relevant to the EP all-reduce.
+      - ``get_moe_a2a_backend().is_flashinfer()``: the flashinfer A2A
+        dispatcher's ``MoeAlltoAll.combine`` already alltoall-reduces partial
+        MoE outputs back to the source rank, so any further EP/TP all-reduce
+        would double-count and overflow BF16. Mirrors TRTLLM's
+        ``not enable_alltoall`` gate
+        (``tensorrt_llm/_torch/modules/fused_moe/interface.py:879``).
 
     The first two args are layer-context flags from ``LayerCommunicator`` and
     default to ``False`` for models that don't use it. Pass ``is_tp_path=True``
@@ -448,6 +462,8 @@ def should_skip_post_experts_all_reduce(
     if should_use_dp_reduce_scatterv():
         return True
     if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
+        return True
+    if get_moe_a2a_backend().is_flashinfer():
         return True
     return False
 
@@ -506,8 +522,14 @@ class RoutingMethodType(IntEnum):
     RenormalizeNaive = (4,)
     # TopK only (no softmax)
     TopK = (5,)
+    # SigmoidRenorm: Sigmoid -> TopK -> Renormalize
+    SigmoidRenorm = (6,)
+    # MiniMax2
+    MiniMax2 = (7,)
+    # Sigmoid: Sigmoid -> TopK (no renormalize)
+    Sigmoid = (8,)
     # Unspecified
-    Unspecified = 6
+    Unspecified = 9
 
 
 AITER_PADDING_SIZE = 128

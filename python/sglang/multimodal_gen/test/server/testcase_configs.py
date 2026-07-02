@@ -12,7 +12,7 @@ pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py -k qwen_ima
 To add a new testcase:
 1. add your testcase with case-id: `my_new_test_case_id` to `ONE_GPU_CASES`, `ONE_GPU_MODELOPT_FP8_CASES`, `ONE_GPU_B200_CASES`, or `TWO_GPU_CASES`
 2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/ -k my_new_test_case_id`
-3. insert or override the corresponding scenario in `scenarios` section of perf_baselines.json with the output baseline of step-2
+3. insert or override the corresponding scenario in the platform JSON under `perf_baselines/`
 
 
 """
@@ -33,6 +33,7 @@ from sglang.multimodal_gen.registry import (
     get_model_info,
     get_pipeline_config_classes,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 
 
@@ -427,10 +428,70 @@ T2I_sampling_params = DiffusionSamplingParams(
     output_size="1024x1024",
 )
 
+IDEOGRAM4_CI_TEXT_PROMPT = "A cat sitting on a bench"
+
+IDEOGRAM4_CI_PROMPT = json.dumps(
+    {
+        "high_level_description": IDEOGRAM4_CI_TEXT_PROMPT,
+        "style_description": {
+            "aesthetics": "warm, peaceful, vibrant",
+            "lighting": "bright afternoon sunlight, long soft shadows",
+            "photo": "shallow depth of field, eye-level, 85mm lens",
+            "medium": "photograph",
+            "color_palette": [
+                "#F5C542",
+                "#87CEEB",
+                "#4A4A4A",
+                "#FFFFFF",
+                "#2E8B57",
+            ],
+        },
+        "compositional_deconstruction": {
+            "background": (
+                "A sunlit garden path with green hedges and a wooden bench. "
+                "Dappled light filters through overhead trees."
+            ),
+            "elements": [
+                {
+                    "type": "obj",
+                    "bbox": [260, 260, 760, 780],
+                    "desc": (
+                        "A small tabby cat sitting calmly on a wooden bench, "
+                        "looking toward the camera."
+                    ),
+                },
+                {
+                    "type": "obj",
+                    "bbox": [180, 580, 840, 840],
+                    "desc": (
+                        "A weathered wooden garden bench with soft sunlight "
+                        "falling across the seat."
+                    ),
+                },
+            ],
+        },
+    },
+    separators=(",", ":"),
+    ensure_ascii=False,
+)
+
+IDEOGRAM4_CI_sampling_params = replace(
+    T2I_sampling_params,
+    prompt=IDEOGRAM4_CI_PROMPT,
+    output_size="1024x1024",
+    output_format="png",
+    extras={"preset": "V4_QUALITY_48", "seed": 0},
+)
+
 MODELOPT_T2I_CI_sampling_params = DiffusionSamplingParams(
     prompt="Doraemon is eating dorayaki",
     output_size="768x768",
     extras={"num_inference_steps": 12, "seed": 0},
+)
+
+MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params = replace(
+    MODELOPT_T2I_CI_sampling_params,
+    extras={"num_inference_steps": 50, "seed": 0},
 )
 
 MODELOPT_TI2I_CI_sampling_params = DiffusionSamplingParams(
@@ -476,6 +537,17 @@ T2V_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
 )
 
+JOY_ECHO_T2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt=T2V_PROMPT,
+    output_size="640x384",
+    num_frames=33,
+    extras={
+        "num_inference_steps": 8,
+        "seed": 42,
+        "enable_memory_bank": False,
+    },
+)
+
 MODELOPT_T2V_CI_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
     output_size="640x384",
@@ -488,6 +560,15 @@ TI2V_sampling_params = DiffusionSamplingParams(
     prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
     image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
     direct_url_test=True,
+)
+
+SANA_WM_TI2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt=TI2V_sampling_params.prompt,
+    image_path=TI2V_sampling_params.image_path,
+    direct_url_test=True,
+    output_size="384x640",
+    num_frames=17,
+    extras={"num_inference_steps": 12, "seed": 0, "guidance_scale": 4.5},
 )
 
 TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
@@ -572,9 +653,61 @@ MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER = (
 )
 MODELOPT_FLUX1_NVFP4_TRANSFORMER = "lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer"
 MODELOPT_FLUX2_NVFP4_WEIGHTS = "black-forest-labs/FLUX.2-dev-NVFP4"
+MODELOPT_QWEN_IMAGE_2512_NVFP4_MODEL = "lmsys/qwen-image-2512-modelopt-nvfp4-sglang"
 MODELOPT_WAN22_NVFP4_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4"
 MODELOPT_NVFP4_B200_ENV_VARS = {}
 MODELOPT_WAN22_NVFP4_B200_ENV_VARS = {}
+
+PERF_BASELINE_PLATFORM_ENV = "SGLANG_DIFFUSION_PERF_BASELINE_PLATFORM"
+PERF_BASELINE_DIR = Path(__file__).with_name("perf_baselines")
+PERF_BASELINE_FILE_BY_PLATFORM = {
+    "h100": "h100.json",
+    "b200": "b200.json",
+    "5090": "5090.json",
+}
+PERF_BASELINE_PLATFORM_ALIASES = {
+    "sm90": "h100",
+    "hopper": "h100",
+    "h100": "h100",
+    "sm100": "b200",
+    "blackwell": "b200",
+    "b200": "b200",
+    "sm120": "5090",
+    "rtx5090": "5090",
+    "5090": "5090",
+}
+
+
+def _normalize_perf_baseline_platform(platform: str) -> str:
+    normalized = platform.strip().lower().replace("_", "-")
+    normalized = normalized.replace("-", "")
+    if normalized not in PERF_BASELINE_PLATFORM_ALIASES:
+        valid = ", ".join(sorted(PERF_BASELINE_FILE_BY_PLATFORM))
+        raise ValueError(
+            f"Invalid diffusion perf baseline platform {platform!r}. "
+            f"Expected one of: {valid}"
+        )
+    return PERF_BASELINE_PLATFORM_ALIASES[normalized]
+
+
+def get_perf_baseline_platform() -> str:
+    override = os.getenv(PERF_BASELINE_PLATFORM_ENV)
+    if override:
+        return _normalize_perf_baseline_platform(override)
+    if current_platform.is_sm120():
+        return "5090"
+    if current_platform.is_blackwell():
+        return "b200"
+    return "h100"
+
+
+def get_perf_baseline_path(platform: str | None = None) -> Path:
+    baseline_platform = (
+        _normalize_perf_baseline_platform(platform)
+        if platform is not None
+        else get_perf_baseline_platform()
+    )
+    return PERF_BASELINE_DIR / PERF_BASELINE_FILE_BY_PLATFORM[baseline_platform]
 
 
 def _make_modelopt_ci_case(
@@ -613,7 +746,7 @@ def _with_default_num_gpus(
 
 # Load global configuration
 BASELINE_CONFIG = (
-    BaselineConfig.load(Path(__file__).with_name("perf_baselines.json"))
+    BaselineConfig.load(get_perf_baseline_path())
     .update(Path(__file__).parent / "ascend" / "perf_baselines_npu.json")
     .update(Path(__file__).parent / "musa" / "perf_baselines_musa.json")
 )

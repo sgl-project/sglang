@@ -428,6 +428,7 @@ class CompressorBackendMixin:
         page_size: int,
         out_loc: torch.Tensor,
         use_fp4_indexer: bool = False,
+        bf16_store: bool = False,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -468,6 +469,7 @@ class CompressorBackendMixin:
             kvcache=kv_cache,
             page_size=page_size,
             use_fp4=use_fp4_indexer,
+            bf16_store=bf16_store,
         )
 
     def forward_unified(
@@ -485,6 +487,10 @@ class CompressorBackendMixin:
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
 
         state_pool = compressor.get_state_pool(self)
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
         if _is_hip and not envs.SGLANG_OPT_USE_JIT_NORM.get():
             self._forward_unified_hip(
                 token_to_kv_pool=token_to_kv_pool,
@@ -498,18 +504,27 @@ class CompressorBackendMixin:
             use_fp4_indexer = (
                 compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
             )
+            bf16_store = False
             if compressor.is_in_indexer:
                 kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
                 page_size = token_to_kv_pool.get_index_k_page_size()
+            elif is_unified_kv_triton():
+                kv_cache = token_to_kv_pool.get_unified_kv(layer_id)
+                page_size = 1
+                out_loc = getattr(
+                    self.forward_metadata.core_metadata.unified,
+                    f"c{compressor.ratio}_out_loc",
+                )
+                bf16_store = True
             else:
                 _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
                 assert compress_kv_pool is not None
                 kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
                 if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
-                    # The v2 compressor writes directly into the raw C4 KV tensor.
-                    # HiSparse C4 therefore needs the physical C4 location here.
-                    out_loc = compress_kv_pool.translate_loc_to_hisparse_device(out_loc)
+                    out_loc = compress_kv_pool._translate_loc_to_hisparse_device(
+                        out_loc
+                    )
             self._forward_compress_all_in_one(
                 kv_score_buffer=state_pool.kv_score_buffer.kv_score,
                 kv_score_input=kv_score_input,
@@ -524,6 +539,18 @@ class CompressorBackendMixin:
                 page_size=page_size,
                 out_loc=out_loc,
                 use_fp4_indexer=use_fp4_indexer,
+                bf16_store=bf16_store,
+            )
+        online_c128_mtp = getattr(self, "online_c128_mtp", None)
+        if online_c128_mtp is not None:
+            online_c128_mtp.write_prefix_states(
+                layer_id=layer_id,
+                compressor=compressor,
+                kv_score_input=kv_score_input,
+                logical_forward_mode=getattr(
+                    forward_batch, "_original_forward_mode", None
+                )
+                or forward_batch.forward_mode,
             )
 
     def _forward_unified_hip(
@@ -657,6 +684,7 @@ def create_paged_compressor_data(
     extend_lens_cpu: Optional[List[int]] = None,
     use_prefill_cuda_graph: bool = False,
     num_q_tokens: Optional[int] = None,
+    online_state_slot_offset: int = 0,
 ) -> CompressMetadata:
     """Build the paged compress metadata (= the plan).
 
@@ -675,6 +703,7 @@ def create_paged_compressor_data(
             extend_lens_cpu=extend_lens_cpu,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             num_q_tokens=num_q_tokens,
+            online_state_slot_offset=online_state_slot_offset,
         )
 
     swa_page_size = token_to_kv_pool.swa_page_size
@@ -702,7 +731,7 @@ def create_paged_compressor_data(
             seq_lens=seq_lens_planner,
             extend_lens=extend_lens_planner,
             req_to_token=req_to_token,
-            full_to_swa=full_to_swa,
+            full_to_state=full_to_swa,
             swa_page_size=swa_page_size,
             ring_size=ring_size,
             num_q_tokens=num_q_tokens,
@@ -713,7 +742,7 @@ def create_paged_compressor_data(
             compress_ratio=compress_ratio,
             req_pool_indices=req_pool_indices_i64,
             req_to_token=req_to_token,
-            full_to_swa=full_to_swa,
+            full_to_state=full_to_swa,
             seq_lens=seq_lens.to(torch.int64),
             swa_page_size=swa_page_size,
             ring_size=ring_size,
@@ -732,11 +761,8 @@ def _create_online_paged_compressor_data(
     extend_lens_cpu: Optional[List[int]],
     use_prefill_cuda_graph: bool,
     num_q_tokens: Optional[int],
+    online_state_slot_offset: int = 0,
 ) -> CompressMetadata:
-    assert not use_prefill_cuda_graph, "online c128 doesn't support cuda graph"
-
-    swa_page_size = int(token_to_kv_pool.swa_page_size)
-    full_to_swa = token_to_kv_pool.full_to_swa_index_mapping.detach()
     req_pool_indices = req_pool_indices.to(torch.int64)
 
     if is_prefill:
@@ -759,15 +785,14 @@ def _create_online_paged_compressor_data(
             extend_lens=extend_lens_planner,
             req_pool_indices=req_pool_indices,
             req_to_token=req_to_token,
-            full_to_swa=full_to_swa,
             num_q_tokens=int(num_q_tokens_planner),
-            swa_page_size=swa_page_size,
+            use_cuda_graph=use_prefill_cuda_graph,
+            state_slot_offset=online_state_slot_offset,
         )
     else:
         return CompressorDecodePlan.generate_online(
             seq_lens=seq_lens.to(torch.int64),
             req_pool_indices=req_pool_indices,
             req_to_token=req_to_token,
-            full_to_swa=full_to_swa,
-            swa_page_size=swa_page_size,
+            state_slot_offset=online_state_slot_offset,
         )

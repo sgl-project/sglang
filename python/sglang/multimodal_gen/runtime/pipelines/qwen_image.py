@@ -12,6 +12,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image_layered import (
     QwenImageLayeredBeforeDenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.qwen_image import (
+    QwenImageProgressiveDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -64,7 +67,10 @@ class QwenImagePipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        self.add_standard_t2i_stages(prepare_extra_timestep_kwargs=[prepare_mu])
+        self.add_standard_t2i_stages(
+            prepare_extra_timestep_kwargs=[prepare_mu],
+            progressive_denoising_stage_cls=QwenImageProgressiveDenoisingStage,
+        )
 
 
 class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):

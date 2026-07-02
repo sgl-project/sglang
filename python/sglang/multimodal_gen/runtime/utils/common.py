@@ -9,6 +9,7 @@ import socket
 import sys
 import threading
 from functools import lru_cache
+from typing import Any
 
 import psutil
 import torch
@@ -76,6 +77,83 @@ def is_valid_ipv6_address(address: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def normalize_gpu_ids(gpu_ids: Any) -> list[int] | None:
+    if gpu_ids is None:
+        return None
+    if isinstance(gpu_ids, str):
+        values = [gpu_ids]
+    else:
+        values = list(gpu_ids)
+
+    tokens: list[str] = []
+    for value in values:
+        tokens.extend(part for part in str(value).replace(",", " ").split() if part)
+    if not tokens:
+        return []
+
+    parsed: list[int] = []
+    for token in tokens:
+        try:
+            gpu_id = int(token)
+        except ValueError as exc:
+            raise ValueError(
+                f"--gpu-ids contains a non-integer GPU id: {token}"
+            ) from exc
+        if gpu_id < 0:
+            raise ValueError(f"--gpu-ids GPU ids must be non-negative: {gpu_id}")
+        parsed.append(gpu_id)
+
+    if len(set(parsed)) != len(parsed):
+        raise ValueError(f"--gpu-ids contains duplicate GPU ids: {parsed}")
+    return parsed
+
+
+def parse_size(size: str) -> tuple[int | None, int | None]:
+    try:
+        parts = size.lower().replace(" ", "").split("x")
+        if len(parts) != 2:
+            raise ValueError
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None, None
+
+
+def parse_tcp_host_port(value: str | None, field_name: str) -> tuple[str, int]:
+    if value is None or not str(value).strip():
+        raise ValueError(f"{field_name} is required")
+
+    addr = str(value).strip()
+    if addr.startswith("tcp://"):
+        addr = addr[len("tcp://") :]
+
+    try:
+        host, port_str = addr.rsplit(":", 1)
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name} must be formatted as tcp://host:port or host:port"
+        ) from exc
+
+    host = host.strip()
+    port_str = port_str.strip()
+    if not host or not port_str:
+        raise ValueError(f"{field_name} must include both host and port: {value!r}")
+
+    try:
+        port = int(port_str)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} port must be an integer: {port_str}") from exc
+
+    if port < 0 or port > 65535:
+        raise ValueError(f"{field_name} port must be between 0 and 65535: {port}")
+    return host, port
+
+
+def format_tcp_endpoint(host: str, port: int, field_name: str) -> str:
+    if port < 0 or port > 65535:
+        raise ValueError(f"{field_name} port must be between 0 and 65535: {port}")
+    return f"tcp://{host}:{port}"
 
 
 def configure_ipv6(dist_init_addr):
@@ -330,9 +408,9 @@ except:
     is_intel_amx_backend_available = False
 
 try:
-    # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
+    # move torch.cpu._is_amx_tile_supported() from cpu_has_amx_support
     # to support torch compile
-    is_amx_tile_supported = torch._C._cpu._is_amx_tile_supported()
+    is_amx_tile_supported = torch.cpu._is_amx_tile_supported()
 except:
     is_amx_tile_supported = False
 

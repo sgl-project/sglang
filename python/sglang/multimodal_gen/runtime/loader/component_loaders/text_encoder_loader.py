@@ -9,7 +9,6 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed import init_device_mesh
-from transformers import AutoModel
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
@@ -39,6 +38,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import precision_to_dtype
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.environ import envs
 
@@ -99,22 +99,73 @@ class TextEncoderLoader(ComponentLoader):
         component_model_path: str,
         server_args: ServerArgs,
         transformers_or_diffusers: str,
+        component_name: str | None = None,
     ):
         if transformers_or_diffusers != "transformers":
             return super().load_native(
-                component_model_path, server_args, transformers_or_diffusers
+                component_model_path,
+                server_args,
+                transformers_or_diffusers,
+                component_name,
             )
 
         encoder_idx = (
-            1 if component_model_path.rstrip("/").endswith("text_encoder_2") else 0
+            self._extract_encoder_index(component_name or "text_encoder_2")
+            if component_name
+            else 1 if component_model_path.rstrip("/").endswith("text_encoder_2") else 0
         )
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[encoder_idx]
-        return AutoModel.from_pretrained(
+        dtype = precision_to_dtype(
+            encoder_dtype,
+            f"text_encoder_precisions[{encoder_idx}]",
+        )
+        transformers_model_class = self._resolve_transformers_text_encoder_class(
+            component_model_path, server_args
+        )
+        return transformers_model_class.from_pretrained(
             component_model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
-            torch_dtype=PRECISION_TO_TYPE[encoder_dtype],
+            torch_dtype=dtype,
         )
+
+    @staticmethod
+    def _resolve_transformers_text_encoder_class(component_model_path, server_args):
+        """Resolve the concrete transformers class for a text encoder.
+
+        AutoModel maps encoder-decoder model types (e.g. T5/UMT5) to full
+        seq2seq classes, whose forward expects decoder inputs and raises when
+        the module is used purely as a text encoder. For such checkpoints,
+        prefer the encoder-only class from the config architectures or map the
+        full seq2seq architecture to its encoder-only counterpart. Encoders that
+        are not encoder-decoder keep using AutoModel unchanged.
+        """
+        import transformers
+        from transformers import AutoConfig, AutoModel
+
+        try:
+            config = AutoConfig.from_pretrained(
+                component_model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            )
+        except Exception:
+            return AutoModel
+        if getattr(config, "is_encoder_decoder", False):
+            encoder_only_map = {
+                "T5Model": "T5EncoderModel",
+                "T5ForConditionalGeneration": "T5EncoderModel",
+                "UMT5Model": "UMT5EncoderModel",
+                "UMT5ForConditionalGeneration": "UMT5EncoderModel",
+                "MT5Model": "MT5EncoderModel",
+                "MT5ForConditionalGeneration": "MT5EncoderModel",
+            }
+            for arch in getattr(config, "architectures", None) or []:
+                encoder_arch = encoder_only_map.get(arch, arch)
+                transformers_model_class = getattr(transformers, encoder_arch, None)
+                if isinstance(transformers_model_class, type):
+                    return transformers_model_class
+        return AutoModel
 
     def _prepare_weights(
         self,
@@ -246,6 +297,11 @@ class TextEncoderLoader(ComponentLoader):
         if encoder_index == 0:
             for key, value in diffusers_pretrained_config.__dict__.items():
                 setattr(encoder_config.arch_config, key, value)
+        post_diffusers_config_update = getattr(
+            encoder_config, "post_diffusers_config_update", None
+        )
+        if post_diffusers_config_update is not None:
+            post_diffusers_config_update()
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
             encoder_index
         ]
@@ -299,6 +355,18 @@ class TextEncoderLoader(ComponentLoader):
             )
         else:
             fsdp_cpu_offload = False
+            should_offload = False
+
+        if (
+            getattr(
+                model_config.arch_config, "requires_gpu_resident_text_encoder", False
+            )
+            and should_offload
+        ):
+            logger.warning(
+                "Keeping bitsandbytes 4-bit text encoder GPU-resident; CUDA "
+                "weights and quant states are required for this checkpoint."
+            )
             should_offload = False
 
         if should_offload and not current_platform.is_mps():

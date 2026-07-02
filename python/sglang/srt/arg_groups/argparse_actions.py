@@ -67,6 +67,34 @@ class DeprecatedStoreTrueAction(argparse.Action):
         setattr(namespace, self.dest, True)
 
 
+class DeprecatedStoreConstAction(argparse.Action):
+    """Deprecated boolean flag that stores a fixed string/value into ``dest``
+    and prints a warning. Used to translate a legacy boolean flag into a
+    setting on the new per-phase config dict (e.g.
+    ``--disable-piecewise-cuda-graph`` -> ``cuda_graph_backend_prefill="disabled"``)."""
+
+    def __init__(
+        self,
+        option_strings,
+        dest,
+        new_flag=None,
+        const_value=None,
+        nargs=0,
+        default=None,
+        **kwargs,
+    ):
+        self.new_flag = new_flag
+        self.const_value = const_value
+        super().__init__(option_strings, dest, nargs=nargs, default=default, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        replacement = f" Use '{self.new_flag}' instead." if self.new_flag else ""
+        print_deprecated_warning(
+            f"'{option_string}' is deprecated and will be removed in a future release.{replacement}"
+        )
+        setattr(namespace, self.dest, self.const_value)
+
+
 class DeprecatedAliasStoreAction(argparse.Action):
     """Deprecated alias that stores its value and prints a warning."""
 

@@ -1,0 +1,304 @@
+---
+title: Krea-2
+metatags:
+    description: "Deploy Krea-2 with SGLang - fast, high-quality text-to-image generation."
+---
+
+## 1. Model Introduction
+
+[Krea-2](https://huggingface.co/krea/Krea-2-Turbo) is a high-quality text-to-image diffusion model from [Krea](https://www.krea.ai/). It ships in two variants that share the same backbone and differ only in their sampling recipe:
+
+- **[Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turbo)** - a distilled, few-step model that produces photorealistic images in only **8 inference steps** with no classifier-free guidance (`guidance_scale = 1.0`), ideal for fast and interactive generation.
+- **[Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw)** - the base (non-distilled) model that trades speed for maximum fidelity, using a longer schedule (~52 steps) with classifier-free guidance (`guidance_scale ≈ 4.5`).
+
+Both variants are built on a single-stream MMDiT with a Qwen3-VL text encoder and the Qwen-Image VAE, and are distributed in the standard diffusers layout (a `model_index.json` plus sharded `transformer/`, `text_encoder/`, `vae/`, `tokenizer/`, and `scheduler/` folders). SGLang loads them **natively** - just point `--model-path` at the repo, no conversion step required.
+
+**Key Features:**
+
+- **Two variants, one pipeline**: switch between fast (Turbo) and high-fidelity (Raw) by changing only the model path and the sampling settings.
+- **Photorealistic generation** at 1024x1024 and other resolutions.
+- **Native diffusers loading**: components (DiT, text encoder, VAE, scheduler) are read straight from the repo's `model_index.json`.
+
+For more details, see the [Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turbo) and [Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw) HuggingFace pages.
+
+## 2. SGLang-diffusion Installation
+
+SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang-diffusion installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for installation instructions.
+
+## 3. Model Deployment
+
+This section covers deploying Krea-2-Turbo for fast, high-quality image generation.
+
+### 3.1 Basic Configuration
+
+Krea-2-Turbo generates high-quality images in only 8 inference steps. Launch the server with:
+
+```bash Command
+sglang serve \
+  --model-path krea/Krea-2-Turbo \
+  --num-gpus 1 \
+  --port 30000
+```
+
+The step count and guidance scale are **request-time** settings (see [API Usage](#4-api-usage)); Krea-2-Turbo defaults to 8 steps with `guidance_scale = 1.0`.
+
+### 3.2 Configuration Tips
+
+Currently supported optimizations are listed [here](/docs/sglang-diffusion/compatibility_matrix).
+
+- `--num-gpus`: Number of GPUs to use.
+- `--tp-size`: Tensor parallelism size (the recommended multi-GPU path for Krea-2). Its attention heads (48, with 12 KV heads) and text heads (20) are divisible by a tensor-parallel size of 1, 2, or 4.
+
+## 4. API Usage
+
+For complete API documentation, please refer to the [official API usage guide](/docs/sglang-diffusion/api/openai_api).
+
+### 4.1 Generate an Image
+
+Generate an image with the OpenAI-compatible images API:
+
+```python Example
+import base64
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30000/v1")
+
+response = client.images.generate(
+    model="krea/Krea-2-Turbo",
+    prompt="a red fox sitting in fresh snow, golden hour, photorealistic",
+    n=1,
+    response_format="b64_json",
+)
+
+# Save the generated image
+image_bytes = base64.b64decode(response.data[0].b64_json)
+with open("output.png", "wb") as f:
+    f.write(image_bytes)
+```
+
+You can also generate a single image from the command line:
+
+```bash Command
+sglang generate --model-path krea/Krea-2-Turbo \
+    --prompt "a red fox sitting in fresh snow, golden hour, photorealistic" \
+    --num-inference-steps 8 --height 1024 --width 1024 --save-output
+```
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Cache-DiT Acceleration
+
+SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to speed up inference with minimal quality loss. Enable it by setting `SGLANG_CACHE_DIT_ENABLED=true`. For more details, see the SGLang Cache-DiT [documentation](/docs/sglang-diffusion/cache_dit).
+
+Cache-DiT works for **both** Krea-2 variants with no extra configuration: SGLang tracks each request's classifier-free-guidance mode, so Krea-2-Turbo (no CFG, `guidance_scale = 1.0`) and Krea-2-Raw (CFG, `guidance_scale ≈ 4.5`) both cache correctly and automatically.
+
+**Basic Usage**
+
+```bash Command
+SGLANG_CACHE_DIT_ENABLED=true sglang serve \
+  --model-path krea/Krea-2-Turbo \
+  --num-gpus 1 \
+  --port 30000
+```
+
+Measured per-image denoise speedup with the default cache settings (NVIDIA H200, 1024x1024, seed 0):
+
+| Variant | Inference steps | Denoise (no cache → cache) | Speedup |
+| :--- | :--- | :--- | :--- |
+| Krea-2-Turbo (no CFG) | 8 | 1.27s → 0.92s | ~1.4x |
+| Krea-2-Raw (CFG 4.5) | 50 | 18.0s → 6.3s | ~2.9x |
+
+Caching has the most headroom on Raw's longer schedule; the 8-step distilled Turbo has only a few cacheable steps after warmup.
+
+**Advanced Usage**
+
+- DBCache Parameters: DBCache controls block-level caching behavior:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Env Variable</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Fn</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_FN`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of first blocks to always compute</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Bn</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_BN`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of last blocks to always compute</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>W</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_WARMUP`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Warmup steps before caching starts</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>R</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_RDT`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.24</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Residual difference threshold</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MC</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_MC`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum continuous cached steps</td>
+    </tr>
+  </tbody>
+</table>
+- TaylorSeer Configuration: TaylorSeer improves caching accuracy using Taylor expansion (best suited to the longer Raw schedule; not recommended for the 8-step Turbo):
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Env Variable</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Enable</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_TAYLORSEER`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>false</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable TaylorSeer calibrator</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Order</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_TS_ORDER`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Taylor expansion order (1 or 2)</td>
+    </tr>
+  </tbody>
+</table>
+
+  Combined Configuration Example (Krea-2-Raw, default cache settings shown explicitly):
+
+```bash Command
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_FN=1 \
+SGLANG_CACHE_DIT_BN=0 \
+SGLANG_CACHE_DIT_WARMUP=4 \
+SGLANG_CACHE_DIT_RDT=0.24 \
+SGLANG_CACHE_DIT_MC=3 \
+sglang serve --model-path krea/Krea-2-Raw
+```
+
+#### 4.2.2 Memory & CPU Offload
+
+Krea-2's DiT is ~24 GB in bf16 (the bulk of the model). On memory-constrained GPUs you can keep less of it resident:
+
+- `--dit-layerwise-offload`: stream the DiT's transformer blocks layer-by-layer with async host-to-device prefetch overlap, so only a small working set stays on the GPU. This is the primary way to fit Krea-2 on a single consumer / 32 GB-class card, at a modest latency cost. Tune the memory/latency trade-off with `--dit-offload-prefetch-size` (`0.0` prefetches one layer for the lowest memory; larger values prefetch more layers -- faster but more memory).
+- `--dit-cpu-offload`: keep the whole DiT in host memory. Combine it with `--dit-layerwise-offload` for the lowest peak GPU memory (weights stay on host and only the layers needed for the current step are brought on-device).
+- `--text-encoder-cpu-offload`: offload the Qwen3-VL text encoder (it is idle during the denoise loop).
+- `--vae-cpu-offload`: offload the VAE.
+- `--pin-cpu-memory`: pin host memory for offload. Add only as a temporary workaround if you hit `CUDA error: invalid argument`.
+
+On large-VRAM GPUs (e.g. H200), keep everything resident (offloads off) for the fastest latency.
+
+## 5. Benchmark
+
+Test Environment:
+
+- Hardware: NVIDIA H200 GPU (1x)
+- Model: krea/Krea-2-Turbo (8 inference steps)
+- sglang diffusion version: 0.5.13
+
+**Server Command** (used for both benchmarks below):
+
+```shell Command
+sglang serve --model-path krea/Krea-2-Turbo --port 30000
+```
+
+### 5.1 Generate an image
+
+**Benchmark Command**:
+
+```shell Command
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --model krea/Krea-2-Turbo --dataset vbench --task text-to-image \
+    --num-prompts 1 --max-concurrency 1
+```
+
+**Result**:
+
+```text Output
+================= Serving Benchmark Result =================
+Task:                                    text-to-image
+Model:                                   krea/Krea-2-Turbo
+Dataset:                                 vbench
+--------------------------------------------------
+Benchmark duration (s):                  1.56
+Request rate:                            inf
+Max request concurrency:                 1
+Successful requests:                     1/1
+--------------------------------------------------
+Request throughput (req/s):              0.64
+Latency Mean (s):                        1.5600
+Latency Median (s):                      1.5600
+Latency P99 (s):                         1.5600
+--------------------------------------------------
+Peak Memory Max (MB):                    37466.00
+Peak Memory Mean (MB):                   37466.00
+Peak Memory Median (MB):                 37466.00
+============================================================
+```
+
+### 5.2 Generate images with high concurrency
+
+**Benchmark Command**:
+
+```shell Command
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --model krea/Krea-2-Turbo --dataset vbench --task text-to-image \
+    --num-prompts 20 --max-concurrency 20
+```
+
+**Result**:
+
+```text Output
+================= Serving Benchmark Result =================
+Task:                                    text-to-image
+Model:                                   krea/Krea-2-Turbo
+Dataset:                                 vbench
+--------------------------------------------------
+Benchmark duration (s):                  31.47
+Request rate:                            inf
+Max request concurrency:                 20
+Successful requests:                     20/20
+--------------------------------------------------
+Request throughput (req/s):              0.64
+Latency Mean (s):                        16.5000
+Latency Median (s):                      16.5200
+Latency P99 (s):                         31.1300
+--------------------------------------------------
+Peak Memory Max (MB):                    37468.00
+Peak Memory Mean (MB):                   37466.40
+Peak Memory Median (MB):                 37466.00
+============================================================
+```

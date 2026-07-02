@@ -16,6 +16,7 @@ import math
 import os
 import re
 import socket
+import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -37,12 +38,14 @@ import huggingface_hub
 import numpy as np
 import torch
 
+from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_available_gpu_memory
 
 # Try to import accelerate (optional dependency)
 try:
@@ -82,12 +85,13 @@ from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
 )
+from sglang.srt.utils.common import is_cuda_alike
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
     0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
 )
-from sglang.srt.environ import envs
+from sglang.srt.environ import envs, temp_set_env
 from sglang.srt.model_loader.weight_utils import (
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
@@ -242,6 +246,27 @@ def _get_quantization_config(
 
         if isinstance(quant_config, Fp8Config):
             quant_config.is_fp4_experts = model_config.is_fp4_experts
+            # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
+            nvfp4_meta = model_config.nvfp4_moe_meta
+            if nvfp4_meta is not None:
+                from sglang.srt.layers.quantization.modelopt_quant import (
+                    HybridFp8NvFp4Config,
+                    ModelOptFp4Config,
+                )
+
+                # MTP MoE layers (model.decoder.*) are not NVFP4 quantized.
+                nvfp4_exclude_modules = list(
+                    nvfp4_meta.get("exclude_modules") or []
+                ) + ["model.decoder.*"]
+                nvfp4_config = ModelOptFp4Config(
+                    is_checkpoint_nvfp4_serialized=True,
+                    group_size=int(nvfp4_meta["group_size"]),
+                    exclude_modules=nvfp4_exclude_modules,
+                    packed_modules_mapping=quant_config.packed_modules_mapping,
+                )
+                quant_config = HybridFp8NvFp4Config(
+                    fp8_config=quant_config, nvfp4_config=nvfp4_config
+                )
         if not _is_npu:
             major, minor = get_device_capability()
 
@@ -348,7 +373,7 @@ class DefaultModelLoader(BaseModelLoader):
         fall_back_to_pt: bool = True
         """Whether .pt weights can be used."""
 
-        model_config: Optional["ModelConfig"] = None
+        model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
         @classmethod
@@ -514,7 +539,7 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self, source: "Source"
+        self, source: Source
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
@@ -746,7 +771,43 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
-        model.load_weights(weights)
+        # Used in tests to verify memory savings when using online quantization.
+        if is_cuda_alike():
+            peak_memory = torch.cuda.max_memory_allocated()
+            logger.debug(
+                "Peak GPU memory before loading weights: %s GiB",
+                f"{peak_memory / GIB_BYTES:.3f}",
+            )
+            memory_start = get_available_gpu_memory(
+                target_device.type, gpu_id=torch.cuda.current_device()
+            )
+
+        quant_config = getattr(model, "quant_config", None)
+        is_nvfp4_online = getattr(quant_config, "is_nvfp4_online", False)
+
+        if is_nvfp4_online:
+            # Scope exact FP4 quantization math to load-time conversion only;
+            # restore the original environment before serving starts.
+            with temp_set_env(
+                TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
+                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
+            ):
+                model.load_weights(weights)
+            if target_device.type == "cuda":
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        else:
+            model.load_weights(weights)
+
+        # Used in tests to verify memory savings when using online quantization.
+        if is_cuda_alike():
+            memory_end = get_available_gpu_memory(
+                target_device.type, gpu_id=torch.cuda.current_device()
+            )
+            logger.debug(
+                "Memory increase during load_weights: %s GiB",
+                f"{memory_start - memory_end:.3f}",
+            )
 
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
@@ -1343,6 +1404,12 @@ class DummyModelLoader(BaseModelLoader):
                     quant_config,
                 )
 
+            # NOTE(woosuk): For accurate performance evaluation, we assign
+            # random values to the weights.
+            initialize_dummy_weights(model)
+
+            _post_load_weights(model)
+
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
@@ -1353,12 +1420,6 @@ class DummyModelLoader(BaseModelLoader):
                     ):
                         continue
                     quant_method.process_weights_after_loading(module)
-
-            # NOTE(woosuk): For accurate performance evaluation, we assign
-            # random values to the weights.
-            initialize_dummy_weights(model)
-
-            _post_load_weights(model)
 
         return model.eval()
 
@@ -2521,6 +2582,110 @@ def load_model_with_cpu_quantization(
     return model.eval()
 
 
+class IncModelLoader(DefaultModelLoader):
+    """
+    Model loader that applies Intel AutoRound quantization
+    """
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+
+        logger.info("IncModelLoader: Loading model...")
+
+        # Check if model is already quantized
+        if model_config._is_already_quantized():
+            logger.info("Model is already quantized, loading directly...")
+            # Use default loading for pre-quantized models
+            return super().load_model(
+                model_config=model_config, device_config=device_config
+            )
+
+        quant_model = self._autoround_quantization_workflow(model_config, device_config)
+
+        target_device = torch.device(device_config.device)
+
+        # Return autoround model for offline quantization mode
+        if self.load_config.inc_save_path is not None:
+            quant_model.to(target_device)
+            return quant_model.eval()
+
+        model_config.hf_config = quant_model.config
+        quant_config = _get_quantization_config(model_config, self.load_config)
+
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                    quant_config,
+                )
+
+            self.load_weights_and_postprocess(
+                model, iter(quant_model.state_dict().items()), target_device
+            )
+        return model.eval()
+
+    def _parse_quantization(self, quantization: str):
+        """Map quantization to AutoRound's scheme and format."""
+        AR_QUANT_CFG_CHOICES = {
+            "auto-round-int8": ("INT8", "llm_compressor"),
+        }
+        quant_cfg = AR_QUANT_CFG_CHOICES.get(quantization)
+        if not quant_cfg:
+            raise ValueError(
+                f"Invalid quantization choice: '{quantization}'. "
+                f"Available choices: {list(AR_QUANT_CFG_CHOICES.keys())}"
+            )
+        return quant_cfg
+
+    def _autoround_quantization_workflow(
+        self, model_config: ModelConfig, device_config: DeviceConfig
+    ) -> nn.Module:
+        """Auto-round quantization workflow: quantize, save checkpoint, then return model."""
+        try:
+            from auto_round import AutoRound
+        except ImportError:
+            logger.error(
+                "auto-round library not found. "
+                "Please install it using `pip install auto-round` to use AutoRound quantization."
+            )
+            raise
+
+        scheme, format = self._parse_quantization(model_config.quantization)
+
+        try:
+            autoround = AutoRound(
+                model_config.model_path,
+                scheme=scheme,
+                iters=self.load_config.inc_tuning_iters,
+                disable_opt_rtn=self.load_config.inc_disable_opt_rtn,
+                low_cpu_mem_usage=False,
+            )
+            if self.load_config.inc_save_path is not None:
+                logger.info("Offline quantization mode: Will quantize and save")
+                model, _ = autoround.quantize_and_save(
+                    output_dir=self.load_config.inc_save_path, format=format
+                )
+                return model
+            else:
+                logger.info("Online quantization mode: Will quantize and skip saving")
+                # Use a temporary directory and discard it so nothing is persisted in online mode.
+                with tempfile.TemporaryDirectory() as tmp_save_dir:
+                    model, _ = autoround.quantize_and_save(
+                        output_dir=tmp_save_dir, format=format
+                    )
+                return model
+        except Exception as e:
+            raise ValueError(f"AutoRound quantization failed: {e}")
+
+
 class ModelOptModelLoader(DefaultModelLoader):
     """
     Model loader that applies NVIDIA Model Optimizer quantization
@@ -2824,7 +2989,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         fall_back_to_pt: bool = True
         """Whether .pt weights can be used."""
 
-        model_config: Optional["ModelConfig"] = None
+        model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
         @classmethod
@@ -2924,7 +3089,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         return hf_folder, hf_weights_files
 
     def _get_weights_iterator(
-        self, source: "Source"
+        self, source: Source
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         from sglang.srt.model_loader.weight_utils import (
@@ -3041,6 +3206,10 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)
+
+    if model_config and model_config.quantization in ["auto-round-int8"]:
+        logger.info("Using IncModelLoader due to AutoRound quantization config.")
+        return IncModelLoader(load_config)
 
     # ModelOptModelLoader's local-copy quantize-and-export workflow doesn't apply
     # to non-local loaders. These loaders own their weight transport path and still

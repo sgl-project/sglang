@@ -25,6 +25,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_device_sm,
+    get_hip_version,
     is_cpu,
     is_cuda,
     is_gfx95_supported,
@@ -47,6 +48,7 @@ _is_xpu = is_xpu()
 _device_sm = get_device_sm()
 _is_gfx95_supported = is_gfx95_supported()
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
+_use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
 
 
 _is_cublas_ge_129 = is_nvidia_cublas_version_ge_12_9()

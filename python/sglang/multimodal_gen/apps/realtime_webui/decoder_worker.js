@@ -80,24 +80,36 @@ function rawFramesToRgbaBuffers(header, payload) {
   return buffers;
 }
 
-async function encodedFrameToRgbaBuffers(header, payload) {
-  if (typeof createImageBitmap === "undefined" || typeof OffscreenCanvas === "undefined") {
+function splitEncodedPayload(header, payload) {
+  const bytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
+  const lengths = Array.isArray(header.payload_lengths) && header.payload_lengths.length
+    ? header.payload_lengths.map(Number)
+    : [bytes.byteLength];
+  const payloads = [];
+  let offset = 0;
+  for (const length of lengths) {
+    payloads.push(bytes.buffer.slice(
+      bytes.byteOffset + offset,
+      bytes.byteOffset + offset + length,
+    ));
+    offset += length;
+  }
+  return payloads;
+}
+
+async function encodedFramesToImageBitmaps(header, payload) {
+  if (typeof createImageBitmap === "undefined") {
     throw new Error("This browser does not support worker image decoding");
   }
 
-  const blob = new Blob([payload], { type: header.content_type });
-  const bitmap = await createImageBitmap(blob);
-  const width = bitmap.width;
-  const height = bitmap.height;
-  const canvas = new OffscreenCanvas(width, height);
-  const ctx = canvas.getContext("2d", { alpha: false });
-  ctx.drawImage(bitmap, 0, 0);
-  const image = ctx.getImageData(0, 0, width, height);
-  bitmap.close?.();
+  const frames = await Promise.all(splitEncodedPayload(header, payload).map((framePayload) => (
+    createImageBitmap(new Blob([framePayload], { type: header.content_type }))
+  )));
   return {
-    width,
-    height,
-    frames: [image.data.buffer],
+    width: frames[0]?.width || 0,
+    height: frames[0]?.height || 0,
+    frame_type: "bitmap",
+    frames,
   };
 }
 
@@ -107,12 +119,13 @@ async function decode(header, payload) {
     header.content_type === WEBP_FRAME_CONTENT_TYPE ||
     header.content_type === JPEG_FRAME_CONTENT_TYPE
   ) {
-    const decoded = await encodedFrameToRgbaBuffers(header, payload);
+    const decoded = await encodedFramesToImageBitmaps(header, payload);
     return {
       id: header.__decode_id,
       width: decoded.width,
       height: decoded.height,
       chunk: Number(header.chunk_index),
+      frame_type: decoded.frame_type,
       frames: decoded.frames,
     };
   } else if (header.content_type === RAW_RGB_CONTENT_TYPE) {
@@ -148,10 +161,7 @@ self.onmessage = async (event) => {
       return;
     }
     const result = await decode(message.header, message.payload);
-    self.postMessage(
-      { type: "decoded", ...result },
-      result.frames,
-    );
+    self.postMessage({ type: "decoded", ...result }, result.frames);
   } catch (error) {
     self.postMessage({
       type: "error",
