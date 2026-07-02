@@ -74,7 +74,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.realtime.causal_state import (
+from sglang.multimodal_gen.runtime.realtime.states import (
     RealtimeCausalDecodeState,
     RealtimeCausalDiTState,
 )

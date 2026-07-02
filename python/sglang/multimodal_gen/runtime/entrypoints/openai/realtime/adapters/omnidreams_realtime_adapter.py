@@ -14,15 +14,15 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeVideoGenerationsRequest,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
+    BaseRealtimeModelAdapter,
     RealtimeChunkInputs,
-    RealtimeModelAdapter,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
     RawRGBRealtimeOutputAdapter,
     RealtimeFrameSendStats,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-    _parse_size,
+    _parse_size_or_raise,
     build_sampling_params,
     save_image_to_path,
 )
@@ -36,11 +36,9 @@ from sglang.multimodal_gen.runtime.models.vision_utils import (
     pil_to_numpy,
     resize,
 )
-from sglang.multimodal_gen.runtime.realtime.condition_events import (
-    ConditionEvent,
-    ConditionEventQueue,
-    ConditionSamplingParams,
-    ControlSignal,
+from sglang.multimodal_gen.runtime.realtime.control_signals import (
+    ControlSignalQueue,
+    ControlSignalSamplingParams,
 )
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
@@ -167,7 +165,7 @@ def _decode_hdmap_chunk(
 class OmniDreamsRealtimeState:
     """Per-session mutable state for the OmniDreams realtime adapter.
 
-    Holds a :class:`ConditionEventQueue` keyed on ``"prompt"`` (max 1 queued
+    Holds a :class:`ControlSignalQueue` keyed on ``"prompt"`` (max 1 queued
     entry — latest wins) and ``"hdmap"`` (max 4 queued chunks of per-frame
     pixel data, ring-buffer semantics to bound memory under a lagging client).
 
@@ -177,7 +175,7 @@ class OmniDreamsRealtimeState:
     """
 
     def __init__(self) -> None:
-        self.events = ConditionEventQueue(max_events={"prompt": 1, "hdmap": 4})
+        self.events = ControlSignalQueue(max_events={"prompt": 1, "hdmap": 4})
         self.latest_sampled_event_id: int | None = None
 
     def clear(self) -> None:
@@ -187,16 +185,7 @@ class OmniDreamsRealtimeState:
 
     def receive_prompt(self, prompt: str, *, event_id: int | None = None) -> None:
         """Push an updated text prompt into the event queue (replaces any pending)."""
-        self.events.push(
-            ConditionEvent(
-                kind="prompt",
-                payload=ControlSignal(
-                    kind="prompt",
-                    payload=prompt,
-                    seq_id=event_id,
-                ),
-            )
-        )
+        self.events.push("prompt", prompt, event_id=event_id)
 
     def has_prompt(self) -> bool:
         return self.events.has_events("prompt")
@@ -216,16 +205,7 @@ class OmniDreamsRealtimeState:
         message.  See :meth:`OmniDreamsRealtimeAdapter.ingest_event` for the
         expected encoding contract.
         """
-        self.events.push(
-            ConditionEvent(
-                kind="hdmap",
-                payload=ControlSignal(
-                    kind="hdmap",
-                    payload=payload,
-                    seq_id=event_id,
-                ),
-            )
-        )
+        self.events.push("hdmap", payload, event_id=event_id)
 
     def sample_hdmap_chunk(self, chunk_size: int) -> list[Any] | None:
         """Sample ``chunk_size`` HDMap frames for the upcoming AR block.
@@ -239,7 +219,7 @@ class OmniDreamsRealtimeState:
         """
         result = self.events.sample_chunk(
             "hdmap",
-            ConditionSamplingParams(
+            ControlSignalSamplingParams(
                 chunk_size=chunk_size,
                 repeat_last=True,
                 default_item=None,
@@ -253,7 +233,7 @@ class OmniDreamsRealtimeState:
         return result
 
 
-class OmniDreamsRealtimeAdapter(RealtimeModelAdapter):
+class OmniDreamsRealtimeAdapter(BaseRealtimeModelAdapter):
     """Realtime model adapter for the NVIDIA OmniDreams world model.
 
     Wires the WebSocket ``/v1/realtime_video/generate`` session loop to the
@@ -343,7 +323,7 @@ class OmniDreamsRealtimeAdapter(RealtimeModelAdapter):
 
         * ``bytes`` — JPEG- or PNG-encoded image for a single HDMap frame.
         * ``list[bytes]`` — one JPEG/PNG per latent frame within the chunk
-          (``len_t`` items).  The ``ConditionEventQueue`` expands the list and
+          (``len_t`` items).  The ``ControlSignalQueue`` expands the list and
           samples exactly ``len_t`` frames in :meth:`prepare_next_request`.
         * ``str`` — base64-encoded JPEG/PNG (or a data-URL / file path), for
           JSON transport.
@@ -397,7 +377,7 @@ class OmniDreamsRealtimeAdapter(RealtimeModelAdapter):
         hdmap_frames = state.sample_hdmap_chunk(chunk_size)
         condition_inputs: dict[str, Any] = {}
         if hdmap_frames is not None:
-            w, h = _parse_size(request.size) if request.size else (None, None)
+            w, h = _parse_size_or_raise(request.size) if request.size else (None, None)
             if w and h:
                 hdmap_tensor = _decode_hdmap_chunk(hdmap_frames, h, w)
                 if hdmap_tensor is not None:

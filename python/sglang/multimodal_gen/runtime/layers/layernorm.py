@@ -670,12 +670,6 @@ class _NormScaleShift(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
-        if not x.is_cuda:
-            # CPU tensors on a CUDA-capable build still dispatch to forward_cuda
-            # because the CustomOp selects the method at init time by platform,
-            # not by input tensor device.  Fall back to the native PyTorch path.
-            return self.forward_native(x, shift, scale)
-
         if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
             import warnings
 

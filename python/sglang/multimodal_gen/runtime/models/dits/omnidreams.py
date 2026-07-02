@@ -895,7 +895,6 @@ being written to the KV-cache (standard RoPE, not the cache-relative variant).
 
 
 import torch
-from torch import Tensor
 
 from sglang.multimodal_gen.runtime.layers.rotary_embedding.mrope import (
     NDRotaryEmbedding,
@@ -1077,7 +1076,6 @@ Per-step usage::
 from dataclasses import dataclass, field
 
 import torch
-from torch import Tensor
 from typing_extensions import Self
 
 
@@ -1351,4 +1349,3 @@ class BlockKVCache:
         self._prev_chunk_idx = -1
         self._n_cached = 0
         self._curr_chunk_idx = None
-

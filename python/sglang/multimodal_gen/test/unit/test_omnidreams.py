@@ -16,28 +16,51 @@ Merged from the former test_omnidreams_{components,fp8,hdmap,optimizations,regre
   - realtime: session equivalence/KV-reuse/lifecycle, HD-map condition queue,
     HD-map decode helpers.
 """
+
 from __future__ import annotations
 
+import json
+import os
 import types
-
-from collections import Counter
-
-import numpy as np
-
-import PIL.Image
-
-import pytest
-
-import torch
+from collections import Counter, OrderedDict
+from itertools import chain
 
 import imageio.v2 as imageio
-
+import numpy as np
+import PIL.Image
+import pytest
+import torch
 from fastapi import HTTPException
 
+from sglang.multimodal_gen.configs.models.dits.omnidreams import (
+    OmniDreamsDiTArchConfig,
+    OmniDreamsDiTConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.omnidreams import (
+    OmniDreamsPipelineConfig,
+    warp_flow_match_sigmas,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _validate_http_hdmap_path,
 )
-
+from sglang.multimodal_gen.runtime.layers.layernorm import LayerNormScaleShift
+from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
+    BlockKVCache,
+    OmniDreamsDiT,
+    RotaryPositionEmbedding3D,
+    TimestepEmbedding,
+    Timesteps,
+    apply_rope_freqs,
+    rope_dims,
+)
+from sglang.multimodal_gen.runtime.models.encoders.omnidreams_text import (
+    COSMOS_REASON1_HIDDEN,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.omnidreams import (  # noqa: E501
+    _MAX_AR_CHUNKS,
+    _TEXT_MAX_LENGTH,
+    OmniDreamsBeforeDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.omnidreams_hdmap_decode import (
     _read_frames_numpy,
     decode_hdmap_baseline,
@@ -45,51 +68,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.o
     decode_hdmap_numpy,
     decode_hdmap_numpy_limited,
 )
-
-import os
-
-from collections import OrderedDict
-
-from sglang.multimodal_gen.runtime.layers.layernorm import LayerNormScaleShift
-
-from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
-    BlockKVCache,
-    RotaryPositionEmbedding3D,
-    apply_rope_freqs,
-)
-
-import json
-
-from itertools import chain
-
-from sglang.multimodal_gen.configs.models.dits.omnidreams import (
-    OmniDreamsDiTArchConfig,
-    OmniDreamsDiTConfig,
-)
-
-from sglang.multimodal_gen.configs.pipeline_configs.omnidreams import (
-    OmniDreamsPipelineConfig,
-    warp_flow_match_sigmas,
-)
-
-from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
-    OmniDreamsDiT,
-    TimestepEmbedding,
-    Timesteps,
-    rope_dims,
-)
-
-from sglang.multimodal_gen.runtime.models.encoders.omnidreams_text import (
-    COSMOS_REASON1_HIDDEN,
-)
-
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.omnidreams import (  # noqa: E501
-    _MAX_AR_CHUNKS,
-    _TEXT_MAX_LENGTH,
-    OmniDreamsBeforeDenoisingStage,
-)
-
-
 
 # ============================================================================
 # Components section
@@ -114,17 +92,6 @@ requires_gpu = pytest.mark.skipif(
     reason="OmniDreams DiT forward runs on the platform (GPU) device",
 )
 
-from sglang.multimodal_gen.configs.models.dits.omnidreams import (
-    OmniDreamsDiTArchConfig,
-    OmniDreamsDiTConfig,
-)
-from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
-    BlockKVCache,
-    OmniDreamsDiT,
-    RotaryPositionEmbedding3D,
-    apply_rope_freqs,
-    rope_dims,
-)
 from sglang.multimodal_gen.runtime.models.encoders.omnidreams_text import (
     FULL_CONCAT_DIM,
     full_concat_embeddings,
@@ -132,9 +99,6 @@ from sglang.multimodal_gen.runtime.models.encoders.omnidreams_text import (
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_omnidreams_flow_match import (  # noqa: E501
     OmniDreamsFlowMatchScheduler,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.omnidreams import (  # noqa: E501
-    OmniDreamsBeforeDenoisingStage,
 )
 
 
@@ -351,6 +315,8 @@ def test_kv_cache_fill_roll_steady_state():
     ck = c.cached_k().clone()
     c.after_update(2)
     assert bool((ck[:, :2] == 11).all()) and bool((ck[:, 2:] == 12).all())
+
+
 def test_kv_cache_sink_is_never_evicted():
     c = BlockKVCache(
         k_shape=(1, 6, 2, 3),
@@ -693,6 +659,7 @@ def test_reference_preprocess_pil_resizes_and_normalizes():
     assert out.min() >= -1.0 - 1e-4 and out.max() <= 1.0 + 1e-4
     assert out.min() < 0.0  # mapped into the signed VAE input range
 
+
 @pytest.mark.parametrize(
     "input_range",
     ["signed", "unsigned"],
@@ -862,7 +829,8 @@ def test_encode_hdmap_clamps_short_sequence(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "hdmap_path", ["scene_hdmap.mp4", ["scene_hdmap.mp4"]],
+    "hdmap_path",
+    ["scene_hdmap.mp4", ["scene_hdmap.mp4"]],
     ids=["string", "cli_list_wraps_string"],
 )
 def test_encode_hdmap_video_path_decoded_per_frame(monkeypatch, hdmap_path):
@@ -1010,6 +978,7 @@ def test_block_cross_view_attention_rejected_when_enabled():
 #   The native-ext / CUDA-source-text / LightVAE-FP8-state tests were deleted with
 #   the native tree.
 #   """
+
 
 def test_cosmos_fp8_per_out_channel_quant_rcr_contract():
     from sglang.multimodal_gen.runtime.models.dits.omnidreams_cosmos_fp8_utils import (
@@ -1394,9 +1363,9 @@ def test_vae_encoder_wanvae_setup(cfg_kwargs, expect_resolve_called):
     )
 
     cfg = OmniDreamsVAEEncoderConfig(**cfg_kwargs)
-    with patch.object(comp, "resolve_wan_vae_path", return_value="/fake/vae") as rp, patch.object(
-        comp, "load_wan_vae", return_value=MagicMock()
-    ) as lw:
+    with patch.object(
+        comp, "resolve_wan_vae_path", return_value="/fake/vae"
+    ) as rp, patch.object(comp, "load_wan_vae", return_value=MagicMock()) as lw:
         cfg.setup()
     if expect_resolve_called:
         rp.assert_called_once()
@@ -1495,6 +1464,7 @@ def test_shipped_accel_json_configs_load():
 #      build sampling params directly and bypass this guard.
 #   """
 
+
 def _write_synthetic_mp4(path, num_frames, h, w):
     """Write a synthetic RGB mp4 (ffmpeg via imageio-ffmpeg)."""
     rng = np.random.RandomState(0)
@@ -1514,7 +1484,11 @@ def _write_synthetic_mp4(path, num_frames, h, w):
 def test_read_frames_numpy(tmp_path, num_frames, max_frames, expected_len):
     p = str(tmp_path / "v.mp4")
     _write_synthetic_mp4(p, num_frames=num_frames, h=16, w=32)
-    frames = _read_frames_numpy(p, max_frames=max_frames) if max_frames else _read_frames_numpy(p)
+    frames = (
+        _read_frames_numpy(p, max_frames=max_frames)
+        if max_frames
+        else _read_frames_numpy(p)
+    )
     assert len(frames) == expected_len
     assert frames[0].shape == (16, 32, 3)
     assert frames[0].dtype == np.uint8
@@ -1790,6 +1764,7 @@ def test_rope_works_for_all_ar_offsets():
             out.norm(dim=-1), x.norm(dim=-1), atol=1e-4
         ), f"ar_idx={ar_idx}: norm not preserved"
 
+
 def test_rope_batch_dimension_broadcast():
     """B>1: each batch element gets the same position-dependent cos/sin."""
     torch.manual_seed(0)
@@ -1849,6 +1824,7 @@ def test_kv_cache_split_copy_steady_state_roll():
     assert bool((ck[:, :2] == 11).all()), "first chunk should be 11 after roll"
     assert bool((ck[:, 2:4] == 12).all()), "second chunk should be 12 after roll"
     assert bool((ck[:, 4:6] == 13).all()), "third chunk should be new 13"
+
 
 def test_kv_cache_split_copy_overwrite_same_chunk():
     """Re-forward overwrite (same chunk_idx) works with split-copy."""
@@ -1911,6 +1887,7 @@ def test_kv_cache_split_copy_overlap_handling():
     assert ck[0, 1, 0, 0].item() == 3.0, f"expected 3, got {ck[0,1,0,0]}"
     assert ck[0, 2, 0, 0].item() == 4.0, f"expected 4, got {ck[0,2,0,0]}"
 
+
 def test_text_cache_lru_eviction_order():
     """LRU cache evicts oldest entry when full (FIFO-like with move_to_end)."""
     # Simulate the cache data structure and logic from _encode_text
@@ -1971,6 +1948,7 @@ def test_text_cache_stores_on_cpu():
     assert cache["test"].device.type == "cpu"
     # Detached tensor should not have grad
     assert not cache["test"].requires_grad
+
 
 def test_lighttae_frames_to_trim_math():
     from sglang.multimodal_gen.runtime.models.vaes.taehv import TAEHV
@@ -2494,7 +2472,7 @@ if __name__ == "__main__":
 #      block_idx==0, release disposes it and returns True.
 #
 #   4. ``test_hdmap_condition_queue``  — CPU-safe.
-#      ConditionEventQueue.push + .sample_chunk(repeat_last=True) over 3 chunks:
+#      ControlSignalQueue.push + .sample_chunk(repeat_last=True) over 3 chunks:
 #      verify length-2 output, advancing seq_ids, and repeat_last fallback.
 #
 #   Run on chen@100.87.72.4 (CPU unit tests) or rtx6kd (GPU tests).
@@ -2508,22 +2486,21 @@ requires_gpu = pytest.mark.skipif(
     reason="OmniDreams realtime equivalence requires a CUDA GPU",
 )
 
-# ---------------------------------------------------------------------------
-# Imports: kept at module level so collection always works on CPU.
-# All sglang imports are placed here; they don't touch CUDA at import time.
-# ---------------------------------------------------------------------------
-from sglang.multimodal_gen.runtime.realtime.causal_state import (
-    RealtimeCausalDiTState,
-)
-from sglang.multimodal_gen.runtime.realtime.condition_events import (
-    ConditionEvent,
-    ConditionEventQueue,
-    ConditionSamplingParams,
-    ControlSignal,
+from sglang.multimodal_gen.runtime.realtime.control_signals import (
+    ControlSignalQueue,
+    ControlSignalSamplingParams,
 )
 from sglang.multimodal_gen.runtime.realtime.session import (
     RealtimeSession,
     RealtimeSessionCache,
+)
+
+# ---------------------------------------------------------------------------
+# Imports: kept at module level so collection always works on CPU.
+# All sglang imports are placed here; they don't touch CUDA at import time.
+# ---------------------------------------------------------------------------
+from sglang.multimodal_gen.runtime.realtime.states import (
+    RealtimeCausalDiTState,
 )
 
 # ===========================================================================
@@ -3040,16 +3017,16 @@ def test_session_lifecycle_block_idx0_resets_existing_session():
 # Test 4: test_hdmap_condition_queue  (CPU-safe)
 # ===========================================================================
 
+
 def test_hdmap_condition_queue_seq_id_advances():
     """After sampling 3 single-item events, last_sampled_seq_id advances
     monotonically (seq_ids 0, 1, 2 consumed in order).
     """
-    queue = ConditionEventQueue()
+    queue = ControlSignalQueue()
     for i in range(3):
-        signal = ControlSignal(kind="hdmap", payload=f"payload_{i}", seq_id=i)
-        queue.push(ConditionEvent(kind="hdmap", payload=signal))
+        queue.push("hdmap", f"payload_{i}", event_id=i)
 
-    params = ConditionSamplingParams(chunk_size=1, repeat_last=True)
+    params = ControlSignalSamplingParams(chunk_size=1, repeat_last=True)
     seen_seq_ids = []
     for _ in range(3):
         queue.sample_chunk("hdmap", params)
@@ -3066,12 +3043,11 @@ def test_hdmap_condition_queue_repeat_last_fallback_when_empty():
     """When the queue is drained, repeat_last=True pads from the last consumed
     payload; repeat_last=False returns None when no default is set.
     """
-    queue = ConditionEventQueue()
+    queue = ControlSignalQueue()
     last_payload = "final_frame"
-    signal = ControlSignal(kind="hdmap", payload=last_payload, seq_id=0)
-    queue.push(ConditionEvent(kind="hdmap", payload=signal))
+    queue.push("hdmap", last_payload, event_id=0)
 
-    params_repeat = ConditionSamplingParams(chunk_size=2, repeat_last=True)
+    params_repeat = ControlSignalSamplingParams(chunk_size=2, repeat_last=True)
     # First sample drains the one real event; repeat_last pads to chunk_size=2.
     first = queue.sample_chunk("hdmap", params_repeat)
     assert first is not None and len(first) == 2
@@ -3084,7 +3060,7 @@ def test_hdmap_condition_queue_repeat_last_fallback_when_empty():
     # the queue returns None for an unseen kind ... but "hdmap" has been seen
     # (pushed once above); the result depends on repeat_last_across_empty_chunks.
     # Here we check that repeat_last=False returns None on an empty known kind.
-    params_no_repeat = ConditionSamplingParams(chunk_size=2, repeat_last=False)
+    params_no_repeat = ControlSignalSamplingParams(chunk_size=2, repeat_last=False)
     result_no_repeat = queue.sample_chunk("hdmap", params_no_repeat)
     # The "hdmap" kind has been seen (seen_kinds is populated on push); no pending
     # events remain and repeat_last=False, so None is the correct fallback.
@@ -3097,13 +3073,12 @@ def test_hdmap_condition_queue_three_chunks_full_coverage():
     """Push 3 events (seq_ids 0-2), sample 3 chunks of size 2 with repeat_last.
     Each chunk result has length 2; seq_id advances; exhaustion falls back cleanly.
     """
-    queue = ConditionEventQueue()
+    queue = ControlSignalQueue()
     fake_frames = [torch.zeros(1, 3, 1, 4, 4) + i for i in range(3)]
     for i, frame in enumerate(fake_frames):
-        signal = ControlSignal(kind="hdmap", payload=frame, seq_id=i)
-        queue.push(ConditionEvent(kind="hdmap", payload=signal))
+        queue.push("hdmap", frame, event_id=i)
 
-    params = ConditionSamplingParams(chunk_size=2, repeat_last=True)
+    params = ControlSignalSamplingParams(chunk_size=2, repeat_last=True)
 
     # chunk 0: consumes events 0 and 1 (seq_ids 0 and 1)
     c0 = queue.sample_chunk("hdmap", params)
