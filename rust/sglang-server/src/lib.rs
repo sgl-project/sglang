@@ -3,11 +3,12 @@
 //!
 //! Pipeline stages 1–5 are pure Rust and never touch a `PyObject`, so they run
 //! concurrently with the Python scheduler without contending for the GIL. The
-//! only GIL crossings are the two boundary methods on [`Server`]:
+//! only GIL crossings are the boundary methods on [`Server`]:
 //!   * `recv_requests` — Python scheduler thread drains the ingress ring.
-//!   * `push_chunk`    — Python scheduler thread pushes one output chunk.
+//!   * `push_batch`    — Python scheduler thread pushes one output batch.
+//!   * `push_result`   — Python scheduler thread pushes one control result.
 //!
-//! Both are non-blocking, so the GIL is never held across a wait.
+//! All are non-blocking, so the GIL is never held across a wait.
 
 mod api_server;
 mod detokenizer;
@@ -18,7 +19,6 @@ mod message;
 mod runtime;
 mod tokenizer;
 mod tokenizer_manager;
-mod transport;
 
 use std::net::SocketAddr;
 
@@ -45,7 +45,6 @@ impl Server {
     #[new]
     #[pyo3(signature = (
         bind = None,
-        headless_server_bind = None,
         ingress_ring_cap = 8192,
         egress_ring_cap = 8192,
         channel_cap = 8192,
@@ -59,7 +58,6 @@ impl Server {
     #[allow(clippy::too_many_arguments)]
     fn start(
         bind: Option<String>,
-        headless_server_bind: Option<String>,
         ingress_ring_cap: usize,
         egress_ring_cap: usize,
         channel_cap: usize,
@@ -97,16 +95,6 @@ impl Server {
 
         let tokenizer_path = server_args.tokenizer_path();
         let revision = server_args.revision();
-        // Headless TCP transport (`dp_size > 1`): when set, replaces the embedded
-        // HTTP api-server with a TCP listener a standalone api-server drives.
-        let headless: Option<SocketAddr> = match headless_server_bind {
-            Some(addr) => Some(addr.parse().map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "bad headless_server_bind: {e}"
-                ))
-            })?),
-            None => None,
-        };
 
         let server_args = std::sync::Arc::new(server_args);
 
@@ -122,7 +110,6 @@ impl Server {
             cores,
             tokenizer_path,
             revision,
-            headless,
             server_args,
         };
         let rt = runtime::start(cfg).map_err(|e| {
@@ -159,10 +146,15 @@ impl Server {
         Ok((headers, ids_buf, cols.lengths))
     }
 
-    /// Push one scheduler-output chunk (already msgpack-encoded `ChunkEvent`)
-    /// into the egress ring → detok shard. Returns `False` on backpressure.
-    fn push_chunk(&self, py: Python<'_>, chunk: &[u8]) -> bool {
-        let bytes = crate::message::frame_egress_chunk(chunk);
+    /// Push a whole decode batch as ONE frame: a columnar msgpack `header`
+    /// (per-request scalars + numeric-column length metadata) plus one
+    /// concatenated raw `data` buffer (token ids, and — when any request wants
+    /// them — logprob/hidden columns, kept out of msgpack like the ingress
+    /// `input_ids` split). The tm-egress dispatcher fans it out into per-request
+    /// chunks and routes each by rid, collapsing N per-request msgpack encodes +
+    /// N FFI crossings into one. Returns `False` on backpressure.
+    fn push_batch(&self, py: Python<'_>, header: &[u8], data: &[u8]) -> bool {
+        let bytes = crate::message::frame_egress_batch(header, data);
         py.detach(|| self.rt.egress.try_push(bytes))
     }
 
@@ -180,66 +172,6 @@ impl Server {
     }
 }
 
-/// Run the standalone api-server process (`dp_size > 1`): serve the OpenAI /
-/// `/generate` HTTP API on `bind` and the internal `/internal/register` endpoint.
-/// The TCP pool to the DP ranks is **deferred** — each headless rank reports its
-/// endpoint via registration, and the pool connects once all `dp_size` have
-/// (handlers answer 503 until then). Blocks for the process lifetime; the GIL is
-/// released while the Rust HTTP server runs, so the host process can still handle
-/// signals.
-#[pyfunction]
-#[pyo3(signature = (
-    bind,
-    egress_buf = 8192,
-    server_args_json = "{}",
-))]
-fn run_api_server(
-    py: Python<'_>,
-    bind: String,
-    egress_buf: usize,
-    server_args_json: &str,
-) -> PyResult<()> {
-    let to_val = |e: String| PyErr::new::<pyo3::exceptions::PyValueError, _>(e);
-
-    let server_args = runtime::ServerArgs::from_json(server_args_json)
-        .map_err(|e| to_val(format!("bad server_args_json: {e}")))?;
-    server_args
-        .validate_mandatory()
-        .map_err(|e| to_val(format!("server_args: {e}")))?;
-    let bind: SocketAddr = bind.parse().map_err(|e| to_val(format!("bad bind: {e}")))?;
-    let standalone_api_worker_num = server_args.standalone_api_server_num();
-    // Readiness state: ranks register their endpoints, then the pool connects.
-    let ready = transport::NetReady::new(
-        server_args.dp_size(),
-        server_args.ingress_pool_size(),
-        server_args.egress_pool_size(),
-    );
-    let server_args = std::sync::Arc::new(server_args);
-    let id_gen = std::sync::Arc::new(crate::ids::RequestIdGen::default());
-
-    // Release the GIL: pure-Rust HTTP server that runs until the process is
-    // signalled. The pool connect is driven by registrations inside `block_on`.
-    py.detach(move || -> Result<(), String> {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(standalone_api_worker_num)
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        rt.block_on(async move {
-            api_server::serve(
-                bind,
-                api_server::Transport::Net(ready),
-                id_gen,
-                egress_buf,
-                server_args,
-            )
-            .await;
-            Ok(())
-        })
-    })
-    .map_err(to_val)
-}
-
 /// The Python module: `import sglang_server`.
 #[pymodule]
 fn sglang_server(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -251,6 +183,5 @@ fn sglang_server(m: &Bound<'_, PyModule>) -> PyResult<()> {
         )
         .try_init();
     m.add_class::<Server>()?;
-    m.add_function(wrap_pyfunction!(run_api_server, m)?)?;
     Ok(())
 }

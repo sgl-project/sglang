@@ -6,11 +6,7 @@
 //! ingress pipeline, and then either awaits a single `Done` (unary) or relays
 //! frames as Server-Sent Events (streaming), byte-compatible with the Python
 //! `http_server.generate_request` (`data: {json}\n\n` … `data: [DONE]\n\n`).
-//!
-//! The OpenAI-compatible endpoints (`/v1/*`) live in the [`openai`] submodule;
-//! they share this module's [`AppState`] and submit machinery. Future protocols
-//! (e.g. Anthropic) get their own sibling submodule the same way.
-
+//! `/server_info` reuses the same submit machinery for a single control result.
 mod openai;
 
 use std::net::SocketAddr;
@@ -31,7 +27,6 @@ use tokio::sync::mpsc;
 
 use crate::fsm::RequestState;
 use crate::ids::{RequestId, RequestIdGen};
-use dynamo_renderer::PromptFormatter;
 
 use crate::message::{
     ControlRequest, EgressItem, EgressSink, GeneratePayload, GenerateRequest, GenerationOutput,
@@ -39,73 +34,46 @@ use crate::message::{
 };
 use crate::runtime::ServerArgs;
 use crate::runtime::channels::{Senders, TmEvent};
-use crate::transport::NetReady;
-
-/// How the api-server reaches the pipeline. Embedded (`dp_size == 1`) uses the
-/// in-process `flume` channels; the standalone api-server process (`dp_size > 1`)
-/// reaches each headless DP rank over TCP. The [`NetReady`] pool is established
-/// lazily, once every rank has registered (`POST /internal/register`), so
-/// `submit` answers 503 until then. `submit` is the only place that branches;
-/// every handler is transport-agnostic.
-#[derive(Clone)]
-pub enum Transport {
-    Local(Senders),
-    Net(Arc<NetReady>),
-}
-
-/// Built once at startup from the model's `tokenizer_config.json` (`None` when
-/// the model has no chat template, or under `skip_tokenizer_init`). `Clone` is a
-/// refcount bump (the formatter is `Arc`-backed), so it rides on `AppState`.
-#[derive(Clone)]
-struct ChatFormatter(PromptFormatter);
 
 /// Shared state for every handler. Holds the submit machinery (`senders`,
-/// `id_gen`, `egress_buf`) plus the static `ServerArgs` read by `/v1/models`.
-/// `server_args` is an `Arc`, so the per-request clone axum makes is a refcount
-/// bump.
+/// `id_gen`, `egress_buf`) and the shared tokenizer. `Clone` is a set of
+/// refcount bumps (each field is `Arc`-backed), so axum's per-request clone is
+/// cheap.
 #[derive(Clone)]
 struct AppState {
-    transport: Transport,
+    senders: Senders,
     id_gen: Arc<RequestIdGen>,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
-    /// `None` when the model has no chat template → `/v1/chat/completions` 400s.
-    chat: Option<ChatFormatter>,
+    /// Shared with the detok shards / tokenizer pool (Arc-backed). Used to decode
+    /// logprob token ids to text when `return_text_in_logprobs` is set. `None`
+    /// under `skip_tokenizer_init`.
+    tokenizer: Option<dynamo_tokenizers::Tokenizer>,
 }
 
 pub async fn serve(
     bind: SocketAddr,
-    transport: Transport,
+    senders: Senders,
     id_gen: Arc<RequestIdGen>,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
+    tokenizer: Option<dynamo_tokenizers::Tokenizer>,
 ) {
-    let chat = openai::load_chat_formatter(&server_args).map(ChatFormatter);
     let state = AppState {
-        transport,
+        senders,
         id_gen,
         egress_buf,
         server_args,
-        chat,
+        tokenizer,
     };
     let app = Router::new()
         .route("/generate", post(generate))
-        // OpenAI-compatible: same tokenize→generate→detok pipeline, OpenAI shape.
-        .route("/v1/completions", post(openai::openai_completions))
-        .route(
-            "/v1/chat/completions",
-            post(openai::openai_chat_completions),
-        )
         // Control-plane endpoints: each reuses the ingress FSM (no tokenization)
         // and returns a single, non-streamed JSON result from the scheduler.
         // Adding one = a route line passing its scheduler request-struct tag.
         .route("/server_info", get(server_info))
         // Static config endpoint (OpenAI-compatible): no scheduler round-trip.
         .route("/v1/models", get(openai::available_models))
-        // Internal: a headless DP rank reports its TCP endpoint so the standalone
-        // api-server can build its pool (Mode A registration). No-op (400) on the
-        // embedded transport.
-        .route("/internal/register", post(register))
         .with_state(state);
 
     match tokio::net::TcpListener::bind(bind).await {
@@ -119,33 +87,6 @@ pub async fn serve(
     }
 }
 
-/// Body of `POST /internal/register`: one headless DP rank announcing the TCP
-/// address the api-server should dial it at.
-#[derive(serde::Deserialize)]
-struct RegisterBody {
-    dp_rank: usize,
-    endpoint: String,
-}
-
-/// `POST /internal/register` — a headless DP rank reports its TCP endpoint. The
-/// standalone api-server collects all `dp_size` of them, then connects its pool
-/// (handled inside [`NetReady::register`]); request handlers return 503 until
-/// it's up. Not applicable to the embedded (in-process) transport.
-async fn register(State(state): State<AppState>, Json(body): Json<RegisterBody>) -> Response {
-    match &state.transport {
-        Transport::Net(ready) => match body.endpoint.parse() {
-            Ok(addr) => {
-                ready.register(body.dp_rank, addr);
-                (StatusCode::OK, "registered").into_response()
-            }
-            Err(_) => (StatusCode::BAD_REQUEST, "bad endpoint").into_response(),
-        },
-        Transport::Local(_) => {
-            (StatusCode::BAD_REQUEST, "registration not applicable").into_response()
-        }
-    }
-}
-
 /// Submit a request into the ingress pipeline. Returns the per-request egress
 /// receiver to read the result(s) from. The `kind` carries the variant body
 /// (generate payload / control tag), so this stays generic over both.
@@ -154,63 +95,21 @@ async fn submit(
     kind: RequestKind,
 ) -> Result<(RequestId, mpsc::Receiver<EgressItem>), ()> {
     let id = state.id_gen.next();
-    match &state.transport {
-        // Embedded: move the request into the in-process pipeline. Async-aware
-        // send so a full TM inbox yields (backpressure) instead of parking a
-        // worker thread; Err only when the inbox is closed (runtime shutdown).
-        Transport::Local(senders) => {
-            let (tx, rx) = mpsc::channel::<EgressItem>(state.egress_buf);
-            let req = Request {
-                id,
-                state: RequestState::Received,
-                sink: EgressSink::Local(tx),
-                kind,
-            };
-            match senders.tm.send_async(TmEvent::Ingress(req)).await {
-                Ok(()) => Ok((id, rx)),
-                Err(_) => {
-                    tracing::error!("tm inbox closed; request dropped");
-                    Err(())
-                }
-            }
-        }
-        // Standalone: serialize the request and route it over TCP. The pool is
-        // up only after every rank has registered — until then `client()` is
-        // `None` and we fail (→ 503). Generate requests load-balance to one rank;
-        // **control** requests (e.g. `/server_info`) are answered per-rank, so
-        // they're broadcast to all and the first response wins — round-robin
-        // could pick a rank whose answer never returns, hanging the caller.
-        Transport::Net(ready) => match ready.client() {
-            Some(client) => {
-                let rx = match kind {
-                    RequestKind::Control(_) => {
-                        client.submit_broadcast(id, kind, state.egress_buf).await?
-                    }
-                    RequestKind::Generate(_) => client.submit(id, kind, state.egress_buf).await?,
-                };
-                Ok((id, rx))
-            }
-            None => Err(()),
-        },
-    }
-}
-
-impl Transport {
-    /// Best-effort, **non-blocking** abort of `rid` — the HTTP client
-    /// disconnected. Safe to call from `Drop`: never awaits. Local routes a
-    /// `TmEvent::Abort` to the ingress loop; Net broadcasts a `Frame::Abort` to
-    /// every rank. A full/closed channel just drops it (the request then finishes
-    /// at EOS, only later).
-    fn try_abort(&self, rid: RequestId) {
-        match self {
-            Transport::Local(senders) => {
-                let _ = senders.tm.try_send(TmEvent::Abort(rid));
-            }
-            Transport::Net(ready) => {
-                if let Some(client) = ready.client() {
-                    client.try_abort_broadcast(rid.0);
-                }
-            }
+    // Move the request into the in-process pipeline. Async-aware send so a full
+    // TM inbox yields (backpressure) instead of parking a worker thread; Err only
+    // when the inbox is closed (runtime shutdown).
+    let (tx, rx) = mpsc::channel::<EgressItem>(state.egress_buf);
+    let req = Request {
+        id,
+        state: RequestState::Received,
+        sink: EgressSink::Local(tx),
+        kind,
+    };
+    match state.senders.tm.send_async(TmEvent::Ingress(req)).await {
+        Ok(()) => Ok((id, rx)),
+        Err(_) => {
+            tracing::error!("tm inbox closed; request dropped");
+            Err(())
         }
     }
 }
@@ -221,20 +120,16 @@ impl Transport {
 /// `request.is_disconnected()`. Each rid is disarmed once it finishes naturally;
 /// whatever is left when the guard drops gets an abort.
 struct AbortGuard {
-    transport: Transport,
+    senders: Senders,
     rids: Vec<RequestId>,
 }
 
 impl AbortGuard {
-    fn new(transport: Transport, rid: RequestId) -> Self {
+    fn new(senders: Senders, rid: RequestId) -> Self {
         Self {
-            transport,
+            senders,
             rids: vec![rid],
         }
-    }
-
-    fn with_rids(transport: Transport, rids: Vec<RequestId>) -> Self {
-        Self { transport, rids }
     }
 
     /// Request `rid` finished naturally — don't abort it on drop.
@@ -245,8 +140,11 @@ impl AbortGuard {
 
 impl Drop for AbortGuard {
     fn drop(&mut self) {
+        // Best-effort, non-blocking abort of each still-in-flight rid — route a
+        // `TmEvent::Abort` to the ingress loop. A full/closed channel just drops
+        // it (the request then finishes at EOS, only later).
         for &rid in &self.rids {
-            self.transport.try_abort(rid);
+            let _ = self.senders.tm.try_send(TmEvent::Abort(rid));
         }
     }
 }
@@ -279,10 +177,85 @@ async fn await_control_result(
     }
 }
 
+/// The text slot of a `[logprob, token_id, text]` tuple: the decoded token when
+/// `return_text_in_logprobs` supplied a text buffer, else `null`.
+fn text_slot(texts: Option<&[String]>, j: usize) -> serde_json::Value {
+    texts
+        .and_then(|t| t.get(j))
+        .map(|s| serde_json::json!(s))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Decode each logprob token id to its own text — one id at a time, matching
+/// Python's `batch_decode([[id] for id in ids])`. Decode errors fall back to "".
+fn decode_logprob_texts(tok: &dynamo_tokenizers::Tokenizer, idxs: &[i32]) -> Vec<String> {
+    idxs.iter()
+        .map(|&id| {
+            tok.decode(&[id as u32], false)
+                .map(String::from)
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Build the SGLang logprob wire shape: a list of `[logprob, token_id, text]`
+/// tuples. `texts` (flat, parallel to `idxs`) fills the text slot when
+/// `return_text_in_logprobs` is set; otherwise it is `null`.
+fn logprob_tuples(vals: &[f32], idxs: &[i32], texts: Option<&[String]>) -> serde_json::Value {
+    let tuples: Vec<serde_json::Value> = vals
+        .iter()
+        .zip(idxs.iter())
+        .enumerate()
+        .map(|(j, (&v, &tid))| serde_json::json!([v, tid, text_slot(texts, j)]))
+        .collect();
+    serde_json::Value::Array(tuples)
+}
+
+/// Build the ragged top-k / token-ids logprob shape: one entry per position,
+/// each a list of `[logprob, token_id, text]` tuples, or `null` for an empty
+/// position (`lens[p] == 0`) — mirroring `detokenize_top_logprobs_tokens`.
+/// `texts` is flat, parallel to `vals`/`idxs`.
+fn ragged_logprob_tuples(
+    vals: &[f32],
+    idxs: &[i32],
+    lens: &[u32],
+    texts: Option<&[String]>,
+) -> serde_json::Value {
+    let mut positions = Vec::with_capacity(lens.len());
+    let mut off = 0usize;
+    for &l in lens {
+        let l = l as usize;
+        if l == 0 {
+            positions.push(serde_json::Value::Null);
+        } else {
+            let tuples: Vec<serde_json::Value> = (off..off + l)
+                .map(|j| serde_json::json!([vals[j], idxs[j], text_slot(texts, j)]))
+                .collect();
+            positions.push(serde_json::Value::Array(tuples));
+        }
+        off += l;
+    }
+    serde_json::Value::Array(positions)
+}
+
+/// Reshape flat hidden-state f32s + per-row lengths into `meta_info`'s nested
+/// `list[list[float]]` (one row per output position). A single row of length 1
+/// wins the common last-token case; multi-row is the per-token case.
+fn hidden_states_rows(vals: &[f32], lens: &[u32]) -> serde_json::Value {
+    let mut rows = Vec::with_capacity(lens.len());
+    let mut off = 0usize;
+    for &l in lens {
+        let l = l as usize;
+        rows.push(serde_json::json!(&vals[off..(off + l).min(vals.len())]));
+        off += l;
+    }
+    serde_json::Value::Array(rows)
+}
+
 /// Format a neutral [`GenerationOutput`] as one SGLang `/generate` frame. Lives
 /// in the handler now that the detok shard is protocol-neutral. `output_ids` is
 /// surfaced only in `skip_tokenizer_init` mode (cumulative, non-empty there).
-fn sglang_frame(out: &GenerationOutput) -> Vec<u8> {
+fn sglang_frame(out: &GenerationOutput, tok: Option<&dynamo_tokenizers::Tokenizer>) -> Vec<u8> {
     let mut v = serde_json::json!({
         "text": out.text,
         "meta_info": {
@@ -292,8 +265,61 @@ fn sglang_frame(out: &GenerationOutput) -> Vec<u8> {
             "finish_reason": out.finish_reason.as_deref().map(|r| serde_json::json!({ "type": r })),
         },
     });
+    // Logprobs: SGLang shape is a list of `[logprob, token_id, token_text|null]`
+    // tuples. When `tok` is set (`return_text_in_logprobs`), decode each idx to
+    // text; otherwise the text slot stays null.
+    let texts = |idxs: &[i32]| tok.map(|t| decode_logprob_texts(t, idxs));
     if !out.output_ids.is_empty() {
         v["output_ids"] = serde_json::json!(out.output_ids);
+    }
+    if !out.out_lp_val.is_empty() {
+        v["meta_info"]["output_token_logprobs"] = logprob_tuples(
+            &out.out_lp_val,
+            &out.out_lp_idx,
+            texts(&out.out_lp_idx).as_deref(),
+        );
+    }
+    if !out.in_lp_val.is_empty() {
+        v["meta_info"]["input_token_logprobs"] = logprob_tuples(
+            &out.in_lp_val,
+            &out.in_lp_idx,
+            texts(&out.in_lp_idx).as_deref(),
+        );
+    }
+    if !out.out_top_lens.is_empty() {
+        v["meta_info"]["output_top_logprobs"] = ragged_logprob_tuples(
+            &out.out_top_val,
+            &out.out_top_idx,
+            &out.out_top_lens,
+            texts(&out.out_top_idx).as_deref(),
+        );
+    }
+    if !out.in_top_lens.is_empty() {
+        v["meta_info"]["input_top_logprobs"] = ragged_logprob_tuples(
+            &out.in_top_val,
+            &out.in_top_idx,
+            &out.in_top_lens,
+            texts(&out.in_top_idx).as_deref(),
+        );
+    }
+    if !out.out_tid_lens.is_empty() {
+        v["meta_info"]["output_token_ids_logprobs"] = ragged_logprob_tuples(
+            &out.out_tid_val,
+            &out.out_tid_idx,
+            &out.out_tid_lens,
+            texts(&out.out_tid_idx).as_deref(),
+        );
+    }
+    if !out.in_tid_lens.is_empty() {
+        v["meta_info"]["input_token_ids_logprobs"] = ragged_logprob_tuples(
+            &out.in_tid_val,
+            &out.in_tid_idx,
+            &out.in_tid_lens,
+            texts(&out.in_tid_idx).as_deref(),
+        );
+    }
+    if !out.hidden_lens.is_empty() {
+        v["meta_info"]["hidden_states"] = hidden_states_rows(&out.hidden_val, &out.hidden_lens);
     }
     serde_json::to_vec(&v).unwrap_or_default()
 }
@@ -384,6 +410,31 @@ struct OutputAccumulator {
     prompt_tokens: u32,
     completion_tokens: u64,
     finish_reason: Option<String>,
+    /// Output-token logprobs, concatenated across chunks (parallel val/idx).
+    out_lp_val: Vec<f32>,
+    out_lp_idx: Vec<i32>,
+    /// Input (prefill) token logprobs — set once (only the first chunk carries
+    /// them).
+    in_lp_val: Vec<f32>,
+    in_lp_idx: Vec<i32>,
+    /// Top-k logprobs, concatenated across chunks (2-level ragged: flat val/idx
+    /// + per-position lens). Output concatenates; input is set once.
+    out_top_val: Vec<f32>,
+    out_top_idx: Vec<i32>,
+    out_top_lens: Vec<u32>,
+    in_top_val: Vec<f32>,
+    in_top_idx: Vec<i32>,
+    in_top_lens: Vec<u32>,
+    /// Token-ids logprobs (same layout).
+    out_tid_val: Vec<f32>,
+    out_tid_idx: Vec<i32>,
+    out_tid_lens: Vec<u32>,
+    in_tid_val: Vec<f32>,
+    in_tid_idx: Vec<i32>,
+    in_tid_lens: Vec<u32>,
+    /// Hidden states — last-writer-wins (final chunk carries the full set).
+    hidden_val: Vec<f32>,
+    hidden_lens: Vec<u32>,
 }
 
 impl OutputAccumulator {
@@ -393,6 +444,34 @@ impl OutputAccumulator {
         self.output_ids.extend_from_slice(&d.output_ids);
         self.completion_tokens += d.completion_tokens;
         self.prompt_tokens = d.prompt_tokens; // constant across the request
+        self.out_lp_val.extend_from_slice(&d.out_lp_val);
+        self.out_lp_idx.extend_from_slice(&d.out_lp_idx);
+        self.out_top_val.extend_from_slice(&d.out_top_val);
+        self.out_top_idx.extend_from_slice(&d.out_top_idx);
+        self.out_top_lens.extend_from_slice(&d.out_top_lens);
+        self.out_tid_val.extend_from_slice(&d.out_tid_val);
+        self.out_tid_idx.extend_from_slice(&d.out_tid_idx);
+        self.out_tid_lens.extend_from_slice(&d.out_tid_lens);
+        if !d.in_lp_val.is_empty() {
+            self.in_lp_val = d.in_lp_val.clone();
+            self.in_lp_idx = d.in_lp_idx.clone();
+        }
+        // Input families ride once (prefill); `lens` non-empty marks their arrival.
+        if !d.in_top_lens.is_empty() {
+            self.in_top_val = d.in_top_val.clone();
+            self.in_top_idx = d.in_top_idx.clone();
+            self.in_top_lens = d.in_top_lens.clone();
+        }
+        if !d.in_tid_lens.is_empty() {
+            self.in_tid_val = d.in_tid_val.clone();
+            self.in_tid_idx = d.in_tid_idx.clone();
+            self.in_tid_lens = d.in_tid_lens.clone();
+        }
+        // Hidden states are non-cumulative: the latest non-empty set wins.
+        if !d.hidden_lens.is_empty() {
+            self.hidden_val = d.hidden_val.clone();
+            self.hidden_lens = d.hidden_lens.clone();
+        }
         if d.finish_reason.is_some() {
             self.finish_reason = d.finish_reason.clone();
         }
@@ -408,6 +487,24 @@ impl OutputAccumulator {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
             finish_reason: self.finish_reason.clone(),
+            out_lp_val: self.out_lp_val.clone(),
+            out_lp_idx: self.out_lp_idx.clone(),
+            in_lp_val: self.in_lp_val.clone(),
+            in_lp_idx: self.in_lp_idx.clone(),
+            out_top_val: self.out_top_val.clone(),
+            out_top_idx: self.out_top_idx.clone(),
+            out_top_lens: self.out_top_lens.clone(),
+            in_top_val: self.in_top_val.clone(),
+            in_top_idx: self.in_top_idx.clone(),
+            in_top_lens: self.in_top_lens.clone(),
+            out_tid_val: self.out_tid_val.clone(),
+            out_tid_idx: self.out_tid_idx.clone(),
+            out_tid_lens: self.out_tid_lens.clone(),
+            in_tid_val: self.in_tid_val.clone(),
+            in_tid_idx: self.in_tid_idx.clone(),
+            in_tid_lens: self.in_tid_lens.clone(),
+            hidden_val: self.hidden_val.clone(),
+            hidden_lens: self.hidden_lens.clone(),
         }
     }
 
@@ -421,12 +518,36 @@ impl OutputAccumulator {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
             finish_reason: self.finish_reason,
+            out_lp_val: self.out_lp_val,
+            out_lp_idx: self.out_lp_idx,
+            in_lp_val: self.in_lp_val,
+            in_lp_idx: self.in_lp_idx,
+            out_top_val: self.out_top_val,
+            out_top_idx: self.out_top_idx,
+            out_top_lens: self.out_top_lens,
+            in_top_val: self.in_top_val,
+            in_top_idx: self.in_top_idx,
+            in_top_lens: self.in_top_lens,
+            out_tid_val: self.out_tid_val,
+            out_tid_idx: self.out_tid_idx,
+            out_tid_lens: self.out_tid_lens,
+            in_tid_val: self.in_tid_val,
+            in_tid_idx: self.in_tid_idx,
+            in_tid_lens: self.in_tid_lens,
+            hidden_val: self.hidden_val,
+            hidden_lens: self.hidden_lens,
         }
     }
 }
 
 async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePayload>) -> Response {
     let stream = payload.stream;
+    // `return_text_in_logprobs` → decode logprob token ids to text at frame time
+    // (needs the shared tokenizer). Capture before `payload` is moved.
+    let tok = match payload.return_text_in_logprobs {
+        Some(true) => state.tokenizer.clone(),
+        _ => None,
+    };
     let kind = RequestKind::Generate(GenerateRequest {
         payload,
         input_ids: None,
@@ -441,7 +562,7 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
     // Abort the request if the client disconnects: the guard fires `try_abort`
     // when dropped before the request finishes — i.e. axum drops this handler /
     // SSE stream because the connection closed. Disarmed on a natural terminal.
-    let mut guard = AbortGuard::new(state.transport.clone(), rid);
+    let mut guard = AbortGuard::new(state.senders.clone(), rid);
 
     if stream {
         // SSE: the SGLang `/generate` protocol carries **cumulative** text per
@@ -452,12 +573,12 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
                 match item {
                     EgressItem::Frame(out) => {
                         acc.fold(&out);
-                        let f = sglang_frame(&acc.snapshot(&out.rid));
+                        let f = sglang_frame(&acc.snapshot(&out.rid), tok.as_ref());
                         yield Ok::<_, Infallible>(Event::default().data(String::from_utf8_lossy(&f)));
                     }
                     EgressItem::Done(out) => {
                         acc.fold(&out);
-                        let f = sglang_frame(&acc.into_output(out.rid));
+                        let f = sglang_frame(&acc.into_output(out.rid), tok.as_ref());
                         yield Ok(Event::default().data(String::from_utf8_lossy(&f)));
                         break;
                     }
@@ -490,7 +611,7 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
                     return (
                         StatusCode::OK,
                         [("content-type", "application/json")],
-                        sglang_frame(&acc.into_output(out.rid)),
+                        sglang_frame(&acc.into_output(out.rid), tok.as_ref()),
                     )
                         .into_response();
                 }
@@ -509,5 +630,48 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
         // Sender dropped without a terminal item → request already gone.
         guard.disarm(rid);
         (StatusCode::from_u16(499).unwrap(), "request aborted").into_response()
+    }
+}
+
+#[cfg(test)]
+mod logprob_shape_tests {
+    use super::*;
+
+    #[test]
+    fn flat_logprob_tuples_shape() {
+        let v = logprob_tuples(&[-0.5, -1.5], &[10, 20], None);
+        assert_eq!(
+            v,
+            serde_json::json!([
+                [-0.5f32, 10, serde_json::Value::Null],
+                [-1.5f32, 20, serde_json::Value::Null]
+            ])
+        );
+    }
+
+    /// With a text buffer, the tuple's third slot carries the decoded token.
+    #[test]
+    fn flat_logprob_tuples_with_text() {
+        let texts = vec!["a".to_string(), "b".to_string()];
+        let v = logprob_tuples(&[-0.5, -1.5], &[10, 20], Some(&texts));
+        assert_eq!(
+            v,
+            serde_json::json!([[-0.5f32, 10, "a"], [-1.5f32, 20, "b"]])
+        );
+    }
+
+    /// Ragged reshape restores null positions (len 0) — mirrors
+    /// detokenize_top_logprobs_tokens emitting None for empty positions.
+    #[test]
+    fn ragged_logprob_tuples_restores_null_positions() {
+        // 2 positions: first null (len 0), second k=1.
+        let v = ragged_logprob_tuples(&[-0.3], &[9], &[0, 1], None);
+        assert_eq!(
+            v,
+            serde_json::json!([
+                serde_json::Value::Null,
+                [[-0.3f32, 9, serde_json::Value::Null]]
+            ])
+        );
     }
 }
