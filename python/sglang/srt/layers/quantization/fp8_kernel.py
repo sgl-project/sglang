@@ -465,12 +465,38 @@ def create_per_token_group_quant_fp8_output_scale(
     scale_outer_major: bool = False,
 ):
     # TODO: replace the scale layout booleans with a single enum before adding
-    # more mutually exclusive scale layouts.
+    # more mutually exclusive scale layouts. Valid combinations:
+    #   (none)                                  -> row-major float32
+    #   column_major                            -> column-major float32
+    #   column_major + tma_aligned              -> column-major float32, mn 4-aligned
+    #   ue8m0                                   -> row-major float32 (power-of-2 values)
+    #   ue8m0 + column_major + tma_aligned      -> 2D packed int32 UE8M0 (DeepGEMM native)
+    #   ue8m0 + outer_major                     -> float32 (mn, outer, K) view, outer-major storage
+    #   ue8m0 + outer_major + tma_aligned       -> per-outer-slice packed int32 UE8M0 (DeepGEMM native)
+    # scale_tma_aligned in any other combination is rejected below rather than
+    # silently ignored.
     if scale_outer_major:
         assert scale_ue8m0
-        assert not column_major_scales and not scale_tma_aligned
+        assert not column_major_scales
         assert len(x_shape) == 3
         *x_batch, x_s_mn, x_s_outer, x_q_k = x_shape
+        if scale_tma_aligned:
+            # DeepGEMM's native SM100 SFA layout, one packed slab per outer
+            # slice: four UE8M0 exponent bytes per int32 along K, mn (token)
+            # dim TMA-aligned to 4. Same slab layout as the 2D packed branch
+            # below. The returned view keeps the logical (mn, outer, K-packs)
+            # shape; do not make it contiguous.
+            x_s_k_packed = ceil_align(x_q_k // group_size, 4) // 4
+            aligned_mn = ceil_align(x_s_mn, 4)
+            return (
+                torch.empty(
+                    (*x_batch, x_s_outer, x_s_k_packed, aligned_mn),
+                    device=device,
+                    dtype=torch.int,
+                )
+                .transpose(-1, -2)[..., :x_s_mn, :]
+                .transpose(-3, -2)
+            )
         # Store the outer axis as the leading allocation dim (each outer slice
         # stays contiguous); the returned view keeps the logical (mn, outer, K) shape.
         return torch.empty(
@@ -496,6 +522,10 @@ def create_per_token_group_quant_fp8_output_scale(
                 "column_major_scales requires scale_tma_aligned=True "
                 "when scale_ue8m0 is enabled"
             )
+            assert not scale_tma_aligned, (
+                "scale_tma_aligned requires column_major_scales=True or "
+                "scale_outer_major=True when scale_ue8m0 is enabled"
+            )
             # Row-major UE8M0 keeps the scale as float32 power-of-two values,
             # matching deep_gemm.ceil_to_ue8m0 and deep_gemm.fp8_einsum.
             return torch.empty(
@@ -520,6 +550,9 @@ def create_per_token_group_quant_fp8_output_scale(
                 dtype=torch.float32,
             ).permute(-1, -2)
     else:
+        assert (
+            not scale_tma_aligned
+        ), "scale_tma_aligned requires column_major_scales=True"
         return torch.empty(
             x_shape[:-1] + (x_shape[-1] // group_size,),
             device=device,
@@ -601,6 +634,7 @@ def sglang_per_token_group_quant_fp8(
                     scale_ue8m0=scale_ue8m0,
                     fuse_silu_and_mul=fuse_silu_and_mul,
                     masked_m=masked_m,
+                    scale_outer_major=scale_outer_major,
                 )
             else:
                 sgl_per_token_group_quant_8bit_jit(

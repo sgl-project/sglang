@@ -51,6 +51,7 @@ def _per_token_group_quant_8bit_v2_custom_op(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    scale_outer_major: bool = False,
 ) -> None:
     """Opaque custom-op boundary around the JIT v2 kernel.
 
@@ -73,12 +74,31 @@ def _per_token_group_quant_8bit_v2_custom_op(
     num_local_experts = input.shape[0] if masked_layout else 1
     last = output_q.dim() - 1
     is_column_major = output_s.stride(last - 1) < output_s.stride(last)
+    # Outer-major packed UE8M0 layout (one 2D packed slab per outer slice,
+    # logical (mn, outer, K-packs) with mn the fastest-moving dim in memory):
+    # selected explicitly by the caller; the int32 dtype distinguishes the
+    # packed variant from the fp32 outer-major layout, which flows through the
+    # generic row-major stride handling below. The kernel reuses the
+    # column-major packed store, with the outer dim routed through the
+    # expert-stride slot.
+    is_outer_major_packed = scale_outer_major and output_s.dtype == torch.int32
     hidden_dim_num_groups = output_q.shape[last] // group_size
     num_tokens_per_expert = output_q.shape[last - 1]
-    if is_column_major:
+    if is_outer_major_packed:
+        assert (
+            not masked_layout and output_s.dim() == 3 and output_s.stride(-3) == 1
+        ), "outer-major packed scales must be non-masked 3D slabs, mn-fastest"
+        is_column_major = True
+        scale_expert_stride = output_s.stride(-2)
+        scale_hidden_stride = output_s.stride(-1)
+    elif is_column_major:
         scale_expert_stride = output_s.stride(0) if masked_layout else 0
         scale_hidden_stride = output_s.stride(-1)
     else:
+        assert output_s.dtype != torch.int32, (
+            "packed int32 scales require column-major strides, a masked "
+            "layout, or scale_outer_major=True"
+        )
         scale_expert_stride = output_s.stride(-3) if output_s.dim() == 3 else 0
         scale_hidden_stride = (
             output_s.stride(-2) if output_s.dim() == 3 else output_s.stride(-1)
@@ -116,8 +136,12 @@ def per_token_group_quant_8bit_v2(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    scale_outer_major: bool = False,
 ) -> None:
-    """JIT port of sgl_per_token_group_quant_8bit_v2 (full feature parity).
+    """JIT port of sgl_per_token_group_quant_8bit_v2 (full feature parity),
+    plus the JIT-only outer-major scale layouts for 3D row-major inputs
+    (``scale_outer_major``; fp32 or, with an int32 ``output_s``, packed UE8M0
+    slabs — see create_per_token_group_quant_fp8_output_scale).
 
     Wraps the registered custom op so torch.compile / piecewise CUDA graph treat
     the tvm-ffi kernel call as an opaque boundary.
@@ -133,4 +157,5 @@ def per_token_group_quant_8bit_v2(
         scale_ue8m0=scale_ue8m0,
         fuse_silu_and_mul=fuse_silu_and_mul,
         masked_m=masked_m,
+        scale_outer_major=scale_outer_major,
     )

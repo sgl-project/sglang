@@ -138,6 +138,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
     is_gfx942_supported,
+    is_sm100_supported,
     log_info_on_rank0,
     make_layers,
 )
@@ -172,6 +173,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
+_is_sm100_supported = is_sm100_supported()
 
 if _use_aiter:
     if _is_gfx95_supported:
@@ -1089,6 +1091,10 @@ class MQALayer(nn.Module):
                 group_size=128,
                 scale_ue8m0=True,
                 scale_outer_major=True,
+                # Packed int32 UE8M0 scales are consumed natively only by
+                # DeepGEMM's SM100 runtime; other archs (e.g. SM90) need the
+                # fp32 power-of-two scales deep_gemm transforms internally.
+                scale_tma_aligned=_is_sm100_supported,
             )
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
