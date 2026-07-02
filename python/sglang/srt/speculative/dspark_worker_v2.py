@@ -142,6 +142,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._markov_refine_buffer_cap: int = 0
         self._markov_candidates_buf: Optional[torch.Tensor] = None
         self._markov_embeds_buf: Optional[torch.Tensor] = None
+        self._materialize_draft_compressors_enabled = True
         self._stacked_wqkv_fp8_proj = None
         self._stacked_wqkv_kv_offsets: list[tuple[int, int]] = []
         self._stacked_wqkv_out_sizes: list[int] = []
@@ -420,6 +421,43 @@ class DSparkWorkerV2(BaseSpecWorker):
                         attn_backend=attn_backend,
                     )
 
+    def _materialize_main_hidden_to_draft_compressors(
+        self,
+        *,
+        main_hidden: torch.Tensor,
+        draft_forward_batch,
+    ) -> None:
+        if not self._materialize_draft_compressors_enabled:
+            return
+        if main_hidden is None:
+            raise RuntimeError("DSpark missing target main_hidden context features.")
+        if main_hidden.numel() == 0 or draft_forward_batch is None:
+            return
+
+        device = self.device
+        if main_hidden.device != device:
+            main_hidden = main_hidden.to(device, non_blocking=True)
+
+        attn_backend = self.draft_model_runner.attn_backend
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            torch.inference_mode(),
+        ):
+            main_x = self.draft_model.project_main_hidden(main_hidden)
+            for layer in self._draft_inner.layers:
+                attn = layer.self_attn
+                compressor = getattr(attn, "compressor", None)
+                if compressor is None:
+                    continue
+                attn_backend.forward_core_compressor(
+                    main_x,
+                    draft_forward_batch,
+                    attn.layer_id,
+                    compressor,
+                )
+
     def _write_draft_kv_from_projected_kv(
         self,
         *,
@@ -452,7 +490,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         positions: torch.Tensor,
         verify_out_cache_loc: torch.Tensor,
         dp_decode_global_num_tokens: Optional[list[int]] = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, object]:
         draft_block_spec_info = DSparkDraftBlockInput(
             draft_token=block_ids.reshape(-1),
             positions=positions,
@@ -490,8 +528,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                     int(self.block_size), self._draft_inner.hidden_size
                 )
         block_hidden = block_hidden[:keep_tokens]
-        return block_hidden.reshape(
-            reshape_bs, int(self.block_size), block_hidden.shape[-1]
+        return (
+            block_hidden.reshape(
+                reshape_bs, int(self.block_size), block_hidden.shape[-1]
+            ),
+            draft_forward_batch,
         )
 
     def _ensure_markov_refine_buffers(self, bs: int, device: torch.device) -> None:
@@ -868,7 +909,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
-            block_hidden = self._run_draft_block(
+            block_hidden, draft_forward_batch = self._run_draft_block(
                 batch=model_worker_batch,
                 bs=bs,
                 block_ids=block_ids,
@@ -968,14 +1009,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
-        if bs > 0:
-            self._clear_unaccepted_c128_draft_states(
-                batch=model_worker_batch,
-                prefix_lens=prefix_lens,
-                commit_lens=commit_lens,
-            )
-        if on_publish is not None:
-            on_publish(new_seq_lens)
 
         hidden = logits_output.hidden_states
         if hidden is None:
@@ -984,17 +1017,37 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         if bs > 0:
             hidden = hidden.view(bs, block_size, -1)
+            hidden_flat = hidden.reshape(-1, hidden.shape[-1])
+            try:
+                self._materialize_main_hidden_to_draft_compressors(
+                    main_hidden=hidden_flat,
+                    draft_forward_batch=draft_forward_batch,
+                )
+            except Exception as e:
+                self._materialize_draft_compressors_enabled = False
+                logger.warning(
+                    "DSpark draft compressor materialization failed; "
+                    "falling back to SWA-only materialization: %s",
+                    e,
+                )
+            self._clear_unaccepted_c128_draft_states(
+                batch=model_worker_batch,
+                prefix_lens=prefix_lens,
+                commit_lens=commit_lens,
+            )
             commit_mask = (
                 self._block_pos_offsets.unsqueeze(0)
                 < commit_lens.unsqueeze(1).to(torch.int64)
             ).reshape(-1)
             self._materialize_main_hidden_to_draft_kv(
-                main_hidden=hidden.reshape(-1, hidden.shape[-1])[commit_mask],
+                main_hidden=hidden_flat[commit_mask],
                 cache_loc=verify_out_cache_loc[commit_mask],
                 positions=positions[commit_mask],
             )
 
         logits_output.hidden_states = None
+        if on_publish is not None:
+            on_publish(new_seq_lens)
 
         next_draft_input = self._make_next_draft_input_decode(
             bonus_tokens=bonus_tokens,
