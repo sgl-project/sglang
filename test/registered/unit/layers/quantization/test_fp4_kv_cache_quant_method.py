@@ -37,9 +37,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
             get_kv_cache_quant_method,
         )
 
-        method = get_kv_cache_quant_method(
-            "nvfp4", num_layers=4, device="cpu"
-        )
+        method = get_kv_cache_quant_method("nvfp4", num_layers=4, device="cpu")
         self.assertIsInstance(method, NVFP4KVCacheMethod)
         self.assertEqual(method.name, "nvfp4")
 
@@ -263,7 +261,9 @@ class TestFP4MXBlock16KVQuantizeUtil(CustomTestCase):
     """Test the existing block-16 FP4 FP4MXBlock16KVQuantizeUtil roundtrip."""
 
     def test_roundtrip_cpu(self):
-        from sglang.srt.layers.quantization.kvfp4_tensor import FP4MXBlock16KVQuantizeUtil
+        from sglang.srt.layers.quantization.kvfp4_tensor import (
+            FP4MXBlock16KVQuantizeUtil,
+        )
 
         x = torch.randn(4, 8, 128, dtype=torch.bfloat16)
         packed, scales = FP4MXBlock16KVQuantizeUtil.batched_quantize(x)

@@ -975,9 +975,7 @@ class ModelRunnerKVCacheMixin:
                 )
                 hybrid_quant_method = None
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                    quant_name = resolve_kv_cache_quant(
-                        self.server_args.kv_cache_dtype
-                    )
+                    quant_name = resolve_kv_cache_quant(self.server_args.kv_cache_dtype)
                     if quant_name is not None:
                         hybrid_quant_method = get_kv_cache_quant_method(
                             quant_name,
@@ -1013,9 +1011,7 @@ class ModelRunnerKVCacheMixin:
                     assert (
                         not enable_page_major
                     ), "page-major KV layout is not supported with fp4 KV cache"
-                    quant_name = resolve_kv_cache_quant(
-                        self.server_args.kv_cache_dtype
-                    )
+                    quant_name = resolve_kv_cache_quant(self.server_args.kv_cache_dtype)
                     if quant_name is not None:
                         quant_method = get_kv_cache_quant_method(
                             quant_name,
