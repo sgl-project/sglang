@@ -65,6 +65,25 @@
 //   Every cell at parity with its tp4-GB300 and H200 references; NVFP4 needs NO escape
 //   (group_size=16 divides the 64-wide tp8 shard — unlike FP8 [128,128] / INT4 gs=128).
 
+//
+// REAL AIME25 (sgl-eval `run aime25`, 30 problems x 16 repeats, temperature 1.0, top-p 0.95,
+// max-tokens 64000, 128 threads; value shipped = pass@1[avg-of-16], SEM ~1.4pt/cell at 480
+// samples). Thinking ENABLED by serving with a copy of the model's chat template whose
+// enable_thinking default is flipped to true — sgl-eval's --thinking sets the generic
+// 'thinking' key, which Laguna's template ignores (see Configuration Tips: Thinking).
+// Run @ main 0543246184.
+//
+//   B300 (same 2x(4xGB300) tp8/MNNVL topology + shard math as the GSM8K B300 numbers):
+//     high-throughput: BF16 65.21 | FP8 61.67 | NVFP4 57.92 | INT4 63.54
+//     low-latency:     BF16 65.62 | FP8 62.50 | NVFP4 60.21 | INT4 62.92
+//   GB300 (4-GPU single node, tp 4):
+//     high-throughput: BF16 62.50 | FP8 63.12 | NVFP4 60.00 | INT4 64.79
+//     low-latency:     BF16 65.83 | FP8 63.12 | NVFP4 60.00 | INT4 61.04
+//
+//   DFlash accuracy-neutral on AIME25 too (|dense-spec| <= 2.7pt ~ 1-2 SEM); accept-len ~2.9
+//   on long thinking traces (vs ~4 on greedy GSM8K). NVFP4 is the weakest quant on AIME25
+//   (~4-5 SEM below BF16) while being the strongest on GSM8K — quant rankings are
+//   benchmark-dependent. Truncation ~0% at the 64k cap. H200 cells: AIME25 not measured.
 export const benchmarks = [
   // ===== H200 (8-GPU HGX; bf16 tp 8, fp8/int4 tp8+ep8) — ✅ REAL, full GSM8K =====
   {
@@ -123,56 +142,56 @@ export const benchmarks = [
     match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main; run @ main 0543246184)",
-    accuracy: { gsm8k_pct: 75.59 },
+    accuracy: { gsm8k_pct: 75.59, aime25_pct: 65.21 },
   },
   {
     // REAL — BF16 + DFlash (matched bf16 draft), tp8, trtllm_mha. Accept-len 4.08.
     match: { hw: "b300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main; run @ main 0543246184)",
-    accuracy: { gsm8k_pct: 75.36 },
+    accuracy: { gsm8k_pct: 75.36, aime25_pct: 65.62 },
   },
   {
     // REAL — FP8 dense, tp8+ep8+SGLANG_SHARED_EXPERT_TP1=1 (plain tp8 impossible: block-FP8 scale granularity).
     match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main; run @ main 0543246184)",
-    accuracy: { gsm8k_pct: 71.19 },
+    accuracy: { gsm8k_pct: 71.19, aime25_pct: 61.67 },
   },
   {
     // REAL — FP8 + DFlash (matched fp8-calibrated draft), tp8+ep8+flag, trtllm_mha. Accept-len 4.05.
     match: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main; run @ main 0543246184)",
-    accuracy: { gsm8k_pct: 71.87 },
+    accuracy: { gsm8k_pct: 71.87, aime25_pct: 62.50 },
   },
   {
     // REAL — NVFP4 dense, tp8 — NO escape needed (group_size=16 shards 8-way cleanly).
     match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main; run @ main 0543246184)",
-    accuracy: { gsm8k_pct: 78.01 },
+    accuracy: { gsm8k_pct: 78.01, aime25_pct: 57.92 },
   },
   {
     // REAL — NVFP4 + DFlash (matched nvfp4-calibrated draft), tp8, trtllm_mha. Accept-len 4.04.
     match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main; run @ main 0543246184)",
-    accuracy: { gsm8k_pct: 77.79 },
+    accuracy: { gsm8k_pct: 77.79, aime25_pct: 60.21 },
   },
   {
     // REAL — INT4 dense (mixed 4/8-bit MoE), tp8+ep8 (plain tp8 impossible: Marlin gs=128 'scales is not contiguous', same signature as H200).
     match: { hw: "b300", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main; run @ main 0543246184)",
-    accuracy: { gsm8k_pct: 67.25 },
+    accuracy: { gsm8k_pct: 67.25, aime25_pct: 63.54 },
   },
   {
     // REAL — INT4 + DFlash (matched int4-calibrated draft), tp8+ep8, trtllm_mha. Accept-len 4.01.
     match: { hw: "b300", variant: "default", quant: "int4", strategy: "low-latency", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main; run @ main 0543246184)",
-    accuracy: { gsm8k_pct: 66.72 },
+    accuracy: { gsm8k_pct: 66.72, aime25_pct: 62.92 },
   },
 
   // ===== GB300 (4-GPU single node, tp 4) — ✅ REAL, full GSM8K =====
@@ -181,55 +200,55 @@ export const benchmarks = [
     match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main)",
-    accuracy: { gsm8k_pct: 75.66 },
+    accuracy: { gsm8k_pct: 75.66, aime25_pct: 62.50 },
   },
   {
     // ✅ REAL — 4×GB300, BF16 + DFlash (matched bf16 draft), tp4, trtllm_mha. Accept-len 4.17.
     match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main)",
-    accuracy: { gsm8k_pct: 76.19 },
+    accuracy: { gsm8k_pct: 76.19, aime25_pct: 65.83 },
   },
   {
     // ✅ REAL — 4×GB300, FP8 dense, tp4, backend auto→trtllm_mha.
     match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main)",
-    accuracy: { gsm8k_pct: 71.87 },
+    accuracy: { gsm8k_pct: 71.87, aime25_pct: 63.12 },
   },
   {
     // ✅ REAL — 4×GB300, FP8 + DFlash (matched fp8-calibrated draft), tp4, trtllm_mha. Accept-len 4.05.
     match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main)",
-    accuracy: { gsm8k_pct: 72.02 },
+    accuracy: { gsm8k_pct: 72.02, aime25_pct: 63.12 },
   },
   {
     // ✅ REAL — 4×GB300, NVFP4 dense, tp4, backend auto→trtllm_mha.
     match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main)",
-    accuracy: { gsm8k_pct: 78.39 },
+    accuracy: { gsm8k_pct: 78.39, aime25_pct: 60.00 },
   },
   {
     // ✅ REAL — 4×GB300, NVFP4 + DFlash (matched nvfp4-calibrated draft), tp4, trtllm_mha. Accept-len 4.02.
     match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main)",
-    accuracy: { gsm8k_pct: 74.53 },
+    accuracy: { gsm8k_pct: 74.53, aime25_pct: 60.00 },
   },
   {
     // ✅ REAL — 4×GB300, INT4 dense (mixed 4/8-bit MoE, needs #29761), tp4, backend auto→trtllm_mha.
     match: { hw: "gb300", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main)",
-    accuracy: { gsm8k_pct: 66.79 },
+    accuracy: { gsm8k_pct: 66.79, aime25_pct: 64.79 },
   },
   {
     // ✅ REAL — 4×GB300, INT4 + DFlash (matched int4-calibrated draft), tp4, trtllm_mha. Accept-len 3.80.
     match: { hw: "gb300", variant: "default", quant: "int4", strategy: "low-latency", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main)",
-    accuracy: { gsm8k_pct: 67.02 },
+    accuracy: { gsm8k_pct: 67.02, aime25_pct: 61.04 },
   },
 ];
