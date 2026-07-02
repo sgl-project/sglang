@@ -1024,20 +1024,17 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         # qw:     uint8 [E, N, K//2]     (packed FP4)
         # w_scale: uint8 [E, N, ceil(K/64), 2]
 
-        # 1. Reinterpret as the real FP4 type
-        qw_f4 = qw.view(torch_npu.float4_e2m1fn_x2)        # [E, N, K//2]
-
-        # 2. Transpose to [E, K//2, N] while still a regular tensor
+        # 1. Transpose to [E, K//2, N] while still a regular tensor
         qw_t = qw_f4.transpose(1, 2).contiguous()           # standard layout
 
-        # 3. Cast to FRACTAL_NZ with the correct input dtype hint
+        # 2. Cast to FRACTAL_NZ with the correct input dtype hint
         qw_nz = torch_npu.npu_format_cast(
             qw_t, 29,
             customize_dtype=torch.float8_e4m3fn,            # internal storage dtype hint
             input_dtype=torch_npu.float4_e2m1fn_x2          # logical dtype of input
         )  # shape remains [E, K//2, N]
 
-        # 4. Prepare scale: transpose to [E, ceil(K/64), N, 2]
+        # 3. Prepare scale: transpose to [E, ceil(K/64), N, 2]
         w_scale_t = w_scale.transpose(1, 2).contiguous()
 
         # Store on layer and self
