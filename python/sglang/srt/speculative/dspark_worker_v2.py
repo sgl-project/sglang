@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.distributed import (
+    get_attn_tp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
@@ -592,12 +593,17 @@ class DSparkWorkerV2(BaseSpecWorker):
         confidence_head = self._draft_inner.confidence_head
         lm_head = self.draft_model.lm_head
 
-        tp_size = get_tensor_model_parallel_world_size()
         vocab_size = int(self._draft_inner.vocab_size)
 
-        def _gather_full_vocab(logits_shard: torch.Tensor) -> torch.Tensor:
+        def _gather_full_vocab(logits_shard: torch.Tensor, head) -> torch.Tensor:
             if logits_shard.shape[-1] >= vocab_size:
                 return logits_shard[..., :vocab_size]
+            if getattr(head, "use_attn_tp_group", False):
+                group = get_attn_tp_group()
+                if group.world_size == 1:
+                    return logits_shard
+                return group.all_gather(logits_shard, dim=-1)[..., :vocab_size]
+            tp_size = get_tensor_model_parallel_world_size()
             if tp_size == 1:
                 return logits_shard
             return tensor_model_parallel_all_gather(logits_shard, dim=-1)[
@@ -613,12 +619,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         candidates[:, 0].copy_(first_tokens)
 
         with torch.inference_mode():
-            base_logits = _gather_full_vocab(F.linear(block_hidden, lm_head.weight))
+            base_logits = _gather_full_vocab(
+                F.linear(block_hidden, lm_head.weight), lm_head
+            )
             prev_tokens = candidates[:, 0]
             for i in range(block_size):
                 prev_embed = markov_head.get_prev_embeddings(prev_tokens)
                 markov_embeds[:, i].copy_(prev_embed)
-                bias = _gather_full_vocab(markov_head.project_bias(prev_embed))
+                bias = _gather_full_vocab(
+                    markov_head.project_bias(prev_embed), markov_head.markov_w2
+                )
                 bias.add_(base_logits[:, i])
                 next_tokens = torch.argmax(bias, dim=-1)
                 if i + 1 < block_size:
