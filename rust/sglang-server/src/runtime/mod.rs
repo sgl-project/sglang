@@ -353,9 +353,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let senders = senders.clone();
         let id_gen = id_gen.clone();
-        // Shared (Arc-backed) with the detok shards; used to decode logprob token
-        // text at frame time.
-        let api_tokenizer = dyn_tokenizer.clone();
         let api_activity = egress_activity.clone();
         let handle = std::thread::Builder::new()
             .name("api-runtime".into())
@@ -378,9 +375,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     id_gen,
                     cfg.channel_cap,
                     cfg.server_args.clone(),
-                    // Shared with detok/tokenizer pool — decodes logprob token
-                    // text when `return_text_in_logprobs` is set.
-                    api_tokenizer,
                     // Egress heartbeat watched by `/health_generate`.
                     api_activity,
                 ))
