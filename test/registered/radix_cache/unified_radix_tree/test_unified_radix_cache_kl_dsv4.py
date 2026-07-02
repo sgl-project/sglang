@@ -126,6 +126,7 @@ class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
 
     l3_prefetch_page_size = 256
     l3_prefetch_prompt_pages = 4
+    max_running_requests = 4
 
     @classmethod
     def setUpClass(cls):
@@ -164,6 +165,8 @@ class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 "file",
                 "--swa-full-tokens-ratio",
                 "0.25",
+                "--max-running-requests",
+                str(cls.max_running_requests),
             ],
             env={
                 "SGLANG_DSV4_FP4_EXPERTS": "0",
