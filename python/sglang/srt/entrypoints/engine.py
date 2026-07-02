@@ -27,6 +27,8 @@ import multiprocessing as mp
 import os
 import random
 import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -113,7 +115,6 @@ from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import NetworkAddress, get_zmq_socket, is_port_available
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
-from sglang.srt.weight_cache.daemon import run_weight_cache_daemon
 from sglang.srt.weight_cache.protocol import get_ready_path
 from sglang.version import __version__
 
@@ -638,28 +639,49 @@ class Engine(EngineScoreMixin, EngineBase):
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
-                proc = mp.Process(
-                    target=run_weight_cache_daemon,
-                    kwargs=dict(
-                        model_path=server_args.model_path,
-                        gpu_id=gpu_id,
-                        tp_size=tp_size,
-                        tp_rank=tp_rank,
-                        pp_size=server_args.pp_size,
-                        pp_rank=pp_rank,
-                        dp_size=1,
-                        load_format=server_args.load_format,
-                        dtype=server_args.dtype,
-                        quantization=server_args.quantization,
-                        model_loader_extra_config=server_args.model_loader_extra_config,
-                        trust_remote_code=server_args.trust_remote_code,
-                        revision=server_args.revision,
-                        dist_init_method=dist_init_method,
-                    ),
-                    daemon=True,
-                    name=f"weight_cache_daemon_gpu{gpu_id}",
-                )
-                proc.start()
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "sglang.srt.weight_cache.daemon",
+                    "--model-path",
+                    server_args.model_path,
+                    "--gpu-id",
+                    str(gpu_id),
+                    "--tp-size",
+                    str(tp_size),
+                    "--tp-rank",
+                    str(tp_rank),
+                    "--pp-size",
+                    str(server_args.pp_size),
+                    "--pp-rank",
+                    str(pp_rank),
+                    "--dp-size",
+                    "1",
+                    "--ep-size",
+                    str(server_args.ep_size),
+                    "--load-format",
+                    server_args.load_format,
+                    "--dtype",
+                    server_args.dtype,
+                    "--dist-init-method",
+                    dist_init_method,
+                ]
+                if server_args.quantization:
+                    cmd += ["--quantization", server_args.quantization]
+                if (
+                    server_args.model_loader_extra_config
+                    and server_args.model_loader_extra_config != "{}"
+                ):
+                    cmd += [
+                        "--model-loader-extra-config",
+                        server_args.model_loader_extra_config,
+                    ]
+                if server_args.trust_remote_code:
+                    cmd += ["--trust-remote-code"]
+                if server_args.revision:
+                    cmd += ["--revision", server_args.revision]
+
+                proc = subprocess.Popen(cmd)
                 daemon_procs.append(proc)
 
         # Wait for all daemons to be ready (ready file exists)
@@ -681,10 +703,10 @@ class Engine(EngineScoreMixin, EngineBase):
                         )
                     # Check if daemon process is still alive
                     for p in daemon_procs:
-                        if not p.is_alive():
+                        if p.poll() is not None:
                             raise RuntimeError(
-                                f"Weight cache daemon {p.name} exited prematurely "
-                                f"with code {p.exitcode}"
+                                f"Weight cache daemon (pid={p.pid}) exited prematurely "
+                                f"with code {p.returncode}"
                             )
                 logger.info(
                     f"Weight cache daemon for pp_rank={pp_rank} "

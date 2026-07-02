@@ -9,8 +9,9 @@ import json
 import logging
 import pickle
 import struct
-from dataclasses import asdict, dataclass
 from typing import Any, Dict, Optional
+
+import msgspec
 
 from sglang.srt.utils.common import safe_pickle_loads
 
@@ -24,8 +25,7 @@ WEIGHT_CACHE_SOCKET_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}.sock"
 WEIGHT_CACHE_READY_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}.ready"
 
 
-@dataclass
-class CacheConfig:
+class CacheConfig(msgspec.Struct):
     """Fingerprint of the cached weights. Used to validate compatibility
     between a daemon's cached state and a requesting engine process.
 
@@ -46,22 +46,10 @@ class CacheConfig:
 
     def matches(self, other: "CacheConfig") -> bool:
         """Check if two configs are compatible for weight sharing."""
-        return (
-            self.model_path == other.model_path
-            and self.model_arch == other.model_arch
-            and self.tp_size == other.tp_size
-            and self.tp_rank == other.tp_rank
-            and self.pp_size == other.pp_size
-            and self.pp_rank == other.pp_rank
-            and self.dp_size == other.dp_size
-            and self.ep_size == other.ep_size
-            and self.quant_method == other.quant_method
-            and self.quant_config_hash == other.quant_config_hash
-            and self.dtype == other.dtype
-        )
+        return self == other
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return {f: getattr(self, f) for f in self.__struct_fields__}
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "CacheConfig":
@@ -81,7 +69,7 @@ def hash_quant_config(quant_config: Any) -> str:
             config_str = str(quant_config)
         return hashlib.sha256(config_str.encode()).hexdigest()[:16]
     except Exception:
-        return str(hash(quant_config))[:16]
+        return hashlib.sha256(repr(quant_config).encode()).hexdigest()[:16]
 
 
 def get_quant_method_name(quant_config: Any) -> str:

@@ -347,23 +347,26 @@ class IpcModelLoader(BaseModelLoader):
         """Connect to daemon, validate config, fetch IPC handles."""
         import socket as socket_mod
 
+        sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
         try:
-            sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
             sock.settimeout(30)  # 30s timeout for large state dicts
             sock.connect(self.socket_path)
         except FileNotFoundError:
+            sock.close()
             logger.info(
                 f"[IpcModelLoader] Daemon socket not found at {self.socket_path}. "
                 f"The daemon may not be running."
             )
             return None
         except ConnectionRefusedError:
+            sock.close()
             logger.info(
                 f"[IpcModelLoader] Daemon not accepting connections at "
                 f"{self.socket_path}. It may still be loading."
             )
             return None
         except Exception as e:
+            sock.close()
             logger.warning(
                 f"[IpcModelLoader] Error connecting to daemon at "
                 f"{self.socket_path}: {e}"
@@ -401,6 +404,13 @@ class IpcModelLoader(BaseModelLoader):
             except Exception:
                 ep_size = 1
 
+            try:
+                from sglang.srt.server_args import get_global_server_args
+
+                dp_size = get_global_server_args().dp_size
+            except Exception:
+                dp_size = 1
+
             quant_config = getattr(model_config, "hf_config", None)
             if quant_config is not None:
                 quant_config = getattr(quant_config, "quantization_config", None)
@@ -421,7 +431,7 @@ class IpcModelLoader(BaseModelLoader):
                 tp_rank=tp_rank,
                 pp_size=pp_size,
                 pp_rank=pp_rank,
-                dp_size=1,  # TODO: get actual dp_size
+                dp_size=dp_size,
                 ep_size=ep_size,
                 quant_method=quant_method,
                 quant_config_hash=hash_quant_config(quant_config),
