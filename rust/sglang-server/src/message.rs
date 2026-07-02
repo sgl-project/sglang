@@ -44,8 +44,9 @@ pub struct GenerationOutput {
     /// Decoded text **delta** for this chunk (empty in `skip_tokenizer_init`
     /// mode, or when the step only produced a partial multi-byte sequence).
     pub text: String,
-    /// Output token ids for this chunk (`skip_tokenizer_init` mode; empty
-    /// otherwise).
+    /// Output token ids for this chunk. Surfaced as the `/generate` response's
+    /// `output_ids` (returned by default, like the Python server) — populated in
+    /// both normal and `skip_tokenizer_init` mode.
     pub output_ids: Vec<i32>,
     /// Prompt token count (from the scheduler; constant across the request).
     pub prompt_tokens: u32,
