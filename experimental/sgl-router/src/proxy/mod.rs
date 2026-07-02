@@ -8,15 +8,155 @@ pub mod sse;
 use crate::health::circuit_breaker::CircuitBreaker;
 use crate::server::error::ApiError;
 use crate::server::header_utils::should_forward_request_header;
+use crate::server::metrics::MetricsRegistry;
 use crate::workers::WireProtocol;
 use anyhow::Context;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use reqwest::{Client, Url};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+/// Total number of [`AbortReason`] variants. Referenced by
+/// [`crate::server::metrics::MetricsRegistry`] to size the fixed-length
+/// per-reason counter array — a compile-time invariant that adding a new
+/// variant here without bumping this constant would break, which is exactly
+/// the failure mode we want (versus a silent OOB or a HashMap re-alloc under
+/// contention). Update alongside every new variant.
+pub(crate) const ABORT_REASON_COUNT: usize = 8;
+
+/// Why the router is telling an engine to stop generating a specific request.
+///
+/// Recorded via [`AbortOnDrop`] at the drop site and stamped into (a) the WARN
+/// log line the drop emits and (b) the JSON body of the `/abort_request` POST
+/// (as `router_reason`) so operators can attribute engine-side aborts to a
+/// specific router-side trigger without having to correlate by `rid` alone.
+/// Values are stored in an `AtomicU8` so the reason can be updated cross-thread
+/// (the SSE pump is on a different tokio task than the handler owning the
+/// guard) without borrowing gymnastics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum AbortReason {
+    /// The drop happened without any code path narrowing the cause. Only
+    /// observed when a call site failed to `set_reason` — treat as a bug in
+    /// call-site coverage, not a legitimate reason.
+    Unknown = 0,
+    /// Unary/pre-headers guard: the handler future was dropped mid-await
+    /// before any specific `ApiError` was assigned. In practice this is a
+    /// client-side disconnect: axum cancelled the handler when the client's
+    /// connection closed while the router was still awaiting the engine's
+    /// buffered response.
+    HandlerCancelled = 1,
+    /// Unary/pre-headers guard: the stale-request janitor
+    /// (`ActiveLoadGuard::cancel_token`) fired before the engine responded.
+    /// The handler's `tokio::select!` returned `StaleRequestExpired` and the
+    /// guard was left armed on purpose.
+    StaleRequestExpired = 2,
+    /// Unary/pre-headers guard: the router-side wait-for-response-headers
+    /// budget (`request_timeout`) elapsed before the engine sent headers.
+    /// Distinct from stale-timeout in that the router itself gave up on this
+    /// worker, not the request as a whole.
+    UpstreamTimeout = 3,
+    /// Unary/pre-headers guard: connect / TCP / TLS / write error before a
+    /// response was received. Covers reqwest's transport-layer failures,
+    /// breaker-open rejections, and DNS/URL problems.
+    TransportError = 4,
+    /// Streaming guard: the SSE pump's `tx.send` failed or `tx.closed` fired
+    /// while the pump had more upstream to deliver — i.e. axum/hyper dropped
+    /// the response Body (client TCP close, HTTP/2 RST_STREAM, or a middle
+    /// box severing the connection). The most common streaming abort cause.
+    StreamClientGone = 5,
+    /// Streaming guard: the pump waited `STREAM_SEND_STALL` (120 s) for the
+    /// client to drain the read-ahead buffer and the client never made
+    /// progress. Treated as "client is present but not consuming"; the abort
+    /// releases the engine slot so a working consumer can be served.
+    StreamDownstreamStall = 6,
+    /// Streaming guard: the pump task itself panicked. Distinct from a
+    /// clean client-gone because the panic implies a router-side bug, not a
+    /// client problem — surface it so it doesn't get lumped with the
+    /// normal disconnect volume.
+    StreamPumpPanicked = 7,
+}
+
+impl AbortReason {
+    /// Stable label for logs, metrics, and the outbound POST body. Keep in
+    /// sync with the `AbortReason` variants: adding a variant without adding
+    /// a label here surfaces a compile error, which is why this is a `match`
+    /// and not e.g. a `Debug`-derived string.
+    pub(crate) fn as_label(&self) -> &'static str {
+        match self {
+            AbortReason::Unknown => "unknown",
+            AbortReason::HandlerCancelled => "handler_cancelled",
+            AbortReason::StaleRequestExpired => "stale_request_expired",
+            AbortReason::UpstreamTimeout => "upstream_timeout",
+            AbortReason::TransportError => "transport_error",
+            AbortReason::StreamClientGone => "stream_client_gone",
+            AbortReason::StreamDownstreamStall => "stream_downstream_stall",
+            AbortReason::StreamPumpPanicked => "stream_pump_panicked",
+        }
+    }
+
+    /// Inverse of the `#[repr(u8)]` cast; used by [`crate::server::metrics`]
+    /// to translate its per-reason array index back to a label at scrape
+    /// time. `pub(crate)` (not `pub`) because the discriminant→variant map
+    /// is a crate-private detail — external code goes through `as_label`.
+    ///
+    /// `0` is the legitimate `Unknown` discriminant; other out-of-range
+    /// values are corruption (the atomic is only written from
+    /// `AbortReason as u8`, so they should be unreachable). Split the two
+    /// with a `debug_assert!` so a debug build panics loudly on
+    /// discriminant drift, while release keeps the safe fallback.
+    pub(crate) fn from_u8(v: u8) -> Self {
+        match v {
+            0 => AbortReason::Unknown,
+            1 => AbortReason::HandlerCancelled,
+            2 => AbortReason::StaleRequestExpired,
+            3 => AbortReason::UpstreamTimeout,
+            4 => AbortReason::TransportError,
+            5 => AbortReason::StreamClientGone,
+            6 => AbortReason::StreamDownstreamStall,
+            7 => AbortReason::StreamPumpPanicked,
+            other => {
+                debug_assert!(
+                    false,
+                    "AbortReason::from_u8 got out-of-range value {other}; \
+                     did you add a variant without bumping ABORT_REASON_COUNT?",
+                );
+                AbortReason::Unknown
+            }
+        }
+    }
+
+    /// Contiguous index in `0..ABORT_REASON_COUNT`. Used by the metrics
+    /// registry to index its fixed-length per-reason counter array without a
+    /// hash lookup or lock. Guaranteed in-range by the `#[repr(u8)]` +
+    /// explicit-discriminant layout (0..=7 for the current 8 variants) and
+    /// the `ABORT_REASON_COUNT` constant kept in sync above.
+    pub(crate) fn as_index(&self) -> usize {
+        *self as usize
+    }
+}
+
+// Compile-time invariant: every `AbortReason` discriminant is < ABORT_REASON_COUNT.
+// If you add a new variant without also bumping the constant above, this fails
+// to build — which is the whole point. Runtime array-index panics on the hot
+// path (metrics.rs `engine_aborts_total[reason.as_index()]`) would be
+// significantly worse than a compile error here. Also asserts the "top
+// discriminant is exactly COUNT-1" so a gap (someone assigning a scratch
+// discriminant like `= 100`) also fails to build.
+const _: () = {
+    assert!((AbortReason::Unknown as u8) < ABORT_REASON_COUNT as u8);
+    assert!((AbortReason::HandlerCancelled as u8) < ABORT_REASON_COUNT as u8);
+    assert!((AbortReason::StaleRequestExpired as u8) < ABORT_REASON_COUNT as u8);
+    assert!((AbortReason::UpstreamTimeout as u8) < ABORT_REASON_COUNT as u8);
+    assert!((AbortReason::TransportError as u8) < ABORT_REASON_COUNT as u8);
+    assert!((AbortReason::StreamClientGone as u8) < ABORT_REASON_COUNT as u8);
+    assert!((AbortReason::StreamDownstreamStall as u8) < ABORT_REASON_COUNT as u8);
+    assert!((AbortReason::StreamPumpPanicked as u8) < ABORT_REASON_COUNT as u8);
+    assert!((AbortReason::StreamPumpPanicked as u8) == (ABORT_REASON_COUNT as u8) - 1);
+};
 
 /// Parse a worker URL emitted by discovery.  On failure, trip the worker's
 /// circuit breaker so the malformed worker drops out of subsequent
@@ -92,16 +232,32 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const ABORT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Tell an engine to stop generating a request whose client has disconnected,
-/// by `POST`ing `/abort_request {rid, abort_all:false}`. The engine cancels
-/// every in-flight request whose `rid` *starts with* this one, which also
-/// covers the `n>1` parallel-sampling expansions (`<rid>_0`, `<rid>_1`, …).
+/// by `POST`ing `/abort_request {rid, abort_all:false, router_reason}`. The
+/// engine cancels every in-flight request whose `rid` *starts with* this one,
+/// which also covers the `n>1` parallel-sampling expansions
+/// (`<rid>_0`, `<rid>_1`, …).
+///
+/// `reason` is a stable label from [`AbortReason::as_label`] identifying why
+/// the router is aborting. It rides on the request body as `router_reason` so
+/// the engine can log/count aborts by cause (SGLang currently ignores extra
+/// fields, keeping this forward-compatible), and is also stamped into the
+/// WARN log emitted by the [`AbortOnDrop`] drop site — that log is the
+/// primary observability surface: one `sending /abort_request` line per real
+/// abort, tagged with reason, so operators can quantify "how many of my
+/// aborts were `stream_client_gone` vs `stale_request_expired`" without
+/// having to parse pump-timing debug logs.
 ///
 /// Best-effort by construction: the client is already gone, so there is no one
 /// to surface an error to, and a missed abort wastes engine compute but is not
 /// a correctness fault. Failures are logged, not propagated. Not circuit-breaker
 /// gated — an abort is a courtesy to the engine, never counted against a worker.
-async fn send_abort(client: &Client, abort_url: &str, rid: &str) {
-    let body = serde_json::json!({ "rid": rid, "abort_all": false });
+async fn send_abort(client: &Client, abort_url: &str, rid: &str, reason: AbortReason) {
+    let reason_label = reason.as_label();
+    let body = serde_json::json!({
+        "rid": rid,
+        "abort_all": false,
+        "router_reason": reason_label,
+    });
     match client
         .post(abort_url)
         .json(&body)
@@ -112,14 +268,16 @@ async fn send_abort(client: &Client, abort_url: &str, rid: &str) {
         Ok(resp) => tracing::debug!(
             abort_url,
             rid,
+            reason = reason_label,
             status = %resp.status(),
-            "told engine to abort request after client disconnect",
+            "engine acknowledged /abort_request",
         ),
         Err(e) => tracing::warn!(
             abort_url,
             rid,
+            reason = reason_label,
             error = %e,
-            "failed to send abort to engine after client disconnect",
+            "failed to POST /abort_request to engine (best-effort; not retried)",
         ),
     }
 }
@@ -146,16 +304,40 @@ pub(crate) struct AbortOnDrop {
     /// `None` for unary (decided solely by `armed`); `Some` for streaming, where
     /// the abort fires only if the engine had not reached its terminal item.
     reached_end: Option<Arc<AtomicBool>>,
+    /// Encoded [`AbortReason`]. Stored via `Arc<AtomicU8>` so an update from a
+    /// different task than the one that owns the guard (specifically, the SSE
+    /// pump task writing into a streaming guard held inside `stream_guards`)
+    /// is race-free and Send/Sync-friendly.
+    ///
+    /// Defaults are set in the constructors: unary → [`AbortReason::HandlerCancelled`]
+    /// (the "you dropped me without telling me why" catch-all that also covers
+    /// the common client-disconnect-during-await case); streaming →
+    /// [`AbortReason::StreamClientGone`] (the majority streaming case). Call
+    /// sites narrow those defaults via [`Self::set_reason`] or by writing to
+    /// the [`Self::reason_handle`] before the guard drops.
+    reason: Arc<AtomicU8>,
+    /// Metrics sink used in `Drop` to bump `sgl_router_engine_aborts_total`
+    /// with the per-reason label. `None` when the guard was constructed
+    /// directly (unit tests) or the proxy never had metrics attached;
+    /// the WARN log still fires, only the counter goes dark.
+    metrics: Option<Arc<MetricsRegistry>>,
     armed: bool,
 }
 
 impl AbortOnDrop {
-    fn for_unary(client: Client, abort_url: String, rid: String) -> Self {
+    fn for_unary(
+        client: Client,
+        abort_url: String,
+        rid: String,
+        metrics: Option<Arc<MetricsRegistry>>,
+    ) -> Self {
         Self {
             client,
             abort_url,
             rid,
             reached_end: None,
+            reason: Arc::new(AtomicU8::new(AbortReason::HandlerCancelled as u8)),
+            metrics,
             armed: true,
         }
     }
@@ -165,12 +347,15 @@ impl AbortOnDrop {
         abort_url: String,
         rid: String,
         reached_end: Arc<AtomicBool>,
+        metrics: Option<Arc<MetricsRegistry>>,
     ) -> Self {
         Self {
             client,
             abort_url,
             rid,
             reached_end: Some(reached_end),
+            reason: Arc::new(AtomicU8::new(AbortReason::StreamClientGone as u8)),
+            metrics,
             armed: true,
         }
     }
@@ -179,6 +364,22 @@ impl AbortOnDrop {
     /// once a full response has been received from the engine (unary path).
     pub(crate) fn disarm(&mut self) {
         self.armed = false;
+    }
+
+    /// Narrow the recorded [`AbortReason`] from the constructor default. Idempotent
+    /// per drop — later writes overwrite earlier ones, which is intentional: the
+    /// most-specific known reason at drop time wins.
+    pub(crate) fn set_reason(&self, reason: AbortReason) {
+        self.reason.store(reason as u8, Ordering::Relaxed);
+    }
+
+    /// Handle that lets a task NOT holding `&self` write the reason before drop.
+    /// Used by the SSE pump: the pump task holds the guard inside its opaque
+    /// `stream_guards`, but takes a separate `Arc<AtomicU8>` clone so it can
+    /// tag the reason as it hits `break` on `client_gone` / `downstream_stall` /
+    /// panic paths. Cheap: one `Arc::clone`, no allocation.
+    pub(crate) fn reason_handle(&self) -> Arc<AtomicU8> {
+        Arc::clone(&self.reason)
     }
 
     fn should_abort(&self) -> bool {
@@ -195,6 +396,22 @@ impl Drop for AbortOnDrop {
         if !self.should_abort() {
             return;
         }
+        let reason = AbortReason::from_u8(self.reason.load(Ordering::Relaxed));
+        // One WARN line per real abort. Deliberately WARN, not DEBUG: an
+        // abort means the engine is doing wasted work on our behalf, and
+        // operators need to be able to grep this at scale. Paired with the
+        // Prom counter bump below, this gives both a per-event trail (log)
+        // and an aggregate signal (metric) with matching labels — cheap to
+        // slice by reason without full log parsing.
+        tracing::warn!(
+            rid = %self.rid,
+            reason = reason.as_label(),
+            abort_url = %self.abort_url,
+            "sending /abort_request to engine",
+        );
+        if let Some(m) = self.metrics.as_ref() {
+            m.record_engine_abort(reason);
+        }
         let client = self.client.clone();
         let abort_url = std::mem::take(&mut self.abort_url);
         let rid = std::mem::take(&mut self.rid);
@@ -205,11 +422,12 @@ impl Drop for AbortOnDrop {
         // exiting and there is no point chasing an abort.
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn(async move { send_abort(&client, &abort_url, &rid).await });
+                handle.spawn(async move { send_abort(&client, &abort_url, &rid, reason).await });
             }
             Err(_) => tracing::debug!(
                 %abort_url,
                 %rid,
+                reason = reason.as_label(),
                 "no tokio runtime at drop (shutdown); skipping engine abort",
             ),
         }
@@ -232,6 +450,15 @@ pub struct Proxy {
     /// Wall-clock timeout applied to non-streaming upstream requests. Streaming
     /// requests deliberately do not use this (long generations are valid).
     pub request_timeout: Duration,
+    /// Metrics sink for the drop-side of `AbortOnDrop`. Filled once at startup
+    /// via [`Self::attach_metrics`] — matching the same pattern
+    /// `ActiveLoadRegistry` and `PolicyRegistry` use — so tests that build a
+    /// `Proxy` in isolation don't need a full metrics wiring, and prod flows
+    /// get their per-reason `sgl_router_engine_aborts_total` counter bumped
+    /// on every abort. `OnceLock`, not `Mutex<Option<_>>`, because the wire-in
+    /// is a single-shot at app startup and the read path is on every abort
+    /// drop — one atomic load beats a mutex acquire.
+    metrics: OnceLock<Arc<MetricsRegistry>>,
 }
 
 /// Build a forwarding client for `protocol`, sharing pool/connect tuning
@@ -264,7 +491,52 @@ impl Proxy {
             http1_client: build_client(WireProtocol::Http1)?,
             h2c_client: build_client(WireProtocol::H2c)?,
             request_timeout,
+            metrics: OnceLock::new(),
         })
+    }
+
+    /// Wire a metrics registry into this proxy — every subsequent
+    /// [`AbortOnDrop`] created via [`Self::abort_guard_for`] /
+    /// [`Self::forward_streaming_to`] inherits it and bumps the per-reason
+    /// `sgl_router_engine_aborts_total` counter on drop.
+    ///
+    /// Single-shot (**first attach wins**): backing storage is
+    /// `OnceLock<Arc<MetricsRegistry>>`, deliberately not `Mutex<Option<_>>`
+    /// like `ActiveLoadRegistry::attach_metrics` (which supports replace
+    /// semantics). A `Proxy` outlives one metrics registry in practice —
+    /// there is no hot-swap use case in prod — and the read path
+    /// (`metrics_for_abort` called on every abort drop) benefits from being
+    /// lock-free.
+    ///
+    /// The distinction is observable: if a caller wires the proxy twice
+    /// with different registries, the SECOND registry is silently dropped
+    /// and the FIRST keeps taking bumps. That's a wiring bug the operator
+    /// needs to see — so the second call logs at WARN. The first call
+    /// logs at INFO so a missing wire-in (proxy built, never attached) is
+    /// grep-able at startup instead of showing up later as a flat metric.
+    ///
+    /// Not required for correctness — a proxy without a metrics sink still
+    /// aborts and still WARN-logs the reason; only the aggregate counter goes
+    /// dark. Tests that build a proxy in isolation deliberately skip this so
+    /// they can assert on the log line alone.
+    pub fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
+        if self.metrics.set(metrics).is_ok() {
+            tracing::info!(
+                "Proxy metrics attached; sgl_router_engine_aborts_total is now populated"
+            );
+        } else {
+            tracing::warn!(
+                "Proxy::attach_metrics called more than once; second registry ignored \
+                 (first-attach-wins). sgl_router_engine_aborts_total continues to bump \
+                 the first-attached registry, not this one — check AppContext wiring."
+            );
+        }
+    }
+
+    /// Clone the attached metrics registry, if any. Cheap: one `OnceLock::get`
+    /// + one `Arc::clone` on the hot path.
+    fn metrics_for_abort(&self) -> Option<Arc<MetricsRegistry>> {
+        self.metrics.get().map(Arc::clone)
     }
 
     /// The forwarding client for `protocol`. Selected per request from the
@@ -308,6 +580,7 @@ impl Proxy {
             self.client_for(protocol).clone(),
             abort_url.to_string(),
             rid.to_string(),
+            self.metrics_for_abort(),
         ))
     }
 
@@ -577,7 +850,7 @@ impl Proxy {
         // body (it isn't generating), so it is never abortable.
         let upstream: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>> =
             sse::idle_timeout_stream(resp.bytes_stream(), STREAM_IDLE_TIMEOUT);
-        let (upstream, abort_guard) = match abort_rid {
+        let (upstream, abort_guard, abort_reason_handle) = match abort_rid {
             Some(rid) if status.is_success() => match worker_url.join("/abort_request") {
                 Ok(abort_url) => {
                     let reached_end = Arc::new(AtomicBool::new(false));
@@ -586,12 +859,23 @@ impl Proxy {
                         abort_url.to_string(),
                         rid.to_string(),
                         Arc::clone(&reached_end),
+                        self.metrics_for_abort(),
                     );
-                    (sse::mark_terminal(upstream, reached_end), Some(guard))
+                    // Extract the reason atom so the SSE pump can narrow it
+                    // from the constructor default (`StreamClientGone`) to the
+                    // specific cause (stall / panic) as it hits each break
+                    // site. The atom is `Arc`-shared with the guard, so the
+                    // pump's write is visible to the guard's `Drop`.
+                    let reason_handle = guard.reason_handle();
+                    (
+                        sse::mark_terminal(upstream, reached_end),
+                        Some(guard),
+                        Some(reason_handle),
+                    )
                 }
-                Err(_) => (upstream, None),
+                Err(_) => (upstream, None, None),
             },
-            _ => (upstream, None),
+            _ => (upstream, None, None),
         };
         let guards: Option<Box<dyn Send + 'static>> = match (stream_guards, abort_guard) {
             (Some(g), Some(a)) => Some(Box::new((g, pump_phase, a))),
@@ -599,7 +883,13 @@ impl Proxy {
             (None, Some(a)) => Some(Box::new((pump_phase, a))),
             (None, None) => Some(Box::new(pump_phase)),
         };
-        let body = sse::bytes_stream_to_body(upstream, guards, on_complete, first_byte_hook);
+        let body = sse::bytes_stream_to_body(
+            upstream,
+            guards,
+            on_complete,
+            first_byte_hook,
+            abort_reason_handle,
+        );
         let mut out = Response::new(body);
         *out.status_mut() = status;
         out.headers_mut().insert(
@@ -1095,7 +1385,7 @@ mod tests {
         let client = Client::new();
         {
             let _guard =
-                AbortOnDrop::for_unary(client, format!("{url}/abort_request"), "test-rid-1".into());
+                AbortOnDrop::for_unary(client, format!("{url}/abort_request"), "test-rid-1".into(), None);
         }
         wait_for_abort(&abort_log, Duration::from_secs(2)).await;
         let log = abort_log.lock().unwrap();
@@ -1106,6 +1396,10 @@ mod tests {
         );
         assert_eq!(log[0]["rid"], "test-rid-1");
         assert_eq!(log[0]["abort_all"], false);
+        // No call site refined the reason before drop, so the constructor
+        // default (unary → `HandlerCancelled`, the catch-all covering
+        // "handler future dropped mid-await") must be what the engine sees.
+        assert_eq!(log[0]["router_reason"], "handler_cancelled");
     }
 
     /// Unary guard: `disarm()` before drop (a complete response was received)
@@ -1117,7 +1411,7 @@ mod tests {
         let client = Client::new();
         {
             let mut guard =
-                AbortOnDrop::for_unary(client, format!("{url}/abort_request"), "test-rid-2".into());
+                AbortOnDrop::for_unary(client, format!("{url}/abort_request"), "test-rid-2".into(), None);
             guard.disarm();
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1141,14 +1435,21 @@ mod tests {
                 format!("{url}/abort_request"),
                 "test-rid-3".into(),
                 Arc::clone(&reached_end),
+                None,
             );
         }
         wait_for_abort(&abort_log, Duration::from_secs(2)).await;
+        let log = abort_log.lock().unwrap();
         assert_eq!(
-            abort_log.lock().unwrap().len(),
+            log.len(),
             1,
             "reached_end=false at drop (client gone before engine finished) must abort"
         );
+        // Streaming guards default to `StreamClientGone` — the majority
+        // real-world cause when the pump exits without setting a narrower
+        // reason (e.g., a test that drops the guard directly without ever
+        // running the pump loop).
+        assert_eq!(log[0]["router_reason"], "stream_client_gone");
     }
 
     /// Streaming guard: dropped with `reached_end` already true (the engine
@@ -1167,6 +1468,7 @@ mod tests {
                 format!("{url}/abort_request"),
                 "test-rid-4".into(),
                 Arc::clone(&reached_end),
+                None,
             );
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1176,17 +1478,26 @@ mod tests {
         );
     }
 
-    /// `send_abort` posts `{rid, abort_all:false}` to the given URL.
+    /// `send_abort` posts `{rid, abort_all:false, router_reason}` to the given URL.
+    /// The `router_reason` field lets operators break down engine-side aborts
+    /// by the router-side trigger without correlating by rid alone.
     #[tokio::test]
     async fn send_abort_posts_rid_and_abort_all_false() {
         let (url, abort_log, _shutdown) =
             spawn_hanging_worker_with_abort_capture(Duration::from_secs(10)).await;
         let client = Client::new();
-        send_abort(&client, &format!("{url}/abort_request"), "direct-rid").await;
+        send_abort(
+            &client,
+            &format!("{url}/abort_request"),
+            "direct-rid",
+            AbortReason::StreamClientGone,
+        )
+        .await;
         let log = abort_log.lock().unwrap();
         assert_eq!(log.len(), 1);
         assert_eq!(log[0]["rid"], "direct-rid");
         assert_eq!(log[0]["abort_all"], false);
+        assert_eq!(log[0]["router_reason"], "stream_client_gone");
     }
 
     /// `send_abort` is best-effort: an unreachable abort URL (connection
@@ -1196,7 +1507,68 @@ mod tests {
         let client = Client::new();
         // Port 1 is privileged / never listened on in CI sandboxes — refused
         // promptly. No assertion beyond "this does not panic or hang".
-        send_abort(&client, "http://127.0.0.1:1/abort_request", "rid-x").await;
+        send_abort(
+            &client,
+            "http://127.0.0.1:1/abort_request",
+            "rid-x",
+            AbortReason::HandlerCancelled,
+        )
+        .await;
+    }
+
+    /// The abort guard's constructor default is refined by `set_reason` at the
+    /// call site; the final `router_reason` on the wire must match the last
+    /// value stored, not the default. Exercises the `Arc<AtomicU8>` handoff.
+    #[tokio::test]
+    async fn set_reason_narrows_the_default_before_drop() {
+        let (url, abort_log, _shutdown) =
+            spawn_hanging_worker_with_abort_capture(Duration::from_secs(10)).await;
+        let client = Client::new();
+        {
+            let guard = AbortOnDrop::for_unary(
+                client,
+                format!("{url}/abort_request"),
+                "narrowed-rid".into(),
+                None,
+            );
+            // Default is `HandlerCancelled`; narrow to `UpstreamTimeout`.
+            guard.set_reason(AbortReason::UpstreamTimeout);
+            // guard drops at end of scope while armed
+        }
+        wait_for_abort(&abort_log, Duration::from_secs(2)).await;
+        let log = abort_log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0]["router_reason"], "upstream_timeout");
+    }
+
+    /// A guard whose `reason_handle` is written from a different task than
+    /// the one that owns the guard (the streaming SSE pump pattern) still
+    /// sees the narrowed reason on Drop.
+    #[tokio::test]
+    async fn reason_handle_writes_are_visible_to_drop() {
+        let (url, abort_log, _shutdown) =
+            spawn_hanging_worker_with_abort_capture(Duration::from_secs(10)).await;
+        let client = Client::new();
+        let reached_end = Arc::new(AtomicBool::new(false));
+        let guard = AbortOnDrop::for_stream(
+            client,
+            format!("{url}/abort_request"),
+            "cross-task-rid".into(),
+            Arc::clone(&reached_end),
+            None,
+        );
+        let handle = guard.reason_handle();
+        // Simulate the pump's write from a different task.
+        tokio::spawn(async move {
+            handle.store(AbortReason::StreamDownstreamStall as u8, Ordering::Relaxed);
+        })
+        .await
+        .unwrap();
+        drop(guard);
+        wait_for_abort(&abort_log, Duration::from_secs(2)).await;
+        let log = abort_log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0]["router_reason"], "stream_downstream_stall");
     }
 
     /// `abort_guard_for` returns `None` for a worker URL that can't be parsed

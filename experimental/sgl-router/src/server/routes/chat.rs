@@ -4,11 +4,33 @@
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
+use crate::proxy::AbortReason;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
     MetricsRegistry, RequestLogContext, StaleRequestOutcome, WorkerModeLabel,
 };
+
+/// Narrow the pre-drop abort reason on the pre-headers / unary guard from
+/// its constructor default (`HandlerCancelled`, the catch-all for "handler
+/// future dropped mid-await") to the specific `ApiError` variant that caused
+/// the fetch to resolve as `Err`. Called at the one site where we know both
+/// the guard and the settled `Result` — right after the `tokio::select!` in
+/// the plain-mode streaming and plain-mode unary arms.
+///
+/// `Ok(_)` means the engine responded (any status): responsibility passes
+/// to either the streaming pump's internal guard (2xx) or nothing at all
+/// (non-2xx, engine's own error body). Nothing to record here.
+fn abort_reason_from_api_error(err: &ApiError) -> AbortReason {
+    match err {
+        ApiError::UpstreamTimeout { .. } => AbortReason::UpstreamTimeout,
+        ApiError::StaleRequestExpired { .. } => AbortReason::StaleRequestExpired,
+        // Everything else is a router-side transport / configuration failure.
+        // The abort still fires (the engine may have started work), but its
+        // origin is on our side, not a client cancel or timeout.
+        _ => AbortReason::TransportError,
+    }
+}
 use crate::workers::Worker;
 use axum::body::Body;
 use axum::extract::State;
@@ -651,9 +673,20 @@ async fn chat_completions_inner(
         // disarm so this one doesn't also fire. Left armed only when `fetch`
         // never resolved (stale-timeout) or a transport-level dispatch error
         // occurred before any response.
-        if r.is_ok() {
-            if let Some(g) = pre_headers_abort_guard.as_mut() {
-                g.disarm();
+        match &r {
+            Ok(_) => {
+                if let Some(g) = pre_headers_abort_guard.as_mut() {
+                    g.disarm();
+                }
+            }
+            Err(err) => {
+                // Narrow the abort reason before the guard drops so the
+                // WARN log + POST body identify the *specific* trigger
+                // (stale timeout / upstream timeout / transport) rather
+                // than the constructor default `HandlerCancelled`.
+                if let Some(g) = pre_headers_abort_guard.as_ref() {
+                    g.set_reason(abort_reason_from_api_error(err));
+                }
             }
         }
         r
@@ -692,9 +725,20 @@ async fn chat_completions_inner(
         // A complete response (any status) means the engine is done with this
         // request — don't abort it. Only an early drop (client disconnect) or
         // stale-timeout leaves the guard armed.
-        if r.is_ok() {
-            if let Some(g) = abort_guard.as_mut() {
-                g.disarm();
+        match &r {
+            Ok(_) => {
+                if let Some(g) = abort_guard.as_mut() {
+                    g.disarm();
+                }
+            }
+            Err(err) => {
+                // Same reason-narrowing as the streaming arm above — see there
+                // for the rationale. Handler-cancellation (client disconnect
+                // during the buffered await) still hits the constructor
+                // default because that path returns no `Err`, it just drops.
+                if let Some(g) = abort_guard.as_ref() {
+                    g.set_reason(abort_reason_from_api_error(err));
+                }
             }
         }
         r
@@ -1095,6 +1139,123 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
+    use axum::http::StatusCode;
+    use reqwest::Url;
+
+    /// Every `ApiError` variant must map deterministically to exactly one
+    /// `AbortReason`. This test pins the mapping so:
+    ///   * A future PR adding a new `ApiError` variant is forced to think
+    ///     about which abort reason it belongs to (the wildcard `_ =>
+    ///     TransportError` in `abort_reason_from_api_error` catches it, but
+    ///     silently — this test freezes the intended default).
+    ///   * A typo swap (e.g. `UpstreamTimeout → StaleRequestExpired`) fails
+    ///     loudly here even though both are timeout-family and would
+    ///     otherwise pass a code review.
+    ///
+    /// Kept as one function with a table of cases so adding a new
+    /// `ApiError` variant fails one assertion instead of one whole test —
+    /// the diff shows the exact new row that needed a decision.
+    #[test]
+    fn abort_reason_from_api_error_covers_every_variant() {
+        // sentinel worker URL for the variants that carry one
+        let worker_url = Url::parse("http://w:1/").unwrap();
+        let cases: Vec<(ApiError, AbortReason)> = vec![
+            // Explicitly-mapped narrow reasons — these are the informative
+            // labels the whole change exists to surface.
+            (
+                ApiError::UpstreamTimeout {
+                    worker: worker_url.clone(),
+                },
+                AbortReason::UpstreamTimeout,
+            ),
+            (
+                ApiError::StaleRequestExpired {
+                    model: "m".into(),
+                },
+                AbortReason::StaleRequestExpired,
+            ),
+            // Every other variant falls through to `TransportError`. Each
+            // row is a decision — do not silently accept a default without
+            // considering whether a distinct label would be more useful.
+            (ApiError::BadRequest("x".into()), AbortReason::TransportError),
+            (
+                ApiError::ModelNotFound("m".into()),
+                AbortReason::TransportError,
+            ),
+            (
+                ApiError::UpstreamUnreachable {
+                    worker: worker_url.clone(),
+                    source: anyhow!("unreachable"),
+                },
+                AbortReason::TransportError,
+            ),
+            (
+                ApiError::UpstreamStatus {
+                    status: StatusCode::BAD_GATEWAY,
+                },
+                AbortReason::TransportError,
+            ),
+            (
+                ApiError::NoHealthyWorkers { model: "m".into() },
+                AbortReason::TransportError,
+            ),
+            (
+                ApiError::NoPrefillWorkersAvailable { model: "m".into() },
+                AbortReason::TransportError,
+            ),
+            (
+                ApiError::NoDecodeWorkersAvailable { model: "m".into() },
+                AbortReason::TransportError,
+            ),
+            (
+                ApiError::PolicySelectionFailed { model: "m".into() },
+                AbortReason::TransportError,
+            ),
+            (
+                ApiError::BreakerOpen {
+                    worker: "http://w".into(),
+                },
+                AbortReason::TransportError,
+            ),
+            (
+                ApiError::WorkerMisconfigured {
+                    worker: "http://w".into(),
+                    source: anyhow!("bad url"),
+                },
+                AbortReason::TransportError,
+            ),
+            (
+                ApiError::ServiceOverloaded { model: "m".into() },
+                AbortReason::TransportError,
+            ),
+            (ApiError::Internal(anyhow!("boom")), AbortReason::TransportError),
+        ];
+        for (err, expected) in cases.iter() {
+            let got = abort_reason_from_api_error(err);
+            assert_eq!(
+                got, *expected,
+                "abort_reason_from_api_error({err}) — expected {:?}, got {:?}. \
+                 If you changed the mapping, update the expected value; \
+                 if you added a new ApiError variant, add a row here to pin \
+                 which AbortReason it maps to.",
+                expected, got,
+            );
+        }
+        // Coverage check: the table above must cover every ApiError
+        // variant. If someone adds a new variant without adding a row,
+        // this count assertion catches it — a coarse but effective net.
+        // Keep the expected count in sync with the ApiError enum.
+        const EXPECTED_APIERROR_VARIANTS: usize = 14;
+        assert_eq!(
+            cases.len(),
+            EXPECTED_APIERROR_VARIANTS,
+            "abort_reason_from_api_error test table has {} rows; \
+             ApiError has {} variants — add or remove rows to match.",
+            cases.len(),
+            EXPECTED_APIERROR_VARIANTS,
+        );
+    }
 
     /// `generate_room_id` MUST return values in `[0, i64::MAX]`. The
     /// SGLang prefill stores `bootstrap_room` as `torch.int64`; a u64
@@ -1523,7 +1684,7 @@ mod tests {
             .body(Body::from("[]"))
             .unwrap();
         let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
         let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
