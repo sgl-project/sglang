@@ -409,5 +409,64 @@ def test_moe_fused_gate_grouped_matches_production_impl(
     )
 
 
+@pytest.mark.parametrize(
+    "num_experts,num_expert_group,topk_group,topk,num_fused_shared_experts",
+    [
+        (256, 8, 4, 8, 0),  # DeepSeek-V3
+        (256, 8, 4, 9, 1),  # DeepSeek-V3 + one fused shared expert
+    ],
+)
+def test_grouped_dispatch_flag_matches_default(
+    num_experts: int,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    num_fused_shared_experts: int,
+) -> None:
+    """The opt-in SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK dispatch must match the
+    default grouped path (flashinfer/AOT) that biased_grouped_topk_gpu selects when
+    the flag is off. This covers the wiring, not just the raw kernel — validated
+    bit-exact on DeepSeek-V3.2 e2e; here we assert parity against the default path.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.topk import biased_grouped_topk_gpu
+
+    M = 256
+    torch.manual_seed(num_experts * 3 + num_expert_group * 5 + topk)
+    # fp32 gating: both the default (flashinfer upcasts to fp32) and the Triton
+    # dispatch (also upcasts) operate on the same fp32 scores, so no bf16
+    # borderline-expert divergence is expected.
+    gating = torch.randn(M, num_experts, dtype=torch.float32, device=DEVICE) * 2.0
+    bias = torch.randn(num_experts, dtype=torch.float32, device=DEVICE) * 0.5
+    hidden = torch.randn(M, 16, dtype=torch.float32, device=DEVICE)
+
+    kwargs = dict(
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        num_fused_shared_experts=num_fused_shared_experts,
+        routed_scaling_factor=2.5,
+        apply_routed_scaling_factor_on_output=False,
+    )
+    with envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(False):
+        def_w, def_i = biased_grouped_topk_gpu(
+            hidden, gating, bias, topk, True, **kwargs
+        )
+    with envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(True):
+        jit_w, jit_i = biased_grouped_topk_gpu(
+            hidden, gating, bias, topk, True, **kwargs
+        )
+    torch.cuda.synchronize()
+
+    # Compare routed experts only (shared-expert slot ids are placeholders the
+    # downstream fusion overwrites; the routed selection + weights are what matter).
+    topk_routed = topk - num_fused_shared_experts
+    torch.testing.assert_close(
+        _scatter_by_expert(def_w[:, :topk_routed], def_i[:, :topk_routed], num_experts),
+        _scatter_by_expert(jit_w[:, :topk_routed], jit_i[:, :topk_routed], num_experts),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

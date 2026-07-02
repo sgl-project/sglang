@@ -1402,6 +1402,33 @@ def biased_grouped_topk_gpu(
     topk_routed = topk - num_fused_shared_experts
     if (
         _is_cuda
+        and num_expert_group
+        and num_expert_group > 1
+        and envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
+    ):
+        # Opt-in: unified Triton router for DeepSeek-V3 grouped routing. Bit-exact
+        # with the flashinfer/AOT paths on DeepSeek-V3.2 e2e (validated); handles any
+        # experts-per-group (no <=32 cap). Off by default — see the env-var comment.
+        from sglang.jit_kernel.moe_fused_gate import moe_fused_gate as jit_grouped_gate
+
+        return jit_grouped_gate(
+            gating_output.to(dtype=torch.float32),
+            correction_bias.to(dtype=torch.float32),
+            topk,
+            scoring_func="sigmoid",
+            num_fused_shared_experts=num_fused_shared_experts,
+            renormalize=renormalize,
+            routed_scaling_factor=(
+                routed_scaling_factor if routed_scaling_factor is not None else 1.0
+            ),
+            apply_routed_scaling_factor_on_output=bool(
+                apply_routed_scaling_factor_on_output
+            ),
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+        )
+    if (
+        _is_cuda
         and fused_topk_deepseek is not None
         and is_power_of_two(num_experts)
         # flashinfer constraints (applied to routed experts only)
