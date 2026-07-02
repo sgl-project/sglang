@@ -122,3 +122,9 @@ mthreads:
     - any-glob-to-any-file:
       - '**/*mthreads*'
       - '**/*musa*'
+
+# Apple Silicon specific
+apple-silicon:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*mlx*'
