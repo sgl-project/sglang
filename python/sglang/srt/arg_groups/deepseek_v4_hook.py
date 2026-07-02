@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.environ import envs
+
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
@@ -15,24 +17,35 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 
     server_args.attention_backend = "dsv4"
     server_args.page_size = 256
+    if server_args.kv_cache_dtype == "auto":
+        server_args.kv_cache_dtype = "fp8_e4m3"
+        logger.warning(
+            f"Setting KV cache dtype to {server_args.kv_cache_dtype} for {model_arch}."
+        )
+
+    if server_args.device == "npu":
+        # NPU keeps the device-aware "dsv4" backend (the registry routes it to
+        # the Ascend V4 subclass); only the pool geometry / dtype differ.
+        # set_default_server_args() pins all three backends to "ascend" for
+        # generic NPU models; undo that here so V4 stays consistently on dsv4.
+        server_args.prefill_attention_backend = "dsv4"
+        server_args.decode_attention_backend = "dsv4"
+        server_args.page_size = 128
+        server_args.kv_cache_dtype = "bfloat16"
+
     logger.info(
-        f"Use dsv4 attention backend for {model_arch}, setting page_size to 256."
+        f"Use dsv4 attention backend for {model_arch}, setting page_size to {server_args.page_size}."
     )
+    assert server_args.kv_cache_dtype in [
+        "fp8_e4m3",
+        "bfloat16",
+    ], f"{server_args.kv_cache_dtype} is not supported for {model_arch}"
 
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 256
         logger.warning(
             f"Setting max_running_requests to {server_args.max_running_requests} for {model_arch}."
         )
-
-    if server_args.kv_cache_dtype == "auto":
-        server_args.kv_cache_dtype = "fp8_e4m3"
-        logger.warning(
-            f"Setting KV cache dtype to {server_args.kv_cache_dtype} for {model_arch}."
-        )
-    assert server_args.kv_cache_dtype in [
-        "fp8_e4m3"
-    ], f"{server_args.kv_cache_dtype} is not supported for {model_arch}"
 
     if server_args.speculative_algorithm is not None:
         assert (
@@ -46,6 +59,17 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         server_args.swa_full_tokens_ratio = 0.1
         logger.info(
             f"Setting swa_full_tokens_ratio to {server_args.swa_full_tokens_ratio} for {model_arch}."
+        )
+
+    # nvidia/DeepSeek-V4-Pro-NVFP4 uses flashinfer_trtllm_routed MoE runner backend.
+    if (
+        server_args.moe_runner_backend == "auto"
+        and server_args.get_model_config().nvfp4_moe_meta is not None
+    ):
+        server_args.moe_runner_backend = "flashinfer_trtllm_routed"
+        logger.info(
+            "Use flashinfer_trtllm_routed as MoE runner backend for "
+            f"{model_arch} hybrid FP8+NVFP4 checkpoint."
         )
 
 
@@ -71,6 +95,11 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     assert (
         server_args.tp_size <= 8
     ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+    logger.warning(
+        "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
+        "context parallelism is enabled."
+    )
+    envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
     logger.warning(
         f"Enable Context Parallel for DeepSeekV4, "
         f"dp_size={server_args.dp_size}, moe_dense_tp_size={server_args.moe_dense_tp_size}, "

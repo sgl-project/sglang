@@ -8,12 +8,11 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
-    get_attention_dp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
@@ -409,7 +408,7 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
         and get_moe_runner_backend().is_flashinfer_cutlass()
         and is_dp_attention_enabled()
         and MOE_QUANTIZATION == "modelopt_fp4"
-        and get_moe_expert_parallel_world_size() == get_attention_dp_size()
+        and get_parallel().moe_ep_size == get_parallel().attn_dp_size
     )
 
 
@@ -423,8 +422,8 @@ def should_use_dp_reduce_scatterv():
         not should_use_flashinfer_cutlass_moe_fp4_allgather()
         and get_moe_a2a_backend().is_none()
         and is_dp_attention_enabled()
-        and get_attention_dp_size() > 1
-        and get_moe_expert_parallel_world_size() == get_attention_dp_size()
+        and get_parallel().attn_dp_size > 1
+        and get_parallel().moe_ep_size == get_parallel().attn_dp_size
     )
 
 
@@ -447,6 +446,12 @@ def should_skip_post_experts_all_reduce(
       - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
         the flashinfer cutlass FP4 kernel performs an all-gather that absorbs
         the post-experts TP all-reduce. Not relevant to the EP all-reduce.
+      - ``get_moe_a2a_backend().is_flashinfer()``: the flashinfer A2A
+        dispatcher's ``MoeAlltoAll.combine`` already alltoall-reduces partial
+        MoE outputs back to the source rank, so any further EP/TP all-reduce
+        would double-count and overflow BF16. Mirrors TRTLLM's
+        ``not enable_alltoall`` gate
+        (``tensorrt_llm/_torch/modules/fused_moe/interface.py:879``).
 
     The first two args are layer-context flags from ``LayerCommunicator`` and
     default to ``False`` for models that don't use it. Pass ``is_tp_path=True``
@@ -457,6 +462,8 @@ def should_skip_post_experts_all_reduce(
     if should_use_dp_reduce_scatterv():
         return True
     if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
+        return True
+    if get_moe_a2a_backend().is_flashinfer():
         return True
     return False
 

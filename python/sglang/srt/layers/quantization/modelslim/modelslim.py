@@ -88,6 +88,17 @@ class ModelSlimConfig(QuantizationConfig):
 
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
+        keys = [k for k in quant_config if isinstance(k, str)]
+        is_dsv4 = any(k.startswith("hc_head_") for k in keys)
+        if is_dsv4:
+            from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+            remap = DeepseekV4ForCausalLM.remap_weight_name_to_dpsk_hf_format
+            quant_config = {
+                (remap(k) if isinstance(k, str) else k): v
+                for k, v in quant_config.items()
+            }
+
         self.quant_description = quant_config
         ignore = cast(List[str], quant_config.get("ignore", []))
         self.ignore = ignore if ignore is not None else []
@@ -166,6 +177,8 @@ class ModelSlimConfig(QuantizationConfig):
             ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
+            if layer.scheme is None:
+                return UnquantizedLinearMethod()
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer, prefix)
