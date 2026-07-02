@@ -1876,6 +1876,17 @@ class AiterAttnBackend(AttentionBackend):
         # base class NotImplementedError.
         pass
 
+    def _use_fused_fp8_kv_write(self, layer: RadixAttention) -> bool:
+        # Fused write reuses K's num_heads/head_dim for V, so it needs FP8,
+        # non-MLA, non-SWA, and matching K/V head count + head_dim.
+        return (
+            self.kv_cache_dtype == fp8_dtype
+            and not self.use_mla
+            and not self.use_sliding_window_kv_pool
+            and layer.tp_k_head_num == layer.tp_v_head_num
+            and layer.qk_head_dim == layer.v_head_dim
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1950,13 +1961,8 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 elif self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
-                elif (
-                    self.kv_cache_dtype == fp8_dtype
-                    and not self.use_sliding_window_kv_pool
-                ):
-                    # FP8: fuse bf16->fp8 cast + paged write in one kernel instead
-                    # of the separate div/cast + store in set_kv_buffer.
-                    # Single-pool only; SWA models fall back to set_kv_buffer.
+                elif self._use_fused_fp8_kv_write(layer):
+                    # FP8: fuse bf16->fp8 cast + paged write in one kernel.
                     k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
                     )
@@ -2440,14 +2446,13 @@ class AiterAttnBackend(AttentionBackend):
                     k_scale=k_descale,
                     v_scale=v_descale,
                 )
-            elif (
-                self.kv_cache_dtype == fp8_dtype
-                and not self.use_mla
-                and not self.use_sliding_window_kv_pool
-            ):
-                # FP8: fuse bf16->fp8 cast + paged write in one kernel. Works for
-                # both unified and standard (paged_attention_ragged) read paths.
-                # Single-pool only; SWA models fall back to set_kv_buffer.
+            elif self.use_mla:
+                # MLA pool has its own set_kv_buffer (no scale args).
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v
+                )
+            elif self._use_fused_fp8_kv_write(layer):
+                # FP8: fuse bf16->fp8 cast + paged write in one kernel.
                 token_to_kv_pool = self.token_to_kv_pool
                 k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
                 launch_reshape_and_cache_flash(
@@ -2472,6 +2477,8 @@ class AiterAttnBackend(AttentionBackend):
                     ),
                     k,
                     v,
+                    k_descale,
+                    v_descale,
                 )
 
         if self.use_mla:
