@@ -1804,7 +1804,7 @@ def _page_size_default(view: Any) -> dict:
 
 @register_post_process
 def _data_parallelism_defaults(view: Any) -> dict:
-    if view.dp_size == 1:
+    if view.dp_size == 1 and view.ep_join_mode != "scale":
         return {"enable_dp_attention": False, "enable_dp_lm_head": False}
     return {}
 
