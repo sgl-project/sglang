@@ -1499,7 +1499,12 @@ def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
 # COPIED FROM DeepGEMM
 def ceil_to_ue8m0(x: torch.Tensor):
-    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
+    bits = x.abs().float().view(torch.int32)
+    exp = (bits >> 23) & 0xFF
+    mantissa = bits & 0x7FFFFF
+    exp = exp + (mantissa != 0).to(torch.int32)
+    exp = exp.clamp(1, 254)
+    return (exp << 23).view(torch.float32)
 
 
 def channel_quant_to_tensor_quant(
