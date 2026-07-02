@@ -88,7 +88,8 @@ class TestNPUQwen3_6_27B_1P_In1080p_30_Out256_50ms(TestNpuPerformanceTestCaseBas
     model = QWEN3_6_27B_MODEL_PATH
     other_args = QWEN3_6_27B_1080P_OTHER_ARGS
     envs = QWEN3_6_27B_1080P_ENVS
-    dataset_name = "random"
+    backend = "sglang-oai-chat"
+    dataset_name = "image"
     max_concurrency = 30
     num_prompts = 120
     input_len = 30
@@ -96,6 +97,7 @@ class TestNPUQwen3_6_27B_1P_In1080p_30_Out256_50ms(TestNpuPerformanceTestCaseBas
     random_range_ratio = 1
     image_resolution = "1920x1080"
     image_count = 1
+    seed = 1
     tpot = 50
     output_token_throughput = 226
 
