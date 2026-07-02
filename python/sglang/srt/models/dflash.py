@@ -73,14 +73,7 @@ class DFlashAttention(nn.Module):
         super().__init__()
         hidden_size = int(config.hidden_size)
         tp_size = int(get_parallel().tp_size)
-        # LagunaConfig synthesizes and validates num_attention_heads_per_layer;
-        # non-Laguna draft configs only carry the scalar.
-        heads_per_layer = getattr(config, "num_attention_heads_per_layer", None)
-        total_num_heads = int(
-            heads_per_layer[layer_id]
-            if heads_per_layer is not None
-            else config.num_attention_heads
-        )
+        total_num_heads = int(config.num_attention_heads)
         total_num_kv_heads = int(
             getattr(config, "num_key_value_heads", total_num_heads)
         )
