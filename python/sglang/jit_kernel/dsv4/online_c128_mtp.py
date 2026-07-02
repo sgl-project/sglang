@@ -15,9 +15,12 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_online_c128_mtp_module(
-    head_dim: int, dtype_buffer: torch.dtype = torch.float32
+    head_dim: int,
+    seq_dtype: torch.dtype,
+    req_dtype: torch.dtype,
+    dtype_buffer: torch.dtype,
 ) -> Module:
-    args = make_cpp_args(head_dim, dtype_buffer)
+    args = make_cpp_args(head_dim, seq_dtype, req_dtype, dtype_buffer)
     return load_jit(
         make_name(f"online_c128_mtp_{head_dim}"),
         *args,
@@ -81,12 +84,14 @@ class OnlineC128MTPController:
         if head_dim is None or state_dtype is None or self._num_verify_tokens() == 0:
             return
         token_to_kv_pool = self.backend.token_to_kv_pool
-        _jit_online_c128_mtp_module(head_dim, state_dtype).mark_pending(
+        _jit_online_c128_mtp_module(
+            head_dim, seq_lens.dtype, req_pool_indices.dtype, state_dtype
+        ).mark_pending(
             seq_lens,
             req_pool_indices,
             token_to_kv_pool.get_online_c128_mtp_pending_seq_lens(),
             min(seq_lens.shape[0], req_pool_indices.shape[0]),
-            token_to_kv_pool.max_num_reqs,
+            token_to_kv_pool.get_online_c128_state_num_req_slots(),
         )
 
     def clear(self) -> None:
@@ -162,16 +167,16 @@ class OnlineC128MTPController:
         if layer_bs <= 0:
             return
 
-        _jit_online_c128_mtp_module(head_dim, state.dtype).write_prefix_states(
+        _jit_online_c128_mtp_module(
+            head_dim, ctx.seq_lens.dtype, ctx.req_pool_indices.dtype, state.dtype
+        ).write_prefix_states(
             kv_score_input,
             ctx.seq_lens,
             ctx.req_pool_indices,
             self.backend.req_to_token,
-            token_to_kv_pool.full_to_swa_index_mapping,
             compressor.ape.reshape(128, head_dim),
             state,
             layer_bs,
-            token_to_kv_pool.swa_page_size,
             num_verify_tokens,
             state_pool.online_mtp_state_slot_offset,
         )
@@ -201,19 +206,20 @@ class OnlineC128MTPController:
 
         for runtime in self._iter_layer_runtimes():
             _jit_online_c128_mtp_module(
-                runtime.head_dim, runtime.state_dtype
+                runtime.head_dim,
+                seq_lens.dtype,
+                req_pool_indices.dtype,
+                runtime.state_dtype,
             ).commit_pending(
                 seq_lens,
                 req_pool_indices,
                 backend.req_to_token,
-                token_to_kv_pool.full_to_swa_index_mapping,
                 pending_seq_lens,
                 runtime.main_state,
                 cur_bs,
-                token_to_kv_pool.swa_page_size,
                 num_verify_tokens,
                 runtime.state_slot_offset,
-                token_to_kv_pool.max_num_reqs,
+                token_to_kv_pool.get_online_c128_state_num_req_slots(),
             )
 
         self.clear()

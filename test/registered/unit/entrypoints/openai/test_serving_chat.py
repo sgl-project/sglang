@@ -102,6 +102,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.basic_req = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
+            session_id="session-1",
             temperature=0.7,
             max_tokens=100,
             stream=False,
@@ -145,6 +146,7 @@ class ServingChatTestCase(unittest.TestCase):
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
+            self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
     def test_convert_to_internal_request_rejects_stream_return_prompt_token_ids(self):
@@ -1447,6 +1449,203 @@ class ServingChatTestCase(unittest.TestCase):
         # Check that there is an error chunk and a DONE chunk
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
+
+    def _run_chat_stream(self, adapted_request, req):
+        async def run_stream():
+            chunks = []
+            async for chunk in self.chat._generate_chat_stream(
+                adapted_request, req, self.fastapi_request
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        return get_or_create_event_loop().run_until_complete(run_stream())
+
+    def _parse_chunks(self, chunks):
+        parsed = []
+        for c in chunks:
+            if c.startswith("data: ") and c != "data: [DONE]\n\n":
+                parsed.append(json.loads(c[len("data: ") :]))
+        return parsed
+
+    async def _collect_stream_content(self, content, choice_logprobs, req):
+        chunks = []
+        async for chunk in self.chat._generate_stream_content(
+            content=content,
+            index=0,
+            request=req,
+            stream_offsets={},
+            reasoning_parser_dict={},
+            parser_dict={},
+            has_tool_calls={},
+            choice_logprobs=choice_logprobs,
+            finish_reason_type="stop",
+            continuous_usage_stats=False,
+            prompt_tokens={0: 5},
+            reasoning_tokens={0: 0},
+            completion_tokens={0: 1},
+        ):
+            chunks.append(chunk)
+        return chunks
+
+    def test_streaming_logprobs_attached_with_reasoning_parser(self):
+        """Logprobs must ride on the reasoning chunk when a reasoning parser is active."""
+        self.chat.reasoning_parser = "qwen3"
+
+        content = {
+            "text": "thinking...",
+            "meta_info": {
+                "id": "chatcmpl-reasoning",
+                "prompt_tokens": 5,
+                "completion_tokens": 2,
+                "cached_tokens": 0,
+                "finish_reason": {"type": "stop", "matched": None},
+                "output_token_logprobs": [(0.1, 1, "think"), (0.2, 2, "ing")],
+                "output_top_logprobs": [],
+                "output_token_logprobs_length": 2,
+            },
+            "index": 0,
+        }
+        choice_logprobs = self.chat._process_streaming_logprobs(
+            content, 0, 2
+        ).model_dump()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            logprobs=True,
+            separate_reasoning=True,
+        )
+
+        with patch.object(self.chat, "_process_reasoning_stream") as proc_mock:
+            proc_mock.return_value = ("Let me think", "")
+            chunks = get_or_create_event_loop().run_until_complete(
+                self._collect_stream_content(content, choice_logprobs, req)
+            )
+
+        parsed = self._parse_chunks(chunks)
+        reasoning_chunks = [
+            c
+            for c in parsed
+            if c["choices"][0]["delta"].get("reasoning_content") is not None
+        ]
+        self.assertTrue(
+            reasoning_chunks, "reasoning_parser did not emit a reasoning_content chunk"
+        )
+        logprob_chunks = [
+            c for c in parsed if c["choices"][0].get("logprobs") is not None
+        ]
+        self.assertTrue(
+            logprob_chunks,
+            "logprobs dropped: no chunk carried logprobs with reasoning_parser active",
+        )
+
+    def test_streaming_logprobs_flushed_when_tool_parser_buffers_delta(self):
+        """Logprobs must be flushed on a standalone chunk when the tool parser emits no content delta."""
+        self.chat.tool_call_parser = "hermes"
+
+        content = {
+            "text": "(<",
+            "meta_info": {
+                "id": "chatcmpl-tool",
+                "prompt_tokens": 5,
+                "completion_tokens": 1,
+                "cached_tokens": 0,
+                "finish_reason": {"type": "stop", "matched": None},
+                "output_token_logprobs": [(0.3, 9, "(<")],
+                "output_top_logprobs": [],
+                "output_token_logprobs_length": 1,
+            },
+            "index": 0,
+        }
+        choice_logprobs = self.chat._process_streaming_logprobs(
+            content, 0, 1
+        ).model_dump()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            stream=True,
+            logprobs=True,
+        )
+
+        async def _empty_tool_stream(*args, **kwargs):
+            return
+            yield  # make it an async generator
+
+        with patch.object(self.chat, "_process_tool_call_stream", _empty_tool_stream):
+            chunks = get_or_create_event_loop().run_until_complete(
+                self._collect_stream_content(content, choice_logprobs, req)
+            )
+
+        parsed = self._parse_chunks(chunks)
+        logprob_chunks = [
+            c for c in parsed if c["choices"][0].get("logprobs") is not None
+        ]
+        self.assertTrue(
+            logprob_chunks,
+            "logprobs dropped: no flush chunk carried logprobs when tool parser buffered the delta",
+        )
+
+    def test_streaming_logprobs_not_flushed_on_empty_delta_step_without_parser(self):
+        """With no parser active, an empty-delta step must not emit a standalone
+        empty-delta logprobs chunk — clients expect each chunk to carry real
+        content/reasoning/tool_calls or a finish_reason."""
+        self.chat.reasoning_parser = None
+        self.chat.tool_call_parser = None
+
+        async def _mock_generate():
+            yield {
+                "text": "",
+                "meta_info": {
+                    "id": "chatcmpl-empty",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "output_token_logprobs": [(0.5, 7, "")],
+                    "output_top_logprobs": [],
+                    "output_token_logprobs_length": 1,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            logprobs=True,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+            chunks = self._run_chat_stream(adapted_request, req)
+
+        parsed = self._parse_chunks(chunks)
+        empty_logprob_chunks = [
+            c
+            for c in parsed
+            if c["choices"][0].get("logprobs") is not None
+            and not c["choices"][0]["delta"].get("content")
+            and not c["choices"][0]["delta"].get("reasoning_content")
+            and not c["choices"][0]["delta"].get("tool_calls")
+            and not c["choices"][0].get("finish_reason")
+        ]
+        self.assertFalse(
+            empty_logprob_chunks,
+            "empty-delta logprobs chunk emitted without a parser; would break client chunk-shape assumptions",
+        )
 
     def test_non_streaming_cached_tokens_details_emits_sglext(self):
         """Test that non-streaming chat responses emit cached token details in sglext."""
