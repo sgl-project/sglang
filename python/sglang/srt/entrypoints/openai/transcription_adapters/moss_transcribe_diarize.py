@@ -15,10 +15,10 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
 
 _SPECIAL_TOKEN_RE = re.compile(r"<\|(?:im_start|im_end|endoftext)\|>")
 _SEGMENT_RE = re.compile(
-    r"\[(?P<start>\d+(?:\.\d+)?)\]\[(?P<speaker>S\d{2,})\]"
+    r"\[(?P<start>\d+(?:\.\d+)?)\]\s*\[(?P<speaker>S\d{2,})\]"
     r"(?P<text>.*?)"
-    r"\[(?P<end>\d+(?:\.\d+)?)\]"
-    r"(?=\s*(?:\[\d+(?:\.\d+)?\]\[S\d{2,}\]|$))",
+    r"\s*\[(?P<end>\d+(?:\.\d+)?)\]"
+    r"(?=\s*(?:\[\d+(?:\.\d+)?\]\s*\[S\d{2,}\]|$))",
     re.DOTALL,
 )
 
