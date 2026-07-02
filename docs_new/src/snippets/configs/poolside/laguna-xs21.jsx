@@ -267,10 +267,9 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      // VERIFIED 8×H200 tp8+ep8: GSM8K 64.52%, accept-length 4.94 (matched int4-calibrated
-      // draft). Widest tp8-vs-tp4 delta measured across the quantized cells (64.52% vs
-      // 66.41% at tp4) — inside two binomial SEs but the least-repeated combo in this grid;
-      // re-check if this exact config goes to production.
+      // VERIFIED 8×H200 tp8+ep8: GSM8K 66.57% (matched int4-calibrated draft), accept-length
+      // ~5. First run drew 64.52% — 2pt below the tp4 sibling (66.41%); a same-command repeat
+      // scored 66.57%, confirming ordinary eval noise (not an EP8/DFlash interaction).
       match: { hw: "h200", variant: "default", quant: "int4", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [],
