@@ -937,6 +937,29 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         return commit_lens, bonus_tokens, out_tokens
 
+    def _clear_unaccepted_c128_draft_states(
+        self,
+        *,
+        batch: ScheduleBatch,
+        prefix_lens: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> None:
+        allocator = getattr(batch, "token_to_kv_pool_allocator", None)
+        if allocator is None:
+            return
+        kvcache = allocator.get_kvcache()
+        clear_unaccepted_c128 = getattr(
+            kvcache, "clear_unaccepted_c128_draft_states", None
+        )
+        if clear_unaccepted_c128 is None:
+            return
+        clear_unaccepted_c128(
+            batch.req_pool_indices,
+            prefix_lens,
+            commit_lens,
+            int(self.block_size),
+        )
+
     def _make_next_draft_input_prefill(
         self,
         *,
@@ -1213,6 +1236,12 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+        if bs > 0:
+            self._clear_unaccepted_c128_draft_states(
+                batch=model_worker_batch,
+                prefix_lens=prefix_lens,
+                commit_lens=commit_lens,
+            )
         if on_publish is not None:
             on_publish(new_seq_lens)
 
