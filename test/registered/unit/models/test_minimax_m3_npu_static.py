@@ -3,13 +3,9 @@ import re
 import unittest
 from pathlib import Path
 
-try:
-    from sglang.test.ci.ci_register import register_cpu_ci
-except ModuleNotFoundError:
-    register_cpu_ci = None
+from sglang.test.ci.ci_register import register_cpu_ci
 
-if register_cpu_ci is not None:
-    register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -49,7 +45,9 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
         self.assertIn("torch_npu.npu_scatter_nd_update_", source)
 
     def test_ascend_pool_selection_prefers_minimax_sparse_pool(self):
-        source = _read("python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py")
+        source = _read(
+            "python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py"
+        )
         ascend_branch = source[
             source.index('self.server_args.attention_backend == "ascend"') :
         ]

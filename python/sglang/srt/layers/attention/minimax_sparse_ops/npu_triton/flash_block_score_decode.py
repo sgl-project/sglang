@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-
 import triton
 import triton.language as tl
+
 
 def _next_power_of_2(x: int) -> int:
     return 1 << (int(x) - 1).bit_length()
@@ -163,9 +163,9 @@ def _torch_topk_from_score(
 )
 @triton.jit
 def _topk_index_streaming_bnsd_kernel(
-    score_ptr,          # [QH, B, max_seqblock]
-    topk_idx_ptr,       # [QH, B, topk]
-    seq_lens,           # [B]
+    score_ptr,  # [QH, B, max_seqblock]
+    topk_idx_ptr,  # [QH, B, topk]
+    seq_lens,  # [B]
     block_size: tl.constexpr,
     topk: tl.constexpr,
     max_seqblock: tl.constexpr,
@@ -336,11 +336,11 @@ def _streaming_topk_from_score(
 )
 @triton.jit
 def _decode_bnsd_score_kernel(
-    q_ptr,              # [B, QH, D]
-    k_cache_ptr,        # [NBLOCKS, BLOCK, KVH, D]
-    block_table_ptr,    # [B, max_num_blocks]
-    score_ptr,          # [QH, B, max_seqblock]
-    seq_lens,           # [B]
+    q_ptr,  # [B, QH, D]
+    k_cache_ptr,  # [NBLOCKS, BLOCK, KVH, D]
+    block_table_ptr,  # [B, max_num_blocks]
+    score_ptr,  # [QH, B, max_seqblock]
+    seq_lens,  # [B]
     # shape
     batch_size,
     gqa_group_size,
@@ -440,9 +440,7 @@ def _decode_bnsd_score_kernel(
     if SCORE_TYPE == "max":
         score = sub_max
     else:
-        score = sub_max + tl.log2(
-            tl.sum(tl.exp2(qk - sub_max[:, None]), axis=1)
-        )
+        score = sub_max + tl.log2(tl.sum(tl.exp2(qk - sub_max[:, None]), axis=1))
         score = tl.where(score != score, float("-inf"), score)
 
     # Match the original/reference behavior:
@@ -455,11 +453,7 @@ def _decode_bnsd_score_kernel(
     score = tl.where(is_init, 1e30, score)
     score = tl.where(is_local, 1e29, score)
 
-    s_offsets = (
-        (pid_h + off_h) * stride_s_h
-        + pid_b * stride_s_b
-        + pid_blk * stride_s_n
-    )
+    s_offsets = (pid_h + off_h) * stride_s_h + pid_b * stride_s_b + pid_blk * stride_s_n
 
     tl.store(
         score_ptr + s_offsets,
@@ -483,11 +477,11 @@ def _decode_bnsd_score_kernel(
 )
 @triton.jit
 def _decode_bnsd_score_chunk_kernel(
-    q_ptr,              # [B, QH, D]
-    k_cache_ptr,        # [NBLOCKS, BLOCK, KVH, D]
-    block_table_ptr,    # [B, max_num_blocks]
-    score_ptr,          # [QH, B, max_seqblock]
-    seq_lens,           # [B]
+    q_ptr,  # [B, QH, D]
+    k_cache_ptr,  # [NBLOCKS, BLOCK, KVH, D]
+    block_table_ptr,  # [B, max_num_blocks]
+    score_ptr,  # [QH, B, max_seqblock]
+    seq_lens,  # [B]
     # shape
     batch_size,
     gqa_group_size,
@@ -615,9 +609,7 @@ def _decode_bnsd_score_chunk_kernel(
         if SCORE_TYPE == "max":
             score = sub_max
         else:
-            score = sub_max + tl.log2(
-                tl.sum(tl.exp2(qk - sub_max[:, None]), axis=1)
-            )
+            score = sub_max + tl.log2(tl.sum(tl.exp2(qk - sub_max[:, None]), axis=1))
             score = tl.where(score != score, float("-inf"), score)
 
         is_init = logical_block < init_blocks
@@ -653,15 +645,15 @@ def _decode_bnsd_score_chunk_kernel(
 )
 @triton.jit
 def _decode_bnsd_score_attn_chunk_kernel(
-    q_ptr,              # [B, QH, D]
-    sink_ptr,           # optional [QH, D]
-    k_cache_ptr,        # [NBLOCKS, BLOCK, KVH, D]
-    v_cache_ptr,        # [NBLOCKS, BLOCK, KVH, D]
-    block_table_ptr,    # [B, max_num_blocks]
-    o_ptr,              # [C, B, QH, D]
-    lse_ptr,            # [C, B, QH]
-    score_ptr,          # [QH, B, max_seqblock]
-    seq_lens,           # [B]
+    q_ptr,  # [B, QH, D]
+    sink_ptr,  # optional [QH, D]
+    k_cache_ptr,  # [NBLOCKS, BLOCK, KVH, D]
+    v_cache_ptr,  # [NBLOCKS, BLOCK, KVH, D]
+    block_table_ptr,  # [B, max_num_blocks]
+    o_ptr,  # [C, B, QH, D]
+    lse_ptr,  # [C, B, QH]
+    score_ptr,  # [QH, B, max_seqblock]
+    seq_lens,  # [B]
     # shape
     batch_size,
     gqa_group_size,
@@ -754,14 +746,12 @@ def _decode_bnsd_score_attn_chunk_kernel(
 
     if HAS_SINK:
         if pid_c == 0:
-            sink_offsets = (
-                (pid_h + off_h[:, None]) * stride_sink_h
-                + off_d[None, :] * stride_sink_d
-            )
+            sink_offsets = (pid_h + off_h[:, None]) * stride_sink_h + off_d[
+                None, :
+            ] * stride_sink_d
             sink = tl.load(
                 sink_ptr + sink_offsets,
-                mask=(off_h[:, None] < gqa_group_size)
-                & (off_d[None, :] < head_dim),
+                mask=(off_h[:, None] < gqa_group_size) & (off_d[None, :] < head_dim),
                 other=0.0,
             ).to(tl.float32)
             qsink = tl.sum(q.to(tl.float32) * sink, axis=1) * sm_scale_log2e
@@ -819,9 +809,7 @@ def _decode_bnsd_score_attn_chunk_kernel(
         if SCORE_TYPE == "max":
             score = sub_max
         else:
-            score = sub_max + tl.log2(
-                tl.sum(tl.exp2(qk - sub_max[:, None]), axis=1)
-            )
+            score = sub_max + tl.log2(tl.sum(tl.exp2(qk - sub_max[:, None]), axis=1))
             score = tl.where(score != score, float("-inf"), score)
 
         is_init = logical_block < init_blocks
@@ -867,11 +855,7 @@ def _decode_bnsd_score_attn_chunk_kernel(
         mask=(off_h[:, None] < gqa_group_size) & (off_d[None, :] < head_dim),
     )
 
-    l_offsets = (
-        pid_c * stride_l_c
-        + pid_b * stride_l_b
-        + (pid_h + off_h) * stride_l_h
-    )
+    l_offsets = pid_c * stride_l_c + pid_b * stride_l_b + (pid_h + off_h) * stride_l_h
     tl.store(
         lse_ptr + l_offsets,
         lse_i.to(lse_ptr.dtype.element_ty),
@@ -891,10 +875,10 @@ def _decode_bnsd_score_attn_chunk_kernel(
 )
 @triton.jit
 def _merge_bnsd_attn_out_kernel(
-    o_ptr,              # [C, B, QH, D]
-    lse_ptr,            # [C, B, QH]
-    seq_lens,           # [B]
-    out_ptr,            # [B, QH, D]
+    o_ptr,  # [C, B, QH, D]
+    lse_ptr,  # [C, B, QH]
+    seq_lens,  # [B]
+    out_ptr,  # [B, QH, D]
     # shape
     head_dim,
     block_size: tl.constexpr,
@@ -971,12 +955,12 @@ def _merge_bnsd_attn_out_kernel(
 
 @torch.no_grad()
 def flash_decode_bnsd_with_topk_idx(
-    q: torch.Tensor,                  # [batch_size, num_q_heads, head_dim]
-    sink: Optional[torch.Tensor],      # optional [num_q_heads, head_dim]
-    k_cache_bnsd: torch.Tensor,        # [num_blocks, block_size, num_kv_heads, head_dim]
+    q: torch.Tensor,  # [batch_size, num_q_heads, head_dim]
+    sink: Optional[torch.Tensor],  # optional [num_q_heads, head_dim]
+    k_cache_bnsd: torch.Tensor,  # [num_blocks, block_size, num_kv_heads, head_dim]
     v_cache_bnsd: Optional[torch.Tensor],
-    block_table: torch.Tensor,         # [batch_size, max_num_blocks]
-    seq_lens: torch.Tensor,            # [batch_size]
+    block_table: torch.Tensor,  # [batch_size, max_num_blocks]
+    seq_lens: torch.Tensor,  # [batch_size]
     max_seqlen: int,
     block_size: int,
     topk: int,
@@ -1039,7 +1023,7 @@ def flash_decode_bnsd_with_topk_idx(
     gqa_group_size = num_q_heads // num_kv_heads
 
     if sm_scale is None:
-        sm_scale = head_dim ** -0.5
+        sm_scale = head_dim**-0.5
 
     max_seqblock = (max_seqlen + block_size - 1) // block_size
     block_size_n = _next_power_of_2(block_size)
@@ -1064,6 +1048,7 @@ def flash_decode_bnsd_with_topk_idx(
     # skip_trivial_topk_score = use_dense_main_attn or use_jit_topk.
     skip_trivial_topk_score = use_triton_topk
     import os as _os_skip
+
     if _os_skip.environ.get("MINIMAX_NPU_TRITON_DISABLE_TRIVIAL_SKIP"):
         skip_trivial_topk_score = False
 
