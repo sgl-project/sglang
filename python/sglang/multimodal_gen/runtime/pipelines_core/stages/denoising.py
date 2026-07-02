@@ -205,10 +205,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         attn_head_size = hidden_size // num_attention_heads
 
         # torch compile
-        self._offloaded_for_compile: list[torch.nn.Module] = []
+        self._offloaded_dit_modules_for_compile: list[torch.nn.Module] = []
+        # layerwise-offload and then compile to avoid OOM
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             self._maybe_offload_during_compile(transformer)
-            self._maybe_enable_torch_compile(transformer)
+            self._maybe_torch_compile(transformer)
 
         self.scheduler = scheduler
         self.vae = vae
@@ -324,7 +325,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             return
         module.configure_layerwise_offload(args)
         if is_layerwise_offloaded_module(module):
-            self._offloaded_for_compile.append(module)
+            self._offloaded_dit_modules_for_compile.append(module)
 
     def _move_resident_components_for_warmup(self) -> list[torch.nn.Module]:
         """Move resident non-DiT components off-device while the warmup
@@ -346,7 +347,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     moved.append(module)
         return moved
 
-    def _maybe_enable_torch_compile(self, module: object) -> None:
+    def _maybe_torch_compile(self, module: object) -> None:
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object is not a nn.Module.
@@ -402,7 +403,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         """Apply request-dependent transformer acceleration in trace-safe order."""
         self._maybe_enable_cache_dit(num_inference_steps, batch)
         for transformer in filter(None, [self.transformer, self.transformer_2]):
-            self._maybe_enable_torch_compile(transformer)
+            self._maybe_torch_compile(transformer)
 
     @staticmethod
     def _needs_nvfp4_jit_prewarm(module: nn.Module) -> bool:
@@ -1411,24 +1412,32 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         return latents
 
+    def _maybe_offload_for_torch_compile_warmup(self, batch: Req, server_args: ServerArgs):
+        if not self._offloaded_dit_modules_for_compile:
+            return None
+        # if the dits are offloaded in preparation stage
+        if batch.is_warmup:
+            # for warmup request, offload components to ensure sufficient VRAM headroom for torch compile
+            moved = self._move_resident_components_for_warmup()
+            try:
+                return self._denoise(batch, server_args)
+            finally:
+                device = get_local_torch_device()
+                for module in moved:
+                    module.to(device)
+        # prepare for first real request: restore the user-configured residency
+        for module in self._offloaded_dit_modules_for_compile:
+            module.disable_offload()
+        # clear the list for avoid overhead during real request
+        self._offloaded_dit_modules_for_compile.clear()
+        return None
+
     def forward(
         self,
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
-        if self._offloaded_for_compile:
-            if batch.is_warmup:
-                moved = self._move_resident_components_for_warmup()
-                try:
-                    return self._denoise(batch, server_args)
-                finally:
-                    device = get_local_torch_device()
-                    for module in moved:
-                        module.to(device)
-            # first real request: restore the user-configured residency
-            for module in self._offloaded_for_compile:
-                module.disable_offload()
-            self._offloaded_for_compile.clear()
+        self._maybe_offload_for_torch_compile_warmup()
         return self._denoise(batch, server_args)
 
     @torch.no_grad()
