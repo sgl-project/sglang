@@ -226,6 +226,16 @@ class DSparkDraftInputV2(SpecInput):
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DSPARK_DRAFT)
+        device = self.bonus_tokens.device
+
+        def move_empty_to_device(tensor: Optional[torch.Tensor]):
+            if tensor is None or tensor.numel() != 0 or tensor.device == device:
+                return tensor
+            return torch.empty(tensor.shape, dtype=tensor.dtype, device=device)
+
+        self.topk_p = move_empty_to_device(self.topk_p)
+        self.topk_index = move_empty_to_device(self.topk_index)
+        self.hidden_states = move_empty_to_device(self.hidden_states)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return 1, 1
