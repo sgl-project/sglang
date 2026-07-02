@@ -31,6 +31,20 @@ def get_few_shot_examples(lines, k):
 
 def get_answer_value(answer_str):
     answer_str = answer_str.replace(",", "")
+    # GSM8K answers (both the ground-truth and the few-shot format the model
+    # imitates) end with a `#### <number>` marker. Prefer the number after the
+    # FIRST such marker: it is the answer to the question actually asked.
+    # Instruction-tuned models that don't reliably stop after `####` (e.g.
+    # Mistral/Mixtral) run on and emit further `Question:/#### N` pairs; taking
+    # the last number in the whole string then scores the run-on continuation
+    # instead of the real answer. Fall back to the last number when there is no
+    # `####` marker (models that answer in prose).
+    marker = re.search(r"####\s*(-?\d+\.?\d*)", answer_str)
+    if marker is not None:
+        try:
+            return ast.literal_eval(marker.group(1))
+        except (SyntaxError, ValueError):
+            return INVALID
     numbers = re.findall(r"-?\d+\.?\d*", answer_str)
     if len(numbers) < 1:
         return INVALID
