@@ -3781,7 +3781,7 @@ class ServerArgs:
                             self.tp_size <= 8
                         ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
                         # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
-                        # DSACPLayerCommunicator does not all-reduce attention-TP
+                        # The CP communicator path does not all-reduce attention-TP
                         # partial o_proj outputs before replicated dense FFNs.
                         self.attn_cp_size = self.tp_size // self.dp_size
                         self.cuda_graph_config.prefill.backend = Backend.DISABLED
@@ -3866,7 +3866,7 @@ class ServerArgs:
                         "For MLA CP, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
                     )
                     # FIXME(kpham-sgl): Keep attn_tp_size == 1 under MLA CP.
-                    # DSACPLayerCommunicator does not all-reduce attention-TP
+                    # The CP communicator path does not all-reduce attention-TP
                     # partial o_proj outputs before replicated dense FFNs.
                     self.attn_cp_size = self.tp_size // self.dp_size
                     self.cuda_graph_config.prefill.backend = Backend.DISABLED

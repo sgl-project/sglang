@@ -2899,11 +2899,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.prepare_attn_tp_scatter_input(self)
 
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
-        # The skip is scoped to DSACPLayerCommunicator-style CP (DSA, MLA): those
+        # The skip is scoped to communicator-owned CP layouts (DSA, MLA): those
         # flavors already feed a zigzag-split rank-local layout whose token count
         # should not be further divided by attn_tp_size. MHA-arch prefill CP
         # (Qwen3/Qwen2 MoE) keeps the attn_tp-replicated layout and wants the
-        # adjustment to run — see docs/design/prefill-cp-mla.md §Phase 5.
+        # adjustment to run -- see docs/design/prefill-cp-mla.md §Phase 5.
         if (
             forward_batch.num_token_non_padded is not None
             and forward_batch.global_num_tokens_gpu is not None

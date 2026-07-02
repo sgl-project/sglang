@@ -70,7 +70,6 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
-from sglang.srt.layers.communicator_dsa_cp import DSACPLayerCommunicator
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -2133,31 +2132,16 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
-        if self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp:
-            # DSACPLayerCommunicator is flavor-agnostic; its internal gates
-            # read both dsa_use_prefill_cp and mla_use_prefill_cp. The rename
-            # to CPLayerCommunicator is deferred to a cleanup PR.
-            self.layer_communicator = DSACPLayerCommunicator(
-                layer_scatter_modes=self.layer_scatter_modes,
-                input_layernorm=self.input_layernorm,
-                post_attention_layernorm=self.post_attention_layernorm,
-                allow_reduce_scatter=True,
-                is_last_layer=(
-                    is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
-                ),
-                qkv_latent_func=self.self_attn.prepare_qkv_latent,
-            )
-        else:
-            self.layer_communicator = LayerCommunicator(
-                layer_scatter_modes=self.layer_scatter_modes,
-                input_layernorm=self.input_layernorm,
-                post_attention_layernorm=self.post_attention_layernorm,
-                allow_reduce_scatter=True,
-                is_last_layer=(
-                    is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
-                ),
-                qkv_latent_func=self.self_attn.prepare_qkv_latent,
-            )
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
+            is_last_layer=(
+                is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
+            ),
+            qkv_latent_func=self.self_attn.prepare_qkv_latent,
+        )
 
     def _detect_gfx95_quant_format(self) -> str:
         if not _is_gfx95_supported:

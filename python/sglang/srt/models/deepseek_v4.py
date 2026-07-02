@@ -43,10 +43,10 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
-from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.communicator_dsa_cp import (
-    dsa_cp_gather_hidden_states,
-    dsa_cp_reduce_scatter_hidden_states,
+from sglang.srt.layers.communicator import (
+    cp_gather_hidden_states,
+    cp_reduce_scatter_hidden_states,
+    get_attn_tp_context,
 )
 from sglang.srt.layers.deepseek_v4_rope import (
     v4_rope_inplace_npu,
@@ -1633,7 +1633,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         if _use_cp:
             if get_moe_a2a_backend().is_none():
-                hidden_states = dsa_cp_gather_hidden_states(hidden_states)
+                hidden_states = cp_gather_hidden_states(hidden_states)
             else:
                 assert get_moe_a2a_backend().is_deepep(), (
                     "CP requires DeepEP (moe_a2a_backend == deepep). "
@@ -1666,7 +1666,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             skip_shared_experts=_do_shared_local,
         )
         if _use_cp and get_moe_a2a_backend().is_none():
-            hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+            hidden_states = cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),

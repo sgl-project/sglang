@@ -36,12 +36,15 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
+    attn_cp_all_gather_into_tensor,
+    attn_cp_reduce_scatter_tensor,
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
     dp_gather_partial,
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
+    get_attention_cp_group,
     get_attention_tp_group,
     get_dp_global_num_tokens,
     get_global_dp_buffer,
@@ -329,6 +332,34 @@ def get_attn_tp_context():
     return ATTN_TP_CONTEXT
 
 
+def _is_attn_cp_layer_comm_enabled() -> bool:
+    return is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
+
+
+def cp_gather_hidden_states(hidden_states: torch.Tensor):
+    attn_dp_size = get_parallel().attn_dp_size
+    attn_tp_size = get_parallel().attn_tp_size
+    assert attn_dp_size == 1 and attn_tp_size == 1
+    hidden_states, local_hidden_states = (
+        get_local_dp_buffer(get_attention_cp_group()),
+        hidden_states,
+    )
+    attn_cp_all_gather_into_tensor(hidden_states, local_hidden_states)
+    return hidden_states
+
+
+def cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
+    attn_dp_size = get_parallel().attn_dp_size
+    attn_tp_size = get_parallel().attn_tp_size
+    assert attn_dp_size == 1 and attn_tp_size == 1
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
+    input_hidden_states = hidden_states
+    hidden_states = hidden_states.tensor_split(cp_size)[cp_rank]
+    attn_cp_reduce_scatter_tensor(hidden_states, input_hidden_states)
+    return hidden_states
+
+
 @dataclass
 class _LayerModeComputationContext:
     num_layers: int
@@ -462,6 +493,10 @@ class LayerCommunicator:
         )
 
     def _post_init_communicate(self):
+        if _is_attn_cp_layer_comm_enabled():
+            self._post_init_attn_cp_communicate()
+            return
+
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
             input_mode=self.layer_scatter_modes.layer_input_mode,
             output_mode=self.layer_scatter_modes.attn_mode,
@@ -481,6 +516,36 @@ class LayerCommunicator:
                 hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
                 residual_input_mode=self.layer_scatter_modes.middle_residual_mode,
                 output_mode=self.layer_scatter_modes.layer_output_mode,
+                context=self._context,
+            )
+        )
+
+    def _post_init_attn_cp_communicate(self):
+        # Under CP, SCATTERED/FULL describe token layouts, not just process
+        # group sizes. Keep these layout transitions in the common communicator.
+        if self.layer_scatter_modes.mlp_mode != ScatterMode.SCATTERED:
+            assert (
+                self._context.attn_dp_size == 1
+            ), "dp_size should be 1 when moe_runner_backend is none"
+        self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
+            input_mode=ScatterMode.SCATTERED,
+            output_mode=ScatterMode.SCATTERED,
+            context=self._context,
+        )
+        self._communicate_with_all_reduce_and_layer_norm_fn = (
+            CommunicateWithAllReduceAndLayerNormFn.get_fn(
+                hidden_states_input_mode=ScatterMode.SCATTERED,
+                residual_input_mode=ScatterMode.SCATTERED,
+                hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,
+                residual_output_mode=ScatterMode.SCATTERED,
+                context=self._context,
+            )
+        )
+        self._communicate_summable_tensor_pair_fn = (
+            CommunicateSummableTensorPairFn.get_fn(
+                hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
+                residual_input_mode=ScatterMode.SCATTERED,
+                output_mode=ScatterMode.SCATTERED,
                 context=self._context,
             )
         )
@@ -933,6 +998,19 @@ class CommunicateWithAllReduceAndLayerNormFn:
         residual_output_mode: ScatterMode,
         context: CommunicateContext,
     ):
+        if (
+            _is_attn_cp_layer_comm_enabled()
+            and hidden_states_input_mode == ScatterMode.SCATTERED
+            and residual_input_mode == ScatterMode.SCATTERED
+            and residual_output_mode == ScatterMode.SCATTERED
+        ):
+            if hidden_states_output_mode == ScatterMode.SCATTERED:
+                return CommunicateWithAllReduceAndLayerNormFn._simple
+            if hidden_states_output_mode == ScatterMode.FULL:
+                return partial(
+                    CommunicateWithAllReduceAndLayerNormFn._cp_gather_hidden_states_and_residual,
+                    residual_input_mode=residual_input_mode,
+                )
 
         if (
             context.is_same_group_size(
@@ -1014,6 +1092,22 @@ class CommunicateWithAllReduceAndLayerNormFn:
         # TODO move these `if shape != 0` into LayerNorm itself
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
+        return hidden_states, residual
+
+    @staticmethod
+    def _cp_gather_hidden_states_and_residual(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layernorm: torch.nn.Module,
+        context: CommunicateContext,
+        *,
+        residual_input_mode,
+    ):
+        if hidden_states.shape[0] != 0:
+            hidden_states, residual = layernorm(hidden_states, residual)
+        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+            hidden_states = cp_gather_hidden_states(hidden_states)
         return hidden_states, residual
 
     @staticmethod
@@ -1253,6 +1347,17 @@ class CommunicateSummableTensorPairFn:
         output_mode: ScatterMode,
         context: CommunicateContext,
     ):
+        # Under CP, FULL and SCATTERED can have the same group size while still
+        # representing different token layouts, so exact CP layout dispatch must
+        # run before the same-group-size shortcut.
+        if (
+            _is_attn_cp_layer_comm_enabled()
+            and hidden_states_input_mode == ScatterMode.FULL
+            and residual_input_mode == ScatterMode.SCATTERED
+            and output_mode == ScatterMode.SCATTERED
+        ):
+            return CommunicateSummableTensorPairFn._cp_scatter_hidden_states
+
         if context.is_same_group_size(
             hidden_states_input_mode, output_mode
         ) and context.is_same_group_size(residual_input_mode, output_mode):
@@ -1298,6 +1403,18 @@ class CommunicateSummableTensorPairFn:
         context: CommunicateContext,
         **kwargs,
     ):
+        return hidden_states, residual
+
+    @staticmethod
+    def _cp_scatter_hidden_states(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        context: CommunicateContext,
+        allow_reduce_scatter: bool = False,
+    ):
+        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+            hidden_states = cp_reduce_scatter_hidden_states(hidden_states)
         return hidden_states, residual
 
     @staticmethod
