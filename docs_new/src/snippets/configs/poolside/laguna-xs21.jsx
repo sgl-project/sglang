@@ -127,13 +127,11 @@ sgl-eval run gsm8k \\
     ["gsm8k_pct", "GSM8K", "%"],
   ],
 
-  // High-Throughput (dense) runs on any current nightly (INT4 needs a build ≥ PR #29761's merge).
-  // Low-Latency (DFlash) needs PR #29446 — build from that branch until it merges, then any
-  // nightly at or past the merge commit.
+  // Dedicated image built for this cookbook page (PR #29446 + #29761 preinstalled on cu13).
   dockerImages: {
-    h200:  "lmsysorg/sglang:latest",
-    b200:  "lmsysorg/sglang:latest",
-    gb300: "lmsysorg/sglang:latest",
+    h200:  "lmsysorg/sglang:dev-cu13-laguna-xs-2-1",
+    b200:  "lmsysorg/sglang:dev-cu13-laguna-xs-2-1",
+    gb300: "lmsysorg/sglang:dev-cu13-laguna-xs-2-1",
   },
 
   github: {
