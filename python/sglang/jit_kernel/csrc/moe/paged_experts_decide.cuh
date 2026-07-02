@@ -11,14 +11,15 @@
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
+
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE
 
-#include <cuda_runtime.h>  // For cudaHostGetDevicePointer (UVA device pointer of the pinned store)
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
 #include <climits>
 #include <cstdint>
+#include <cuda_runtime.h>  // For cudaHostGetDevicePointer (UVA device pointer of the pinned store)
 
 namespace {
 
@@ -72,15 +73,15 @@ __global__ void decide_kernel(
     int E,
     int K,
     int lfu,
-    int32_t* step_ctr,       // [1] monotonic step counter, incremented on-device (capture-safe)
-    int32_t* slot_expert,    // [K] slot -> expert id (-1 == empty), mutated
-    int32_t* expert_slot,    // [E] expert -> slot (-1 == not resident), mutated
-    int32_t* slot_lastuse,   // [K] last step each slot was used, mutated
-    int32_t* freq,           // [E] per-expert use count (LFU key), mutated
-    int32_t* src,            // [>=K] out: page-in source experts
-    int32_t* dst,            // [>=K] out: page-in destination slots
-    int32_t* n_out,          // [1]  out: number of page-ins
-    int32_t* idx) {          // [E]  out: logical -> slot map snapshot
+    int32_t* step_ctr,      // [1] monotonic step counter, incremented on-device (capture-safe)
+    int32_t* slot_expert,   // [K] slot -> expert id (-1 == empty), mutated
+    int32_t* expert_slot,   // [E] expert -> slot (-1 == not resident), mutated
+    int32_t* slot_lastuse,  // [K] last step each slot was used, mutated
+    int32_t* freq,          // [E] per-expert use count (LFU key), mutated
+    int32_t* src,           // [>=K] out: page-in source experts
+    int32_t* dst,           // [>=K] out: page-in destination slots
+    int32_t* n_out,         // [1]  out: number of page-ins
+    int32_t* idx) {         // [E]  out: logical -> slot map snapshot
   if (blockIdx.x || threadIdx.x >= 32) return;
   const int lane = threadIdx.x;
   // The step counter lives on-device and is bumped here so a captured graph advances LRU recency on every
@@ -106,8 +107,7 @@ __global__ void decide_kernel(
       const int e = topk[i];
       if (e < 0 || e >= E) continue;
       if (expert_slot[e] >= 0) continue;  // resident (or just assigned this step)
-      const int victim =
-          pick_victim(topk, topk_n, K, lfu, slot_expert, slot_lastuse, freq, nullptr);
+      const int victim = pick_victim(topk, topk_n, K, lfu, slot_expert, slot_lastuse, freq, nullptr);
       if (victim < 0) continue;  // pool too small (should not happen: distinct <= K)
       const int old = slot_expert[victim];
       if (old >= 0) expert_slot[old] = -1;
@@ -122,7 +122,8 @@ __global__ void decide_kernel(
   }
   __syncwarp();
   // map snapshot (warp-parallel)
-  for (int e = lane; e < E; e += 32) idx[e] = expert_slot[e];
+  for (int e = lane; e < E; e += 32)
+    idx[e] = expert_slot[e];
 }
 
 // Bounded keep-warm + LRU/LFU decision for the pinned-WINDOW store (distinct active experts <= K). Same
@@ -187,8 +188,7 @@ __global__ void decide_bounded_kernel(
         ++nc;
         continue;
       }
-      const int victim =
-          pick_victim(topk, topk_n, K, lfu, slot_expert, slot_lastuse, freq, log2hot);
+      const int victim = pick_victim(topk, topk_n, K, lfu, slot_expert, slot_lastuse, freq, log2hot);
       if (victim < 0) continue;  // pool too small (should not happen: distinct <= K)
       const int old = slot_expert[victim];
       if (old >= 0) expert_slot[old] = -1;
@@ -209,7 +209,8 @@ __global__ void decide_bounded_kernel(
   }
   __syncwarp();
   // map snapshot + needed[] scan (warp-parallel over E and K; inner topk scan is short)
-  for (int e = lane; e < E; e += 32) idx[e] = expert_slot[e];
+  for (int e = lane; e < E; e += 32)
+    idx[e] = expert_slot[e];
   for (int s = lane; s < K; s += 32) {
     const int se = slot_expert[s];
     int nd = 0;
@@ -231,19 +232,12 @@ __global__ void decide_bounded_kernel(
 // caller runs ceil(E/K) waves; each active expert is served in exactly its wave, so summing the per-wave
 // GEMM partials reconstructs the full MoE output (lossless). No eviction, no state mutation, no host sync.
 __global__ void decide_wave_kernel(
-    const int32_t* topk,
-    int topk_n,
-    int E,
-    int K,
-    int w,
-    int32_t* src,
-    int32_t* dst,
-    int32_t* n_out,
-    int32_t* idx) {
+    const int32_t* topk, int topk_n, int E, int K, int w, int32_t* src, int32_t* dst, int32_t* n_out, int32_t* idx) {
   if (blockIdx.x || threadIdx.x >= 32) return;
   const int lane = threadIdx.x;
   const int lo = w * K, hi = lo + K;
-  for (int e = lane; e < E; e += 32) idx[e] = (e >= lo && e < hi) ? (e - lo) : -1;
+  for (int e = lane; e < E; e += 32)
+    idx[e] = (e >= lo && e < hi) ? (e - lo) : -1;
   if (lane == 0) {
     int n = 0;
     for (int i = 0; i < topk_n; ++i) {
@@ -271,13 +265,13 @@ __global__ void decide_wave_kernel(
 // (a gather + 2x where + 2x zeros_like = 5 elementwise launches) with ONE capturable launch. Reads the
 // LIVE idx map, so it can run after an in-graph staging break (BCG) and see the just-staged experts.
 __global__ void remap_mask_kernel(
-    const int32_t* topk,   // [T] flattened logical expert ids (negative = padding)
+    const int32_t* topk,  // [T] flattened logical expert ids (negative = padding)
     int topk_n,
     int E,
-    const int32_t* idx,    // [E] logical -> slot (-1 == not resident / masked)
-    const float* tw,       // [T] routing weights (float32)
-    int32_t* safe_ids,     // [T] out: slot id, masked -> 0 (slot-0 output x 0 = exact 0)
-    float* masked_tw) {    // [T] out: routing weight, masked -> 0
+    const int32_t* idx,  // [E] logical -> slot (-1 == not resident / masked)
+    const float* tw,     // [T] routing weights (float32)
+    int32_t* safe_ids,   // [T] out: slot id, masked -> 0 (slot-0 output x 0 = exact 0)
+    float* masked_tw) {  // [T] out: routing weight, masked -> 0
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= topk_n) return;
   const int e = topk[i];
@@ -291,8 +285,8 @@ __global__ void remap_mask_kernel(
 // experts the decide kernel chose this step (transfer_kv would move a fixed src_indices.numel() instead).
 // ``store`` is the pinned host buffer addressed through its UVA device pointer; ``e16`` = per-expert
 // bytes / 16. Copy-only — marlin int4 / bf16 rows travel packed; no dequant.
-__global__ void gather_kernel(
-    const float4* store, float4* slot, const int32_t* src, const int32_t* dst, const int32_t* n, long e16) {
+__global__ void
+gather_kernel(const float4* store, float4* slot, const int32_t* src, const int32_t* dst, const int32_t* n, long e16) {
   const long M = static_cast<long>(*n) * e16;
   const long stride = static_cast<long>(gridDim.x) * blockDim.x;
   for (long j = blockIdx.x * static_cast<long>(blockDim.x) + threadIdx.x; j < M; j += stride) {
@@ -308,9 +302,9 @@ __global__ void gather_kernel(
 // per-tensor expert-block sizes / 16. Blocks iterate the tensors serially and grid-stride within each;
 // the copy is PCIe-bound, so a modest grid saturates it and empty plans retire cheaply.
 __global__ void gather_multi_kernel(
-    const int64_t* stores,   // [ntens] per-tensor pinned-store base (UVA device pointer)
-    const int64_t* slots,    // [ntens] per-tensor GPU slot-pool base
-    const int64_t* e16s,     // [ntens] per-tensor per-expert bytes / 16
+    const int64_t* stores,  // [ntens] per-tensor pinned-store base (UVA device pointer)
+    const int64_t* slots,   // [ntens] per-tensor GPU slot-pool base
+    const int64_t* e16s,    // [ntens] per-tensor per-expert bytes / 16
     int ntens,
     const int32_t* src,
     const int32_t* dst,
@@ -336,11 +330,11 @@ __global__ void gather_multi_kernel(
 // layer's paged tensors, in ONE launch. Replaces per-tensor-per-expert micro-copies (4*n launches, two
 // of which move <1 KB fp8 scale rows) with a single kernel; ``n`` is host-known at refill time.
 __global__ void scatter_multi_kernel(
-    const int64_t* stages,   // [ntens] per-tensor device staging base (n contiguous rows each)
-    const int64_t* slots,    // [ntens] per-tensor GPU slot-pool base
-    const int64_t* e16s,     // [ntens] per-tensor per-expert bytes / 16
+    const int64_t* stages,  // [ntens] per-tensor device staging base (n contiguous rows each)
+    const int64_t* slots,   // [ntens] per-tensor GPU slot-pool base
+    const int64_t* e16s,    // [ntens] per-tensor per-expert bytes / 16
     int ntens,
-    const int32_t* dst,      // [>=n] destination slot per staged row
+    const int32_t* dst,  // [>=n] destination slot per staged row
     int n) {
   const long stride = static_cast<long>(gridDim.x) * blockDim.x;
   const long tid = blockIdx.x * static_cast<long>(blockDim.x) + threadIdx.x;
@@ -378,7 +372,13 @@ void decide(
   SymbolicDevice device_;
   device_.set_options<kDLCUDA>();
   TensorMatcher({E}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(expert_slot).verify(freq).verify(idx);
-  TensorMatcher({K}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(slot_expert).verify(slot_lastuse).verify(src).verify(dst);
+  TensorMatcher({K})
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(slot_expert)
+      .verify(slot_lastuse)
+      .verify(src)
+      .verify(dst);
   TensorMatcher({T}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(topk);
 
   const int e = static_cast<int>(E.unwrap());
@@ -428,8 +428,22 @@ void decide_bounded(
   SymbolicSize E = {"num_experts"}, K = {"num_slots"}, T = {"topk_n"};
   SymbolicDevice device_;
   device_.set_options<kDLCUDA>();
-  TensorMatcher({E}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(expert_slot).verify(freq).verify(idx).verify(log2hot);
-  TensorMatcher({K}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(slot_expert).verify(slot_lastuse).verify(src).verify(dst).verify(cold_log).verify(needed);
+  TensorMatcher({E})
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(expert_slot)
+      .verify(freq)
+      .verify(idx)
+      .verify(log2hot);
+  TensorMatcher({K})
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(slot_expert)
+      .verify(slot_lastuse)
+      .verify(src)
+      .verify(dst)
+      .verify(cold_log)
+      .verify(needed);
   TensorMatcher({T}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(topk);
 
   const int e = static_cast<int>(E.unwrap());
@@ -519,9 +533,7 @@ void gather(
   TensorMatcher({One}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(n_out);
   const DLDevice device = device_.unwrap();
   RuntimeCheck(
-      item_bytes % 16 == 0,
-      "paged_experts gather needs 16-byte-aligned per-expert blocks (float4); got ",
-      item_bytes);
+      item_bytes % 16 == 0, "paged_experts gather needs 16-byte-aligned per-expert blocks (float4); got ", item_bytes);
 
   LaunchKernel(2048, 256, device)(
       gather_kernel,

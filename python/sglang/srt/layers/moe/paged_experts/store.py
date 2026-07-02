@@ -252,7 +252,7 @@ class WindowedExpertStore(ExpertStore):
             {}
         )  # [E-W, *shape] cold tier (RAM pageable | disk mmap)
         self.item_bytes: Dict[str, int] = {}
-        self._cold_mm: Dict[str, "mmap.mmap"] = (
+        self._cold_mm: Dict[str, mmap.mmap] = (
             {}
         )  # disk tier mmap objects, for madvise read-ahead hints
         on_disk = cold_backing == "disk"

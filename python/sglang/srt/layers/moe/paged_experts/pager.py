@@ -291,7 +291,7 @@ def _post_replay_refill_all() -> bool:
     return False
 
 
-def _register_replay_pager(p: "ExpertPager") -> None:
+def _register_replay_pager(p: ExpertPager) -> None:
     global _REPLAY_HOOK_INSTALLED
     if p not in _REPLAY_PAGERS:
         _REPLAY_PAGERS.append(p)
