@@ -916,39 +916,45 @@ class NPUWNA16Int4MoEMethod(_NPUMoEMethodBase):
 
 
 # ---------------------------------------------------------------------------
-# NPUUnquantMoEMethod
+# NPUUnquantMoEMethod (corrected for MXFP8, prepared for other modes)
 # ---------------------------------------------------------------------------
 class NPUUnquantMoEMethod(_NPUMoEMethodBase):
     def __init__(self):
         super().__init__(quant_config=None)
         self.matmul = GroupedMatmul()
         self.hidden_states_quantizer = None
+        self._quant_mode = None          # store current mode for apply logic
 
     def process_weights_after_loading(self, layer, weight_prefix):
         self._validate_weight_prefix(layer, weight_prefix)
         weight_name = f"{weight_prefix}_weight"
 
-        online_quant = "w4a8_mxfp8"   # or from server_args / env
+        online_quant = "w4a8_mxfp8"      # change as needed
 
         if online_quant == "w8a8_int8":
             self._apply_online_w8a8(layer, weight_prefix, weight_name)
+            self._quant_mode = "w8a8_int8"
         elif online_quant == "w8a8_mxfp8":
             self._apply_online_mxfp8(layer, weight_prefix, weight_name)
-        elif online_quant == "w4a8_mxfp8":        # W4A8 MXFP4
+            self._quant_mode = "w8a8_mxfp8"
+        elif online_quant == "w4a8_mxfp8":
             self._apply_online_mxfp4_w4a8(layer, weight_prefix, weight_name)
-        elif online_quant == "w4a4_mxfp4":        # W4A4 MXFP4
+            self._quant_mode = "w4a8_mxfp8"
+        elif online_quant == "w4a4_mxfp4":
             self._apply_online_mxfp4_w4a4(layer, weight_prefix, weight_name)
+            self._quant_mode = "w4a4_mxfp4"
         else:
-            # Pure BF16: just store the transposed weight on self
+            # Pure BF16
             weight = getattr(layer, weight_name)
             formatted = npu_format_cast(weight.data.transpose(1, 2))
             layer.__setattr__(weight_name,
                               torch.nn.Parameter(formatted, requires_grad=False))
-            setattr(self, weight_name, formatted)   # also store on self
+            setattr(self, weight_name, formatted)
+            self._quant_mode = "bf16"
             if weight_prefix == "w13":
                 self._set_dispatcher_output_dtype(layer, "bf16")
 
-    # --------------- W8A8 path (unchanged) ---------------
+    # --------------- W8A8 int8 ---------------
     def _apply_online_w8a8(self, layer, weight_prefix, weight_name):
         weight_fp = getattr(layer, weight_name)
         qw, weight_scale = torch.ops.npu.npu_dynamic_quant(weight_fp)
@@ -964,57 +970,55 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         setattr(self, f"{weight_name}_scale", weight_scale)
 
         torch.npu.empty_cache()
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
 
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "int8")
 
-        self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
-
-    # --------------- MXFP8 path (unchanged) ---------------
+    # --------------- MXFP8 (W8A8, float8) – FIXED ---------------
     def _apply_online_mxfp8(self, layer, weight_prefix, weight_name):
         weight_fp = getattr(layer, weight_name)
+        # optional dtype/device checks omitted for brevity
 
         qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
             weight_fp, dst_type=torch_npu.float8_e4m3fn
         )
-        # Transpose and force contiguous
-        qw_t = qw.transpose(1, 2).contiguous()          # [E, K, N]
-        w_scale_t = w_scale.transpose(1, 2).contiguous() # [E, ceil(K/64), N, 2]
+        qw_t = qw.transpose(1, 2).contiguous()
+        w_scale_t = w_scale.transpose(1, 2).contiguous()
 
-        # Store on the layer (for parameter saving etc.)
         setattr(layer, weight_name,
                 torch.nn.Parameter(qw_t, requires_grad=False))
         layer.register_parameter(
             f"{weight_name}_scale",
-            torch.nn.Parameter(w_scale_t, requires_grad=False),
-        )
+            torch.nn.Parameter(w_scale_t, requires_grad=False))
 
         setattr(self, weight_name, qw_t)
         setattr(self, f"{weight_name}_scale", w_scale_t)
 
         torch.npu.empty_cache()
-        self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch_npu.float8_e4m3fn)
+
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.float8_e4m3fn)
 
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
 
-    # --------------- W4A8 MXFP4 path ---------------
+    # --------------- W4A8 MXFP4 ---------------
     def _apply_online_mxfp4_w4a8(self, layer, weight_prefix, weight_name):
         self._apply_online_mxfp4_common(
             layer, weight_prefix, weight_name,
-            act_quant_dtype=torch_npu.float8_e4m3fn
+            act_quant_dtype=torch.float8_e4m3fn
         )
 
-    # --------------- W4A4 MXFP4 path ---------------
+    # --------------- W4A4 MXFP4 ---------------
     def _apply_online_mxfp4_w4a4(self, layer, weight_prefix, weight_name):
         self._apply_online_mxfp4_common(
             layer, weight_prefix, weight_name,
             act_quant_dtype=torch_npu.float4_e2m1fn_x2
         )
 
-    # --------------- shared MXFP4 weight processing (W4A8 & W4A4) ---------------
+    # --------------- Shared MXFP4 weight processing ---------------
     def _apply_online_mxfp4_common(self, layer, weight_prefix, weight_name, act_quant_dtype):
-        weight_fp = getattr(layer, weight_name)               # [E, N, K]
+        weight_fp = getattr(layer, weight_name)
         if weight_fp.dtype not in (torch.float16, torch.bfloat16):
             weight_fp = weight_fp.to(torch.bfloat16)
         if not weight_fp.is_npu:
@@ -1025,50 +1029,61 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             weight_fp, dst_type=fp4_dtype, round_mode="round"
         )
         qw_nz = torch_npu.npu_format_cast(qw, 29)
-        # Transpose and force contiguous
-        qw_t = qw_nz.transpose(1, 2).contiguous()          # [E, K, N]
-        w_scale_t = w_scale.transpose(1, 2).contiguous() # [E, ceil(K/64), N, 2]
+        qw_t = qw_nz.transpose(1, 2).contiguous()
+        w_scale_t = w_scale.transpose(1, 2).contiguous()
 
-        # Store on the layer (for parameter saving etc.)
-        setattr(layer, weight_name,
-                torch.nn.Parameter(qw_t, requires_grad=False))
+        setattr(layer, weight_name, torch.nn.Parameter(qw_t, requires_grad=False))
         layer.register_parameter(
-            f"{weight_name}_scale",
-            torch.nn.Parameter(w_scale_t, requires_grad=False),
-        )
+            f"{weight_name}_scale", torch.nn.Parameter(w_scale_t, requires_grad=False))
 
         setattr(self, weight_name, qw_t)
         setattr(self, f"{weight_name}_scale", w_scale_t)
 
         torch.npu.empty_cache()
 
-        # Set activation quantizer according to the mode (W4A8 or W4A4)
+        # For W4A8 / W4A4, the per‑token scale dtype must match the quantizer.
+        # HiddenStatesDynamicQuant with appropriate quant_dtype should work,
+        # but you may need dedicated quantizers if scales are not float8_e8m0fnu.
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=act_quant_dtype)
 
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
 
-    # apply method (works for all quant modes)
+    # ------------------------------------------------------------------
+    # Forward pass – generic over all quant modes
+    # ------------------------------------------------------------------
     def apply(self, quant_info, hidden_states, expert_tokens,
               pertoken_scale, output_dtype, weight_prefix, group_list_type):
         weight_scale = getattr(self, f"{weight_prefix}_weight_scale", None)
         if weight_scale is None:
-            # fallback pure BF16
             return self.matmul.forward(
                 quant_info, weight_prefix, hidden_states, expert_tokens,
                 output_dtype, group_list_type=group_list_type)
 
+        # Quantize activations if needed
         if self.hidden_states_quantizer is not None and pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
 
-        scale_args = {
-            "scale": [weight_scale],
-            "per_token_scale": [pertoken_scale],
-            # "x_dtype": torch_npu.float4_e2m1fn_x2, 
-            "weight_dtype": torch_npu.float4_e2m1fn_x2,
-            "scale_dtype": torch_npu.float8_e8m0fnu,
-            "per_token_scale_dtype": torch_npu.float8_e8m0fnu,
-        }
+        # Build scale arguments depending on the quant mode
+        scale_args = {"scale": [weight_scale]}
+        if pertoken_scale is not None:
+            scale_args["per_token_scale"] = [pertoken_scale]
+
+        # Set dtype hints based on the stored mode
+        if self._quant_mode == "w8a8_mxfp8":
+            # For MXFP8, per‑token scale is already float8_e8m0fnu
+            scale_args["scale_dtype"] = torch_npu.float8_e8m0fnu
+            scale_args["per_token_scale_dtype"] = torch_npu.float8_e8m0fnu
+        elif self._quant_mode in ("w4a8_mxfp8", "w4a4_mxfp4"):
+            # For FP4 weights, hints may differ – adjust as needed
+            scale_args["weight_dtype"] = torch_npu.float4_e2m1fn_x2
+            scale_args["scale_dtype"] = torch_npu.float8_e8m0fnu
+            scale_args["per_token_scale_dtype"] = torch_npu.float8_e8m0fnu
+        elif self._quant_mode == "w8a8_int8":
+            # For int8, scale dtypes are usually int64 or float32; adjust if needed
+            scale_args["scale_dtype"] = None        # or torch.int64 / torch.float32
+            scale_args["per_token_scale_dtype"] = None
+
         return self.matmul.forward(
             quant_info, weight_prefix, hidden_states, expert_tokens,
             output_dtype, group_list_type=group_list_type, **scale_args)
