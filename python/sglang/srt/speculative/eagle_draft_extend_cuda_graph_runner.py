@@ -66,7 +66,7 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
     # MTP IndexShare: draft model publishes its indexer top-k here for the worker.
-    mtp_seed_topk_capture: Optional[torch.Tensor] = None
+    dsa_seed_topk_capture: Optional[torch.Tensor] = None
 
 
 class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
@@ -236,15 +236,15 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         # MTP IndexShare: static buffer the draft model writes its indexer top-k
         # into; the worker gathers the per-request last-position seed after replay.
-        if self.eagle_worker.seed_topk_from_extend:
-            mtp_seed_topk_capture = torch.full(
+        if self.eagle_worker.seed_dsa_topk_from_extend:
+            dsa_seed_topk_capture = torch.full(
                 (self.max_num_token, self.eagle_worker.dsa_index_topk),
                 -1,
                 dtype=torch.int32,
                 device=model_runner.device,
             )
         else:
-            mtp_seed_topk_capture = None
+            dsa_seed_topk_capture = None
 
         self.buffers = EagleDraftExtendInputBuffers(
             input_ids=input_ids,
@@ -261,7 +261,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             next_token_logits_buffer=next_token_logits_buffer,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
-            mtp_seed_topk_capture=mtp_seed_topk_capture,
+            dsa_seed_topk_capture=dsa_seed_topk_capture,
         )
         self.buffers.share_buffers()
 
@@ -399,8 +399,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
 
         # MTP IndexShare: route the indexer top-k into the static capture buffer.
-        if self.buffers.mtp_seed_topk_capture is not None:
-            spec_info.mtp_seed_topk_capture = self.buffers.mtp_seed_topk_capture[
+        if self.buffers.dsa_seed_topk_capture is not None:
+            spec_info.dsa_seed_topk_capture = self.buffers.dsa_seed_topk_capture[
                 :num_tokens
             ]
 

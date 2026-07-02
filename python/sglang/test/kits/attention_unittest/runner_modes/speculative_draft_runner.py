@@ -200,7 +200,7 @@ class _EagleDraftWorkerHarness:
         self.dsa_index_topk = getattr(
             self.draft_runner.model_config.hf_config, "index_topk", None
         )
-        self.seed_topk_from_extend = (
+        self.seed_dsa_topk_from_extend = (
             self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
         )
 

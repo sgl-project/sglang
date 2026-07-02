@@ -74,7 +74,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             hidden_states=torch.empty(CAPTURE_BS, 2, dtype=torch.float32),
             req_pool_indices=torch.empty(CAPTURE_BS, dtype=torch.int32),
             seq_lens_cpu=torch.empty(CAPTURE_BS, dtype=torch.int32),
-            mtp_seed_topk=None,
+            dsa_seed_topk=None,
         )
         runner.capture_bs = [1, CAPTURE_BS]
         runner.num_tokens_per_bs = 1

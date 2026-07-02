@@ -161,7 +161,7 @@ class EagleDraftInput(SpecInput):
 
     # Survives across draft steps: spec_info is shared by reference across the
     # per-step forwards (each runs on a copied ForwardBatch, dropping writebacks).
-    mtp_topk_indices: Optional[torch.Tensor] = None
+    dsa_topk_indices: Optional[torch.Tensor] = None
 
     # Per-req bonus token (the "+1" target prediction at end of each accept
     # chain); the worker copies it here post-extend for next iter's draft.
@@ -233,8 +233,8 @@ class EagleDraftInput(SpecInput):
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[: len(new_indices)]
             self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
-            if self.mtp_topk_indices is not None:
-                self.mtp_topk_indices = self.mtp_topk_indices[: len(new_indices)]
+            if self.dsa_topk_indices is not None:
+                self.dsa_topk_indices = self.dsa_topk_indices[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
@@ -244,8 +244,8 @@ class EagleDraftInput(SpecInput):
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[new_indices]
             self.bonus_tokens = self.bonus_tokens[new_indices]
-            if self.mtp_topk_indices is not None:
-                self.mtp_topk_indices = self.mtp_topk_indices[new_indices]
+            if self.dsa_topk_indices is not None:
+                self.dsa_topk_indices = self.dsa_topk_indices[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
@@ -264,7 +264,7 @@ class EagleDraftInput(SpecInput):
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             self.draft_probs = spec_info.draft_probs
-            self.mtp_topk_indices = spec_info.mtp_topk_indices
+            self.dsa_topk_indices = spec_info.dsa_topk_indices
             return
         if len(spec_info.topk_index) == 0:
             return
@@ -279,12 +279,12 @@ class EagleDraftInput(SpecInput):
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
         # Carried IndexShare seed is per-request; concat when both sides have it,
         # else drop (next draft step recomputes topk — correctness preserved).
-        if self.mtp_topk_indices is not None and spec_info.mtp_topk_indices is not None:
-            self.mtp_topk_indices = torch.cat(
-                [self.mtp_topk_indices, spec_info.mtp_topk_indices]
+        if self.dsa_topk_indices is not None and spec_info.dsa_topk_indices is not None:
+            self.dsa_topk_indices = torch.cat(
+                [self.dsa_topk_indices, spec_info.dsa_topk_indices]
             )
         else:
-            self.mtp_topk_indices = None
+            self.dsa_topk_indices = None
         if self.draft_probs is not None and spec_info.draft_probs is not None:
             self.draft_probs = torch.cat([self.draft_probs, spec_info.draft_probs])
 
@@ -331,9 +331,9 @@ class EagleDraftExtendInput(SpecInput):
     num_tokens_for_logprob_per_req: int = 1
 
     # MTP IndexShare: draft model publishes its indexer topk into this buffer
-    # (optionally gathered at mtp_seed_topk_select rows) to seed the next loop.
-    mtp_seed_topk_capture: Optional[torch.Tensor] = None
-    mtp_seed_topk_select: Optional[torch.Tensor] = None
+    # (optionally gathered at dsa_seed_topk_select rows) to seed the next loop.
+    dsa_seed_topk_capture: Optional[torch.Tensor] = None
+    dsa_seed_topk_select: Optional[torch.Tensor] = None
 
     # None for draft-extend's idle batch; attention backends fall back to
     # rebuilding plain metadata from seq_lens when this is None.
