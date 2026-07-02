@@ -505,8 +505,22 @@ class HiCacheNixl(HiCacheStorage):
             return [False] * len(keys)
 
         if self.backend_selector.mem_type == "FILE":
-            file_paths = [self.file_manager.get_file_path(key) for key in key_strs]
-            success = self._xfer_pre_registered(host_buffers, file_paths, direction)
+            final_paths = [self.file_manager.get_file_path(key) for key in key_strs]
+            if direction == "WRITE":
+                temp_paths = [
+                    self.file_manager.get_temp_file_path(p) for p in final_paths
+                ]
+                success = self._xfer_pre_registered(host_buffers, temp_paths, direction)
+                if success:
+                    for temp_path, final_path in zip(temp_paths, final_paths):
+                        self.file_manager.finalize_temp_file(temp_path, final_path)
+                else:
+                    for temp_path in temp_paths:
+                        self.file_manager.remove_file(temp_path)
+            else:
+                success = self._xfer_pre_registered(
+                    host_buffers, final_paths, direction
+                )
         else:  # mem_type == "OBJ"
             success = self._xfer_pre_registered(host_buffers, key_strs, direction)
 
