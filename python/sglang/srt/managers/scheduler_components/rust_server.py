@@ -118,6 +118,12 @@ class RustServer:
 
         return cls(server)
 
+    def wait_ingress(self, timeout_ms: int) -> None:
+        """Block until a request is pushed into the in-process ring or the timeout
+        elapses.
+        """
+        self.server.wait_ingress(timeout_ms)
+
     def drain(self, max_recv: int) -> List[Any]:
         """Ingress: non-blocking drain of the in-process ring → list of decoded
         request objects. The scheduler's request receiver duck-types on this
