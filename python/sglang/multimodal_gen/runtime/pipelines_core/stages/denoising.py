@@ -72,6 +72,10 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+    is_layerwise_offloaded_module,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -201,7 +205,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         attn_head_size = hidden_size // num_attention_heads
 
         # torch compile
+        self._offloaded_for_compile: list[torch.nn.Module] = []
         for transformer in filter(None, [self.transformer, self.transformer_2]):
+            self._maybe_offload_during_compile(transformer)
             self._maybe_enable_torch_compile(transformer)
 
         self.scheduler = scheduler
@@ -297,6 +303,48 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if candidate is module:
                 return name
         return default_name
+
+    def _maybe_offload_during_compile(self, module: object) -> None:
+        """
+        Layerwise-offload the DiT so the compile warmup autotunes each layer
+        with only itself resident; forward() restores it after the warmup.
+        """
+        args = self.server_args
+        if (
+            # a subclass with its own forward would never run the restore
+            type(self).forward is not DenoisingStage.forward
+            or not args.offload_during_compile
+            or not args.enable_torch_compile
+            or not args.warmup
+            or args.use_fsdp_inference
+            or envs.SGLANG_CACHE_DIT_ENABLED
+            or not isinstance(module, LayerwiseOffloadableModuleMixin)
+            or is_layerwise_offloaded_module(module)
+        ):
+            return
+        module.configure_layerwise_offload(args)
+        if is_layerwise_offloaded_module(module):
+            self._offloaded_for_compile.append(module)
+
+    def _move_resident_components_for_warmup(self) -> list[torch.nn.Module]:
+        """Move resident non-DiT components off-device while the warmup
+        denoising (the compile/autotune peak) runs; forward() moves them back."""
+        pipeline = self.pipeline() if self.pipeline is not None else None
+        if pipeline is None:
+            return []
+        dit_ids = {id(self.transformer), id(self.transformer_2)}
+        moved = []
+        for module in pipeline.modules.values():
+            if (
+                isinstance(module, torch.nn.Module)
+                and id(module) not in dit_ids
+                and not is_layerwise_offloaded_module(module)
+            ):
+                param = next(module.parameters(), None)
+                if param is not None and param.device.type != "cpu":
+                    module.to("cpu")
+                    moved.append(module)
+        return moved
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
@@ -1363,8 +1411,28 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         return latents
 
-    @torch.no_grad()
     def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        if self._offloaded_for_compile:
+            if batch.is_warmup:
+                moved = self._move_resident_components_for_warmup()
+                try:
+                    return self._denoise(batch, server_args)
+                finally:
+                    device = get_local_torch_device()
+                    for module in moved:
+                        module.to(device)
+            # first real request: restore the user-configured residency
+            for module in self._offloaded_for_compile:
+                module.disable_offload()
+            self._offloaded_for_compile.clear()
+        return self._denoise(batch, server_args)
+
+    @torch.no_grad()
+    def _denoise(
         self,
         batch: Req,
         server_args: ServerArgs,

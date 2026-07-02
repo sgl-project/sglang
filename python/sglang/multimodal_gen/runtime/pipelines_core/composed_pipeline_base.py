@@ -18,7 +18,6 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
 )
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
 )
@@ -33,9 +32,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentResidencyManager,
     ComponentResidencyStrategy,
     get_global_component_residency_manager,
-)
-from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
-    is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
@@ -150,7 +146,6 @@ class ComposedPipelineBase(ABC):
         # Load modules directly in initialization
         logger.info("Loading pipeline modules...")
         self.modules = self.load_modules(server_args, loaded_modules)
-        self._offload_during_compile_done = False
 
         self.__post_init__()
 
@@ -976,37 +971,6 @@ class ComposedPipelineBase(ABC):
         Returns:
             Req: The batch with the generated video or image.
         """
-        if (
-            server_args._offloaded_for_compile
-            and not batch.is_warmup
-            and not self._offload_during_compile_done
-        ):
-            for name in ("transformer", "transformer_2"):
-                module = self.get_module(name)
-                if module is not None and is_layerwise_offloaded_module(module):
-                    module.disable_offload()
-            restore = server_args._offload_during_compile_restore
-            server_args.text_encoder_cpu_offload = restore["text_encoder"]
-            server_args.image_encoder_cpu_offload = restore["image_encoder"]
-            server_args.vae_cpu_offload = restore["vae"]
-            # residency strategies are cached per component; the flags above
-            # changed in place, so invalidate explicitly
-            get_global_component_residency_manager(
-                self, server_args
-            ).strategy_for.cache_clear()
-            device = get_local_torch_device()
-            for name, module in self.modules.items():
-                for prefix, was_offloaded in restore.items():
-                    if (
-                        name.startswith(prefix)
-                        and not was_offloaded
-                        and isinstance(module, torch.nn.Module)
-                    ):
-                        if is_layerwise_offloaded_module(module):
-                            module.disable_offload()
-                        else:
-                            module.to(device)
-            self._offload_during_compile_done = True
 
         if self.is_lora_set() and not self.is_lora_effective():
             logger.warning(

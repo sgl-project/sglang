@@ -217,8 +217,6 @@ class ServerArgs(DisaggServerArgsMixin):
     layerwise_offload_components: list[str] | None = None
     dit_offload_prefetch_size: float = 0.0
     offload_during_compile: bool = True
-    _offloaded_for_compile: bool = field(default=False, repr=False)
-    _offload_during_compile_restore: dict = field(default_factory=dict, repr=False)
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = False
@@ -387,7 +385,6 @@ class ServerArgs(DisaggServerArgsMixin):
         self._adjust_parallelism()
         self._adjust_attention_backend()
         self._adjust_platform_specific()
-        self._adjust_offload_during_compile()
         self._adjust_layerwise_offload_components()
         self._adjust_autocast()
         auto_tuner.finalize_auto_flags()
@@ -968,31 +965,6 @@ class ServerArgs(DisaggServerArgsMixin):
             in cpu_offload_flags_for_layerwise_components(component_names)
         )
 
-    def _adjust_offload_during_compile(self):
-        # For the compile warmup only: layerwise-offload the DiT (each layer
-        # compiles with only itself resident, which caps the compile-time peak)
-        # and cpu-offload every other component. ComposedPipelineBase.forward
-        # restores the user-configured residency after the warmup.
-        if (
-            self.offload_during_compile
-            and self.enable_torch_compile
-            and self.warmup
-            and not self.dit_layerwise_offload
-            and not self.is_dit_layerwise_offload_selected
-            and not self.use_fsdp_inference
-            and os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() != "true"
-        ):
-            self._offload_during_compile_restore = {
-                "text_encoder": self.text_encoder_cpu_offload,
-                "image_encoder": self.image_encoder_cpu_offload,
-                "vae": self.vae_cpu_offload,
-            }
-            self.dit_layerwise_offload = True
-            self.text_encoder_cpu_offload = True
-            self.image_encoder_cpu_offload = True
-            self.vae_cpu_offload = True
-            self._offloaded_for_compile = True
-
     def _adjust_layerwise_offload_components(self):
         explicitly_set_component_names = normalize_layerwise_offload_components(
             self.layerwise_offload_components
@@ -1330,7 +1302,7 @@ class ServerArgs(DisaggServerArgsMixin):
             "--offload-during-compile",
             action=StoreBoolean,
             default=ServerArgs.offload_during_compile,
-            help="Offload every component during the torch.compile warmup (the DiT layerwise, so max-autotune fits on tighter-memory GPUs), then restore the configured residency for serving. Skipped when the DiT is already layerwise-offloaded, or under cache-dit / FSDP.",
+            help="Offload components during the torch.compile warmup (the DiT layerwise) so max-autotune fits on tighter-memory GPUs, then restore the configured residency for serving. Skipped when the DiT is already layerwise-offloaded, or under cache-dit / FSDP.",
         )
 
         parser.add_argument(
