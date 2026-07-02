@@ -14,6 +14,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter 
     build_realtime_sampling_params,
     save_realtime_first_frame,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.conditions import (
+    LINGBOT_PROMPT_UPDATED_CONDITION,
+)
 from sglang.multimodal_gen.runtime.realtime.control_signals import ControlSignalQueue
 from sglang.multimodal_gen.runtime.realtime.states import (
     RealtimeCameraControlState,
@@ -137,15 +140,19 @@ class LingBotWorldRealtimeAdapter(BaseRealtimeModelAdapter):
         if request is None:
             raise ValueError("realtime request is not initialized")
 
+        prompt_updated = False
         if chunk.index == 0:
             prompt = request.prompt
         elif state.has_prompt():
             prompt = state.sample_prompt()
             request.prompt = prompt
+            prompt_updated = True
         else:
             prompt = request.prompt
 
         condition_inputs = {}
+        if prompt_updated:
+            condition_inputs[LINGBOT_PROMPT_UPDATED_CONDITION] = True
         camera_actions = state.sample_camera_actions(chunk_size)
         if camera_actions is not None:
             condition_inputs["camera_actions"] = camera_actions

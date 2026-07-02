@@ -17,6 +17,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CausalDMDCachePolicy,
     CausalDMDDenoisingStage,
+    CausalDMDForwardContext,
+    CausalDMDRealtimeCacheContext,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.conditions import (
+    LINGBOT_PROMPT_UPDATED_CONDITION,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -26,6 +31,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
@@ -172,6 +180,29 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             )
         return policy
 
+    @staticmethod
+    def _should_reset_lingbot_crossattn_cache(batch: Req) -> bool:
+        condition_inputs = getattr(batch, "condition_inputs", None) or {}
+        return bool(condition_inputs.get(LINGBOT_PROMPT_UPDATED_CONDITION))
+
+    def _sync_lingbot_crossattn_cache(
+        self,
+        batch: Req,
+        cache_ctx: CausalDMDRealtimeCacheContext,
+    ) -> None:
+        if self._should_reset_lingbot_crossattn_cache(batch):
+            self._reset_crossattn_cache(cache_ctx.crossattn_cache)
+
+    def _prepare_realtime_causal_caches(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        ctx: CausalDMDForwardContext,
+    ) -> CausalDMDRealtimeCacheContext:
+        cache_ctx = super()._prepare_realtime_causal_caches(batch, server_args, ctx)
+        self._sync_lingbot_crossattn_cache(batch, cache_ctx)
+        return cache_ctx
+
     def _base_kv_sample_num_frames(self) -> int | None:
         sample_frames = (
             int(self.sliding_window_num_frames)
@@ -237,6 +268,83 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
 
         return int(dynamic_state["sample_num_frames"])
 
+    def _log_lingbot_kv_window(
+        self,
+        cache_state,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        sample_frames: int | None,
+    ) -> None:
+        if not self._interactive_kv_window_enabled(server_args):
+            return
+
+        mode = "base"
+        still_chunks = None
+        if self._uses_interactive_kv_window(batch, server_args):
+            dynamic_state = cache_state.runtime_cache.get(
+                "lingbot_interactive_kv_window", {}
+            )
+            still_chunks = dynamic_state.get("consecutive_still_chunks")
+            condition_inputs = getattr(batch, "condition_inputs", None) or {}
+            if self._chunk_has_camera_motion(condition_inputs.get("camera_actions")):
+                mode = "moving"
+            else:
+                still_window = int(
+                    getattr(
+                        server_args.pipeline_config, "interactive_kv_still_window", 3
+                    )
+                )
+                still_chunks_threshold = max(
+                    1,
+                    int(
+                        getattr(
+                            server_args.pipeline_config,
+                            "interactive_kv_still_chunks",
+                            2,
+                        )
+                    ),
+                )
+                if (
+                    sample_frames == still_window
+                    and still_chunks is not None
+                    and still_chunks >= still_chunks_threshold
+                ):
+                    mode = "still"
+                else:
+                    mode = "moving"
+
+        window_frames = (
+            int(self.sliding_window_num_frames)
+            if sample_frames is None
+            else int(self.sink_size)
+            + int(sample_frames)
+            + int(self.num_frames_per_block)
+        )
+        sample_tokens = (
+            None
+            if sample_frames is None
+            else int(sample_frames) * int(self.num_token_per_frame)
+        )
+        logger.info(
+            "LingBot interactive KV window: session_id=%s request_id=%s "
+            "chunk_idx=%s mode=%s window_frames=%s sample_frames=%s "
+            "cache_frames=%s sink_frames=%s current_frames=%s sample_tokens=%s "
+            "cache_tokens=%s still_chunks=%s",
+            getattr(batch, "realtime_session_id", None),
+            getattr(batch, "request_id", None),
+            getattr(batch, "block_idx", None),
+            mode,
+            window_frames,
+            sample_frames,
+            int(self.sliding_window_num_frames),
+            int(self.sink_size),
+            int(self.num_frames_per_block),
+            sample_tokens,
+            int(self.sliding_window_num_frames) * int(self.num_token_per_frame),
+            still_chunks,
+        )
+
     def _set_lingbot_kv_sample_tokens(
         self,
         cache_state,
@@ -253,6 +361,12 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             None
             if sample_frames is None
             else int(sample_frames) * self.num_token_per_frame
+        )
+        self._log_lingbot_kv_window(
+            cache_state,
+            batch,
+            server_args,
+            sample_frames=sample_frames,
         )
         previous = getattr(batch, "realtime_causal_kv_sample_tokens", None)
         batch.realtime_causal_kv_sample_tokens = sample_tokens

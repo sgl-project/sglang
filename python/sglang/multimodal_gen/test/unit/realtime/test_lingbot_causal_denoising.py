@@ -25,6 +25,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
     LingBotWorldCausalDMDDenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.conditions import (
+    LINGBOT_PROMPT_UPDATED_CONDITION,
+)
 from sglang.multimodal_gen.runtime.realtime.states import RealtimeCausalDiTState
 
 LINGBOT_INTERACTIVE_KV_WINDOW_ENV = "SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW"
@@ -452,6 +455,27 @@ def test_lingbot_dynamic_condition_cache_clear_removes_chunk_entries():
     assert "lingbot_c2ws_plucker_emb" not in cache_state.runtime_cache
     assert "lingbot_cam_conditioner" not in cache_state.runtime_cache
     assert "lingbot_rope" in cache_state.runtime_cache
+
+
+def test_lingbot_crossattn_cache_resets_on_prompt_event():
+    stage = LingBotWorldCausalDMDDenoisingStage.__new__(
+        LingBotWorldCausalDMDDenoisingStage
+    )
+    crossattn_cache = [CrossAttentionKVCache()]
+    crossattn_cache[0].store(torch.ones(1), torch.ones(1))
+    cache_ctx = SimpleNamespace(
+        cache_state=RealtimeCausalDiTState(),
+        crossattn_cache=crossattn_cache,
+    )
+    batch = SimpleNamespace(condition_inputs={})
+
+    stage._sync_lingbot_crossattn_cache(batch, cache_ctx)
+    assert crossattn_cache[0].is_init
+
+    batch.condition_inputs = {LINGBOT_PROMPT_UPDATED_CONDITION: True}
+    stage._sync_lingbot_crossattn_cache(batch, cache_ctx)
+
+    assert not crossattn_cache[0].is_init
 
 
 def test_lingbot_i2v_model_input_writer_reuses_buffer():

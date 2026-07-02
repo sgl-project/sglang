@@ -296,6 +296,33 @@ def test_lingbot_realtime_adapter_ingests_generic_events():
     assert state.latest_sampled_event_id == 8
 
 
+def test_lingbot_realtime_prompt_event_marks_crossattn_reset():
+    adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
+    session = GenerateSession()
+    session.set_adapter(adapter)
+    session.set_request(
+        RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="walk forward",
+        )
+    )
+    state = adapter._state(session)
+    state.receive_prompt("turn left", event_id=8)
+
+    chunk_inputs = adapter.sample_chunk_inputs(
+        session,
+        server_args=SimpleNamespace(),
+        chunk=SimpleNamespace(index=1),
+        chunk_size=3,
+    )
+
+    assert chunk_inputs.prompt == "turn left"
+    assert session.request.prompt == "turn left"
+    assert chunk_inputs.condition_inputs[
+        lingbot_realtime.LINGBOT_PROMPT_UPDATED_CONDITION
+    ]
+
+
 def test_lingbot_realtime_adapter_ingests_state_camera_events():
     adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
     session = GenerateSession()
