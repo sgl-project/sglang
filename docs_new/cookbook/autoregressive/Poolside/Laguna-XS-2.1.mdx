@@ -1,6 +1,6 @@
 ---
 title: Laguna-XS-2.1
-description: "Deploy poolside's Laguna-XS-2.1 — a 33B-parameter hybrid-SWA Mixture-of-Experts model (3B active) for agentic coding — with SGLang on NVIDIA H200, B300, and GB300, across BF16, FP8, NVFP4, and INT4, with a DFlash speculative-decoding low-latency mode."
+description: "Deploy poolside's Laguna-XS-2.1 — a 33B hybrid-SWA Mixture-of-Experts model (3B active) for agentic coding — with SGLang on NVIDIA H200, B300, and GB300 in BF16, FP8, NVFP4, and INT4."
 tag: NEW
 ---
 
@@ -10,7 +10,7 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Laguna-XS-2.1 needs two fixes that are now both **merged to SGLang `main`**: [PR #29446](https://github.com/sgl-project/sglang/pull/29446) (DFlash speculative-decoding support, plus the `SGLANG_SHARED_EXPERT_TP1` shared-expert fix used by the FP8 8-GPU recipe) and [PR #29761](https://github.com/sgl-project/sglang/pull/29761) (INT4 mixed-precision MoE load fix). Any build at or past their merge covers every cell below — no branch checkout needed.
+Laguna-XS-2.1 support is fully merged to SGLang `main` ([PR #29446](https://github.com/sgl-project/sglang/pull/29446): DFlash speculative decoding + shared-expert fix; [PR #29761](https://github.com/sgl-project/sglang/pull/29761): INT4 loader fix). Any build at or past their merge covers every cell below.
 
 The model ships custom config code on the Hub, so `--trust-remote-code` is required (included in the launch commands).
 
@@ -45,12 +45,12 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Accordion>
 
-Pick your hardware + quantization + strategy to generate the launch command. Laguna-XS-2.1 ships **two operating points** per cell:
+Pick your hardware + quantization + strategy to generate the launch command. The two serving strategies cover the common operating points:
 
-- **Low-Latency (DFlash)** — speculative decoding with a matched-precision DFlash draft. The draft proposes a block, the target verifies it in one forward pass (measured accept-length ranges ~3–7 depending on precision and parallelism — see per-cell numbers below), cutting per-token latency for interactive / few-stream serving. Accuracy-neutral (verification-based).
-- **High-Throughput** — plain serving. At batch-saturated load the GPU is compute-bound and speculation's draft + rejected-token overhead costs more than it saves, so the dense path wins on aggregate tokens/sec.
+- **Low-latency** — DFlash speculative decoding with a matched draft model. Pick for chat and interactive agents.
+- **High-throughput** — plain serving. Best for batch workloads, where speculation's draft + rejection overhead costs more than it saves.
 
-On the 8-GPU HGX platforms (H200 / B300), BF16 uses plain `--tp 8`. The **FP8 and INT4 checkpoints use `--tp 8 --ep-size 8`** instead — plain `--tp 8` fails at weight load because their quantization scale granularity cannot shard the 512-dim MoE 8-way, so expert-parallelism is used to still saturate all 8 GPUs on one instance (FP8 additionally needs `SGLANG_SHARED_EXPERT_TP1=1`; see [Configuration Tips](#2-configuration-tips)). The 4-GPU Grace-Blackwell GB300 node uses plain `--tp 4` throughout (4 GPUs is already inside the plain-TP ceiling).
+On the 8-GPU HGX platforms (H200 / B300), BF16 and NVFP4 run plain `--tp 8`; FP8 and INT4 run `--tp 8 --ep-size 8` because their quantization scales cannot shard the MoE 8-way (see [Configuration Tips](#2-configuration-tips)). The 4-GPU GB300 node runs plain `--tp 4` throughout.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/poolside/laguna-xs21.jsx";
@@ -68,17 +68,17 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-[Laguna-XS-2.1](https://huggingface.co/poolside/Laguna-XS-2.1) is an open-weight **33B-parameter** hybrid sliding-window-attention Mixture-of-Experts model (**~3B activated per token**) from [poolside](https://poolside.ai), built for agentic coding and long-horizon software-engineering work — the extra-small sibling of [Laguna-M.1](./Laguna-M.1).
+[Laguna-XS-2.1](https://huggingface.co/poolside/Laguna-XS-2.1) is an open-weight **33B-parameter** hybrid sliding-window-attention MoE model (**~3B active per token**) from [poolside](https://poolside.ai), built for agentic coding and long-horizon software engineering — the extra-small sibling of [Laguna-M.1](./Laguna-M.1).
 
 **Key Features:**
 
-- **Sparse MoE**: 40-layer transformer with **256 routed experts, top-8 routing**.
-- **Hybrid sliding-window attention**: 30 sliding-window layers (window 512) interleaved with 10 full-attention layers; 48 Q-heads / 8 KV-heads (head dim 128).
-- **Long context**: 262,144 tokens, RoPE with YaRN on the full-attention layers.
-- **DFlash speculative decoding**: poolside ships **matched-precision DFlash draft models** (5-layer, ~0.9 GB) calibrated per quantization for low-latency serving.
-- **Hybrid reasoning**: `<think>…</think>` segments toggled per request via `chat_template_kwargs={"enable_thinking": …}`.
+- **Sparse MoE**: 40 layers, 256 routed experts, top-8 routing.
+- **Hybrid attention**: 30 sliding-window layers (window 512) interleaved with 10 full-attention layers; 48 Q / 8 KV heads.
+- **Long context**: 262,144 tokens (RoPE + YaRN on the full-attention layers).
+- **DFlash drafts**: matched draft models (5-layer, ~0.9 GB) ship per quantization for low-latency serving.
+- **Hybrid reasoning**: `<think>…</think>` toggled per request via `chat_template_kwargs={"enable_thinking": …}`.
 
-**Available Quantizations (targets) and their matched DFlash drafts:**
+**Available quantizations:**
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -90,7 +90,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
     <tr style={{borderBottom: "2px solid #d55816"}}>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Precision</th>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Target model</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>DFlash draft (Low-Latency)</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Draft model</th>
     </tr>
   </thead>
   <tbody>
@@ -117,7 +117,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
   </tbody>
 </table>
 
-The `-DFlash-*` drafts are **not themselves quantized** — each is a small bf16 model *calibrated against the matching quantized target*. **Always pair a target with its matched draft** (mixing precisions degrades accept-length, i.e. the speculative speedup).
+The drafts themselves are small bf16 models, each *calibrated against its quantized target* — always pair a target with its matched draft (mixing precisions degrades accept-length).
 
 **License:** Apache 2.0
 
@@ -125,31 +125,47 @@ The `-DFlash-*` drafts are **not themselves quantized** — each is a small bf16
 
 ## 2. Configuration Tips
 
-- **Trust remote code** (`--trust-remote-code`): Laguna-XS-2.1 ships custom modeling/config code on the Hugging Face Hub, so this flag is required.
-- **Attention backend — leave it alone for dense, pin it for DFlash.** Laguna is hybrid-SWA and backend-sensitive:
-  - **High-Throughput (dense)**: do **not** pass `--attention-backend`. Auto-select resolves the correct kernel per platform (`fa3` on Hopper, `trtllm_mha` on Blackwell).
-  - **Low-Latency (DFlash)**: with a speculative algorithm active, auto-select falls back to **flashinfer**, which is broken for this model at `tp ≥ 4` on Blackwell (greedy GSM8K collapses 76% → 28%). The generated Low-Latency commands therefore pin the target backend explicitly (`trtllm_mha` on Blackwell, `fa3` on H200). The DFlash *draft* worker is fine on its automatic fallback — leave `--speculative-draft-attention-backend` unset.
-  - **Never** use `--attention-backend triton` with Laguna — its SWA handling is broken for this model (GSM8K 13%).
-- **DFlash memory**: the Low-Latency cells carry `--mem-fraction-static 0.7`. At `tp 4` on GB300 the default fraction OOMs in the draft vocab all-gather (`Failed to CUDA calloc`); 0.7 is validated. Dense cells use the default heuristic.
-- **INT4 is mixed-precision**: the INT4 checkpoint quantizes MoE layers in *mixed* 4-bit / 8-bit config groups (regex targets, no `"Linear"` group). Builds older than [PR #29761](https://github.com/sgl-project/sglang/pull/29761) crash at load with `KeyError: 'Linear'` — use a build at or past its merge.
-- **Chat template**: on transformers ≥ 5.10 the standalone `chat_template.jinja` auto-loads — no `--chat-template` flag needed (the server logs `Auto-detected template features: reasoning_parser=poolside_v1, tool_call_parser=poolside_v1` when it resolves correctly). On older pinned transformers (≤ ~5.8) the `{% include %}` stub in `tokenizer_config.json` cannot resolve and the server silently falls back to a generic template — there, pass `--chat-template <model-dir>/chat_template.jinja` explicitly.
-- **Thinking default**: thinking is **off by default**; opt in per request with `extra_body={"chat_template_kwargs": {"enable_thinking": True}}`. The template gates on `enable_thinking` — the generic `thinking` key is ignored.
-- **Served model id**: the server registers the model under whatever you pass to `--model-path`, so a client's `model` field must match it — `poolside/Laguna-XS-2.1` (BF16) or the `-FP8` / `-NVFP4` / `-INT4` id for the quantized cells.
-- **TP degree**: 48 Q-heads / 8 KV-heads shard cleanly at `tp` 1 / 2 / 4 / 8, but the **FP8 and INT4 checkpoints cap plain TP at 4**: `moe_intermediate_size=512` with FP8 block `[128,128]` / INT4 `group_size=128` scales cannot shard 8-way (512/8 = 64 violates the 128-granularity — FP8 fails at weight creation, INT4 crashes in the Marlin kernel; reproduced on 8×H200, and the checks are hardware-independent). Rather than give up 4 of 8 GPUs, the generated H200/B300 commands for FP8 and INT4 use `--tp 8 --ep-size 8` — expert parallelism keeps whole experts per rank, sidestepping the shard-granularity wall while still using every GPU on a single instance (FP8 additionally needs `SGLANG_SHARED_EXPERT_TP1=1`, since its shared expert is also block-quantized; INT4's stays bf16). Other options: plain `--tp 4` (uses only 4 of 8 GPUs), or `--tp 4 --dp-size 2` (two replicas across all 8). Accuracy is parallelism-independent within noise (verified `tp 1` ≡ `tp 4` on GB300; on H200 full-set GSM8K, `tp 4` vs `tp 8 + ep 8` differ by ≤1pt on every combination — an initial ~2pt gap on INT4+DFlash didn't reproduce on a repeat run, confirming ordinary eval noise rather than a parallelism effect).
+**Attention backend**
+
+Leave `--attention-backend` unset for High-throughput cells — auto-select is correct (`fa3` on Hopper, `trtllm_mha` on Blackwell). With DFlash active, auto-select instead falls back to `flashinfer`, which breaks this hybrid-SWA model at `tp ≥ 4` on Blackwell (greedy GSM8K 76% → 28%), so the Low-latency commands pin the target backend explicitly. Leave `--speculative-draft-attention-backend` unset. Never use `triton` attention with Laguna (GSM8K 13%).
+
+**Quantized checkpoints cap plain TP at 4**
+
+`moe_intermediate_size=512` with FP8 block `[128,128]` / INT4 `group_size=128` scales cannot shard 8-way (512/8 = 64 < 128 granularity): FP8 fails at weight creation, INT4 crashes in the Marlin kernel, on any hardware. The generated 8-GPU FP8/INT4 commands therefore use `--tp 8 --ep-size 8` — expert parallelism keeps whole experts per rank, using all 8 GPUs on one instance. FP8 additionally needs `SGLANG_SHARED_EXPERT_TP1=1` (its shared expert is also block-quantized; INT4's stays bf16). Alternatives: plain `--tp 4`, or `--tp 4 --dp-size 2`. Accuracy is parallelism-independent within eval noise (verified tp1 ≡ tp4 on GB300 and tp4 ≡ tp8+ep8 on H200).
+
+**DFlash memory**
+
+Low-latency cells carry `--mem-fraction-static 0.7`: the default fraction OOMs in the draft vocab all-gather at `tp 4` on GB300. Dense cells use the default heuristic.
+
+**INT4 is mixed-precision**
+
+The INT4 checkpoint quantizes MoE layers in mixed 4-bit / 8-bit config groups. Builds older than [PR #29761](https://github.com/sgl-project/sglang/pull/29761) crash at load with `KeyError: 'Linear'`.
+
+**Chat template**
+
+On transformers ≥ 5.10 the standalone `chat_template.jinja` auto-loads — no flag needed (the server logs `Auto-detected template features: reasoning_parser=poolside_v1, ...`). On older transformers (≤ ~5.8) the `{% include %}` stub in `tokenizer_config.json` cannot resolve and the server silently falls back to a generic template — pass `--chat-template <model-dir>/chat_template.jinja` explicitly there.
+
+**Thinking**
+
+Off by default; opt in per request with `extra_body={"chat_template_kwargs": {"enable_thinking": True}}`. The template gates on `enable_thinking` — the generic `thinking` key is ignored.
+
+**Served model id**
+
+The server registers the model under whatever you pass to `--model-path`; a client's `model` field must match it (`poolside/Laguna-XS-2.1`, or the `-FP8` / `-NVFP4` / `-INT4` id).
 
 ## 3. Advanced Usage
 
-### 3.1 DFlash Speculative Decoding (Low-Latency strategy)
+### 3.1 DFlash Speculative Decoding
 
-DFlash is a block-wise speculative decoder: the 5-layer draft proposes a block of tokens, the target model verifies the whole block in a single forward pass, and only target-approved tokens are emitted — so **output quality is the target's, by construction** (measured: GSM8K matches dense within noise on every quantization). The speedup lever is **accept-length** — how many draft tokens survive verification per target step:
+DFlash is a block-wise speculative decoder: the 5-layer draft proposes a block of tokens and the target verifies the whole block in one forward pass, so only target-approved tokens are emitted — output quality is the target's by construction (GSM8K matches dense within noise on every quantization). The speedup lever is **accept-length**, the number of draft tokens surviving verification per target step:
 
-- ~**6** tokens/step at `tp 1`, ~**4** at plain `tp 4` (measured on GB300 and 8×H200, matched-precision pairs; ~3 under mixed reasoning-heavy traffic) — versus 1 token/step dense. Under `--tp 8 --ep-size 8` on H200 (greedy GSM8K), FP8 measured ~6.75 and INT4 ~5–5.6 across repeat runs — comparable to or higher than plain-TP figures, though these numbers came from a different eval workload than the tp4/tp1 figures above, so treat exact cross-config comparisons loosely.
-- Best for **interactive / few-stream** serving where the GPU has idle compute. Under batch-saturated load prefer the High-Throughput cells: speculation's draft + rejected-token overhead costs aggregate throughput once the GPU is compute-bound.
-- **Match the draft to the target precision** (the generated commands do) — each draft is calibrated against its specific quantized target.
+- Measured ~6 tokens/step at `tp 1`, ~4 at `tp 4` (greedy GSM8K, matched-precision pairs; ~3 under mixed reasoning-heavy traffic; FP8 reached 6.75 at `tp 8 + ep 8` on H200) — versus 1 token/step dense.
+- Best for interactive / few-stream serving. Under batch-saturated load prefer High-throughput: once the GPU is compute-bound, draft + rejected-token overhead costs aggregate throughput.
+- The generated commands always pair the draft calibrated for the selected target precision.
 
 ### 3.2 Reasoning
 
-Launch with `--reasoning-parser poolside_v1` (baked into every generated command). Reasoning is **opt-in**: the Laguna chat template gates it on `enable_thinking=True` via `chat_template_kwargs`. The `<think>` trace lands in `message.reasoning_content`, separate from the final answer in `message.content`.
+Launch with `--reasoning-parser poolside_v1` (baked into every generated command). Reasoning is opt-in via `enable_thinking=True`; the `<think>` trace lands in `message.reasoning_content`, separate from the final answer in `message.content`.
 
 <Accordion title="Reasoning Example (Python)">
 
@@ -176,8 +192,8 @@ print(message.content)
 
 <Note>
 XS-2.1 is an extra-small model — give it generous `max_tokens` when thinking is enabled
-(AIME-class problems regularly reason for thousands of tokens), and keep thinking **off**
-for short-form tasks where it isn't needed.
+(hard problems regularly reason for thousands of tokens), and keep thinking off for
+short-form tasks.
 </Note>
 
 ### 3.3 Tool Calling

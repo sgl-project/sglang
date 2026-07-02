@@ -73,8 +73,8 @@ export const config = {
   //   high-throughput = plain serving (no speculation) — batch-saturated workloads, where
   //                  speculation's draft+rejection overhead costs more than it saves.
   strategies: [
-    { id: "low-latency",     label: "Low-Latency (DFlash)" },
-    { id: "high-throughput", label: "High-Throughput" },
+    { id: "low-latency",     label: "Low-latency" },
+    { id: "high-throughput", label: "High-throughput" },
   ],
 
   nodesOptions: [
