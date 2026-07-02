@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
-from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.managers.cache_controller import HiCacheController, KVTCHiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
     get_mha_host_pool_cls,
+    NPUMHATokenToKVPoolHybrid,
 )
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
@@ -77,7 +78,24 @@ class HiRadixCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
-        if isinstance(self.kv_cache, MHATokenToKVPool):
+        if server_args.hicache_kvtc_params and isinstance(self.kv_cache, MHATokenToKVPool):
+            self.token_to_kv_pool_host = NPUMHATokenToKVPoolHybrid(
+                self.kv_cache,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+                server_args.hicache_kvtc_params,
+                server_args.hicache_kvtc_k_cr,
+                server_args.hicache_kvtc_v_cr,
+                rotary_emb=params.rotary_embeddings,
+                tp_rank=params.tp_cache_group.rank(),
+                tp_size=params.tp_cache_group.size(),
+                pp_rank=params.pp_rank,
+                pp_size=params.pp_size,
+                allocator_type=server_args.hicache_storage_backend,
+            )
+        elif isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = get_mha_host_pool_cls(self.kv_cache)(
                 self.kv_cache,
                 server_args.hicache_ratio,
@@ -125,7 +143,24 @@ class HiRadixCache(RadixCache):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
-        if isinstance(self.kv_cache, DSATokenToKVPool):
+        if isinstance(self.token_to_kv_pool_host, NPUMHATokenToKVPoolHybrid):
+            self.cache_controller = KVTCHiCacheController(
+                params.token_to_kv_pool_allocator,
+                self.token_to_kv_pool_host,
+                self.page_size,
+                self.tp_group,
+                load_cache_event=self.load_cache_event,
+                write_policy=server_args.hicache_write_policy,
+                io_backend=server_args.hicache_io_backend,
+                storage_backend=server_args.hicache_storage_backend,
+                prefetch_threshold=prefetch_threshold,
+                model_name=server_args.served_model_name,
+                storage_backend_extra_config=extra_config,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                enable_storage_metrics=self.enable_storage_metrics,
+            )
+        elif isinstance(self.token_to_kv_pool_host, DSATokenToKVPool):
             attach_hybrid_dsa_pool_to_hiradix_cache(
                 self,
                 params,
@@ -765,18 +800,37 @@ class HiRadixCache(RadixCache):
         ):
             return 0
 
-        host_indices = self.cache_controller.write(
-            device_indices=node.value,
-            node_id=node.id,
-            **self._get_extra_pools(),
-        )
-        if host_indices is None:
-            self.evict_host(len(node.value))
+        if isinstance(self.token_to_kv_pool_host, NPUMHATokenToKVPoolHybrid):
+            token_indices_start = node.parent.prefix_len
+            token_indices_end = token_indices_start + len(node.key)
+            token_indices = torch.arange(start=token_indices_start, end=token_indices_end, device=self.device)
+            host_indices = self.cache_controller.write(
+                device_indices=node.value,
+                token_indices=token_indices,
+                node_id=node.id,
+                **self._get_extra_pools(),
+            )
+            if host_indices is None:
+                self.evict_host(len(node.value))
+                host_indices = self.cache_controller.write(
+                    device_indices=node.value,
+                    token_indices=token_indices,
+                    node_id=node.id,
+                    **self._get_extra_pools(),
+                )
+        else:
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
                 node_id=node.id,
                 **self._get_extra_pools(),
             )
+            if host_indices is None:
+                self.evict_host(len(node.value))
+                host_indices = self.cache_controller.write(
+                    device_indices=node.value,
+                    node_id=node.id,
+                    **self._get_extra_pools(),
+                )
         if host_indices is not None:
             node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
@@ -1167,18 +1221,37 @@ class HiRadixCache(RadixCache):
             self.dec_lock_ref(ancester_node)
             return None
 
-        device_indices = self.cache_controller.load(
-            host_indices=host_indices,
-            node_id=last_hit_node.id,
-            **self._get_extra_pools(),
-        )
-        if device_indices is None:
-            self.evict(EvictParams(num_tokens=len(host_indices)))
+        if isinstance(self.token_to_kv_pool_host, NPUMHATokenToKVPoolHybrid):
+            token_indices = torch.arange(start=ancester_node.prefix_len, end=last_hit_node.prefix_len, device=self.device)
+
+            device_indices = self.cache_controller.load(
+                host_indices=host_indices,
+                token_indices=token_indices,
+                node_id=last_hit_node.id,
+                **self._get_extra_pools(),
+            )
+            if device_indices is None:
+                self.evict(EvictParams(num_tokens=len(host_indices)))
+                device_indices = self.cache_controller.load(
+                    host_indices=host_indices,
+                    token_indices=token_indices,
+                    node_id=last_hit_node.id,
+                    **self._get_extra_pools(),
+                )
+        else:
             device_indices = self.cache_controller.load(
                 host_indices=host_indices,
                 node_id=last_hit_node.id,
                 **self._get_extra_pools(),
             )
+            if device_indices is None:
+                self.evict(EvictParams(num_tokens=len(host_indices)))
+                device_indices = self.cache_controller.load(
+                    host_indices=host_indices,
+                    node_id=last_hit_node.id,
+                    **self._get_extra_pools(),
+                )
+
         self.dec_lock_ref(ancester_node)
         if device_indices is None:
             # no sufficient GPU memory to load back KV caches
