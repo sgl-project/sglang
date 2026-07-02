@@ -1,4 +1,8 @@
-# Paged Experts
+---
+title: "Paged Experts"
+metatags:
+    description: "SGLang Paged Experts: serve an MoE model larger than VRAM by keeping K of E experts GPU-resident and paging the rest from host memory (or disk) on demand. Computation stays on the GPU."
+---
 
 This document describes SGLang **Paged Experts**, a feature that lets you serve a Mixture-of-Experts
 (MoE) model whose expert weights do not fit in GPU memory. It covers the motivation, the system design
@@ -14,7 +18,7 @@ in GPU memory unused for that step. Paged Experts exploits this: it keeps a work
 experts resident on the GPU** and **pages the remaining experts in from pinned host memory over PCIe, on
 demand**, as routing requires them.
 
-This mirrors the tiering idea behind [HiCache](hicache_design.md), but applied to *expert weights*
+This mirrors the tiering idea behind [HiCache](./hicache_design), but applied to *expert weights*
 instead of the KV cache: GPU memory is the fast tier that holds the hot working set, and host memory is
 the larger backing tier. Where HiCache lets the KV cache spill to host, Paged Experts lets the expert
 table spill to host, so the model's expert capacity is bounded by host RAM rather than VRAM.
