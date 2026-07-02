@@ -146,7 +146,6 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         req = SimpleNamespace(
             output_ids=[10, 11, 12],
             time_stats=MagicMock(),
-            kv_cache_cpu=object(),
         )
         scheduler.running_batch.retract_all.return_value = [req]
         scheduler.running_batch.filter_batch = MagicMock()
@@ -161,7 +160,11 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertEqual(req.output_ids, [10, 11])
         self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
         self.assertTrue(req.pd_rebootstrap_in_progress)
-        self.assertFalse(hasattr(req, "kv_cache_cpu"))
+        # Rebootstrap recomputes the KV from the prefill, so the retract must skip
+        # the device->host KV offload rather than offload-then-delete it.
+        scheduler.running_batch.retract_all.assert_called_once_with(
+            scheduler.server_args, offload_kv=False
+        )
 
     def test_pd_decode_continue_releases_held_rebootstrap(self):
         """continue_generation must enqueue staged rebootstrap reqs on resume."""
