@@ -81,7 +81,12 @@ PCM_SAMPLE_WIDTH = 2
 
 
 def slice_pcm_range(buffer: Union[bytes, bytearray], start: int, end: int) -> bytes:
-    """Return an immutable ``buffer[start:end]`` snapshot with bounds checking."""
+    """Snapshot PCM bytes for an ASR request.
+
+    The resident buffer is a mutable rolling ``bytearray``. Return immutable
+    bytes so later append/compaction cannot change the in-flight audio, and
+    fail fast if absolute-to-local offset bookkeeping produced an invalid range.
+    """
     if not (0 <= start <= end <= len(buffer)):
         raise ValueError(
             f"slice_pcm_range: range=[{start}, {end}) not in [0, {len(buffer)}]"
@@ -142,6 +147,9 @@ class SessionConfig:
 class AudioState:
     """Per-item PCM buffer plus absolute byte offsets.
 
+    Realtime ASR can keep one item open for many chunks. After slicing starts,
+    old PCM should stop growing resident memory, but inference anchors still
+    need to be expressed in the item's original byte timeline.
     ``pcm_buffer`` stores only the resident bytes still needed for inference.
     The offset fields stay absolute within the current item, so compaction can
     drop old bytes without moving inference anchors backward.
@@ -152,7 +160,7 @@ class AudioState:
     left_overlap_bytes: int
     slicing_min_chunk_index: int
     state: StreamingASRState
-    # False when the left overlap covers the whole unfixed-chunk window.
+    # Disabled when overlap leaves no fresh audio window for text dedupe.
     slicing_enabled: bool = True
     pcm_buffer: bytearray = field(default_factory=bytearray)
     pcm_buffer_base_offset_bytes: int = 0
@@ -161,12 +169,12 @@ class AudioState:
     last_sliced_buffer_end_bytes: int = 0
 
     def append_pcm(self, pcm: bytes) -> None:
-        """Append resident PCM and advance the absolute received-byte cursor."""
+        """Append PCM while keeping total received bytes absolute."""
         self.pcm_buffer.extend(pcm)
         self.total_pcm_bytes_received += len(pcm)
 
     def compact_after_sliced_inference(self) -> None:
-        """Retain only the next sliced inference's overlap+chunk tail."""
+        """Bound resident PCM while preserving the next slice's context."""
         keep_bytes = self.left_overlap_bytes + self.chunk_size_bytes
         keep_start = max(0, self.last_sliced_buffer_end_bytes - keep_bytes)
         drop_bytes = keep_start - self.pcm_buffer_base_offset_bytes
@@ -186,7 +194,7 @@ class AudioState:
         self.last_sliced_buffer_end_bytes = 0
 
     def global_to_local(self, global_offset: int) -> int:
-        """Translate an item-absolute byte offset into ``pcm_buffer`` space."""
+        """Translate item-absolute offsets after old PCM has been compacted."""
         return global_offset - self.pcm_buffer_base_offset_bytes
 
 
@@ -677,9 +685,13 @@ class RealtimeConnection:
         )
 
     async def _run_inference(self, is_last: bool) -> bool:
-        """Run ASR on the current audio window: the whole PCM buffer
-        (cumulative) or a tail slice with left overlap + output dedupe
-        (slicing). Returns False on failure -- commit-time emits
+        """Run ASR on the current audio window.
+
+        Short/unstable items keep the cumulative path for compatibility. Longer
+        items switch to a tail slice so each chunk sends bounded audio instead
+        of re-encoding the full item. The left overlap preserves acoustic
+        context, and output dedupe removes text repeated from that overlap.
+        Returns False on failure -- commit-time emits
         transcription.failed and rolls the item; append-time closes the WS."""
         # Slicing uses a bare prompt: the retained overlap + dedupe replace
         # injecting emitted_text as a continuation prefix.

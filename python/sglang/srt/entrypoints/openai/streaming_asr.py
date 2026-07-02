@@ -29,6 +29,9 @@ _PUNCT_WS_RE = re.compile(r"\s+([,.;:!?，。！？；：、])")
 class StreamingASRState:
     """State for chunk-based streaming ASR with prefix rollback.
 
+    Chunked ASR outputs can revise the newest text when more audio arrives.
+    Keep only a stable prefix as confirmed, emit deltas from that prefix, and
+    hold back the latest tokens/chars so later chunks can correct them.
     Parameters are model-specific and should be provided via the
     adapter's ``chunked_streaming_config``.
 
@@ -95,7 +98,7 @@ class StreamingASRState:
         return self._record_emit(" ".join(new_words[common_count:]))
 
     def _update_chars(self, new_transcript: str, *, cumulative: bool) -> str:
-        """Character rollback for no-whitespace transcripts."""
+        """Use character rollback when whitespace cannot define stable words."""
         old_confirmed = self.confirmed_text
         holdback = max(0, self.unfixed_token_num)
         if holdback == 0:
@@ -278,6 +281,9 @@ def _dedupe_by_word(committed_text: str, candidate_out: str) -> str:
 def dedupe_overlap(committed_text: str, candidate_out: str) -> str:
     """Word-level text dedupe for sliced ASR overlap.
 
+    Sliced realtime requests intentionally resend a little old audio for
+    continuity. That overlap can make the model repeat already-emitted words,
+    so trim the repeated prefix before updating streaming state.
     Trims words at the start of ``candidate_out`` that re-transcribe
     ``committed_text``'s tail. It matches whitespace-delimited words only;
     repeated-speech edge cases need timestamp/token alignment for exact handling.
@@ -305,6 +311,8 @@ async def process_asr_chunk(
     ``audio_data`` accepts WAV bytes or pre-decoded float samples.
     ``prompt`` overrides the default ``adapter.prompt_template + state.get_prefix_text()``.
     ``dedupe_against`` triggers ``dedupe_overlap`` on raw model output before ``state`` ingests it.
+    Realtime sliced calls pass both: the bare prompt avoids text-prefix injection,
+    and the dedupe target removes text repeated from the acoustic overlap.
     """
     if prompt is None:
         prompt = adapter.prompt_template + state.get_prefix_text()
