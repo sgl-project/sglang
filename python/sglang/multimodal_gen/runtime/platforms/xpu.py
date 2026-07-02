@@ -105,7 +105,15 @@ class XpuPlatform(Platform):
 
         # Use mem_get_info() to reflect true OS-level free memory
         # including graph pool reservations; avoids KV-cache over-allocation.
-        free_gpu_memory, _ = torch.xpu.mem_get_info(device_id)
+        try:
+            free_gpu_memory, _ = torch.xpu.mem_get_info(device_id)
+        except Exception:
+            # Fallback for devices/drivers that do not support querying free memory
+            used_memory = float(torch.xpu.memory_allocated(device_id))
+            total_gpu_memory = float(
+                torch.xpu.get_device_properties(device_id).total_memory
+            )
+            free_gpu_memory = max(0.0, total_gpu_memory - used_memory)
 
         if distributed:
             import torch.distributed as dist
