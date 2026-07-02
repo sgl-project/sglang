@@ -263,7 +263,7 @@ class TestDisaggregationNixlAccuracy(NixlPDDisaggregationServerBase):
 
         metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
-        self.assertGreaterEqual(
+        self.assertGreater(
             metrics["score"],
             NIXL_GSM8K_SCORE_THRESHOLD,
             f"Expected NIXL PD transfer to preserve GSM8K accuracy, got {metrics}",
