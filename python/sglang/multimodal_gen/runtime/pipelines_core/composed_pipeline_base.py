@@ -978,10 +978,16 @@ class ComposedPipelineBase(ABC):
         Returns:
             Req: The batch with the generated video or image.
         """
-        if server_args._offloaded_for_compile and not batch.is_warmup and not self._offload_during_compile_done:
+        if (
+            server_args._offloaded_for_compile
+            and not batch.is_warmup
+            and not self._offload_during_compile_done
+        ):
             keep = server_args._offload_during_compile_keep
             for name, module in self.modules.items():
-                if is_layerwise_offloaded_module(module) and not layerwise_component_matches_any_selection(name, keep):
+                if is_layerwise_offloaded_module(
+                    module
+                ) and not layerwise_component_matches_any_selection(name, keep):
                     module.disable_offload()
             self._offload_during_compile_done = True
 
