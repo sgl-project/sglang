@@ -333,6 +333,32 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             f"{threshold}."
         )
 
+    if server_args.speculative_use_rejection_sampling:
+        if server_args.speculative_eagle_topk != 1:
+            raise ValueError(
+                "--speculative-use-rejection-sampling requires --speculative-eagle-topk=1."
+            )
+        if (
+            server_args.speculative_accept_threshold_single != 1.0
+            or server_args.speculative_accept_threshold_acc != 1.0
+        ):
+            raise ValueError(
+                "--speculative-use-rejection-sampling is incompatible with "
+                "--speculative-accept-threshold-single / "
+                "--speculative-accept-threshold-acc; rejection sampling ignores "
+                "the accept thresholds."
+            )
+        if server_args.enable_deterministic_inference:
+            raise ValueError(
+                "--speculative-use-rejection-sampling is incompatible with "
+                "--enable-deterministic-inference; the sampling kernel draws "
+                "coins from the global RNG and is not batch-invariant."
+            )
+        logger.info(
+            "Rejection sampling is enabled for DSpark speculative decoding "
+            "(speculative_use_rejection_sampling=True)."
+        )
+
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
         logger.warning(

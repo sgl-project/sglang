@@ -8,8 +8,10 @@ import torch.nn.functional as F
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
 )
+from sglang.srt.layers.dp_attention import get_attention_tp_group, is_dp_attention_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
@@ -29,13 +31,24 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.dflash_utils import compute_dflash_correct_drafts_and_bonus
+from sglang.srt.speculative.dflash_utils import (
+    _get_or_create_chain_verify_buffers,
+    apply_dflash_verify_logits_adjustments,
+    compute_dflash_correct_drafts_and_bonus,
+    compute_dflash_sampling_correct_drafts_and_bonus,
+    is_dflash_sampling_verify_available,
+)
 from sglang.srt.speculative.dspark_info import (
     DSparkDraftBlockInput,
     DSparkDraftInputV2,
     DSparkVerifyInput,
 )
-from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.speculative.reject_sampling import chain_speculative_sampling_triton
+from sglang.srt.speculative.spec_utils import (
+    draft_tp_context,
+    fast_sample,
+    renorm_draft_probs,
+)
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.speculative.triton_ops.dspark import (
     _compute_dspark_accept_bonus_triton_unchecked,
@@ -133,6 +146,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
         self._use_triton_accept_bonus = is_cuda() or is_hip()
+        self._use_rejection_sampling = bool(
+            server_args.speculative_use_rejection_sampling
+        )
         self._accept_bonus_buffer_cap: int = 0
         self._accept_bonus_buffer_slot: int = 0
         self._commit_lens_bufs: List[torch.Tensor] = []
@@ -531,7 +547,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         block_hidden: torch.Tensor,
         bonus_tokens: torch.Tensor,
         output_bs: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        sampling_info=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         bs = int(block_hidden.shape[0])
         output_bs = bs if output_bs is None else int(output_bs)
         block_size = int(self.block_size)
@@ -542,7 +559,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             empty_confidence = torch.empty(
                 (output_bs, block_size), dtype=torch.float32, device=block_hidden.device
             )
-            return empty_tokens, empty_confidence
+            return empty_tokens, empty_confidence, None
 
         self._ensure_markov_refine_buffers(bs, block_hidden.device)
         assert self._markov_candidates_buf is not None
@@ -573,6 +590,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 (bs,), self.noise_token_id, dtype=torch.int64, device=block_hidden.device
             )
         candidates[:, 0].copy_(first_tokens)
+        use_rejection_sampling = bool(
+            self._use_rejection_sampling
+            and sampling_info is not None
+            and not sampling_info.is_all_greedy
+        )
+        draft_probs_list: Optional[List[torch.Tensor]] = (
+            [] if use_rejection_sampling else None
+        )
 
         with torch.inference_mode():
             base_logits = _gather_full_vocab(F.linear(block_hidden, lm_head.weight))
@@ -582,14 +607,40 @@ class DSparkWorkerV2(BaseSpecWorker):
                 markov_embeds[:, i].copy_(prev_embed)
                 bias = _gather_full_vocab(markov_head.project_bias(prev_embed))
                 bias.add_(base_logits[:, i])
-                next_tokens = torch.argmax(bias, dim=-1)
+                if use_rejection_sampling:
+                    probs = renorm_draft_probs(
+                        bias,
+                        sampling_info,
+                        use_rejection_sampling=True,
+                    )
+                    _, next_tokens_2d = fast_sample(probs, num_samples=1)
+                    next_tokens = next_tokens_2d.squeeze(1)
+                    assert draft_probs_list is not None
+                    draft_probs_list.append(probs)
+                else:
+                    next_tokens = torch.argmax(bias, dim=-1)
                 if i + 1 < block_size:
                     candidates[:, i + 1].copy_(next_tokens)
                 prev_tokens = next_tokens
 
             confidence = confidence_head(block_hidden, markov_embeds)
 
-        return candidates[:output_bs], confidence[:output_bs]
+        if use_rejection_sampling:
+            tp_group = (
+            get_attention_tp_group() if is_dp_attention_enabled() else get_tp_group()
+        )
+            if tp_group.world_size > 1:
+                tp_group.broadcast(candidates, src=0)
+            assert draft_probs_list is not None
+            draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
+        else:
+            draft_probs = None
+
+        return (
+            candidates[:output_bs],
+            confidence[:output_bs],
+            draft_probs[:output_bs] if draft_probs is not None else None,
+        )
 
     def _confident_prefix(self, confidence: torch.Tensor) -> torch.Tensor:
         keep = torch.sigmoid(confidence) >= self.confidence_threshold
@@ -672,6 +723,207 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         return commit_lens, bonus_tokens, out_tokens
 
+    def _sample_bonus_at_accept_len(
+        self,
+        *,
+        next_token_logits: torch.Tensor,
+        sampling_info,
+        accept_len: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+
+        bs = int(accept_len.shape[0])
+        row_ids = torch.arange(bs, device=next_token_logits.device, dtype=torch.long)
+        flat_rows = row_ids * int(block_size) + accept_len.to(torch.long)
+        logits = next_token_logits[flat_rows].float()
+        temperature = sampling_info.temperatures.to(
+            device=logits.device, dtype=torch.float32
+        ).clamp_min(1e-6)
+        probs = F.softmax(logits / temperature.view(-1, 1), dim=-1)
+        if bool(getattr(sampling_info, "need_top_k_sampling", True)):
+            probs = top_k_renorm_prob(
+                probs,
+                sampling_info.top_ks.to(device=logits.device),
+            )
+        if bool(getattr(sampling_info, "need_top_p_sampling", False)):
+            probs = top_p_renorm_prob(
+                probs,
+                sampling_info.top_ps.to(device=logits.device),
+            )
+        return torch.multinomial(probs, num_samples=1).squeeze(1).to(torch.int64)
+
+    def _compute_accept_bonus_sampling(
+        self,
+        *,
+        candidates: torch.Tensor,
+        next_token_logits: torch.Tensor,
+        sampling_info,
+        confidence: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bs, block_size = candidates.shape
+        apply_dflash_verify_logits_adjustments(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            draft_token_num=block_size,
+        )
+        accept_len, bonus_tokens = compute_dflash_sampling_correct_drafts_and_bonus(
+            candidates=candidates,
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+        )
+
+        confident_prefix = self._confident_prefix(confidence).to(torch.int64)
+        capped_accept_len = torch.minimum(accept_len.to(torch.int64), confident_prefix)
+        clipped = capped_accept_len != accept_len.to(torch.int64)
+        if bool(clipped.any().item()):
+            capped_bonus = self._sample_bonus_at_accept_len(
+                next_token_logits=next_token_logits,
+                sampling_info=sampling_info,
+                accept_len=capped_accept_len,
+                block_size=block_size,
+            )
+            bonus_tokens = torch.where(
+                clipped,
+                capped_bonus,
+                bonus_tokens.to(torch.int64),
+            )
+
+        commit_lens = capped_accept_len.to(torch.int32) + 1
+        out_tokens = torch.empty(
+            (bs, block_size), dtype=torch.int64, device=candidates.device
+        )
+        if block_size > 1:
+            out_tokens[:, : block_size - 1].copy_(candidates[:, 1:])
+        out_tokens[:, block_size - 1].fill_(0)
+        out_tokens.scatter_(
+            1,
+            capped_accept_len.unsqueeze(1),
+            bonus_tokens.unsqueeze(1).to(torch.int64),
+        )
+        return commit_lens, bonus_tokens, out_tokens
+
+    def _compute_accept_bonus_rejection_sampling(
+        self,
+        *,
+        candidates: torch.Tensor,
+        next_token_logits: torch.Tensor,
+        draft_probs: torch.Tensor,
+        sampling_info,
+        confidence: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+
+        bs, block_size = candidates.shape
+        if draft_probs is None:
+            raise ValueError("DSpark rejection sampling requires draft_probs.")
+        if draft_probs.shape[:2] != (bs, block_size):
+            raise ValueError(
+                "draft_probs shape mismatch: "
+                f"expected {(bs, block_size, 'vocab')}, got {tuple(draft_probs.shape)}"
+            )
+
+        apply_dflash_verify_logits_adjustments(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            draft_token_num=block_size,
+        )
+
+        expanded_temperature = torch.repeat_interleave(
+            sampling_info.temperatures, block_size, dim=0
+        ).to(device=next_token_logits.device, dtype=torch.float32)
+        target_probs = F.softmax(
+            next_token_logits.float() / expanded_temperature.clamp_min(1e-6), dim=-1
+        )
+        if bool(getattr(sampling_info, "need_top_k_sampling", True)):
+            target_probs = top_k_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(sampling_info.top_ks, block_size, dim=0),
+            )
+        if bool(getattr(sampling_info, "need_top_p_sampling", False)):
+            target_probs = top_p_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(sampling_info.top_ps, block_size, dim=0),
+            )
+        target_probs = target_probs.view(bs, block_size, -1).contiguous()
+        draft_probs = draft_probs.to(
+            device=target_probs.device, dtype=torch.float32
+        ).contiguous()
+
+        (
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            predicts,
+            accept_index,
+            accept_token_num,
+        ) = _get_or_create_chain_verify_buffers(
+            bs=bs,
+            draft_token_num=block_size,
+            device=next_token_logits.device,
+        )
+        coins = torch.rand(
+            (bs, block_size), dtype=torch.float32, device=next_token_logits.device
+        )
+        final_coins = torch.rand(
+            (bs,), dtype=torch.float32, device=next_token_logits.device
+        )
+        chain_speculative_sampling_triton(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=(
+                candidates
+                if candidates.dtype == torch.int64
+                else candidates.to(torch.int64)
+            ),
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=coins,
+            uniform_samples_for_final_sampling=final_coins,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=1.0,
+            threshold_acc=1.0,
+            deterministic=False,
+        )
+
+        tp_group = (
+            get_attention_tp_group() if is_dp_attention_enabled() else get_tp_group()
+        )
+        if tp_group.world_size > 1:
+            tp_group.broadcast(predicts, src=0)
+            tp_group.broadcast(accept_index, src=0)
+            tp_group.broadcast(accept_token_num, src=0)
+
+        accepted = accept_token_num.to(torch.int64)
+        confident_prefix = self._confident_prefix(confidence).to(torch.int64)
+        capped_accept = torch.minimum(accepted, confident_prefix)
+        row_ids = torch.arange(bs, dtype=torch.long, device=next_token_logits.device)
+        accept_pos = accept_index[row_ids, accepted].to(torch.long)
+        bonus_tokens = predicts[accept_pos].to(torch.int64)
+
+        clipped = capped_accept != accepted
+        if bool(clipped.any().item()):
+            clipped_probs = target_probs[row_ids, capped_accept]
+            clipped_bonus = torch.multinomial(clipped_probs, num_samples=1).squeeze(1)
+            bonus_tokens = torch.where(clipped, clipped_bonus.to(torch.int64), bonus_tokens)
+
+        commit_lens = capped_accept.to(torch.int32) + 1
+        out_tokens = torch.empty(
+            (bs, block_size), dtype=torch.int64, device=candidates.device
+        )
+        if block_size > 1:
+            out_tokens[:, : block_size - 1].copy_(candidates[:, 1:])
+        out_tokens[:, block_size - 1].fill_(0)
+        out_tokens.scatter_(
+            1,
+            capped_accept.unsqueeze(1),
+            bonus_tokens.unsqueeze(1).to(torch.int64),
+        )
+        return commit_lens, bonus_tokens, out_tokens
+
     def _make_next_draft_input_prefill(
         self,
         *,
@@ -709,18 +961,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         sampling_info = getattr(model_worker_batch, "sampling_info", None)
+        non_greedy_sampling = (
+            sampling_info is not None and not sampling_info.is_all_greedy
+        )
         if (
-            sampling_info is not None
-            and not sampling_info.is_all_greedy
+            non_greedy_sampling
+            and not self._use_rejection_sampling
+            and not is_dflash_sampling_verify_available()
             and self.tp_rank == 0
-            and not getattr(self, "_warned_sampling", False)
+            and not getattr(self, "_warned_sampling_unavailable", False)
         ):
-            self._warned_sampling = True
+            self._warned_sampling_unavailable = True
             logger.warning(
-                "DSpark verifies greedily; temperature>0 requests are served with "
-                "greedy verification. Rejection-sampling support is a follow-up."
+                "DSpark non-greedy target-only sampling requested but DFlash "
+                "sampling verify kernel is unavailable; falling back to greedy "
+                "verification."
             )
-
         if (
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
@@ -796,6 +1052,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 device=self.device
             )
         draft_input = model_worker_batch.spec_info
+        sampling_info = getattr(model_worker_batch, "sampling_info", None)
         if not isinstance(draft_input, DSparkDraftInputV2):
             raise RuntimeError(
                 "DSpark spec-v2 expected DSparkDraftInputV2 state on the running batch."
@@ -856,10 +1113,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 dp_decode_global_num_tokens=dp_decode_global_num_tokens,
             )
 
-            candidates, confidence = self._refine_block_markov(
+            candidates, confidence, draft_probs = self._refine_block_markov(
                 block_hidden=block_hidden,
                 bonus_tokens=draft_input.bonus_tokens,
                 output_bs=bs,
+                sampling_info=sampling_info,
             )
 
         verify_input = DSparkVerifyInput(
@@ -899,15 +1157,43 @@ class DSparkWorkerV2(BaseSpecWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
-        target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-            bs, block_size
+        use_rejection_sampling = bool(
+            self._use_rejection_sampling
+            and sampling_info is not None
+            and not sampling_info.is_all_greedy
         )
+        use_target_only_sampling = bool(
+            not self._use_rejection_sampling
+            and sampling_info is not None
+            and not sampling_info.is_all_greedy
+            and is_dflash_sampling_verify_available()
+        )
+        target_predict = None
+        if not use_rejection_sampling and not use_target_only_sampling:
+            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
+                bs, block_size
+            )
 
         new_seq_lens = None
         if bs == 0:
             bonus_tokens = torch.empty((0,), dtype=torch.int64, device=device)
             commit_lens = torch.empty((0,), dtype=torch.int32, device=device)
             out_tokens = torch.empty((0, block_size), dtype=torch.int64, device=device)
+        elif use_rejection_sampling:
+            commit_lens, bonus_tokens, out_tokens = self._compute_accept_bonus_rejection_sampling(
+                candidates=candidates,
+                next_token_logits=logits_output.next_token_logits,
+                draft_probs=draft_probs,
+                sampling_info=sampling_info,
+                confidence=confidence,
+            )
+        elif use_target_only_sampling:
+            commit_lens, bonus_tokens, out_tokens = self._compute_accept_bonus_sampling(
+                candidates=candidates,
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                confidence=confidence,
+            )
         elif self._use_triton_accept_bonus:
             try:
                 (
@@ -916,6 +1202,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     out_tokens,
                     new_seq_lens,
                 ) = self._next_accept_bonus_buffers(bs)
+                assert target_predict is not None
                 _compute_dspark_accept_bonus_triton_unchecked(
                     candidates=candidates,
                     target_top1=target_predict,
@@ -933,12 +1220,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "DSPARK Triton accept/bonus failed; falling back to eager path: %s",
                     e,
                 )
+                assert target_predict is not None
                 commit_lens, bonus_tokens, out_tokens = self._compute_accept_bonus_eager(
                     candidates=candidates,
                     target_predict=target_predict,
                     confidence=confidence,
                 )
         else:
+            assert target_predict is not None
             commit_lens, bonus_tokens, out_tokens = self._compute_accept_bonus_eager(
                 candidates=candidates,
                 target_predict=target_predict,

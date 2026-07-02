@@ -185,7 +185,11 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     # multi_layer_eagle, DFLASH, and DSPARK don't relay hidden_states through
     # FutureMap (DSPARK materializes target hidden states into the draft KV pool).
     # TODO(lsyin): also skip when step == 1.
-    if server_args.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
+    if server_args.speculative_algorithm in (
+        "STANDALONE",
+        "DFLASH",
+        "DSPARK",
+    ):
         return False
     return not server_args.enable_multi_layer_eagle
 
