@@ -14,6 +14,7 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cdiv,
@@ -177,6 +178,12 @@ def _get_sm_count(device: torch.device) -> int:
 
 
 def calc_rows_per_block(M: int, device: torch.device) -> int:
+    # Batch-invariant mode (true-on-policy RL): ROWS_PER_BLOCK must not depend on M.
+    # The 2D-tile fp32 reduction rounds by ~1 bf16 ULP differently for rows_per_block=1
+    # (M=12 single-token decode) vs 4 (M=6144 full-seq Megatron teacher-forcing), which
+    # diverged post_norm_out and cascaded down the residual stream. Pin to the constant.
+    if is_batch_invariant_mode_enabled():
+        return MAX_ROWS_PER_BLOCK
     # When piecewise cuda graph is enabled, use a constant value to avoid
     # torch.compile creating guards on the dynamic batch dimension.
     try:
