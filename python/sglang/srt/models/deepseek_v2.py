@@ -440,6 +440,9 @@ class MoEGate(nn.Module):
         super().__init__()
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
+        # TODO: Remove the model_type fallback once released GLM-5.2 configs
+        # include moe_router_dtype. Existing GLM-5.2 checkpoints do not expose
+        # that field yet, so keep model_type as a temporary compatibility check.
         self.router_dtype = (
             torch.float32
             if getattr(config, "model_type", None) == "glm_moe_dsa"
