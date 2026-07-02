@@ -38,6 +38,7 @@ class TestDeepSeekOCR(CustomTestCase):
             "xpu",
             "--attention-backend",
             "intel_xpu",
+            "--disable-decode-cuda-graph",
         ]
         os.environ["SGLANG_USE_SGL_XPU"] = "1"
         cls.process = popen_launch_server(

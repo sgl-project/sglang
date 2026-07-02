@@ -61,7 +61,9 @@ than restating.
   explicit maintainer-confirmed justification in the PR. The MDX strategy bullets describe serving semantics
   in the DSv4 style (single-user chat / typical multi-user / batch jobs), not internal
   toggles.
-- `dockerImages` covers the hw ids that have cells (else users hit the `:dev` fallback).
+- `dockerImages` covers the hw ids that have cells (else users hit the `:dev` fallback); a
+  `hw|quant` key (resolved before the plain `hw`) is valid when one quant on a shared GPU needs
+  a different image (e.g. an FP4 dev build) — don't flag those.
 - `multiNodeHints` present ONLY for hw whose fabric needs manual NIC env (e.g. `gb200`
   NVL72) — NOT every `multi-N` hw (standard-IB DeepEP / Marlin multi-node don't need it).
 - `github.cookbookModel` is set to the model's HF id (`<hf-org>/<model-slug>`). The issue
