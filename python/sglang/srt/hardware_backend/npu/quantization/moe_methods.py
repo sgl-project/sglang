@@ -976,7 +976,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         weight_fp = getattr(layer, weight_name)
 
         qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            weight_fp, dst_type=torch_npu.float8_e4m3fn
+            weight_fp, dst_type=torch.float8_e4m3fn
         )
         qw_t = qw.transpose(1, 2).contiguous()          # [E, K, N]
         w_scale_t = w_scale.transpose(1, 2).contiguous() # [E, ceil(K/64), N, 2]
@@ -989,7 +989,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         torch.npu.empty_cache()
 
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(
-                quant_dtype=torch_npu.float8_e4m3fn
+                quant_dtype=torch.float8_e4m3fn
             )
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
