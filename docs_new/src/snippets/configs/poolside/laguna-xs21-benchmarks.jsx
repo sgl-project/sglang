@@ -80,10 +80,20 @@
 //     high-throughput: BF16 62.50 | FP8 63.12 | NVFP4 60.00 | INT4 64.79
 //     low-latency:     BF16 65.83 | FP8 63.12 | NVFP4 60.00 | INT4 61.04
 //
+//   H200 (8-GPU HGX; bf16 tp8, fp8/int4 tp8+ep8 — same recipes as GSM8K):
+//     high-throughput: BF16 63.96 | FP8 64.79 | INT4 63.33
+//     low-latency:     BF16 65.00 | FP8 62.50 | INT4 64.17
+//
 //   DFlash accuracy-neutral on AIME25 too (|dense-spec| <= 2.7pt ~ 1-2 SEM); accept-len ~2.9
 //   on long thinking traces (vs ~4 on greedy GSM8K). NVFP4 is the weakest quant on AIME25
 //   (~4-5 SEM below BF16) while being the strongest on GSM8K — quant rankings are
-//   benchmark-dependent. Truncation ~0% at the 64k cap. H200 cells: AIME25 not measured.
+//   benchmark-dependent. Truncation ~0% at the 64k cap.
+//   H200 tp8+ep8 vs tp4/tp8-plain reference (same eval shape, different sglang session):
+//   BF16 dense 65.83->63.96 (1.25 SEM), FP8 dense 61.67->64.79 (2.50 SEM, higher not lower —
+//   FP8-dense alone now spans ~3pt across 4 independent full-set-equivalent measurements this
+//   week, so this is ordinary AIME variance for a 30x16 eval, not an EP8 effect), all other
+//   cells <=1.05 SEM. pass@16/majority@16 (single 30-item proportions, ~6-8pt SE) all <1 SEM;
+//   full detail in the day-0 support log, not reproduced here.
 export const benchmarks = [
   // ===== H200 (8-GPU HGX; bf16 tp 8, fp8/int4 tp8+ep8) — ✅ REAL, full GSM8K =====
   {
@@ -91,7 +101,7 @@ export const benchmarks = [
     match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main)",
-    accuracy: { gsm8k_pct: 76.12 },
+    accuracy: { gsm8k_pct: 76.12, aime25_pct: 63.96 },
   },
   {
     // ✅ REAL — 8×H200, BF16 + DFlash (matched bf16 draft), tp8, fa3. Accept-len 3.05
@@ -99,7 +109,7 @@ export const benchmarks = [
     match: { hw: "h200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main)",
-    accuracy: { gsm8k_pct: 75.97 },
+    accuracy: { gsm8k_pct: 75.97, aime25_pct: 65.00 },
   },
   {
     // ✅ REAL — 8×H200, FP8 dense, tp8+ep8+SGLANG_SHARED_EXPERT_TP1=1 (plain tp8 impossible:
@@ -107,7 +117,7 @@ export const benchmarks = [
     match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main)",
-    accuracy: { gsm8k_pct: 73.54 },
+    accuracy: { gsm8k_pct: 73.54, aime25_pct: 64.79 },
   },
   {
     // ✅ REAL — 8×H200, FP8 + DFlash (matched fp8-calibrated draft), tp8+ep8+flag, fa3.
@@ -115,7 +125,7 @@ export const benchmarks = [
     match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main)",
-    accuracy: { gsm8k_pct: 74.53 },
+    accuracy: { gsm8k_pct: 74.53, aime25_pct: 62.50 },
   },
   {
     // ✅ REAL — 8×H200, INT4 dense (mixed 4/8-bit MoE, needs #29761), tp8+ep8 (plain tp8
@@ -123,7 +133,7 @@ export const benchmarks = [
     match: { hw: "h200", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main)",
-    accuracy: { gsm8k_pct: 67.02 },
+    accuracy: { gsm8k_pct: 67.02, aime25_pct: 63.33 },
   },
   {
     // ✅ REAL — 8×H200, INT4 + DFlash (matched int4-calibrated draft), tp8+ep8, fa3.
@@ -132,7 +142,7 @@ export const benchmarks = [
     match: { hw: "h200", variant: "default", quant: "int4", strategy: "low-latency", nodes: "single" },
     verified: true,
     sglang_version: "PR #29446 + #29761 (both merged to main)",
-    accuracy: { gsm8k_pct: 66.57 },
+    accuracy: { gsm8k_pct: 66.57, aime25_pct: 64.17 },
   },
 
   // ===== B300 (8-GPU HGX; bf16/nvfp4 tp 8, fp8/int4 tp8+ep8) — REAL, full GSM8K =====
