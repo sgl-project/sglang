@@ -636,21 +636,24 @@ class TritonAttnBackend(AttentionBackend):
         """
         if self._translate_kv_loc is None:
             return None
-        # Full-attention read path. kv_indptr[bs] == forward_batch.seq_lens_sum;
-        # read the CPU mirror to avoid a per-step D2H `.item()` sync.
+        # seq_lens_sum is the reliable "mirror present" signal: it is
+        # None-preserving into the replay view, unlike seq_lens_cpu (always a
+        # non-None but stale slice for gpu_only batches). None -> fall back to a
+        # per-step D2H `.item()` on the indptr.
+        have_cpu_mirror = forward_batch.seq_lens_sum is not None
+        # Full-attention read path. kv_indptr[bs] == seq_lens_sum.
         n_kv = (
             forward_batch.seq_lens_sum
-            if forward_batch.seq_lens_sum is not None
+            if have_cpu_mirror
             else int(self.kv_indptr[bs].item())
         )
         if n_kv > 0:
             self.cuda_graph_kv_indices[:n_kv] = self._translate_kv_loc(
                 self.cuda_graph_kv_indices[:n_kv]
             )
-        # SWA window read path (hybrid-SWA unified pools only). window_kv_indptr[bs]
-        # == sum(min(seq_len, window)); compute it from the CPU seq_lens mirror.
+        # SWA window read path. window_kv_indptr[bs] == sum(min(seq_len, window)).
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
-            if forward_batch.seq_lens_cpu is not None:
+            if have_cpu_mirror:
                 n_win = int(
                     forward_batch.seq_lens_cpu[:bs]
                     .clamp(max=self.sliding_window_size)
