@@ -212,7 +212,10 @@ class SchedulerMultiplexMixin:
                             self.running_batch.merge_batch(self.split_prefill_batch)
                         else:
                             self.running_batch = self.split_prefill_batch
-
+                        # FIX: event-based stream dependency
+                        self.prefill_commit_done = torch.cuda.Event()
+                        self.prefill_commit_done.record(prefill_stream)
+                        decode_stream.wait_event(self.prefill_commit_done)
                         self.split_prefill_batch = None
                         wait_prefill_kernel_done = False
                         adjust_stream_group = True
