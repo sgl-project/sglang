@@ -833,3 +833,50 @@ mod abort_tests {
         assert!(arr[5].is_nil());
     }
 }
+
+#[cfg(test)]
+mod ingress_header_tests {
+    use super::*;
+
+    /// The ingress header must carry ALL fields the scheduler's msgspec struct
+    /// `TokenizedGenerateReqInput` requires positionally through `stream` — i.e.
+    /// `input_embeds` (idx 5) and `token_type_ids` (idx 7) must be present, so
+    /// `sampling_params` lands at idx 8. Omitting them makes the array too short
+    /// (msgspec: "Expected array of at least length 14") and misaligns
+    /// `sampling_params`. Regression guard for that exact decode failure.
+    #[test]
+    fn to_header_msgpack_is_positionally_aligned() {
+        let payload = TokenizedReqPayload {
+            rid: "r1".into(),
+            input_text: Some("hi".into()),
+            input_ids: vec![1, 2, 3],
+            sampling_params: Some(rmpv::Value::Map(vec![(
+                rmpv::Value::from("max_new_tokens"),
+                rmpv::Value::from(5),
+            )])),
+            return_logprob: true,
+            logprob_start_len: -1,
+            top_logprobs_num: 3,
+            token_ids_logprob: None,
+            return_hidden_states: false,
+            stream: true,
+        };
+        let bytes = payload.to_header_msgpack().unwrap();
+        let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+        let arr = val.as_array().expect("array");
+        // msgspec requires >= 14 (through `stream`); we emit 15.
+        assert!(
+            arr.len() >= 14,
+            "header must have >=14 elements, got {}",
+            arr.len()
+        );
+        assert_eq!(arr[0].as_str(), Some("TokenizedGenerateReqInput"));
+        assert_eq!(arr[1].as_str(), Some("r1"));
+        assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");
+        assert!(arr[7].is_nil(), "idx 7 must be token_type_ids (nil)");
+        assert!(arr[8].is_map(), "sampling_params must land at idx 8");
+        assert_eq!(arr[9].as_bool(), Some(true), "return_logprob at idx 9");
+        assert_eq!(arr[11].as_u64(), Some(3), "top_logprobs_num at idx 11");
+        assert_eq!(arr[13].as_bool(), Some(true), "stream at idx 13");
+    }
+}

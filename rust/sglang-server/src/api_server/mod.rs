@@ -72,7 +72,12 @@ pub async fn serve(
         // and returns a single, non-streamed JSON result from the scheduler.
         // Adding one = a route line passing its scheduler request-struct tag.
         .route("/server_info", get(server_info))
-        // Static config endpoint (OpenAI-compatible): no scheduler round-trip.
+        // Static config endpoints: no scheduler round-trip. `/get_model_info`
+        // (+ its `/model_info` alias) is what the SGLang lang backend
+        // (`RuntimeEndpoint`, used by the gsm8k/eval benchmarks) calls at
+        // startup; `/v1/models` is OpenAI-compatible.
+        .route("/get_model_info", get(model_info))
+        .route("/model_info", get(model_info))
         .route("/v1/models", get(openai::available_models))
         .with_state(state);
 
@@ -352,6 +357,29 @@ async fn control(State(state): State<AppState>, tag: &'static str) -> Response {
 /// `max_req_input_len`). Those are dropped for now — add them here once the
 /// values are plumbed through (e.g. captured at `Server.start` / a richer
 /// scheduler response).
+/// `GET /get_model_info` (+ `/model_info` alias) — static model metadata read
+/// from `server_args`; no scheduler round-trip, mirroring `/v1/models`. The
+/// SGLang lang backend (`RuntimeEndpoint`) calls this at startup and only reads
+/// `model_path` (for chat-template detection); the gsm8k/eval benchmark scripts
+/// go through it. `is_generation` is always true — this server is generation
+/// only.
+async fn model_info(State(state): State<AppState>) -> Response {
+    let sa = &state.server_args;
+    let body = serde_json::json!({
+        "model_path": sa.model_path(),
+        "tokenizer_path": sa.tokenizer_path(),
+        "is_generation": true,
+        "preferred_sampling_params": serde_json::Value::Null,
+        "weight_version": serde_json::Value::Null,
+    });
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        serde_json::to_vec(&body).unwrap_or_default(),
+    )
+        .into_response()
+}
+
 async fn server_info(State(state): State<AppState>) -> Response {
     let bytes = match await_control_result(&state, "GetInternalStateReq").await {
         Ok(b) => b,
