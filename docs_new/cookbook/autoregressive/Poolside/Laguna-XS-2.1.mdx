@@ -10,10 +10,7 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Laguna-XS-2.1 splits across two build requirements, matching the **Strategy** toggle in the command panel:
-
-- **High-Throughput (dense)** runs on SGLang `main`. The **INT4** checkpoint is a *mixed-precision* compressed-tensors MoE (4-bit + 8-bit config groups) and needs [PR #29761](https://github.com/sgl-project/sglang/pull/29761) (**merged**) — any build at or past that commit loads it.
-- **Low-Latency (DFlash speculative decoding)** needs [PR #29446](https://github.com/sgl-project/sglang/pull/29446) (Laguna XS-2.1 DFlash support — **open** at the time of writing). Install from that branch until it merges.
+Laguna-XS-2.1 needs two fixes that are now both **merged to SGLang `main`**: [PR #29446](https://github.com/sgl-project/sglang/pull/29446) (DFlash speculative-decoding support, plus the `SGLANG_SHARED_EXPERT_TP1` shared-expert fix used by the FP8 8-GPU recipe) and [PR #29761](https://github.com/sgl-project/sglang/pull/29761) (INT4 mixed-precision MoE load fix). Any build at or past their merge covers every cell below — no branch checkout needed.
 
 The model ships custom config code on the Hub, so `--trust-remote-code` is required (included in the launch commands).
 
@@ -27,9 +24,6 @@ uv venv --python 3.12 && source .venv/bin/activate
 
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
-# High-Throughput cells: main is enough (INT4 fix #29761 is merged).
-# Low-Latency (DFlash) cells: check out the PR #29446 branch until it merges:
-#   git fetch origin pull/29446/head:laguna-dflash && git checkout laguna-dflash
 uv pip install -e python
 ```
 
@@ -40,11 +34,10 @@ Then run the **Python** output of the command panel below in that environment.
 <Tab title="Docker">
 
 ```bash Command
-# Dense (High-Throughput) cells work on any current nightly at or past PR #29761's merge:
 docker pull lmsysorg/sglang:latest
 ```
 
-For Low-Latency (DFlash) cells, build from the [PR #29446](https://github.com/sgl-project/sglang/pull/29446) branch until it merges — no published image carries it yet. For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
 
 </Tab>
 
@@ -54,10 +47,10 @@ For Low-Latency (DFlash) cells, build from the [PR #29446](https://github.com/sg
 
 Pick your hardware + quantization + strategy to generate the launch command. Laguna-XS-2.1 ships **two operating points** per cell:
 
-- **Low-Latency (DFlash)** — speculative decoding with a matched-precision DFlash draft. The draft proposes a block, the target verifies it in one forward pass (measured accept-length ~4 at tp 4, ~6 at tp 1), cutting per-token latency for interactive / few-stream serving. Accuracy-neutral (verification-based).
+- **Low-Latency (DFlash)** — speculative decoding with a matched-precision DFlash draft. The draft proposes a block, the target verifies it in one forward pass (measured accept-length ranges ~3–7 depending on precision and parallelism — see per-cell numbers below), cutting per-token latency for interactive / few-stream serving. Accuracy-neutral (verification-based).
 - **High-Throughput** — plain serving. At batch-saturated load the GPU is compute-bound and speculation's draft + rejected-token overhead costs more than it saves, so the dense path wins on aggregate tokens/sec.
 
-BF16 on the 8-GPU HGX platforms (H200 / B200) uses `--tp 8`; the **FP8 and INT4 checkpoints cap at `--tp 4`** on every platform (their quantization scale granularity cannot shard the 512-dim MoE 8-way — see [Configuration Tips](#2-configuration-tips)); the 4-GPU Grace-Blackwell GB300 node uses `--tp 4` throughout.
+On the 8-GPU HGX platforms (H200 / B200), BF16 uses plain `--tp 8`. The **FP8 and INT4 checkpoints use `--tp 8 --ep-size 8`** instead — plain `--tp 8` fails at weight load because their quantization scale granularity cannot shard the 512-dim MoE 8-way, so expert-parallelism is used to still saturate all 8 GPUs on one instance (FP8 additionally needs `SGLANG_SHARED_EXPERT_TP1=1`; see [Configuration Tips](#2-configuration-tips)). The 4-GPU Grace-Blackwell GB300 node uses plain `--tp 4` throughout (4 GPUs is already inside the plain-TP ceiling).
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/poolside/laguna-xs21.jsx";
@@ -142,7 +135,7 @@ The `-DFlash-*` drafts are **not themselves quantized** — each is a small bf16
 - **Chat template**: on transformers ≥ 5.10 the standalone `chat_template.jinja` auto-loads — no `--chat-template` flag needed (the server logs `Auto-detected template features: reasoning_parser=poolside_v1, tool_call_parser=poolside_v1` when it resolves correctly). On older pinned transformers (≤ ~5.8) the `{% include %}` stub in `tokenizer_config.json` cannot resolve and the server silently falls back to a generic template — there, pass `--chat-template <model-dir>/chat_template.jinja` explicitly.
 - **Thinking default**: thinking is **off by default**; opt in per request with `extra_body={"chat_template_kwargs": {"enable_thinking": True}}`. The template gates on `enable_thinking` — the generic `thinking` key is ignored.
 - **Served model id**: the server registers the model under whatever you pass to `--model-path`, so a client's `model` field must match it — `poolside/Laguna-XS-2.1` (BF16) or the `-FP8` / `-NVFP4` / `-INT4` id for the quantized cells.
-- **TP degree**: 48 Q-heads / 8 KV-heads shard cleanly at `tp` 1 / 2 / 4 / 8, but the **FP8 and INT4 checkpoints cap MoE TP at 4**: `moe_intermediate_size=512` with FP8 block `[128,128]` / INT4 `group_size=128` scales cannot shard 8-way (512/8 = 64 violates the 128-granularity — FP8 fails at weight creation, INT4 crashes in the Marlin kernel; reproduced on 8×H200, and the checks are hardware-independent). The generated commands use `--tp 4` for those cells. To use all 8 GPUs of an HGX node with a quantized checkpoint: `--tp 4 --dp-size 2` (two replicas), or a single instance with `--tp 8 --ep-size 8` (FP8 additionally needs `SGLANG_SHARED_EXPERT_TP1=1`). Accuracy is parallelism-independent (verified `tp 1` ≡ `tp 4` on GB300, and `tp 4` ≡ `tp 8 + ep 8` on full GSM8K on H200).
+- **TP degree**: 48 Q-heads / 8 KV-heads shard cleanly at `tp` 1 / 2 / 4 / 8, but the **FP8 and INT4 checkpoints cap plain TP at 4**: `moe_intermediate_size=512` with FP8 block `[128,128]` / INT4 `group_size=128` scales cannot shard 8-way (512/8 = 64 violates the 128-granularity — FP8 fails at weight creation, INT4 crashes in the Marlin kernel; reproduced on 8×H200, and the checks are hardware-independent). Rather than give up 4 of 8 GPUs, the generated H200/B200 commands for FP8 and INT4 use `--tp 8 --ep-size 8` — expert parallelism keeps whole experts per rank, sidestepping the shard-granularity wall while still using every GPU on a single instance (FP8 additionally needs `SGLANG_SHARED_EXPERT_TP1=1`, since its shared expert is also block-quantized; INT4's stays bf16). Other options: plain `--tp 4` (uses only 4 of 8 GPUs), or `--tp 4 --dp-size 2` (two replicas across all 8). Accuracy is parallelism-independent within noise (verified `tp 1` ≡ `tp 4` on GB300; on H200 full-set GSM8K, `tp 4` vs `tp 8 + ep 8` differ by ≤1pt on BF16/FP8/INT4-dense, and by ~2pt on INT4+DFlash — the newest of these combinations, worth a second look before high-stakes production use).
 
 ## 3. Advanced Usage
 
@@ -150,7 +143,7 @@ The `-DFlash-*` drafts are **not themselves quantized** — each is a small bf16
 
 DFlash is a block-wise speculative decoder: the 5-layer draft proposes a block of tokens, the target model verifies the whole block in a single forward pass, and only target-approved tokens are emitted — so **output quality is the target's, by construction** (measured: GSM8K matches dense within noise on every quantization). The speedup lever is **accept-length** — how many draft tokens survive verification per target step:
 
-- ~**6** tokens/step at `tp 1`, ~**4** at `tp 4`–`tp 8` (measured on GB300 and 8×H200, matched-precision pairs; ~3 under mixed reasoning-heavy traffic) — versus 1 token/step dense.
+- ~**6** tokens/step at `tp 1`, ~**4** at plain `tp 4` (measured on GB300 and 8×H200, matched-precision pairs; ~3 under mixed reasoning-heavy traffic) — versus 1 token/step dense. Under `--tp 8 --ep-size 8` on H200, accept-length varies more by precision: BF16 ~4, INT4 ~4.9, FP8 ~6.75 (greedy GSM8K) — expert-parallel batching interacts with acceptance differently than plain TP, so don't assume flat scaling across configurations.
 - Best for **interactive / few-stream** serving where the GPU has idle compute. Under batch-saturated load prefer the High-Throughput cells: speculation's draft + rejected-token overhead costs aggregate throughput once the GPU is compute-bound.
 - **Match the draft to the target precision** (the generated commands do) — each draft is calibrated against its specific quantized target.
 

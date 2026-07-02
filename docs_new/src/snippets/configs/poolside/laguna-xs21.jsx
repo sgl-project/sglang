@@ -1,12 +1,13 @@
 // Laguna-XS-2.1 (poolside) — config-driven cookbook page.
 // Consumed by the shared _deployment.jsx + _playground.jsx engines (no model code there).
 //
-// Build: the `laguna` model type (hybrid SWA + MoE) is on SGLang main. Two extra pieces:
+// Build: the `laguna` model type (hybrid SWA + MoE) is on SGLang main. Two extra pieces,
+// BOTH MERGED to main as of 2026-07-02 — no branch/cherry-pick needed:
 //   - INT4: poolside/Laguna-XS-2.1-INT4 is a MIXED-precision compressed-tensors MoE
 //     (4-bit + 8-bit config groups, regex targets, no "Linear" group) — needs PR #29761
-//     (MERGED on main) or it crashes at load with KeyError: 'Linear'.
-//   - Low-Latency (DFlash speculative decoding): needs PR #29446 (OPEN at authoring time) —
-//     install from that branch until it merges. High-Throughput cells run on plain main.
+//     or it crashes at load with KeyError: 'Linear'.
+//   - Low-Latency (DFlash speculative decoding) + the 8-GPU FP8 recipe below both need
+//     PR #29446 (Laguna XS-2.1 DFlash support + SGLANG_SHARED_EXPERT_TP1 shared-expert fix).
 //
 // Attention backend (IMPORTANT — Laguna is hybrid-SWA and backend-sensitive):
 //   - Dense (High-Throughput): leave --attention-backend UNSET. Auto-select is correct:
@@ -28,21 +29,25 @@
 // fraction OOMs in the draft vocab all-gather ("Failed to CUDA calloc"); 0.7 is validated.
 // Dense cells use the default heuristic (validated at defaults on GB300).
 //
-// TP: attention shards cleanly at 1/2/4/8 (48 Q / 8 KV heads), BUT the quantized checkpoints
-// cap MoE TP at 4: moe_intermediate_size=512 with FP8 block [128,128] / INT4 group_size=128
-// scales cannot shard 8-way (512/8 = 64 < 128 granularity → FP8 ValueError at weight create,
-// INT4 Marlin scale-contiguity crash; reproduced on 8×H200, and the checks are pure shard
-// arithmetic — arch-independent). So: BF16 → --tp 8 on 8-GPU HGX (H200/B200); FP8/INT4 →
-// --tp 4 everywhere; GB300 (4-GPU node) → --tp 4. 8-GPU alternatives for FP8/INT4 exist
-// (--tp 4 --dp-size 2, or --tp 8 --ep-size 8 with SGLANG_SHARED_EXPERT_TP1=1 for FP8) but
-// are kept out of the cells for simplicity.
+// TP/EP on the 8-GPU HGX platforms (H200/B200): plain --tp 8 works for BF16, but the
+// quantized checkpoints cap PLAIN TP at 4 — moe_intermediate_size=512 with FP8 block
+// [128,128] / INT4 group_size=128 scales cannot shard 8-way (512/8 = 64 < 128 granularity
+// → FP8 ValueError at weight create, INT4 Marlin scale-contiguity crash; reproduced on
+// 8×H200, and the checks are pure shard arithmetic — arch-independent, so this is not an
+// H200-only limitation). To still use all 8 GPUs on a single instance, FP8/INT4 cells use
+// `--tp 8 --ep-size 8` instead: EP keeps whole experts per rank (256 experts ÷ 8 = 32,
+// avoiding the 512-dim MoE intermediate shard entirely) which fixes the *routed* experts
+// for both precisions. FP8's shared expert is ALSO block-quantized (unlike INT4's, which
+// stays bf16), so FP8 additionally needs `SGLANG_SHARED_EXPERT_TP1=1` (replicates the
+// shared expert instead of TP-sharding it — see PR #29446). GB300 (4-GPU node) uses plain
+// `--tp 4` throughout since 4 GPUs is already inside the plain-TP ceiling.
 //
 // NVFP4 is Blackwell-only → no h200×nvfp4 cells (same rule as Laguna-M.1).
 //
 // verified:true = ran that command shape on that hardware and it served correctly + passed
 // full GSM8K (see laguna-xs21-benchmarks.jsx). GB300 cells verified (4×GB300, tp 4); H200
-// cells verified (8×H200: bf16 at tp 8, fp8/int4 at tp 4); B200 cells are command-correct
-// but pending measurement.
+// cells verified (8×H200: bf16 tp8, fp8/int4 tp8+ep8); B200 cells are command-correct
+// (same merged fix, arch-independent quant checks) but pending measurement.
 
 export const config = {
   modelName: "Laguna-XS-2.1",
@@ -166,8 +171,9 @@ sgl-eval run gsm8k \\
     // All 6 cells ran on 8×H200 with full-GSM8K accuracy (laguna-xs21-benchmarks.jsx).
     // Dense auto-selects fa3 on Hopper (no flag). LL pins fa3 (DFlash-safe on Hopper;
     // with a spec algorithm active, auto would fall back to flashinfer).
-    // FP8/INT4 use --tp 4 (quantized-checkpoint MoE TP cap — see header comment);
-    // tp 8 crashes at weight load for both.
+    // FP8/INT4 use --tp 8 --ep-size 8 to use all 8 GPUs on one instance (plain --tp 8
+    // crashes at weight load for both — see header comment). FP8 additionally needs
+    // SGLANG_SHARED_EXPERT_TP1=1 (its shared expert is block-quantized too).
     {
       // VERIFIED 8×H200 tp8: GSM8K 76.12% (full 1319, greedy).
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
@@ -205,33 +211,33 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      // VERIFIED 8×H200 tp4: GSM8K 74.53%. tp 8 is impossible for this checkpoint
-      // (block-FP8 [128,128] can't shard the 512-dim MoE 8-way). Uses 4 of 8 GPUs;
-      // to use all 8 add --dp-size 2, or --ep-size 8 with SGLANG_SHARED_EXPERT_TP1=1.
+      // VERIFIED 8×H200 tp8+ep8: GSM8K 73.54% (full 1319, greedy).
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      env: [],
+      env: ["SGLANG_SHARED_EXPERT_TP1=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
-        "--tp 4",
+        "--tp 8",
+        "--ep-size 8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      // VERIFIED 8×H200 tp4: GSM8K 74.07%, accept-length 3.05 (matched fp8-calibrated draft).
+      // VERIFIED 8×H200 tp8+ep8: GSM8K 74.53%, accept-length 6.75 (matched fp8-calibrated draft).
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: [],
+      env: ["SGLANG_SHARED_EXPERT_TP1=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
-        "--tp 4",
+        "--tp 8",
+        "--ep-size 8",
         "--attention-backend fa3",
         "--speculative-algorithm DFLASH",
         "--speculative-draft-model-path poolside/Laguna-XS-2.1-DFlash-FP8",
@@ -242,10 +248,10 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      // VERIFIED 8×H200 tp4: GSM8K 67.48%. Mixed 4/8-bit MoE — needs a build ≥ PR #29761
-      // (merged). tp 8 crashes (Marlin gs=128 scale layout can't shard the 512-dim MoE
-      // 8-way). Uses 4 of 8 GPUs; to use all 8 add --dp-size 2, or --ep-size 8 (no extra
-      // env needed for INT4 — its shared expert stays bf16).
+      // VERIFIED 8×H200 tp8+ep8: GSM8K 67.02% (full 1319, greedy). Mixed 4/8-bit MoE —
+      // needs a build ≥ PR #29761 (merged). No SGLANG_SHARED_EXPERT_TP1 needed — INT4's
+      // shared expert stays bf16 (its ignore-list keeps it unquantized), so it TP-shards
+      // freely under EP; only FP8's shared expert needs replication.
       match: { hw: "h200", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
@@ -254,13 +260,17 @@ sgl-eval run gsm8k \\
         "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
-        "--tp 4",
+        "--tp 8",
+        "--ep-size 8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      // VERIFIED 8×H200 tp4: GSM8K 66.41%, accept-length 2.94 (matched int4-calibrated draft).
+      // VERIFIED 8×H200 tp8+ep8: GSM8K 64.52%, accept-length 4.94 (matched int4-calibrated
+      // draft). Widest tp8-vs-tp4 delta measured across the quantized cells (64.52% vs
+      // 66.41% at tp4) — inside two binomial SEs but the least-repeated combo in this grid;
+      // re-check if this exact config goes to production.
       match: { hw: "h200", variant: "default", quant: "int4", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [],
@@ -269,7 +279,8 @@ sgl-eval run gsm8k \\
         "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
-        "--tp 4",
+        "--tp 8",
+        "--ep-size 8",
         "--attention-backend fa3",
         "--speculative-algorithm DFLASH",
         "--speculative-draft-model-path poolside/Laguna-XS-2.1-DFlash-INT4",
@@ -316,29 +327,32 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      // FP8 caps at tp 4 (quantized MoE TP cap, arch-independent — see header comment);
-      // tp 8 fails at weight load on any hardware.
+      // Plain tp 8 fails at weight load (quantized MoE TP cap, arch-independent — see
+      // header comment); tp 8 + ep 8 uses all 8 GPUs instead (verified on 8×H200, same
+      // merged fix — pending measurement on this hardware).
       match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      env: [],
+      env: ["SGLANG_SHARED_EXPERT_TP1=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
-        "--tp 4",
+        "--tp 8",
+        "--ep-size 8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
       match: { hw: "b200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-      env: [],
+      env: ["SGLANG_SHARED_EXPERT_TP1=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
-        "--tp 4",
+        "--tp 8",
+        "--ep-size 8",
         "--attention-backend trtllm_mha",
         "--speculative-algorithm DFLASH",
         "--speculative-draft-model-path poolside/Laguna-XS-2.1-DFlash-FP8",
@@ -381,7 +395,8 @@ sgl-eval run gsm8k \\
     },
     {
       // INT4 (mixed 4/8-bit compressed-tensors MoE) — needs a build ≥ PR #29761 (merged).
-      // Caps at tp 4 (quantized MoE TP cap, arch-independent — see header comment).
+      // tp 8 + ep 8 uses all 8 GPUs (verified on 8×H200 — pending measurement on this
+      // hardware); no SGLANG_SHARED_EXPERT_TP1 needed, INT4's shared expert stays bf16.
       match: { hw: "b200", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
       env: [],
       flags: [
@@ -389,7 +404,8 @@ sgl-eval run gsm8k \\
         "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
-        "--tp 4",
+        "--tp 8",
+        "--ep-size 8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -402,7 +418,8 @@ sgl-eval run gsm8k \\
         "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
-        "--tp 4",
+        "--tp 8",
+        "--ep-size 8",
         "--attention-backend trtllm_mha",
         "--speculative-algorithm DFLASH",
         "--speculative-draft-model-path poolside/Laguna-XS-2.1-DFlash-INT4",
