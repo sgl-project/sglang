@@ -1024,25 +1024,21 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
             weight_fp, dst_type=fp4_dtype, round_mode="round"
         )
-        # qw: [E, N, K//2] (packed FP4)
-        # w_scale: [E, N, ceil(K/64), 2] (or 2D legacy shape)
+        # Transpose and force contiguous
+        qw_t = qw.transpose(1, 2).contiguous()          # [E, K, N]
+        w_scale_t = w_scale.transpose(1, 2).contiguous() # [E, ceil(K/64), N, 2]
 
-        qw_t = qw.transpose(1, 2)                     # [E, K_packed, N]
-
-        # Pack scale to [E, K_groups//2, N, 2]
-        g, n, k = w_scale.shape
-        if w_scale.dim() == 2:                           # fallback
-            w_scale = w_scale.reshape(g, n, -1, 2)
-        w_scale_t = w_scale.reshape(g, n, -1, 2).transpose(1, 2).contiguous()
-
-        # Store on layer and self
+        # Store on the layer (for parameter saving etc.)
         setattr(layer, weight_name,
                 torch.nn.Parameter(qw_t, requires_grad=False))
         layer.register_parameter(
             f"{weight_name}_scale",
-            torch.nn.Parameter(w_scale_t, requires_grad=False))
+            torch.nn.Parameter(w_scale_t, requires_grad=False),
+        )
+
         setattr(self, weight_name, qw_t)
         setattr(self, f"{weight_name}_scale", w_scale_t)
+
         torch.npu.empty_cache()
 
         # Set activation quantizer according to the mode (W4A8 or W4A4)
