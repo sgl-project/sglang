@@ -19,11 +19,9 @@ from sglang.multimodal_gen.test.server.test_server_utils import ServerManager
 from sglang.multimodal_gen.test.test_utils import get_dynamic_server_port
 
 # Test models and prompts
-IMAGE_MODEL = (
-    "/root/.cache/modelscope/hub/models/Efficient-Large-Model/Sana_600M_512px_diffusers"
-)
+IMAGE_MODEL = "Efficient-Large-Model/Sana_600M_512px_diffusers"
 IMAGE_PROMPT = "A beautiful sunset over mountains, oil painting style"
-VIDEO_MODEL = "/root/.cache/modelscope/hub/models/Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+VIDEO_MODEL = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 VIDEO_PROMPT = "A cat playing with a ball"
 
 # Timeout settings

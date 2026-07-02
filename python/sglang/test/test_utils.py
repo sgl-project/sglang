@@ -882,7 +882,6 @@ def popen_launch_server(
     device: str = "auto",
     pd_separated: bool = False,
     num_replicas: Optional[int] = None,
-    skip_device_arg: bool = False,
 ):
     """Launch a server process with automatic device detection and offline/online retry.
 
@@ -897,15 +896,14 @@ def popen_launch_server(
         device: Device type ("auto", "cuda", "rocm" or "cpu")
         pd_separated: Whether to use PD separated mode
         num_replicas: Number of replicas for mixed PD mode
-        skip_device_arg: If True, skip adding --device argument (for diffusion models)
 
     Returns:
         Started subprocess.Popen object
     """
     other_args = other_args or []
 
-    # Auto-detect device if needed (skip for diffusion models)
-    if device == "auto" and not skip_device_arg:
+    # Auto-detect device if needed
+    if device == "auto":
         device = auto_config_device()
         other_args = list(other_args)
         other_args += ["--device", str(device)]
