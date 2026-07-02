@@ -23,6 +23,23 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.runtime_context import get_server_args
+from sglang.srt.utils import is_cuda
+
+if is_cuda():
+    try:
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+    except (ImportError, OSError) as e:
+
+        def flash_attn_varlen_func(*args, _import_error=e, **kwargs):
+            raise RuntimeError(
+                "MiMoAudioTokenizer requires sgl_kernel flash attention to run."
+            ) from _import_error
+
+else:
+
+    def flash_attn_varlen_func(*args, **kwargs):
+        raise RuntimeError("MiMoAudioTokenizer requires CUDA to run.")
+
 
 logger = logging.getLogger(__name__)
 

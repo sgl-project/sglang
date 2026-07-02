@@ -455,6 +455,10 @@ class TestContextParallelServerArgs(CustomTestCase):
             ep_size=1,
             pp_size=1,
             enable_aiter_allreduce_fusion=False,
+            enable_dp_attention=False,
+            encoder_only=False,
+            speculative_algorithm=None,
+            enable_hierarchical_cache=False,
         )
         defaults.update(overrides)
         for key, value in defaults.items():
@@ -605,6 +609,34 @@ class TestContextParallelServerArgs(CustomTestCase):
                 self.assertEqual(
                     server_args.enable_prefill_context_parallel, expect_generic
                 )
+
+    def test_mimo_cp_v2_default_uses_full_attention_cp_before_tp_validation(self):
+        hf_config = SimpleNamespace(
+            architectures=["MiMoV2ForCausalLM"],
+            attention_projection_layout="fused_qkv",
+            num_key_value_heads=8,
+        )
+        server_args = self._new_cp_args(
+            model_path="XiaomiMiMo/MiMo-V2.5-Pro",
+            enable_prefill_cp=True,
+            cp_strategy="zigzag",
+            tp_size=8,
+        )
+        server_args.get_model_config = MagicMock(
+            return_value=SimpleNamespace(hf_config=hf_config)
+        )
+
+        with (
+            patch(
+                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.is_set",
+                return_value=False,
+            ),
+            patch("sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.set") as set_cp_v2,
+        ):
+            server_args._handle_model_specific_adjustments()
+
+        set_cp_v2.assert_called_once_with(True)
+        self.assertEqual(server_args.attn_cp_size, 8)
 
 
 class TestPortArgs(unittest.TestCase):

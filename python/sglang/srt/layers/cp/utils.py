@@ -39,6 +39,8 @@ if TYPE_CHECKING:
 
 CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
     {
+        "MiMoV2FlashForCausalLM",
+        "MiMoV2ForCausalLM",
         "Qwen3MoeForCausalLM",
     }
 )
@@ -143,7 +145,11 @@ def is_cp_v2_active(forward_batch) -> bool:
     if input_ids is None:
         return False
 
-    return strategy.can_apply(len(input_ids), forward_batch)
+    num_tokens = getattr(forward_batch, "num_token_non_padded_cpu", None)
+    if num_tokens is None:
+        num_tokens = len(input_ids)
+
+    return strategy.can_apply(int(num_tokens), forward_batch)
 
 
 def prepare_cp_forward(forward_batch) -> None:
@@ -151,7 +157,10 @@ def prepare_cp_forward(forward_batch) -> None:
     assert is_cp_v2_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
-    num_tokens = len(forward_batch.input_ids)
+    num_tokens = getattr(forward_batch, "num_token_non_padded_cpu", None)
+    if num_tokens is None:
+        num_tokens = len(forward_batch.input_ids)
+    num_tokens = int(num_tokens)
 
     seq_lens_cpu = _to_int_list(getattr(forward_batch, "seq_lens_cpu", None))
     extend_lens_cpu = _to_int_list(getattr(forward_batch, "extend_seq_lens_cpu", None))

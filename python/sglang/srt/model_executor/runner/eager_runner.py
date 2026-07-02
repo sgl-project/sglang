@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Tuple, Union
 
 import torch
@@ -59,6 +59,111 @@ _is_hip = is_hip()
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+@dataclass
+class CPV2LogitsInputs:
+    hidden_states: Any
+    aux_hidden_states: Any = None
+    hidden_states_before_norm: Any = None
+
+
+def _prepare_cp_v2_logits_inputs(
+    model_output: Any,
+    capture_aux_hidden_states: bool,
+    gather_fn,
+) -> CPV2LogitsInputs:
+    aux_hidden_states = None
+    hidden_states_before_norm = None
+    hidden_states = model_output
+
+    if capture_aux_hidden_states:
+        hidden_states, aux_hidden_states = hidden_states
+
+    if isinstance(hidden_states, tuple):
+        hidden_states, hidden_states_before_norm = hidden_states
+
+    hidden_states = gather_fn(hidden_states)
+    if hidden_states_before_norm is not None:
+        hidden_states_before_norm = gather_fn(hidden_states_before_norm)
+
+    return CPV2LogitsInputs(
+        hidden_states=hidden_states,
+        aux_hidden_states=aux_hidden_states,
+        hidden_states_before_norm=hidden_states_before_norm,
+    )
+
+
+def _get_cp_v2_input_embeds(model, input_ids):
+    if hasattr(model, "get_input_embedding"):
+        return model.get_input_embedding(input_ids)
+    return model.get_input_embeddings()(input_ids)
+
+
+def _get_cp_v2_real_num_tokens(forward_batch: ForwardBatch) -> int:
+    num_tokens = getattr(forward_batch, "num_token_non_padded_cpu", None)
+    if num_tokens is not None:
+        return int(num_tokens)
+
+    input_ids = getattr(forward_batch, "input_ids", None)
+    if input_ids is not None:
+        return int(input_ids.shape[0])
+
+    input_embeds = getattr(forward_batch, "input_embeds", None)
+    if input_embeds is not None:
+        return int(input_embeds.shape[0])
+
+    return 0
+
+
+def _trim_cp_v2_padding(forward_batch: ForwardBatch) -> ForwardBatch:
+    """Drop MLP-sync padding rows before CP-v2 prefill planning.
+
+    CP-v2 materializes K/V and attention metadata in zigzag token order. The
+    scheduler may pad model inputs so TP/DP/MoE collectives have aligned shapes,
+    but those dummy rows are not real sequence tokens and must not enter CP
+    layout or FA/SWA metadata.
+    """
+    real_num_tokens = _get_cp_v2_real_num_tokens(forward_batch)
+    input_ids = getattr(forward_batch, "input_ids", None)
+    padded_num_tokens = int(input_ids.shape[0]) if input_ids is not None else 0
+    if padded_num_tokens == 0 or real_num_tokens >= padded_num_tokens:
+        return forward_batch
+
+    trimmed = replace(forward_batch)
+    trimmed.input_ids = forward_batch.input_ids[:real_num_tokens]
+    trimmed.positions = forward_batch.positions[:real_num_tokens]
+    trimmed.out_cache_loc = forward_batch.out_cache_loc[:real_num_tokens]
+    trimmed.extend_num_tokens = real_num_tokens
+
+    if forward_batch.input_embeds is not None:
+        trimmed.input_embeds = forward_batch.input_embeds[:real_num_tokens]
+    if getattr(forward_batch, "mrope_positions", None) is not None:
+        trimmed.mrope_positions = forward_batch.mrope_positions[:, :real_num_tokens]
+
+    if getattr(forward_batch, "global_num_tokens_cpu", None) is not None:
+        original_global_num_tokens = getattr(
+            forward_batch, "original_global_num_tokens_cpu", None
+        )
+        if original_global_num_tokens is not None:
+            trimmed.global_num_tokens_cpu = list(original_global_num_tokens)
+        elif len(forward_batch.global_num_tokens_cpu) == 1:
+            trimmed.global_num_tokens_cpu = [real_num_tokens]
+
+        if trimmed.global_num_tokens_cpu is not forward_batch.global_num_tokens_cpu:
+            trimmed.global_num_tokens_gpu = torch.tensor(
+                trimmed.global_num_tokens_cpu,
+                dtype=forward_batch.global_num_tokens_gpu.dtype,
+                device=forward_batch.global_num_tokens_gpu.device,
+            )
+
+    if getattr(forward_batch, "num_token_non_padded", None) is not None:
+        trimmed.num_token_non_padded = forward_batch.num_token_non_padded.new_tensor(
+            real_num_tokens
+        )
+    trimmed.num_token_non_padded_cpu = real_num_tokens
+
+    return trimmed
 
 
 class EagerRunner(BaseRunner):
@@ -260,6 +365,13 @@ class EagerRunner(BaseRunner):
         if not self.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
+        cp_v2_active = is_cp_v2_active(forward_batch)
+        if cp_v2_active:
+            forward_batch = _trim_cp_v2_padding(forward_batch)
+            if kwargs.get("input_embeds") is not None:
+                real_num_tokens = _get_cp_v2_real_num_tokens(forward_batch)
+                kwargs["input_embeds"] = kwargs["input_embeds"][:real_num_tokens]
+
         if forward_batch.needs_forward_metadata_init():
             if hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp"):
                 # prepare kv cache buffer for dcp to gather kv cache
@@ -284,14 +396,15 @@ class EagerRunner(BaseRunner):
                 model_runner.model.prepare_forward_batch(forward_batch)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
 
-        cp_v2_active = is_cp_v2_active(forward_batch)
         forward_positions = forward_batch.positions
         if cp_v2_active:
             prepare_cp_forward(forward_batch)
             complete_hidden_states = kwargs.get("input_embeds")
             if complete_hidden_states is None:
-                embed_layer = model_runner.model.get_input_embeddings()
-                complete_hidden_states = embed_layer(forward_batch.input_ids)
+                complete_hidden_states = _get_cp_v2_input_embeds(
+                    model_runner.model,
+                    forward_batch.input_ids,
+                )
             sharded_hidden_states, sharded_positions = cp_split_before_forward(
                 complete_hidden_states,
                 forward_batch.positions,
@@ -341,36 +454,41 @@ class EagerRunner(BaseRunner):
                     )
             elif cp_v2_active:
                 # CP-V2: drive .model directly to gather across CP ranks before logits.
-                hidden_states = model_runner.model.model(
+                model_output = model_runner.model.model(
                     forward_batch.input_ids,
                     forward_positions,
                     forward_batch,
                     input_embeds=kwargs.get("input_embeds"),
                     pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
                 )
-                aux_hidden_states = None
                 capture_aux_hidden_states = getattr(
                     model_runner.model, "capture_aux_hidden_states", False
                 )
-                if capture_aux_hidden_states:
-                    hidden_states, aux_hidden_states = hidden_states
                 if model_runner.model.pp_group.is_last_rank:
-                    hidden_states = cp_gather_after_forward(
-                        hidden_states,
-                        forward_batch,
-                        torch.cuda.current_stream(),
+                    logits_inputs = _prepare_cp_v2_logits_inputs(
+                        model_output,
+                        capture_aux_hidden_states,
+                        lambda x: cp_gather_after_forward(
+                            x,
+                            forward_batch,
+                            torch.cuda.current_stream(),
+                        ),
                     )
                     ret = model_runner.model.logits_processor(
                         forward_batch.input_ids,
-                        hidden_states,
+                        logits_inputs.hidden_states,
                         model_runner.model.lm_head,
                         forward_batch,
-                        aux_hidden_states,
+                        logits_inputs.aux_hidden_states,
+                        hidden_states_before_norm=(
+                            logits_inputs.hidden_states_before_norm
+                        ),
                     )
                 elif capture_aux_hidden_states:
+                    hidden_states, aux_hidden_states = model_output
                     ret = hidden_states, aux_hidden_states
                 else:
-                    ret = hidden_states
+                    ret = model_output
             else:
                 ret = model_runner.model.forward(
                     forward_batch.input_ids,

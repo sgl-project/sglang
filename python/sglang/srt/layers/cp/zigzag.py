@@ -90,13 +90,19 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
 
 ContextParallelMetadata = ZigzagContextParallelMetadata
 
+# CP-v2 is kept for page-sized-or-larger prefill chunks. Smaller chunks stay on
+# the legacy path, but uneven long chunks are supported by the zigzag metadata's
+# per-rank padding.
+MIN_ZIGZAG_CP_V2_TOKENS = 128
+
 
 class ZigzagCPStrategy(ContextParallelStrategy):
     name = "zigzag"
     kind = ContextParallelStrategyKind.ZIGZAG
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
-        if self.cp_size <= 1 or num_tokens < self.cp_size * 2:
+        min_cp_tokens = max(MIN_ZIGZAG_CP_V2_TOKENS, self.cp_size * 2)
+        if self.cp_size <= 1 or num_tokens < min_cp_tokens:
             return False
         forward_mode = getattr(forward_batch, "forward_mode", None)
         if forward_mode is not None and not forward_mode.is_context_parallel_extend():
@@ -105,7 +111,8 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is None:
             return True
-        return all(int(length) >= self.cp_size * 2 for length in extend_lens)
+
+        return all(int(length) >= min_cp_tokens for length in extend_lens)
 
     def build_metadata(
         self,
@@ -375,6 +382,8 @@ class ZigzagCPStrategy(ContextParallelStrategy):
                 device=x.device,
                 dtype=x.dtype,
             )
+        if len(set(meta.per_rank_actual_token)) > 1:
+            group.barrier()
         group.cp_all_gather_into_tensor_async(gathered, x, stream)
 
         chunks = torch.split(gathered, meta.max_rank_len, dim=0)

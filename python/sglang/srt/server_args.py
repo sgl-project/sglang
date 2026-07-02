@@ -4239,6 +4239,8 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+        cp_v2_enabled = self._maybe_enable_cp_v2_by_default(model_arch)
+        self._maybe_set_default_cp_v2_size(model_arch, cp_v2_enabled)
 
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
             raise ValueError(
@@ -4548,20 +4550,21 @@ class ServerArgs:
                 )
                 if (
                     expected_attn_tp_size is not None
-                    and effective_attn_tp_size != expected_attn_tp_size
+                    and expected_attn_tp_size % effective_attn_tp_size != 0
                 ):
                     raise ValueError(
                         "MiMoV2ForCausalLM requires effective attention TP "
-                        f"size {expected_attn_tp_size} because its fused "
-                        "qkv_proj weights are "
+                        f"size to divide {expected_attn_tp_size} because its "
+                        "fused qkv_proj weights are "
                         f"TP={expected_attn_tp_size}-interleaved; got "
                         f"{effective_attn_tp_size} "
                         f"(tp_size={self.tp_size}, dp_size={self.dp_size}, "
                         f"enable_dp_attention={view.enable_dp_attention}, "
                         f"attn_cp_size={view.attn_cp_size}). "
                         "Set --tp, --dp, --enable-dp-attention, and "
-                        "--attention-context-parallel-size so the effective "
-                        f"attention TP size is {expected_attn_tp_size}."
+                        "--attention-context-parallel-size so the fused "
+                        "checkpoint TP size is divisible by the effective "
+                        "attention TP size."
                     )
 
             # enable_multi_layer_eagle for EAGLE moved to the override registry
@@ -5259,6 +5262,54 @@ class ServerArgs:
                     f"{self.linear_replayssm_cache_len}."
                 )
 
+    def _maybe_enable_cp_v2_by_default(self, model_arch: str) -> bool:
+        from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
+
+        if model_arch not in CP_V2_DEFAULT_MODEL_CLASSES:
+            return False
+
+        if not envs.SGLANG_ENABLE_CP_V2.is_set():
+            envs.SGLANG_ENABLE_CP_V2.set(True)
+            return True
+
+        return bool(envs.SGLANG_ENABLE_CP_V2.get())
+
+    def _maybe_set_default_cp_v2_size(
+        self, model_arch: str, cp_v2_enabled: Optional[bool] = None
+    ) -> None:
+        if cp_v2_enabled is None:
+            cp_v2_enabled = self._maybe_enable_cp_v2_by_default(model_arch)
+
+        if not self.enable_prefill_cp or self.attn_cp_size > 1 or not cp_v2_enabled:
+            return
+
+        attn_dp_size = self.dp_size if self.enable_dp_attention else 1
+        if self.moe_dp_size > 1:
+            default_attn_cp_size = self.moe_dp_size
+        else:
+            default_attn_cp_size = self.tp_size // attn_dp_size
+
+        if default_attn_cp_size <= 1:
+            return
+        if self.tp_size % attn_dp_size != 0:
+            raise ValueError(
+                "tp_size must be divisible by the attention data parallel size "
+                "when defaulting context parallelism."
+            )
+        if self.tp_size % default_attn_cp_size != 0:
+            raise ValueError(
+                "tp_size must be divisible by the default attention context "
+                f"parallel size {default_attn_cp_size}."
+            )
+
+        self.attn_cp_size = default_attn_cp_size
+        logger.warning(
+            "Defaulting --attention-context-parallel-size to "
+            f"{self.attn_cp_size} for {model_arch} with CP-v2 enabled "
+            f"(tp_size={self.tp_size}, attn_dp_size={attn_dp_size}, "
+            f"moe_dp_size={self.moe_dp_size})."
+        )
+
     def _handle_legacy_cp_arguments(self):
         legacy_mode_to_strategy = {
             "in-seq-split": "zigzag",
@@ -5303,15 +5354,10 @@ class ServerArgs:
 
     def _handle_context_parallelism(self):
         if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
-            from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
-
             model_config = self.get_model_config()
             model_arch = model_config.hf_config.architectures[0]
-            if (
-                model_arch in CP_V2_DEFAULT_MODEL_CLASSES
-                and not envs.SGLANG_ENABLE_CP_V2.is_set()
-            ):
-                envs.SGLANG_ENABLE_CP_V2.set(True)
+            cp_v2_enabled = self._maybe_enable_cp_v2_by_default(model_arch)
+            self._maybe_set_default_cp_v2_size(model_arch, cp_v2_enabled)
 
         if self.enable_prefill_cp and self.cp_strategy is None:
             raise ValueError(

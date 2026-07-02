@@ -2230,7 +2230,19 @@ def initialize_model_parallel(
         _ATTN_CP is None
     ), "attention context model parallel group is already initialized"
     if attn_cp_size == tensor_model_parallel_size:
-        _ATTN_CP = _TP
+        # Keep attention-CP on a distinct communicator even when it spans the
+        # whole TP group. CP-v2 zigzag can produce uneven per-rank token counts;
+        # if CP all-gathers share the TP communicator with layer-boundary
+        # all-reduces, faster ranks can enter a CP collective while slower ranks
+        # are still draining TP work from the previous layer.
+        _ATTN_CP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+            group_name="attn_cp",
+            recovered_rank=recovered_rank,
+        )
     else:
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
