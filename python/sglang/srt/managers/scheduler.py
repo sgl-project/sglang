@@ -2147,7 +2147,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self.spec_algorithm.is_dflash():
+        if self.spec_algorithm.is_dflash() or self.spec_algorithm.is_ddtree():
             error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)

@@ -599,6 +599,18 @@ class ModelRunnerKVCacheMixin:
                     enable_linear_replayssm=self.server_args.enable_linear_replayssm,
                     linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
                     mamba_envelope_layout=self.server_args.enable_page_major_kv_layout,
+                    # DDTree full-tree verify walks per-token tree ancestors in the
+                    # mamba conv kernel even though speculative_eagle_topk stays 1
+                    # (branching is controlled by speculative_ddtree_budget), so
+                    # the dedup conv-window layout would silently corrupt the
+                    # accepted chain's conv state.
+                    tree_verify_uses_per_token_ancestors=(
+                        self.spec_algorithm.is_ddtree()
+                        and self.server_args.speculative_ddtree_budget is not None
+                        and self.server_args.speculative_num_draft_tokens is not None
+                        and self.server_args.speculative_ddtree_budget
+                        > self.server_args.speculative_num_draft_tokens - 1
+                    ),
                 )
             else:
                 # DSV4 on NPU needs an extended ReqToTokenPool holding per-req

@@ -670,6 +670,17 @@ class Envs:
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
 
+    # DDTREE (Diffusion Draft Tree) full-tree speculative decoding tuning.
+    # SGLANG_DDTREE_MAX_TOPK: max candidate tokens per tree position (tree
+    #   width cap). Effective width is also bounded by ddtree_budget.
+    # SGLANG_DDTREE_DEPTH_BONUS: beam-search log-prob bonus for growing the tree
+    #   deeper. Lower/negative biases the budget toward wider, shallower trees.
+    # SGLANG_DDTREE_RANK_PROBE: log whether the target's next token appears in
+    #   draft top-k along the accepted path, for draft-quality diagnostics.
+    SGLANG_DDTREE_MAX_TOPK = EnvInt(6)
+    SGLANG_DDTREE_DEPTH_BONUS = EnvFloat(0.2)
+    SGLANG_DDTREE_RANK_PROBE = EnvBool(False)
+
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 

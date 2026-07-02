@@ -242,6 +242,43 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
 
+def _handle_ddtree(server_args: ServerArgs) -> None:
+    _handle_dflash(server_args)
+
+    if server_args.speculative_ddtree_budget is None:
+        server_args.speculative_ddtree_budget = (
+            server_args.speculative_num_draft_tokens - 1
+        )
+        logger.info(
+            "Inferred speculative_ddtree_budget=%d from speculative_num_draft_tokens=%d for DDTREE.",
+            server_args.speculative_ddtree_budget,
+            server_args.speculative_num_draft_tokens,
+        )
+    elif server_args.speculative_ddtree_budget < 1:
+        raise ValueError(
+            "--speculative-ddtree-budget must be >= 1, got "
+            f"{server_args.speculative_ddtree_budget}."
+        )
+
+    # DDTree currently uses the non-overlap worker path.
+    server_args.disable_overlap_schedule = True
+
+    block_size = server_args.speculative_num_draft_tokens
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    if (
+        server_args.cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE
+        and server_args.speculative_ddtree_budget > block_size - 1
+    ):
+        server_args.cuda_graph_config.prefill.backend = Backend.DISABLED
+        logger.warning(
+            "Piecewise CUDA graph is disabled for DDTREE full-tree mode "
+            "(budget=%d > block_size-1=%d) to avoid compilation OOM.",
+            server_args.speculative_ddtree_budget,
+            block_size - 1,
+        )
+
+
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48

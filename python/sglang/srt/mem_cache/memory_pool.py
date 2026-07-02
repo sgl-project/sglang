@@ -104,7 +104,10 @@ _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
 
 def conv_window_dedup_enabled(
-    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int]
+    is_npu: bool,
+    is_cpu: bool,
+    speculative_eagle_topk: Optional[int],
+    tree_verify_uses_per_token_ancestors: bool = False,
 ) -> bool:
     """Whether the deduplicated sliding-window conv-intermediate layout is safe.
 
@@ -115,12 +118,20 @@ def conv_window_dedup_enabled(
     columns can need different values from different parent chains -> fall back to
     the dense layout. NPU/CPU also keep the dense layout (their kernels assume
     contiguous per-step windows). See ``MambaPool.__init__``.
+
+    ``tree_verify_uses_per_token_ancestors`` is set by callers whose draft
+    structure can't be inferred from ``speculative_eagle_topk`` alone (e.g.
+    DDTree's full-tree mode keeps ``speculative_eagle_topk == 1`` but still
+    routes the tree-aware mamba scan, so the dedup layout would silently
+    corrupt the accepted chain's conv state).
     """
-    return (
-        not is_npu
-        and not is_cpu
-        and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
-    )
+    if is_npu or is_cpu:
+        return False
+    if speculative_eagle_topk is not None and speculative_eagle_topk > 1:
+        return False
+    if tree_verify_uses_per_token_ancestors:
+        return False
+    return True
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -365,6 +376,7 @@ class MambaPool:
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
+        tree_verify_uses_per_token_ancestors: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -530,7 +542,10 @@ class MambaPool:
                 # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
                 # so the dense fallback reads correctly through the same code path.
                 dedup_conv_window = conv_window_dedup_enabled(
-                    _is_npu, _is_cpu, speculative_eagle_topk
+                    _is_npu,
+                    _is_cpu,
+                    speculative_eagle_topk,
+                    tree_verify_uses_per_token_ancestors=tree_verify_uses_per_token_ancestors,
                 )
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:
@@ -836,6 +851,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
+        tree_verify_uses_per_token_ancestors: bool = False,
     ):
         super().__init__(
             size=size,
@@ -862,6 +878,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
+            tree_verify_uses_per_token_ancestors=tree_verify_uses_per_token_ancestors,
         )
 
     def _init_mamba_pool(
@@ -877,6 +894,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
+        tree_verify_uses_per_token_ancestors: bool = False,
     ):
         self.mamba_pool = MambaPool(
             size=mamba_size,
@@ -890,6 +908,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
+            tree_verify_uses_per_token_ancestors=tree_verify_uses_per_token_ancestors,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

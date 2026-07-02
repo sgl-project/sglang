@@ -253,6 +253,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     self.speculative_num_draft_tokens, model_runner.is_draft_worker
                 )
             )
+            # DDTree's target verify forwards `max_tree_nodes = budget + 1`
+            # tokens per req, which doesn't necessarily equal block_size. The
+            # cudagraph buffers must match runtime exactly (DDTreeVerifyInput
+            # sets draft_token_num to max_tree_nodes), otherwise
+            # mixed_qkv.view(bs, draft_token_num, -1) fails in
+            # gdn_backend.forward_extend. The draft worker still drafts
+            # block_size tokens, so only override on the target path.
+            if (
+                self.model_runner.spec_algorithm.is_ddtree()
+                and not self.model_runner.is_draft_worker
+            ):
+                tree_budget = (
+                    self.model_runner.server_args.speculative_ddtree_budget
+                )
+                if tree_budget is None:
+                    tree_budget = self.speculative_num_draft_tokens - 1
+                self.num_tokens_per_bs = tree_budget + 1
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
@@ -815,7 +832,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                     )
                 if (
-                    self.model_runner.spec_algorithm.is_dflash()
+                    (
+                        self.model_runner.spec_algorithm.is_dflash()
+                        or self.model_runner.spec_algorithm.is_ddtree()
+                    )
                     and self.model_runner.is_draft_worker
                     and "input_embeds" in inspect.signature(forward).parameters
                 ):
@@ -920,7 +940,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
-                self.model_runner.spec_algorithm.is_dflash()
+                (
+                    self.model_runner.spec_algorithm.is_dflash()
+                    or self.model_runner.spec_algorithm.is_ddtree()
+                )
                 and self.model_runner.is_draft_worker
                 and forward_batch.input_embeds is not None
             ):
@@ -947,6 +970,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_ddtree()
                 else max_num_tokens
             )
             bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
@@ -963,7 +987,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         if (
-            self.model_runner.spec_algorithm.is_dflash()
+            (
+                self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_ddtree()
+            )
             and self.model_runner.is_draft_worker
             and forward_batch.input_embeds is not None
         ):
@@ -1121,6 +1148,55 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)
+                    else self.buffers.custom_mask
+                ),
+                capture_hidden_mode=(
+                    CaptureHiddenMode.NULL
+                    if self.model_runner.is_draft_worker
+                    else CaptureHiddenMode.FULL
+                ),
+            )
+
+        elif self.model_runner.spec_algorithm.is_ddtree():
+            # DDTree's target verify forwards `max_tree_nodes = budget + 1`
+            # tokens (which can exceed block_size in full-tree mode). The draft
+            # worker still runs a block_size-sized block, so only the target
+            # path needs the inflated draft_token_num. Both spine and full-tree
+            # share the V2 DDTreeVerifyInput dispatch in DDTreeWorker, but
+            # `topk` MUST match runtime so capture and replay agree on whether
+            # the mamba kernel uses the tree-aware scan:
+            #   - spine (budget <= block_size - 1): topk=1, linear scan
+            #   - full-tree (budget > block_size - 1): topk=2, tree-aware scan
+            # If the dummy topk left 1 for a full-tree config, capture would
+            # record the linear path while replay (topk=2) would re-emit the
+            # tree path -> mamba state corruption.
+            from sglang.srt.speculative.ddtree_info import DDTreeVerifyInput
+
+            block_size = self.speculative_num_draft_tokens
+            tree_budget = self.model_runner.server_args.speculative_ddtree_budget
+            if tree_budget is None:
+                tree_budget = block_size - 1
+            is_full_tree = tree_budget > block_size - 1
+            draft_token_num = (
+                block_size
+                if self.model_runner.is_draft_worker
+                else tree_budget + 1
+            )
+            spec_info = DDTreeVerifyInput(
+                draft_token=None,
+                positions=None,
+                draft_token_num=draft_token_num,
+                tree_budget=tree_budget,
+                topk=2 if is_full_tree else 1,
+                spec_steps=tree_budget,
+                # retrieve_* are filled from the backend's pre-allocated buffers
+                # at capture; only runtime needs the real per-step tensors.
+                retrive_index=None,
+                retrive_next_token=None,
+                retrive_next_sibling=None,
+                custom_mask=(
+                    None
+                    if self.model_runner.is_draft_worker
                     else self.buffers.custom_mask
                 ),
                 capture_hidden_mode=(

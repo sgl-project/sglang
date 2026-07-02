@@ -53,6 +53,21 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
 
+    def _spec_topk(self, spec_info: Optional[SpecInput]) -> int:
+        return int(getattr(spec_info, "topk", self.topk) or self.topk or 0)
+
+    @staticmethod
+    def _get_tree_retrieve_tensors(spec_info: Optional[SpecInput]):
+        if spec_info is None:
+            return None, None
+        retrieve_next_token = getattr(spec_info, "retrieve_next_token", None)
+        retrieve_next_sibling = getattr(spec_info, "retrieve_next_sibling", None)
+        if retrieve_next_token is None:
+            retrieve_next_token = getattr(spec_info, "retrive_next_token", None)
+        if retrieve_next_sibling is None:
+            retrieve_next_sibling = getattr(spec_info, "retrive_next_sibling", None)
+        return retrieve_next_token, retrieve_next_sibling
+
     def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
         """Run deferred clear/COW ops on the forward stream to avoid races."""
         if (
@@ -197,10 +212,9 @@ class MambaAttnBackendBase(AttentionBackend):
                     device=forward_batch.input_ids.device,
                 )
 
-                if self.topk > 1:
-                    retrieve_next_token = forward_batch.spec_info.retrieve_next_token
-                    retrieve_next_sibling = (
-                        forward_batch.spec_info.retrieve_next_sibling
+                if self._spec_topk(forward_batch.spec_info) > 1:
+                    retrieve_next_token, retrieve_next_sibling = (
+                        self._get_tree_retrieve_tensors(forward_batch.spec_info)
                     )
                     # None during dummy run
                     if retrieve_next_token is not None:
@@ -497,7 +511,7 @@ class MambaAttnBackendBase(AttentionBackend):
             else None
         )
 
-        if forward_mode.is_target_verify() and self.topk > 1:
+        if forward_mode.is_target_verify() and self._spec_topk(spec_info) > 1:
             # retrieve_* are None during capture, so skip the copy.
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
@@ -638,17 +652,17 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
-        if forward_mode.is_target_verify() and self.topk > 1:
-            if (
-                spec_info is not None
-                and getattr(spec_info, "retrieve_next_token", None) is not None
-            ):
-                bs_without_pad = spec_info.retrieve_next_token.shape[0]
+        if forward_mode.is_target_verify() and self._spec_topk(spec_info) > 1:
+            retrieve_next_token, retrieve_next_sibling = self._get_tree_retrieve_tensors(
+                spec_info
+            )
+            if retrieve_next_token is not None:
+                bs_without_pad = retrieve_next_token.shape[0]
                 self.retrieve_next_token_list[bs - 1][:bs_without_pad].copy_(
-                    spec_info.retrieve_next_token
+                    retrieve_next_token
                 )
                 self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
-                    spec_info.retrieve_next_sibling
+                    retrieve_next_sibling
                 )
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],

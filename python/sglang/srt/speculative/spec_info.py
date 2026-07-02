@@ -33,6 +33,7 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    DDTREE = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     FROZEN_KV_MTP = auto()
@@ -109,6 +110,9 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
+    def is_ddtree(self) -> bool:
+        return self == SpeculativeAlgorithm.DDTREE
+
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
@@ -116,7 +120,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_target_verify_for_draft(self) -> bool:
-        return self.is_dflash()
+        return self.is_dflash() or self.is_ddtree()
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
@@ -165,6 +169,7 @@ class SpeculativeAlgorithm(Enum):
         In-place updated.
         """
         from sglang.srt.arg_groups.speculative_hook import (
+            _handle_ddtree,
             _handle_dflash,
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
@@ -173,6 +178,8 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dflash():
             _handle_dflash(server_args)
+        elif self.is_ddtree():
+            _handle_ddtree(server_args)
         elif self.is_frozen_kv_mtp():
             _handle_frozen_kv_mtp(server_args)
         elif self.is_eagle() or self.is_standalone():
@@ -213,6 +220,11 @@ class SpeculativeAlgorithm(Enum):
 
             return FrozenKVMTPWorkerV2
 
+        if self.is_ddtree():
+            from sglang.srt.speculative.ddtree_worker import DDTreeWorker
+
+            return DDTreeWorker
+
         # EAGLE / EAGLE3 / STANDALONE / MULTI_LAYER always use the V2 worker,
         # even with overlap disabled (scheduler drives it synchronously).
         if self.is_eagle() and server_args.enable_multi_layer_eagle:
@@ -250,6 +262,8 @@ class SpecInputType(IntEnum):
     FROZEN_KV_MTP_VERIFY = auto()
     DFLASH_DRAFT = auto()
     DFLASH_VERIFY = auto()
+    DDTREE_DRAFT = auto()
+    DDTREE_VERIFY = auto()
     NGRAM_VERIFY = auto()
 
 
@@ -267,6 +281,7 @@ class SpecInput(ABC):
             SpecInputType.EAGLE_DRAFT_EXTEND,
             SpecInputType.FROZEN_KV_MTP_DRAFT,
             SpecInputType.DFLASH_DRAFT,
+            SpecInputType.DDTREE_DRAFT,
         }
 
     def is_verify_input(self) -> bool:
@@ -274,6 +289,7 @@ class SpecInput(ABC):
             SpecInputType.EAGLE_VERIFY,
             SpecInputType.FROZEN_KV_MTP_VERIFY,
             SpecInputType.DFLASH_VERIFY,
+            SpecInputType.DDTREE_VERIFY,
             SpecInputType.NGRAM_VERIFY,
         }
 
@@ -332,6 +348,23 @@ def create_dummy_verify_input(
             draft_token=None,
             positions=None,
             draft_token_num=server_args.speculative_num_draft_tokens,
+            custom_mask=None,
+            capture_hidden_mode=(
+                CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL
+            ),
+        )
+
+    elif spec_algorithm.is_ddtree():
+        from sglang.srt.speculative.ddtree_info import DDTreeVerifyInput
+
+        tree_budget = server_args.speculative_ddtree_budget
+        if tree_budget is None:
+            tree_budget = server_args.speculative_num_draft_tokens - 1
+        spec_info = DDTreeVerifyInput(
+            draft_token=None,
+            positions=None,
+            draft_token_num=tree_budget + 1,
+            tree_budget=tree_budget,
             custom_mask=None,
             capture_hidden_mode=(
                 CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL
