@@ -675,17 +675,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         bonus_tokens: torch.Tensor,
         seq_lens: torch.Tensor,
         cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
     ) -> DSparkDraftInputV2:
         return DSparkDraftInputV2(
             bonus_tokens=bonus_tokens.to(dtype=torch.int64),
             new_seq_lens=seq_lens.to(dtype=torch.int64),
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
-            hidden_states=(
-                hidden_states
-                if hidden_states is not None
-                else torch.empty((0, 0), device=self.device, dtype=torch.float16)
-            ),
         )
 
     def _make_next_draft_input_decode(
@@ -779,16 +773,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             positions=positions,
         )
 
-        last_hidden_indices = torch.cumsum(ctx_lens.to(torch.int64), dim=0) - 1
-        last_hidden_states = logits_output.hidden_states[last_hidden_indices]
-
         logits_output.hidden_states = None
 
         batch_output.next_draft_input = self._make_next_draft_input_prefill(
             bonus_tokens=next_token_ids,
             seq_lens=model_worker_batch.seq_lens,
             cur_allocated_seq_lens_cpu=model_worker_batch.seq_lens_cpu,
-            hidden_states=last_hidden_states,
         )
         verify_done = torch.get_device_module(device).Event()
         verify_done.record()
@@ -829,24 +819,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         block_size = int(self.block_size)
         prefix_lens = model_worker_batch.seq_lens
         req_pool_indices = model_worker_batch.req_pool_indices
-
-        if (
-            draft_input.main_hidden is not None
-            and draft_input.main_hidden_mask is not None
-            and draft_input.main_hidden.shape[0] == bs
-        ):
-            bootstrap_mask = draft_input.main_hidden_mask.to(device=device)
-            bootstrap_mask = bootstrap_mask & (prefix_lens > 0)
-            if bool(bootstrap_mask.any().item()):
-                bootstrap_positions = prefix_lens[bootstrap_mask].to(torch.int64) - 1
-                bootstrap_cache_loc = self.model_runner.req_to_token_pool.req_to_token[
-                    req_pool_indices[bootstrap_mask], bootstrap_positions
-                ]
-                self._materialize_main_hidden_to_draft_kv(
-                    main_hidden=draft_input.main_hidden[bootstrap_mask],
-                    cache_loc=bootstrap_cache_loc,
-                    positions=bootstrap_positions,
-                )
 
         block_ids = torch.full(
             (bs, block_size), self.noise_token_id, dtype=torch.int64, device=device
