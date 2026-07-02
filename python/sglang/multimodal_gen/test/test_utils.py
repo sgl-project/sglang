@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CI_DATA_REVISION = "8db1f7d4daddc8db468f8d3710f0fd65ba03e34a"
+SGL_TEST_FILES_CI_DATA_REVISION = "9ec165b301fda67c54b1bb41ce14fe32c099f4cd"
 
 if current_platform.is_npu():
     SGL_TEST_FILES_CI_DATA_REVISION = "670d66a8a290b62c0c3c077b3e9b0f4a4d9a44e7"

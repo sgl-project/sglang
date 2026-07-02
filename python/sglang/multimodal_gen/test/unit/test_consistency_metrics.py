@@ -54,6 +54,19 @@ def test_remote_video_gt_candidates_survive_inconclusive_probe(monkeypatch):
     ]
 
 
+def test_ltx_hq_remote_gt_uses_sglang_generated(monkeypatch):
+    monkeypatch.setattr(test_utils, "_remote_file_exists", lambda url: True)
+
+    files = test_utils._find_remote_consistency_gt_files(
+        "ltx_2_3_hq_pipeline",
+        1,
+        is_video=True,
+    )
+
+    assert files
+    assert all("/sglang_generated/" in url for _, url in files)
+
+
 def test_platform_gt_candidates_prefer_platform_then_default(monkeypatch):
     monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "5090")
 
