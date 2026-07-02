@@ -1069,7 +1069,6 @@ class QwenImageTransformerBlock(nn.Module):
         # Apply attention gates and add residual (like in Megatron)
         #   - residual_out = gate_x * x + residual_x
         # - x = norm(residual_out) * (1 + scale) + shift
-        # TODO: clean code here
         is_scale_residual = isinstance(norm_module, ScaleResidualLayerNormScaleShift)
 
         shift, scale, gate = mod_params.chunk(3, dim=-1)
@@ -1413,7 +1412,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         txt_seq_lens: Optional[List[int]] = None,
         freqs_cis: tuple[torch.Tensor, torch.Tensor] = None,
         additional_t_cond: Optional[torch.Tensor] = None,
-        guidance: torch.Tensor = None,  # TODO: this should probably be removed
+        guidance: torch.Tensor = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         controlnet_block_samples=None,
         return_dict: bool = True,

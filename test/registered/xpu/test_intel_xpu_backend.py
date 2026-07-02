@@ -34,6 +34,7 @@ def intel_xpu_benchmark(
                 "1",
                 "--device",
                 "xpu",
+                "--disable-decode-cuda-graph",
             ]
             ci_args = ["--input", "64", "--output", "4"] if is_in_ci() else []
             full_args = common_args + ci_args + (extra_args or [])
