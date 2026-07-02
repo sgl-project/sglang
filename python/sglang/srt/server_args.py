@@ -3223,11 +3223,13 @@ class ServerArgs:
         rules = [
             # MLA prefill takes a different attn-forward path under BCG.
             ("MLA attention", lambda: self.use_mla_backend()),
-            # DSV4 is BCG-compatible but introduces heavy memory pressure: the
-            # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
+            # DSV4 target-prefill BCG replay corrupts the hidden states fed
+            # to the spec draft (garbled outputs; reproduces on main with
+            # BCG forced). Plain DSV4 prefill under BCG is bit-correct.
             (
-                "DeepSeek-V4 (heavy capture-pool memory pressure)",
-                lambda: is_deepseek_v4(self.get_model_config().hf_config),
+                "DeepSeek-V4 with speculative decoding",
+                lambda: self.speculative_algorithm is not None
+                and is_deepseek_v4(self.get_model_config().hf_config),
             ),
             # CP all_gather replay size mismatch under BCG.
             ("context parallel (attn_cp_size > 1)", lambda: self.attn_cp_size > 1),
@@ -3505,6 +3507,34 @@ class ServerArgs:
                 else:
                     # For MLA backend the memory overhead is much higher than expected with fa3
                     reserved_mem += 1.5 * 1024
+
+                from sglang.srt.configs.model_config import is_deepseek_v4
+
+                if prefill_cuda_graph_config.backend == Backend.BREAKABLE and (
+                    is_deepseek_v4(self.get_model_config().hf_config)
+                ):
+                    # DSV4's breakable prefill graph records the c4-indexer
+                    # fp32 logits scratch — num_tokens × (context_len / 4)
+                    # elements, i.e. context_len bytes per captured token —
+                    # into the graph pool, where it stays live for replay.
+                    context_len = self.get_model_config().context_len
+                    reserved_mem += (
+                        prefill_cuda_graph_config.max_bs * context_len / (1 << 20)
+                    )
+                    # Each bucket also retains captured attention metadata,
+                    # dominated by its page table: num_tokens × (context_len
+                    # / page_size 64) int32 entries = context_len / 16 bytes
+                    # per token, summed over all capture buckets.
+                    reserved_mem += (
+                        sum(prefill_cuda_graph_config.bs) * context_len / 16 / (1 << 20)
+                    )
+                    # Segment-bridge buffers (~30 MB per bucket), first-capture
+                    # pool overhead, and DeepGEMM JIT workspaces. Measured on
+                    # 4x B200 tp=4: total BCG capture usage is ~9.7 GB, ~3 GB
+                    # above the two modeled terms; without this headroom,
+                    # EAGLE's verify/draft graphs exhaust the remainder and
+                    # runtime allocations (e.g. NCCL buffers) fail.
+                    reserved_mem += 3 * 1024
 
             if gpu_mem is not None and gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)

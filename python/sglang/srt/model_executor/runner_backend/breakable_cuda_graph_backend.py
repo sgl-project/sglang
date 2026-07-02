@@ -103,19 +103,41 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             finally:
                 self._capture_stream = None
 
-    def capture_one(
+    def warmup_one(
         self,
-        shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
-        dummies: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
+        """Run the two eager warmup iterations for one shape. The prefill
+        runner calls this for every shape before any capture (see
+        _capture_one_stream): warmup transients (e.g. DSV4's ~4 GB
+        c4-indexer scratch) then live in the regular caching allocator and
+        get reused across shapes, instead of coexisting with the graph
+        mempool, which cannot use regular cached blocks.
+        """
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
             forward_fn()
             if post_warmup_hook is not None:
                 post_warmup_hook()
+
+    def capture_one(
+        self,
+        shape_key: ShapeKey,
+        forward_fn: Callable[[], Any],
+        dummies: Optional[Any] = None,
+        post_warmup_hook: Optional[Callable[[], None]] = None,
+        skip_warmup: bool = False,
+    ) -> None:
+        if not skip_warmup:
+            self.warmup_one(forward_fn, post_warmup_hook)
+            # Return warmup transients to the driver before recording — the
+            # graph mempool cannot use blocks cached by the regular
+            # allocator, so keeping them reserved ratchets memory up per
+            # bucket until capture OOMs.
+            self._device_module.synchronize()
+            self._device_module.empty_cache()
 
         graph = BreakableCUDAGraph(self.deduped_cuda_graph)
         captured_fn = (
