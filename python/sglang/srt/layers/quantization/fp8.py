@@ -1349,7 +1349,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         num_experts, n, _ = scale_param.data.shape
                         k = weight_param.shape[2] * 2
                         scale_param.data = transform_sf_into_required_layout(
-                            scale_param.data,
+                            scale_param.data.contiguous(),
                             mn=n,
                             k=k,
                             recipe=(1, 32),

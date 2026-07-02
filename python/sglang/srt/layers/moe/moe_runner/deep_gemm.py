@@ -29,6 +29,7 @@ from sglang.srt.utils import (
     is_npu,
 )
 from sglang.srt.utils.offloader import get_offloader
+from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -393,6 +394,15 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 hidden_states_scale = _cast_to_e8m0_with_rounding_up(
                     hidden_states_scale
                 )
+            # SM120: _cast_to_e8m0_with_rounding_up produces INT32 with
+            # non-TMA-aligned strides. Apply TMA alignment for SM120's
+            # grouped GEMM which validates strides in check_sf_layout.
+            if is_sm120_supported():
+                hidden_states_scale = (
+                    deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
+                        hidden_states_scale.view(torch.float32)
+                    ).view(torch.int32)
+                )
         elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 hidden_states_scale
@@ -422,13 +432,20 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             assert (
                 not _MASKED_GEMM_FAST_ACT
             ), "DeepSeek V4 does not support SGLANG_MASKED_GEMM_FAST_ACT"
-            assert (
-                envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-            ), "DeepSeek V4 requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
 
-            if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
+            # When JIT EP activation can run (hidden_dim/8 >= num_experts),
+            # use fused swiglu_limit path. Otherwise, pass swiglu_limit
+            # through to _varlen_deep_gemm_silu_mul_quant which handles the
+            # fallback (separate clamp + Triton SiLU+Mul+Quant).
+            E_check, _, D2_check = gateup_output.shape
+            can_use_jit = (
+                envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
+                and (D2_check // 2) // 8 >= E_check
+            )
+
+            if can_use_jit and envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
                 swiglu_limit_arg = self.swiglu_limit
-            else:
+            elif can_use_jit:
                 gateup_output = einops.rearrange(
                     gateup_output, "grp tok hidden -> (grp tok) hidden"
                 )
@@ -438,6 +455,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 gateup_output = einops.rearrange(
                     gateup_output, "(grp tok) hidden -> grp tok hidden", grp=num_groups
                 )
+            else:
+                # JIT kernel can't handle this shape; let the quant
+                # function apply swiglu_limit in its Triton fallback.
+                swiglu_limit_arg = self.swiglu_limit
 
         # Act
         down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
@@ -874,6 +895,10 @@ def _varlen_deep_gemm_silu_mul_quant(
     use_jit_ep_activation = envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
     if N % 4 != 0 or G % 4 != 0 or D // 8 < E:
         use_jit_ep_activation = False
+    # JIT kernel requires num_threads (D//8) >= num_experts (E).
+    # On SM120 with TP>=2, hidden_dim is too small (e.g. TP=4: 512/8=64 < 256).
+    if use_jit_ep_activation and D // 8 < E:
+        use_jit_ep_activation = False
 
     if use_jit_ep_activation:
         packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
@@ -897,12 +922,12 @@ def _varlen_deep_gemm_silu_mul_quant(
         if packed_ue8m0:
             down_input_scale = down_input_scale.transpose(-1, -2)
     else:
-        assert (
-            swiglu_limit is None
-        ), "swiglu_limit (DeepSeek V4) requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
-        assert (
-            not swizzle
-        ), "SGLANG_OPT_FIX_MEGA_MOE_MEMORY requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+        # Triton fallback: apply swiglu_limit in-place, then SiLU+Mul+Quant
+        if swiglu_limit is not None:
+            orig_shape = gateup_output.shape
+            gateup_output = gateup_output.view(-1, orig_shape[-1])
+            _apply_swiglu_limit(gateup_output, swiglu_limit)
+            gateup_output = gateup_output.view(orig_shape)
         down_input_scale = torch.empty(
             (E, N, G),
             device=hidden_states_device,
@@ -916,6 +941,16 @@ def _varlen_deep_gemm_silu_mul_quant(
             masked_m,
             scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         )
+        # Convert fp32 scales to packed int32 UE8M0 if needed by DeepGEMM
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            down_input_scale = _cast_to_e8m0_with_rounding_up(down_input_scale)
+            # SM120: apply TMA alignment to the packed INT32 scales
+            if is_sm120_supported():
+                down_input_scale = (
+                    deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
+                        down_input_scale.view(torch.float32)
+                    ).view(torch.int32)
+                )
     return down_input, down_input_scale
 
 
@@ -923,17 +958,11 @@ def _apply_swiglu_limit(
     gateup_output: torch.Tensor, swiglu_limit: float
 ) -> torch.Tensor:
     assert swiglu_limit == 10
-
-    num_tokens, hidden_size_x2 = gateup_output.shape
     assert gateup_output.dtype == torch.bfloat16
 
-    gate, up = torch.chunk(gateup_output, chunks=2, dim=-1)
-    assert gate.shape == (num_tokens, hidden_size_x2 // 2)
-    assert up.shape == (num_tokens, hidden_size_x2 // 2)
-
-    up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
-    gate = torch.clamp(gate, max=swiglu_limit)
-
-    out = torch.cat([gate, up], dim=-1)
-    assert out.shape == (num_tokens, hidden_size_x2)
-    return out
+    num_tokens, hidden_size_x2 = gateup_output.shape
+    half = hidden_size_x2 // 2
+    # In-place clamp avoids torch.cat overhead (7.4ms/step from CatArrayBatchedCopy)
+    gateup_output[:, :half].clamp_(max=swiglu_limit)
+    gateup_output[:, half:].clamp_(min=-swiglu_limit, max=swiglu_limit)
+    return gateup_output
