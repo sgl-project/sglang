@@ -101,6 +101,66 @@ python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-R1 --tp 8 --tru
 
 For configuring CPU service, please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
+### 3.4 NVIDIA B200 NVFP4 Deployment with MTP
+
+The NVFP4 checkpoint [nvidia/DeepSeek-R1-0528-FP4-v2](https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2) runs on **4× B200** (half a node) with EAGLE Multi-Token Prediction. Serve it with `--quantization modelopt_fp4`, the TRT-LLM MLA attention backend, and the FlashInfer TRT-LLM MoE runner. The two configurations below trade latency for throughput; both require **SGLang ≥ v0.5.12.post1**.
+
+**Latency-optimized (low concurrency, TP4 / EP1):**
+
+```bash Command
+SGLANG_ENABLE_SPEC_V2=1 SGLANG_RADIX_FORCE_MISS=1 python3 -m sglang.launch_server \
+  --model-path nvidia/DeepSeek-R1-0528-FP4-v2 \
+  --quantization modelopt_fp4 \
+  --tp 4 --dp 1 --ep-size 1 \
+  --attention-backend trtllm_mla \
+  --moe-runner-backend flashinfer_trtllm \
+  --enable-flashinfer-allreduce-fusion \
+  --kv-cache-dtype fp8_e4m3 \
+  --cuda-graph-max-bs 256 --max-running-requests 256 \
+  --mem-fraction-static 0.85 \
+  --chunked-prefill-size 16384 \
+  --disable-piecewise-cuda-graph \
+  --stream-interval 10 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 2 \
+  --speculative-num-draft-tokens 3 \
+  --speculative-eagle-topk 1 \
+  --trust-remote-code
+```
+
+**Throughput-optimized (high concurrency, TP4 / EP4 + DP attention):**
+
+```bash Command
+SGLANG_ENABLE_SPEC_V2=1 SGLANG_RADIX_FORCE_MISS=1 python3 -m sglang.launch_server \
+  --model-path nvidia/DeepSeek-R1-0528-FP4-v2 \
+  --quantization modelopt_fp4 \
+  --tp 4 --dp 4 --ep-size 4 \
+  --enable-dp-attention \
+  --enable-dp-attention-local-control-broadcast \
+  --enable-dp-lm-head \
+  --attention-backend trtllm_mla \
+  --moe-runner-backend flashinfer_trtllm \
+  --enable-flashinfer-allreduce-fusion \
+  --kv-cache-dtype fp8_e4m3 \
+  --cuda-graph-max-bs 256 --max-running-requests 256 \
+  --mem-fraction-static 0.85 \
+  --chunked-prefill-size 32768 \
+  --scheduler-recv-interval 1 \
+  --disable-piecewise-cuda-graph \
+  --stream-interval 10 \
+  --schedule-conservativeness 3.33 \
+  --enable-prefill-delayer \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 2 \
+  --speculative-num-draft-tokens 3 \
+  --speculative-eagle-topk 1 \
+  --trust-remote-code
+```
+
+<Note>
+Use EP1 (no DP attention) for the lowest latency at small batch sizes. Switch to EP4 with DP attention (`--enable-dp-attention` plus `--enable-dp-attention-local-control-broadcast` and `--enable-dp-lm-head`) once concurrency is high enough to saturate the GPUs; the `--enable-prefill-delayer`, `--schedule-conservativeness 3.33`, `--scheduler-recv-interval 1`, and larger `--chunked-prefill-size 32768` settings are tuned for that high-throughput regime.
+</Note>
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
