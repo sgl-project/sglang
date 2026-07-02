@@ -1213,7 +1213,8 @@ async def remote_instance_transfer_engine_info(rank: int = None):
 
     server_args = _global_state.tokenizer_manager.server_args
     try:
-        resp = requests.get(
+        resp = await asyncio.to_thread(
+            requests.get,
             f"{server_args.engine_info_bootstrap_url}/get_transfer_engine_info",
             params={"rank": rank},
             timeout=5,
