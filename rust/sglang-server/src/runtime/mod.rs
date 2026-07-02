@@ -116,6 +116,15 @@ impl ServerArgs {
             .unwrap_or("")
     }
 
+    /// The model path (HF repo id / local dir) reported by `/get_model_info`.
+    /// The SGLang lang backend (`RuntimeEndpoint`) uses it for chat-template
+    /// detection. Falls back to the served name if `model_path` is absent.
+    pub fn model_path(&self) -> &str {
+        self.str_field("model_path")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.served_model_name())
+    }
+
     /// `max_model_len` for `/v1/models`: the resolved `model_config.context_len`
     /// (model_config is attached to server_args before the dump), falling back
     /// to the `context_length` user override.
