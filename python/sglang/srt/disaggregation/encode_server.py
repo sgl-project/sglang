@@ -89,6 +89,11 @@ logger = logging.getLogger(__name__)
 
 HEALTH_CHECK_TIMEOUT = 30
 
+
+def is_health_check_request(rid: Optional[str]) -> bool:
+    return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+
+
 # Minimal 32x32 black PNG for health check dummy encode
 MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
@@ -1438,7 +1443,7 @@ class MMEncoder:
 
         return normalized
 
-    async def _process_mm_items(self, mm_items, modality):
+    async def _process_mm_items(self, mm_items, modality, log_metrics: bool = True):
         model_preprocessor = getattr(self.model, "preprocess_mm_for_encoder", None)
 
         preprocess_start = time.perf_counter()
@@ -1456,7 +1461,7 @@ class MMEncoder:
             )
         else:
             raise ValueError(f"Unsupported modality: {modality}")
-        if encoder_metrics_collector is not None:
+        if encoder_metrics_collector is not None and log_metrics:
             encoder_metrics_collector.observe_preprocess(
                 time.perf_counter() - preprocess_start, modality=modality.name.lower()
             )
@@ -1571,12 +1576,16 @@ class MMEncoder:
         processor_input["audio_feature_lens"] = output_lengths
         return processor_input
 
-    async def _encode(self, mm_items, modality: Modality) -> torch.Tensor:
+    async def _encode(
+        self, mm_items, modality: Modality, log_metrics: bool = True
+    ) -> torch.Tensor:
         modality_str = modality.name.lower()
         try:
             # preprocess latency is observed inside _process_mm_items so all
             # callers (encode / batch_encode / global-cache) are covered.
-            mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
+            mm_inputs, get_feature_fn = await self._process_mm_items(
+                mm_items, modality, log_metrics=log_metrics
+            )
         except NotImplementedError as e:
             raise InternalError(f"Not implemented error: {str(e)}")
         except Exception as e:
@@ -1598,7 +1607,8 @@ class MMEncoder:
                 mm_item.set(k, _convert(v))
 
             cache_hit = False
-            if self.server_args.enable_prefix_mm_cache:
+            use_mm_cache = self.server_args.enable_prefix_mm_cache and log_metrics
+            if use_mm_cache:
                 mm_item.set_pad_value()
                 mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
                 async with self.mm_cache_lock:
@@ -1614,16 +1624,13 @@ class MMEncoder:
                     mm_embedding = mm_embedding.cpu()
                 if len(mm_embedding.shape) != 2:
                     mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
-                if encoder_metrics_collector is not None:
+                if encoder_metrics_collector is not None and log_metrics:
                     encoder_metrics_collector.observe_model_forward(
                         time.perf_counter() - forward_start, modality=modality_str
                     )
 
             # Per-request cache hit metrics: tokens = embedding rows, files = 1 item.
-            if (
-                self.server_args.enable_prefix_mm_cache
-                and encoder_metrics_collector is not None
-            ):
+            if use_mm_cache and encoder_metrics_collector is not None:
                 total_tokens = int(mm_embedding.shape[0])
                 hit_tokens = total_tokens if cache_hit else 0
                 encoder_metrics_collector.record_cache_tokens(
@@ -1633,7 +1640,7 @@ class MMEncoder:
                     1 if cache_hit else 0, 1, modality=modality_str
                 )
 
-            if self.server_args.enable_prefix_mm_cache:
+            if use_mm_cache:
                 async with self.mm_cache_lock:
                     entries_before = len(self.mm_cache)
                     already_present = self.mm_cache.has(mm_hash)
@@ -1664,7 +1671,7 @@ class MMEncoder:
                 if encode_video_audio_fn is not None:
                     audio_forward_start = time.perf_counter()
                     audio_embedding = encode_video_audio_fn(mm_inputs)
-                    if encoder_metrics_collector is not None:
+                    if encoder_metrics_collector is not None and log_metrics:
                         encoder_metrics_collector.observe_model_forward(
                             time.perf_counter() - audio_forward_start, modality="audio"
                         )
@@ -1810,7 +1817,10 @@ class MMEncoder:
         self, mm_items, modality: Modality, req_id, num_parts, part_idx, hashes=None
     ):
         try:
-            grid_dim, mm_embedding, aux_data = await self._encode(mm_items, modality)
+            log_metrics = not is_health_check_request(req_id)
+            grid_dim, mm_embedding, aux_data = await self._encode(
+                mm_items, modality, log_metrics=log_metrics
+            )
 
             if self.rank == 0:
                 mm_data = EmbeddingData(
@@ -2751,6 +2761,7 @@ class DPDispatcher:
         result_socket,
         worker_processes: List[mp.Process],
         enable_metrics: bool = False,
+        labels: Optional[Dict[str, str]] = None,
     ):
         self.dp_size = dp_size
         self.dispatch_sockets = dispatch_sockets
@@ -2771,6 +2782,7 @@ class DPDispatcher:
 
         # Prometheus gauge: pending requests per DP rank. Lives in the main
         # process (the dispatcher), unlike the per-worker EncoderMetricsCollector.
+        self.labels = dict(labels or {})
         self.pending_gauge = None
         if enable_metrics:
             from prometheus_client import Gauge
@@ -2778,7 +2790,7 @@ class DPDispatcher:
             self.pending_gauge = Gauge(
                 name="sglang:encoder_dp_pending_requests",
                 documentation="Number of pending requests per encoder DP rank.",
-                labelnames=["dp_rank"],
+                labelnames=list(self.labels.keys()) + ["dp_rank"],
                 multiprocess_mode="mostrecent",
             )
 
@@ -2790,7 +2802,7 @@ class DPDispatcher:
         """Push current pending counts to the Prometheus gauge (absolute set)."""
         if self.pending_gauge is not None:
             for i, c in enumerate(self.pending_counts):
-                self.pending_gauge.labels(dp_rank=str(i)).set(c)
+                self.pending_gauge.labels(**self.labels, dp_rank=str(i)).set(c)
 
     @property
     def alive_ranks(self) -> List[int]:
@@ -3642,12 +3654,16 @@ def _launch_server_dp(server_args: ServerArgs):
             proc.start()
         worker_processes.append(proc)
 
+    labels = {"model_name": server_args.served_model_name}
+    if server_args.extra_metric_labels:
+        labels.update(server_args.extra_metric_labels)
     dp_dispatcher = DPDispatcher(
         dp_size,
         dispatch_sockets,
         result_socket,
         worker_processes,
         enable_metrics=server_args.enable_metrics,
+        labels=labels,
     )
 
     # Register this encoder's URL with prefill server(s) if configured.
