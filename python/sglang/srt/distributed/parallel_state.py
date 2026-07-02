@@ -629,6 +629,12 @@ class GroupCoordinator:
             and not should_use_pymscclpp_allreduce
         ):
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
+            # NCCL symmetric-memory all-reduce can corrupt results when captured
+            # and replayed in a CUDA graph on some runtime combinations. Keep
+            # symm-mem for eager execution, but use standard NCCL while capturing.
+            if torch.cuda.is_current_stream_capturing():
+                torch.distributed.all_reduce(input_, group=self.device_group)
+                return input_
             with self.pynccl_comm.change_state(enable=True):
                 self.pynccl_comm.all_reduce(input_)
                 return input_
