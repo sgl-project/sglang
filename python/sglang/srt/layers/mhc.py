@@ -345,7 +345,6 @@ def mhc_pre_gemm_sqrsum_tilelang(
                 out_frag,
                 transpose_A=False,
                 transpose_B=True,
-                wg_wait=0,
                 clear_accum=False,
             )
         sqrsum_l = T.alloc_fragment(token_block, T.float32)
@@ -426,7 +425,6 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
                     out_frag,
                     transpose_A=False,
                     transpose_B=True,
-                    wg_wait=0,
                     clear_accum=False,
                 )
 
