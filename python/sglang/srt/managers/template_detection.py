@@ -48,7 +48,8 @@ class TemplateDetectionContext:
         return re.search(pattern, self.template, flags) is not None
 
     def has_vocab_pattern(self, pattern: str) -> bool:
-        return any(re.search(pattern, tok) for tok in self.vocab)
+        compiled = re.compile(pattern)
+        return any(isinstance(tok, str) and compiled.search(tok) for tok in self.vocab)
 
 
 @dataclass(frozen=True)

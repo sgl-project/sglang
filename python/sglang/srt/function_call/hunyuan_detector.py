@@ -50,6 +50,8 @@ def resolve_hunyuan_tokens(tokenizer) -> Dict[str, str]:
             vocab = None
     if vocab:
         for tok in vocab:
+            if not isinstance(tok, str):
+                continue
             m = _HUNYUAN_TOKEN_RE.match(tok)
             if m:
                 tokens[m.group("name")] = tok
