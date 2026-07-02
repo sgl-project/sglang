@@ -1063,6 +1063,8 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         scale_args = {
             "scale": [weight_scale],
             "per_token_scale": [pertoken_scale],
+            # "x_dtype": torch_npu.float4_e2m1fn_x2, 
+            "weight_dtype": torch_npu.float4_e2m1fn_x2,
             "scale_dtype": torch_npu.float8_e8m0fnu,
             "per_token_scale_dtype": torch_npu.float8_e8m0fnu,
         }
