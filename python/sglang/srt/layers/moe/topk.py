@@ -1417,7 +1417,7 @@ def biased_grouped_topk_gpu(
         if num_fused_shared_experts > 0:
             # Append shared expert columns: ID = num_experts (first shared slot),
             # weight = sum(routed) / scaling_factor (matching biased_grouped_topk_impl).
-            # For DeepEP/MegaMOE per-rank shared-slot layouts, post-process remaps
+            # For DeepEP/MegaMOE per-rank shared-slot layout, post-process remaps
             # this placeholder ID and overwrites the shared weight for the active scaling path.
             topk_ids = F.pad(topk_ids, (0, num_fused_shared_experts), value=num_experts)
             topk_weights = F.pad(topk_weights, (0, num_fused_shared_experts))
@@ -1636,11 +1636,11 @@ def remap_topk_for_per_rank_shared_slots(
     num_physical_routed_experts: int,
     topk_config: TopKConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Remap TopK output to an interleaved per-rank shared expert layout.
+    """Remap TopK IDs to a per-rank shared-slot layout.
 
     DeepEP and MegaMoE dispatch need each rank's shared expert at a unique ID
-    so tokens route to the correct rank. The layout interleaves shared slots
-    among routed experts: [routed_0..L-1, shared, routed_L..2L-1, shared, ...].
+    so tokens route to the correct rank. The layout is ordered by rank:
+    [rank0 routed..., rank0 shared, rank1 routed..., rank1 shared, ...].
 
     Routed IDs:  e -> e + e // num_local_routed
     Shared IDs:  ep_rank * num_local_experts + num_local_routed
@@ -1653,7 +1653,7 @@ def remap_topk_for_per_rank_shared_slots(
     ep_rank = get_parallel().moe_ep_rank
     # Static EPLB may add redundant physical experts. At this point routed
     # topk_ids have already been remapped from logical to physical ids, so the
-    # interleaved layout must use the physical routed count.
+    # per-rank shared-slot layout must use the physical routed count.
     num_local_routed = num_physical_routed_experts // ep_size
     num_local_experts = num_local_routed + num_fused_shared_experts
 
@@ -1768,8 +1768,8 @@ def _post_process_topk_ids(
             )
             topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
             # ExpertDistributionRecorder tracks EPLB physical routed experts.
-            # Per-rank shared-slot dispatch later inserts local shared slots into
-            # topk_ids, so keep the routed physical ids separately for stats.
+            # Per-rank shared-slot remap later adds shared slots to the topk ID
+            # space, so keep the routed physical ids separately for statistics.
             recorder_topk_ids = routed_cols
         else:
             topk_ids = _biased_grouped_topk_postprocess(
@@ -1861,7 +1861,7 @@ def _post_process_topk_ids(
         )
 
     elif use_per_rank_shared_slots:
-        # DeepEP/MegaMOE: remap to interleaved expert layout where each
+        # DeepEP/MegaMOE: remap to per-rank shared-slot layout where each
         # rank's shared expert has a unique ID for dispatch routing.
         num_physical_routed_experts = (
             expert_location_dispatch_info.num_physical_experts
