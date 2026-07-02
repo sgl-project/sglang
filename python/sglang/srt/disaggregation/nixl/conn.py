@@ -1715,6 +1715,17 @@ class NixlKVManager(CommonKVManager):
                     f"(room={kv_chunk.room}). Increase "
                     f"SGLANG_DISAGG_STAGING_POOL_SIZE_MB."
                 )
+            # STAGING_RSP / WATERMARK are fire-and-forget; if one was lost,
+            # this chunk would otherwise re-enqueue forever. Re-request after
+            # a stall so decode replays the allocation and watermark.
+            staging_strategy.maybe_resend_staging_req(
+                kv_chunk.room,
+                chunk_idx,
+                num_pages,
+                req.agent_name,
+                req.endpoint,
+                req.dst_port,
+            )
             queue.put(kv_chunk)
             return (None, True)
 
