@@ -737,10 +737,13 @@ def bmm_batch_invariant(a, b, *, out=None):
         N = b.shape[2]
         dtype = a.dtype
 
-        if dtype == torch.float32:
-            return torch.baddbmm(
-                torch.empty((B, M, N), device=a.device, dtype=dtype), a, b, beta=0.0, alpha=1.0
-            )
+        # NOTE: fp32 must NOT short-circuit to torch.baddbmm (cuBLAS). cuBLAS is neither
+        # batch- nor M-invariant: its fp32 output for one query row (M=1, decode) differs
+        # from the same row inside an M=64 batch (prefill) by ~1e-5, and Megatron's
+        # bmm_batch_invariant (batch_invariant_kernels.py) routes fp32 through the Triton
+        # persistent kernel with no such short-circuit. Routing fp32 here through the same
+        # Triton kernel makes sglang decode reproduce Megatron's chunked delta rule per token
+        # bit-for-bit (the GDN incremental chunk-replay depends on this M-invariance).
 
         # Allocate output
         if out is None:

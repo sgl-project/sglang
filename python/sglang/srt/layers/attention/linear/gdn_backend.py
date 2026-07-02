@@ -179,8 +179,16 @@ def torch_chunk_gated_delta_rule(
     cache_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
     chunk_size: int = 64,
+    return_boundary_state: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, None]:
-    """Pure PyTorch chunked gated delta rule matching Megatron's deterministic implementation."""
+    """Pure PyTorch chunked gated delta rule matching Megatron's deterministic implementation.
+
+    When return_boundary_state=True the 3rd tuple element is the recurrent state as it enters
+    the final (possibly partial) chunk, i.e. the state after folding every COMPLETE 64-chunk.
+    For an aligned sequence (sequence_length % chunk_size == 0) this equals last_recurrent_state.
+    Decode chunk-replay seeds from this boundary state and replays the trailing partial-chunk
+    tokens, reproducing Megatron's full-sequence per-token output bit-for-bit.
+    """
     # Normalize memory layout: SGLang passes non-contiguous views (sliced from the fused
     # qkv projection) while Megatron passes contiguous tensors. Identical values in different
     # strides make the bf16 L2-norm reduction and downstream fp32 bmm tiling pick different
@@ -259,6 +267,13 @@ def torch_chunk_gated_delta_rule(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
     )
 
+    # State entering the final (possibly partial) chunk: the recurrent state after folding all
+    # COMPLETE 64-chunks. Captured right after the (num_complete_chunks-1)-th fold so it is
+    # correct both for aligned prompts (equals last_recurrent_state) and misaligned prompts
+    # (the seed decode replays the trailing partial-chunk tokens from).
+    num_complete_chunks = sequence_length // chunk_size
+    boundary_state = last_recurrent_state  # correct when num_complete_chunks == 0
+
     for i in range(0, total_sequence_length // chunk_size):
         q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
         attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
@@ -270,12 +285,16 @@ def torch_chunk_gated_delta_rule(
             last_recurrent_state * g[:, :, i, -1, None, None].exp()
             + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
         )
+        if return_boundary_state and (i + 1) == num_complete_chunks:
+            boundary_state = last_recurrent_state
 
     core_attn_out = core_attn_out.reshape(
         core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
     )
     core_attn_out = core_attn_out[:, :, :sequence_length]
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    if return_boundary_state:
+        return core_attn_out, last_recurrent_state, boundary_state
     return core_attn_out, last_recurrent_state, None
 
 
@@ -491,6 +510,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
+        # Batch-invariant decode chunk-replay cache, keyed by (layer_id, slot). Each entry holds
+        # the recurrent state entering the current partial 64-chunk (boundary) plus the raw
+        # post-conv q/k/v and pre-gating a/b for every token since that boundary. Decode replays
+        # torch_chunk_gated_delta_rule over the growing partial chunk to reproduce Megatron's
+        # full-sequence per-token output bit-for-bit. Populated at prefill (trailing partial
+        # chunk) and advanced each decode step; the 64th token folds a new boundary and clears
+        # the token buffer. Only allocated for active slots (scales with batch, not pool size).
+        self.gdn_replay_cache = {}
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -503,6 +530,167 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+
+    def _gdn_chunk_replay_decode(
+        self,
+        layer: "RadixLinearAttention",
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Differentiable incremental chunk-replay decode (batch-invariant path).
+
+        Reproduces Megatron's full-sequence torch_chunk_gated_delta_rule output for each decode
+        token bit-for-bit. For every active slot we keep, since the last completed 64-boundary:
+        the recurrent boundary state and the raw post-conv q/k/v + pre-gating a/b of each token
+        in the partial chunk. Each step appends the new token and re-runs torch_chunk over the
+        partial chunk (width = tokens-since-boundary) seeded by the boundary state, returning the
+        last row. When the partial chunk reaches 64 tokens we fold a fresh boundary and clear the
+        buffer. Uses the exact production torch_chunk math, so it is autograd-differentiable via
+        the same graph (including the _solve_fwd_sub analytic VJP).
+
+        mixed_qkv: [B, q_dim+k_dim+v_dim] post-conv, one decode token per row.
+        a, b: [B, HV] pre-gating inputs. Returns [1, B, HV, head_v_dim].
+        """
+        B = mixed_qkv.shape[0]
+        q_flat, k_flat, v_flat = torch.split(
+            mixed_qkv, [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
+        )
+        q_tok = q_flat.view(B, layer.num_k_heads, layer.head_k_dim)
+        k_tok = k_flat.view(B, layer.num_k_heads, layer.head_k_dim)
+        v_tok = v_flat.view(B, layer.num_v_heads, layer.head_v_dim)
+        cidx_cpu = cache_indices.tolist()
+        outputs = mixed_qkv.new_empty(B, layer.num_v_heads, layer.head_v_dim)
+        zero_cidx = torch.zeros(1, dtype=torch.long, device=mixed_qkv.device)
+
+        for j in range(B):
+            slot = cidx_cpu[j]
+            if slot == PAD_SLOT_ID:
+                outputs[j].zero_()
+                continue
+            entry = self.gdn_replay_cache.get((layer.layer_id, slot))
+            if entry is None:
+                # No prefill-seeded partial chunk (aligned prompt or missing): start empty at a
+                # zero-fold boundary. The prefill path seeds this for the common misaligned case.
+                entry = {
+                    "boundary": torch.zeros(
+                        1, layer.num_v_heads, layer.head_k_dim, layer.head_v_dim,
+                        device=mixed_qkv.device, dtype=torch.float32,
+                    ),
+                    "q": [], "k": [], "v": [], "a": [], "b": [],
+                }
+                self.gdn_replay_cache[(layer.layer_id, slot)] = entry
+            entry["q"].append(q_tok[j])
+            entry["k"].append(k_tok[j])
+            entry["v"].append(v_tok[j])
+            entry["a"].append(a[j])
+            entry["b"].append(b[j])
+            w = len(entry["q"])
+            q_seq = torch.stack(entry["q"], dim=0).unsqueeze(0)  # [1, w, HK, Dk]
+            k_seq = torch.stack(entry["k"], dim=0).unsqueeze(0)
+            v_seq = torch.stack(entry["v"], dim=0).unsqueeze(0)  # [1, w, HV, Dv]
+            a_seq = torch.stack(entry["a"], dim=0)  # [w, HV]
+            b_seq = torch.stack(entry["b"], dim=0)
+            g_seq, beta_seq = torch_gdn_gating(layer.A_log, a_seq, b_seq, layer.dt_bias)
+            qsl = torch.tensor([0, w], dtype=torch.int32, device=mixed_qkv.device)
+            core, last, boundary = torch_chunk_gated_delta_rule(
+                q_seq, k_seq, v_seq, g=g_seq, beta=beta_seq,
+                ssm_states=entry["boundary"], cache_indices=zero_cidx,
+                query_start_loc=qsl, return_boundary_state=True,
+            )
+            outputs[j] = core[0, -1]
+            if w == FLA_CHUNK_SIZE:
+                # Completed a 64-chunk: fold it into a fresh boundary and reset the token buffer.
+                entry["boundary"] = last.detach()
+                entry["q"].clear(); entry["k"].clear(); entry["v"].clear()
+                entry["a"].clear(); entry["b"].clear()
+
+        return outputs.unsqueeze(0)
+
+    def _seed_gdn_replay_cache(
+        self,
+        layer: "RadixLinearAttention",
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        cache_indices: torch.Tensor,
+        ssm_states: torch.Tensor,
+    ) -> None:
+        """Seed the decode chunk-replay cache from a completed batch-invariant prefill.
+
+        For each prefill sequence: the boundary state is the recurrent state after folding all
+        complete 64-chunks (obtained by replaying torch_chunk over the complete-chunk prefix from
+        the sequence's initial ssm state), and the partial-chunk buffer holds the raw post-conv
+        q/k/v + pre-gating a/b of the trailing (seqlen % 64) tokens. Decode appends to this buffer
+        and re-runs torch_chunk, so decode token 0 reproduces Megatron's row at position seqlen.
+
+        mixed_qkv is [total_tokens, q_dim+k_dim+v_dim] post-conv; a, b are [total_tokens, HV].
+        """
+        q_flat, k_flat, v_flat = torch.split(
+            mixed_qkv, [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
+        )
+        q_all = q_flat.view(-1, layer.num_k_heads, layer.head_k_dim)
+        k_all = k_flat.view(-1, layer.num_k_heads, layer.head_k_dim)
+        v_all = v_flat.view(-1, layer.num_v_heads, layer.head_v_dim)
+        qsl_cpu = query_start_loc.tolist()
+        cidx_cpu = cache_indices.tolist()
+        zero_cidx = torch.zeros(1, dtype=torch.long, device=mixed_qkv.device)
+        C = FLA_CHUNK_SIZE
+        for i in range(len(qsl_cpu) - 1):
+            slot = cidx_cpu[i]
+            if slot == PAD_SLOT_ID:
+                continue
+            start, end = qsl_cpu[i], qsl_cpu[i + 1]
+            seqlen = end - start
+            if seqlen <= 0:
+                self.gdn_replay_cache.pop((layer.layer_id, slot), None)
+                continue
+            comp = (seqlen // C) * C  # tokens in complete chunks
+            # Boundary state = state entering the trailing partial chunk. Fold the complete-chunk
+            # prefix from this sequence's initial ssm state (disable_radix_cache => zeros; a
+            # non-zero prefix state is honored via ssm_states[slot]). Folding is causal so this
+            # equals the boundary the full-sequence forward would produce.
+            if comp > 0:
+                init_state = (
+                    ssm_states[slot].transpose(-1, -2).unsqueeze(0).float().contiguous()
+                    if ssm_states is not None
+                    else None
+                )
+                g_c, beta_c = torch_gdn_gating(
+                    layer.A_log, a[start : start + comp], b[start : start + comp], layer.dt_bias
+                )
+                _, boundary, _ = torch_chunk_gated_delta_rule(
+                    q_all[start : start + comp].unsqueeze(0),
+                    k_all[start : start + comp].unsqueeze(0),
+                    v_all[start : start + comp].unsqueeze(0),
+                    g=g_c, beta=beta_c,
+                    ssm_states=init_state,
+                    cache_indices=zero_cidx,
+                    query_start_loc=torch.tensor([0, comp], dtype=torch.int32, device=mixed_qkv.device),
+                )
+                boundary = boundary.detach()
+            elif ssm_states is not None:
+                # No complete chunk: boundary is the sequence's initial state (zeros when
+                # disable_radix_cache, else the prefix-cached state), in [1, HV, K, V] layout.
+                boundary = (
+                    ssm_states[slot].transpose(-1, -2).unsqueeze(0).float().contiguous().detach()
+                )
+            else:
+                boundary = torch.zeros(
+                    1, layer.num_v_heads, layer.head_k_dim, layer.head_v_dim,
+                    device=mixed_qkv.device, dtype=torch.float32,
+                )
+            entry = {
+                "boundary": boundary,
+                "q": [q_all[t] for t in range(start + comp, end)],
+                "k": [k_all[t] for t in range(start + comp, end)],
+                "v": [v_all[t] for t in range(start + comp, end)],
+                "a": [a[t] for t in range(start + comp, end)],
+                "b": [b[t] for t in range(start + comp, end)],
+            }
+            self.gdn_replay_cache[(layer.layer_id, slot)] = entry
 
     def forward_decode(
         self,
@@ -556,6 +744,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer.activation,
                 conv_state_indices=cache_indices,
             )
+
+        # Batch-invariant decode: differentiable incremental chunk-replay that reproduces
+        # Megatron's chunked delta rule per token bit-for-bit (the fused recurrent kernel is a
+        # different fp32 reduction order, ~7.8e-3 off). See _gdn_chunk_replay_decode.
+        if is_batch_invariant_mode_enabled():
+            core_attn_out = self._gdn_chunk_replay_decode(
+                layer, mixed_qkv, a, b, cache_indices
+            )
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices
+            )
+            return core_attn_out
 
         # Skip split + reshape + separate gating kernel by consuming
         # the packed mixed_qkv directly in a single fused Triton kernel.
@@ -759,6 +959,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     ssm_states=ssm_states,
                     cache_indices=cache_indices,
                     query_start_loc=query_start_loc,
+                )
+                # Seed the decode chunk-replay cache: per slot, the recurrent state entering the
+                # trailing partial chunk (boundary) and the raw post-conv q/k/v + pre-gating a/b
+                # of the partial-chunk tokens. Decode continues the replay from here so its first
+                # token reproduces Megatron's full-sequence row at position prompt_len bit-for-bit.
+                self._seed_gdn_replay_cache(
+                    layer, mixed_qkv, a, b, query_start_loc, cache_indices, ssm_states
                 )
             else:
                 g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
