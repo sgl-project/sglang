@@ -224,10 +224,12 @@ def _make_method_class():
             num_experts_E: int,
             num_resident_K: int,
             pin_host: bool = True,
+            use_ondevice: bool = False,
             eviction: str = "lru",
             window: int = 0,
             cold_backing: str = "ram",
             cold_dir: Optional[str] = None,
+            breakable_decode: bool = False,
         ):
             self.base_method = base_method
             self.E = num_experts_E
@@ -241,9 +243,15 @@ def _make_method_class():
             # the store exceed RAM). cold_dir is the disk location for the "disk" tier.
             self.cold_backing = cold_backing
             self.cold_dir = cold_dir
-            # Decode placement: eager host paging (Paged Experts requires --disable-cuda-graph for now; a
-            # captured on-device placement is a follow-up). See placement.py.
-            self._placement = make_placement()
+            # Decode placement: captured (on-device decide + UVA gather, needs a pinned store) when CUDA
+            # graphs are on, else eager host; the captured variant is windowed (replay-twice) when a window
+            # is set. The bool + window resolve to a Placement strategy (placement.py).
+            self.use_ondevice = use_ondevice and pin_host
+            self._placement = make_placement(
+                self.use_ondevice,
+                windowed=window > 0,
+                breakable_decode=breakable_decode,
+            )
             self._pager = None
 
         def create_weights(
@@ -294,8 +302,20 @@ def _make_method_class():
     return PagedExpertsMoEMethod
 
 
-# id() of the ServerArgs the current model build is for: a new engine in the same process brings a
-# new ServerArgs, and the first wrapped layer must drop the previous model's cached sizing + registry.
+def resolve_breakable_decode(server_args: Any) -> bool:
+    """True when the decode-phase CUDA-graph backend is the breakable one: the convenience flag
+    ``--cuda-graph-backend-decode breakable``, else the ``cuda_graph_config`` decode phase.
+    """
+    bd = getattr(server_args, "cuda_graph_backend_decode", None)
+    if bd is None:
+        cfg = getattr(server_args, "cuda_graph_config", None)
+        bd = getattr(getattr(cfg, "decode", None), "backend", None) if cfg else None
+    return bd == "breakable"
+
+
+# id() of the ServerArgs the current model build is for. A new engine in the same process brings a new
+# ServerArgs object; detecting the change lets the first wrapped layer drop the previous model's cached
+# sizing state and module-global pager state (registered pagers over freed tensors, spent horizon).
 _BUILT_FOR_SA: Optional[int] = None
 
 
@@ -316,9 +336,9 @@ def make_for_layer(
     if _BUILT_FOR_SA != id(server_args):
         _BUILT_FOR_SA = id(server_args)
         reset_sizing_state()
-        from sglang.srt.layers.moe.paged_experts.pager import _ALL_PAGERS
+        from sglang.srt.layers.moe.paged_experts.pager import reset_paged_experts_state
 
-        _ALL_PAGERS.clear()
+        reset_paged_experts_state()
     check_paged_experts_compat(server_args)
     _geo_mc, _geo_htc = _moe_geometry()[:2]
     check_paged_experts_quant(_quant_source(_geo_mc, _geo_htc))
@@ -328,21 +348,35 @@ def make_for_layer(
     else:
         K = int(num_resident)
     pin_host = getattr(server_args, "paged_experts_store", "pinned") != "paged"
+    # Use the on-device (capturable) decode path unless CUDA graphs are disabled. With graphs off it's the
+    # eager kernel-free path (host decide + transfer_kv); with graphs on the decode step is captured.
+    use_ondevice = not bool(getattr(server_args, "disable_cuda_graph", False))
+    if use_ondevice and not pin_host:
+        # The pageable store has no capture-safe gather: it would select the eager placement, whose
+        # host-side decision syncs inside graph capture and fails cryptically at startup. Reject up front.
+        raise RuntimeError(
+            "Paged Experts: --paged-experts-store paged requires --disable-cuda-graph (the pageable "
+            "store pages via a host-driven copy that cannot run inside a captured decode graph)."
+        )
     eviction = getattr(server_args, "paged_experts_eviction", "lru")
     # The pinned window is sized automatically (the largest window that fits — page-locking every expert
     # when the whole store fits); there is no user knob. A pageable store pins nothing, so it has no window.
     window = resolve_window_experts(E) if bool(pin_host) else 0
     cold_backing = getattr(server_args, "paged_experts_cold_backing", "ram")
     cold_dir = getattr(server_args, "paged_experts_cold_dir", "") or None
+    # Windowed decode under the breakable backend -> BCG break-and-page-in (no replay-twice).
+    breakable_decode = resolve_breakable_decode(server_args)
     return _make_method_class()(
         base_method,
         E,
         K,
         pin_host=bool(pin_host),
+        use_ondevice=use_ondevice,
         eviction=eviction,
         window=window,
         cold_backing=cold_backing,
         cold_dir=cold_dir,
+        breakable_decode=breakable_decode,
     )
 
 

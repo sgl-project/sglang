@@ -32,12 +32,6 @@ def check_paged_experts_compat(server_args: Any) -> None:
     load_format = str(getattr(server_args, "load_format", "") or "")
 
     problems = []
-    if not getattr(server_args, "disable_cuda_graph", False):
-        problems.append(
-            "Paged Experts requires --disable-cuda-graph for now: the residency decision is host-side "
-            "(data-dependent) and cannot be captured into a CUDA graph yet. Add --disable-cuda-graph "
-            "(a captured on-device decode path is a follow-up)."
-        )
     if tp > 1:
         problems.append(
             f"tensor parallelism (tp_size={tp}) is not supported yet: the host expert store is not "

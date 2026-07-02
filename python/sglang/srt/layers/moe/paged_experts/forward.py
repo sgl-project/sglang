@@ -53,6 +53,22 @@ def _gemm_hidden(
     return out.hidden_states if hasattr(out, "hidden_states") else out
 
 
+def _gemm_hidden_fused(
+    method, layer, dispatch_output, safe_ids, masked_tw, *, clone_hidden: bool
+):
+    """Like :func:`_gemm_hidden`, but the masking/remap chain was already computed by the fused
+    ``remap_mask`` kernel (``pager.remap_mask_ondevice``) — just swap the buffers in and run the GEMM.
+    """
+    topk_output = dispatch_output.topk_output
+    hidden = dispatch_output.hidden_states
+    md = dispatch_output._replace(
+        hidden_states=hidden.clone() if clone_hidden else hidden,
+        topk_output=topk_output._replace(topk_ids=safe_ids, topk_weights=masked_tw),
+    )
+    out = method.base_method.apply(layer, md)
+    return out.hidden_states if hasattr(out, "hidden_states") else out
+
+
 def _wave_apply(method, layer, dispatch_output, topk_ids: torch.Tensor, distinct):
     """Serve > K distinct experts in ceil(len(distinct)/K) waves; sum the per-wave partials (lossless)."""
     pager = method._pager
@@ -92,10 +108,27 @@ def _wave_apply(method, layer, dispatch_output, topk_ids: torch.Tensor, distinct
     return out
 
 
-def paged_apply(method, layer, dispatch_output):
-    """Dispatch the step to the method's decode placement (eager host paging).
+def _ondevice_wave_apply(method, layer, dispatch_output, topk_ids):
+    """On-device static-wave path (distinct > K, e.g. prefill): ceil(E/K) waves, each planned+gathered
+    on-device, GEMM'd and summed. No host sync. Resyncs the keep-warm state to the last wave so a
+    following decode step is consistent. Lossless (each active expert is served in exactly one wave).
+    """
+    pager = method._pager
+    nwaves = (pager.E + pager.K - 1) // pager.K
+    out = None
+    for w in range(nwaves):
+        pager.decide_and_page_wave_ondevice(topk_ids, w)
+        remap = mask_and_remap_expert_ids(topk_ids, pager.logical_to_gpu_index_cuda)
+        partial = _gemm_hidden(method, layer, dispatch_output, remap, clone_hidden=True)
+        out = partial if out is None else out + partial
+    pager.resync_residency_ondevice(nwaves - 1)
+    return out
 
-    The placement (``method._placement``) owns the decide + page-in flow; it ends in ``_gemm_hidden``
+
+def paged_apply(method, layer, dispatch_output):
+    """Dispatch the step to the method's decode placement (eager host vs captured on-device).
+
+    The placement (``method._placement``) owns the decide + page-in flow; both end in ``_gemm_hidden``
     over the K-slot pool. See ``placement.py``.
     """
     return method._placement.apply(method, layer, dispatch_output)

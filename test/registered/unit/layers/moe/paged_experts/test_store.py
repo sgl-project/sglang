@@ -148,11 +148,16 @@ class TestWindowedExpertStore(CustomTestCase):
         # pick a hot set that is NOT [0, W): hottest = 7,6,5,4,3 (so 0,1,2 become cold)
         new_hot = [7, 6, 5, 4, 3]
         store.set_window_membership(new_hot)
-        for i, e in enumerate(new_hot):
+        # Membership is the contract; the Δ-set re-pin keeps surviving experts in their rows (only the
+        # promoted/demoted pairs move), so row ORDER within the tier is free — just distinct and valid.
+        hot_rows = [int(store.hot_pos[e]) for e in new_hot]
+        for e in new_hot:
             self.assertTrue(store.is_hot(e))
-            self.assertEqual(int(store.hot_pos[e]), i)
+        self.assertEqual(sorted(hot_rows), list(range(W)))
+        cold_rows = [int(store.cold_pos[e]) for e in (0, 1, 2)]
         for e in (0, 1, 2):
             self.assertFalse(store.is_hot(e))
+        self.assertEqual(sorted(cold_rows), list(range(E - W)))
         # data integrity: every expert's bytes are intact and reachable through the new maps
         for name in store.gpu:
             for e in range(E):

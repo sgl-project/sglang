@@ -18,6 +18,7 @@ No torch.compile.
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -51,6 +52,20 @@ if TYPE_CHECKING:
         BaseCudaGraphRunner,
     )
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
+
+
+# Per-step post-replay hook (the breakable analog of the full backend's). Fires once after replay() returns
+# — i.e. after the full forward + all eager breaks complete and before the next step — so it is a safe
+# boundary to mutate state the captured gathers read (e.g. the paged-experts freq-window re-pin). Unlike the
+# full backend's hook this does NOT loop/re-replay: BCG pages cold experts inline at the break, so there is
+# nothing to converge; the hook is purely a per-step boundary callback. None = no hook installed.
+_post_replay_hook: Optional[Callable[[], None]] = None
+
+
+def set_post_replay_hook(fn: Optional[Callable[[], None]]) -> None:
+    """Register a once-per-step callback fired after each decode replay (between steps)."""
+    global _post_replay_hook
+    _post_replay_hook = fn
 
 
 class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
@@ -151,6 +166,17 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
             return [self._slice_output(item, num_tokens) for item in output]
+        if dataclasses.is_dataclass(output) and not isinstance(output, type):
+            # e.g. LogitsProcessorOutput: slice the per-token tensor fields (next_token_logits /
+            # hidden_states), leave None / scalar / list fields (logprobs, filled later by the sampler) as-is.
+            return dataclasses.replace(
+                output,
+                **{
+                    f.name: getattr(output, f.name)[:num_tokens]
+                    for f in dataclasses.fields(output)
+                    if torch.is_tensor(getattr(output, f.name))
+                },
+            )
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _copy_output_to_buffer(
@@ -190,6 +216,16 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             for item, buffer in zip(output, output_buffer):
                 self._copy_output_to_buffer(item, buffer, num_tokens)
             return
+        if dataclasses.is_dataclass(output) and dataclasses.is_dataclass(output_buffer):
+            for f in dataclasses.fields(output):
+                v = getattr(output, f.name)
+                if torch.is_tensor(
+                    v
+                ):  # copy the per-token tensor fields into the captured buffer
+                    self._copy_output_to_buffer(
+                        v, getattr(output_buffer, f.name), num_tokens
+                    )
+            return
         raise TypeError(
             "Unsupported BCG output buffer pair: "
             f"{type(output)} vs {type(output_buffer)}"
@@ -210,6 +246,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         **kwargs,
     ) -> Any:
         self._graphs[shape_key].replay()
+        if _post_replay_hook is not None:
+            _post_replay_hook()  # once-per-step boundary (no re-replay; cold already staged at the break)
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:

@@ -30,10 +30,6 @@ expert-parallel CPU offload, both of which move the expert computation itself on
 Decode under Paged Experts is **PCIe-bandwidth-bound** — the dominant cost is moving expert weights from
 host to GPU each step — which shapes its performance profile (see [Performance](#performance)).
 
-> **Requires `--disable-cuda-graph`.** The per-step residency decision — which experts to page in — is
-> host-side and data-dependent, so the decode step cannot be captured into a CUDA graph; run Paged Experts
-> with `--disable-cuda-graph`.
-
 ## Related Parameters
 
 - **`--enable-paged-experts`**: Enable Paged Experts. The MoE layers are wrapped with the resident
@@ -64,12 +60,13 @@ host to GPU each step — which shapes its performance profile (see [Performance
   brief gaps and tends to win when expert routing is skewed. The choice trades nothing but hit rate, so
   it is workload-dependent; `lru` is a safe default.
 
-The next two parameters are the **pinned-window fallback** — they let Paged Experts serve stores too
-large to fully page-lock, up to stores larger than host RAM. The window itself is **sized automatically**:
-every expert is page-locked when the whole store fits the pin budget (half of available host memory,
-additionally capped near total VRAM on WSL2, where pinning maps into a GPU-visible aperture); otherwise
-only the largest window that fits the budget is page-locked. There is no window knob. These two
-parameters only choose *where* the cold tail lives.
+The next two parameters concern the **pinned-window fallback** — how Paged Experts serves stores too
+large to fully page-lock, up to stores larger than host RAM. Both the window *size* (every expert is
+page-locked when the whole store fits the pin budget — half of available host memory, additionally capped
+near total VRAM on WSL2, where pinning maps into a GPU-visible aperture; otherwise the largest window that
+fits the budget) and *which* experts it holds (the most-routed, ranked by profiling the first 128 decode
+tokens) are chosen **automatically** — there are no window knobs. These two tune only *where* the cold
+tail lives.
 
 - **`--paged-experts-cold-backing {ram,disk}`**: Where the windowed cold tail lives. `ram` (default) keeps
   it in pageable host RAM, so the *whole* store must still fit RAM. `disk` memory-maps it to a file
@@ -158,8 +155,41 @@ Each decode step, for each MoE layer, Paged Experts performs three operations be
    exactly zero, and its id is clamped to a valid slot for the kernel's binning. The real fused-MoE GEMM
    then runs over the `K`-slot pool.
 
-The result is lossless: the correct weights are in the correct slots and the remap is exact, so the
-output matches the equivalent fully-resident MoE.
+When a step's distinct active experts exceed `K` (prefill, or a large decode batch), the layer is instead
+served in `K`-sized **waves**: each wave pages ≤K experts, masks the routing to that wave, runs the GEMM,
+and the per-wave partial outputs are summed — each active expert is served in exactly one wave.
+
+The result is lossless either way: the correct weights are in the correct slots and the remap is exact,
+so the output matches the equivalent fully-resident MoE.
+
+### Captured decode
+
+The per-step workflow above is host-driven and data-dependent, so with CUDA graphs disabled it runs
+eagerly. To capture the decode step, the decide + gather move **on-device**: a JIT kernel computes the
+residency decision with no host sync, and the experts are gathered through a unified-address-space pointer
+table whose count is data-dependent but resolved on-device, so the gather shape stays graph-stable.
+
+The wrinkle is the pinned **window**: the captured gather reads a fixed-address, page-locked source, which
+the hot window is — but the pageable/`disk` cold tier is not, so a window miss cannot be served inside the
+graph. Paged Experts handles this two ways:
+
+- **Replay-twice** (the default full-graph decode backend): the captured decide records cold misses to a
+  device miss-vector and leaves them masked for that replay; a post-replay hook (out of graph) stages the
+  missed experts into their slots and replays the *same* graph again, until no miss remains (typically one
+  extra replay). Sampling lives outside the graph, and the re-replay overwrites the same fixed KV slots
+  for the same token with the corrected values, so the discarded first replay leaves no stale state.
+- **Breakable CUDA graph (BCG)** (select with `--cuda-graph-backend-decode breakable`): the graph breaks
+  at an in-layer eager marker where the cold experts are staged inline, so the step finishes in a single
+  replay (no converge loop).
+
+The captured keep-warm regime applies while a capture batch satisfies `batch × top_k ≤ K` (the shape-static
+worst case for distinct active experts); on the windowed store, capture sizes past that are rejected at
+startup with the fix (cap `--cuda-graph-max-bs`, or serve eager).
+
+This decouples the *capturable* model size from the page-lockable size: with `--paged-experts-cold-backing
+disk` a model **larger than host RAM** serves captured and coherent, cold misses faulting from disk. The
+freq-ranked window (sizing the hot set by routing frequency) keeps those misses rare — most impactful on the
+`disk` cold tier, where each avoided miss saves a disk read.
 
 ### Reusing the KV transfer kernels
 
@@ -177,12 +207,15 @@ The size of the resident pool, `K`, trades directly against the KV cache: SGLang
 the VRAM left after weights, and the `K`-slot expert pool counts as weights. Paged Experts therefore sizes
 `K` from SGLang's own memory accounting rather than a fixed guess. With `--paged-experts-num-resident
 auto` (the default), at weight-creation time it reads the already-derived `mem_fraction_static`,
-`max_running_requests`, `context_length`, and `kv_cache_dtype` off the running server config, and computes:
+`context_length`, and `kv_cache_dtype` off the running server config, and computes:
 
 ```
 K = clamp(top_k, E, floor((free_vram * mem_fraction_static - non_expert_weights - kv_reserve)
                           / (moe_layers * per_expert_bytes)))
 ```
+
+(`non_expert_weights` is a fixed headroom estimate — 2.5 GB — for the attention/dense weights, and
+`kv_reserve` defaults to a single-stream context; see `--paged-experts-kv-reserve-gb` above.)
 
 Because `K` is sized against the *same* `mem_fraction_static` the server runs at, the resident pool and
 the KV pool stay coherent by construction. The resolved value is logged at startup:

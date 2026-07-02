@@ -226,6 +226,23 @@ _enable_pcg_dsv2_dual_stream = (
 )
 
 
+def _paged_experts_breakable_decode(server_args) -> bool:
+    """True when paged-experts is served under the breakable decode backend (BCG).
+
+    BCG inserts an eager graph break inside the routed-expert GEMM (between the residency decide and the
+    GEMM, to page cold experts in). The dual-stream forward runs that GEMM on the alt stream, so the
+    break's capture_end() fires while the ambient stream is the alt stream — but capture began on the main
+    stream, raising "Capture must end on the same stream it began on". Fall back to the single-stream
+    forward in this case; the dual-stream shared/routed overlap is negligible when the routed path is the
+    paging bottleneck anyway.
+    """
+    if not getattr(server_args, "enable_paged_experts", False):
+        return False
+    from sglang.srt.layers.moe.paged_experts.method import resolve_breakable_decode
+
+    return resolve_breakable_decode(server_args)
+
+
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -873,7 +890,17 @@ class DeepseekV2MoE(nn.Module):
 
         if not self._enable_a2a_moe:
             server_args = get_global_server_args()
-            if self._can_dual_stream_graph(hidden_states, server_args):
+            # Paged-experts BCG breaks the captured graph inside the routed GEMM, which the dual-stream
+            # forward runs on the alt stream -> capture_end on the wrong stream. Force single-stream.
+            # Resolved once and cached (this runs per layer per step when paged experts is enabled).
+            _force_single_stream = self.__dict__.get("_pe_force_single_stream")
+            if _force_single_stream is None:
+                _force_single_stream = _paged_experts_breakable_decode(server_args)
+                self._pe_force_single_stream = _force_single_stream
+            if (
+                self._can_dual_stream_graph(hidden_states, server_args)
+                and not _force_single_stream
+            ):
                 return dsv2_flashinfer_moe_dual_stream_graph(
                     hidden_states,
                     self.layer_id,
@@ -884,6 +911,7 @@ class DeepseekV2MoE(nn.Module):
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
+                and not _force_single_stream
                 and get_is_capture_mode()
                 and not (
                     server_args.enable_torch_compile

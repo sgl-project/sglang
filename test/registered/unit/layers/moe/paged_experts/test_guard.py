@@ -22,7 +22,6 @@ def _sa(**overrides):
         moe_a2a_backend="none",
         enable_eplb=False,
         load_format="auto",
-        disable_cuda_graph=True,  # Paged Experts is eager-only for now
         paged_experts_store="pinned",
         paged_experts_cold_backing="ram",
     )
@@ -33,12 +32,6 @@ def _sa(**overrides):
 class TestPagedExpertsGuard(CustomTestCase):
     def test_clean_config_passes(self):
         check_paged_experts_compat(_sa())  # must not raise
-
-    def test_requires_disable_cuda_graph(self):
-        # Paged Experts has no captured decode path yet; CUDA graphs must be disabled.
-        with self.assertRaises(RuntimeError) as cm:
-            check_paged_experts_compat(_sa(disable_cuda_graph=False))
-        self.assertIn("disable-cuda-graph", str(cm.exception))
 
     def test_rejects_incompatible_placement(self):
         # single-GPU first cut: any multi-device parallelism / placement is rejected
@@ -56,7 +49,8 @@ class TestPagedExpertsGuard(CustomTestCase):
             self.assertIn(fragment, str(cm.exception))
 
     def test_disk_cold_backing_passes(self):
-        # the window is sized automatically, so a disk cold tier is a plain, coherent choice
+        # the window is sized (and freq-ranked) automatically, so a disk cold tier is a plain, coherent
+        # choice — no window flags to be incoherent with
         check_paged_experts_compat(
             _sa(paged_experts_cold_backing="disk")
         )  # must not raise
