@@ -369,41 +369,44 @@ class _GenerationStreamAccumulator:
 
         send_token_offset = req.send_token_offset
         send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
+        # Fields the Rust egress (`push_generation`) actually reads: rids,
+        # finished_reasons, output_ids, prompt_tokens (+ the logprob/hidden
+        # blocks below, already gated on their flags).
         self.rids.append(req.rid)
-        self.http_worker_ipcs.append(req.http_worker_ipc)
         self.finished_reasons.append(
             req.finished_reason.to_json() if req.finished_reason else None
         )
-        self.decoded_texts.append(req.decoded_text)
-        if self.rust_mode:
-            # Rust detok works from raw output tokens and ignores decode_ids /
-            # read_offset, so skip the per-step incremental-detok bookkeeping
-            # (surr_and_decode_ids) entirely. Placeholders keep the parallel
-            # lists aligned; the Rust egress (push_generation) never reads them.
-            self.decode_ids_list.append([])
-            self.read_offsets.append(0)
-        else:
-            decode_ids, read_offset = req.init_incremental_detokenize()
-            self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
-            req.send_decode_id_offset = len(decode_ids)
-            self.read_offsets.append(read_offset)
-
         # Exclude the tokens after stop condition
         output_ids_ = req.output_ids_through_stop
         self.output_ids.append(output_ids_[send_token_offset:])
         req.send_token_offset = len(output_ids_)
-        self.skip_special_tokens.append(req.sampling_params.skip_special_tokens)
-        self.spaces_between_special_tokens.append(
-            req.sampling_params.spaces_between_special_tokens
-        )
-        self.no_stop_trim.append(req.sampling_params.no_stop_trim)
         self.prompt_tokens.append(len(req.origin_input_ids))
-        self.reasoning_tokens.append(req.reasoning_tokens)
-        self.completion_tokens.append(len(output_ids_))
-        self.cached_tokens.append(req.cached_tokens)
 
-        # Collect detailed cache breakdown if available
-        self.cached_tokens_details.append(self.get_cached_tokens_details(req))
+        if not self.rust_mode:
+            # Everything below feeds the Python DetokenizerManager /
+            # TokenizerManager (incremental detok, meta_info, per-request metrics)
+            # or gets pickled into the payload (time_stats). The Rust server
+            # replaces those stages and builds its own metadata from the
+            # ChunkEvent, so `push_generation` never reads these — skip the whole
+            # block. The parallel lists stay empty; the payload goes straight to
+            # `push_generation`, which only indexes the fields appended above.
+            self.http_worker_ipcs.append(req.http_worker_ipc)
+            self.decoded_texts.append(req.decoded_text)
+            decode_ids, read_offset = req.init_incremental_detokenize()
+            self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+            req.send_decode_id_offset = len(decode_ids)
+            self.read_offsets.append(read_offset)
+            self.skip_special_tokens.append(req.sampling_params.skip_special_tokens)
+            self.spaces_between_special_tokens.append(
+                req.sampling_params.spaces_between_special_tokens
+            )
+            self.no_stop_trim.append(req.sampling_params.no_stop_trim)
+            self.reasoning_tokens.append(req.reasoning_tokens)
+            self.completion_tokens.append(len(output_ids_))
+            self.cached_tokens.append(req.cached_tokens)
+
+            # Collect detailed cache breakdown if available
+            self.cached_tokens_details.append(self.get_cached_tokens_details(req))
 
         # Multimodal prompt token counts. In disagg decode mode the prefill node
         # already computed these and transferred them via the metadata buffer
