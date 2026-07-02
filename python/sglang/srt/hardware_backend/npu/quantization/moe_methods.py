@@ -929,20 +929,16 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
         weight_name = f"{weight_prefix}_weight"
 
-        online_quant = "ascend_mxfp4_w4a4"   # or from server_args / env
+        online_quant = "bf16"   # or from server_args / env
 
-        if online_quant == "ascend_w8a8":
+        if online_quant == "w8a8_int8":
             self._apply_online_w8a8(layer, weight_prefix, weight_name)
-            self._quant_type = "w8a8"
-        elif online_quant == "ascend_mxfp8":
+        elif online_quant == "w8a8_mxfp8":
             self._apply_online_mxfp8(layer, weight_prefix, weight_name)
-            self._quant_type = "mxfp8"
-        elif online_quant == "ascend_mxfp4_w4a8":        # W4A8 MXFP4
+        elif online_quant == "w4a8_mxfp8":        # W4A8 MXFP8
             self._apply_online_mxfp4_w4a8(layer, weight_prefix, weight_name)
-            self._quant_type = "mxfp4_w4a8"
-        elif online_quant == "ascend_mxfp4_w4a4":        # W4A4 MXFP4
+        elif online_quant == "aw4a4_mxfp4":        # W4A4 MXFP4
             self._apply_online_mxfp4_w4a4(layer, weight_prefix, weight_name)
-            self._quant_type = "mxfp4_w4a4"
         else:
             # Pure BF16: just store the transposed weight on self
             weight = getattr(layer, weight_name)
