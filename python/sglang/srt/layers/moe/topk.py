@@ -24,6 +24,7 @@ from typing import (
     NamedTuple,
     Optional,
     Protocol,
+    Tuple,
     TypeGuard,
     runtime_checkable,
 )
@@ -139,6 +140,7 @@ _is_musa = is_musa()
 # an accuracy run before becoming the default.
 _skip_hip_pad_mask = get_bool_env_var("SGLANG_MORI_NO_PAD_MASK", "False")
 
+
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
 
@@ -176,11 +178,6 @@ if _is_cuda:
 
     except ImportError:
         fused_topk_deepseek = None
-
-    try:
-        from sgl_kernel import kimi_k2_moe_fused_gate
-    except ImportError as e:
-        pass
 
 if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel import topk_softmax
@@ -1026,7 +1023,7 @@ def biased_topk_jit_kernel_impl(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     if _use_aiter and scoring_func == "sqrtsoftplus" and num_fused_shared_experts == 0:
@@ -1234,6 +1231,74 @@ def _eplb_remap_enabled() -> bool:
     )
 
 
+@triton.jit
+def _fill_padded_rows_kernel(
+    out_ptr,
+    num_token_non_padded_ptr,
+    n_cols,
+    fill_value,
+    stride_row,
+    BLOCK_COLS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    n_valid = tl.load(num_token_non_padded_ptr)
+    if row >= n_valid:
+        cols = tl.arange(0, BLOCK_COLS)
+        mask = cols < n_cols
+        ptrs = out_ptr + row * stride_row + cols
+        fill = tl.full((BLOCK_COLS,), fill_value, dtype=out_ptr.dtype.element_ty)
+        tl.store(ptrs, fill, mask=mask)
+
+
+def _can_fuse_padded_region(x: torch.Tensor) -> bool:
+    # The fused kernel uses one program per row and assumes a row-major 2D
+    # tensor (columns contiguous); fall back to eager for anything else.
+    return x.dim() == 2 and x.stride(1) == 1
+
+
+def _fill_padded_rows(
+    x: torch.Tensor,
+    num_token_non_padded: torch.Tensor,
+    fill_value,
+) -> None:
+    """Set ``x[row, :] = fill_value`` for every padded row (row index
+    ``>= num_token_non_padded``) using a single Triton launch.
+
+    Replaces the eager ``arange + (>=) + boolean index_put_`` sequence, which
+    issues several launch-latency-bound kernels per call. The grid is static
+    (one program per row) and the pad count is read from device memory inside
+    the kernel, so this is safe to capture inside a CUDA/HIP graph.
+    """
+    # Metadata-only checks (no device sync): the kernel reads a single scalar
+    # routing count from device memory, so it must be a 1-element integer tensor
+    # on the same device as ``x``. Use explicit raises (not asserts) so the
+    # checks survive ``python -O`` and invalid inputs fail loudly instead of
+    # turning into opaque Triton/memory errors.
+    if not isinstance(num_token_non_padded, torch.Tensor):
+        raise TypeError("num_token_non_padded must be a torch.Tensor")
+    if num_token_non_padded.numel() != 1:
+        raise ValueError(
+            "num_token_non_padded must be a single-element tensor, got shape "
+            f"{tuple(num_token_non_padded.shape)}"
+        )
+    if num_token_non_padded.dtype.is_floating_point:
+        raise TypeError(
+            "num_token_non_padded must be an integer tensor, got "
+            f"{num_token_non_padded.dtype}"
+        )
+    if num_token_non_padded.device != x.device:
+        raise ValueError("num_token_non_padded and x must be on the same device")
+    n_rows, n_cols = x.shape
+    _fill_padded_rows_kernel[(n_rows,)](
+        x,
+        num_token_non_padded,
+        n_cols,
+        fill_value,
+        x.stride(0),
+        BLOCK_COLS=triton.next_power_of_2(n_cols),
+    )
+
+
 def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
@@ -1245,12 +1310,7 @@ def _mask_topk_ids_padded_region(
     if _is_cuda and topk_ids.dtype == torch.int32 and fill_value == -1:
         mask_topk_ids(topk_ids, num_token_non_padded)
     elif _is_npu:
-        # On NPU, bool-indexed scatter `topk_ids[bool_mask, :] = -1` lowers
-        # to aclnnNonzeroV2 and can trigger an aicore timeout under long
-        # workloads; `torch.where` avoids that nonzero scan.
-        indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-        mask = (indices >= num_token_non_padded).unsqueeze(-1)
-        topk_ids = torch.where(mask, torch.full_like(topk_ids, -1), topk_ids)
+        return
     elif _can_fuse_padded_region(topk_ids):
         _fill_padded_rows(topk_ids, num_token_non_padded, fill_value)
     else:
@@ -1291,8 +1351,7 @@ def biased_grouped_topk_gpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
-):
-
+) -> Tuple[torch.Tensor, torch.Tensor]:
     num_tokens = gating_output.shape[0]
     num_experts = gating_output.shape[1]
     experts_per_group = (
@@ -1409,8 +1468,8 @@ def biased_grouped_topk_gpu(
             True,
             apply_routed_scaling_factor_on_output,
         )
+        return topk_weights, topk_ids
     else:
-        # Use optimized path for Kimi K2 (384 experts with num_expert_group=1)
         num_experts = gating_output.shape[1]
         if _is_cuda and num_experts == 384 and num_expert_group == 1:
             # ===== TO BE REFACTORED ====
@@ -1437,12 +1496,18 @@ def biased_grouped_topk_gpu(
                     apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 )
             # ===== END TO BE REFACTORED ====
-            return kimi_k2_moe_fused_gate(
+            from sglang.jit_kernel.moe_fused_gate import moe_fused_gate as jit_gate
+
+            return jit_gate(
                 gating_output.to(dtype=torch.float32),
                 correction_bias,
                 topk=topk,
+                scoring_func="sigmoid",
+                num_fused_shared_experts=num_fused_shared_experts,
                 renormalize=renormalize,
-                routed_scaling_factor=routed_scaling_factor,
+                routed_scaling_factor=(
+                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
+                ),
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
         elif (
@@ -1570,7 +1635,7 @@ def _remap_topk_for_deepep(
 
     Routed IDs:  e -> e + e // num_local_routed
     Shared IDs:  ep_rank * num_local_experts + num_local_routed
-    Shared weight: 1 / routed_scaling_factor (compensates post-MoE scaling)
+    Shared weight: 1.0 on the aiter path, else 1/routed_scaling_factor (see below).
     """
     if topk_ids.shape[0] == 0:
         return topk_ids, topk_weights
@@ -1594,9 +1659,33 @@ def _remap_topk_for_deepep(
         + torch.arange(num_fused_shared_experts, device=topk_ids.device)
     )
 
-    # Override shared weight: 1/routed_scaling_factor so net contribution = 1.0
+    # Override the fused shared expert's weight so its net contribution is 1.0x.
+    #
+    # The correct value depends on whether routed_scaling_factor is applied to
+    # the MoE output AFTER the experts run, or already folded into the routed
+    # topk weights BEFORE dispatch:
+    #
+    #   * Post-MoE scaling path (default): DeepseekV2MoE.forward_deepep later
+    #     multiplies the whole MoE output by routed_scaling_factor, so the shared
+    #     weight must be 1/routed_scaling_factor for (1/rsf) * rsf = 1.0.
+    #   * aiter (HIP) path: aiter_biased_grouped_topk folds routed_scaling_factor
+    #     into each routed topk weight, and forward_deepep SKIPS the post-MoE
+    #     multiply for _use_aiter (see its `not (... or _use_aiter)` guard). The
+    #     shared weight must therefore be 1.0 -- applying 1/rsf here would
+    #     under-weight the always-on shared expert by routed_scaling_factor and
+    #     corrupt every MoE layer.
+    #
+    # NOTE: forward_deepep also skips the post-MoE multiply for the non-aiter
+    # families where routed_scaling_factor is pre-folded in topk
+    # (should_fuse_routed_scaling_factor_in_topk / apply_routed_scaling_factor_on_output:
+    # ModelOpt NVFP4, cutlass/trtllm-routed fp8), so those would likewise need a
+    # 1.0 shared weight. This fix is deliberately scoped to the aiter path (the
+    # one validated on AMD MI355X); those other backends are left at their
+    # existing behavior and can be addressed by their maintainers.
     routed_scaling_factor = topk_config.routed_scaling_factor
-    if routed_scaling_factor is not None and routed_scaling_factor != 0:
+    if _use_aiter:
+        topk_weights[:, -num_fused_shared_experts:] = 1.0
+    elif routed_scaling_factor is not None and routed_scaling_factor != 0:
         topk_weights[:, -num_fused_shared_experts:] = 1.0 / routed_scaling_factor
 
     return topk_ids, topk_weights
@@ -1698,7 +1787,48 @@ def _post_process_topk_ids(
     if recorder_topk_ids is None:
         recorder_topk_ids = topk_ids
 
-    if num_fused_shared_experts > 0 and _use_aiter:
+    _aiter_append = num_fused_shared_experts > 0 and _use_aiter
+    _deepep_remap = num_fused_shared_experts > 0 and is_deepep_class_backend()
+
+    if _aiter_append and _deepep_remap:
+        # Fused path: append shared experts AND apply the DeepEP interleaved
+        # remap in a single Triton kernel. This replaces the original
+        # fused_append_shared_experts() + eager _remap_topk_for_deepep() pair,
+        # collapsing ~6 launch-bound elementwise kernels/layer (div_floor / add /
+        # arange / fill / copy) into the one append kernel that already runs.
+        #
+        # Shared weight is 1.0 here because this branch is aiter-only:
+        # aiter_biased_grouped_topk folds routed_scaling_factor into the routed
+        # weights and forward_deepep skips the post-MoE multiply for _use_aiter,
+        # so the always-on shared expert must contribute 1.0x. (The eager
+        # _remap_topk_for_deepep instead sets shared weight to
+        # 1/routed_scaling_factor to compensate a post-MoE scale that the aiter
+        # path does not apply; see PR #28237.)
+        num_physical_routed_experts = (
+            expert_location_dispatch_info.num_physical_experts
+            if expert_location_dispatch_info is not None
+            else router_logits.shape[1]
+        )
+        ep_size = get_parallel().moe_ep_size
+        ep_rank = get_parallel().moe_ep_rank
+        num_local_routed = num_physical_routed_experts // ep_size
+        num_local_experts = num_local_routed + num_fused_shared_experts
+        shared_id_base = ep_rank * num_local_experts + num_local_routed
+
+        # Lazy import to avoid circular-import issues
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+            fused_append_remap_shared_experts_deepep,
+        )
+
+        topk_ids, topk_weights = fused_append_remap_shared_experts_deepep(
+            topk_ids,
+            topk_weights,
+            num_fused_shared_experts,
+            1.0,  # shared-expert weight on the aiter path
+            shared_id_base,
+            num_local_routed,
+        )
+    elif _aiter_append:
         M, N = router_logits.shape
         scale_factor = (
             1.0
@@ -1718,10 +1848,9 @@ def _post_process_topk_ids(
             scale_factor,
             N,  # base id for shared experts
         )
-
-    # DeepEP: remap to interleaved expert layout where each rank's shared
-    # expert has a unique ID for dispatch routing.
-    if num_fused_shared_experts > 0 and is_deepep_class_backend():
+    elif _deepep_remap:
+        # DeepEP: remap to interleaved expert layout where each rank's shared
+        # expert has a unique ID for dispatch routing.
         num_physical_routed_experts = (
             expert_location_dispatch_info.num_physical_experts
             if expert_location_dispatch_info is not None

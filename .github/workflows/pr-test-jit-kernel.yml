@@ -76,7 +76,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-1-gpu-large
+          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-test-1-gpu-large
 
   jit-kernel-multigpu-unit-test:
     if: |
@@ -114,7 +114,7 @@ jobs:
         timeout-minutes: 45
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-8-gpu-h200
+          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-test-8-gpu-h200
 
   jit-kernel-benchmark-test:
     if: |
@@ -154,7 +154,7 @@ jobs:
         timeout-minutes: 45
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-1-gpu-large
+          python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-large
 
   jit-kernel-b200-test:
     if: |
@@ -194,4 +194,4 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-1-gpu-b200
+          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-test-4-gpu-b200

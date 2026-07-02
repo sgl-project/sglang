@@ -71,6 +71,9 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     freeze_gc,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    maybe_flashinfer_autotune_speculative_draft,
+)
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
@@ -129,7 +132,7 @@ def build_replay_fb_view(
     fields like spec_info, out_cache_loc, and the runtime
     actual_forward_mode) with the padded capture-time buffers from
     buffers (for req_pool_indices, seq_lens, seq_lens_cpu,
-    encoder_lens).
+    positions, encoder_lens).
 
     forward_mode is the capture-time mode (used by backends for
     bucket / dispatch decisions); actual_forward_mode is the
@@ -144,6 +147,7 @@ def build_replay_fb_view(
         forward_mode=capture_forward_mode,
         actual_forward_mode=forward_batch.forward_mode,
         input_ids=buffers.input_ids[:num_tokens],
+        positions=buffers.positions[:num_tokens],
         req_pool_indices=buffers.req_pool_indices[:bs],
         seq_lens=buffers.seq_lens[:bs],
         seq_lens_sum=(
@@ -156,6 +160,11 @@ def build_replay_fb_view(
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+        # The mamba-track registry slot (VIRTUAL ids) is the v2p translate SOURCE
+        # for the backend, which copies the result into its own static buffer and
+        # reads THAT in the decode track-save — this slot is never mutated. None
+        # when mamba-track is disabled.
+        mamba_track_indices=getattr(buffers, "mamba_track_indices", None),
         spec_info=forward_batch.spec_info,
     )
 
@@ -234,7 +243,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
-                if not self.model_runner.spec_algorithm.is_dflash():
+                if (
+                    not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
+                ):
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
             self.num_tokens_per_bs = (
@@ -702,6 +713,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
 
+        # No pool-side pin to clear: the captured full-physical write loc rides the
+        # backend's `ForwardMetadata.out_cache_loc_full_physical` (-> KVWriteLoc.full_loc).
+
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
         avail_mem = get_available_gpu_memory(
             self.model_runner.device,
@@ -772,9 +786,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
-                # Must run inside the capture block: warmup mutations here are
-                # undone by on_after_cuda_graph_warmup so capture starts clean.
+                # Graph-recordable metadata-prep hook. The unified memory pool
+                # records ZERO translate nodes here: all its read/write translates
+                # run eagerly in `init_forward_metadata_out_graph` (replay-prep), so
+                # the captured graph reads already-physical locs. Base no-op for triton.
                 attn_backend.init_forward_metadata_in_graph(forward_batch)
+
+                # No invalidate_loc_cache() here: the unified pool translates its
+                # locs in `init_forward_metadata_out_graph`, so no cache to invalidate.
 
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
                     None
@@ -802,12 +821,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ):
                     kwargs["input_embeds"] = self.buffers.input_embeds[:num_tokens]
 
-                return forward(
+                out = forward(
                     forward_batch.input_ids,
                     forward_batch.positions,
                     forward_batch,
                     **kwargs,
                 )
+                dflash_sampler = getattr(
+                    self.model_runner, "dflash_draft_sampler", None
+                )
+                if dflash_sampler is not None:
+                    # Must be captured here, or replay leaves a stale output buffer
+                    # the worker would read as valid tokens -- fail loudly instead.
+                    if (
+                        not isinstance(out, LogitsProcessorOutput)
+                        or out.hidden_states is None
+                    ):
+                        raise RuntimeError(
+                            "DFLASH draft sampler set but the draft forward has no "
+                            "hidden_states to capture into the graph."
+                        )
+                    dflash_sampler(out.hidden_states)
+                return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
             canary_ctx = (
@@ -815,17 +850,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if (c := self.model_runner.canary_manager) is not None
                 else contextlib.nullcontext()
             )
+            # Full-physical write loc lives in the attention metadata (the backend's
+            # `out_cache_loc_full_physical` -> KVWriteLoc.full_loc), so the runner
+            # wires no buffer here. (SWA write loc rides the `swa_out_cache_loc` rail.)
+
             with canary_ctx:
                 shape_key = self._make_graph_key(bs, stream_idx, variant_label)
+                post_warmup_hook = getattr(
+                    self.model_runner.attn_backend,
+                    "on_after_cuda_graph_warmup",
+                    None,
+                )
+                maybe_flashinfer_autotune_speculative_draft(
+                    self,
+                    run_once,
+                    post_warmup_hook=post_warmup_hook,
+                    skip_logits=False,
+                )
                 self.backend.capture_one(
                     shape_key,
                     run_once,
                     dummies=None,
-                    post_warmup_hook=getattr(
-                        self.model_runner.attn_backend,
-                        "on_after_cuda_graph_warmup",
-                        None,
-                    ),
+                    post_warmup_hook=post_warmup_hook,
                 )
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
@@ -977,14 +1023,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
-            # Snapshot built -- publish a read-done event for the WAR barrier.
-            # Only plain DECODE: the captured decode graph reads only its static
-            # snapshot, so the forward is done reading the shared pool here. Spec
-            # verify (target_verify/dllm_extend) replays on this runner too, but
-            # those are NOT the step's last shared-buffer-reading phase (eagle
-            # publishes from draft_extend; ngram/dflash must not publish here),
-            # and some verify graphs may read beyond the snapshot in replay.
-            if forward_batch.forward_mode.is_decode():
+            # Publish a read-done event for the WAR barrier: a cuda-graph forward
+            # finishes its shared req_to_token / SWA reads at this pre-replay
+            # snapshot, so plain DECODE and DFLASH TARGET_VERIFY both qualify.
+            if forward_batch.forward_mode.is_decode() or (
+                forward_batch.forward_mode.is_target_verify()
+                and self.model_runner.spec_algorithm.is_dflash()
+            ):
                 read_done = self.device_module.Event()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
