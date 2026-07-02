@@ -72,10 +72,9 @@ class TestXpuMemorySaver(unittest.TestCase):
     def setUpClass(cls):
         # Pin a single device for the whole class. Probing every device with
         # set_device() churns SYCL/L0 contexts and can destabilize the runtime
-        # when many GPU-heavy tests share one process; pick once, by free memory,
-        # without leaving the current device changed mid-probe.
+        # when many GPU-heavy tests share one process; pick once, by free memory
+        # (mem_get_info(i) reads a specific device without changing the current one).
         best, best_free = 0, -1
-        cur = torch.xpu.current_device()
         for i in range(torch.xpu.device_count()):
             free, _ = torch.xpu.mem_get_info(i)
             if free > best_free:
