@@ -1071,11 +1071,13 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         if self.hidden_states_quantizer is not None and pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
 
+        print(pertoken_scale.dtype)
+
         scale_args = {
             "scale": [weight_scale],
             "per_token_scale": [pertoken_scale],
-            "scale_dtype": torch.float8_e8m0fnu if pertoken_scale.dtype == torch.float8_e8m0fnu else None,
-            "per_token_scale_dtype": torch.float8_e8m0fnu if pertoken_scale.dtype == torch.float8_e8m0fnu else None,
+            "scale_dtype": torch_npu.float8_e8m0fnu if pertoken_scale.dtype == torch_npu.float8_e8m0fnu else None,
+            "per_token_scale_dtype": torch_npu.float8_e8m0fnu if pertoken_scale.dtype == torch_npu.float8_e8m0fnu else None,
         }
         return self.matmul.forward(
             quant_info, weight_prefix, hidden_states, expert_tokens,
