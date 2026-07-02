@@ -11,6 +11,7 @@ import os
 import time
 import weakref
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from functools import lru_cache
 from typing import Any
@@ -1413,40 +1414,42 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         return latents
 
-    def _maybe_offload_for_torch_compile_warmup(
-        self, batch: Req, server_args: ServerArgs
-    ):
-        """deal with warmup req if torch-compile is enabled
-        Returns the result if req is a warmup request
+    @contextmanager
+    def _offload_for_torch_compile_warmup(self, batch: Req):
+        """wrap a denoise so the torch.compile warmup has spare VRAM.
+
+        No-op unless the DiT was layerwise-offloaded for compile.
+        Warmup: move resident non-DiT components off-device for the autotune window, restore
+        after.
         """
         if not self._offloaded_dit_modules_for_compile:
-            return None
+            yield
+            return
         # if the dits have been layerwise-offloaded in preparation stage
         if batch.is_warmup:
             # if warmup is enabled, for warmup request, offload components to ensure sufficient VRAM headroom for torch compile
             moved = self._move_resident_components_for_warmup()
             try:
-                return self._denoise(batch, server_args)
+                yield
             finally:
                 device = get_local_torch_device()
                 for module in moved:
                     module.to(device)
+            return
         # prepare for first real request: restore the user-configured residency
         for module in self._offloaded_dit_modules_for_compile:
             module.disable_offload()
         # clear the list for avoid overhead during real request
         self._offloaded_dit_modules_for_compile.clear()
-        return None
+        yield
 
     def forward(
         self,
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
-        warmup_result = self._maybe_offload_for_torch_compile_warmup(batch, server_args)
-        if warmup_result is not None:
-            return warmup_result
-        return self._denoise(batch, server_args)
+        with self._offload_for_torch_compile_warmup(batch):
+            return self._denoise(batch, server_args)
 
     @torch.no_grad()
     def _denoise(
