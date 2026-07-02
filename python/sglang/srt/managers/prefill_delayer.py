@@ -240,10 +240,14 @@ class PrefillDelayer:
             if slot_condition or queue_condition:
                 # When the "max_decode_bs - running_bs < max_prefill_bs" condition is met,
                 # the first merge_batch causes the decoding to fail to reach the maximum batch size.
+                # Bound by max_delay_passes (parity with "mixed"): otherwise a
+                # persistently-true slot_condition delays forever and starves
+                # prefill on every rank until KV drains empty.
+                prev_delayed_count = prev_state.delayed_count if prev_state else 0
                 if self.skip_first_delayer:
                     self.skip_first_delayer = False
                     pass
-                else:
+                elif prev_delayed_count < self._max_delay_passes - 1:
                     next_state = prev_state or _State()
                     next_state = next_state.bump_delayed_count()
                     return _NegotiateOutput(
@@ -251,6 +255,15 @@ class PrefillDelayer:
                         output_allow=False,
                         output_reason="delay",
                         **debug_info,
+                    )
+                else:
+                    # Hit max_delay_passes: stop delaying, allow prefill.
+                    return _NegotiateOutput(
+                        next_state=None,
+                        output_allow=True,
+                        output_reason="wait_timeout",
+                        **debug_info,
+                        **wait_info,
                     )
             exist_previous_wait = prev_state is not None
             return _NegotiateOutput(

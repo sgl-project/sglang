@@ -253,6 +253,30 @@ _NEGOTIATE_TEST_CASES = [
         # still surface that wait to the histograms.
         expected_wait_forward_passes=2,
     ),
+    # Regression guard: the "all" branch must honor max_delay_passes (it had no
+    # timeout, unlike "mixed", causing a permanent prefill-starvation deadlock).
+    # 1024 - 1000 = 24 < max_prefill_bs (80) keeps slot_condition true every
+    # call; with max_delay_passes=3, call 1 is skip_first, calls 2-3 delay, call
+    # 4 releases via wait_timeout.
+    NegotiateTestCase(
+        name="all_slot_condition_timeout",
+        max_delay_passes=3,
+        token_usage_low_watermark=0.8,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[1000, 1000, 1000, 1000],
+                max_prefill_bs=[80, 80, 80, 80],
+                max_running_requests=1024,
+            )
+            for _ in range(4)
+        ],
+        expected_allow=True,
+        expected_reason="wait_timeout",
+        # Two delays accumulated before the timeout release.
+        expected_wait_forward_passes=2,
+    ),
     # Queue-based trigger: waiting queue below queue_min = min(running * R,
     # max_prefill_bs) should defer prefill. With R=0.5, running=100 and
     # max_prefill_bs=80, queue_min = min(50, 80) = 50, and queue_len=10 < 50.

@@ -2949,7 +2949,12 @@ class Scheduler(
             self.chunked_req is None or len(can_run_list) != 1
         )
 
-        self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
+        # Decaying (not all-time) high-water; feeds only the PrefillDelayer slot
+        # condition (max_running_requests - running < max_prefill_bs). A permanent
+        # high-water lets a one-off burst latch this near max_running_requests,
+        # collapsing the delayer's margin and starving prefill; decaying lets it
+        # fall back to the typical prefill size once bursts stop.
+        self.max_prefill_bs = max(len(can_run_list), self.max_prefill_bs - 1)
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
