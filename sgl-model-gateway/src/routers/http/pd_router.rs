@@ -234,7 +234,6 @@ impl PDRouter {
     const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
     const DISAGG_PREFILL_DP_RANK_KEY: &'static str = "disagg_prefill_dp_rank";
-    const PD_REBOOTSTRAP_PREFILL_URL_KEY: &'static str = "pd_rebootstrap_prefill_url";
 
     fn inject_bootstrap_into_value(
         mut original: Value,
@@ -249,12 +248,10 @@ impl PDRouter {
             let mut hosts = Vec::with_capacity(n);
             let mut ports = Vec::with_capacity(n);
             let mut rooms = Vec::with_capacity(n);
-            let mut prefill_urls = Vec::with_capacity(n);
             for _ in 0..n {
                 hosts.push(prefill_worker.bootstrap_host());
                 ports.push(prefill_worker.bootstrap_port());
                 rooms.push(super::pd_types::generate_room_id());
-                prefill_urls.push(prefill_worker.url().to_string());
             }
             // Use static string keys to avoid per-request allocations
             obj.insert(
@@ -277,10 +274,6 @@ impl PDRouter {
                 Self::BOOTSTRAP_ROOM_KEY.to_string(),
                 Value::Array(rooms.into_iter().map(Value::from).collect()),
             );
-            obj.insert(
-                Self::PD_REBOOTSTRAP_PREFILL_URL_KEY.to_string(),
-                Value::Array(prefill_urls.into_iter().map(Value::from).collect()),
-            );
         } else {
             // Use static string keys to avoid per-request allocations
             obj.insert(
@@ -297,10 +290,6 @@ impl PDRouter {
             obj.insert(
                 Self::BOOTSTRAP_ROOM_KEY.to_string(),
                 Value::from(super::pd_types::generate_room_id()),
-            );
-            obj.insert(
-                Self::PD_REBOOTSTRAP_PREFILL_URL_KEY.to_string(),
-                Value::from(prefill_worker.url()),
             );
         }
         Ok(original)

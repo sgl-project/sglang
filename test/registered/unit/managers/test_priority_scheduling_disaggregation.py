@@ -238,7 +238,6 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
             bootstrap_host="127.0.0.1",
             bootstrap_port=30000,
             bootstrap_room=7,
-            pd_rebootstrap_prefill_url="http://prefill",
             priority=10,
             extra_key=None,
             routing_key=None,
@@ -256,10 +255,11 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
         self.assertEqual(payload["input_ids"], [1, 2, 3, 4])
         self.assertTrue(all(type(x) is int for x in payload["input_ids"]))
         self.assertEqual(payload["sampling_params"]["max_new_tokens"], 1)
-        self.assertEqual(payload["pd_rebootstrap_prefill_url"], "http://prefill")
         self.assertEqual(payload["bootstrap_room"], 7)
-        # The boundary token is replayed/overridden on the decode side, not sent
-        # to the prefill, so it must not be in the payload.
+        # The prefill /generate URL is derived from bootstrap info on the decode
+        # side, not sent in the payload; and the boundary token is replayed via
+        # the decode-side override, so neither belongs in the payload.
+        self.assertNotIn("pd_rebootstrap_prefill_url", payload)
         self.assertNotIn("pd_rebootstrap_forced_output_id", payload)
         # Must be JSON-serializable (numpy scalars would raise here).
         json.dumps(payload)
@@ -281,19 +281,37 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
         mgr.waiting_timeout = 300
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
+        # Decode-side prefill info cache; the rebootstrap /generate URL is derived
+        # from here (bootstrap_addr host + self-registered prefill_http_port)
+        # instead of a router-injected pd_rebootstrap_prefill_url.
+        mgr.prefill_info_table = {}
         return mgr
 
-    def _payload(self, url="http://prefill"):
+    def _register_prefill_info(self, mgr, bootstrap_addr, http_port):
+        from sglang.srt.disaggregation.common.conn import PrefillServerInfo
+
+        mgr.prefill_info_table[bootstrap_addr] = PrefillServerInfo(
+            attn_tp_size=1,
+            attn_cp_size=1,
+            dp_size=1,
+            pp_size=1,
+            page_size=1,
+            kv_cache_dtype=None,
+            follow_bootstrap_room=True,
+            prefill_http_port=http_port,
+        )
+
+    def _payload(self):
         return {
             "input_ids": [1, 2, 3, 4],
             "rid": "rid-0",
-            "pd_rebootstrap_prefill_url": url,
         }
 
     def test_submit_dispatches_run_to_shared_executor(self):
         mgr = self._new_manager()
         mgr._prefill_recompute_executor = MagicMock()
-        receiver = MagicMock(bootstrap_room=7)
+        receiver = MagicMock(bootstrap_room=7, bootstrap_addr="127.0.0.1:8998")
+        self._register_prefill_info(mgr, "127.0.0.1:8998", 30000)
 
         mgr.submit_prefill_recompute(receiver, self._payload())
 
@@ -301,15 +319,17 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
         args = mgr._prefill_recompute_executor.submit.call_args[0]
         self.assertEqual(args[0], mgr._run_prefill_recompute)
         self.assertIs(args[1], receiver)
-        self.assertEqual(args[2], "http://prefill")
+        # URL derived from bootstrap_addr host + registered prefill_http_port.
+        self.assertEqual(args[2], "http://127.0.0.1:30000")
         receiver.abort.assert_not_called()
 
-    def test_submit_missing_url_fails_via_abort(self):
+    def test_submit_unresolved_url_fails_via_abort(self):
         mgr = self._new_manager()
         mgr._prefill_recompute_executor = MagicMock()
-        receiver = MagicMock(bootstrap_room=7)
+        # No prefill_info registered for this bootstrap_addr -> URL unresolved.
+        receiver = MagicMock(bootstrap_room=7, bootstrap_addr="127.0.0.1:8998")
 
-        mgr.submit_prefill_recompute(receiver, self._payload(url=None))
+        mgr.submit_prefill_recompute(receiver, self._payload())
 
         receiver.abort.assert_called_once()
         mgr._prefill_recompute_executor.submit.assert_not_called()

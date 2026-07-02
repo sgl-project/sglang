@@ -76,6 +76,12 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
 
+    # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
+    # already knows the prefill host (the bootstrap_addr host), so it can POST
+    # /generate to http://{bootstrap_host}:{prefill_http_port} to trigger a KV
+    # recompute -- no router-injected pd_rebootstrap_prefill_url needed.
+    prefill_http_port: Optional[int] = None
+
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
     target_tp_ranks: Optional[List[int]] = None
@@ -94,6 +100,9 @@ class PrefillServerInfo:
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
+        self.prefill_http_port = (
+            int(self.prefill_http_port) if self.prefill_http_port is not None else None
+        )
 
 
 @dataclasses.dataclass
@@ -274,6 +283,24 @@ class CommonKVManager(BaseKVManager):
             self._prefill_recompute_sessions.session = session
         return session
 
+    def _resolve_rebootstrap_prefill_url(
+        self, kv_receiver: CommonKVReceiver
+    ) -> Optional[str]:
+        """Derive the prefill ``/generate`` base URL for a PD true-retraction
+        rebootstrap from bootstrap info.
+
+        The decode already knows the prefill host (the ``bootstrap_addr`` host,
+        which the router/client set to the prefill's HTTP host), and the prefill
+        self-registers its HTTP API port in ``PrefillServerInfo`` at bootstrap
+        registration. Combining them yields ``http://{host}:{prefill_http_port}``
+        with no router-injected ``pd_rebootstrap_prefill_url``.
+        """
+        prefill_info = self.prefill_info_table.get(kv_receiver.bootstrap_addr)
+        if prefill_info is None or prefill_info.prefill_http_port is None:
+            return None
+        host = NetworkAddress.parse(kv_receiver.bootstrap_addr).host
+        return NetworkAddress(host, prefill_info.prefill_http_port).to_url()
+
     def submit_prefill_recompute(
         self, kv_receiver: CommonKVReceiver, payload: dict
     ) -> None:
@@ -282,26 +309,30 @@ class CommonKVManager(BaseKVManager):
         KV under the current weights and transfers it back over the
         already-bootstrapped channel.
 
+        The target prefill ``/generate`` URL is derived from bootstrap info (the
+        prefill self-registered its HTTP port), not from a router-injected field.
+
         Non-blocking from the scheduler's perspective: the HTTP POST runs on the
-        shared executor. Any failure (missing URL, HTTP error, exception) is
+        shared executor. Any failure (unresolved URL, HTTP error, exception) is
         surfaced through the standard ``KVPoll.Failed`` path via
         ``kv_receiver.abort()`` so the scheduler's existing transfer-failure
         handling streams the aborted request back to the client. ``payload`` is
         prebuilt by the decode scheduler (``Req.build_rebootstrap_payload``) so
         HTTP/sampling concerns stay on the kv manager.
         """
-        prefill_url = payload.get("pd_rebootstrap_prefill_url")
+        prefill_url = self._resolve_rebootstrap_prefill_url(kv_receiver)
         if not prefill_url:
             logger.error(
-                "PD retract rebootstrap requires pd_rebootstrap_prefill_url from "
-                "the router (rid=%s bootstrap_room=%s).",
+                "PD retract rebootstrap could not resolve the prefill /generate "
+                "URL from bootstrap info (rid=%s bootstrap_room=%s bootstrap_addr=%s).",
                 payload.get("rid"),
                 payload.get("bootstrap_room"),
+                kv_receiver.bootstrap_addr,
             )
             self._fail_prefill_recompute(
                 kv_receiver,
-                "PD retract rebootstrap requires pd_rebootstrap_prefill_url from "
-                "the router.",
+                "PD retract rebootstrap could not resolve the prefill /generate "
+                "URL from bootstrap info.",
             )
             return
         self._ensure_prefill_recompute_executor().submit(
@@ -538,6 +569,10 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
+            # Self-register the HTTP API port so the decode can derive the PD
+            # retract rebootstrap /generate URL from bootstrap info instead of a
+            # router-injected pd_rebootstrap_prefill_url.
+            "prefill_http_port": self.server_args.port,
         }
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
@@ -1333,6 +1368,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
+        self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1399,6 +1435,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        prefill_http_port = data.get("prefill_http_port")
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1417,6 +1454,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
+
+        if self.prefill_http_port is None and prefill_http_port is not None:
+            self.prefill_http_port = int(prefill_http_port)
 
         if self.follow_bootstrap_room is None:
             load_balance_method = data.get(
@@ -1487,6 +1527,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
+                prefill_http_port=self.prefill_http_port,
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 
