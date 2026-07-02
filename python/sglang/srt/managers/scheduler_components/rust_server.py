@@ -7,11 +7,10 @@ scheduler holds an `Optional[RustServer]` and delegates to it.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-import threading
 from array import array
+from itertools import chain
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
@@ -27,6 +26,59 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _flatten_ragged(per_pos_val, per_pos_idx):
+    """Flatten a per-position ``list[Optional[list]]`` (top-k / token-ids
+    logprobs) into flat ``val``/``idx`` buffers plus a per-position ``lens``
+    vector for the columnar egress wire. A falsy (None/empty) position
+    contributes no values and a ``0`` length — the Rust side reshapes it back to
+    a ``null`` position, matching ``detokenize_top_logprobs_tokens``.
+    """
+    flat_val: List[float] = []
+    flat_idx: List[int] = []
+    lens: List[int] = []
+    if not per_pos_val:
+        return flat_val, flat_idx, lens
+    per_pos_idx = per_pos_idx or []
+    for p, pv in enumerate(per_pos_val):
+        if pv:
+            pi = per_pos_idx[p] if p < len(per_pos_idx) else []
+            flat_val.extend(pv)
+            flat_idx.extend(pi or [])
+            lens.append(len(pv))
+        else:
+            lens.append(0)
+    return flat_val, flat_idx, lens
+
+
+def _flatten_floats(x):
+    """Recursively flatten a (possibly nested) float structure into a flat list
+    of floats — handles the ``float | list[float]`` union inside a hidden-state
+    chunk."""
+    if isinstance(x, (int, float)):
+        return [float(x)]
+    out: List[float] = []
+    for e in x:
+        out.extend(_flatten_floats(e))
+    return out
+
+
+def _flatten_hidden(hs):
+    """Flatten one request's hidden states into a flat ``val`` buffer plus a
+    per-row ``lens`` vector (one row per output position). Each top-level element
+    becomes a single row; the Rust side reshapes back to ``list[list[float]]``,
+    matching ``meta_info["hidden_states"]``'s common per-position-vector shape.
+    """
+    vals: List[float] = []
+    lens: List[int] = []
+    if not hs:
+        return vals, lens
+    for row in hs:
+        flat = _flatten_floats(row)
+        vals.extend(flat)
+        lens.append(len(flat))
+    return vals, lens
+
+
 class RustServer:
     """Owns the embedded multi-threaded Rust server (``sglang_server.Server``).
 
@@ -37,7 +89,6 @@ class RustServer:
     def __init__(self, server: Server, max_per_poll: int = 256):
         self.server = server
         self._max_per_poll = max_per_poll
-        self._seq_id: dict = {}
 
     @classmethod
     def maybe_create(cls, scheduler: Scheduler) -> RustServer:
@@ -57,7 +108,6 @@ class RustServer:
             pin_cores=cores is not None,
             cores=cores,
             bind=bind,
-            headless_server_bind=None,
             server_args_json=cls._build_server_args(scheduler),
         )
 
@@ -139,30 +189,171 @@ class RustServer:
     def push_generation(self, payload: BatchTokenIDOutput) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).
 
-        Fan the batch out into per-request ChunkEvents and push them into the
-        Rust egress ring (-> detokenizer shard -> client stream). ChunkEvent is a
-        positional msgpack array ``[rid, seq, token_ids, finish_reason,
-        prompt_tokens]`` (which rmp-serde decodes from an array).
-        ``output_ids[i]`` is the incremental new output tokens for this step;
-        ``finished_reasons[i]``'s ``type`` becomes the chunk's finish reason;
-        ``prompt_tokens[i]`` rides along so the egress can report usage.
+        Fan the batch out into per-request chunks and push each into the Rust
+        egress ring (-> detokenizer shard -> client stream). Each chunk is a
+        ``(header, data)`` pair, mirroring the ingress ``input_ids`` split so the
+        bulk numeric columns never go through msgpack:
+
+          - ``header``: msgpack ``ChunkHeader`` positional array — scalars
+            (``rid, seq, token_ids, finish_reason, prompt_tokens``) plus the shape
+            metadata (``out_lp_n, in_lp_n`` element counts for the flat logprob
+            columns, and the per-position ``lens`` vectors for the ragged / hidden
+            columns).
+          - ``data``: the raw little-endian numeric buffer — every column is a
+            4-byte element (``f32`` values, ``i32`` indices), concatenated in the
+            order the Rust ``decode_chunk_frame`` reads them.
+
+        Logprobs are columnar: output families are per-step deltas, input
+        (prefill) families ride once on the first chunk. Ragged families (top-k,
+        token-ids) flatten a per-position ``list[list]`` into flat ``val``/``idx``
+        buffers plus a per-position ``lens`` vector (0 = null position). Hidden
+        states flatten to rows of floats (one row per output position).
         """
         output_ids = payload.output_ids or []
         prompt_tokens = payload.prompt_tokens or []
-        for i, rid in enumerate(payload.rids):
-            ids = output_ids[i] if i < len(output_ids) else None
-            token_ids = list(ids) if ids is not None else []
-            fr = payload.finished_reasons[i]
-            finish = fr.get("type") if isinstance(fr, dict) else None
-            n_prompt = prompt_tokens[i] if i < len(prompt_tokens) else 0
+        out_lp_val = payload.output_token_logprobs_val or []
+        out_lp_idx = payload.output_token_logprobs_idx or []
+        in_lp_val = payload.input_token_logprobs_val or []
+        in_lp_idx = payload.input_token_logprobs_idx or []
+        out_top_val = payload.output_top_logprobs_val or []
+        out_top_idx = payload.output_top_logprobs_idx or []
+        in_top_val = payload.input_top_logprobs_val or []
+        in_top_idx = payload.input_top_logprobs_idx or []
+        out_tid_val = payload.output_token_ids_logprobs_val or []
+        out_tid_idx = payload.output_token_ids_logprobs_idx or []
+        in_tid_val = payload.input_token_ids_logprobs_val or []
+        in_tid_idx = payload.input_token_ids_logprobs_idx or []
+        hidden = getattr(payload, "output_hidden_states", None) or []
 
-            seq = self._seq_id.get(rid, 0)
-            self._seq_id[rid] = seq + 1
-            chunk = msgspec.msgpack.encode([rid, seq, token_ids, finish, n_prompt])
-            if not self.server.push_chunk(chunk):
-                logger.warning("Rust egress ring full; dropped chunk for %s", rid)
-            if finish is not None:
-                self._seq_id.pop(rid, None)
+        def at(seq_, j):
+            return seq_[j] if j < len(seq_) else None
+
+        # Hot-path guard: the overwhelming majority of decode steps request no
+        # logprobs / hidden states. Only then do we run the per-request flatten +
+        # raw-buffer packing; otherwise the loop stays as cheap as plain token
+        # streaming (a small header + empty data), which keeps this off the
+        # scheduler/CUDA-launch thread's critical path.
+        has_extra = bool(
+            out_lp_val
+            or in_lp_val
+            or out_top_val
+            or in_top_val
+            or out_tid_val
+            or in_tid_val
+            or hidden
+        )
+
+        # Both paths ship the WHOLE batch in one frame: columnar scalars via a
+        # single msgpack header + one concatenated raw `data` buffer + one
+        # `push_batch` FFI. The tm-egress dispatcher fans it out per rid (routing
+        # is by rid, so the old per-rid load-balance seq is no longer tracked
+        # here). Collapsing N per-request encodes + N FFI crossings to one is what
+        # keeps 4k-16k-request PD decode steps off the scheduler's critical path.
+        rids = payload.rids
+        finish_types = [
+            (fr.get("type") if isinstance(fr, dict) else None)
+            for fr in payload.finished_reasons
+        ]
+        # `chain.from_iterable` flattens the per-request id arrays in C (no
+        # Python-level per-token loop); `tok_lens` splits them back out in Rust.
+        tok_lens = [len(x) if x else 0 for x in output_ids]
+        flat_ids = array("i", chain.from_iterable(x or () for x in output_ids))
+
+        # Column order here MUST match BatchHeader (header_cols) and
+        # decode_batch_frame's read order (data_cols).
+        header_cols = [rids, finish_types, list(prompt_tokens), tok_lens]
+        data_cols = [flat_ids.tobytes()]
+
+        if has_extra:
+            # Rare: at least one request wants logprobs/hidden states. Append the
+            # numeric columns concatenated across all requests (column-major).
+            # Flat families carry a per-request element count; ragged families and
+            # hidden states carry a per-request position/row count + a flat
+            # per-position length stream.
+            olp_v, olp_i, out_lp_lens = array("f"), array("i"), []
+            ilp_v, ilp_i, in_lp_lens = array("f"), array("i"), []
+            ot_v, ot_i, ot_pos, ot_req = array("f"), array("i"), [], []
+            it_v, it_i, it_pos, it_req = array("f"), array("i"), [], []
+            od_v, od_i, od_pos, od_req = array("f"), array("i"), [], []
+            id_v, id_i, id_pos, id_req = array("f"), array("i"), [], []
+            h_v, h_pos, h_req = array("f"), [], []
+
+            # TODO(perf): this per-request flatten assumes the logprob/hidden
+            # columns are ragged, non-contiguous nested Python lists — which is
+            # only an assumption. The scheduler moves these off the GPU with
+            # `tensor.tolist()`, so revisit whether the underlying values are
+            # still contiguous tensors upstream. If so, ship them as raw bytes
+            # (`tensor.contiguous().numpy().tobytes()`) + a shape descriptor and
+            # skip this flatten entirely, making the extras path loop-free too.
+            for i in range(len(rids)):
+                olv = at(out_lp_val, i) or []
+                olp_v.extend(olv)
+                olp_i.extend(at(out_lp_idx, i) or [])
+                out_lp_lens.append(len(olv))
+                ilv = at(in_lp_val, i) or []
+                ilp_v.extend(ilv)
+                ilp_i.extend(at(in_lp_idx, i) or [])
+                in_lp_lens.append(len(ilv))
+                otv, oti, otl = _flatten_ragged(at(out_top_val, i), at(out_top_idx, i))
+                ot_v.extend(otv)
+                ot_i.extend(oti)
+                ot_pos.extend(otl)
+                ot_req.append(len(otl))
+                itv, iti, itl = _flatten_ragged(at(in_top_val, i), at(in_top_idx, i))
+                it_v.extend(itv)
+                it_i.extend(iti)
+                it_pos.extend(itl)
+                it_req.append(len(itl))
+                odv, odi, odl = _flatten_ragged(at(out_tid_val, i), at(out_tid_idx, i))
+                od_v.extend(odv)
+                od_i.extend(odi)
+                od_pos.extend(odl)
+                od_req.append(len(odl))
+                idv, idi, idl = _flatten_ragged(at(in_tid_val, i), at(in_tid_idx, i))
+                id_v.extend(idv)
+                id_i.extend(idi)
+                id_pos.extend(idl)
+                id_req.append(len(idl))
+                hv, hlens = _flatten_hidden(at(hidden, i))
+                h_v.extend(hv)
+                h_pos.extend(hlens)
+                h_req.append(len(hlens))
+
+            header_cols += [
+                out_lp_lens,
+                in_lp_lens,
+                ot_req,
+                ot_pos,
+                it_req,
+                it_pos,
+                od_req,
+                od_pos,
+                id_req,
+                id_pos,
+                h_req,
+                h_pos,
+            ]
+            data_cols += [
+                olp_v.tobytes(),
+                olp_i.tobytes(),
+                ilp_v.tobytes(),
+                ilp_i.tobytes(),
+                ot_v.tobytes(),
+                ot_i.tobytes(),
+                it_v.tobytes(),
+                it_i.tobytes(),
+                od_v.tobytes(),
+                od_i.tobytes(),
+                id_v.tobytes(),
+                id_i.tobytes(),
+                h_v.tobytes(),
+            ]
+
+        header = msgspec.msgpack.encode(header_cols)
+        if not self.server.push_batch(header, b"".join(data_cols)):
+            logger.warning(
+                "Rust egress ring full; dropped batch of %d requests", len(rids)
+            )
 
     @staticmethod
     def _build_server_args(scheduler: Scheduler) -> str:
@@ -223,126 +414,3 @@ class RustServer:
             launch_cores,
         )
         return server_cores
-
-
-# --- Standalone api-server (Mode B): SGLANG_RUST_SERVER + ---------------------
-# SGLANG_RUST_STANDALONE_API_SERVER + dp_size>1. The DP ranks run headless (TCP)
-# and a single api-server process, spawned by the node-0 launcher, serves the
-# HTTP API and connects to every rank. The api-server has no deterministic
-# endpoint list: each rank reports the address to dial via `POST
-# /internal/register`, so per-rank node IPs need no out-of-band discovery and the
-# api-server connects its pool only once all ranks have registered.
-
-
-def _rust_headless_port(server_args, dp_rank: int) -> int:
-    """Per-DP-rank headless TCP port, offset from the HTTP ``port`` so it never
-    collides with the api-server's ``port``."""
-    return server_args.port + 1 + dp_rank
-
-
-def rust_headless_tcp_bind(server_args, dp_rank: int) -> str:
-    """Address DP rank ``dp_rank``'s headless listener **binds** to. Single-node:
-    loopback. Multi-node (``nnodes > 1``): all interfaces, so the api-server on
-    node 0 can reach ranks on other nodes — the concrete address it dials is the
-    one the rank advertises (:func:`rust_headless_advertise_addr`)."""
-    host = "0.0.0.0" if server_args.nnodes > 1 else "127.0.0.1"
-    return f"{host}:{_rust_headless_port(server_args, dp_rank)}"
-
-
-def rust_headless_advertise_addr(server_args, dp_rank: int) -> str:
-    """Address the api-server should **dial** for DP rank ``dp_rank`` — the value
-    the rank reports via registration. Single-node: loopback. Multi-node: this
-    node's auto-detected reachable IP."""
-    if server_args.nnodes > 1:
-        from sglang.srt.utils.network import get_local_ip_auto
-
-        host = get_local_ip_auto(fallback=server_args.host)
-    else:
-        host = "127.0.0.1"
-    return f"{host}:{_rust_headless_port(server_args, dp_rank)}"
-
-
-def _api_server_register_url(server_args) -> str:
-    """URL of the node-0 standalone api-server's ``/internal/register`` endpoint.
-    Node 0 is the ``dist_init_addr`` host (loopback for a single node)."""
-    if server_args.dist_init_addr:
-        from sglang.srt.utils.network import NetworkAddress
-
-        host = NetworkAddress.parse(server_args.dist_init_addr).host
-    else:
-        host = "127.0.0.1"
-    return f"http://{host}:{server_args.port}/internal/register"
-
-
-def _register_headless_rank(server_args, dp_rank: int) -> None:
-    """Report this headless DP rank's TCP endpoint to the standalone api-server so
-    it can dial the rank and (once all ranks register) connect its pool.
-
-    Runs on a daemon thread with bounded retry: the api-server (node 0) may not be
-    listening yet, while this rank's own listener is already up — so the
-    api-server connects as soon as it receives the registration.
-    """
-    url = _api_server_register_url(server_args)
-    endpoint = rust_headless_advertise_addr(server_args, dp_rank)
-
-    def _post() -> None:
-        import time
-        import urllib.error
-        import urllib.request
-
-        body = json.dumps({"dp_rank": dp_rank, "endpoint": endpoint}).encode()
-        deadline = time.monotonic() + 120.0
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                req = urllib.request.Request(
-                    url, data=body, headers={"Content-Type": "application/json"}
-                )
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    resp.read()
-                logger.info(
-                    "Rust headless rank %s registered %s -> %s", dp_rank, endpoint, url
-                )
-                return
-            except (urllib.error.URLError, OSError) as e:
-                if time.monotonic() >= deadline:
-                    logger.error(
-                        "Rust headless rank %s failed to register to %s after %d attempts: %s",
-                        dp_rank,
-                        url,
-                        attempt,
-                        e,
-                    )
-                    return
-                time.sleep(0.2)
-
-    threading.Thread(
-        target=_post, daemon=True, name=f"rust-register-dp{dp_rank}"
-    ).start()
-
-
-def run_rust_api_server(server_args) -> None:
-    """Entry point for the standalone Rust api-server (Mode B), run on a daemon
-    thread of the node-0 launcher.
-
-    Resolves its own ``ModelConfig`` (it has no scheduler), dumps server_args,
-    and hands off to the Rust ``run_api_server``, which serves the OpenAI /
-    ``/generate`` HTTP API plus ``/internal/register`` and connects to the DP
-    ranks once they register. Blocks (with the GIL released) for the process
-    lifetime.
-    """
-    import sglang_server
-
-    from sglang.srt.configs.model_config import ModelConfig
-
-    model_config = ModelConfig.from_server_args(server_args)
-    server_args_json = RustServer._dump_server_args_json(server_args, model_config)
-
-    bind = f"{server_args.host}:{server_args.port}"
-    logger.info(
-        "Rust standalone api-server: HTTP %s, awaiting %d DP-rank registration(s)",
-        bind,
-        server_args.dp_size,
-    )
-    sglang_server.run_api_server(bind, server_args_json=server_args_json)
