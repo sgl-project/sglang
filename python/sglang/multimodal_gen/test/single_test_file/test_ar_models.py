@@ -26,7 +26,7 @@ from sglang.test.test_utils import CustomTestCase
 HOST = "127.0.0.1"
 _LOG_DIR = Path(os.environ.get("SGLANG_TEST_LOG_DIR", "/tmp"))
 
-from sglang.multimodal_gen.test.server.test_disagg_server import (
+from sglang.multimodal_gen.test.single_test_file.test_disagg_server import (
     DisaggCluster,
     _DisaggTestBase,
     _generate_image,
