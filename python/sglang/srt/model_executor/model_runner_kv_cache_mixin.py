@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.allocator.swa import (
     SWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
+from sglang.srt.mem_cache.cp_layersplit_pool import build_kv_pool_maybe_layersplit
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
@@ -852,8 +853,13 @@ class ModelRunnerKVCacheMixin:
                 pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                     self.server_args
                 ).host_to_device_ratio
-            self.token_to_kv_pool = PoolCls(
-                self.max_total_num_tokens,
+            # base_kwargs uses the PP-local layer range; the layersplit wrapper
+            # overrides layer_num/start_layer/end_layer per owned/transient pool.
+            # num_layers is the PP-local effective count; layer_offset carries the
+            # global start so layersplit computes correct global owned bands.
+            num_layers = self.num_effective_layers
+            base_kwargs = dict(
+                size=self.max_total_num_tokens,
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
                 kv_lora_rank=self.model_config.kv_lora_rank,
@@ -866,6 +872,15 @@ class ModelRunnerKVCacheMixin:
                 end_layer=self.end_layer,
                 index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                 **pool_kwargs,
+            )
+            self.token_to_kv_pool = build_kv_pool_maybe_layersplit(
+                server_args=self.server_args,
+                num_layers=num_layers,
+                attn_cp_size=self.attn_cp_size,
+                attn_cp_rank=self.attn_cp_rank,
+                inner_pool_cls=PoolCls,
+                base_kwargs=base_kwargs,
+                layer_offset=self.start_layer,
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_dsa_model
@@ -883,8 +898,13 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
             else:
-                self.token_to_kv_pool = MLATokenToKVPool(
-                    self.max_total_num_tokens,
+                # base_kwargs uses the PP-local layer range; the layersplit wrapper
+                # overrides layer_num/start_layer/end_layer per owned/transient pool.
+                # num_layers is the PP-local effective count; layer_offset carries the
+                # global start so layersplit computes correct global owned bands.
+                num_layers = self.num_effective_layers
+                base_kwargs = dict(
+                    size=self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     kv_lora_rank=self.model_config.kv_lora_rank,
@@ -894,6 +914,15 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
+                )
+                self.token_to_kv_pool = build_kv_pool_maybe_layersplit(
+                    server_args=self.server_args,
+                    num_layers=num_layers,
+                    attn_cp_size=self.attn_cp_size,
+                    attn_cp_rank=self.attn_cp_rank,
+                    inner_pool_cls=MLATokenToKVPool,
+                    base_kwargs=base_kwargs,
+                    layer_offset=self.start_layer,
                 )
         else:
             if self.is_hybrid_swa:
@@ -1210,8 +1239,16 @@ class ModelRunnerKVCacheMixin:
                 )
             token_capacity = min(token_capacity, user_limit)
 
-        # Sync across PP ranks (each may have different layer counts)
-        if self.pp_size > 1:
+        # Sync across PP ranks (each may have different layer counts), and across
+        # ranks under CP layer-split: uneven owned-layer counts give each CP rank a
+        # different per-token KV cell size -> different token capacity. If capacity
+        # diverges, radix/host eviction and prefix matching diverge across CP ranks,
+        # deadlocking the per-layer CP prefix broadcast. MIN-reduce so all ranks agree.
+        from sglang.srt.layers.utils.cp_utils import is_cp_layersplit_active
+
+        if self.pp_size > 1 or is_cp_layersplit_active(
+            self.server_args, self.attn_cp_rank
+        ):
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,

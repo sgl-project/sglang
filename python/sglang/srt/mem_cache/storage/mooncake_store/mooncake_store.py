@@ -540,6 +540,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else:
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
+            # CP layer-split: namespace by CP rank (both MHA and MLA) so CP ranks
+            # holding different owned layers don't collide on the same content key.
+            if storage_config is not None and storage_config.is_cp_layersplit:
+                cp = f"_cp{self.attn_cp_rank}_{self.attn_cp_size}"
+                self.mha_suffix += cp
+                self.mla_suffix += cp
 
             self.storage_config = storage_config
             self.split_factor = 0

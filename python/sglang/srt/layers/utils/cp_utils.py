@@ -490,6 +490,90 @@ def cp_attn_forward_extend(
     return torch.concat([result_prev, result_next], dim=0)
 
 
+def cp_layersplit_layer_range(
+    num_layers: int, cp_size: int, cp_rank: int, layer_offset: int = 0
+):
+    """Contiguous layer block owned by cp_rank. Returns global [start, end).
+
+    ``num_layers`` is the PP-local layer count; ``layer_offset`` is the global
+    start of this PP stage (0 for pp_size==1, keeping the pp1 path byte-identical).
+    By default requires exact divisibility so per-row bytes stay identical
+    across CP ranks. ``SGLANG_ENABLE_DSA_PREFILL_CP_LAYERSPLIT_UNEVEN=True``
+    opts into balanced remainder blocks: early ranks own one extra layer.
+    """
+    from sglang.srt.environ import envs
+
+    assert (
+        0 <= cp_rank < cp_size
+    ), f"cp_rank ({cp_rank}) must be in [0, cp_size={cp_size})"
+    if num_layers % cp_size == 0:
+        per = num_layers // cp_size
+        start = cp_rank * per
+        return layer_offset + start, layer_offset + start + per
+
+    assert envs.SGLANG_ENABLE_DSA_PREFILL_CP_LAYERSPLIT_UNEVEN.get(), (
+        f"cp-layersplit requires num_layers ({num_layers}) % cp_size ({cp_size}) == 0 "
+        "unless SGLANG_ENABLE_DSA_PREFILL_CP_LAYERSPLIT_UNEVEN=True"
+    )
+    base = num_layers // cp_size
+    extra = num_layers % cp_size
+    start = cp_rank * base + min(cp_rank, extra)
+    end = start + base + (1 if cp_rank < extra else 0)
+    return layer_offset + start, layer_offset + end
+
+
+def cp_layersplit_owns_layer(
+    layer_id: int, num_layers: int, cp_size: int, cp_rank: int, layer_offset: int = 0
+) -> bool:
+    start, end = cp_layersplit_layer_range(num_layers, cp_size, cp_rank, layer_offset)
+    return start <= layer_id < end
+
+
+def cp_layersplit_owner_rank(
+    layer_id: int, num_layers: int, cp_size: int, layer_offset: int = 0
+) -> int:
+    """Return the CP rank that owns layer_id.
+
+    ``num_layers`` is the PP-local layer count; ``layer_offset`` is the global
+    start of this PP stage. ``layer_id`` is a global id and must lie in
+    ``[layer_offset, layer_offset + num_layers)``.
+    Derived by scanning each rank's cp_layersplit_layer_range so it stays consistent
+    with the partition for both even and uneven splits. Raises ValueError if out of range.
+    """
+    if not (layer_offset <= layer_id < layer_offset + num_layers):
+        raise ValueError(
+            f"layer_id {layer_id} out of range [{layer_offset}, {layer_offset + num_layers})"
+        )
+    for r in range(cp_size):
+        start, end = cp_layersplit_layer_range(num_layers, cp_size, r, layer_offset)
+        if start <= layer_id < end:
+            return r
+    raise ValueError(
+        f"layer_id {layer_id} not covered by any rank in cp_size={cp_size}"
+    )
+
+
+def cp_layersplit_local_layer_count(num_layers: int, cp_size: int, cp_rank: int) -> int:
+    """Number of local pool layers for this rank: owned layers + 1 transient slot."""
+    start, end = cp_layersplit_layer_range(num_layers, cp_size, cp_rank)
+    return (end - start) + 1
+
+
+def is_cp_layersplit_active(server_args, attn_cp_rank) -> bool:
+    """True iff cp-layersplit is enabled and this rank has a valid attn_cp_rank."""
+    return server_args.enable_dsa_prefill_cp_layersplit and attn_cp_rank is not None
+
+
+def cp_layersplit_should_broadcast_prefix(forward_batch) -> bool:
+    """Gate for prefix gather: cp-layersplit enabled + extend (non-speculative) + has prefix."""
+    return (
+        get_global_server_args().enable_dsa_prefill_cp_layersplit
+        and forward_batch.forward_mode.is_extend_without_speculative()
+        and forward_batch.extend_prefix_lens_cpu is not None
+        and any(forward_batch.extend_prefix_lens_cpu)
+    )
+
+
 def prepare_context_parallel_metadata(
     kv_len,
     cp_rank,

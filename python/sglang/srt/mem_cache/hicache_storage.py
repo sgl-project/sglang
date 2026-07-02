@@ -37,6 +37,7 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    is_cp_layersplit: bool = False
 
 
 @dataclass
@@ -340,9 +341,13 @@ class HiCacheFile(HiCacheStorage):
             self.config_suffix += f"_{tp_rank}_{tp_size}"
         if enable_pp:
             self.config_suffix += f"_{pp_size}_{pp_rank}"
-        # Under NSA context parallel each CP rank holds a disjoint slice of every
-        # page, so give each rank its own file key to avoid a cross-rank write race.
-        if attn_cp_size > 1:
+        # Give each CP rank its own key when it holds rank-distinct payload under
+        # the same token content hash: NSA context parallel (disjoint page slice
+        # per rank) or CP layer-split (different owned-layer block per rank). Since
+        # layer-split always runs with attn_cp_size > 1, the two conditions overlap;
+        # OR them into one suffix so the key is namespaced exactly once (both MHA
+        # and MLA; MLA otherwise has no rank component and two CP ranks would collide).
+        if attn_cp_size > 1 or storage_config.is_cp_layersplit:
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:

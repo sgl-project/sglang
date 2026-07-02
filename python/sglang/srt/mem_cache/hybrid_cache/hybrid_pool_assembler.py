@@ -1174,6 +1174,12 @@ def attach_hybrid_pool_to_unified_cache(
     """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
     try:
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        # CP layer-split presents a full-layer wrapper; unwrap to owned_pool so
+        # strategy selection (DSA/INDEXER), host sizing, and layer-transfer-counter
+        # registration all see the owned token-to-kv pool. No-op otherwise.
+        from sglang.srt.mem_cache.cp_layersplit_pool import unwrap_cp_layersplit_kv_pool
+
+        kvcache = unwrap_cp_layersplit_kv_pool(kvcache)
         components = set(cache.components.keys())
         strategy = _select_strategy(kvcache, components)
         result = strategy.build(

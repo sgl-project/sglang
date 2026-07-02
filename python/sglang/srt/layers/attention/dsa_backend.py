@@ -55,6 +55,9 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_position,
 )
+from sglang.srt.mem_cache.cp_layersplit_pool import (
+    cp_layersplit_broadcast_prefix_if_needed,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -1765,6 +1768,10 @@ class DeepseekSparseAttnBackend(
                 forward_batch=forward_batch,
                 metadata=metadata,
             )
+
+        cp_layersplit_broadcast_prefix_if_needed(
+            layer.layer_id, forward_batch, "latent"
+        )
 
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None

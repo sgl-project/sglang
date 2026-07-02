@@ -142,6 +142,7 @@ class CommonKVManager(BaseKVManager):
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
         )
+        self.is_cp_layersplit = server_args.enable_dsa_prefill_cp_layersplit
 
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
@@ -158,10 +159,12 @@ class CommonKVManager(BaseKVManager):
         self.failure_lock = threading.Lock()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, all CP ranks
-            # participate in KV transfer; Otherwise only CP rank 0 sends.
+            # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, or when
+            # cp-layersplit is active (every rank owns distinct layers), all CP
+            # ranks participate in KV transfer; otherwise only CP rank 0 sends.
             self.is_dummy_cp_rank = (
                 not self.enable_all_cp_ranks_for_transfer
+                and not self.is_cp_layersplit
                 and self.attn_cp_size > 1
                 and self.attn_cp_rank != 0
             )
@@ -356,6 +359,14 @@ class CommonKVManager(BaseKVManager):
         info.target_pp_ranks = target_pp_ranks
         info.required_dst_info_num = required_dst_info_num
         info.required_prefill_response_num = required_prefill_response_num
+
+    def _should_filter_cp_indices(self) -> bool:
+        """Return True when per-rank CP index filtering should apply.
+
+        Under cp-layersplit every CP rank owns distinct layers and sends its own
+        pages unfiltered, so filtering is not applicable.
+        """
+        return self.enable_all_cp_ranks_for_transfer and not self.is_cp_layersplit
 
     def _sync_bootstrap_port_across_nodes(self, local_port: int) -> int:
         """Broadcast world-rank-0's bootstrap port to all prefill ranks.
@@ -876,7 +887,7 @@ class CommonKVSender(BaseKVSender):
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
-        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+        if self.kv_mgr._should_filter_cp_indices():
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
                 self.kv_mgr,
                 kv_indices,

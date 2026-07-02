@@ -237,6 +237,11 @@ class HiCacheController:
 
         if isinstance(mem_pool_device, HybridLinearKVPool):
             mem_pool_device = mem_pool_device.full_kv_pool
+        from sglang.srt.mem_cache.cp_layersplit_pool import CpLayerSplitKVPool
+
+        self.is_cp_layersplit = isinstance(mem_pool_device, CpLayerSplitKVPool)
+        if self.is_cp_layersplit:
+            mem_pool_device = mem_pool_device.owned_pool
         self.mem_pool_device = mem_pool_device
         self.mem_pool_host = mem_pool_host
         self.write_policy = write_policy
@@ -626,6 +631,7 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            is_cp_layersplit=self.is_cp_layersplit,
         )
 
     def reset(self):

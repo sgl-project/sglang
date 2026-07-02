@@ -631,9 +631,11 @@ def filter_kv_indices_for_cp_rank(
 
 
 def is_mla_backend(target_kv_pool) -> bool:
+    from sglang.srt.mem_cache.cp_layersplit_pool import unwrap_cp_layersplit_kv_pool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
+    target_kv_pool = unwrap_cp_layersplit_kv_pool(target_kv_pool)
     return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
 
 
@@ -668,11 +670,14 @@ def setup_state_kv_args(
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.cp_layersplit_pool import unwrap_cp_layersplit_kv_pool
     from sglang.srt.mem_cache.memory_pool import (
         DSATokenToKVPool,
         HybridLinearKVPool,
         MiniMaxSparseKVPool,
     )
+
+    token_to_kv_pool = unwrap_cp_layersplit_kv_pool(token_to_kv_pool)
 
     kv_args.state_types = []
     kv_args.state_data_ptrs = []

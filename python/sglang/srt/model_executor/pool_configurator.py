@@ -134,6 +134,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         else:
             num_layers = mr.num_effective_layers
 
+        # CP layer-split: each rank only stores its owned layers + 1 transient slot,
+        # so the per-token KV cost is far below full num_layers.
+        from sglang.srt.layers.utils.cp_utils import (
+            cp_layersplit_local_layer_count,
+            is_cp_layersplit_active,
+        )
+
+        if is_cp_layersplit_active(mr.server_args, mr.attn_cp_rank):
+            num_layers = cp_layersplit_local_layer_count(
+                num_layers, mr.server_args.attn_cp_size, mr.attn_cp_rank
+            )
+
         self._cell_size = self._compute_cell_size(mr, num_layers)
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.

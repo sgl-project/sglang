@@ -393,6 +393,7 @@ class TpModelWorker(BaseTpWorker):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
+            attn_cp_rank=self.attn_cp_rank,
         )
 
     def _init_multi_layer_eagle_model_runners(self):
