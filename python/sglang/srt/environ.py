@@ -874,12 +874,7 @@ class Envs:
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
-    # Default-on for CUDA, default-off for ROCm/HIP: the FlashMLA sparse prefill
-    # path produces incorrect output for DeepSeek-V4-Flash on AMD (MI355X), which
-    # breaks the disaggregation nightly. Keep the previous (dense prefill) default
-    # on ROCm until the sparse kernel is validated for that variant. Explicitly
-    # setting SGLANG_OPT_FLASHMLA_SPARSE_PREFILL still overrides this.
-    SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(lambda: not _default_hip())
+    SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
     # SWA radix cache
     # TODO(DSV4): @ispobock this has bug on main branch when retract
