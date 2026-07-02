@@ -22,6 +22,8 @@
 #   MODEL_PATH         - local snapshot dir (preferred over downloading MODEL)
 #   SLURM_PARTITION    - default: amd-sglang
 #   SLURM_NODELIST     - optional explicit node pin (else scheduler chooses)
+#   SLURM_EXCLUDE      - optional comma-separated nodes to keep the scheduler
+#                        off (e.g. hosts with a broken RDMA driver)
 #   RUNNER_NAME        - GitHub runner name (a built-in default env var)
 #   GITHUB_RUN_ID      - GitHub Actions run id (a built-in default env var)
 #                        The allocation is named
@@ -101,6 +103,13 @@ emit("CHUNK", rt["chunked_prefill_size"])
 emit("SWA", rt["swa_full_tokens_ratio"])
 emit("PTP", b["prefill"]["tensor-parallel-size"])
 emit("DTP", b["decode"]["tensor-parallel-size"])
+emit("PEP", b["prefill"].get("expert-parallel-size", 1))
+emit("PDP", b["prefill"].get("data-parallel-size", 1))
+m = r.get("mtp", {}) or {}
+emit("MTP_ENABLED", 1 if m.get("enabled") else 0)
+emit("MTP_STEPS", m.get("num_steps", 3))
+emit("MTP_TOPK", m.get("eagle_topk", 1))
+emit("MTP_DRAFT", m.get("num_draft_tokens", 4))
 # Worker counts double as node counts here: one server per node (TP == GPUs/node).
 # 1P1D today; bumping these reserves 2P2D / 1P3D / 3P1D. Multi-node-per-worker
 # (TP > GPUs/node, needs --dist-init-addr/--nnodes/--node-rank) is out of scope.
@@ -175,12 +184,24 @@ DSV4_ENV=(
 DSV4_ENV_STR="${DSV4_ENV[*]}"
 MORI_ENV="-e MORI_DISABLE_AUTO_XGMI=1 -e NCCL_IB_HCA=ionic -e NCCL_IB_GID_INDEX=1 -e NCCL_CROSS_NIC=1"
 
+# Optional topology / speculative-decode flags driven by the recipe. Base recipes
+# (EP1/DP1, no mtp) leave EXTRA_FLAGS empty, preserving prior behavior exactly.
+EXTRA_FLAGS=""
+(( PDP > 1 )) && EXTRA_FLAGS="$EXTRA_FLAGS --enable-dp-attention --dp-size $PDP"
+(( PEP > 1 )) && EXTRA_FLAGS="$EXTRA_FLAGS --ep-size $PEP"
+if [[ "$MTP_ENABLED" == "1" ]]; then
+    EXTRA_FLAGS="$EXTRA_FLAGS --speculative-algorithm EAGLE \
+--speculative-num-steps $MTP_STEPS --speculative-eagle-topk $MTP_TOPK \
+--speculative-num-draft-tokens $MTP_DRAFT"
+fi
+echo "extra flags: ${EXTRA_FLAGS:-<none>} (pep=$PEP pdp=$PDP mtp=$MTP_ENABLED)"
+
 COMMON_FLAGS="--trust-remote-code --tp $PTP --disable-radix-cache \
 --attention-backend $ATTN --max-running-requests $MAXREQ --page-size $PAGE \
 --mem-fraction-static $MEMFRAC --swa-full-tokens-ratio $SWA \
 --chunked-prefill-size $CHUNK --disable-shared-experts-fusion \
 --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
---disaggregation-transfer-backend mori --disaggregation-ib-device $IB"
+--disaggregation-transfer-backend mori --disaggregation-ib-device $IB$EXTRA_FLAGS"
 
 DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \
 --security-opt seccomp=unconfined \
@@ -367,6 +388,12 @@ NODELIST_ARG=()
 EXCLUSIVE_ARG=()
 [[ "${SLURM_EXCLUSIVE:-1}" == "1" ]] && EXCLUSIVE_ARG=(--exclusive)
 
+# Keep the scheduler off known-bad nodes (e.g. a host whose ionic RDMA driver
+# ABI mismatches the container, where MORI reports "no active RDMA device" and
+# the disagg server dies on init). Comma-separated node list.
+EXCLUDE_ARG=()
+[[ -n "${SLURM_EXCLUDE:-}" ]] && EXCLUDE_ARG=(--exclude="$SLURM_EXCLUDE")
+
 # One node per prefill/decode worker (TP == GPUs/node). 1P1D -> 2 nodes.
 TOTAL_NODES=$((PW + DW))
 
@@ -377,7 +404,7 @@ TOTAL_NODES=$((PW + DW))
 JOB_NAME="mi355x-ci-${RUNNER_NAME:-norunner}-${GITHUB_RUN_ID:-0}-${MATRIX_CONFIG_NAME}"
 
 set +e
-salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \
+salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \
     --job-name "$JOB_NAME" -t "$TIME_LIMIT" \
     bash "$WORKDIR/drive.sh" "$WORKDIR" "$PW" "$DW"
 SALLOC_RC=$?

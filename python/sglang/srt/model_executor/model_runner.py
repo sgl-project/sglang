@@ -112,6 +112,7 @@ from sglang.srt.eplb.lplb_solver import (
     set_global_lplb_solver,
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
+from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
@@ -879,7 +880,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
-        elif self.device == "cpu":
+        elif self.device in ["cpu", "xpu"]:
             self.init_attention_backend()
         elif self.device == "npu":
             self.init_attention_backend()
@@ -922,7 +923,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.graph_mem_usage = 0
 
         if capture_decode_cuda_graph:
-            if self.device in ("cuda", "musa", "cpu", "npu"):
+            if self.device in ("cuda", "musa", "cpu", "npu", "xpu"):
                 self.init_decode_cuda_graph()
             elif (
                 current_platform.is_out_of_tree()
@@ -2601,6 +2602,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "musa": "CUDA graph",
                 "cpu": "CPU graph",
                 "npu": "NPU graph",
+                "xpu": "XPU graph",
             },
         )
         role = "draft" if self.is_draft_worker else "target"
@@ -2636,6 +2638,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 {
                     "cpu": CPUGraphRunner,
                     "npu": NPUGraphRunner,
+                    "xpu": XPUGraphRunner,
                 },
             )
             self.decode_cuda_graph_runner = graph_runners[self.device](self)
