@@ -709,7 +709,11 @@ class ModelConfig:
             setattr(self.hf_text_config, "head_dim", self.head_dim)
 
         self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", None)
-        if self.v_head_dim is None:
+        if not self.v_head_dim:
+            # Treat 0 the same as unset: MLA-disabled checkpoints (e.g.
+            # deepseek-vl2-tiny, DeepseekV2ForCausalLM with use_mla=False)
+            # zero out the MLA head-dim fields instead of omitting them, and a
+            # 0-width V cache breaks every MHA KV pool sized from this value.
             self.v_head_dim = self.head_dim
             setattr(self.hf_text_config, "v_head_dim", self.v_head_dim)
 
