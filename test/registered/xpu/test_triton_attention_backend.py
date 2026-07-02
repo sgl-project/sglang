@@ -31,6 +31,7 @@ def triton_attention_benchmark(extra_args=None, mem_fraction_static="0.84"):
                 "2050",
                 "--attention-backend",
                 "triton",
+                "--disable-decode-cuda-graph",
             ]
             full_args = common_args + (extra_args or [])
 
