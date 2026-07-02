@@ -440,8 +440,17 @@ class MoEGate(nn.Module):
         super().__init__()
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
+        self.router_dtype = (
+            torch.float32
+            if getattr(config, "model_type", None) == "glm_moe_dsa"
+            or getattr(config, "moe_router_dtype", None) is not None
+            else None
+        )
         self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size))
+            torch.empty(
+                (config.n_routed_experts, config.hidden_size),
+                dtype=self.router_dtype,
+            )
         )
 
         if config.topk_method == "noaux_tc" and not is_hash_moe:
@@ -469,6 +478,11 @@ class MoEGate(nn.Module):
         self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
 
+    def _router_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.router_dtype is None:
+            return F.linear(hidden_states, self.weight, None)
+        return F.linear(hidden_states.to(self.router_dtype), self.weight, None)
+
     def forward(
         self,
         hidden_states,
@@ -484,7 +498,7 @@ class MoEGate(nn.Module):
             )
 
         if get_global_server_args().enable_deterministic_inference:
-            return F.linear(hidden_states, self.weight, None)
+            return self._router_gemm(hidden_states)
 
         if (
             not self.is_deepseek_v4
@@ -494,11 +508,13 @@ class MoEGate(nn.Module):
                 or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
             )
         ):
-            logits = F.linear(hidden_states, self.weight, None)
+            logits = self._router_gemm(hidden_states)
         else:
             # NOTE(b8zhong): this threshold has been empirically verified
             max_router_gemm_tokens = 4 if _device_sm in (100, 103) else 16
-            if (
+            if self.router_dtype is not None:
+                logits = self._router_gemm(hidden_states)
+            elif (
                 _is_cuda
                 and hidden_states.shape[0] <= max_router_gemm_tokens
                 and hidden_states.shape[1] % 1024 == 0
@@ -512,7 +528,7 @@ class MoEGate(nn.Module):
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
             elif _is_npu:
-                logits = F.linear(hidden_states, self.weight, None)
+                logits = self._router_gemm(hidden_states)
             else:
                 if self.is_deepseek_v4:
                     from sglang.jit_kernel.dsv4 import linear_bf16_fp32
@@ -520,7 +536,7 @@ class MoEGate(nn.Module):
                     logits = linear_bf16_fp32(hidden_states, self.weight)
                 else:
                     # After testing, we may use the faster code in `if deepseek v4` branch
-                    logits = F.linear(hidden_states, self.weight, None)
+                    logits = self._router_gemm(hidden_states)
 
         return logits
 
