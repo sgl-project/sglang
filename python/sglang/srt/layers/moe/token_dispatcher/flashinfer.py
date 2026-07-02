@@ -176,7 +176,7 @@ class FlashinferDispatcher(BaseDispatcher):
         output_dtype = hidden_states.dtype
         x = hidden_states
         x_sf = None
-        topk_ids = topk_output.topk_ids
+        topk_ids = topk_output.topk_ids.to(torch.int32)
         topk_weights = topk_output.topk_weights
 
         global_scale = self.quant_config.get("input_global_scale", None)
