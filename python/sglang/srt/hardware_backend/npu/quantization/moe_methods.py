@@ -992,12 +992,11 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             torch.nn.Parameter(w_scale_t, requires_grad=False),
         )
     
-        # !!! Also store on self (the quant_info) so the matmul can find them
         setattr(self, weight_name, qw_t)
         setattr(self, f"{weight_name}_scale", w_scale_t)
     
         torch.npu.empty_cache()
-        self.hidden_states_quantizer = HiddenStatesMXFP8DynamicQuant()
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.float8_e4m3fn)
     
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
