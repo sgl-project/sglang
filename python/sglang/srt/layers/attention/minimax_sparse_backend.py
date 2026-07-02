@@ -21,11 +21,15 @@ from sglang.srt.utils import is_npu
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
 def _npu_use_triton_sparse() -> bool:
-    """Whether the NPU sparse path should use the fused triton kernels."""
+    """Whether the NPU sparse path should use the fused triton kernels.
+
+    The fused Triton path is the default on NPU. Set SGLANG_MINIMAX_NPU_TRITON=0
+    to fall back to the non-Triton sparse decode path.
+    """
     import os
 
     return is_npu() and bool(
-        int(os.environ.get("SGLANG_MINIMAX_NPU_TRITON", "0"))
+        int(os.environ.get("SGLANG_MINIMAX_NPU_TRITON", "1"))
     )
 
 
@@ -113,7 +117,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             get_minimax_sparse_disable_value_layer_ids(sparse_cfg)
         )
         self.score_type: str = get_minimax_sparse_score_type(sparse_cfg)
-        # assert self.idx_head_dim == head_dim
 
         # max_seqlen for the current forward pass, stored as a plain Python int
         # so that it is safe to use inside CUDA graphs (no .item() at graph time).
