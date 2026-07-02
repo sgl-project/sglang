@@ -978,7 +978,9 @@ class ServerArgs(DisaggServerArgsMixin):
             and os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() != "true"
         ):
             self._offload_during_compile_keep = (
-                normalize_layerwise_offload_components(self.layerwise_offload_components)
+                normalize_layerwise_offload_components(
+                    self.layerwise_offload_components
+                )
                 or []
             )
             self.dit_layerwise_offload = True
