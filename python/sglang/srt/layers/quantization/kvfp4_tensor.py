@@ -162,7 +162,7 @@ class NVFP4KVQuantizeUtil:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Quantize BF16/FP16 tensor to NVFP4 format.
 
-        Uses ``nvfp4_kv_quantize`` on Blackwell (SM100/SM120),
+        Requires SM90+.  Uses ``nvfp4_kv_quantize`` on SM100+ (native PTX),
         falls back to ``fp4_quantize`` on SM90.
 
         Args:
@@ -237,8 +237,8 @@ class NVFP4KVQuantizeUtil:
     ) -> torch.Tensor:
         """Dequantize NVFP4 tensor to BF16/FP16.
 
-        Uses ``nvfp4_kv_dequantize`` on Blackwell (SM100/SM120), falls back
-        to pure PyTorch E2M1 LUT on SM90.
+        Uses ``nvfp4_kv_dequantize`` on SM100+, falls back to pure PyTorch
+        E2M1 LUT on SM90.
 
         Args:
             quant_tensor: Packed FP4 data of shape [B, M, N/2] (uint8)
