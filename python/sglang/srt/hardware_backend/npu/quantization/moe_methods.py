@@ -1024,8 +1024,9 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
             weight_fp, dst_type=fp4_dtype, round_mode="round"
         )
+        qw_nz = torch_npu.npu_format_cast(qw, 29)
         # Transpose and force contiguous
-        qw_t = qw.transpose(1, 2).contiguous()          # [E, K, N]
+        qw_t = qw_nz.transpose(1, 2).contiguous()          # [E, K, N]
         w_scale_t = w_scale.transpose(1, 2).contiguous() # [E, ceil(K/64), N, 2]
 
         # Store on the layer (for parameter saving etc.)
