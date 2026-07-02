@@ -1,6 +1,8 @@
 import logging
 from typing import Any
 
+import requests
+
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
@@ -9,7 +11,6 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import get_hf_config
 
 logger = logging.getLogger(__name__)
-import requests
 
 
 class VisionLanguageEncoderLoader(ComponentLoader):
