@@ -473,6 +473,15 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
         not runner_config.apply_router_weight_on_input
     ), "apply_router_weight_on_input is not supported for Flashinfer"
 
+    if not dispatch_output.format.is_deepep_ll():
+        raise NotImplementedError(
+            "flashinfer_cutedsl FP4 MoE only supports DeepEP low_latency dispatch "
+            f"(masked layout), but received {dispatch_output.format}. DeepEP "
+            "normal/prefill dispatch has no CuteDSL FP4 handler. Pass "
+            "--deepep-mode low_latency, or use a MoE runner backend that supports "
+            "DeepEP normal dispatch."
+        )
+
     hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
 
     # flashinfer_cutedsl_moe_masked reinterprets scales as float8_e4m3fn.
