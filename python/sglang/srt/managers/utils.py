@@ -10,6 +10,7 @@ import torch
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.state_capturer.base import TopkCaptureOutput
@@ -291,5 +292,9 @@ class EmbeddingBatchResult:
 
 
 def is_health_check_generate_req(recv_req):
+    # The Rust ingress marks health probes with a flag (rids stay numeric); the
+    # Python http_server marks them with the HEALTH_CHECK rid prefix.
+    if isinstance(recv_req, TokenizedGenerateReqInput) and recv_req.is_health_check:
+        return True
     rid = getattr(recv_req, "rid", None)
     return rid is not None and rid.startswith(HEALTH_CHECK_RID_PREFIX)

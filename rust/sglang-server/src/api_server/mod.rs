@@ -34,6 +34,7 @@ use crate::message::{
 };
 use crate::runtime::ServerArgs;
 use crate::runtime::channels::{Senders, TmEvent};
+use crate::tokenizer_manager::ActivityCounter;
 
 /// Shared state for every handler. Holds the submit machinery (`senders`,
 /// `id_gen`, `egress_buf`) and the shared tokenizer. `Clone` is a set of
@@ -49,6 +50,25 @@ struct AppState {
     /// logprob token ids to text when `return_text_in_logprobs` is set. `None`
     /// under `skip_tokenizer_init`.
     tokenizer: Option<dynamo_tokenizers::Tokenizer>,
+    /// Egress heartbeat (bumped per drained ring frame). `/health_generate`
+    /// watches it advance to confirm the scheduler → detok path is alive.
+    egress_activity: ActivityCounter,
+    /// `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION` (default true). When true,
+    /// `/health` also runs the generation round-trip; when false it's plain 200.
+    health_endpoint_generation: bool,
+}
+
+/// Parse `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION`, matching Python's `EnvBool`
+/// (`true/1/yes/y` → true, `false/0/no/n` → false). Unset or unrecognized → the
+/// `true` default (health generation on).
+fn read_health_endpoint_generation() -> bool {
+    match std::env::var("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "no" | "n"
+        ),
+        Err(_) => true,
+    }
 }
 
 pub async fn serve(
@@ -58,6 +78,7 @@ pub async fn serve(
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
     tokenizer: Option<dynamo_tokenizers::Tokenizer>,
+    egress_activity: ActivityCounter,
 ) {
     let state = AppState {
         senders,
@@ -65,9 +86,16 @@ pub async fn serve(
         egress_buf,
         server_args,
         tokenizer,
+        egress_activity,
+        health_endpoint_generation: read_health_endpoint_generation(),
     };
     let app = Router::new()
         .route("/generate", post(generate))
+        // Health: `/health` runs the generation round-trip by default
+        // (`SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION`, else plain 200);
+        // `/health_generate` always does. Mirrors the Python handler.
+        .route("/health", get(health))
+        .route("/health_generate", get(health_generate))
         // Control-plane endpoints: each reuses the ingress FSM (no tokenization)
         // and returns a single, non-streamed JSON result from the scheduler.
         // Adding one = a route line passing its scheduler request-struct tag.
@@ -348,15 +376,81 @@ async fn control(State(state): State<AppState>, tag: &'static str) -> Response {
     }
 }
 
-/// `GET /server_info` — shapes the scheduler's `GetInternalStateReqOutput` the
-/// way `tokenizer_control_mixin.get_internal_state` does: lift `server_args` to
-/// the top, drop null fields, merge (internal-state fields win on collision).
+/// `GET /health` — liveness. By default (`SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION`
+/// True, mirroring Python) this runs the same 1-token round-trip as
+/// `/health_generate`; when the env is set false it returns a plain 200 (the
+/// api-server routing the request already proves the frontend is up).
+async fn health(State(state): State<AppState>) -> Response {
+    if state.health_endpoint_generation {
+        health_generate_inner(&state).await
+    } else {
+        StatusCode::OK.into_response()
+    }
+}
+
+/// `GET /health_generate` — always the deep round-trip, regardless of the env.
+async fn health_generate(State(state): State<AppState>) -> Response {
+    health_generate_inner(&state).await
+}
+
+/// Deep health: confirm the scheduler → detok path is actually producing output.
+/// Returns 200 iff the egress heartbeat advances within the timeout, else 503.
 ///
-/// TODO(server_info): the original Python endpoint also includes `version`,
-/// `kv_events`, and scheduler init info (`max_total_num_tokens`,
-/// `max_req_input_len`). Those are dropped for now — add them here once the
-/// values are plumbed through (e.g. captured at `Server.start` / a richer
-/// scheduler response).
+/// It fires a pre-tokenized 1-token probe (`input_ids = [0]`, which skips the
+/// tokenizer via `classify → AlreadyTokenized`) so an **idle** pipeline produces
+/// a frame, then watches the **global** [`AppState::egress_activity`] counter
+/// (not the probe's own rid). So a **busy** server passes immediately on
+/// concurrent traffic and a backlogged queue never causes a false 503 — the
+/// rust-native analogue of the Python health check's `last_receive_tstamp`. The
+/// scheduler's `HEALTH_CHECK`-rid skip and `http_worker_ipc` ack are irrelevant
+/// here: those exist for the multi-tokenizer-*process* setup, whereas this
+/// single-process server owns the egress ring and observes activity directly.
+async fn health_generate_inner(state: &AppState) -> Response {
+    let baseline = state
+        .egress_activity
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    // Fire the probe (we do not await its own response; the heartbeat is the
+    // signal). One decode step, so it self-completes with nothing to abort.
+    let sampling_params = rmpv::Value::Map(vec![
+        (rmpv::Value::from("max_new_tokens"), rmpv::Value::from(1)),
+        (rmpv::Value::from("temperature"), rmpv::Value::F64(0.0)),
+    ]);
+    let payload = GeneratePayload {
+        input_ids: Some(vec![0]),
+        sampling_params: Some(sampling_params),
+        ..Default::default()
+    };
+    let kind = RequestKind::Generate(GenerateRequest {
+        payload,
+        input_ids: None,
+        stream: false,
+        // The scheduler skips this when busy so it never occupies a queue slot.
+        is_health_check: true,
+    });
+    let _keepalive = match submit(state, kind).await {
+        // Hold the receiver so the probe's sink stays open until it completes.
+        Ok((_rid, rx)) => rx,
+        Err(()) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+
+    // Watch the heartbeat advance. `SGLANG_HEALTH_CHECK_TIMEOUT` defaults to 20s.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if state
+            .egress_activity
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != baseline
+        {
+            return StatusCode::OK.into_response();
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// `GET /get_model_info` (+ `/model_info` alias) — static model metadata read
 /// from `server_args`; no scheduler round-trip, mirroring `/v1/models`. The
 /// SGLang lang backend (`RuntimeEndpoint`) calls this at startup and only reads
@@ -380,6 +474,15 @@ async fn model_info(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+/// `GET /server_info` — shapes the scheduler's `GetInternalStateReqOutput` the
+/// way `tokenizer_control_mixin.get_internal_state` does: lift `server_args` to
+/// the top, drop null fields, merge (internal-state fields win on collision).
+///
+/// TODO(server_info): the original Python endpoint also includes `version`,
+/// `kv_events`, and scheduler init info (`max_total_num_tokens`,
+/// `max_req_input_len`). Those are dropped for now — add them here once the
+/// values are plumbed through (e.g. captured at `Server.start` / a richer
+/// scheduler response).
 async fn server_info(State(state): State<AppState>) -> Response {
     let bytes = match await_control_result(&state, "GetInternalStateReq").await {
         Ok(b) => b,
@@ -580,6 +683,7 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
         payload,
         input_ids: None,
         stream,
+        is_health_check: false,
     });
     let (rid, mut rx) = match submit(&state, kind).await {
         Ok(v) => v,

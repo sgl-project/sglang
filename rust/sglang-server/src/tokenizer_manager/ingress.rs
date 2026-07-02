@@ -228,6 +228,7 @@ impl Ingress {
         let top_logprobs_num = g.payload.top_logprobs_num.unwrap_or(0);
         let token_ids_logprob = g.payload.token_ids_logprob.take();
         let return_hidden_states = g.payload.return_hidden_states.unwrap_or(false);
+        let is_health_check = g.is_health_check;
 
         let input_ids = match input_ids {
             Some(ids) if !ids.is_empty() => ids,
@@ -247,6 +248,7 @@ impl Ingress {
             top_logprobs_num,
             token_ids_logprob,
             return_hidden_states,
+            is_health_check,
             stream,
         };
 

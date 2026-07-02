@@ -802,6 +802,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Whether this is a health-check probe
+    is_health_check: bool = False
+
     # Whether to return captured routed experts
     return_routed_experts: bool = False
     # See GenerateReqInput.routed_experts_start_len.
