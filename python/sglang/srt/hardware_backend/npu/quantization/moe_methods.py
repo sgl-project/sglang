@@ -1038,7 +1038,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             )  # shape still [E, K//2, N]
         else:
             # W4A4: keep as plain ND tensor (no format cast)
-            qw_final = qw_t
+            qw_final = qw_t.reshape(qw_t.shape[0], -1, qw_t.shape[2] // 2)  # [E, K, N//2]
 
         # Scale: transpose to [E, ceil(K/64), N, 2]
         w_scale_t = w_scale.transpose(1, 2).contiguous()
