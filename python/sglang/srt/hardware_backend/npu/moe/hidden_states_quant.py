@@ -34,7 +34,7 @@ class HiddenStatesDynamicQuant(BaseHiddenStatesQuant):
     - ``torch.int8``                              → `npu_dynamic_quant`
     - ``torch.quint4x2``                          → `npu_dynamic_quant`
     - ``torch.float8_e4m3fn``                     → `npu_dynamic_mx_quant`
-    - ``torch_npu.float4_e2m1fn_x2``              → `npu_dynamic_mx_quant`
+    - ``torch.float4_e2m1fn_x2``                  → `npu_dynamic_mx_quant`
 
     Returns ``(quantized_hidden_states, per‑token_scale)``.
     """
@@ -42,7 +42,7 @@ class HiddenStatesDynamicQuant(BaseHiddenStatesQuant):
     def __init__(self, quant_dtype: torch.dtype) -> None:
         super().__init__(quant_dtype)
         # Decide which operator to use based on the target type.
-        if quant_dtype in (torch_npu.float8_e4m3fn, torch_npu.float4_e2m1fn_x2):
+        if quant_dtype in (torch.float8_e4m3fn, torch.float4_e2m1fn_x2):
             self._op = torch.ops.npu.npu_dynamic_mx_quant
         elif quant_dtype in (torch.int8, torch.quint4x2):
             self._op = torch.ops.npu.npu_dynamic_quant
