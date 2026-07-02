@@ -1075,8 +1075,14 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         if self._quant_mode == "w8a8_mxfp8":
             scale_args["scale_dtype"] = torch_npu.float8_e8m0fnu
             scale_args["per_token_scale_dtype"] = torch_npu.float8_e8m0fnu
-        elif self._quant_mode in ("w4a8_mxfp8", "w4a4_mxfp4"):
+        elif self._quant_mode == "w4a8_mxfp8":
             # For FP4 weights, add weight_dtype and keep scale hints
+            scale_args["weight_dtype"] = torch_npu.float4_e2m1fn_x2
+            scale_args["scale_dtype"] = torch_npu.float8_e8m0fnu
+            scale_args["per_token_scale_dtype"] = torch_npu.float8_e8m0fnu
+        elif self._quant_mode == "w4a4_mxfp4":
+            # For FP4 weights, add weight_dtype and keep scale hints
+            scale_args["x_dtype"] = torch_npu.float4_e2m1fn_x2
             scale_args["weight_dtype"] = torch_npu.float4_e2m1fn_x2
             scale_args["scale_dtype"] = torch_npu.float8_e8m0fnu
             scale_args["per_token_scale_dtype"] = torch_npu.float8_e8m0fnu
