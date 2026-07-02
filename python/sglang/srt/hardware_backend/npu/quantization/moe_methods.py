@@ -1002,7 +1002,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
     def _apply_online_mxfp4_w4a8(self, layer, weight_prefix, weight_name):
         self._apply_online_mxfp4_common(
             layer, weight_prefix, weight_name,
-            act_quant_dtype=torch.float8_e4m3fn
+            act_quant_dtype=torch_npu.float8_e4m3fn
         )
 
     # --------------- W4A4 MXFP4 path ---------------
