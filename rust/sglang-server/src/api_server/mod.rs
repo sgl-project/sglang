@@ -46,10 +46,6 @@ struct AppState {
     id_gen: Arc<RequestIdGen>,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
-    /// Shared with the detok shards / tokenizer pool (Arc-backed). Used to decode
-    /// logprob token ids to text when `return_text_in_logprobs` is set. `None`
-    /// under `skip_tokenizer_init`.
-    tokenizer: Option<dynamo_tokenizers::Tokenizer>,
     /// Egress heartbeat (bumped per drained ring frame). `/health_generate`
     /// watches it advance to confirm the scheduler → detok path is alive.
     egress_activity: ActivityCounter,
@@ -77,7 +73,6 @@ pub async fn serve(
     id_gen: Arc<RequestIdGen>,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
-    tokenizer: Option<dynamo_tokenizers::Tokenizer>,
     egress_activity: ActivityCounter,
 ) {
     let state = AppState {
@@ -85,7 +80,6 @@ pub async fn serve(
         id_gen,
         egress_buf,
         server_args,
-        tokenizer,
         egress_activity,
         health_endpoint_generation: read_health_endpoint_generation(),
     };
@@ -219,16 +213,10 @@ fn text_slot(texts: Option<&[String]>, j: usize) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
-/// Decode each logprob token id to its own text — one id at a time, matching
-/// Python's `batch_decode([[id] for id in ids])`. Decode errors fall back to "".
-fn decode_logprob_texts(tok: &dynamo_tokenizers::Tokenizer, idxs: &[i32]) -> Vec<String> {
-    idxs.iter()
-        .map(|&id| {
-            tok.decode(&[id as u32], false)
-                .map(String::from)
-                .unwrap_or_default()
-        })
-        .collect()
+/// A decoded-text column becomes the tuples' text source only when populated
+/// (`return_text_in_logprobs`); empty → `None` → null text slots.
+fn opt_texts(t: &[String]) -> Option<&[String]> {
+    (!t.is_empty()).then_some(t)
 }
 
 /// Build the SGLang logprob wire shape: a list of `[logprob, token_id, text]`
@@ -288,7 +276,7 @@ fn hidden_states_rows(vals: &[f32], lens: &[u32]) -> serde_json::Value {
 /// Format a neutral [`GenerationOutput`] as one SGLang `/generate` frame. Lives
 /// in the handler now that the detok shard is protocol-neutral. `output_ids` is
 /// surfaced only in `skip_tokenizer_init` mode (cumulative, non-empty there).
-fn sglang_frame(out: &GenerationOutput, tok: Option<&dynamo_tokenizers::Tokenizer>) -> Vec<u8> {
+fn sglang_frame(out: &GenerationOutput) -> Vec<u8> {
     let mut v = serde_json::json!({
         "text": out.text,
         "meta_info": {
@@ -299,32 +287,25 @@ fn sglang_frame(out: &GenerationOutput, tok: Option<&dynamo_tokenizers::Tokenize
         },
     });
     // Logprobs: SGLang shape is a list of `[logprob, token_id, token_text|null]`
-    // tuples. When `tok` is set (`return_text_in_logprobs`), decode each idx to
-    // text; otherwise the text slot stays null.
-    let texts = |idxs: &[i32]| tok.map(|t| decode_logprob_texts(t, idxs));
+    // tuples. The token text (`return_text_in_logprobs`) was decoded on the detok
+    // shard into the `*_txt` columns; empty → null text slot.
     if !out.output_ids.is_empty() {
         v["output_ids"] = serde_json::json!(out.output_ids);
     }
     if !out.out_lp_val.is_empty() {
-        v["meta_info"]["output_token_logprobs"] = logprob_tuples(
-            &out.out_lp_val,
-            &out.out_lp_idx,
-            texts(&out.out_lp_idx).as_deref(),
-        );
+        v["meta_info"]["output_token_logprobs"] =
+            logprob_tuples(&out.out_lp_val, &out.out_lp_idx, opt_texts(&out.out_lp_txt));
     }
     if !out.in_lp_val.is_empty() {
-        v["meta_info"]["input_token_logprobs"] = logprob_tuples(
-            &out.in_lp_val,
-            &out.in_lp_idx,
-            texts(&out.in_lp_idx).as_deref(),
-        );
+        v["meta_info"]["input_token_logprobs"] =
+            logprob_tuples(&out.in_lp_val, &out.in_lp_idx, opt_texts(&out.in_lp_txt));
     }
     if !out.out_top_lens.is_empty() {
         v["meta_info"]["output_top_logprobs"] = ragged_logprob_tuples(
             &out.out_top_val,
             &out.out_top_idx,
             &out.out_top_lens,
-            texts(&out.out_top_idx).as_deref(),
+            opt_texts(&out.out_top_txt),
         );
     }
     if !out.in_top_lens.is_empty() {
@@ -332,7 +313,7 @@ fn sglang_frame(out: &GenerationOutput, tok: Option<&dynamo_tokenizers::Tokenize
             &out.in_top_val,
             &out.in_top_idx,
             &out.in_top_lens,
-            texts(&out.in_top_idx).as_deref(),
+            opt_texts(&out.in_top_txt),
         );
     }
     if !out.out_tid_lens.is_empty() {
@@ -340,7 +321,7 @@ fn sglang_frame(out: &GenerationOutput, tok: Option<&dynamo_tokenizers::Tokenize
             &out.out_tid_val,
             &out.out_tid_idx,
             &out.out_tid_lens,
-            texts(&out.out_tid_idx).as_deref(),
+            opt_texts(&out.out_tid_txt),
         );
     }
     if !out.in_tid_lens.is_empty() {
@@ -348,7 +329,7 @@ fn sglang_frame(out: &GenerationOutput, tok: Option<&dynamo_tokenizers::Tokenize
             &out.in_tid_val,
             &out.in_tid_idx,
             &out.in_tid_lens,
-            texts(&out.in_tid_idx).as_deref(),
+            opt_texts(&out.in_tid_txt),
         );
     }
     if !out.hidden_lens.is_empty() {
@@ -566,6 +547,14 @@ struct OutputAccumulator {
     /// Hidden states — last-writer-wins (final chunk carries the full set).
     hidden_val: Vec<f32>,
     hidden_lens: Vec<u32>,
+    /// Decoded logprob token text (parallel to each `*_idx`); output concatenates,
+    /// input is set once, same as the val/idx columns.
+    out_lp_txt: Vec<String>,
+    in_lp_txt: Vec<String>,
+    out_top_txt: Vec<String>,
+    in_top_txt: Vec<String>,
+    out_tid_txt: Vec<String>,
+    in_tid_txt: Vec<String>,
 }
 
 impl OutputAccumulator {
@@ -583,20 +572,26 @@ impl OutputAccumulator {
         self.out_tid_val.extend_from_slice(&d.out_tid_val);
         self.out_tid_idx.extend_from_slice(&d.out_tid_idx);
         self.out_tid_lens.extend_from_slice(&d.out_tid_lens);
+        self.out_lp_txt.extend_from_slice(&d.out_lp_txt);
+        self.out_top_txt.extend_from_slice(&d.out_top_txt);
+        self.out_tid_txt.extend_from_slice(&d.out_tid_txt);
         if !d.in_lp_val.is_empty() {
             self.in_lp_val = d.in_lp_val.clone();
             self.in_lp_idx = d.in_lp_idx.clone();
+            self.in_lp_txt = d.in_lp_txt.clone();
         }
         // Input families ride once (prefill); `lens` non-empty marks their arrival.
         if !d.in_top_lens.is_empty() {
             self.in_top_val = d.in_top_val.clone();
             self.in_top_idx = d.in_top_idx.clone();
             self.in_top_lens = d.in_top_lens.clone();
+            self.in_top_txt = d.in_top_txt.clone();
         }
         if !d.in_tid_lens.is_empty() {
             self.in_tid_val = d.in_tid_val.clone();
             self.in_tid_idx = d.in_tid_idx.clone();
             self.in_tid_lens = d.in_tid_lens.clone();
+            self.in_tid_txt = d.in_tid_txt.clone();
         }
         // Hidden states are non-cumulative: the latest non-empty set wins.
         if !d.hidden_lens.is_empty() {
@@ -636,6 +631,12 @@ impl OutputAccumulator {
             in_tid_lens: self.in_tid_lens.clone(),
             hidden_val: self.hidden_val.clone(),
             hidden_lens: self.hidden_lens.clone(),
+            out_lp_txt: self.out_lp_txt.clone(),
+            in_lp_txt: self.in_lp_txt.clone(),
+            out_top_txt: self.out_top_txt.clone(),
+            in_top_txt: self.in_top_txt.clone(),
+            out_tid_txt: self.out_tid_txt.clone(),
+            in_tid_txt: self.in_tid_txt.clone(),
         }
     }
 
@@ -667,18 +668,21 @@ impl OutputAccumulator {
             in_tid_lens: self.in_tid_lens,
             hidden_val: self.hidden_val,
             hidden_lens: self.hidden_lens,
+            out_lp_txt: self.out_lp_txt,
+            in_lp_txt: self.in_lp_txt,
+            out_top_txt: self.out_top_txt,
+            in_top_txt: self.in_top_txt,
+            out_tid_txt: self.out_tid_txt,
+            in_tid_txt: self.in_tid_txt,
         }
     }
 }
 
 async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePayload>) -> Response {
     let stream = payload.stream;
-    // `return_text_in_logprobs` → decode logprob token ids to text at frame time
-    // (needs the shared tokenizer). Capture before `payload` is moved.
-    let tok = match payload.return_text_in_logprobs {
-        Some(true) => state.tokenizer.clone(),
-        _ => None,
-    };
+    // `return_text_in_logprobs` is decoded on the detok shard (see
+    // DetokMsg::Register.decode_logprob_text) into the `*_txt` columns, so
+    // `sglang_frame` just reads them — no tokenizer needed here.
     let kind = RequestKind::Generate(GenerateRequest {
         payload,
         input_ids: None,
@@ -705,12 +709,12 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
                 match item {
                     EgressItem::Frame(out) => {
                         acc.fold(&out);
-                        let f = sglang_frame(&acc.snapshot(&out.rid), tok.as_ref());
+                        let f = sglang_frame(&acc.snapshot(&out.rid));
                         yield Ok::<_, Infallible>(Event::default().data(String::from_utf8_lossy(&f)));
                     }
                     EgressItem::Done(out) => {
                         acc.fold(&out);
-                        let f = sglang_frame(&acc.into_output(out.rid), tok.as_ref());
+                        let f = sglang_frame(&acc.into_output(out.rid));
                         yield Ok(Event::default().data(String::from_utf8_lossy(&f)));
                         break;
                     }
@@ -743,7 +747,7 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
                     return (
                         StatusCode::OK,
                         [("content-type", "application/json")],
-                        sglang_frame(&acc.into_output(out.rid), tok.as_ref()),
+                        sglang_frame(&acc.into_output(out.rid)),
                     )
                         .into_response();
                 }
@@ -805,5 +809,14 @@ mod logprob_shape_tests {
                 [[-0.3f32, 9, serde_json::Value::Null]]
             ])
         );
+    }
+
+    /// A populated text column (decoded on the detok shard) → `Some`; empty
+    /// (`return_text_in_logprobs` off) → `None` → null text slots.
+    #[test]
+    fn opt_texts_gates_on_population() {
+        assert!(opt_texts(&[]).is_none());
+        let t = vec!["x".to_string()];
+        assert_eq!(opt_texts(&t), Some(t.as_slice()));
     }
 }

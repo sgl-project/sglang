@@ -30,6 +30,9 @@ pub enum DetokMsg {
     Register {
         id: RequestId,
         sink: EgressSink,
+        /// `return_text_in_logprobs`: decode logprob token ids to text in this
+        /// shard (CPU-bound pool) rather than on the api-server I/O threads.
+        decode_logprob_text: bool,
     },
     Chunk(ChunkEvent),
     /// Control-request result: a single already-serialized JSON payload to
