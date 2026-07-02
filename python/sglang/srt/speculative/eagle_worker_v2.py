@@ -69,6 +69,7 @@ from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
     build_tree_kernel_efficient,
+    default_tree_mask_mode,
     eagle_prepare_for_verify,
     eagle_sample,
     get_draft_recurrent_hidden_state_spec,
@@ -117,6 +118,9 @@ _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+
+if _is_cpu:
+    from sgl_kernel import fill_bonus_tokens_cpu
 
 logger = logging.getLogger(__name__)
 
@@ -201,7 +205,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        self.tree_mask_mode = TreeMaskMode.FULL_MASK
+        self.tree_mask_mode = default_tree_mask_mode()
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
@@ -260,12 +264,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         if (c := self.draft_runner.canary_manager) is not None:
             c.mark_init_finished()
-
-        # The CPU verify attention kernel (intel_amx) consumes the qlen x qlen
-        # QLEN_ONLY tree mask directly; FULL_MASK is for the GPU kernels.
-        self.tree_mask_mode = (
-            TreeMaskMode.QLEN_ONLY if _is_cpu else TreeMaskMode.FULL_MASK
-        )
 
     def _init_dsa_index_share_state(self) -> None:
         # Populate DSA index-share fields from the draft runner's hf_config.
@@ -401,10 +399,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
-        # Keep in sync with __init__: QLEN_ONLY on CPU, FULL_MASK on GPU.
-        self.tree_mask_mode = (
-            TreeMaskMode.QLEN_ONLY if _is_cpu else TreeMaskMode.FULL_MASK
-        )
+        self.tree_mask_mode = default_tree_mask_mode()
 
     def _capture_cuda_graphs(self):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""
@@ -1685,10 +1680,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # stride = accept_tokens per-req width = accept_index.shape[1]
             # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
             if _is_cpu:
-                from sgl_kernel import (
-                    fill_bonus_tokens_cpu,
-                )
-
                 fill_bonus_tokens_cpu(
                     accept_tokens,
                     accept_lens,

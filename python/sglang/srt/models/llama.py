@@ -52,13 +52,13 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import add_prefix, is_cpu, is_cuda, is_npu, is_xpu, make_layers
+from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_xpu, make_layers
 from sglang.utils import get_exception_traceback
 
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
-_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 _is_npu = is_npu()
@@ -783,9 +783,9 @@ class LlamaForCausalLM(nn.Module):
         if _is_xpu:
             torch.xpu.empty_cache()
             torch.xpu.synchronize()
-        elif not _is_cpu:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        else:
+            current_platform.empty_cache()
+            current_platform.synchronize()
 
     def get_embed(self):
         return self.model.embed_tokens.weight
@@ -802,9 +802,9 @@ class LlamaForCausalLM(nn.Module):
         if _is_xpu:
             torch.xpu.empty_cache()
             torch.xpu.synchronize()
-        elif not _is_cpu:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        else:
+            current_platform.empty_cache()
+            current_platform.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)

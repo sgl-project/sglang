@@ -20,6 +20,7 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         super().__init__()
         self.forward_metadata = None
+        self.extend_metadata = None
         self.draft_decode_metadata = None
         self.device = model_runner.device
         # Pool refs — captured at construction so they survive deletion of the
@@ -53,8 +54,71 @@ class IntelAMXAttnBackend(AttentionBackend):
         self.decode_attention_fwd = torch.ops.sgl_kernel.decode_attention_cpu
         self.extend_attention_fwd = torch.ops.sgl_kernel.extend_attention_cpu
 
+        # Number of KV splits used by decode_attention_cpu; attn_logits is
+        # sized [bs, num_head, num_kv_splits, v_head_dim + 1] to match.
+        self.num_kv_splits = 8
+
         # speculative decoding params
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+
+    def _build_extend_metadata(self, forward_batch: ForwardBatch):
+        """Resolve (seq_lens, extend_seq_lens, extend_start_loc, tree_mask) for
+        forward_extend, once per forward pass.
+
+        In TARGET_VERIFY mode the batch carries no extend_* fields, so they are
+        derived from spec_info (mirrors the CUDA unified path in
+        triton_backend.py); each request extends by exactly draft_token_num
+        tokens. Outside spec decoding the fields are passed through, computing
+        extend_start_loc only if the batch did not provide it.
+        """
+        bs = forward_batch.batch_size
+        seq_lens = forward_batch.seq_lens
+        tree_mask = None
+
+        if forward_batch.extend_seq_lens is None:
+            spec_info = forward_batch.spec_info
+            if spec_info is None:
+                raise RuntimeError(
+                    "extend_seq_lens is None but cannot infer from spec_info. "
+                    "This should not happen in TARGET_VERIFY mode."
+                )
+            draft_token_num = spec_info.draft_token_num
+            extend_seq_lens = torch.full(
+                (bs,), draft_token_num, dtype=torch.int32, device=self.device
+            )
+            # Uniform extend lengths: start locations form a plain range.
+            extend_start_loc = torch.arange(
+                0,
+                bs * draft_token_num,
+                draft_token_num,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            seq_lens = forward_batch.seq_lens + draft_token_num
+            # Speculative verify with a token tree: each draft token may only
+            # attend to its ancestors among the draft tokens (the committed
+            # prefix stays fully visible).
+            #
+            # tree_topk == 1 means a simple chain, which equals the kernel's
+            # built-in causal masking, so no explicit mask is needed. EAGLE
+            # has tree_topk == topk (>1 for trees); NGRAM has tree_topk == -1
+            # (irregular tree).
+            if spec_info.tree_topk != 1:
+                custom_mask = spec_info.custom_mask
+                if custom_mask is not None and custom_mask.numel() > 0:
+                    tree_mask = custom_mask
+        else:
+            extend_seq_lens = forward_batch.extend_seq_lens
+            if forward_batch.extend_start_loc is None:
+                extend_start_loc = torch.zeros(
+                    bs, dtype=torch.int32, device=self.device
+                )
+                if bs > 1:
+                    extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+            else:
+                extend_start_loc = forward_batch.extend_start_loc
+
+        return seq_lens, extend_seq_lens, extend_start_loc, tree_mask
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -64,7 +128,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             (
                 bs,
                 self.num_head,
-                8,  # self.num_kv_splits,
+                self.num_kv_splits,
                 self.v_head_dim + 1,
             ),
             dtype=torch.float32,
@@ -72,10 +136,13 @@ class IntelAMXAttnBackend(AttentionBackend):
         )
         if forward_batch.forward_mode.is_decode_or_idle():
             max_extend_len = None
+            self.extend_metadata = None
         elif forward_batch.forward_mode.is_target_verify():
             max_extend_len = self.num_draft_tokens
+            self.extend_metadata = self._build_extend_metadata(forward_batch)
         else:
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
+            self.extend_metadata = self._build_extend_metadata(forward_batch)
         self.forward_metadata = (attn_logits, max_extend_len)
 
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -104,7 +171,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             (
                 bs,
                 self.num_head,
-                8,  # self.num_kv_splits,
+                self.num_kv_splits,
                 self.v_head_dim + 1,
             ),
             dtype=torch.float32,
@@ -112,6 +179,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         )
         max_extend_len = None
         self.forward_metadata = (attn_logits, max_extend_len)
+        self.extend_metadata = None
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         pass
@@ -143,50 +211,9 @@ class IntelAMXAttnBackend(AttentionBackend):
                 layer, KVWriteLoc(cache_loc, swa_loc), k, v
             )
 
-        # Handle cases where extend_seq_lens or extend_start_loc might not be set
-        # In speculative decoding, we can infer these from spec_info or compute them
-        bs = forward_batch.batch_size
-        seq_lens = forward_batch.seq_lens
-        tree_mask = None
-        if forward_batch.extend_seq_lens is None:
-            # TARGET_VERIFY mode: infer extend_seq_lens from spec_info
-            if forward_batch.spec_info is not None and hasattr(
-                forward_batch.spec_info, "draft_token_num"
-            ):
-                spec_info = forward_batch.spec_info
-                draft_token_num = spec_info.draft_token_num
-                extend_seq_lens = torch.full(
-                    (bs,), draft_token_num, dtype=torch.int32, device=self.device
-                )
-                seq_lens = forward_batch.seq_lens + draft_token_num
-                # Speculative verify with a token tree: each draft token may
-                # only attend to its ancestors among the draft tokens (the
-                # committed prefix stays fully visible).
-                #
-                # tree_topk == 1 means a simple chain, which equals the
-                # kernel's built-in causal masking, so no explicit mask is
-                # needed.  EAGLE has tree_topk == topk (>1 for trees); NGRAM
-                # has tree_topk == -1 (irregular tree).
-                topk = getattr(spec_info, "topk", 1)
-                tree_topk = getattr(spec_info, "tree_topk", topk)
-                if tree_topk != 1:
-                    custom_mask = getattr(spec_info, "custom_mask", None)
-                    if custom_mask is not None and custom_mask.numel() > 0:
-                        tree_mask = custom_mask
-            else:
-                raise RuntimeError(
-                    "extend_seq_lens is None but cannot infer from spec_info. "
-                    "This should not happen in TARGET_VERIFY mode."
-                )
-        else:
-            extend_seq_lens = forward_batch.extend_seq_lens
-
-        if forward_batch.extend_start_loc is None:
-            extend_start_loc = torch.zeros(bs, dtype=torch.int32, device=self.device)
-            if bs > 1:
-                extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
-        else:
-            extend_start_loc = forward_batch.extend_start_loc
+        # Precomputed once per forward pass in init_forward_metadata (spec
+        # verify batches carry no extend_* fields; see _build_extend_metadata).
+        seq_lens, extend_seq_lens, extend_start_loc, tree_mask = self.extend_metadata
 
         _, max_extend_len = self.forward_metadata
         self.extend_attention_fwd(
@@ -317,11 +344,12 @@ class IntelAMXMultiStepDraftBackend:
 
         req_pool_indices_expanded = torch.arange(bs, dtype=torch.int64, device=device)
 
+        num_kv_splits = self.attn_backends[0].num_kv_splits
         for step in range(num_steps - 1):
             # Each candidate sees prefix + (step + 1) draft tokens.
             seq_lens_expanded = seq_lens.repeat_interleave(topk) + step + 1
             attn_logits = torch.zeros(
-                (bs, num_head, 8, v_head_dim + 1),
+                (bs, num_head, num_kv_splits, v_head_dim + 1),
                 dtype=torch.float32,
                 device=device,
             )

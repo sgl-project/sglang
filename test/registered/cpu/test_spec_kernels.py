@@ -808,18 +808,20 @@ class TestAssignCacheLocKernels(CustomTestCase):
             ].to(torch.int64)
         torch.testing.assert_close(out_cache_loc, ref, atol=0, rtol=0)
 
-        # dtype contract: int64 req_pool_indices/seq_lens/out_cache_loc, int32
-        # req_to_token (TORCH_CHECK)
-        with self.assertRaises(RuntimeError):
-            torch.ops.sgl_kernel.assign_draft_cache_locs_contiguous_cpu(
-                req_pool_indices,
-                req_to_token,
-                seq_lens.to(torch.int32),
-                out_cache_loc,
-                pool_len,
-                topk,
-                num_steps,
-            )
+        # int32 index tensors are accepted natively (per-tensor index dispatch)
+        out_cache_loc_i32 = torch.empty_like(out_cache_loc)
+        torch.ops.sgl_kernel.assign_draft_cache_locs_contiguous_cpu(
+            req_pool_indices,
+            req_to_token,
+            seq_lens.to(torch.int32),
+            out_cache_loc_i32,
+            pool_len,
+            topk,
+            num_steps,
+        )
+        torch.testing.assert_close(out_cache_loc_i32, ref, atol=0, rtol=0)
+
+        # dtype contract: int32 req_to_token, int64 out_cache_loc (TORCH_CHECK)
         with self.assertRaises(RuntimeError):
             torch.ops.sgl_kernel.assign_draft_cache_locs_contiguous_cpu(
                 req_pool_indices,
@@ -1120,6 +1122,18 @@ class TestMultiLayerEagleStateKernels(CustomTestCase):
                 start + 1 : start + seq_len
             ]
             ref[start + seq_len - 1] = topk_index[i]
+        torch.testing.assert_close(input_ids, ref, atol=0, rtol=0)
+
+        # int32 extend_* tensors are accepted natively (ForwardBatch supplies
+        # int32; the kernel dispatches on the index dtype, no cast needed)
+        input_ids = input_ids_init.clone()
+        torch.ops.sgl_kernel.rotate_input_ids_cpu(
+            input_ids,
+            extend_start_loc.to(torch.int32),
+            extend_seq_lens.to(torch.int32),
+            topk_index,
+            None,
+        )
         torch.testing.assert_close(input_ids, ref, atol=0, rtol=0)
 
         # with select_index: the new token lands at the given global slots

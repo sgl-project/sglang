@@ -12,43 +12,25 @@
 # limitations under the License.
 # ==============================================================================
 
-import torch
-
 from sglang.srt.utils import is_cpu
 
 _is_cpu = is_cpu()
 
+# Device dispatch happens here (not inside the triton implementations):
+# `rotate_input_ids` resolves to the CPU C++ kernel or the Triton kernel once
+# at import time. Both mutate input_ids in place; callers ignore the return.
 if _is_cpu:
-    from sgl_kernel import rotate_input_ids_cpu
+    from sgl_kernel import rotate_input_ids_cpu as rotate_input_ids
 
-if not _is_cpu:
+    rotate_input_ids_kernel = None
+    rotate_input_ids_triton = None
+else:
     from sglang.srt.speculative.triton_ops.multi_layer_eagle import (
         rotate_input_ids_kernel,
         rotate_input_ids_triton,
     )
-else:
-    rotate_input_ids_kernel = None
-    rotate_input_ids_triton = None
 
-
-def rotate_input_ids(
-    input_ids, extend_start_loc, extend_seq_lens, topk_index, select_index=None
-):
-    if _is_cpu:
-        # rotate_input_ids_cpu mutates input_ids in place (callers rely on
-        # this) and requires int64 tensors; extend_* may arrive int32.
-        rotate_input_ids_cpu(
-            input_ids,
-            extend_start_loc.to(torch.int64),
-            extend_seq_lens.to(torch.int64),
-            topk_index.to(torch.int64),
-            select_index.to(torch.int64) if select_index is not None else None,
-        )
-        return input_ids
-    return rotate_input_ids_triton(
-        input_ids, extend_start_loc, extend_seq_lens, topk_index, select_index
-    )
-
+    rotate_input_ids = rotate_input_ids_triton
 
 __all__ = [
     "rotate_input_ids_kernel",

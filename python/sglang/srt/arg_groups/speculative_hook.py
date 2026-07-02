@@ -11,6 +11,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
+    if server_args.device != "cpu":
+        return
+
+    if not server_args.disable_overlap_schedule:
+        server_args.disable_overlap_schedule = True
+        logger.warning(
+            "Overlap schedule is not implemented for speculative decoding on CPU."
+        )
+
+
 def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
@@ -332,12 +343,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    if server_args.device == "cpu" and not server_args.disable_overlap_schedule:
-        server_args.disable_overlap_schedule = True
-        logger.warning(
-            "Overlap schedule is disabled for speculative decoding on CPU "
-            "(the overlap spec path is not supported on CPU yet)."
-        )
+    disable_overlap_schedule_for_cpu(server_args)
 
     if resolved_view(server_args).disable_overlap_schedule:
         logger.warning(
@@ -481,11 +487,7 @@ def _handle_ngram(server_args: ServerArgs) -> None:
             "Ngram speculative decoding only supports CUDA or CPU devices."
         )
 
-    if server_args.device == "cpu" and not server_args.disable_overlap_schedule:
-        server_args.disable_overlap_schedule = True
-        logger.warning(
-            "Overlap schedule is not implemented for speculative decoding on CPU."
-        )
+    disable_overlap_schedule_for_cpu(server_args)
 
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48

@@ -21,6 +21,9 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
 
+if _is_cpu:
+    from sgl_kernel import assign_extend_cache_locs_cpu, assign_req_to_token_pool_cpu
+
 
 @triton.jit
 def assign_req_to_token_pool(
@@ -66,13 +69,11 @@ def assign_req_to_token_pool_func(
     batch_size: int,
 ):
     if _is_cpu:
-        from sgl_kernel import assign_req_to_token_pool_cpu
-
         assign_req_to_token_pool_cpu(
-            req_pool_indices.to(torch.int32),
+            req_pool_indices,
             req_to_token,
-            start_offset.to(torch.int32),
-            end_offset.to(torch.int32),
+            start_offset,
+            end_offset,
             out_cache_loc,
             req_to_token.shape[1],
         )
@@ -400,8 +401,6 @@ def assign_extend_cache_locs_func(
         return out_cache_loc
 
     elif _is_cpu:
-        from sgl_kernel import assign_extend_cache_locs_cpu
-
         out_cache_loc = torch.empty(
             batch_size * draft_token_num, dtype=torch.int64, device="cpu"
         )

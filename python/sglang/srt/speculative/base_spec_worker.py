@@ -9,6 +9,9 @@ from sglang.srt.utils import is_cpu
 
 _is_cpu = is_cpu()
 
+if _is_cpu:
+    from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -207,12 +210,10 @@ class EagleDraftWorkerBase(ABC):
                     device=batch.device,
                 )
                 if _is_cpu:
-                    from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
-
                     assign_draft_cache_locs_contiguous_cpu(
-                        batch.req_pool_indices.long(),
+                        batch.req_pool_indices,
                         req_to_token_pool.req_to_token,
-                        batch.seq_lens.long(),
+                        batch.seq_lens,
                         batch.out_cache_loc,
                         req_to_token_pool.req_to_token.shape[1],
                         topk,

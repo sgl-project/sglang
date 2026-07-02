@@ -51,6 +51,7 @@ from sglang.srt.speculative.eagle_info import (
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     build_tree_kernel_efficient,
+    default_tree_mask_mode,
     eagle_prepare_for_verify,
     eagle_sample,
     get_draft_recurrent_hidden_state_spec,
@@ -81,6 +82,9 @@ from sglang.srt.utils.common import empty_context, fast_topk
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+
+if _is_cpu:
+    from sgl_kernel import fill_bonus_tokens_cpu
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
@@ -172,7 +176,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        self.tree_mask_mode = TreeMaskMode.FULL_MASK
+        self.tree_mask_mode = default_tree_mask_mode()
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
     def alloc_memory_pool(
@@ -197,11 +201,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             speculative_moe_backend_context(),
         ):
             super().init_attention_backends()
-        # The CPU verify attention kernel (intel_amx) consumes the qlen x qlen
-        # QLEN_ONLY tree mask directly; FULL_MASK is for the GPU kernels.
-        self.tree_mask_mode = (
-            TreeMaskMode.QLEN_ONLY if _is_cpu else TreeMaskMode.FULL_MASK
-        )
 
     def init_cuda_graphs(self):
         with (
@@ -878,10 +877,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
             # stride = accept_tokens per-req width = accept_index.shape[1].
             if _is_cpu:
-                from sgl_kernel import (
-                    fill_bonus_tokens_cpu,
-                )
-
                 fill_bonus_tokens_cpu(
                     accept_tokens,
                     accept_lens,

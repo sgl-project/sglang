@@ -146,6 +146,12 @@ class TreeMaskMode(IntEnum):
     QLEN_ONLY_BITPACKING = 2
 
 
+def default_tree_mask_mode() -> TreeMaskMode:
+    # The CPU verify attention kernel (intel_amx) consumes the qlen x qlen
+    # QLEN_ONLY tree mask directly; FULL_MASK is for the GPU kernels.
+    return TreeMaskMode.QLEN_ONLY if _is_cpu else TreeMaskMode.FULL_MASK
+
+
 def build_tree_kernel_efficient(
     bonus_tokens: torch.Tensor,
     parent_list: List[torch.Tensor],
