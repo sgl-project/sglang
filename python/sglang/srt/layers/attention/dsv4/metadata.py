@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_sm120_supported
+
+_IS_SM120 = is_sm120_supported()
 
 if TYPE_CHECKING:
     pass
@@ -112,7 +114,10 @@ class PagedIndexerMetadata:
         else:
             import deep_gemm
 
-            use_jit_indexer = (
+            # SM120: the JIT indexer-metadata kernel requests more dynamic
+            # shared memory than SM120 allows (cudaFuncSetAttribute ->
+            # invalid argument). Use the DeepGEMM metadata kernel, which fits.
+            use_jit_indexer = (not _IS_SM120) and (
                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
                 or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
             )
