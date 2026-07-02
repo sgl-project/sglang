@@ -1224,7 +1224,6 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             c2ws_plucker_emb.dtype,
             c2ws_plucker_emb.device.type,
             c2ws_plucker_emb.device.index,
-            _safe_tensor_version(c2ws_plucker_emb),
             hidden_states.dtype,
             hidden_states.device.type,
             hidden_states.device.index,
@@ -1242,25 +1241,13 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         return c2ws_plucker_emb
 
     @staticmethod
-    def _get_session_cache(forward_batch, name: str) -> dict | None:
+    def _get_request_cache(forward_batch, name: str) -> dict | None:
         if forward_batch is None:
             return None
         session = getattr(forward_batch, "session", None)
         if session is not None:
             state = get_realtime_causal_dit_state(session)
             return state.runtime_cache.setdefault(name, {})
-        extra = getattr(forward_batch, "extra", None)
-        if extra is None:
-            return None
-        return extra.setdefault(name, {})
-
-    @staticmethod
-    def _get_request_cache(forward_batch, name: str) -> dict | None:
-        if forward_batch is None:
-            return None
-        request_cache = getattr(forward_batch, "request_runtime_cache", None)
-        if request_cache is not None:
-            return request_cache.setdefault(name, {})
         extra = getattr(forward_batch, "extra", None)
         if extra is None:
             return None
@@ -1292,7 +1279,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         start_frame: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, ...]:
-        cache = self._get_session_cache(forward_batch, "lingbot_rope")
+        cache = self._get_request_cache(forward_batch, "lingbot_rope")
         cache_key = (
             post_patch_num_frames,
             post_patch_height,
@@ -1345,7 +1332,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         post_patch_width: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, ...]:
-        cache = self._get_session_cache(forward_batch, "lingbot_sequence_shard_rope")
+        cache = self._get_request_cache(forward_batch, "lingbot_sequence_shard_rope")
         cache_key = (
             local_seq_len,
             token_start,
@@ -1411,7 +1398,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         timestep: torch.LongTensor,
         forward_batch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cache = self._get_session_cache(forward_batch, "lingbot_time_embeddings")
+        cache = self._get_request_cache(forward_batch, "lingbot_time_embeddings")
         current_timestep = get_forward_context().current_timestep
         cache_key = (
             current_timestep,

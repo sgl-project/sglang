@@ -4,6 +4,9 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
+    LingBotWorldCausalDMDConfig,
+)
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CausalSelfAttentionKVCache,
     CrossAttentionKVCache,
@@ -22,8 +25,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
     LingBotWorldCausalDMDDenoisingStage,
 )
-from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
 from sglang.multimodal_gen.runtime.realtime.states import RealtimeCausalDiTState
+
+LINGBOT_INTERACTIVE_KV_WINDOW_ENV = "SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW"
 
 
 def test_lingbot_denoising_stage_does_not_own_realtime_cache_refs():
@@ -221,7 +225,16 @@ def test_lingbot_realtime_attention_cache_samples_sink_and_recent_window():
     assert sampled_view.v.flatten().tolist() == [1.0, 1.0, 2.0, 3.0, 3.0, 3.0]
 
 
-def test_lingbot_interactive_kv_window_samples_base_moving_and_still():
+def test_lingbot_interactive_kv_window_config_default_disabled():
+    field = LingBotWorldCausalDMDConfig.__dataclass_fields__[
+        "interactive_kv_window_enable"
+    ]
+
+    assert field.default is False
+
+
+def test_lingbot_interactive_kv_window_samples_base_moving_and_still(monkeypatch):
+    monkeypatch.delenv(LINGBOT_INTERACTIVE_KV_WINDOW_ENV, raising=False)
     stage = LingBotWorldCausalDMDDenoisingStage.__new__(
         LingBotWorldCausalDMDDenoisingStage
     )
@@ -253,8 +266,6 @@ def test_lingbot_interactive_kv_window_samples_base_moving_and_still():
     cache_state.chunk_idx = 0
     stage._set_lingbot_kv_sample_tokens(cache_state, batch, server_args)
     assert batch.realtime_causal_kv_sample_tokens == 120
-    policy = stage._build_realtime_causal_cache_policy(batch, server_args)
-    assert policy.expected_cache_tokens == 240
 
     batch.condition_inputs = {"camera_actions": [[], [], []]}
     cache_state.chunk_idx = 1
@@ -266,7 +277,8 @@ def test_lingbot_interactive_kv_window_samples_base_moving_and_still():
     assert batch.realtime_causal_kv_sample_tokens == 30
 
 
-def test_lingbot_interactive_kv_window_none_uses_base_moving_window():
+def test_lingbot_interactive_kv_window_none_uses_base_moving_window(monkeypatch):
+    monkeypatch.delenv(LINGBOT_INTERACTIVE_KV_WINDOW_ENV, raising=False)
     stage = LingBotWorldCausalDMDDenoisingStage.__new__(
         LingBotWorldCausalDMDDenoisingStage
     )
@@ -295,7 +307,10 @@ def test_lingbot_interactive_kv_window_none_uses_base_moving_window():
     assert policy.expected_cache_tokens == 180
 
 
-def test_lingbot_interactive_kv_window_updates_total_window_for_moving_default():
+def test_lingbot_interactive_kv_window_updates_total_window_for_moving_default(
+    monkeypatch,
+):
+    monkeypatch.delenv(LINGBOT_INTERACTIVE_KV_WINDOW_ENV, raising=False)
     stage = LingBotWorldCausalDMDDenoisingStage.__new__(
         LingBotWorldCausalDMDDenoisingStage
     )
@@ -320,6 +335,70 @@ def test_lingbot_interactive_kv_window_updates_total_window_for_moving_default()
     policy = stage._build_realtime_causal_cache_policy(batch, server_args)
 
     assert stage.sliding_window_num_frames == 24
+    assert policy.expected_cache_tokens == 240
+
+
+def test_lingbot_interactive_kv_window_default_disabled(monkeypatch):
+    monkeypatch.delenv(LINGBOT_INTERACTIVE_KV_WINDOW_ENV, raising=False)
+    stage = LingBotWorldCausalDMDDenoisingStage.__new__(
+        LingBotWorldCausalDMDDenoisingStage
+    )
+    stage.local_attn_size = -1
+    stage.sink_size = 9
+    stage.num_token_per_frame = 10
+    stage.num_frames_per_block = 3
+    stage.sliding_window_num_frames = 18
+    stage.transformer = SimpleNamespace(num_attention_heads=1)
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            realtime_causal_sink_size=9,
+            realtime_causal_kv_cache_num_frames=18,
+            interactive_kv_window_enable=False,
+            interactive_kv_moving_window=12,
+            interactive_kv_still_window=3,
+            interactive_kv_still_chunks=2,
+        )
+    )
+    cache_state = RealtimeCausalDiTState()
+    batch = SimpleNamespace(condition_inputs={"camera_actions": [["w"], [], []]})
+
+    stage._set_lingbot_kv_sample_tokens(cache_state, batch, server_args)
+    policy = stage._build_realtime_causal_cache_policy(batch, server_args)
+
+    assert stage.sliding_window_num_frames == 18
+    assert batch.realtime_causal_kv_sample_tokens is None
+    assert policy.expected_cache_tokens == 180
+
+
+def test_lingbot_interactive_kv_window_env_can_enable_default(monkeypatch):
+    monkeypatch.setenv(LINGBOT_INTERACTIVE_KV_WINDOW_ENV, "1")
+    stage = LingBotWorldCausalDMDDenoisingStage.__new__(
+        LingBotWorldCausalDMDDenoisingStage
+    )
+    stage.local_attn_size = -1
+    stage.sink_size = 9
+    stage.num_token_per_frame = 10
+    stage.num_frames_per_block = 3
+    stage.sliding_window_num_frames = 18
+    stage.transformer = SimpleNamespace(num_attention_heads=1)
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            realtime_causal_sink_size=9,
+            realtime_causal_kv_cache_num_frames=18,
+            interactive_kv_window_enable=False,
+            interactive_kv_moving_window=12,
+            interactive_kv_still_window=3,
+            interactive_kv_still_chunks=2,
+        )
+    )
+    cache_state = RealtimeCausalDiTState()
+    batch = SimpleNamespace(condition_inputs={"camera_actions": [["w"], [], []]})
+
+    stage._set_lingbot_kv_sample_tokens(cache_state, batch, server_args)
+    policy = stage._build_realtime_causal_cache_policy(batch, server_args)
+
+    assert stage.sliding_window_num_frames == 24
+    assert batch.realtime_causal_kv_sample_tokens == 120
     assert policy.expected_cache_tokens == 240
 
 
@@ -357,40 +436,22 @@ def test_lingbot_interactive_kv_window_allocates_expected_cache_size():
     assert cache.attention_window_size == 240
 
 
-def test_lingbot_model_request_cache_prefers_request_scope():
-    forward_batch = SimpleNamespace(
-        request_runtime_cache={},
-        session=object(),
-        extra={},
+def test_lingbot_dynamic_condition_cache_clear_removes_chunk_entries():
+    cache_state = SimpleNamespace(
+        runtime_cache={
+            "lingbot_c2ws_plucker_emb": object(),
+            "lingbot_cam_conditioner": object(),
+            "lingbot_rope": object(),
+        }
     )
 
-    cache = CausalLingBotWorldTransformer3DModel._get_request_cache(
-        forward_batch, "lingbot_c2ws_plucker_emb"
-    )
-    cache["value"] = object()
-
-    assert forward_batch.request_runtime_cache["lingbot_c2ws_plucker_emb"] is cache
-    assert forward_batch.extra == {}
-
-
-def test_lingbot_model_session_cache_uses_realtime_state():
-    session = RealtimeSession()
-    forward_batch = SimpleNamespace(
-        request_runtime_cache={},
-        session=session,
-        extra={},
+    LingBotWorldCausalDMDDenoisingStage._clear_lingbot_dynamic_condition_cache(
+        cache_state
     )
 
-    cache = CausalLingBotWorldTransformer3DModel._get_session_cache(
-        forward_batch, "lingbot_rope"
-    )
-    cache["value"] = object()
-
-    state = session.get_state(RealtimeCausalDiTState)
-    assert state is not None
-    assert state.runtime_cache["lingbot_rope"] is cache
-    assert forward_batch.request_runtime_cache == {}
-    assert forward_batch.extra == {}
+    assert "lingbot_c2ws_plucker_emb" not in cache_state.runtime_cache
+    assert "lingbot_cam_conditioner" not in cache_state.runtime_cache
+    assert "lingbot_rope" in cache_state.runtime_cache
 
 
 def test_lingbot_i2v_model_input_writer_reuses_buffer():
@@ -448,11 +509,7 @@ def test_lingbot_cam_conditioner_cache_reuses_source_tensor(monkeypatch):
         CausalLingBotWorldTransformerBlock
     )
     block.cam_conditioner = _CamConditioner()
-    forward_batch = SimpleNamespace(
-        extra={},
-        request_runtime_cache={},
-        enable_sequence_shard=True,
-    )
+    forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=True)
     monkeypatch.setattr(
         lingbot_world_module, "get_ulysses_parallel_world_size", lambda: 2
     )
@@ -471,7 +528,7 @@ def test_lingbot_cam_conditioner_cache_reuses_source_tensor(monkeypatch):
     assert first is second
     assert third is not first
     assert block.cam_conditioner.calls == 2
-    cache = forward_batch.request_runtime_cache["lingbot_cam_conditioner"]
+    cache = forward_batch.extra["lingbot_cam_conditioner"]
     assert cache["source_key"][0] == next_source.data_ptr()
     assert len(cache["entries"]) == 1
 
@@ -489,11 +546,7 @@ def test_lingbot_cam_conditioner_cache_skips_non_sequence_shard(monkeypatch):
         CausalLingBotWorldTransformerBlock
     )
     block.cam_conditioner = _CamConditioner()
-    forward_batch = SimpleNamespace(
-        extra={},
-        request_runtime_cache={},
-        enable_sequence_shard=False,
-    )
+    forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=False)
     monkeypatch.setattr(
         lingbot_world_module,
         "get_forward_context",
@@ -508,7 +561,6 @@ def test_lingbot_cam_conditioner_cache_skips_non_sequence_shard(monkeypatch):
     assert first[0] is not second[0]
     assert block.cam_conditioner.calls == 2
     assert "lingbot_cam_conditioner" not in forward_batch.extra
-    assert "lingbot_cam_conditioner" not in forward_batch.request_runtime_cache
 
 
 def test_lingbot_cam_conditioner_cache_skips_single_ulysses_world(monkeypatch):
@@ -524,11 +576,7 @@ def test_lingbot_cam_conditioner_cache_skips_single_ulysses_world(monkeypatch):
         CausalLingBotWorldTransformerBlock
     )
     block.cam_conditioner = _CamConditioner()
-    forward_batch = SimpleNamespace(
-        extra={},
-        request_runtime_cache={},
-        enable_sequence_shard=True,
-    )
+    forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=True)
     monkeypatch.setattr(
         lingbot_world_module, "get_ulysses_parallel_world_size", lambda: 1
     )
@@ -545,7 +593,6 @@ def test_lingbot_cam_conditioner_cache_skips_single_ulysses_world(monkeypatch):
     assert first is not second
     assert block.cam_conditioner.calls == 2
     assert "lingbot_cam_conditioner" not in forward_batch.extra
-    assert "lingbot_cam_conditioner" not in forward_batch.request_runtime_cache
 
 
 def test_lingbot_cam_conditioner_cache_reuses_context_update(monkeypatch):
@@ -561,11 +608,7 @@ def test_lingbot_cam_conditioner_cache_reuses_context_update(monkeypatch):
         CausalLingBotWorldTransformerBlock
     )
     block.cam_conditioner = _CamConditioner()
-    forward_batch = SimpleNamespace(
-        extra={},
-        request_runtime_cache={},
-        enable_sequence_shard=True,
-    )
+    forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=True)
     monkeypatch.setattr(
         lingbot_world_module, "get_ulysses_parallel_world_size", lambda: 2
     )
@@ -581,7 +624,7 @@ def test_lingbot_cam_conditioner_cache_reuses_context_update(monkeypatch):
 
     assert first is second
     assert block.cam_conditioner.calls == 1
-    assert "lingbot_cam_conditioner" in forward_batch.request_runtime_cache
+    assert "lingbot_cam_conditioner" in forward_batch.extra
 
 
 def test_lingbot_model_prepares_cam_conditioner_scale_shifts(monkeypatch):
@@ -604,11 +647,7 @@ def test_lingbot_model_prepares_cam_conditioner_scale_shifts(monkeypatch):
         SimpleNamespace(cam_conditioner=_CamConditioner(1)),
         SimpleNamespace(cam_conditioner=_CamConditioner(2)),
     ]
-    forward_batch = SimpleNamespace(
-        extra={},
-        request_runtime_cache={},
-        enable_sequence_shard=True,
-    )
+    forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=True)
     monkeypatch.setattr(
         lingbot_world_module, "get_ulysses_parallel_world_size", lambda: 2
     )

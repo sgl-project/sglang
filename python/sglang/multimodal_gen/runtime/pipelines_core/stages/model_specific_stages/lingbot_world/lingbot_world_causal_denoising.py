@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_ulysses_parallel_world_size,
@@ -112,13 +113,14 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
 
     @staticmethod
     def _interactive_kv_window_enabled(server_args: ServerArgs) -> bool:
-        return bool(
+        config_enabled = bool(
             getattr(
                 server_args.pipeline_config,
                 "interactive_kv_window_enable",
                 False,
             )
         )
+        return config_enabled or envs.SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW
 
     def _apply_causal_cache_overrides(
         self,
@@ -255,6 +257,14 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         previous = getattr(batch, "realtime_causal_kv_sample_tokens", None)
         batch.realtime_causal_kv_sample_tokens = sample_tokens
         return previous
+
+    @staticmethod
+    def _clear_lingbot_dynamic_condition_cache(cache_state) -> None:
+        runtime_cache = getattr(cache_state, "runtime_cache", None)
+        if runtime_cache is None:
+            return
+        runtime_cache.pop("lingbot_c2ws_plucker_emb", None)
+        runtime_cache.pop("lingbot_cam_conditioner", None)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -493,15 +503,18 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             device=ctx.device,
         )
 
-        current_latents = self._denoise_realtime_causal_chunk(
-            batch,
-            server_args,
-            ctx=ctx,
-            cache_ctx=cache_ctx,
-            chunk_latents=current_latents,
-            prepare_model_input=prepare_model_input,
-            prepare_context_input=prepare_model_input,
-        )
+        try:
+            current_latents = self._denoise_realtime_causal_chunk(
+                batch,
+                server_args,
+                ctx=ctx,
+                cache_ctx=cache_ctx,
+                chunk_latents=current_latents,
+                prepare_model_input=prepare_model_input,
+                prepare_context_input=prepare_model_input,
+            )
+        finally:
+            self._clear_lingbot_dynamic_condition_cache(cache_ctx.cache_state)
 
         # Advance cumulative frame position
         self._advance_realtime_causal_cache(cache_ctx, num_frames=ctx.num_frames)
