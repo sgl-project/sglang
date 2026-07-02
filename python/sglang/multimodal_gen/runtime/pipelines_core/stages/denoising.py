@@ -312,11 +312,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         """
         args = self.server_args
         if (
-            # a subclass with its own forward would never run the restore
-            type(self).forward is not DenoisingStage.forward
+            not args.enable_torch_compile
             or not args.offload_during_compile
-            or not args.enable_torch_compile
             or not args.warmup
+            # a subclass with its own forward would never run the restore
+            or type(self).forward is not DenoisingStage.forward
             or args.use_fsdp_inference
             or envs.SGLANG_CACHE_DIT_ENABLED
             or not isinstance(module, LayerwiseOffloadableModuleMixin)
