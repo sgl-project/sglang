@@ -2044,6 +2044,16 @@ class AscendAttnBackend(AttentionBackend):
                 self.speculative_num_draft_tokens,
             )
 
+            # When not in graph_mode, query is sliced to num_token_non_padded
+            # which may drop finished requests. The FIA TND kernel requires
+            # block_table.shape[0] == len(actual_seq_lengths); slice to match.
+            if not self.graph_mode:
+                actual_bs = len(actual_seq_lengths)
+                block_table = self.forward_metadata.block_tables[:actual_bs]
+                actual_seq_lengths_kv = actual_seq_lengths_kv[:actual_bs]
+            else:
+                block_table = self.forward_metadata.block_tables
+
             if (
                 self.q_head_num_padding is not None
                 and self.q_head_num_padding > self.tp_q_head_num
@@ -2089,7 +2099,7 @@ class AscendAttnBackend(AttentionBackend):
                 scale=layer.scaling,
                 antiquant_mode=0,
                 antiquant_scale=None,
-                block_table=self.forward_metadata.block_tables,
+                block_table=block_table,
                 block_size=self.page_size,
                 sparse_mode=3,
                 atten_mask=self.mtp_mask,
@@ -2110,7 +2120,7 @@ class AscendAttnBackend(AttentionBackend):
                 scale=layer.scaling,
                 antiquant_mode=0,
                 antiquant_scale=None,
-                block_table=self.forward_metadata.block_tables,
+                block_table=block_table,
                 block_size=self.page_size,
                 sparse_mode=3,
                 atten_mask=self.mtp_mask,
