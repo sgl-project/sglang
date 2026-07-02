@@ -44,6 +44,7 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 )
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
+    SparsePrefillWorkspace,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -363,8 +364,8 @@ class DSV4Metadata:
     c128_compress_metadata: Optional[FusedCompressMetadata] = None
 
     # Lazily populated on the first call to ``_forward_prefill_sparse`` and
-    # reused across every layer in the chunk. Reset to ``None`` on copy_ so
-    # cuda-graph replay rebuilds it for the next forward.
+    # reused across every layer in the chunk. Reset to ``None`` when graph
+    # metadata is refreshed so replay rebuilds it from the live batch.
     sparse_prefill_cache: Optional[SparsePrefillChunkCache] = None
 
     @property
@@ -397,6 +398,7 @@ class DSV4Metadata:
                 self.c128_compress_metadata,
                 src=static_metadata.c128_compress_metadata,
             )
+        self.sparse_prefill_cache = None
 
 
 @dataclass
@@ -506,6 +508,7 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
+        self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1470,6 +1473,8 @@ class DeepseekV4AttnBackend(
 
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            assert seq_lens_cpu is not None
             # ``swa_window_size`` on the pool is its storage page size, not
             # the model's SWA window — pass both explicitly.
             cache = SparsePrefillChunkCache.build(
@@ -1481,6 +1486,7 @@ class DeepseekV4AttnBackend(
                 swa_window_size=SWA_WINDOW,
                 swa_page_size=token_to_kv_pool.swa_window_size,
                 num_qo_tokens=q_flat.shape[0],
+                max_seq_len=int(seq_lens_cpu.max().item()),
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
@@ -1491,7 +1497,7 @@ class DeepseekV4AttnBackend(
         extra_page_size = None
         flat_token_ids = None
         if compress_ratio == 0:
-            workspace = cache.c0_workspace
+            workspace = self.sparse_prefill_workspace.get(cache.swa_token_ids.shape[0])
             combined_indices = cache.c0_combined_indices
             combined_lens = cache.c0_combined_lens
             swa_slice = workspace
@@ -1502,7 +1508,6 @@ class DeepseekV4AttnBackend(
                 assert core_attn_metadata.c128_page_indices is not None
                 cache.ensure_c128(core_attn_metadata.c128_page_indices)
                 flat_token_ids = cache.c128_flat_token_ids
-                workspace = cache.c128_workspace
                 combined_indices = cache.c128_combined_indices
                 combined_lens = cache.c128_combined_lens
             else:
@@ -1512,11 +1517,15 @@ class DeepseekV4AttnBackend(
                 )
                 cache.ensure_c4(core_attn_metadata.page_table, extra_page_size)
                 flat_token_ids = cache.c4_flat_token_ids
-                workspace = cache.c4_workspace
                 combined_indices, combined_lens = cache.combine_c4_layer(
-                    c4_sparse_raw_indices=core_attn_metadata.c4_sparse_raw_indices,
+                    c4_sparse_raw_indices=core_attn_metadata.c4_sparse_raw_indices[
+                        : cache.num_qo_tokens
+                    ],
                 )
             n_compressed = flat_token_ids.shape[0]
+            workspace = self.sparse_prefill_workspace.get(
+                n_compressed + cache.swa_token_ids.shape[0]
+            )
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
