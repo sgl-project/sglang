@@ -14,7 +14,11 @@ from sglang.test.test_deterministic_utils import (
     COMMON_SERVER_ARGS,
     TestDeterministicBase,
 )
-from sglang.test.test_utils import is_in_amd_ci
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+    is_in_amd_ci,
+)
+from sglang.srt.utils import is_xpu
 
 register_cuda_ci(est_time=207, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=278, suite="stage-b-test-1-gpu-small-amd")
@@ -59,6 +63,30 @@ class TestTritonDeterministic(TestDeterministicBase):
             [
                 "--attention-backend",
                 "triton",
+            ]
+        )
+        return args
+
+
+@unittest.skipUnless(is_xpu(), "Skip unless XPU is available.")
+class TestIntelXPUDeterministic(TestDeterministicBase):
+    # Test with intel_xpu attention backend using smaller model to avoid OOM
+    @classmethod
+    def get_model(cls):
+        # Use smaller model for XPU to avoid OOM
+        return DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
+
+    @classmethod
+    def get_server_args(cls):
+        args = COMMON_SERVER_ARGS
+        args.extend(
+            [
+                "--attention-backend",
+                "intel_xpu",
+                "--device",
+                "xpu",
+                "--mem-fraction-static",
+                "0.80",
             ]
         )
         return args
