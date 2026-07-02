@@ -1018,43 +1018,49 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             weight_fp = weight_fp.to(torch.bfloat16)
         if not weight_fp.is_npu:
             weight_fp = weight_fp.to(f"npu:{torch.npu.current_device()}")
-
+    
         fp4_dtype = torch_npu.float4_e2m1fn_x2
         qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
             weight_fp, dst_type=fp4_dtype, round_mode="round"
         )
-        # qw:      uint8 [E, N, K//2]    (packed FP4 along input dim)
+        # qw:      uint8 [E, N, K//2]    (packed FP4)
         # w_scale: uint8 [E, N, ceil(K/64), 2]
-
-        # Transpose weight to final layout before any optional cast
-        qw_t = qw.transpose(1, 2).contiguous()          # [E, K//2, N] (standard ND)
-
+    
         if use_nz_cast:
-            # W4A8: cast to FRACTAL_NZ with correct dtype hints
+            # W4A8: cast to FRACTAL_NZ after contiguous transpose (unchanged)
+            qw_t = qw.transpose(1, 2).contiguous()
             qw_final = torch_npu.npu_format_cast(
                 qw_t, 29,
                 customize_dtype=torch.float8_e4m3fn,
                 input_dtype=torch_npu.float4_e2m1fn_x2
-            )  # shape still [E, K//2, N]
+            )
+            # Scale: contiguous transpose for FRACTAL_NZ compatibility
+            w_scale_final = w_scale.transpose(1, 2).contiguous()
         else:
-            # W4A4: keep as plain ND tensor (no format cast)
-            qw_final = qw_t.reshape(qw_t.shape[0], -1, qw_t.shape[2] // 2)  # [E, K, N//2]
-
-        # Scale: transpose to [E, ceil(K/64), N, 2]
-        w_scale_t = w_scale.transpose(1, 2).contiguous()
-
-        # Store
-        setattr(layer, weight_name, torch.nn.Parameter(qw_final, requires_grad=False))
+            # W4A4: no format cast, non‑contiguous transpose
+            # Weight: create Parameter, then transpose in‑place (NO .contiguous())
+            weight_param = torch.nn.Parameter(qw, requires_grad=False)
+            weight_param.data = weight_param.data.transpose(1, 2)   # [E, K//2, N]
+            qw_final = weight_param
+    
+            # Scale: same approach
+            scale_param = torch.nn.Parameter(w_scale, requires_grad=False)
+            scale_param.data = scale_param.data.transpose(1, 2)     # [E, ceil(K/64), N, 2]
+            w_scale_final = scale_param
+    
+        # Store on layer and self (use the Parameter objects for W4A4, tensors for W4A8)
+        setattr(layer, weight_name, qw_final if use_nz_cast else weight_param)
         layer.register_parameter(f"{weight_name}_scale",
-                                 torch.nn.Parameter(w_scale_t, requires_grad=False))
-        setattr(self, weight_name, qw_final)
-        setattr(self, f"{weight_name}_scale", w_scale_t)
+                                 w_scale_final if use_nz_cast else scale_param)
+        setattr(self, weight_name, qw_final if use_nz_cast else weight_param)
+        setattr(self, f"{weight_name}_scale", w_scale_final if use_nz_cast else scale_param)
+    
         torch.npu.empty_cache()
-
+    
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(
             quant_dtype=act_quant_dtype
         )
-
+    
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
 
