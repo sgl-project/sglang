@@ -16,6 +16,27 @@ via the chunked delta-rule ``(I + A)^{-1}`` UT-transform, and the full state is
 flushed back only every ``L`` committed tokens. Rejected drafts roll back by a
 pointer move on the cursors -- no state write-back.
 
+Closed-loop exact fold (the state / output error split):
+  The scheme has two error paths with opposite structure. The OUTPUT is one-shot
+  (computed per step, consumed by the sampler, discarded) -- its error never
+  compounds. The STATE accumulates: folding the stored ``d`` records open-loop
+  (as the vLLM reference does) feeds the chunked transform's cancellation error
+  -- amplified up to ``2^(BS-1)`` by ``(I + A)^{-1}`` -- plus their storage
+  quantization into every future window, undamped, so the error grows with
+  generation length. Therefore the flush here does NOT fold ``d``: instead
+  :func:`gdn_replayssm_exact_fold_kernel` sequentially replays the committed
+  window from rings of the RAW inputs (``v`` and pre-norm ``k``, both born in
+  the activation dtype and hence stored losslessly, plus fp32 ``g`` / ``beta``),
+  mirroring ``fused_sigmoid_gating_delta_rule_update_kernel``'s fp32 op order
+  exactly. The delta-rule recurrence is contractive (per step the perturbation
+  gain is ``exp(g) * |1 - beta| < 1`` along ``k`` and ``exp(g) < 1`` elsewhere),
+  so given identical inputs the replayed checkpoint is bit-identical to the
+  recurrent baseline's committed state and carries NO length-dependent error.
+  The chunked transform is kept only for the non-accumulating output, whose
+  dots run with ``input_precision="ieee"`` to match the recurrent kernel's
+  plain-fp32 arithmetic class (requires the fp32 SSM checkpoint; enforced in
+  server_args).
+
 Differences from the vLLM reference:
   * SGLang passes **split** ``q`` / ``k`` / ``v`` tensors (already split + post
     causal-conv1d in the GDN backend) rather than a packed ``mixed_qkv``.
@@ -46,11 +67,13 @@ def gdn_replayssm_spec_circular_kernel(
     A_log,  # [HV] fp32
     dt_bias,  # [HV] fp32
     o,  # [total_tokens, HV, V]  preallocated output
-    h0,  # [num_slots, HV, V, K]  checkpoint state (== ht, in-place)
-    ht,  # [num_slots, HV, V, K]
-    d_cache,  # [num_slots, HV, L, V]
-    k_cache,  # [num_slots, H, L, K]
+    h0,  # [num_slots, HV, V, K]  checkpoint (read-only; folded by the exact-fold kernel)
+    d_cache,  # [num_slots, HV, L, V]  chunked deltas (output reconstruction only)
+    k_cache,  # [num_slots, H, L, K]  L2-normalized keys (output reconstruction only)
     g_cache,  # [num_slots, HV, L]  fp32
+    rawv_cache,  # [num_slots, HV, L, V]  raw v (exact-fold replay)
+    rawk_cache,  # [num_slots, H, L, K]  raw pre-norm k (exact-fold replay)
+    beta_cache,  # [num_slots, HV, L]  fp32 beta (exact-fold replay)
     query_start_loc,  # [B+1] int  packed cu_seqlens
     ssm_state_indices,  # [B] int  physical block per request
     write_pos,  # [num_slots] int32  block-keyed
@@ -67,6 +90,9 @@ def gdn_replayssm_spec_circular_kernel(
     stride_d_slot: tl.constexpr,
     stride_k_slot: tl.constexpr,
     stride_g_slot: tl.constexpr,
+    stride_rawv_slot: tl.constexpr,
+    stride_rawk_slot: tl.constexpr,
+    stride_beta_slot: tl.constexpr,
     stride_qsl: tl.constexpr,
     stride_indices: tl.constexpr,
     H: tl.constexpr,
@@ -157,27 +183,34 @@ def gdn_replayssm_spec_circular_kernel(
     x = a_s + dt_bias_val
     softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
     g_s = tl.where(mask_s, -tl.exp(A_log_val) * softplus_x, 0.0)
-    beta_s = tl.where(mask_s, tl.sigmoid(b_s), 0.0)
+    # Explicit sigmoid expression (NOT tl.sigmoid): bitwise clone of
+    # fused_sigmoid_gating_delta_rule_update_kernel's beta so the fp32 value
+    # stored to beta_cache is exactly what the recurrent baseline would compute.
+    beta_s = tl.where(mask_s, 1.0 / (1.0 + tl.exp(-b_s)), 0.0)
     G_s = tl.cumsum(g_s, axis=0)
     expG_s = tl.exp(G_s)
 
-    # committed-history replay decay from cached g (history loads -> phys_c)
-    p_g_main = g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys_c
-    b_g_all = tl.load(p_g_main, mask=cache_valid, other=0.0).to(tl.float32)
-    b_g_prefix = tl.cumsum(b_g_all, axis=0)
-    b_g_total = tl.sum(b_g_all, axis=0)
-    b_replay_decay = tl.where(cache_valid, tl.exp(b_g_total - b_g_prefix), 0.0)
-    b_total_decay = tl.exp(b_g_total)
+    if not IS_FLUSH:
+        # Committed-history replay decay from cached g (history loads -> phys_c).
+        # Output reconstruction only. On flush steps the history is folded into
+        # the checkpoint by the exact-fold kernel (launched first), so none of
+        # this is needed there.
+        p_g_main = g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys_c
+        b_g_all = tl.load(p_g_main, mask=cache_valid, other=0.0).to(tl.float32)
+        b_g_prefix = tl.cumsum(b_g_all, axis=0)
+        b_g_total = tl.sum(b_g_all, axis=0)
+        b_replay_decay = tl.where(cache_valid, tl.exp(b_g_total - b_g_prefix), 0.0)
+        b_total_decay = tl.exp(b_g_total)
 
-    p_d_main = d_cache + (
-        state_idx * stride_d_slot
-        + (i_hv * MAX_CACHE_LEN + phys_c[None, :]) * V
-        + o_v[:, None]
-    )
-    b_d_all = tl.load(
-        p_d_main, mask=mask_v[:, None] & cache_valid[None, :], other=0.0
-    ).to(tl.float32)
-    b_d_scaled = (b_d_all * b_replay_decay[None, :]).to(h0.dtype.element_ty)
+        p_d_main = d_cache + (
+            state_idx * stride_d_slot
+            + (i_hv * MAX_CACHE_LEN + phys_c[None, :]) * V
+            + o_v[:, None]
+        )
+        b_d_all = tl.load(
+            p_d_main, mask=mask_v[:, None] & cache_valid[None, :], other=0.0
+        ).to(tl.float32)
+        b_d_scaled = (b_d_all * b_replay_decay[None, :]).to(h0.dtype.element_ty)
 
     if USE_QK_L2NORM_IN_KERNEL:
         qnorm_acc = tl.zeros([BS], dtype=tl.float32)
@@ -239,6 +272,10 @@ def gdn_replayssm_spec_circular_kernel(
             mask=mask_kt[None, :],
             other=0.0,
         ).to(tl.float32)
+        # Keep the raw (pre-norm) key tile for the exact-fold ring: the replay
+        # recomputes the L2 norm in fp32 exactly as the recurrent kernel does
+        # (its division form differs bitwise from the reciprocal-multiply below).
+        k_raw_tile = k_tile
         q_tile = (q_tile * (q_rnorm * scale)[:, None]).to(h0.dtype.element_ty)
         k_tile = (k_tile * k_rnorm[:, None]).to(h0.dtype.element_ty)
 
@@ -252,44 +289,50 @@ def gdn_replayssm_spec_circular_kernel(
         sc_tile = tl.load(p_h0, mask=mask_v[:, None] & mask_kt[None, :], other=0.0).to(
             h0.dtype.element_ty
         )
-        # cached-key history load -> phys_c
-        p_k = k_cache + (
-            state_idx * stride_k_slot
-            + (i_h * MAX_CACHE_LEN + phys_c[:, None]) * K
-            + o_kt[None, :]
-        )
-        khist_tile = tl.load(
-            p_k, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
-        ).to(h0.dtype.element_ty)
 
         qT = tl.trans(q_tile)
         kT = tl.trans(k_tile)
-        kk_mat += tl.dot(k_tile, kT)
-        kq_mat += tl.dot(k_tile, qT)
+        kk_mat += tl.dot(k_tile, kT, input_precision="ieee")
+        kq_mat += tl.dot(k_tile, qT, input_precision="ieee")
 
-        if IS_FLUSH:
-            sw_f = tl.dot(
-                b_d_scaled, khist_tile, acc=b_total_decay * sc_tile.to(tl.float32)
-            )
-            sw_tile = sw_f.to(h0.dtype.element_ty)
-            hw_q += tl.dot(sw_tile, qT)
-            hw_k += tl.dot(sw_tile, kT)
-            p_ht = (
-                ht
-                + state_idx * stride_state_slot
-                + i_hv * V * K
-                + o_v[:, None] * K
+        # Checkpoint projection. On flush steps the exact-fold kernel (launched
+        # first) has already folded the committed history into h0, so this is
+        # the whole non-window contribution and no d-fold happens here anymore.
+        hw_q += tl.dot(sc_tile, qT, input_precision="ieee")
+        hw_k += tl.dot(sc_tile, kT, input_precision="ieee")
+
+        if not IS_FLUSH:
+            # cached-key history load -> phys_c (output reconstruction only)
+            p_k = k_cache + (
+                state_idx * stride_k_slot
+                + (i_h * MAX_CACHE_LEN + phys_c[:, None]) * K
                 + o_kt[None, :]
             )
-            tl.store(p_ht, sw_tile, mask=mask_v[:, None] & mask_kt[None, :])
-        else:
-            hw_q += tl.dot(sc_tile, qT)
-            hw_k += tl.dot(sc_tile, kT)
-            scores_q += tl.dot(khist_tile, qT)
-            scores_k += tl.dot(khist_tile, kT)
+            khist_tile = tl.load(
+                p_k, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
+            ).to(h0.dtype.element_ty)
+            scores_q += tl.dot(khist_tile, qT, input_precision="ieee")
+            scores_k += tl.dot(khist_tile, kT, input_precision="ieee")
 
         if write_k:
-            # spec key store -> phys_spec (circular)
+            spec_kt_mask = (
+                mask_s[:, None]
+                & mask_kt[None, :]
+                & ((b_write_pos + o_s[:, None]) < MAX_CACHE_LEN)
+            )
+            # raw pre-norm key for the exact-fold replay -> phys_spec (circular).
+            # Born in the activation dtype, so the store round-trips losslessly.
+            p_cur_rawk = rawk_cache + (
+                state_idx * stride_rawk_slot
+                + (i_h * MAX_CACHE_LEN + phys_spec[:, None]) * K
+                + o_kt[None, :]
+            )
+            tl.store(
+                p_cur_rawk,
+                k_raw_tile.to(p_cur_rawk.dtype.element_ty),
+                mask=spec_kt_mask,
+            )
+            # normalized spec key store -> phys_spec (circular)
             p_cur_k = k_cache + (
                 state_idx * stride_k_slot
                 + (i_h * MAX_CACHE_LEN + phys_spec[:, None]) * K
@@ -298,14 +341,16 @@ def gdn_replayssm_spec_circular_kernel(
             tl.store(
                 p_cur_k,
                 k_tile,
-                mask=mask_s[:, None]
-                & mask_kt[None, :]
-                & ((b_write_pos + o_s[:, None]) < MAX_CACHE_LEN),
+                mask=spec_kt_mask,
             )
 
     if not IS_FLUSH:
-        hw_q = b_total_decay * hw_q + tl.dot(b_d_scaled, scores_q.to(b_d_scaled.dtype))
-        hw_k = b_total_decay * hw_k + tl.dot(b_d_scaled, scores_k.to(b_d_scaled.dtype))
+        hw_q = b_total_decay * hw_q + tl.dot(
+            b_d_scaled, scores_q.to(b_d_scaled.dtype), input_precision="ieee"
+        )
+        hw_k = b_total_decay * hw_k + tl.dot(
+            b_d_scaled, scores_k.to(b_d_scaled.dtype), input_precision="ieee"
+        )
 
     # ------------------------------------------------------------------
     # strictly-lower A and T = (I + A)^{-1}.
@@ -352,7 +397,7 @@ def gdn_replayssm_spec_circular_kernel(
     tl.store(p_o, tl.trans(O_tile).to(p_o.dtype.element_ty), mask=out_mask)
 
     # ------------------------------------------------------------------
-    # write speculative d / g at circular positions (phys_spec).
+    # write speculative d / raw-v / g / beta at circular positions (phys_spec).
     # ------------------------------------------------------------------
     spec_pos = b_write_pos + o_s
     spec_store_mask = mask_s & (spec_pos < MAX_CACHE_LEN)
@@ -366,9 +411,136 @@ def gdn_replayssm_spec_circular_kernel(
         D_spec.to(p_cur_d.dtype.element_ty),
         mask=mask_v[:, None] & spec_store_mask[None, :],
     )
+    # raw v for the exact-fold replay (activation dtype: lossless round-trip)
+    p_cur_v = rawv_cache + (
+        state_idx * stride_rawv_slot
+        + (i_hv * MAX_CACHE_LEN + phys_spec[None, :]) * V
+        + o_v[:, None]
+    )
+    tl.store(
+        p_cur_v,
+        v_tile.to(p_cur_v.dtype.element_ty),
+        mask=mask_v[:, None] & spec_store_mask[None, :],
+    )
     if i_v == 0:
         p_cur_g = g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys_spec
         tl.store(p_cur_g, g_s, mask=spec_store_mask)
+        p_cur_beta = (
+            beta_cache + state_idx * stride_beta_slot + i_hv * MAX_CACHE_LEN + phys_spec
+        )
+        tl.store(p_cur_beta, beta_s, mask=spec_store_mask)
+
+
+@triton.jit
+def gdn_replayssm_exact_fold_kernel(
+    h0,  # [num_slots, HV, V, K]  fp32 checkpoint (in-place)
+    rawv_cache,  # [num_slots, HV, L, V]  raw v
+    rawk_cache,  # [num_slots, H, L, K]  raw pre-norm k
+    g_cache,  # [num_slots, HV, L]  fp32
+    beta_cache,  # [num_slots, HV, L]  fp32
+    ssm_state_indices,  # [B] int  physical block per request
+    write_pos,  # [num_slots] int32  block-keyed
+    cache_base,  # [num_slots] int32  block-keyed
+    is_flush_flags,  # [num_slots] int8  block-keyed
+    stride_state_slot: tl.constexpr,
+    stride_rawv_slot: tl.constexpr,
+    stride_rawk_slot: tl.constexpr,
+    stride_g_slot: tl.constexpr,
+    stride_beta_slot: tl.constexpr,
+    stride_indices: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    MAX_CACHE_LEN: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    NULL_BLOCK_ID: tl.constexpr,
+):
+    """Closed-loop exact fold: sequentially replay the committed ring window
+    into the fp32 checkpoint on flush rows.
+
+    BITWISE CLONE of ``fused_sigmoid_gating_delta_rule_update_kernel``'s state
+    recurrence (fused_sigmoid_gating_recurrent.py) -- same [BK, BV] register
+    tile with the K axis as rows, same 1-D full-K reductions, the same
+    division-form L2 norm with eps inside the sqrt, and the same
+    decay -> delta -> rank-1-update op order. Given identical inputs the
+    committed state matches the recurrent baseline bit-for-bit, which is the
+    whole point: do NOT "optimize" this into tl.dot / reciprocal-multiply /
+    reordered expressions, and keep the launch config (BV=32, num_warps=1)
+    identical to the recurrent kernel so the reduction trees agree.
+
+    Replaces the previous open-loop d-fold, whose per-flush error (chunked
+    (I+A)^{-1} cancellation + d-storage quantization) fed forward across
+    flushes undamped and grew with generation length.
+    """
+    i_v = tl.program_id(0)
+    i_n = tl.program_id(1)
+    i_hv = tl.program_id(2)
+    i_h = i_hv // (HV // H)
+
+    state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
+    if state_idx <= NULL_BLOCK_ID:
+        return
+    if tl.load(is_flush_flags + state_idx) == 0:
+        return
+    b_write_pos = tl.load(write_pos + state_idx).to(tl.int32)
+    if b_write_pos <= 0:
+        return
+    b_cache_base = tl.load(cache_base + state_idx).to(tl.int32)
+
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_k[:, None] & mask_v[None, :]
+
+    # [BK, BV] tile, K rows / V columns -- the recurrent kernel's layout
+    # (memory offset v * K + k, K contiguous).
+    p_h0 = (
+        h0
+        + state_idx * stride_state_slot
+        + i_hv * V * K
+        + o_v[None, :] * K
+        + o_k[:, None]
+    )
+    b_h = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+
+    for t in range(0, b_write_pos):
+        phys = ((b_cache_base + t) & (MAX_CACHE_LEN - 1)).to(tl.int64)
+        b_k = tl.load(
+            rawk_cache
+            + state_idx * stride_rawk_slot
+            + (i_h * MAX_CACHE_LEN + phys) * K
+            + o_k,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        b_v = tl.load(
+            rawv_cache
+            + state_idx * stride_rawv_slot
+            + (i_hv * MAX_CACHE_LEN + phys) * V
+            + o_v,
+            mask=mask_v,
+            other=0.0,
+        ).to(tl.float32)
+        b_g = tl.load(
+            g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys
+        ).to(tl.float32)
+        b_beta = tl.load(
+            beta_cache + state_idx * stride_beta_slot + i_hv * MAX_CACHE_LEN + phys
+        ).to(tl.float32)
+
+        # --- verbatim recurrent update (see the clone note above) ---
+        if USE_QK_L2NORM_IN_KERNEL:
+            b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+        b_h *= tl.exp(b_g)
+        b_v -= tl.sum(b_h * b_k[:, None], 0)
+        b_v *= b_beta
+        b_h += b_k[:, None] * b_v[None, :]
+
+    tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
 @triton.jit
@@ -477,6 +649,9 @@ def _launch_gdn_spec(
     d_cache,
     k_cache,
     g_cache,
+    rawv_cache,
+    rawk_cache,
+    beta_cache,
     query_start_loc,
     ssm_state_indices,
     write_pos,
@@ -525,10 +700,12 @@ def _launch_gdn_spec(
         dt_bias,
         out,
         checkpoint_state,
-        checkpoint_state,
         d_cache,
         k_cache,
         g_cache,
+        rawv_cache,
+        rawk_cache,
+        beta_cache,
         query_start_loc,
         ssm_state_indices,
         write_pos,
@@ -545,6 +722,9 @@ def _launch_gdn_spec(
         d_cache.stride(0),
         k_cache.stride(0),
         g_cache.stride(0),
+        rawv_cache.stride(0),
+        rawk_cache.stride(0),
+        beta_cache.stride(0),
         query_start_loc.stride(0),
         ssm_state_indices.stride(0),
         H=H,
@@ -567,6 +747,64 @@ def _launch_gdn_spec(
     )
 
 
+def _launch_gdn_exact_fold(
+    checkpoint_state,
+    rawv_cache,
+    rawk_cache,
+    g_cache,
+    beta_cache,
+    query_start_loc,
+    ssm_state_indices,
+    write_pos,
+    cache_base,
+    is_flush,
+    max_cache_len,
+    use_qk_l2norm_in_kernel,
+    null_block_id,
+    num_k_heads,
+):
+    """Launch the closed-loop exact fold (flush rows only; device-routed).
+
+    Tiling clones the recurrent kernel exactly (full-K rows, BV = min(np2(V), 32)
+    columns, num_warps=1, num_stages=3) so every reduction tree matches
+    ``fused_sigmoid_gating_delta_rule_update`` and the folded checkpoint is
+    bit-identical to the recurrent baseline's committed state.
+    """
+    num_slots, HV, V, K = checkpoint_state.shape
+    B = query_start_loc.shape[0] - 1
+    BK = triton.next_power_of_2(K)
+    BV = min(triton.next_power_of_2(V), 32)
+    grid = (triton.cdiv(V, BV), B, HV)
+    gdn_replayssm_exact_fold_kernel[grid](
+        checkpoint_state,
+        rawv_cache,
+        rawk_cache,
+        g_cache,
+        beta_cache,
+        ssm_state_indices,
+        write_pos,
+        cache_base,
+        is_flush,
+        checkpoint_state.stride(0),
+        rawv_cache.stride(0),
+        rawk_cache.stride(0),
+        g_cache.stride(0),
+        beta_cache.stride(0),
+        ssm_state_indices.stride(0),
+        H=num_k_heads,
+        HV=HV,
+        K=K,
+        V=V,
+        BK=BK,
+        BV=BV,
+        MAX_CACHE_LEN=max_cache_len,
+        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        NULL_BLOCK_ID=null_block_id,
+        num_warps=1,
+        num_stages=3,
+    )
+
+
 def gdn_replayssm_spec_decode(
     q: torch.Tensor,  # [total_tokens, H, K]  post-conv
     k: torch.Tensor,  # [total_tokens, H, K]  post-conv
@@ -575,10 +813,13 @@ def gdn_replayssm_spec_decode(
     b: torch.Tensor,  # [total_tokens, HV]
     A_log: torch.Tensor,  # [HV] fp32
     dt_bias: torch.Tensor,  # [HV] fp32
-    checkpoint_state: torch.Tensor,  # [num_slots, HV, V, K]  (in-place h0==ht)
+    checkpoint_state: torch.Tensor,  # [num_slots, HV, V, K]  fp32 (folded in-place)
     d_cache: torch.Tensor,  # [num_slots, HV, L, V]
     k_cache: torch.Tensor,  # [num_slots, H, L, K]
     g_cache: torch.Tensor,  # [num_slots, HV, L]  fp32
+    rawv_cache: torch.Tensor,  # [num_slots, HV, L, V]  raw v (exact fold)
+    rawk_cache: torch.Tensor,  # [num_slots, H, L, K]  raw pre-norm k (exact fold)
+    beta_cache: torch.Tensor,  # [num_slots, HV, L]  fp32 beta (exact fold)
     out: torch.Tensor,  # [total_tokens, HV, V]  preallocated
     query_start_loc: torch.Tensor,  # [B+1] int
     ssm_state_indices: torch.Tensor,  # [B] int  physical block per request
@@ -601,18 +842,42 @@ def gdn_replayssm_spec_decode(
     nk_flush: int = 2,
     launch_mode: str = "both",
 ):
-    """GDN cached speculative-decode on a CIRCULAR d/k/g cache (split-qkv varlen).
+    """GDN cached speculative-decode on a CIRCULAR ring cache (split-qkv varlen).
 
-    Two launches (verify + flush ``IS_FLUSH`` specializations); device-side
-    per-row routing keeps the step CUDA-graph capturable. Cursors are block-keyed
-    (indexed by ``ssm_state_indices``) and advanced out-of-kernel by
-    :func:`commit_gdn_replayssm_spec`.
+    Three launches, all device-routed per row so the step stays CUDA-graph
+    capturable:
+      1. exact fold (flush rows): sequentially replay the committed ring window
+         (raw v / raw k / g / beta) into the fp32 checkpoint, bit-identical to
+         the recurrent baseline (closed loop -- no accumulating state error);
+      2. verify (non-flush rows): chunked output from checkpoint + d/k history;
+      3. flush-output (flush rows): chunked output from the freshly folded
+         checkpoint (statically empty history).
+    Cursors are block-keyed (indexed by ``ssm_state_indices``) and advanced
+    out-of-kernel by :func:`commit_gdn_replayssm_spec`.
     """
     if scale is None:
         scale = checkpoint_state.shape[-1] ** -0.5
     if is_flush.dtype != torch.int8:
         is_flush = is_flush.to(torch.int8)
 
+    if launch_mode in ("both", "flush"):
+        # Must precede the flush-output launch: it reads the folded checkpoint.
+        _launch_gdn_exact_fold(
+            checkpoint_state,
+            rawv_cache,
+            rawk_cache,
+            g_cache,
+            beta_cache,
+            query_start_loc,
+            ssm_state_indices,
+            write_pos,
+            cache_base,
+            is_flush,
+            max_cache_len,
+            use_qk_l2norm_in_kernel,
+            null_block_id,
+            k.shape[1],
+        )
     if launch_mode in ("both", "verify"):
         _launch_gdn_spec(
             q,
@@ -627,6 +892,9 @@ def gdn_replayssm_spec_decode(
             d_cache,
             k_cache,
             g_cache,
+            rawv_cache,
+            rawk_cache,
+            beta_cache,
             query_start_loc,
             ssm_state_indices,
             write_pos,
@@ -658,6 +926,9 @@ def gdn_replayssm_spec_decode(
             d_cache,
             k_cache,
             g_cache,
+            rawv_cache,
+            rawk_cache,
+            beta_cache,
             query_start_loc,
             ssm_state_indices,
             write_pos,

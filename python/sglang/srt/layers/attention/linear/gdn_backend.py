@@ -663,7 +663,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         Reconstructs the verify output for the whole draft window from the frozen
         checkpoint (``temporal``) + the per-slot circular ``(d, k, g)`` ring, and
-        appends this window's drafts to the ring. The ring d/k/g are PER-LAYER
+        appends this window's drafts to the rings (chunked ``d`` for output
+        reconstruction; raw ``v`` / pre-norm ``k`` / fp32 ``beta`` for the
+        closed-loop exact fold that replays the recurrent update into the fp32
+        checkpoint at flush). The rings are PER-LAYER
         (sliced via ``mamba2_layer_cache``), while the cursors (write_pos,
         cache_base, is_flush) are PER-SLOT pool attributes shared by all GDN layers
         of the step; the cursors persist across steps and are advanced once per step
@@ -701,6 +704,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             d_cache=d_cache,
             k_cache=layer_cache.replayssm_k,
             g_cache=layer_cache.replayssm_g,
+            # Closed-loop exact-fold rings: raw v / raw pre-norm k / fp32 beta.
+            # The flush replays these through the recurrent update (bit-identical
+            # to the recurrent baseline) instead of folding `d` open-loop.
+            rawv_cache=layer_cache.replayssm_rawv,
+            rawk_cache=layer_cache.replayssm_rawk,
+            beta_cache=layer_cache.replayssm_beta,
             out=out,
             query_start_loc=query_start_loc,
             ssm_state_indices=cache_indices,

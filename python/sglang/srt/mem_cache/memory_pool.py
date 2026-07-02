@@ -323,9 +323,20 @@ class MambaPool:
         #   replayssm_d: [num_layers, num_slots, HV, L, V]
         #   replayssm_k: [num_layers, num_slots, H,  L, K]
         #   replayssm_g: [num_layers, num_slots, HV, L]  (fp32)
+        #   replayssm_rawv: [num_layers, num_slots, HV, L, V]  (conv/activation dtype)
+        #   replayssm_rawk: [num_layers, num_slots, H,  L, K]  (conv/activation dtype)
+        #   replayssm_beta: [num_layers, num_slots, HV, L]     (fp32)
+        # The raw rings + beta exist only under --enable-gdn-replayssm-spec: the
+        # closed-loop exact fold sequentially replays them through the recurrent
+        # update at flush -- bit-identical to the recurrent baseline -- instead
+        # of folding the chunked `d` records open-loop (which accumulates error
+        # across flushes). See fla/gdn_replayssm_spec_decode.py.
         replayssm_d: Optional[torch.Tensor] = None
         replayssm_k: Optional[torch.Tensor] = None
         replayssm_g: Optional[torch.Tensor] = None
+        replayssm_rawv: Optional[torch.Tensor] = None
+        replayssm_rawk: Optional[torch.Tensor] = None
+        replayssm_beta: Optional[torch.Tensor] = None
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
@@ -510,6 +521,7 @@ class MambaPool:
             # ring (--enable-linear-replayssm) or the spec-verify ring
             # (--enable-gdn-replayssm-spec) shares this allocation.
             replayssm_d = replayssm_k = replayssm_g = None
+            replayssm_rawv = replayssm_rawk = replayssm_beta = None
             if _replayssm_on:
                 hv, v_dim, k_dim = temporal_state_shape
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
@@ -539,6 +551,28 @@ class MambaPool:
                     dtype=torch.float32,
                     device=device,
                 )
+                # Closed-loop exact-fold rings (spec-verify only). Raw v / raw
+                # pre-norm k live in the conv (activation) dtype -- they are born
+                # there, so storage round-trips losslessly -- beta in fp32. The
+                # flush replays these through the recurrent update sequentially
+                # (bit-identical to the recurrent baseline) instead of folding
+                # the chunked `d` records open-loop.
+                if enable_gdn_replayssm_spec:
+                    replayssm_rawv = torch.zeros(
+                        size=(num_mamba_layers, num_slots, hv, L, v_dim),
+                        dtype=conv_dtype,
+                        device=device,
+                    )
+                    replayssm_rawk = torch.zeros(
+                        size=(num_mamba_layers, num_slots, h_k, L, k_dim),
+                        dtype=conv_dtype,
+                        device=device,
+                    )
+                    replayssm_beta = torch.zeros(
+                        size=(num_mamba_layers, num_slots, hv, L),
+                        dtype=torch.float32,
+                        device=device,
+                    )
 
             if speculative_num_draft_tokens is not None:
                 if _is_npu:
@@ -626,6 +660,9 @@ class MambaPool:
                     replayssm_d=replayssm_d,
                     replayssm_k=replayssm_k,
                     replayssm_g=replayssm_g,
+                    replayssm_rawv=replayssm_rawv,
+                    replayssm_rawk=replayssm_rawk,
+                    replayssm_beta=replayssm_beta,
                 )
                 logger.info(
                     f"Mamba Cache is allocated. "
@@ -644,6 +681,9 @@ class MambaPool:
                     replayssm_d=replayssm_d,
                     replayssm_k=replayssm_k,
                     replayssm_g=replayssm_g,
+                    replayssm_rawv=replayssm_rawv,
+                    replayssm_rawk=replayssm_rawk,
+                    replayssm_beta=replayssm_beta,
                 )
                 logger.info(
                     f"Mamba Cache is allocated. "
@@ -658,6 +698,13 @@ class MambaPool:
                     f"d={get_tensor_size_bytes(replayssm_d) / GB:.3f}GB, "
                     f"k={get_tensor_size_bytes(replayssm_k) / GB:.3f}GB, "
                     f"g={get_tensor_size_bytes(replayssm_g) / GB:.3f}GB "
+                    + (
+                        f"rawv={get_tensor_size_bytes(replayssm_rawv) / GB:.3f}GB, "
+                        f"rawk={get_tensor_size_bytes(replayssm_rawk) / GB:.3f}GB, "
+                        f"beta={get_tensor_size_bytes(replayssm_beta) / GB:.3f}GB "
+                        if enable_gdn_replayssm_spec
+                        else ""
+                    )
                 )
             # Gate granularity of the linear-attn layers (drives the kernel's
             # IS_KDA path + the g_cache layout). Read by the backend metadata to
@@ -832,7 +879,14 @@ class MambaPool:
                 continue
             # Skip GDN ReplaySSM ring buffers: they are derived/transient decode
             # scratch, not part of the persistent transferable state.
-            if field in ("replayssm_d", "replayssm_k", "replayssm_g"):
+            if field in (
+                "replayssm_d",
+                "replayssm_k",
+                "replayssm_g",
+                "replayssm_rawv",
+                "replayssm_rawk",
+                "replayssm_beta",
+            ):
                 continue
             value = getattr(self.mamba_cache, field)
             if value is None:
@@ -873,6 +927,9 @@ class MambaPool:
                 "replayssm_d",
                 "replayssm_k",
                 "replayssm_g",
+                "replayssm_rawv",
+                "replayssm_rawk",
+                "replayssm_beta",
             ):
                 continue
             value = getattr(self.mamba_cache, field)
