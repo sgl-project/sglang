@@ -108,14 +108,6 @@ def _resolve_attn_backend(forward_batch: ForwardBatch):
 #       The final output is the accumulated output acc_o_n
 
 
-def should_prepare_dsa_indexer_cache_for_mha(skip_topk, is_nextn: bool) -> bool:
-    # Eager MHA does not need topk for the current prefill, but later MLA/decode
-    # still needs indexer K cache for layers that can produce topk. IndexShare
-    # layers reuse a producer layer's topk, so their per-layer indexer cache is
-    # dead work. NextN has its own indexer weights and may need its own cache.
-    return skip_topk is not True or is_nextn
-
-
 class DeepseekMHAForwardMixin:
 
     def init_mha_forward(self: DeepseekV2AttentionMLA):
@@ -177,9 +169,7 @@ class DeepseekMHAForwardMixin:
                     q = self.q_b_proj(q_lora)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                if should_prepare_dsa_indexer_cache_for_mha(
-                    self.skip_topk, self.is_nextn
-                ):
+                if self.should_run_indexer():
                     _ = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
