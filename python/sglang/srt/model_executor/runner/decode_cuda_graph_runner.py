@@ -149,6 +149,17 @@ def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -
     return ragged_verify_compact_enabled()
 
 
+def _slice_dllm_vocab_state(vocab_state, num_tokens: int):
+    if vocab_state is None:
+        return None
+    return vocab_state.__class__(
+        max_values=vocab_state.max_values[:num_tokens],
+        argmax_ids=vocab_state.argmax_ids[:num_tokens],
+        logsumexp=vocab_state.logsumexp[:num_tokens],
+        max_probs=vocab_state.max_probs[:num_tokens],
+    )
+
+
 def build_replay_fb_view(
     forward_batch: ForwardBatch,
     buffers: DecodeInputBuffers,
@@ -1518,6 +1529,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 output,
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,
+                dllm_vocab_state=(
+                    _slice_dllm_vocab_state(
+                        output.dllm_vocab_state,
+                        self.raw_num_token,
+                    )
+                    if self.is_dllm
+                    else None
+                ),
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None

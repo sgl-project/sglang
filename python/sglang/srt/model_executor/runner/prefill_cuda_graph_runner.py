@@ -68,6 +68,7 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     is_mla_cp_enabled,
 )
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -275,6 +276,52 @@ _PREFILL_STATIC_FIELDS = (
 )
 
 
+def _slice_dllm_vocab_state(vocab_state, num_tokens: int):
+    if vocab_state is None:
+        return None
+    return vocab_state.__class__(
+        max_values=vocab_state.max_values[:num_tokens],
+        argmax_ids=vocab_state.argmax_ids[:num_tokens],
+        logsumexp=vocab_state.logsumexp[:num_tokens],
+        max_probs=vocab_state.max_probs[:num_tokens],
+    )
+
+
+def _slice_optional_tensor(value: Optional[torch.Tensor], num_tokens: int):
+    return value[:num_tokens] if value is not None else None
+
+
+def _slice_prefill_logits_output(
+    output: LogitsProcessorOutput,
+    num_tokens: int,
+    *,
+    is_dllm: bool,
+    is_speculative: bool,
+) -> LogitsProcessorOutput:
+    mm_input_embeds = None
+    if is_speculative and output.mm_input_embeds is not None:
+        mm_input_embeds = output.mm_input_embeds[:num_tokens]
+
+    return LogitsProcessorOutput(
+        next_token_logits=(
+            None
+            if is_dllm
+            else _slice_optional_tensor(output.next_token_logits, num_tokens)
+        ),
+        hidden_states=_slice_optional_tensor(output.hidden_states, num_tokens),
+        full_logits=(
+            _slice_optional_tensor(output.full_logits, num_tokens) if is_dllm else None
+        ),
+        dllm_vocab_state=(
+            _slice_dllm_vocab_state(output.dllm_vocab_state, num_tokens)
+            if is_dllm
+            else None
+        ),
+        customized_info=output.customized_info,
+        mm_input_embeds=mm_input_embeds,
+    )
+
+
 class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     """Prefill-phase CUDA graph runner.
 
@@ -363,6 +410,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_hidden_mode = self.return_hidden_states_mode
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
+        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
+        self.is_dllm = self.dllm_config is not None
 
         # --- buffers ---------------------------------------------------
         # `hidden_size` here sizes only the multimodal `input_embeds` buffer,
