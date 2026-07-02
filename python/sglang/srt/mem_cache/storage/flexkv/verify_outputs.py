@@ -20,6 +20,7 @@ is reported and exit code is non-zero. Run again with
 ``FLEXKV_ENABLE_LAYERWISE_TRANSFER=1`` set on the server to exercise
 the layerwise path.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -27,7 +28,6 @@ import json
 import sys
 import time
 import urllib.request
-
 
 PROMPTS = [
     (

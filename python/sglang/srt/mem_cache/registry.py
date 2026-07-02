@@ -153,9 +153,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
         # Honor a CLI --flexkv-config-file by forwarding it via the env
         # var that FlexKV's config loader actually reads.
-        if server_args.flexkv_config_file and not os.environ.get(
-            "FLEXKV_CONFIG_PATH"
-        ):
+        if server_args.flexkv_config_file and not os.environ.get("FLEXKV_CONFIG_PATH"):
             os.environ["FLEXKV_CONFIG_PATH"] = server_args.flexkv_config_file
         return _flexkv_factory(ctx)
 

@@ -108,15 +108,11 @@ class FlexKVConnector:
         )
         self.model_config = self.flexkv_config.model_config
         self.cache_config = self.flexkv_config.cache_config
-        self._label = (
-            f"[model_config={self.model_config}, rank_info={self.rank_info}]"
-        )
+        self._label = f"[model_config={self.model_config}, rank_info={self.rank_info}]"
 
         # 2. Cross-rank sync context.
         world_rank = (
-            torch.distributed.get_rank()
-            if torch.distributed.is_initialized()
-            else 0
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         )
         self._sync_ctx = FlexKVComm(
             rank_info=self.rank_info,
@@ -286,9 +282,7 @@ class FlexKVConnector:
                 hit_length = 0
             else:
                 fkv_task_id, matched_mask = res
-                hit_length = (
-                    int(matched_mask.sum()) if matched_mask is not None else 0
-                )
+                hit_length = int(matched_mask.sum()) if matched_mask is not None else 0
 
         if self._sync_ctx.needs_sync:
             payload = self._sync_ctx.scatter(
@@ -494,9 +488,7 @@ class FlexKVConnector:
         fkv_task_id = -1
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
-                res = self.kv_manager.put_match(
-                    token_ids=token_ids_np, token_mask=None
-                )
+                res = self.kv_manager.put_match(token_ids=token_ids_np, token_mask=None)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[FlexKV] put_match raised: %s", exc)
                 res = None
@@ -526,8 +518,7 @@ class FlexKVConnector:
             payload = self._sync_ctx.scatter_pp(None)
             if payload.get("cmd") != CMD_PUT_META:
                 raise RuntimeError(
-                    f"Tag mismatch: expected CMD_PUT_META, got "
-                    f"{payload.get('cmd')}"
+                    f"Tag mismatch: expected CMD_PUT_META, got " f"{payload.get('cmd')}"
                 )
             fkv_task_id = int(payload["fkv_task_id"])
             mask_list = payload.get("unmatched_mask", [])
@@ -603,8 +594,7 @@ class FlexKVConnector:
             logger.warning("[FlexKV] wait_store: %s", exc)
             return False
         return (
-            fkv_task_id in resp
-            and resp[fkv_task_id].status == KVResponseStatus.SUCCESS
+            fkv_task_id in resp and resp[fkv_task_id].status == KVResponseStatus.SUCCESS
         )
 
     # ------------------------------------------------------------------
@@ -768,8 +758,7 @@ class FlexKVConnector:
                     raise
                 if attempt % 30 == 0:
                     logger.info(
-                        "[FlexKV] GPU register retry %s attempt=%d/%d "
-                        "error=%s",
+                        "[FlexKV] GPU register retry %s attempt=%d/%d " "error=%s",
                         self._label,
                         attempt + 1,
                         max_retries,
@@ -783,9 +772,9 @@ class FlexKVConnector:
         indexer_buffers: Optional[List[torch.Tensor]] = None,
     ) -> None:
         assert len(kv_caches) > 0
-        assert kv_caches[0].ndim == 3, (
-            f"Expected 3D KV cache tensor, got shape={kv_caches[0].shape}"
-        )
+        assert (
+            kv_caches[0].ndim == 3
+        ), f"Expected 3D KV cache tensor, got shape={kv_caches[0].shape}"
 
         is_mla = self.model_config.use_mla
         num_blocks, num_kv_heads, head_size = kv_caches[0].shape

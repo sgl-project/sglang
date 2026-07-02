@@ -73,9 +73,9 @@ class FlexKVRadixCache(RadixCache):
 
     def __init__(
         self,
-        params: "CacheInitParams",
-        model_config: Optional["ModelConfig"],
-        server_args: "ServerArgs",
+        params: CacheInitParams,
+        model_config: Optional[ModelConfig],
+        server_args: ServerArgs,
         tp_rank: int,
         tp_size: int,
         dp_rank: Optional[int],
@@ -178,7 +178,9 @@ class FlexKVRadixCache(RadixCache):
         if self._mode is FlexKVMode.MP:
             if params.req is None:
                 return base_res
-            return self._mp_match_prefix(key, base_res, device_value, last_node, params.req)
+            return self._mp_match_prefix(
+                key, base_res, device_value, last_node, params.req
+            )
         return self._ip_match_prefix(key, base_res, device_value, last_node)
 
     def _mp_match_prefix(
@@ -187,7 +189,7 @@ class FlexKVRadixCache(RadixCache):
         base_res: MatchResult,
         device_value: torch.Tensor,
         last_node: TreeNode,
-        req: "Req",
+        req: Req,
     ) -> MatchResult:
         """LOOKUP-only path. Sets ``host_hit_length`` on the result so
         the scheduler later invokes :meth:`init_load_back`."""
@@ -377,7 +379,7 @@ class FlexKVRadixCache(RadixCache):
     # ------------------------------------------------------------------
 
     def cache_finished_req(  # type: ignore[override]
-        self, req: "Req", is_insert: bool = True
+        self, req: Req, is_insert: bool = True
     ) -> None:
         """Base cache_finished_req then fire an async FlexKV store."""
         super().cache_finished_req(req, is_insert=is_insert)

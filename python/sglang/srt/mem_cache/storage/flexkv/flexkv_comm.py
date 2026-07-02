@@ -31,7 +31,7 @@ import pickle
 import socket
 import struct
 from datetime import timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import torch
 import torch.distributed as dist
@@ -127,9 +127,7 @@ class FlexKVComm:
         self.attn_tp_rank = rank_info.attn_tp_rank
         self.attn_cp_rank = rank_info.attn_cp_rank
 
-        self.is_pp_stage_leader = (
-            self.attn_tp_rank == 0 and self.attn_cp_rank == 0
-        )
+        self.is_pp_stage_leader = self.attn_tp_rank == 0 and self.attn_cp_rank == 0
         self.is_sync_leader = self.pp_rank == 0 and self.is_pp_stage_leader
         self.is_pp_leader = self.pp_rank == 0 and self.is_pp_stage_leader
         self.is_cp_leader = self.attn_cp_rank == 0
@@ -391,10 +389,14 @@ class FlexKVComm:
         dist.irecv(t_data, src=src, tag=tag, group=group).wait()
         return pickle.loads(t_data.numpy().tobytes())
 
-    def _send_tensor(self, tensor: torch.Tensor, dst: int, tag: int = 0, group=None) -> None:
+    def _send_tensor(
+        self, tensor: torch.Tensor, dst: int, tag: int = 0, group=None
+    ) -> None:
         dist.send(tensor, dst=dst, tag=tag, group=group)
 
-    def _recv_tensor(self, tensor: torch.Tensor, src: int, tag: int = 0, group=None) -> None:
+    def _recv_tensor(
+        self, tensor: torch.Tensor, src: int, tag: int = 0, group=None
+    ) -> None:
         dist.recv(tensor, src=src, tag=tag, group=group)
 
     def _bcast_to_stage_members(self, tensor: torch.Tensor, tag: int) -> None:
@@ -426,8 +428,12 @@ class FlexKVComm:
             for dst in other_leaders:
                 self._send_tensor(tensor, dst=dst, tag=tag, group=self._world_cpu_group)
         else:
-            self._send_tensor(tensor, dst=leader_rank, tag=tag, group=self._world_cpu_group)
-            self._recv_tensor(tensor, src=leader_rank, tag=tag, group=self._world_cpu_group)
+            self._send_tensor(
+                tensor, dst=leader_rank, tag=tag, group=self._world_cpu_group
+            )
+            self._recv_tensor(
+                tensor, src=leader_rank, tag=tag, group=self._world_cpu_group
+            )
 
     def _pp_barrier_p2p(self) -> None:
         leader_rank = self._pp_stage_leader_ranks[0]
@@ -440,8 +446,12 @@ class FlexKVComm:
             for dst in other_leaders:
                 self._send_tensor(dummy, dst=dst, tag=tag, group=self._world_cpu_group)
         else:
-            self._send_tensor(dummy, dst=leader_rank, tag=tag, group=self._world_cpu_group)
-            self._recv_tensor(dummy, src=leader_rank, tag=tag, group=self._world_cpu_group)
+            self._send_tensor(
+                dummy, dst=leader_rank, tag=tag, group=self._world_cpu_group
+            )
+            self._recv_tensor(
+                dummy, src=leader_rank, tag=tag, group=self._world_cpu_group
+            )
 
 
 # ----------------------------------------------------------------------
@@ -529,6 +539,7 @@ class FlexKVLayerLoadingEvent:
         yet — and forward proceeds with wrong KV data.
         """
         import os
+
         for fd in self.load_event_fds:
             # The fd is NONBLOCK: read until EAGAIN. Each read is 8 bytes.
             while True:
@@ -550,7 +561,9 @@ class FlexKVLayerLoadingEvent:
         NONBLOCK fd: the read after select is guaranteed to consume one
         signal.
         """
-        import os, select
+        import os
+        import select
+
         assert 0 <= layer_index < self._num_layers
         fd = self.load_event_fds[layer_index]
         while True:
