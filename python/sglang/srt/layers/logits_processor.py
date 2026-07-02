@@ -980,8 +980,10 @@ class LogitsProcessor(nn.Module):
     def _copy_logits_to_buffer(
         self, logits: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> torch.Tensor:
-        if logits_metadata.next_token_logits_buffer is not None:
-            logits_buffer = logits_metadata.next_token_logits_buffer
+        logits_buffer = logits_metadata.next_token_logits_buffer
+        # The shared logits buffer is keyed by vocab width; skip it when this
+        # model's vocab doesn't match (e.g. hot-vocab draft vs full-vocab target).
+        if logits_buffer is not None and logits_buffer.shape[-1] == self.vocab_size:
             assert logits_buffer.dtype == torch.float
             logits_buffer.copy_(logits[:, : self.vocab_size])
             logits = logits_buffer
