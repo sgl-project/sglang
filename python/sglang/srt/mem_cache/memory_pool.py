@@ -1249,7 +1249,7 @@ class KVCache(abc.ABC):
             )
             self.mem_usage = kv_size_GB
 
-    def get_kv_buffer_shape(self) -> torch.Size:
+    def get_kv_buffer_shape(self) -> Tuple[torch.Size, torch.Size]:
         k_buffer, v_buffer = self.get_kv_buffer(self.start_layer)
         return k_buffer.shape, v_buffer.shape
 
