@@ -79,12 +79,19 @@ impl Ingress {
 
         // Register the egress sink with the owning detok shard *before* the
         // request leaves Rust, so the response (generate chunks or a control
-        // result) has a home. Routing is by id only.
+        // result) has a home. Routing is by id only. Carry
+        // `return_text_in_logprobs` so the shard (CPU-bound) does the logprob
+        // token-text decode rather than the api-server I/O threads.
+        let decode_logprob_text = match &req.kind {
+            RequestKind::Generate(g) => g.payload.return_text_in_logprobs.unwrap_or(false),
+            RequestKind::Control(_) => false,
+        };
         let shard = self.senders.detok_for(req.id);
         if shard
             .send(DetokMsg::Register {
                 id: req.id,
                 sink: req.sink.clone(),
+                decode_logprob_text,
             })
             .is_err()
         {
