@@ -1103,3 +1103,31 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices,
                 mamba_steps_to_track,
             )
+
+
+class ShortConvHybridAttnBackend(HybridLinearAttnBackend):
+    """HybridLinearAttnBackend variant for short-conv hybrid models (ZAYA1 CCA,
+    LFM2 short conv).
+
+    The linear sidecar is a :class:`ShortConvAttnBackend
+    <sglang.srt.layers.attention.linear.short_conv_backend.ShortConvAttnBackend>`
+    that owns the per-request conv-state plumbing. The model's conv module
+    reaches it via :meth:`conv_state_metadata` (``get_attn_backend()`` returns
+    this wrapper) and runs its own conv kernel against the returned handle, so
+    the model definition holds no pool access. The sidecar is never reached
+    through the full-vs-linear ``forward_decode`` / ``forward_extend`` dispatch.
+    """
+
+    def __init__(
+        self,
+        full_attn_backend: AttentionBackend,
+        short_conv_backend: MambaAttnBackendBase,
+        full_attn_layers: list,
+    ):
+        # Register short_conv_backend as the linear sidecar so it rides in
+        # attn_backend_list and inherits the metadata / cuda-graph fan-out.
+        super().__init__(full_attn_backend, short_conv_backend, full_attn_layers)
+        self.short_conv_backend = short_conv_backend
+
+    def conv_state_metadata(self, layer_id: int, forward_batch: ForwardBatch):
+        return self.short_conv_backend.conv_state_metadata(layer_id, forward_batch)
