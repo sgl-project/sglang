@@ -57,7 +57,7 @@ Pick your hardware + quantization + strategy to generate the launch command. Lag
 - **Low-Latency (DFlash)** — speculative decoding with a matched-precision DFlash draft. The draft proposes a block, the target verifies it in one forward pass (measured accept-length ~4 at tp 4, ~6 at tp 1), cutting per-token latency for interactive / few-stream serving. Accuracy-neutral (verification-based).
 - **High-Throughput** — plain serving. At batch-saturated load the GPU is compute-bound and speculation's draft + rejected-token overhead costs more than it saves, so the dense path wins on aggregate tokens/sec.
 
-The 8-GPU HGX platforms (H200 / B200) use `--tp 8`; the 4-GPU Grace-Blackwell GB300 node uses `--tp 4`.
+BF16 on the 8-GPU HGX platforms (H200 / B200) uses `--tp 8`; the **FP8 and INT4 checkpoints cap at `--tp 4`** on every platform (their quantization scale granularity cannot shard the 512-dim MoE 8-way — see [Configuration Tips](#2-configuration-tips)); the 4-GPU Grace-Blackwell GB300 node uses `--tp 4` throughout.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/poolside/laguna-xs21.jsx";
@@ -142,7 +142,7 @@ The `-DFlash-*` drafts are **not themselves quantized** — each is a small bf16
 - **Chat template**: on transformers ≥ 5.10 the standalone `chat_template.jinja` auto-loads — no `--chat-template` flag needed (the server logs `Auto-detected template features: reasoning_parser=poolside_v1, tool_call_parser=poolside_v1` when it resolves correctly). On older pinned transformers (≤ ~5.8) the `{% include %}` stub in `tokenizer_config.json` cannot resolve and the server silently falls back to a generic template — there, pass `--chat-template <model-dir>/chat_template.jinja` explicitly.
 - **Thinking default**: thinking is **off by default**; opt in per request with `extra_body={"chat_template_kwargs": {"enable_thinking": True}}`. The template gates on `enable_thinking` — the generic `thinking` key is ignored.
 - **Served model id**: the server registers the model under whatever you pass to `--model-path`, so a client's `model` field must match it — `poolside/Laguna-XS-2.1` (BF16) or the `-FP8` / `-NVFP4` / `-INT4` id for the quantized cells.
-- **TP degree**: 48 Q-heads / 8 KV-heads shard cleanly at `tp` 1 / 2 / 4 / 8. Accuracy is TP-independent on the shipped backends (verified `tp 1` ≡ `tp 4` on GB300).
+- **TP degree**: 48 Q-heads / 8 KV-heads shard cleanly at `tp` 1 / 2 / 4 / 8, but the **FP8 and INT4 checkpoints cap MoE TP at 4**: `moe_intermediate_size=512` with FP8 block `[128,128]` / INT4 `group_size=128` scales cannot shard 8-way (512/8 = 64 violates the 128-granularity — FP8 fails at weight creation, INT4 crashes in the Marlin kernel; reproduced on 8×H200, and the checks are hardware-independent). The generated commands use `--tp 4` for those cells. To use all 8 GPUs of an HGX node with a quantized checkpoint: `--tp 4 --dp-size 2` (two replicas), or a single instance with `--tp 8 --ep-size 8` (FP8 additionally needs `SGLANG_SHARED_EXPERT_TP1=1`). Accuracy is parallelism-independent (verified `tp 1` ≡ `tp 4` on GB300, and `tp 4` ≡ `tp 8 + ep 8` on full GSM8K on H200).
 
 ## 3. Advanced Usage
 
@@ -150,7 +150,7 @@ The `-DFlash-*` drafts are **not themselves quantized** — each is a small bf16
 
 DFlash is a block-wise speculative decoder: the 5-layer draft proposes a block of tokens, the target model verifies the whole block in a single forward pass, and only target-approved tokens are emitted — so **output quality is the target's, by construction** (measured: GSM8K matches dense within noise on every quantization). The speedup lever is **accept-length** — how many draft tokens survive verification per target step:
 
-- ~**6** tokens/step at `tp 1`, ~**4** at `tp 4` (measured on GB300, matched-precision pairs) — versus 1 token/step dense.
+- ~**6** tokens/step at `tp 1`, ~**4** at `tp 4`–`tp 8` (measured on GB300 and 8×H200, matched-precision pairs; ~3 under mixed reasoning-heavy traffic) — versus 1 token/step dense.
 - Best for **interactive / few-stream** serving where the GPU has idle compute. Under batch-saturated load prefer the High-Throughput cells: speculation's draft + rejected-token overhead costs aggregate throughput once the GPU is compute-bound.
 - **Match the draft to the target precision** (the generated commands do) — each draft is calibrated against its specific quantized target.
 

@@ -28,14 +28,21 @@
 // fraction OOMs in the draft vocab all-gather ("Failed to CUDA calloc"); 0.7 is validated.
 // Dense cells use the default heuristic (validated at defaults on GB300).
 //
-// TP: 8-GPU HGX nodes (H200/B200) → --tp 8; GB300 (Grace-Blackwell, 4-GPU single node) → --tp 4.
-// Adjust --tp to your node size (48 attn / 8 KV heads shard cleanly at 1/2/4/8).
+// TP: attention shards cleanly at 1/2/4/8 (48 Q / 8 KV heads), BUT the quantized checkpoints
+// cap MoE TP at 4: moe_intermediate_size=512 with FP8 block [128,128] / INT4 group_size=128
+// scales cannot shard 8-way (512/8 = 64 < 128 granularity → FP8 ValueError at weight create,
+// INT4 Marlin scale-contiguity crash; reproduced on 8×H200, and the checks are pure shard
+// arithmetic — arch-independent). So: BF16 → --tp 8 on 8-GPU HGX (H200/B200); FP8/INT4 →
+// --tp 4 everywhere; GB300 (4-GPU node) → --tp 4. 8-GPU alternatives for FP8/INT4 exist
+// (--tp 4 --dp-size 2, or --tp 8 --ep-size 8 with SGLANG_SHARED_EXPERT_TP1=1 for FP8) but
+// are kept out of the cells for simplicity.
 //
 // NVFP4 is Blackwell-only → no h200×nvfp4 cells (same rule as Laguna-M.1).
 //
 // verified:true = ran that command shape on that hardware and it served correctly + passed
-// full GSM8K (see laguna-xs21-benchmarks.jsx). GB300 cells are verified (4×GB300, tp 4);
-// H200/B200 cells are command-correct but pending measurement.
+// full GSM8K (see laguna-xs21-benchmarks.jsx). GB300 cells verified (4×GB300, tp 4); H200
+// cells verified (8×H200: bf16 at tp 8, fp8/int4 at tp 4); B200 cells are command-correct
+// but pending measurement.
 
 export const config = {
   modelName: "Laguna-XS-2.1",
@@ -155,11 +162,16 @@ sgl-eval run gsm8k \\
   // Draft model precision always matches the target's.
   cells: [
 
-    // ══════════════ NVIDIA Hopper H200 (8-GPU HGX) — BF16 / FP8 / INT4 ══════════════
+    // ══════════════ NVIDIA Hopper H200 (8-GPU HGX) — BF16 / FP8 / INT4 — VERIFIED ══════════════
+    // All 6 cells ran on 8×H200 with full-GSM8K accuracy (laguna-xs21-benchmarks.jsx).
     // Dense auto-selects fa3 on Hopper (no flag). LL pins fa3 (DFlash-safe on Hopper;
     // with a spec algorithm active, auto would fall back to flashinfer).
+    // FP8/INT4 use --tp 4 (quantized-checkpoint MoE TP cap — see header comment);
+    // tp 8 crashes at weight load for both.
     {
+      // VERIFIED 8×H200 tp8: GSM8K 76.12% (full 1319, greedy).
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -172,7 +184,10 @@ sgl-eval run gsm8k \\
       ],
     },
     {
+      // VERIFIED 8×H200 tp8: GSM8K 75.97%, accept-length 3.05 (matched bf16 draft;
+      // ~3.9 on greedy GSM8K at bs=1).
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -190,27 +205,33 @@ sgl-eval run gsm8k \\
       ],
     },
     {
+      // VERIFIED 8×H200 tp4: GSM8K 74.53%. tp 8 is impossible for this checkpoint
+      // (block-FP8 [128,128] can't shard the 512-dim MoE 8-way). Uses 4 of 8 GPUs;
+      // to use all 8 add --dp-size 2, or --ep-size 8 with SGLANG_SHARED_EXPERT_TP1=1.
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
-        "--tp 8",
+        "--tp 4",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
+      // VERIFIED 8×H200 tp4: GSM8K 74.07%, accept-length 3.05 (matched fp8-calibrated draft).
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
-        "--tp 8",
+        "--tp 4",
         "--attention-backend fa3",
         "--speculative-algorithm DFLASH",
         "--speculative-draft-model-path poolside/Laguna-XS-2.1-DFlash-FP8",
@@ -221,28 +242,34 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      // INT4 (mixed 4/8-bit compressed-tensors MoE) — needs a build ≥ PR #29761 (merged).
+      // VERIFIED 8×H200 tp4: GSM8K 67.48%. Mixed 4/8-bit MoE — needs a build ≥ PR #29761
+      // (merged). tp 8 crashes (Marlin gs=128 scale layout can't shard the 512-dim MoE
+      // 8-way). Uses 4 of 8 GPUs; to use all 8 add --dp-size 2, or --ep-size 8 (no extra
+      // env needed for INT4 — its shared expert stays bf16).
       match: { hw: "h200", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
-        "--tp 8",
+        "--tp 4",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
+      // VERIFIED 8×H200 tp4: GSM8K 66.41%, accept-length 2.94 (matched int4-calibrated draft).
       match: { hw: "h200", variant: "default", quant: "int4", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
-        "--tp 8",
+        "--tp 4",
         "--attention-backend fa3",
         "--speculative-algorithm DFLASH",
         "--speculative-draft-model-path poolside/Laguna-XS-2.1-DFlash-INT4",
@@ -289,6 +316,8 @@ sgl-eval run gsm8k \\
       ],
     },
     {
+      // FP8 caps at tp 4 (quantized MoE TP cap, arch-independent — see header comment);
+      // tp 8 fails at weight load on any hardware.
       match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       env: [],
       flags: [
@@ -296,7 +325,7 @@ sgl-eval run gsm8k \\
         "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
-        "--tp 8",
+        "--tp 4",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -309,7 +338,7 @@ sgl-eval run gsm8k \\
         "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
-        "--tp 8",
+        "--tp 4",
         "--attention-backend trtllm_mha",
         "--speculative-algorithm DFLASH",
         "--speculative-draft-model-path poolside/Laguna-XS-2.1-DFlash-FP8",
@@ -352,6 +381,7 @@ sgl-eval run gsm8k \\
     },
     {
       // INT4 (mixed 4/8-bit compressed-tensors MoE) — needs a build ≥ PR #29761 (merged).
+      // Caps at tp 4 (quantized MoE TP cap, arch-independent — see header comment).
       match: { hw: "b200", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
       env: [],
       flags: [
@@ -359,7 +389,7 @@ sgl-eval run gsm8k \\
         "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
-        "--tp 8",
+        "--tp 4",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -372,7 +402,7 @@ sgl-eval run gsm8k \\
         "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
-        "--tp 8",
+        "--tp 4",
         "--attention-backend trtllm_mha",
         "--speculative-algorithm DFLASH",
         "--speculative-draft-model-path poolside/Laguna-XS-2.1-DFlash-INT4",
