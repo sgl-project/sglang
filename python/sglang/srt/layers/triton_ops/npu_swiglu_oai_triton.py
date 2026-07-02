@@ -24,9 +24,6 @@ import torch
 import triton
 import triton.language as tl
 
-# log2(e); used to express exp() through the TBE-verified tl.exp2().
-_LOG2E = 1.4426950408889634
-
 
 @triton.jit
 def _swiglu_oai_kernel(
