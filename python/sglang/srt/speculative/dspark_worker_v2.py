@@ -48,13 +48,6 @@ from sglang.srt.utils.common import empty_context
 logger = logging.getLogger(__name__)
 
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.lower() not in ("0", "false", "off", "no")
-
-
 def _env_int(name: str, default: int) -> int:
     value = os.getenv(name)
     if value is None:
@@ -162,33 +155,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._markov_candidates_buf: Optional[torch.Tensor] = None
         self._markov_embeds_buf: Optional[torch.Tensor] = None
         self._materialize_draft_compressors_enabled = True
-        self._accept_anomaly_enabled = _env_flag("SGLANG_DSPARK_DEBUG_ACCEPT", True)
-        self._accept_anomaly_threshold = max(
-            1, _env_int("SGLANG_DSPARK_DEBUG_ACCEPT_THRESHOLD", 8)
-        )
-        self._accept_anomaly_history_size = max(
-            1, _env_int("SGLANG_DSPARK_DEBUG_ACCEPT_HISTORY", 8)
-        )
-        self._accept_anomaly_max_dumps = max(
-            1, _env_int("SGLANG_DSPARK_DEBUG_ACCEPT_MAX_DUMPS", 64)
-        )
-        self._accept_anomaly_histories: dict[tuple[int, object], list[dict]] = {}
         self._accept_anomaly_streaks: dict[tuple[int, object], int] = {}
-        self._accept_anomaly_dumped: set[tuple[int, object]] = set()
-        self._accept_anomaly_dump_count = 0
         self._zero_draft_recovery_threshold = max(
             1,
             _env_int(
                 "SGLANG_DSPARK_ZERO_DRAFT_RECOVERY_THRESHOLD",
-                self._accept_anomaly_threshold,
+                _env_int("SGLANG_DSPARK_DEBUG_ACCEPT_THRESHOLD", 8),
             ),
         )
         self._zero_draft_recovery_rounds = max(
             0, _env_int("SGLANG_DSPARK_ZERO_DRAFT_RECOVERY_ROUNDS", 32)
-        )
-        self._zero_draft_recovery_log_count = 0
-        self._zero_draft_recovery_max_logs = max(
-            1, _env_int("SGLANG_DSPARK_ZERO_DRAFT_RECOVERY_MAX_LOGS", 64)
         )
         self._stacked_wqkv_fp8_proj = None
         self._stacked_wqkv_kv_offsets: list[tuple[int, int]] = []
@@ -766,69 +742,38 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         return commit_lens, bonus_tokens, out_tokens
 
-    def _maybe_log_accept_anomaly(
+    def _maybe_update_zero_draft_recovery(
         self,
         *,
         model_worker_batch: ScheduleBatch,
-        draft_input: DSparkDraftInputV2,
-        candidates: torch.Tensor,
-        target_predict: torch.Tensor,
         commit_lens: torch.Tensor,
-        bonus_tokens: torch.Tensor,
-        confidence: torch.Tensor,
-        verify_out_cache_loc: torch.Tensor,
-        prefix_lens: torch.Tensor,
-        new_seq_lens: torch.Tensor,
         force_no_spec_mask: Optional[torch.Tensor] = None,
         next_force_no_spec_rounds: Optional[torch.Tensor] = None,
     ) -> None:
-        recovery_enabled = (
-            self._zero_draft_recovery_rounds > 0
-            and next_force_no_spec_rounds is not None
-        )
         if (
-            (not self._accept_anomaly_enabled and not recovery_enabled)
+            self._zero_draft_recovery_rounds <= 0
+            or next_force_no_spec_rounds is None
             or commit_lens.numel() == 0
         ):
             return
 
-        bs, block_size = candidates.shape
+        bs = commit_lens.numel()
         commit_lens_cpu = commit_lens.detach().cpu().tolist()
         force_mask_cpu = (
             force_no_spec_mask.detach().cpu().tolist()
             if force_no_spec_mask is not None and force_no_spec_mask.numel() == bs
             else None
         )
-        if (
-            not any(
-                int(commit_len) <= 1
-                and not (force_mask_cpu is not None and bool(force_mask_cpu[i]))
-                for i, commit_len in enumerate(commit_lens_cpu)
-            )
-            and not self._accept_anomaly_histories
-        ):
+        has_low_accept = any(
+            int(commit_len) <= 1
+            and not (force_mask_cpu is not None and bool(force_mask_cpu[i]))
+            for i, commit_len in enumerate(commit_lens_cpu)
+        )
+        if not has_low_accept and not self._accept_anomaly_streaks:
             return
 
         reqs = getattr(model_worker_batch, "reqs", None) or []
         req_pool_indices = model_worker_batch.req_pool_indices.detach().cpu().tolist()
-        seq_lens = prefix_lens.detach().cpu().tolist()
-        next_seq_lens = new_seq_lens.detach().cpu().tolist()
-        candidate_cpu = candidates.detach().cpu()
-        target_cpu = target_predict.detach().cpu()
-        confidence_cpu = confidence.detach().cpu()
-        next_bonus = bonus_tokens.detach().cpu().tolist()
-        input_bonus = (
-            draft_input.bonus_tokens.detach().cpu().tolist()
-            if draft_input.bonus_tokens.numel() == bs
-            else None
-        )
-        future_indices = (
-            draft_input.future_indices.detach().cpu().tolist()
-            if draft_input.future_indices is not None
-            and draft_input.future_indices.numel() == bs
-            else None
-        )
-        verify_cache = verify_out_cache_loc.detach().cpu().view(bs, block_size)
 
         active_keys = set()
         for i, req_pool_idx in enumerate(req_pool_indices):
@@ -837,76 +782,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             key = (int(req_pool_idx), rid)
             active_keys.add(key)
 
-            candidate_row = candidate_cpu[i]
-            target_row = target_cpu[i]
-            confidence_row = confidence_cpu[i]
-            cache_row = verify_cache[i]
             commit_len = int(commit_lens_cpu[i])
             force_no_spec = (
                 bool(force_mask_cpu[i]) if force_mask_cpu is not None else False
             )
-            history = self._accept_anomaly_histories.setdefault(key, [])
-            history.append(
-                {
-                    "rid": rid,
-                    "req_pool_idx": int(req_pool_idx),
-                    "future_idx": (
-                        int(future_indices[i]) if future_indices is not None else None
-                    ),
-                    "seq_len": int(seq_lens[i]),
-                    "new_seq_len": int(next_seq_lens[i]),
-                    "kv_committed": (
-                        int(getattr(req, "kv_committed_len"))
-                        if req is not None and hasattr(req, "kv_committed_len")
-                        else None
-                    ),
-                    "kv_allocated": (
-                        int(getattr(req, "kv_allocated_len"))
-                        if req is not None and hasattr(req, "kv_allocated_len")
-                        else None
-                    ),
-                    "input_bonus": (
-                        int(input_bonus[i]) if input_bonus is not None else None
-                    ),
-                    "candidate0": (
-                        int(candidate_row[0]) if block_size > 0 else None
-                    ),
-                    "candidate1": (
-                        int(candidate_row[1]) if block_size > 1 else None
-                    ),
-                    "candidate2": (
-                        int(candidate_row[2]) if block_size > 2 else None
-                    ),
-                    "target0": int(target_row[0]) if block_size > 0 else None,
-                    "target1": int(target_row[1]) if block_size > 1 else None,
-                    "target2": int(target_row[2]) if block_size > 2 else None,
-                    "match1": (
-                        bool(candidate_row[1] == target_row[0])
-                        if block_size > 1
-                        else None
-                    ),
-                    "match2": (
-                        bool(candidate_row[2] == target_row[1])
-                        if block_size > 2
-                        else None
-                    ),
-                    "confidence0": (
-                        float(confidence_row[0]) if block_size > 0 else None
-                    ),
-                    "confidence1": (
-                        float(confidence_row[1]) if block_size > 1 else None
-                    ),
-                    "next_bonus": int(next_bonus[i]),
-                    "accept_len": commit_len,
-                    "force_no_spec": force_no_spec,
-                    "verify_cache_first": int(cache_row[0]) if block_size > 0 else None,
-                    "verify_cache_last": (
-                        int(cache_row[-1]) if block_size > 0 else None
-                    ),
-                }
-            )
-            if len(history) > self._accept_anomaly_history_size:
-                del history[: len(history) - self._accept_anomaly_history_size]
 
             if force_no_spec:
                 continue
@@ -917,49 +796,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._accept_anomaly_streaks[key] = 0
                 continue
 
-            if recovery_enabled and streak >= self._zero_draft_recovery_threshold:
+            if streak >= self._zero_draft_recovery_threshold:
                 next_force_no_spec_rounds[i] = self._zero_draft_recovery_rounds
-                if (
-                    self._zero_draft_recovery_log_count
-                    < self._zero_draft_recovery_max_logs
-                ):
-                    self._zero_draft_recovery_log_count += 1
-                    logger.warning(
-                        "DSpark zero-draft recovery triggered: dp_rank=%s "
-                        "tp_rank=%s ep_rank=%s req_pool_idx=%s rid=%s "
-                        "zero_draft_streak=%s rounds=%s",
-                        self.dp_rank,
-                        self.tp_rank,
-                        self.moe_ep_rank,
-                        int(req_pool_idx),
-                        rid,
-                        streak,
-                        self._zero_draft_recovery_rounds,
-                    )
 
-            if (
-                streak >= self._accept_anomaly_threshold
-                and key not in self._accept_anomaly_dumped
-                and self._accept_anomaly_dump_count < self._accept_anomaly_max_dumps
-            ):
-                self._accept_anomaly_dumped.add(key)
-                self._accept_anomaly_dump_count += 1
-                logger.warning(
-                    "DSpark accept anomaly detected: dp_rank=%s tp_rank=%s "
-                    "ep_rank=%s req_pool_idx=%s rid=%s zero_draft_streak=%s "
-                    "history=%s",
-                    self.dp_rank,
-                    self.tp_rank,
-                    self.moe_ep_rank,
-                    int(req_pool_idx),
-                    rid,
-                    streak,
-                    list(history),
-                )
-
-        stale_keys = set(self._accept_anomaly_histories) - active_keys
+        stale_keys = set(self._accept_anomaly_streaks) - active_keys
         for key in stale_keys:
-            self._accept_anomaly_histories.pop(key, None)
             self._accept_anomaly_streaks.pop(key, None)
 
     def _clear_unaccepted_c128_draft_states(
@@ -1289,17 +1130,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             out_tokens[force_no_spec_mask, 0] = target_bonus[force_no_spec_mask]
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
 
-        self._maybe_log_accept_anomaly(
+        self._maybe_update_zero_draft_recovery(
             model_worker_batch=model_worker_batch,
-            draft_input=draft_input,
-            candidates=candidates,
-            target_predict=target_predict,
             commit_lens=commit_lens,
-            bonus_tokens=bonus_tokens,
-            confidence=confidence,
-            verify_out_cache_loc=verify_out_cache_loc,
-            prefix_lens=prefix_lens,
-            new_seq_lens=new_seq_lens,
             force_no_spec_mask=force_no_spec_mask,
             next_force_no_spec_rounds=next_force_no_spec_rounds,
         )
