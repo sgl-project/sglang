@@ -501,9 +501,16 @@ class MultimemAllGatherer:
             return None
         try:
             from sglang.srt.distributed import get_tp_group
+            from sglang.srt.distributed.parallel_state import in_the_same_node_as
 
             tp_group = get_tp_group()
             if tp_group.world_size <= 1:
+                return None
+            if not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0)):
+                logger.warning(
+                    "multimem all-gather disabled because the TP group spans "
+                    "across nodes."
+                )
                 return None
             state = create_state(
                 group=tp_group.device_group,
