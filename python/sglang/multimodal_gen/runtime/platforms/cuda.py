@@ -329,6 +329,41 @@ class CudaPlatformBase(Platform):
                 raise ImportError(
                     "Video MoBA Attention backend is not installed. "
                 ) from e
+        elif selected_backend == AttentionBackendEnum.FLASHINFER_TRTLLM_SKIP_SOFTMAX:
+            major, minor = torch.cuda.get_device_capability()
+            if major != 10:
+                raise ValueError(
+                    "flashinfer_trtllm_skip_softmax backend requires SM 10.x "
+                    "(datacenter Blackwell: B200/B300, where FlashInfer auto-"
+                    f"dispatch selects the trtllm-gen kernels). Got SM {major}.{minor}. "
+                    "On SM 12.x (consumer Blackwell) the same APIs silently fall "
+                    "back to the xqa backend which ignores skip-softmax."
+                )
+            try:
+                from flashinfer.prefill import (  # noqa: F401
+                    trtllm_ragged_attention_deepseek,
+                )
+
+                from sglang.multimodal_gen.runtime.layers.attention.backends.flashinfer_trtllm_skip_softmax_attn import (  # noqa: F401
+                    FlashInferTrtllmSkipSoftmaxBackend,
+                )
+
+                logger.info(
+                    "Using FlashInfer trtllm-gen Skip-Softmax (BLASST) Attention backend"
+                )
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.flashinfer_trtllm_skip_softmax_attn.FlashInferTrtllmSkipSoftmaxBackend"
+            except ImportError as e:
+                logger.error(
+                    "Failed to import FlashInfer trtllm-gen Skip-Softmax backend: %s. "
+                    "Install with `pip install -U flashinfer-python` (>= 0.6.4 with "
+                    "trtllm-gen prefill kernels).",
+                    str(e),
+                )
+                raise ImportError(
+                    "FlashInfer trtllm-gen Skip-Softmax Attention backend requires "
+                    "flashinfer-python with "
+                    "flashinfer.prefill.trtllm_ragged_attention_deepseek."
+                ) from e
         elif selected_backend == AttentionBackendEnum.AITER:
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
         elif selected_backend == AttentionBackendEnum.TORCH_SDPA:

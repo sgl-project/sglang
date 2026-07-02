@@ -5,11 +5,37 @@ from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_block
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+
+# Wan-specific attention backend whitelist. Mirrors DiTArchConfig's default set
+# but adds FLASHINFER_TRTLLM_SKIP_SOFTMAX so users can opt-in via
+# ``--attention-backend flashinfer_trtllm_skip_softmax`` on Wan2.2 (SM10.x).
+# Kept Wan-scoped on purpose - other DiT models (Flux/LTX/Mova) inherit the base
+# whitelist unchanged until they're validated with the new backend.
+_WAN_SUPPORTED_ATTENTION_BACKENDS: set[AttentionBackendEnum] = {
+    AttentionBackendEnum.SLIDING_TILE_ATTN,
+    AttentionBackendEnum.SAGE_ATTN,
+    AttentionBackendEnum.FA,
+    AttentionBackendEnum.AITER,
+    AttentionBackendEnum.AITER_SAGE,
+    AttentionBackendEnum.TORCH_SDPA,
+    AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+    AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
+    AttentionBackendEnum.VMOBA_ATTN,
+    AttentionBackendEnum.SAGE_ATTN_3,
+    AttentionBackendEnum.LASER_ATTN,
+    AttentionBackendEnum.BLOCK_SPARSE_ATTN,
+    AttentionBackendEnum.RAIN_FUSION_ATTN,
+    AttentionBackendEnum.FLASHINFER_TRTLLM_SKIP_SOFTMAX,
+}
 
 
 @dataclass
 class WanVideoArchConfig(DiTArchConfig):
     _fsdp_shard_conditions: list = field(default_factory=lambda: [is_block])
+    _supported_attention_backends: set[AttentionBackendEnum] = field(
+        default_factory=lambda: set(_WAN_SUPPORTED_ATTENTION_BACKENDS)
+    )
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
