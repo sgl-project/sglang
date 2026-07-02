@@ -1,6 +1,7 @@
 import logging
 import math
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
@@ -22,12 +23,16 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
-from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_info_v2 import (
+    DFlashDraftInputV2,
+    _get_overlap_plan_stream,
+)
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    generate_dflash_linear_vocab_mask,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
 )
@@ -39,6 +44,7 @@ from sglang.srt.speculative.triton_ops.dflash import (
     _prepare_dflash_draft_block_unchecked,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
+from sglang.srt.utils.common import is_pin_memory_available
 
 _is_npu = is_npu()
 
@@ -46,6 +52,28 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 _FusedKVMaterializeHelper = None
+_DFLASH_GRAMMAR_MASK_RING_SIZE = 3
+
+
+@dataclass
+class _DFlashGrammarMaskSlot:
+    cpu_buf: Optional[torch.Tensor] = None
+    cpu_cap: int = 0
+    gpu_buf: Optional[torch.Tensor] = None
+    gpu_cap: int = 0
+    gpu_device: Optional[torch.device] = None
+    cache_key: Optional[tuple] = None
+    pin_memory: Optional[bool] = None
+    h2d_done: Optional[object] = None
+    apply_done: Optional[object] = None
+
+
+@dataclass
+class _DFlashPreparedGrammarMask:
+    vocab_mask: torch.Tensor
+    grammar: object
+    ready: Optional[object]
+    slot: Optional[_DFlashGrammarMaskSlot]
 
 
 def _get_fused_kv_materialize_helper():
@@ -286,6 +314,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+        self._grammar_draft_tail_cpu_buf: Optional[torch.Tensor] = None
+        self._grammar_draft_tail_cpu_cap: int = 0
+        self._grammar_draft_tail_cols: int = -1
+        self._grammar_draft_tail_pin_memory: Optional[bool] = None
+        self._grammar_vocab_mask_slots = [
+            _DFlashGrammarMaskSlot() for _ in range(_DFLASH_GRAMMAR_MASK_RING_SIZE)
+        ]
+        self._grammar_vocab_mask_slot: int = 0
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -507,6 +543,290 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_seq_lens_cpu_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device="cpu"
         )
+
+    def _ensure_grammar_draft_tail_cpu_buffer(
+        self, bs: int, block_size: int
+    ) -> torch.Tensor:
+        cols = max(int(block_size) - 1, 0)
+        pin_memory = is_pin_memory_available(self.device)
+        if (
+            self._grammar_draft_tail_cpu_buf is not None
+            and self._grammar_draft_tail_cpu_cap >= int(bs)
+            and self._grammar_draft_tail_cols == cols
+            and self._grammar_draft_tail_pin_memory == pin_memory
+        ):
+            return self._grammar_draft_tail_cpu_buf[:bs]
+
+        new_cap = max(
+            int(bs),
+            (
+                self._grammar_draft_tail_cpu_cap * 2
+                if self._grammar_draft_tail_cpu_cap > 0
+                else int(bs)
+            ),
+        )
+        self._grammar_draft_tail_cpu_buf = torch.empty(
+            (new_cap, cols),
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        self._grammar_draft_tail_cpu_cap = new_cap
+        self._grammar_draft_tail_cols = cols
+        self._grammar_draft_tail_pin_memory = pin_memory
+        return self._grammar_draft_tail_cpu_buf[:bs]
+
+    @staticmethod
+    def _grammar_vocab_mask_key(grammar, vocab_size: int) -> tuple:
+        inner_grammar = getattr(grammar, "grammar", None)
+        return (
+            type(grammar),
+            type(inner_grammar) if inner_grammar is not None else None,
+            int(vocab_size),
+        )
+
+    @staticmethod
+    def _event_is_done(event) -> bool:
+        return event is None or bool(event.query())
+
+    @staticmethod
+    def _clear_done_event(event):
+        return None if event is None or bool(event.query()) else event
+
+    def _next_grammar_vocab_mask_slot(self) -> _DFlashGrammarMaskSlot:
+        slot_count = len(self._grammar_vocab_mask_slots)
+        start = self._grammar_vocab_mask_slot
+        for offset in range(slot_count):
+            idx = (start + offset) % slot_count
+            slot = self._grammar_vocab_mask_slots[idx]
+            if self._event_is_done(slot.h2d_done):
+                slot.h2d_done = None
+                slot.apply_done = self._clear_done_event(slot.apply_done)
+                self._grammar_vocab_mask_slot = (idx + 1) % slot_count
+                return slot
+
+        slot = self._grammar_vocab_mask_slots[start]
+        slot.h2d_done.synchronize()
+        slot.h2d_done = None
+        slot.apply_done = self._clear_done_event(slot.apply_done)
+        self._grammar_vocab_mask_slot = (start + 1) % slot_count
+        return slot
+
+    def _ensure_grammar_vocab_mask_slot(
+        self,
+        *,
+        grammar,
+        vocab_size: int,
+        bs: int,
+        block_size: int,
+    ) -> Optional[_DFlashGrammarMaskSlot]:
+        rows = int(bs) * int(block_size)
+        pin_memory = is_pin_memory_available(self.device)
+        key = self._grammar_vocab_mask_key(grammar, vocab_size)
+        slot = self._next_grammar_vocab_mask_slot()
+
+        if (
+            slot.cpu_buf is not None
+            and slot.cpu_cap >= rows
+            and slot.cache_key == key
+            and slot.pin_memory == pin_memory
+        ):
+            return slot
+
+        if slot.apply_done is not None:
+            slot.apply_done.synchronize()
+            slot.apply_done = None
+
+        new_cap = max(
+            rows,
+            (slot.cpu_cap * 2 if slot.cpu_cap > 0 and slot.cache_key == key else rows),
+        )
+        vocab_mask = grammar.allocate_vocab_mask(
+            vocab_size=vocab_size,
+            batch_size=new_cap,
+            device="cpu",
+        )
+        if vocab_mask is None:
+            return None
+        if pin_memory and not vocab_mask.is_pinned():
+            vocab_mask = vocab_mask.pin_memory()
+
+        slot.cpu_buf = vocab_mask
+        slot.cpu_cap = int(vocab_mask.shape[0])
+        slot.gpu_buf = None
+        slot.gpu_cap = 0
+        slot.gpu_device = None
+        slot.cache_key = key
+        slot.pin_memory = pin_memory
+        return slot
+
+    def _copy_grammar_vocab_mask_to_device(
+        self,
+        *,
+        slot: _DFlashGrammarMaskSlot,
+        cpu_vocab_mask: torch.Tensor,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, Optional[object]]:
+        rows = int(cpu_vocab_mask.shape[0])
+        need_new_gpu_buf = (
+            slot.gpu_buf is None
+            or slot.gpu_cap < rows
+            or slot.gpu_buf.dtype != cpu_vocab_mask.dtype
+            or slot.gpu_buf.shape[1:] != cpu_vocab_mask.shape[1:]
+            or slot.gpu_device != device
+        )
+        if need_new_gpu_buf:
+            if slot.apply_done is not None:
+                slot.apply_done.synchronize()
+                slot.apply_done = None
+            slot.gpu_buf = torch.empty(
+                (slot.cpu_cap, *cpu_vocab_mask.shape[1:]),
+                dtype=cpu_vocab_mask.dtype,
+                device=device,
+            )
+            slot.gpu_cap = int(slot.gpu_buf.shape[0])
+            slot.gpu_device = device
+
+        gpu_vocab_mask = slot.gpu_buf[:rows]
+        copy_stream, copy_stream_ctx = _get_overlap_plan_stream(device)
+        current_stream = torch.get_device_module(device).current_stream()
+        if copy_stream is not None:
+            with copy_stream_ctx:
+                if slot.apply_done is not None:
+                    copy_stream.wait_event(slot.apply_done)
+                    slot.apply_done = None
+                gpu_vocab_mask.copy_(cpu_vocab_mask, non_blocking=True)
+                ready = torch.get_device_module(device).Event()
+                ready.record()
+                slot.h2d_done = ready
+            return gpu_vocab_mask, ready
+
+        if slot.apply_done is not None:
+            current_stream.wait_event(slot.apply_done)
+            slot.apply_done = None
+        gpu_vocab_mask.copy_(cpu_vocab_mask, non_blocking=True)
+        ready = torch.get_device_module(device).Event()
+        ready.record()
+        slot.h2d_done = ready
+        return gpu_vocab_mask, None
+
+    def _copy_grammar_draft_tail_to_cpu(
+        self,
+        *,
+        draft_tokens: torch.Tensor,
+        bs: int,
+        block_size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, Optional[object]]:
+        draft_tail_cpu = self._ensure_grammar_draft_tail_cpu_buffer(bs, block_size)
+        if block_size <= 1:
+            return draft_tail_cpu, None
+
+        copy_stream, copy_stream_ctx = _get_overlap_plan_stream(device)
+        if copy_stream is not None:
+            current_stream = torch.get_device_module(device).current_stream()
+            with copy_stream_ctx:
+                copy_stream.wait_stream(current_stream)
+                draft_tail_cpu.copy_(draft_tokens[:, 1:], non_blocking=True)
+                copy_done = torch.get_device_module(device).Event()
+                copy_done.record()
+            return draft_tail_cpu, copy_done
+
+        draft_tail_cpu.copy_(draft_tokens[:, 1:], non_blocking=True)
+        copy_done = torch.get_device_module(device).Event()
+        copy_done.record()
+        return draft_tail_cpu, copy_done
+
+    def _prepare_grammar_vocab_mask(
+        self,
+        *,
+        model_worker_batch: ScheduleBatch,
+        sampling_info,
+        draft_tail_cpu: Optional[torch.Tensor],
+        draft_tail_copy_done,
+        bs: int,
+        block_size: int,
+        logits_device: torch.device,
+    ) -> Optional[_DFlashPreparedGrammarMask]:
+        if draft_tail_copy_done is not None:
+            draft_tail_copy_done.synchronize()
+        if draft_tail_cpu is None:
+            raise RuntimeError(
+                "DFLASH grammar decoding expected draft-tail CPU buffer."
+            )
+
+        vocab_size = (
+            int(sampling_info.vocab_size)
+            if sampling_info is not None
+            else int(self.target_worker.model_runner.model_config.vocab_size)
+        )
+        first_grammar = next(
+            (req.grammar for req in model_worker_batch.reqs if req.grammar),
+            None,
+        )
+        slot = (
+            self._ensure_grammar_vocab_mask_slot(
+                grammar=first_grammar,
+                vocab_size=vocab_size,
+                bs=bs,
+                block_size=block_size,
+            )
+            if first_grammar is not None
+            else None
+        )
+        vocab_mask_buf = (
+            slot.cpu_buf[: bs * block_size]
+            if slot is not None and slot.cpu_buf is not None
+            else None
+        )
+        vocab_mask, grammar = generate_dflash_linear_vocab_mask(
+            reqs=model_worker_batch.reqs,
+            draft_token_tail_cpu=draft_tail_cpu,
+            vocab_size=vocab_size,
+            vocab_mask_buf=vocab_mask_buf,
+        )
+        if vocab_mask is None:
+            return None
+        if grammar is None:
+            raise RuntimeError("DFLASH grammar mask generation returned no grammar.")
+
+        ready = None
+        if slot is not None and vocab_mask.device.type == "cpu":
+            vocab_mask, ready = self._copy_grammar_vocab_mask_to_device(
+                slot=slot,
+                cpu_vocab_mask=vocab_mask,
+                device=logits_device,
+            )
+        else:
+            vocab_mask = grammar.move_vocab_mask(vocab_mask, logits_device)
+
+        return _DFlashPreparedGrammarMask(
+            vocab_mask=vocab_mask,
+            grammar=grammar,
+            ready=ready,
+            slot=slot,
+        )
+
+    @staticmethod
+    def _apply_prepared_grammar_vocab_mask(
+        prepared_mask: Optional[_DFlashPreparedGrammarMask],
+        logits: torch.Tensor,
+    ) -> None:
+        if prepared_mask is None:
+            return
+
+        if prepared_mask.ready is not None:
+            torch.get_device_module(logits.device).current_stream().wait_event(
+                prepared_mask.ready
+            )
+        prepared_mask.grammar.apply_vocab_mask(
+            logits=logits,
+            vocab_mask=prepared_mask.vocab_mask,
+        )
+        if prepared_mask.slot is not None:
+            apply_done = torch.get_device_module(logits.device).Event()
+            apply_done.record()
+            prepared_mask.slot.apply_done = apply_done
 
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker. Guard
@@ -1563,6 +1883,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
 
+        grammar_draft_tail_cpu = None
+        grammar_tail_copy_done = None
+        if model_worker_batch.has_grammar:
+            grammar_draft_tail_cpu, grammar_tail_copy_done = (
+                self._copy_grammar_draft_tail_to_cpu(
+                    draft_tokens=draft_tokens,
+                    bs=bs,
+                    block_size=block_size,
+                    device=device,
+                )
+            )
+
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
@@ -1612,12 +1944,32 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
+        prepared_grammar_mask = None
+        if model_worker_batch.has_grammar:
+            prepared_grammar_mask = self._prepare_grammar_vocab_mask(
+                model_worker_batch=model_worker_batch,
+                sampling_info=sampling_info,
+                draft_tail_cpu=grammar_draft_tail_cpu,
+                draft_tail_copy_done=grammar_tail_copy_done,
+                bs=bs,
+                block_size=block_size,
+                logits_device=logits_output.next_token_logits.device,
+            )
+            if sampling_info is not None:
+                # Regular grammar masks have one row per request. DFlash verify
+                # needs one row per verify-block position.
+                sampling_info.vocab_mask = None
+
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=int(self.block_size),
             )
+        self._apply_prepared_grammar_vocab_mask(
+            prepared_grammar_mask,
+            logits_output.next_token_logits,
+        )
 
         candidates = draft_tokens
         new_seq_lens = None

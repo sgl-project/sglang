@@ -1,6 +1,9 @@
+import random
+import time
 import unittest
 
 import openai
+import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, kill_process_tree
@@ -11,6 +14,7 @@ from sglang.test.kits.radix_cache_server_kit import (
     gen_radix_tree,
     run_radix_attention_test,
 )
+from sglang.test.kits.spec_server_kits import SpecFeatureKit
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_DFLASH,
     DEFAULT_TARGET_MODEL_DFLASH,
@@ -22,6 +26,14 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=302, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=302, stage="stage-b", runner_config="1-gpu-small-amd")
+
+PROMPTS = [
+    "Today is a sunny day and I like",
+    "Write a short travel tip for Hawaii.",
+    "Summarize what makes a good product launch.",
+    "Who are you?",
+    "Where are you from?",
+]
 
 
 class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
@@ -124,13 +136,44 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
         self.assertEqual(outputs[0], outputs[1])
         assert self.process.poll() is None
 
+    def send_request(self):
+        time.sleep(random.uniform(0, 2))
+        for prompt in PROMPTS:
+            response = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "text": prompt,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 256,
+                    },
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+
+    def send_requests_abort(self):
+        for prompt in PROMPTS:
+            try:
+                time.sleep(random.uniform(0, 2))
+                requests.post(
+                    self.base_url + "/generate",
+                    json={
+                        "text": prompt,
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": 256,
+                        },
+                    },
+                    timeout=1,
+                )
+            except Exception as e:
+                print(e)
+
 
 class TestDFlashServerPage256(TestDFlashServerBase):
     page_size = 256
 
     def test_radix_attention(self):
-        import requests
-
         nodes = gen_radix_tree(num_nodes=50)
         data = {
             "input_ids": [node["input_ids"] for node in nodes],
@@ -152,7 +195,7 @@ class TestDFlashServerNoCudaGraph(TestDFlashServerBase):
     other_launch_args = ["--disable-cuda-graph"]
 
 
-class TestDFlashServerSpecV2(TestDFlashServerBase):
+class TestDFlashServerSpecV2(TestDFlashServerBase, SpecFeatureKit):
     disable_overlap = False
 
     def test_radix_attention(self):

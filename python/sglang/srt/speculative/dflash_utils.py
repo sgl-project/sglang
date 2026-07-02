@@ -196,6 +196,122 @@ def apply_dflash_verify_logits_adjustments(
         get_logits_3d().add_(logit_bias[:, None, :])
 
 
+def _dflash_vocab_mask_allows_token(
+    vocab_mask_row: torch.Tensor,
+    token_id: int,
+    vocab_size: int,
+) -> bool:
+    if token_id < 0 or token_id >= vocab_size:
+        return False
+
+    # Outlines uses dense bool masks where True means "masked out".
+    if vocab_mask_row.dtype == torch.bool and vocab_mask_row.numel() >= vocab_size:
+        return not bool(vocab_mask_row[token_id].item())
+
+    # xgrammar / llguidance use packed 32-token bitsets where a set bit is allowed.
+    word_idx = token_id // 32
+    if word_idx >= vocab_mask_row.numel():
+        return False
+    word = int(vocab_mask_row[word_idx].item())
+    return (word & (1 << (token_id & 31))) != 0
+
+
+def reset_dflash_vocab_mask_to_all_allowed(
+    vocab_mask: torch.Tensor,
+    vocab_size: int,
+) -> None:
+    if vocab_mask.dtype == torch.bool and vocab_mask.shape[-1] >= vocab_size:
+        vocab_mask.zero_()
+    else:
+        vocab_mask.fill_(-1)
+
+
+def generate_dflash_linear_vocab_mask(
+    *,
+    reqs: List[Req],
+    draft_token_tail_cpu: torch.Tensor,
+    vocab_size: int,
+    vocab_mask_buf: Optional[torch.Tensor] = None,
+) -> tuple[Optional[torch.Tensor], Optional[Any]]:
+    """Generate per-position grammar masks for a linear DFlash verify block.
+
+    `draft_token_tail_cpu` contains `candidates[:, 1:]`, the speculative tokens
+    after the already-accepted current token. Row j in the returned mask maps to
+    verify-logit position j:
+
+    - j == 0: grammar state before accepting any draft token in this block.
+    - j > 0: grammar state after accepting draft_token_tail_cpu[:, :j].
+
+    The helper only probes request grammars temporarily. Result processing later
+    advances live grammar state with the accepted token list.
+    """
+
+    if draft_token_tail_cpu.ndim != 2:
+        raise ValueError(
+            "draft_token_tail_cpu must be 2D, "
+            f"got shape={tuple(draft_token_tail_cpu.shape)}."
+        )
+    if len(reqs) != draft_token_tail_cpu.shape[0]:
+        raise ValueError(
+            "req count must match draft_token_tail_cpu batch size, "
+            f"got len(reqs)={len(reqs)}, bs={draft_token_tail_cpu.shape[0]}."
+        )
+    if vocab_size <= 0:
+        raise ValueError(f"vocab_size must be positive, got {vocab_size}.")
+
+    bs, tail_len = draft_token_tail_cpu.shape
+    block_size = tail_len + 1
+    max_rows = bs * block_size
+    vocab_mask = vocab_mask_buf
+    if vocab_mask is not None:
+        if vocab_mask.shape[0] < max_rows:
+            raise ValueError(
+                "preallocated DFLASH vocab mask is too small: "
+                f"need {max_rows} rows, got {vocab_mask.shape[0]}."
+            )
+        vocab_mask = vocab_mask[:max_rows]
+        reset_dflash_vocab_mask_to_all_allowed(vocab_mask, vocab_size)
+    grammar_for_apply = None
+
+    for i, req in enumerate(reqs):
+        grammar = req.grammar
+        if grammar is None:
+            continue
+
+        if vocab_mask is None:
+            vocab_mask = grammar.allocate_vocab_mask(
+                vocab_size=vocab_size,
+                batch_size=max_rows,
+                device="cpu",
+            )
+            reset_dflash_vocab_mask_to_all_allowed(vocab_mask, vocab_size)
+        grammar_for_apply = grammar
+
+        row_offset = i * block_size
+        accepted_for_probe = 0
+        draft_tail = draft_token_tail_cpu[i].tolist()
+        try:
+            for pos in range(block_size):
+                if pos > 0:
+                    token_id = int(draft_tail[pos - 1])
+                    prev_row = vocab_mask[row_offset + pos - 1]
+                    if not _dflash_vocab_mask_allows_token(
+                        prev_row, token_id, vocab_size
+                    ):
+                        break
+                    grammar.accept_token(token_id)
+                    accepted_for_probe += 1
+
+                if grammar.is_terminated():
+                    break
+                grammar.fill_vocab_mask(vocab_mask, row_offset + pos)
+        finally:
+            if accepted_for_probe:
+                grammar.rollback(accepted_for_probe)
+
+    return vocab_mask, grammar_for_apply
+
+
 def _get_or_create_chain_verify_buffers(
     *,
     bs: int,
@@ -779,16 +895,5 @@ def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
 
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
-
-    if (
-        req.sampling_params.json_schema is not None
-        or req.sampling_params.regex is not None
-        or req.sampling_params.ebnf is not None
-        or req.sampling_params.structural_tag is not None
-    ):
-        return (
-            "DFLASH speculative decoding does not support "
-            "grammar-constrained decoding yet."
-        )
 
     return None
