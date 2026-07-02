@@ -14,7 +14,7 @@ When loading models from object storage, SGLang uses a two-phase approach:
 1. **Amazon S3**: `s3://bucket-name/path/to/model/`
 2. **Google Cloud Storage**: `gs://bucket-name/path/to/model/`
 3. **Azure Blob**: `az://some-azure-container/path/`
-4. **S3 compatible**: `s3://bucket-name/path/to/model/`
+4. **S3-compatible endpoints** (MinIO, Tigris, Cloudflare R2, etc.): `s3://bucket-name/path/to/model/`
 
 ## Quick Start
 
@@ -49,6 +49,22 @@ python -m sglang.launch_server \
   --tp 4 \
   --model-loader-extra-config '{"distributed": true}'
 ```
+
+### S3-Compatible Endpoints
+
+To load a model from an S3-compatible object store, point the streamer at the store's endpoint with `AWS_ENDPOINT_URL`. For example, using [Tigris](https://www.tigrisdata.com):
+
+```bash
+AWS_EC2_METADATA_DISABLED=true \
+AWS_ENDPOINT_URL=https://t3.storage.dev \
+AWS_ACCESS_KEY_ID=tid_your_access_key_id \
+AWS_SECRET_ACCESS_KEY=tsec_your_secret_access_key \
+python -m sglang.launch_server \
+  --model-path s3://my-bucket/models/llama-3-8b/ \
+  --load-format runai_streamer
+```
+
+Tigris uses a single global endpoint and doesn't charge egress fees, so the same `s3://` URI works from every worker and there's no cross-region transfer cost when a model is re-pulled on cold starts or autoscale events. The same pattern works for any S3-compatible store — swap `AWS_ENDPOINT_URL` for the provider's endpoint.
 
 ## Configuration
 
