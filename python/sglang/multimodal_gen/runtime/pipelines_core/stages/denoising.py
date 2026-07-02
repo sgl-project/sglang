@@ -205,6 +205,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         attn_head_size = hidden_size // num_attention_heads
 
         # torch compile
+        # list of offloaded dit modules if torch compile is enabled. cleared after compile and warmup
         self._offloaded_dit_modules_for_compile: list[torch.nn.Module] = []
         # layerwise-offload and then compile to avoid OOM
         for transformer in filter(None, [self.transformer, self.transformer_2]):
@@ -1415,11 +1416,14 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def _maybe_offload_for_torch_compile_warmup(
         self, batch: Req, server_args: ServerArgs
     ):
+        """deal with warmup req if torch-compile is enabled
+        Returns the result if req is a
+        """
         if not self._offloaded_dit_modules_for_compile:
             return None
-        # if the dits are offloaded in preparation stage
+        # if the dits have been layerwise-offloaded in preparation stage
         if batch.is_warmup:
-            # for warmup request, offload components to ensure sufficient VRAM headroom for torch compile
+            # if warmup is enabled, for warmup request, offload components to ensure sufficient VRAM headroom for torch compile
             moved = self._move_resident_components_for_warmup()
             try:
                 return self._denoise(batch, server_args)
@@ -1439,7 +1443,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
-        self._maybe_offload_for_torch_compile_warmup()
+        warmup_result = self._maybe_offload_for_torch_compile_warmup(batch, server_args)
+        if warmup_result is not None:
+            return warmup_result
         return self._denoise(batch, server_args)
 
     @torch.no_grad()
