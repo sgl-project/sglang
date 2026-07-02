@@ -976,6 +976,7 @@ class ServerArgs(DisaggServerArgsMixin):
         if (
             self.offload_during_compile
             and self.enable_torch_compile
+            and self.warmup
             and not self.dit_layerwise_offload
             and not self.is_dit_layerwise_offload_selected
             and not self.use_fsdp_inference

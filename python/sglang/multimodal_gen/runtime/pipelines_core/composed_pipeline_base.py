@@ -989,6 +989,11 @@ class ComposedPipelineBase(ABC):
             server_args.text_encoder_cpu_offload = restore["text_encoder"]
             server_args.image_encoder_cpu_offload = restore["image_encoder"]
             server_args.vae_cpu_offload = restore["vae"]
+            # residency strategies are cached per component; the flags above
+            # changed in place, so invalidate explicitly
+            get_global_component_residency_manager(
+                self, server_args
+            ).strategy_for.cache_clear()
             device = get_local_torch_device()
             for name, module in self.modules.items():
                 for prefix, was_offloaded in restore.items():
