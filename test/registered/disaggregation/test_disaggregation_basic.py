@@ -16,6 +16,7 @@ from transformers import AutoTokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.pause_generation_kit import PauseResumeInPlaceMixin
+from sglang.test.kits.spec_server_kits import SpecGrammarKit
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -27,7 +28,7 @@ from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
 
-register_cuda_ci(est_time=700, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=730, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServerBase):
@@ -221,7 +222,9 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
                 raise e from health_check_error
 
 
-class TestDisaggregationMooncakeSpec(JSONConstrainedMixin, PDDisaggregationServerBase):
+class TestDisaggregationMooncakeSpec(
+    JSONConstrainedMixin, SpecGrammarKit, PDDisaggregationServerBase
+):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -237,7 +240,7 @@ class TestDisaggregationMooncakeSpec(JSONConstrainedMixin, PDDisaggregationServe
             "4",
             "--speculative-num-draft-tokens",
             "16",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "8",
             "--dtype=float16",
         ]

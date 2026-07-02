@@ -187,6 +187,7 @@ class TinyLightningModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = False
         self.is_local_attention_model = False
         self.attention_chunk_size = None
@@ -319,6 +320,7 @@ class MockLightningModelRunner(ModelRunner):
         self.sliding_window_size = None
         self.use_mla_backend = False
         self.is_draft_worker = False
+        self._kernel_warmed_up = True
 
     @property
     def hybrid_gdn_config(self):

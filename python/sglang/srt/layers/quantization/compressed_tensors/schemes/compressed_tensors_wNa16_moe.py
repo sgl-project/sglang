@@ -28,6 +28,8 @@ from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
+    from compressed_tensors.quantization import QuantizationArgs
+
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
@@ -62,9 +64,16 @@ class GPTQMarlinState(Enum):
 
 class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
-    def __init__(self, quant_config: CompressedTensorsConfig, num_gpu_experts=-1):
+    def __init__(
+        self,
+        quant_config: CompressedTensorsConfig,
+        weight_quant: QuantizationArgs,
+        num_gpu_experts: int = -1,
+    ):
         self.quant_config = quant_config
-        config = self.quant_config.target_scheme_map["Linear"].get("weights")
+        # Per-layer scheme already resolved by get_moe_scheme(); reuse it directly
+        # (mixed-precision MoE has no "Linear" config group to fall back on).
+        config = weight_quant
         self.num_bits = config.num_bits
         self.packed_factor = 32 // config.num_bits
         self.strategy = config.strategy
@@ -130,7 +139,11 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
         # In the case where we have actorder/g_idx,
         # we do not partition the w2 scales
-        load_full_w2 = (self.actorder != "static") and self.group_size != -1
+        load_full_w2 = (
+            self.actorder is not None
+            and self.actorder != "static"
+            and self.group_size != -1
+        )
 
         if load_full_w2:
             w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size

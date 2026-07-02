@@ -40,7 +40,9 @@ from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
 )
 from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all,
+    _usp_input_all_to_all_varlen,
     _usp_output_all_to_all,
+    _usp_output_all_to_all_varlen,
     ring_attn,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
@@ -143,6 +145,7 @@ class UlyssesAttention(nn.Module):
         replicated_q: torch.Tensor | None = None,
         replicated_k: torch.Tensor | None = None,
         replicated_v: torch.Tensor | None = None,
+        seq_lens: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward pass for distributed attention.
 
@@ -168,11 +171,21 @@ class UlyssesAttention(nn.Module):
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
 
+        if seq_lens is not None:
+            assert (
+                replicated_q is None and replicated_k is None and replicated_v is None
+            ), "Varlen Ulysses attention does not support replicated QKV"
+
         # Stack QKV
         qkv = torch.cat([q, k, v], dim=0)  # [3, seq_len, num_heads, head_dim]
 
         # Redistribute heads across sequence dimension
-        qkv = sequence_model_parallel_all_to_all_4D(qkv, scatter_dim=2, gather_dim=1)
+        if seq_lens is None:
+            qkv = sequence_model_parallel_all_to_all_4D(
+                qkv, scatter_dim=2, gather_dim=1
+            )
+        else:
+            qkv = _usp_input_all_to_all_varlen(qkv, seq_lens, head_dim=2)
         # Apply backend-specific preprocess_qkv
         qkv = self.attn_impl.preprocess_qkv(qkv, ctx_attn_metadata)
 
@@ -204,9 +217,12 @@ class UlyssesAttention(nn.Module):
         # Apply backend-specific postprocess_output
         output = self.attn_impl.postprocess_output(output, ctx_attn_metadata)
 
-        output = sequence_model_parallel_all_to_all_4D(
-            output, scatter_dim=1, gather_dim=2
-        )
+        if seq_lens is None:
+            output = sequence_model_parallel_all_to_all_4D(
+                output, scatter_dim=1, gather_dim=2
+            )
+        else:
+            output = _usp_output_all_to_all_varlen(output, seq_lens, head_dim=2)
         return output, replicated_output
 
 
@@ -409,6 +425,7 @@ class USPAttention(nn.Module):
         prefix: str = "",
         dropout_rate: float = 0.0,
         skip_sequence_parallel: bool = False,
+        enable_packed_qkv_input_a2a: bool = False,
         **extra_impl_args,
     ) -> None:
         """
@@ -464,6 +481,7 @@ class USPAttention(nn.Module):
         self.dropout_p = dropout_rate
 
         self.skip_sequence_parallel = skip_sequence_parallel
+        self.enable_packed_qkv_input_a2a = bool(enable_packed_qkv_input_a2a)
 
     def _get_usp_a2a_stream(self):
         if USPAttention._usp_a2a_stream is None:
@@ -765,9 +783,21 @@ class USPAttention(nn.Module):
         # Ulysses-style All-to-All for sequence/head sharding
         if sp_size > 1:
             # -> [B, S, H_local, D]
-            q = _usp_input_all_to_all(q, head_dim=2)
-            k = _usp_input_all_to_all(k, head_dim=2)
-            v = _usp_input_all_to_all(v, head_dim=2)
+            if self.enable_packed_qkv_input_a2a and q.device.type == "cuda":
+                q, k, v = async_a2a_communicate(
+                    [q, k, v],
+                    sp_size,
+                    get_sp_group().ulysses_group,
+                    self._get_usp_a2a_stream(),
+                    local_seq_2_local_head=True,
+                )
+                q = q.contiguous()
+                k = k.contiguous()
+                v = v.contiguous()
+            else:
+                q = _usp_input_all_to_all(q, head_dim=2)
+                k = _usp_input_all_to_all(k, head_dim=2)
+                v = _usp_input_all_to_all(v, head_dim=2)
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
