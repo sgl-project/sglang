@@ -1,12 +1,16 @@
 """Unit tests for srt/mem_cache/hiradix_cache.py KV cache events."""
 
 import os
+import shutil
+import tempfile
+import time
 import unittest
 from array import array
 
 import torch
 
 from sglang.srt.disaggregation.kv_events import BlockStored, StorageMedium
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -30,16 +34,36 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
             raise unittest.SkipTest("CUDA is required for HiRadixCache tests.")
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", "29601")
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1)
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        os.environ.setdefault("LOCAL_RANK", "0")
 
-    def _build_cache(self):
+        from sglang.srt.distributed.parallel_state import (
+            init_distributed_environment,
+            initialize_model_parallel,
+            model_parallel_is_initialized,
+        )
+
+        if not torch.distributed.is_initialized():
+            init_distributed_environment(
+                world_size=1, rank=0, local_rank=0, backend="gloo"
+            )
+        if not model_parallel_is_initialized():
+            initialize_model_parallel(
+                tensor_model_parallel_size=1,
+                expert_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+                backend="gloo",
+            )
+
+    def _build_cache(self, storage_backend=None):
         server_args = ServerArgs(
             model_path="dummy",
             page_size=PAGE_SIZE,
             hicache_io_backend="direct",
             hicache_mem_layout="layer_first",
             hicache_write_policy="write_through",
+            hicache_storage_backend=storage_backend,
         )
         set_global_server_args_for_scheduler(server_args)
         req_to_token_pool = ReqToTokenPool(
@@ -119,6 +143,37 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
         )
         self.assertIsNone(stored_cpu[0].parent_block_hash)
         self.assertEqual(stored_cpu[1].parent_block_hash, stored_cpu[0].block_hashes[0])
+
+    def test_l3_backup_ack_publishes_external_store_events(self):
+        storage_dir = tempfile.mkdtemp(prefix="hicache_l3_events_")
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        with envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(storage_dir):
+            cache, allocator = self._build_cache(storage_backend="file")
+        cache.take_events()
+
+        self._insert(cache, allocator, [1, 2, 3, 4])
+        node = self._leaf_for(cache, [1, 2, 3, 4])
+        backed_up = cache.write_backup(node, write_back=True)
+        self.assertGreater(backed_up, 0)
+
+        # Flush the write-through DMA, then wait for the async L3 backup ack.
+        deadline = time.monotonic() + 20
+        while cache.ongoing_write_through and time.monotonic() < deadline:
+            cache.writing_check(write_back=True)
+            time.sleep(0.01)
+        while cache.ongoing_backup and time.monotonic() < deadline:
+            cache.drain_storage_control_queues()
+            time.sleep(0.01)
+        self.assertFalse(cache.ongoing_backup)
+
+        stored_l3 = [
+            e
+            for e in cache.take_events()
+            if isinstance(e, BlockStored) and e.medium == StorageMedium.EXTERNAL
+        ]
+        self.assertEqual([list(e.token_ids) for e in stored_l3], [[1, 2], [3, 4]])
+        self.assertIsNone(stored_l3[0].parent_block_hash)
+        self.assertEqual(stored_l3[1].parent_block_hash, stored_l3[0].block_hashes[0])
 
 
 if __name__ == "__main__":

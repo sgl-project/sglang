@@ -2163,6 +2163,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if entry is not None:
                     node, lock_params = entry
                     self.dec_host_lock_ref(node, lock_params)
+                    # Publish an L3 store event once the whole node reached the
+                    # storage backend, so cache-aware routers can index blocks
+                    # persisted to the shared pool (e.g. Mooncake).
+                    if operation.completed_tokens // self.page_size == len(
+                        operation.hash_value
+                    ):
+                        self._record_store_event(node, medium=StorageMedium.EXTERNAL)
                 if (
                     log_metrics
                     and self.enable_storage_metrics

@@ -612,6 +612,13 @@ class HiRadixCache(RadixCache):
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
                     entry.release_host()
+                    # Publish an L3 store event once the whole node reached the
+                    # storage backend, so cache-aware routers can index blocks
+                    # persisted to the shared pool (e.g. Mooncake).
+                    if operation.completed_tokens // self.page_size == len(
+                        operation.hash_value
+                    ):
+                        self._record_store_event(entry, medium=StorageMedium.EXTERNAL)
                 if log_metrics and self.enable_storage_metrics:
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
