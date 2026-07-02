@@ -31,6 +31,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -277,6 +280,11 @@ class RMSNorm(MultiPlatformOp):
                     residual = residual + post_residual_addition
                 return x, residual
             return x
+        # Prefill is precision-sensitive (quantized models regress on the fused
+        # kernel's bf16 residual add), so route BCG prefill to the fp32
+        # forward_native; decode keeps the fused kernel.
+        if is_in_breakable_cuda_graph():
+            return self.forward_native(x, residual, post_residual_addition)
         # sgl_kernel rmsnorm requires 2D input; reshape higher-rank tensors
         needs_reshape = x.dim() != 2 and residual is None
         if needs_reshape:

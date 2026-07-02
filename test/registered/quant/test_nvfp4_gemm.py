@@ -58,8 +58,7 @@ class FP4GemmBase:
         metrics = run_eval(args)
         print(metrics)
 
-        # TODO: restore 0.64 once the BCG-prefill RMSNorm fp32 fix lands.
-        self.assertGreater(metrics["score"], 0.63)
+        self.assertGreater(metrics["score"], 0.64)
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")

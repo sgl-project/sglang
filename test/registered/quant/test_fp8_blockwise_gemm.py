@@ -74,9 +74,6 @@ class MXFP8GemmBase:
             "--trust-remote-code",
             "--fp8-gemm-backend",
             cls.backend,
-            # TODO: pin tc_piecewise — default `breakable` prefill runs MXFP8 RMSNorm in bf16, hurting accuracy; unrelated to BCG-default change.
-            "--cuda-graph-backend-prefill",
-            "tc_piecewise",
         ]
         cls.process = popen_launch_server(
             cls.model,
