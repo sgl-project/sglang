@@ -202,6 +202,10 @@
       "destination": "/docs/advanced_features/vlm_query"
     },
     {
+      "source": "/basic_usage/unlimited_ocr.html",
+      "destination": "/cookbook/autoregressive/Baidu/Unlimited-OCR"
+    },
+    {
       "source": "/basic_usage/deepseek_ocr.html",
       "destination": "/cookbook/autoregressive/DeepSeek/DeepSeek-OCR"
     },
@@ -435,11 +439,11 @@
     },
     {
       "source": "/platforms/ascend/ascend_npu_best_practice.html",
-      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice"
+      "destination": "/docs/hardware-platforms/ascend-npus/best_practice"
     },
     {
       "source": "/platforms/ascend/ascend_npu_deepseek_example.html",
-      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_deepseek_example"
+      "destination": "/docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_v3_2"
     },
     {
       "source": "/platforms/ascend/ascend_npu_environment_variables.html",
@@ -447,7 +451,7 @@
     },
     {
       "source": "/platforms/ascend/ascend_npu_glm5_examples.html",
-      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_glm5_examples"
+      "destination": "/docs/hardware-platforms/ascend-npus/model-tutorials/glm_5_1"
     },
     {
       "source": "/platforms/ascend/ascend_npu_quantization.html",
@@ -459,11 +463,11 @@
     },
     {
       "source": "/platforms/ascend/ascend_npu_qwen3_5_examples.html",
-      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_5_examples"
+      "destination": "/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_5_397b"
     },
     {
       "source": "/platforms/ascend/ascend_npu_qwen3_examples.html",
-      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_examples"
+      "destination": "/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_235b_a22b"
     },
     {
       "source": "/platforms/ascend/ascend_npu_support.html",
@@ -711,8 +715,7 @@
               "docs/basic_usage/ollama_api",
               "docs/basic_usage/offline_engine_api",
               "docs/basic_usage/native_api",
-              "docs/basic_usage/sampling_params",
-              "docs/basic_usage/aws_sagemaker"
+              "docs/basic_usage/sampling_params"
             ]
           },
           {
@@ -721,7 +724,6 @@
             "pages": [
               "docs/advanced_features/overview",
               "docs/advanced_features/server_arguments",
-              "docs/advanced_features/object_storage",
               "docs/advanced_features/hyperparameter_tuning",
               "docs/advanced_features/attention_backend",
               "docs/advanced_features/hisparse_guide",
@@ -757,6 +759,8 @@
               "docs/advanced_features/llm-d",
               "docs/advanced_features/deterministic_inference",
               "docs/advanced_features/observability",
+              "docs/advanced_features/model_loading",
+              "docs/advanced_features/object_storage",
               "docs/advanced_features/checkpoint_engine",
               "docs/advanced_features/sglang_for_rl"
             ]
@@ -809,7 +813,8 @@
                 "group": "Development",
                 "pages": [
                   "docs/developer_guide/development_guide_using_docker",
-                  "docs/developer_guide/development_jit_kernel_guide"
+                  "docs/developer_guide/development_jit_kernel_guide",
+                  "docs/developer_guide/quantization_contribution_guide"
                 ]
               },
               {
@@ -833,13 +838,14 @@
               "docs/references/production_metrics",
               "docs/references/production_request_trace",
               {
-                "group": "Multi-Node Deployment",
+                "group": "Deployment",
                 "pages": [
                   "docs/references/multi_node_deployment/multi_node_index",
                   "docs/references/multi_node_deployment/multi_node",
                   "docs/references/multi_node_deployment/deploy_on_k8s",
                   "docs/references/multi_node_deployment/lws_pd/lws_pd_deploy",
-                  "docs/references/multi_node_deployment/rbg_pd/deepseekv32_pd"
+                  "docs/references/multi_node_deployment/rbg_pd/deepseekv32_pd",
+                  "docs/basic_usage/aws_sagemaker"
                 ]
               },
               "docs/references/custom_chat_template",
@@ -877,6 +883,14 @@
               {
                 "group": "Ascend NPUs",
                 "pages": [
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_quick_start",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_features",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_models",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_quantization",
+                  "docs/hardware-platforms/ascend-npus/mindspore_backend",
+                  "docs/hardware-platforms/ascend-npus/ascend_contribution_guide",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_new_models",
                   {
                     "group": "Model Tutorials",
                     "pages": [
@@ -895,17 +909,6 @@
                       "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_next_80b_a3b_instruct"
                     ]
                   },
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_quick_start",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_features",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_models",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_quantization",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_deepseek_example",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_examples",
-                  "docs/hardware-platforms/ascend-npus/mindspore_backend",
-                  "docs/hardware-platforms/ascend-npus/ascend_contribution_guide",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_new_models",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_best_practice",
                   {
                     "group": "Best Practice",
                     "pages": [
@@ -914,6 +917,7 @@
                       "docs/hardware-platforms/ascend-npus/best_practice/glm5_1",
                       "docs/hardware-platforms/ascend-npus/best_practice/kimi_k2_6",
                       "docs/hardware-platforms/ascend-npus/best_practice/minimax_m2_5",
+                      "docs/hardware-platforms/ascend-npus/best_practice/mimo_v2_flash",
                       "docs/hardware-platforms/ascend-npus/best_practice/qwen3-8b",
                       "docs/hardware-platforms/ascend-npus/best_practice/qwen3_32b",
                       "docs/hardware-platforms/ascend-npus/best_practice/qwen3_30b_a3b",
@@ -928,8 +932,6 @@
                   "docs/hardware-platforms/ascend-npus/ascend_npu_accuracy_evaluation",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_ring_sp_performance",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_5_examples",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_glm5_examples",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_faq",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_operator_performance_optimizing",
@@ -1062,6 +1064,12 @@
                     ]
                   },
                   {
+                    "group": "Baidu",
+                    "pages": [
+                      "cookbook/autoregressive/Baidu/Unlimited-OCR"
+                    ]
+                  },
+                  {
                     "group": "Ernie",
                     "pages": [
                       "cookbook/autoregressive/Ernie/Ernie4.5",
@@ -1186,6 +1194,13 @@
                     ]
                   },
                   {
+                    "group": "JoyEcho",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/JoyEcho/JoyEcho"
+                    ]
+                  },
+                  {
                     "group": "Qwen-Image",
                     "pages": [
                       "cookbook/diffusion/Qwen-Image/Qwen-Image",
@@ -1196,6 +1211,13 @@
                     "group": "Z-Image",
                     "pages": [
                       "cookbook/diffusion/Z-Image/Z-Image-Turbo"
+                    ]
+                  },
+                  {
+                    "group": "Krea",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/Krea/Krea-2"
                     ]
                   },
                   {
