@@ -1071,8 +1071,6 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         if self.hidden_states_quantizer is not None and pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
 
-        print(pertoken_scale.dtype)
-
         scale_args = {
             "scale": [weight_scale],
             "per_token_scale": [pertoken_scale],
