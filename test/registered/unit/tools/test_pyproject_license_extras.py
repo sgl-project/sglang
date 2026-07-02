@@ -92,9 +92,7 @@ class TestPyprojectLicenseExtras(unittest.TestCase):
                 )
 
     def test_other_pyproject_keeps_easydict_in_runtime_common(self):
-        runtime_common = _extract_array(
-            OTHER_PYPROJECT.read_text(), "runtime_common"
-        )
+        runtime_common = _extract_array(OTHER_PYPROJECT.read_text(), "runtime_common")
         self.assertIsNotNone(
             runtime_common, "`runtime_common` extra missing in pyproject_other.toml"
         )
