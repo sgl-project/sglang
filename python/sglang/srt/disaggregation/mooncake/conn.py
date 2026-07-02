@@ -380,8 +380,19 @@ class MooncakeKVManager(CommonKVManager):
                     str(prefill_unique_rank).encode("ascii"),
                 ]
             )
-        except Exception:
-            pass
+        except Exception as e:
+            # A lost CHUNK_READY means decode never scatters/frees this
+            # chunk's staging allocation, which stalls the watermark for the
+            # whole ring. Keep going (the RDMA itself succeeded), but make
+            # the loss visible instead of silently swallowing it.
+            logger.warning(
+                "[Staging] Failed to send CHUNK_READY room=%s chunk=%s "
+                "session=%s: %s",
+                req.room,
+                chunk_idx,
+                req.mooncake_session_id,
+                e,
+            )
 
     def _do_staging_transfer(
         self,
@@ -414,6 +425,17 @@ class MooncakeKVManager(CommonKVManager):
                     f"chunk exceeds ring buffer total size (room={kv_chunk.room}). "
                     f"Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB."
                 )
+            # STAGING_RSP / WATERMARK are fire-and-forget; if one was lost,
+            # this chunk would otherwise re-enqueue forever. Re-request after
+            # a stall so decode replays the allocation and watermark.
+            staging_strategy.maybe_resend_staging_req(
+                kv_chunk.room,
+                chunk_idx,
+                len(kv_chunk.prefill_kv_indices),
+                req.mooncake_session_id,
+                req.endpoint,
+                req.dst_port,
+            )
             queue.put(kv_chunk)
             return (-1, True)
 
