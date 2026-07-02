@@ -19,10 +19,20 @@ from sglang.srt.compilation.compile_phase import (
 )
 from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.common import print_warning_once
+from sglang.srt.utils.common import is_xpu, print_warning_once
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
+_is_xpu = is_xpu()
+
+if _is_xpu:
+    _DeviceGraph = torch.xpu.XPUGraph
+    _device_graph_ctx = torch.xpu.graph
+    _device_empty_cache = torch.xpu.empty_cache
+else:
+    _DeviceGraph = torch.cuda.CUDAGraph
+    _device_graph_ctx = torch.cuda.graph
+    _device_empty_cache = torch.cuda.empty_cache
 
 
 @dataclasses.dataclass
@@ -34,7 +44,7 @@ class ConcreteSizeEntry:
     compiled: bool = False
     runnable: Callable = None  # type: ignore
     num_finished_warmup: int = 0
-    cudagraph: Optional[torch.cuda.CUDAGraph] = None
+    cudagraph: Optional[Any] = None
     output: Optional[Any] = None
 
     # for cudagraph debugging, track the input addresses
@@ -176,7 +186,7 @@ class CUDAPiecewiseBackend:
                     x.data_ptr() for x in args if isinstance(x, torch.Tensor)
                 ]
                 entry.input_addresses = input_addresses
-            cudagraph = torch.cuda.CUDAGraph()
+            cudagraph = _DeviceGraph()
 
             with ExitStack() as stack:
                 if not self.is_first_graph:
@@ -187,9 +197,11 @@ class CUDAPiecewiseBackend:
                     # therefore, we only run gc for the first graph,
                     # and disable gc for the rest of the graphs.
                     stack.enter_context(patch("gc.collect", lambda: None))
-                    stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
+                    empty_cache_target = "torch.xpu.empty_cache" if _is_xpu else "torch.cuda.empty_cache"
+                    stack.enter_context(patch(empty_cache_target, lambda: None))
                 # mind-exploding: carefully manage the reference and memory.
-                with torch.cuda.graph(cudagraph, pool=self.graph_pool, stream=stream):
+                graph_kwargs = {"xpu_graph": cudagraph} if _is_xpu else {"cuda_graph": cudagraph}
+                with _device_graph_ctx(**graph_kwargs, pool=self.graph_pool, stream=stream):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)
                     if self.is_last_graph:
