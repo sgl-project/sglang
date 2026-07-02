@@ -64,6 +64,18 @@ curl http://${HOST}:${PORT}/v1/images/generations \
 </tbody>
 </table>
 
+## Deployment Assumptions & Limitations
+
+:::warning
+**Network Latency & Timeouts:** In SGLang backend mode, the Diffusion server sends an HTTP request to `--srt-encoder-url` for **every auto-regressive (AR) step**.
+- To prevent requests from breaking during long model generations, increase `--srt-encoder-timeout` (e.g., set to 100 seconds).
+- To protect the system against temporary network delays or brief drops in connection, use `--srt-encoder-connection-timeout`.
+:::
+
+- **Recommended Setup:** Run both servers on the same machine or inside the same fast local network.
+- **Cross-Region Warning:** Running the Diffusion server and the AR server in different geographic regions will slow down token generation and heavily reduce performance.
+- **Startup Connection Check:** SGLang automatically checks the connection to `--srt-encoder-url` when starting up. The server will stop immediately if the remote AR host is offline.
+
 ## Ascend NPU ENV
 
 To run 2 servers on same group of NPU you need to specify env variables
