@@ -1027,13 +1027,6 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         # qw: [E, N, K//2] (packed FP4)
         # w_scale: [E, N, ceil(K/64), 2] (or 2D legacy shape)
 
-        # Cast packed weight to FRACTAL_NZ (view as float8_e4m3fn)
-        qw_nz = npu_format_cast(
-            qw.view(torch.uint8),
-            29,                                          # ACL_FORMAT_FRACTAL_NZ
-            customize_dtype=torch.float8_e4m3fn,
-            input_dtype=fp4_dtype,
-        )
         qw_t = qw_nz.transpose(1, 2)                     # [E, K_packed, N]
 
         # Pack scale to [E, K_groups//2, N, 2]
