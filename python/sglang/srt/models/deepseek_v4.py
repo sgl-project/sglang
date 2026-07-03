@@ -948,6 +948,12 @@ class MQALayer(nn.Module):
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
             and get_is_capture_mode()
+            # BCG's segmented capture loses the alt-stream fork/join ordering
+            # across segment boundaries: replay races the indexer/kv/compressor
+            # streams against their consumers and corrupts outputs for a
+            # timing-dependent subset of small prefill buckets (8/12/16/48
+            # measured on 4x B200). Full-graph (decode) capture is unaffected.
+            and not is_in_breakable_cuda_graph()
             and x.shape[0] <= self._multi_stream_bs_limit
             and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
             and not (_is_hip and self.compressor is None)

@@ -3513,28 +3513,20 @@ class ServerArgs:
                 if prefill_cuda_graph_config.backend == Backend.BREAKABLE and (
                     is_deepseek_v4(self.get_model_config().hf_config)
                 ):
-                    # DSV4's breakable prefill graph records the c4-indexer
-                    # fp32 logits scratch — num_tokens × (context_len / 4)
-                    # elements, i.e. context_len bytes per captured token —
-                    # into the graph pool, where it stays live for replay.
-                    context_len = self.get_model_config().context_len
-                    reserved_mem += (
-                        prefill_cuda_graph_config.max_bs * context_len / (1 << 20)
-                    )
-                    # Each bucket also retains captured attention metadata,
-                    # dominated by its page table: num_tokens × (context_len
-                    # / page_size 64) int32 entries = context_len / 16 bytes
-                    # per token, summed over all capture buckets.
-                    reserved_mem += (
-                        sum(prefill_cuda_graph_config.bs) * context_len / 16 / (1 << 20)
-                    )
-                    # Segment-bridge buffers (~30 MB per bucket), first-capture
-                    # pool overhead, and DeepGEMM JIT workspaces. Measured on
-                    # 4x B200 tp=4: total BCG capture usage is ~9.7 GB, ~3 GB
-                    # above the two modeled terms; without this headroom,
-                    # EAGLE's verify/draft graphs exhaust the remainder and
-                    # runtime allocations (e.g. NCCL buffers) fail.
-                    reserved_mem += 3 * 1024
+                    # DSV4 BCG-specific capture overhead. The graph pool
+                    # itself (dominated by the in-graph c4-indexer logits
+                    # scratch) is the captured form of the prefill
+                    # activations already funded by the chunked-prefill
+                    # activation term above, and per-bucket captured
+                    # metadata is deduplicated into max-bucket-size
+                    # backings by the attention backend — neither needs
+                    # extra reserve. What remains: segment-bridge buffers
+                    # (~30 MB per capture bucket), one-time DeepGEMM JIT
+                    # workspaces (~1.5 GB), and runtime headroom for the
+                    # per-replay static-metadata rebuild + NCCL buffers
+                    # (booting with <1 GB free OOMs on the first real
+                    # prefill). Measured on 4x B200 tp=4.
+                    reserved_mem += len(prefill_cuda_graph_config.bs) * 30 + 1536 + 2048
 
             if gpu_mem is not None and gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)

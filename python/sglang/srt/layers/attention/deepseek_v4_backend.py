@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
+    Any,
     Dict,
     List,
     Literal,
@@ -1180,7 +1181,97 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
             use_prefill_cuda_graph=True,
         )
+        self._rehome_capture_metadata_tensors_(
+            self.forward_metadata, len(forward_batch.input_ids)
+        )
         return self.forward_metadata
+
+    def _rehome_capture_metadata_tensors_(self, metadata, num_tokens: int) -> None:
+        """Move large per-token capture metadata tensors into shared
+        max-bucket-size backings, one per field.
+
+        Every BCG prefill bucket stashes its own metadata for replay, and
+        the dominant tensors (e.g. the page table: num_tokens ×
+        MAX_SEQ_LEN_FOR_CAPTURE/64 int32) scale with the token count —
+        50 buckets retaining private copies cost ~2.7 GB at 1M context.
+        Aliasing every bucket's tensor as a [:num_tokens] view of one
+        max-size backing keeps the total at the largest bucket's size.
+        Safe because only one graph replays at a time and
+        refresh_for_breakable_cuda_graph_replay_ copies the live batch's
+        values into these views (in place) before every replay.
+
+        Only standalone tensors (t._base is None) with leading dim ==
+        num_tokens and >= 1 MB are re-homed; views of live buffers keep
+        their aliasing.
+        """
+        if not hasattr(self, "_bcg_metadata_backings"):
+            self._bcg_metadata_backings: Dict[Any, torch.Tensor] = {}
+            prefill_bs = self.model_runner.server_args.cuda_graph_config.prefill.bs
+            self._bcg_backing_max_tokens = max(prefill_bs) if prefill_bs else 0
+
+        max_tokens = self._bcg_backing_max_tokens
+        if num_tokens > max_tokens:
+            return
+
+        visited = set()
+        # Fields may alias one tensor object (e.g. indexer_metadata.page_table
+        # is core_attn_metadata.page_table — the indexer asserts identity), so
+        # every reference to a source tensor must map to the same view.
+        # Values hold (source, view): the source reference keeps the original
+        # tensor alive for the walk so its id() cannot be recycled.
+        replaced: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+        def rehome(t: torch.Tensor, path: str) -> Optional[torch.Tensor]:
+            prior = replaced.get(id(t))
+            if prior is not None:
+                return prior[1]
+            if (
+                t._base is not None
+                or t.dim() < 1
+                or t.shape[0] != num_tokens
+                or t.untyped_storage().size() < (1 << 20)
+                or not t.is_cuda
+                or not t.is_contiguous()
+            ):
+                return None
+            key = (path, tuple(t.shape[1:]), t.dtype)
+            backing = self._bcg_metadata_backings.get(key)
+            if backing is None:
+                backing = torch.empty(
+                    (max_tokens, *t.shape[1:]), dtype=t.dtype, device=t.device
+                )
+                self._bcg_metadata_backings[key] = backing
+            view = backing[:num_tokens]
+            view.copy_(t)
+            replaced[id(t)] = (t, view)
+            return view
+
+        def walk(obj, path: str) -> None:
+            if obj is None or id(obj) in visited:
+                return
+            visited.add(id(obj))
+            container = None
+            if isinstance(obj, dict):
+                container = obj.items()
+            elif isinstance(obj, list):
+                container = enumerate(obj)
+            elif hasattr(obj, "__dict__"):
+                container = vars(obj).items()
+            else:
+                return
+            for name, value in list(container):
+                child_path = f"{path}.{name}"
+                if torch.is_tensor(value):
+                    replacement = rehome(value, child_path)
+                    if replacement is not None:
+                        if isinstance(obj, (dict, list)):
+                            obj[name] = replacement
+                        else:
+                            setattr(obj, name, replacement)
+                elif isinstance(value, (dict, list)) or hasattr(value, "__dict__"):
+                    walk(value, child_path)
+
+        walk(metadata, "metadata")
 
     def prepare_forward_metadata_for_breakable_cuda_graph_replay(
         self,
