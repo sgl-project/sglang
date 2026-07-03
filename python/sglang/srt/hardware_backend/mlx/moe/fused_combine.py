@@ -1,46 +1,22 @@
-"""Fused moe_combine: sum_k (y[b,k,h] * scores[b,k]) in one Metal kernel.
+"""Fuse the MoE combine, sum_k y[b,k,h] * scores[b,k], into one Metal kernel.
 
-Why this exists
----------------
-The reference combine on Apple Silicon runs as two compute kernels:
+The reference combine runs two kernels, a broadcast multiply and a reduce
+over TOP_K, with a transient materialized between them. One kernel saves a
+full read of y, the intermediate round trip, and one dispatch per MoE layer.
 
-    weighted = y * scores[..., None]   # broadcast + multiply
-    out      = weighted.sum(axis=-2)   # reduce over TOP_K
+Geometry follows the single-row pass of MLX's ``col_reduce_small``
+(``mlx/backend/metal/kernels/reduction/reduce_col.h``): 64 threads per
+threadgroup, 4 contiguous outputs per thread in the flat [B*H] space, so
+256 outputs per threadgroup; TOP_K is looped in registers and accumulated
+in fp32. No threadgroup memory, no barriers.
 
-Both walk the full y tensor and a transient ``weighted`` materializes between
-them. Fusing into one kernel saves one read of y, one write of the
-intermediate, and one dispatch per MoE layer.
+Fused when:
+- y is fp16 or bf16, rank 3, shaped [B, TOP_K, H]
+- scores is fp16 or fp32 (independent template dtype TS), rank 2, [B, TOP_K]
+- B, TOP_K, H nonzero
+- H % 256 == 0, so threadgroups tile rows exactly
 
-Design
-------
-Operation:
-    out[b, h] = sum over k in [0, TOP_K) of y[b, k, h] * scores[b, k]
-
-Threadgroup geometry, cribbed from MLX's ``col_reduce_small`` in
-``mlx/backend/metal/kernels/reduction/reduce_col.h``, which is the canonical
-small reduction dim pattern (TOP_K=8 fits this).
-
-    Threads per TG     : 64
-    N_READS per thread : 4 contiguous output columns
-    Outputs per TG     : 256
-    Reduction axis     : looped in registers, no shared memory, no barriers
-
-Each thread owns 4 contiguous outputs in the flat [B*H] index space, loops
-over TOP_K experts, and accumulates in fp32.
-
-Eligibility
------------
-- y dtype in {fp16, bf16}
-- scores dtype in {fp16, fp32}, typed independently of y (template TS) and
-  promoted to fp32 for the accumulate. Real MoE routers emit fp32 routing
-  scores, so the common production combo is fp16 y with fp32 scores.
-- y rank 3, scores rank 2, shapes aligned as [B, TOP_K, H] / [B, TOP_K]
-- B, TOP_K, H all nonzero
-- H divisible by 256 so each TG aligns on a row boundary and no thread
-  straddles the [b, k, *] -> [b, k+1, *] boundary
-
-Outside this regime, fall back to
-``(y * scores[..., None]).sum(axis=-2).astype(y.dtype)``.
+Otherwise: ``(y * scores[..., None]).sum(axis=-2).astype(y.dtype)``.
 """
 
 from __future__ import annotations
@@ -74,10 +50,9 @@ _KERNEL_SOURCE = r"""
     uint b = column_base / H;
     uint h_base = column_base - b * H;   // == column_base % H
 
-    // Scores for this (b, *) row hoisted into registers. Kept in their own
-    // dtype TS (independent of y's dtype T): MLX types the `scores` pointer
-    // from the array dtype, so fp32 scores are read as fp32 here, with no
-    // narrowing to T, then promoted to fp32 for the multiply below.
+    // MLX types the `scores` pointer from the array dtype, not from T, so
+    // fp32 scores are read as fp32 (no narrowing) and promoted to fp32 for
+    // the multiply below.
     TS s_thread[TOPK];
     for (uint k = 0; k < TOPK; k++) {
         s_thread[k] = scores[b * TOPK + k];
@@ -112,12 +87,7 @@ def _dtype_tag(dtype: mx.Dtype) -> str:
 
 
 def _get_kernel(y_dtype: mx.Dtype, scores_dtype: mx.Dtype):
-    """Return a compiled mx.fast.metal_kernel for the (y, scores) dtype pair.
-
-    Keyed on the dtype pair because y and scores now carry independent Metal
-    types (T and TS). MLX handles per-template specialization internally, so
-    different TOP_K / HIDDEN values reuse this same wrapper object.
-    """
+    """Return a compiled mx.fast.metal_kernel for the (y, scores) dtype pair."""
     key = (y_dtype, scores_dtype)
     if key not in _kernel_cache:
         name = f"fused_moe_combine_y{_dtype_tag(y_dtype)}_s{_dtype_tag(scores_dtype)}"

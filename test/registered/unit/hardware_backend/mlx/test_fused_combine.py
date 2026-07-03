@@ -1,36 +1,15 @@
-"""Verification harness for the fused MoE combine Metal kernel.
+"""Verification for the fused MoE combine kernel (``fused_combine``).
 
-Target: ``sglang.srt.hardware_backend.mlx.moe.fused_combine``. The kernel fuses
-``out[b, h] = sum_k y[b, k, h] * scores[b, k]`` into one Metal dispatch, with an
-fp32 product and fp32 accumulate narrowed to ``y.dtype`` on write.
+A spy on ``_get_kernel`` asserts the Metal kernel dispatched on every eligible
+case; negative controls confirm ineligible inputs fall back in ``y.dtype``.
 
-What this proves
-----------------
-1. Regression guard: the original fp16-y / fp16-scores claim across 17 shapes,
-   bit-exact against an fp32 ground-truth reference computed in the kernel's own
-   accumulation order.
-2. The S1 gate widening: scores now carry an independent Metal dtype, so the
-   common production combo (fp16 y with fp32 routing scores) and bf16 y both run
-   on the fused path instead of falling back.
-3. The fused Metal kernel actually fires on every widened dtype case (a spy on
-   ``_get_kernel``), so a silent fallback cannot satisfy the test. Negative
-   controls confirm ineligible inputs do take the fallback.
+Acceptance is scores-dtype driven. fp16 scores: bit-exact vs an fp32
+reference, since <=11-bit mantissas make every ``y * s`` product exact in
+fp32 (<=22 bits <= 24) and FMA contraction coincides with separate mul+add.
+fp32 scores: the product is inexact, FMA contraction diverges by a
+sub-fp32-ULP, and the narrowed result is asserted <=2 fp16 / <=1 bf16 ULP.
 
-Acceptance standard (scores-dtype driven, and grounded in fp arithmetic)
-------------------------------------------------------------------------
-- ``scores`` fp16 -> STRICT bit-exact. When both operands are low precision
-  (<=11-bit mantissa each) every ``y * s`` product is exact in fp32 (<=22 bits
-  <= 24), so FMA contraction and separate mul+add coincide and the kernel's
-  sequential fp32 accumulate matches the reference bit-for-bit.
-- ``scores`` fp32 -> correctly rounded to within a tight narrowing tolerance.
-  fp32 scores make the product inexact in fp32, so the Metal compiler's FMA
-  contraction diverges from a separate mul+add reference by a sub-fp32-ULP,
-  which tips <=2 fp16 / <=1 bf16 ULP on a small fraction of elements. The
-  fused path is strictly closer to the true reduction, so this is
-  correctly-rounded fp16, not a defect.
-
-Hermetic: tensor fixtures only, no model download, no network. Skips on
-non-Apple-Silicon platforms and when ``mlx`` is missing.
+Hermetic: tensor fixtures only; skips off Darwin/arm64 or without ``mlx``.
 """
 
 from __future__ import annotations
@@ -55,8 +34,7 @@ if _IS_APPLE_SILICON and _HAS_MLX:
 
     from sglang.srt.hardware_backend.mlx.moe import fused_combine as fc
 
-# 17 shapes inside the eligibility envelope (H % 256 == 0): decode (B == 1) and
-# prefill (B > 1), TOP_K in {1, 2, 4, 8, 16}, several real hidden sizes.
+# Shapes inside the eligibility envelope (H % 256 == 0), decode and prefill.
 _SHAPES = [
     (1, 8, 2048),  # Qwen3-30B-A3B decode shape
     (1, 8, 256),  # minimum eligible H
@@ -77,14 +55,14 @@ _SHAPES = [
     (1, 8, 1536),
 ]
 
-# dtype combos, all eligible after the S1 gate widening. (y dtype, scores dtype)
+# (name, y dtype, scores dtype), all inside the can_fuse dtype envelope.
 _STRICT_COMBOS = [
-    ("fp16y_fp16s", "float16", "float16"),  # original regression guard
-    ("bf16y_fp16s", "bfloat16", "float16"),  # bf16 y support
+    ("fp16y_fp16s", "float16", "float16"),
+    ("bf16y_fp16s", "bfloat16", "float16"),
 ]
 _ROUNDED_COMBOS = [
     ("fp16y_fp32s", "float16", "float32"),  # production combo (real routers)
-    ("bf16y_fp32s", "bfloat16", "float32"),  # bf16 y with fp32 scores
+    ("bf16y_fp32s", "bfloat16", "float32"),
 ]
 
 # Correctly-rounded narrowing tolerance for the fp32-scores cases, sized to a
@@ -114,11 +92,7 @@ class TestFusedCombine(unittest.TestCase):
 
     @staticmethod
     def _reference_fp32(y, scores):
-        """fp32 ground truth in the kernel's accumulation order (sequential k).
-
-        Promotes both operands to fp32, forms the product in fp32, and
-        accumulates in fp32 left-to-right over TOP_K, mirroring the Metal k loop.
-        """
+        """fp32 ground truth in the kernel's accumulation order (sequential k)."""
         _, topk, hidden = y.shape
         yf = y.astype(mx.float32)
         sf = scores.astype(mx.float32)
@@ -129,11 +103,7 @@ class TestFusedCombine(unittest.TestCase):
 
     @staticmethod
     def _run_fused_traced(y, scores):
-        """Run fused_combine while spying on _get_kernel.
-
-        Returns (out, fused_fired). fused_fired is True iff the Metal dispatch
-        path was entered (not the reference fallback).
-        """
+        """Run fused_combine spying on _get_kernel; returns (out, fused_fired)."""
         calls = []
         orig = fc._get_kernel
 
@@ -155,8 +125,6 @@ class TestFusedCombine(unittest.TestCase):
 
         Both are viewed as uint16 bit patterns; for finite same-sign values the
         IEEE encoding is monotone, so |int(a) - int(b)| is the ULP distance.
-        The fp32-scores cases assert this against _ROUNDED_MAX_ULP; the
-        fp16-scores cases gate on array_equal.
         """
         ai = a.view(mx.uint16).astype(mx.int32)
         bi = b.view(mx.uint16).astype(mx.int32)
@@ -170,7 +138,7 @@ class TestFusedCombine(unittest.TestCase):
         return y, scores
 
     def test_scores_fp16_bit_exact(self):
-        """fp16-scores combos: strictly bit-exact vs fp32 ground truth, 17 shapes."""
+        """fp16-scores combos: strictly bit-exact vs the fp32 ground truth."""
         for ci, (cname, y_name, s_name) in enumerate(_STRICT_COMBOS):
             for si, shape in enumerate(_SHAPES):
                 with self.subTest(combo=cname, shape=shape):
@@ -226,7 +194,7 @@ class TestFusedCombine(unittest.TestCase):
                     )
 
     def test_scores_dtype_reaches_kernel_independently(self):
-        """The (y, scores) dtype pair passed to the kernel is independent (S1 core)."""
+        """The (y, scores) dtype pair reaches the kernel unmerged."""
         shape = (1, 8, 2048)
         for _, y_name, s_name in _STRICT_COMBOS + _ROUNDED_COMBOS:
             with self.subTest(y=y_name, scores=s_name):
@@ -241,11 +209,7 @@ class TestFusedCombine(unittest.TestCase):
                 self.assertEqual(seen, [(getattr(mx, y_name), getattr(mx, s_name))])
 
     def test_fallback_taken_when_ineligible(self):
-        """Negative control: ineligible inputs take the fallback, not the kernel.
-
-        Proves the fused-fired spy actually discriminates and that can_fuse
-        rejects out-of-envelope dtypes/shapes while still returning correct math.
-        """
+        """Ineligible inputs take the fallback (proves the fired spy discriminates)."""
         cases = [
             ("fp32_y_rejected", (1, 8, 2048), "float32", "float32"),
             ("H_not_mult_256", (1, 8, 500), "float16", "float16"),
@@ -264,7 +228,6 @@ class TestFusedCombine(unittest.TestCase):
                 out, fired = self._run_fused_traced(y, scores)
                 self.assertFalse(fired, f"{name}: fused path fired on ineligible input")
                 self.assertEqual(out.dtype, getattr(mx, y_name))
-                # Fallback still returns the correct reduction.
                 ref = (y * scores[..., None]).sum(axis=-2)
                 self.assertTrue(
                     mx.allclose(
