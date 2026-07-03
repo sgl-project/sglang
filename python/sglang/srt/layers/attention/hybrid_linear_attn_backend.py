@@ -95,10 +95,16 @@ class MambaAttnBackendBase(AttentionBackend):
             )
             # The ring cursor is a per-slot decode counter shared by all GDN layers;
             # manage it once here (snapshot, hand to layers, advance mod L), not per-layer.
+            # Gate on the linear_replayssm FLAG, not on cursor-tensor presence: the
+            # spec-verify ring (--enable-gdn-replayssm-spec) shares the write_pos
+            # allocation but owns it exclusively via commit_gdn_replayssm_spec
+            # (advance-by-accept-count once per verify step). Advancing it here as
+            # well inserts one phantom/stale ring entry per step and cumulatively
+            # poisons the reconstruction (degenerate repetition at 10k+ tokens).
             mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
             write_pos_buf = (
-                getattr(mamba_pool, "replayssm_write_pos", None)
-                if mamba_pool is not None
+                mamba_pool.replayssm_write_pos
+                if mamba_pool is not None and mamba_pool.enable_linear_replayssm
                 else None
             )
             if write_pos_buf is not None:
@@ -324,12 +330,20 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
     def _replayssm_enabled(self) -> bool:
-        """True iff --enable-linear-replayssm allocated the ring cursor
-        (MambaPool.replayssm_write_pos doubles as the on/off gate)."""
+        """True iff --enable-linear-replayssm is on for this pool.
+
+        Gate on the FLAG, not on ``replayssm_write_pos is not None``: the
+        spec-verify ring (--enable-gdn-replayssm-spec) also allocates the
+        cursor tensor but owns it exclusively via commit_gdn_replayssm_spec.
+        The decode-ring metadata machinery gated here (per-bs static cursor
+        buffers, the per-replay snapshot + advance-by-one in _replay_metadata,
+        and the decode-kernel ring rerouting downstream) must stay fully
+        dormant for the spec ring.
+        """
         mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
         if mamba_pool is None:
             return False
-        return getattr(mamba_pool, "replayssm_write_pos", None) is not None
+        return bool(mamba_pool.enable_linear_replayssm)
 
     def _replayssm_track_flush_mask(
         self, seq_lens_cpu: torch.Tensor, bs: int
@@ -545,7 +559,10 @@ class MambaAttnBackendBase(AttentionBackend):
                     static_ff.copy_(force_flush_dev)
                 else:
                     static_ff.zero_()
-                if not in_capture:
+                # Defense in depth: the decode-ring advance is only meaningful for
+                # decode/idle forwards (mirrors the eager path's gating). A
+                # TARGET_VERIFY replay must never advance the cursor.
+                if not in_capture and forward_mode.is_decode_or_idle():
                     L = mamba_pool.linear_replayssm_cache_len
                     # Advance only valid (non-padded) slots; a forced flush empties
                     # the ring -> next write_pos 0, like the natural L-1 wrap.
