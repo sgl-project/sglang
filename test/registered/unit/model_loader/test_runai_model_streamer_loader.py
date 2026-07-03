@@ -12,6 +12,10 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.models.deepseek_common import deepseek_weight_loader
+from sglang.srt.models.deepseek_v4 import (
+    _dequant_fp8_wo_a,
+    _dequant_fp8_wo_a_streaming,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -104,6 +108,91 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
         self.assertIsNot(cloned, marked)
         marked.fill_(2)
         self.assertEqual(cloned.item(), 1)
+
+    def test_deepseek_v4_streaming_dequant_fp8_wo_a_pairs_weight_and_scale(self):
+        weight = torch.eye(128, dtype=torch.float32).to(torch.float8_e4m3fn)
+        scale = torch.ones((1, 1), dtype=torch.float32)
+
+        for weights in (
+            [
+                ("layers.0.attn.wo_a.scale", scale),
+                ("layers.0.attn.wo_a.weight", weight),
+                ("layers.0.attn.wq.weight", torch.tensor([3])),
+            ],
+            [
+                ("layers.0.attn.wo_a.weight", weight),
+                ("layers.0.attn.wq.weight", torch.tensor([3])),
+                ("layers.0.attn.wo_a.scale", scale),
+            ],
+        ):
+            converted = list(_dequant_fp8_wo_a_streaming(weights))
+
+            converted_names = [name for name, _ in converted]
+            self.assertIn("layers.0.attn.wo_a.weight", converted_names)
+            self.assertNotIn("layers.0.attn.wo_a.scale", converted_names)
+            converted_weight = dict(converted)["layers.0.attn.wo_a.weight"]
+            self.assertEqual(converted_weight.dtype, torch.bfloat16)
+
+    def test_deepseek_v4_streaming_dequant_matches_legacy_by_name(self):
+        weight = torch.eye(128, dtype=torch.float32).to(torch.float8_e4m3fn)
+        scale = torch.ones((1, 1), dtype=torch.float32)
+        ordinary = torch.tensor([3])
+        weights = [
+            ("layers.0.attn.wo_a.weight", weight),
+            ("layers.0.attn.wq.weight", ordinary),
+            ("layers.0.attn.wo_a.scale", scale),
+        ]
+
+        legacy = list(_dequant_fp8_wo_a(weights))
+        streaming = list(_dequant_fp8_wo_a_streaming(weights))
+
+        self.assertNotEqual(
+            [name for name, _ in legacy], [name for name, _ in streaming]
+        )
+        self.assertEqual(set(dict(legacy)), set(dict(streaming)))
+        for name, legacy_tensor in dict(legacy).items():
+            torch.testing.assert_close(legacy_tensor, dict(streaming)[name])
+
+    def test_deepseek_v4_streaming_dequant_clones_pending_runai_tensors(self):
+        weight = torch.eye(128, dtype=torch.float32).to(torch.float8_e4m3fn)
+        scale = torch.ones((1, 1), dtype=torch.float32)
+        setattr(scale, weight_utils.RUNAI_STREAMER_TENSOR_ATTR, True)
+
+        def weights():
+            yield "layers.0.attn.wo_a.scale", scale
+            scale.fill_(0)
+            yield "layers.0.attn.wo_a.weight", weight
+
+        converted = dict(_dequant_fp8_wo_a_streaming(weights()))
+
+        converted_weight = converted["layers.0.attn.wo_a.weight"]
+        self.assertGreater(converted_weight.abs().sum().item(), 0)
+
+    def test_deepseek_v4_streaming_dequant_preserves_missing_scale_behavior(self):
+        weight = torch.eye(128, dtype=torch.float32).to(torch.float8_e4m3fn)
+        ordinary = torch.tensor([3])
+
+        converted = dict(
+            _dequant_fp8_wo_a_streaming(
+                [
+                    ("layers.0.attn.wo_a.weight", weight),
+                    ("layers.0.attn.wq.weight", ordinary),
+                ]
+            )
+        )
+
+        self.assertIs(converted["layers.0.attn.wo_a.weight"], weight)
+        self.assertIs(converted["layers.0.attn.wq.weight"], ordinary)
+
+        with self.assertRaises(AssertionError):
+            list(
+                _dequant_fp8_wo_a_streaming(
+                    [
+                        ("layers.0.attn.wo_a.weight", weight),
+                        ("layers.1.attn.wo_a.scale", torch.ones((1, 1))),
+                    ]
+                )
+            )
 
     def test_get_model_loader_uses_runai_for_prequantized_modelopt(self):
         load_config = LoadConfig(

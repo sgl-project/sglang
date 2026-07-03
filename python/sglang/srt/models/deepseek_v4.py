@@ -120,7 +120,10 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
 )
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    RUNAI_STREAMER_TENSOR_ATTR,
+    default_weight_loader,
+)
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     try_fused_hc_post_pre,
@@ -2729,13 +2732,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
         if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
-            weights = list(weights)
-            exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
-            if exists_wo_a_scale:
-                logger.info("Execute dequant fp8 wo_a")
-                weights = _dequant_fp8_wo_a(weights)
-            else:
-                logger.info("Skip dequant fp8 wo_a")
+            weights = _dequant_fp8_wo_a_streaming(weights)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
 
@@ -3107,6 +3104,57 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     )
 
     return result.to(torch.bfloat16)
+
+
+def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
+        return tensor.clone().detach()
+    return tensor
+
+
+def _dequant_fp8_wo_a_streaming(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    pending: dict[str, dict[str, torch.Tensor]] = {}
+    saw_wo_a_scale = False
+    emitted = False
+
+    for name, tensor in weights:
+        if name.endswith(".wo_a.weight"):
+            prefix = name[: -len(".weight")]
+            bucket = pending.setdefault(prefix, {})
+            scale = bucket.pop("scale", None)
+            if scale is not None:
+                pending.pop(prefix, None)
+                emitted = True
+                yield name, _dequant_fp8(tensor, scale)
+            else:
+                bucket["weight"] = _clone_if_runai_streamed_tensor(tensor)
+            continue
+
+        if name.endswith(".wo_a.scale"):
+            saw_wo_a_scale = True
+            prefix = name[: -len(".scale")]
+            bucket = pending.setdefault(prefix, {})
+            weight = bucket.pop("weight", None)
+            if weight is not None:
+                pending.pop(prefix, None)
+                emitted = True
+                yield prefix + ".weight", _dequant_fp8(weight, tensor)
+            else:
+                bucket["scale"] = _clone_if_runai_streamed_tensor(tensor)
+            continue
+
+        yield name, tensor
+
+    if emitted:
+        logger.info("Finished streaming dequant fp8 wo_a")
+    for prefix, bucket in pending.items():
+        if "weight" in bucket:
+            assert not saw_wo_a_scale, f"{prefix}.scale is missing"
+            yield prefix + ".weight", bucket["weight"]
+        if "scale" in bucket:
+            yield prefix + ".scale", bucket["scale"]
 
 
 def _dequant_fp8_wo_a(
