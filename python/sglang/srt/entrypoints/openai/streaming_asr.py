@@ -19,19 +19,16 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 logger = logging.getLogger(__name__)
 
 
-# Voice floor used only for sliced-overlap dedupe safety.
+# Treat unmatched sliced overlap as unsafe only when the overlap has clear speech.
+# Keep this higher than the near-silence floor so quiet/noise-only overlap does
+# not block new text forever.
 _OVERLAP_VOICE_RMS = 0.02
 
 
 def _overlap_has_voice(
     samples: Any, sample_rate: Optional[int], overlap_seconds: float
 ) -> bool:
-    """Whether the leading overlap region of a slice carries voiced speech."""
-    if (
-        not isinstance(samples, np.ndarray)
-        or not sample_rate
-        or overlap_seconds <= 0
-    ):
+    if not isinstance(samples, np.ndarray) or not sample_rate or overlap_seconds <= 0:
         return False
     n = int(overlap_seconds * sample_rate)
     if n <= 0:
@@ -50,7 +47,7 @@ def _apply_sliced_dedupe(
     sample_rate: Optional[int],
     overlap_seconds: float,
 ) -> "tuple[str, bool]":
-    """Trim exact overlap and report whether emitting the result is safe."""
+    """Return deduped text and whether the sliced overlap was verified."""
     if not committed_text or not text:
         return text, True
     deduped, matched = _dedupe_by_word(committed_text, text)
@@ -61,32 +58,22 @@ def _apply_sliced_dedupe(
     return deduped, True
 
 
-# Collapse whitespace before punctuation so batched-inference token
-# boundary jitter (" ," vs ",") doesn't leak into deltas. Covers both
-# ASCII punctuation and the CJK / fullwidth equivalents.
 _PUNCT_WS_RE = re.compile(r"\s+([,.;:!?，。！？；：、])")
 
 
+# Text reconciliation only: no audio buffer, GPU state, or scheduler state lives
+# here. Cumulative requests emit a stable prefix with word/char rollback. Sliced
+# realtime requests first trim exact overlap text; if the voiced overlap cannot
+# be verified, the caller can defer the slice without mutating transcript state.
 @dataclass
 class StreamingASRState:
-    """State for chunk-based streaming ASR with prefix rollback.
-
-    Chunked ASR outputs can revise the newest text when more audio arrives.
-    Keep only a stable prefix as confirmed, emit deltas from that prefix, and
-    hold back the latest tokens/chars so later chunks can correct them.
-    Parameters are model-specific and should be provided via the
-    adapter's ``chunked_streaming_config``.
-
-    CJK-style no-whitespace text uses character rollback so partial deltas can
-    advance without whitespace-confirmed words.
-    """
+    """Chunked ASR transcript state with word or char rollback."""
 
     chunk_size_sec: float
     unfixed_chunk_num: int
     unfixed_token_num: int
     confirmed_text: str = ""
-    # Monotonic accumulator. Used as the prompt prefix on cumulative paths and
-    # as the dedupe prefix on the slicing path.
+    # Already emitted text; cumulative prompt and sliced dedupe both depend on it.
     emitted_text: str = ""
     full_transcript: str = ""
     chunk_index: int = 0
@@ -94,8 +81,7 @@ class StreamingASRState:
     def get_prefix_text(self) -> str:
         if self.chunk_index < self.unfixed_chunk_num or not self.emitted_text:
             return ""
-        # Sliced overlap dedupe relies on whitespace-delimited words; CJK
-        # char-rollback streams stay cumulative instead of using word overlap.
+        # Word overlap is unsafe for no-whitespace CJK; keep that path cumulative.
         if _is_cjk_no_whitespace(self.emitted_text):
             return ""
         return self.emitted_text
@@ -103,8 +89,6 @@ class StreamingASRState:
     def _record_emit(self, delta: str) -> str:
         if delta:
             if self.emitted_text:
-                # needs_space avoids a space between adjacent CJK characters;
-                # this accumulator feeds the prompt prefix and the dedupe target.
                 sep = " " if needs_space(self.emitted_text, delta) else ""
                 self.emitted_text = f"{self.emitted_text}{sep}{delta}".strip()
             else:
@@ -164,14 +148,11 @@ class StreamingASRState:
             self.confirmed_text = new_transcript
         self.full_transcript = new_transcript
         self.chunk_index += 1
-        # Compare full words so mid-word extensions emit the corrected word.
         old_words = old_confirmed.split()
         new_words = self.confirmed_text.split()
         if cumulative:
-            # Normalize recasing/repunctuation without dropping new tail words.
             common_count = _norm_common_prefix_len(old_words, new_words)
         else:
-            # Sliced windows rely on acoustic overlap, not token-count holdback.
             common_count = 0
         delta = " ".join(new_words[common_count:])
         if common_count == 0:
@@ -190,7 +171,7 @@ class StreamingASRState:
             cut = len(new_transcript) - holdback
         else:
             cut = 0
-        # Avoid splitting a Latin/alnum run embedded in CJK text.
+        # Do not split an embedded Latin word at the char holdback boundary.
         while (
             0 < cut < len(new_transcript)
             and _is_word_char(new_transcript[cut - 1])
@@ -201,7 +182,6 @@ class StreamingASRState:
         self.full_transcript = new_transcript
         self.chunk_index += 1
 
-        # Emit from the first differing char so revisions do not drop the tail.
         common_count = _common_prefix_len(old_confirmed, self.confirmed_text)
         delta = self.confirmed_text[common_count:]
         if common_count == 0:
@@ -282,9 +262,6 @@ def _is_cjk(c: str) -> bool:
 
 
 def _is_word_char(c: str) -> bool:
-    """A Latin/alphanumeric character that forms a contiguous word (not CJK,
-    which is self-delimiting). Used to avoid splitting an embedded word at the
-    char-rollback holdback boundary."""
     return c.isalnum() and not _is_cjk(c)
 
 
@@ -306,11 +283,6 @@ def _common_prefix_len(left: str, right: str) -> int:
 
 
 def needs_space(prev: str, cur: str) -> bool:
-    """Return whether a boundary space is needed between emitted deltas.
-
-    Avoid spaces around punctuation and between adjacent CJK-context characters.
-    Shared by the realtime WS and HTTP SSE chunked streaming paths.
-    """
     if not prev or not cur:
         return False
     if prev[-1].isspace() or cur[0].isspace():
@@ -323,11 +295,6 @@ def needs_space(prev: str, cur: str) -> bool:
 
 
 def _dedupe_norm(word: str) -> str:
-    """Normalize one whitespace-delimited token for overlap matching.
-
-    NFKC handles fullwidth/compatibility forms, lowercasing handles casing
-    drift, and edge-punctuation stripping lets "word," match "word".
-    """
     word = unicodedata.normalize("NFKC", word)
     lo, hi = 0, len(word)
     while lo < hi and unicodedata.category(word[lo])[0] == "P":
@@ -338,13 +305,7 @@ def _dedupe_norm(word: str) -> str:
 
 
 def _norm_common_prefix_len(left_words: List[str], right_words: List[str]) -> int:
-    """Word-level common-prefix length using normalized-token comparison.
-
-    Normalization (casefold + edge-punctuation strip, via ``_dedupe_norm``)
-    means recasing or repunctuation of an already-emitted word (``He``->``he``,
-    ``.``->``,``) does not reset the prefix. Cumulative snapshots therefore stay
-    append-only and never drop a genuinely-new word from the delta.
-    """
+    """Common prefix robust to recasing and edge punctuation drift."""
     count = 0
     for lw, rw in zip(left_words, right_words):
         if _dedupe_norm(lw) != _dedupe_norm(rw):
@@ -358,8 +319,6 @@ def _dedupe_by_word(committed_text: str, candidate_out: str) -> "tuple[str, bool
     candidate_words = candidate_out.split()
     if not candidate_words:
         return candidate_out, False
-    # Only the last len(candidate_words) committed words can overlap, so rsplit
-    # the tail instead of tokenizing the whole (growing) committed transcript.
     committed_tail = committed_text.rsplit(maxsplit=len(candidate_words))[
         -len(candidate_words) :
     ]
@@ -404,14 +363,7 @@ async def process_asr_chunk(
     defer_if_unverified: bool = False,
     verified_out: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Run inference on one audio chunk. Shared by the HTTP and WS paths.
-
-    ``audio_data`` accepts WAV bytes or pre-decoded float samples.
-    ``prompt`` overrides the default ``adapter.prompt_template + state.get_prefix_text()``.
-    ``dedupe_against`` triggers sliced overlap dedupe before ``state`` ingests
-    the text. ``defer_if_unverified`` returns "" without mutating ``state`` when
-    the overlap cannot be proven safe.
-    """
+    """Run one ASR request for HTTP chunking or realtime WS."""
     if prompt is None:
         prompt = adapter.prompt_template + state.get_prefix_text()
 

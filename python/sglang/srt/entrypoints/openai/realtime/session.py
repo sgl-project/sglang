@@ -13,7 +13,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pybase64
@@ -52,6 +52,14 @@ from openai.types.realtime.realtime_error import RealtimeError
 from pydantic import BaseModel, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import TranscriptionRequest
+from sglang.srt.entrypoints.openai.realtime.audio_buffer import (
+    PCM_SAMPLE_WIDTH,
+    AudioState,
+    is_near_silent_pcm,
+    pcm_to_float_samples,
+    resample_to_target_rate,
+    slice_pcm_range,
+)
 from sglang.srt.entrypoints.openai.realtime.protocol import (
     DEFAULT_INPUT_SAMPLE_RATE,
     SUPPORTED_INPUT_SAMPLE_RATES,
@@ -76,59 +84,7 @@ from sglang.srt.utils import random_uuid
 logger = logging.getLogger(__name__)
 
 
-# PCM16: 16-bit samples -> 2 bytes each.
-PCM_SAMPLE_WIDTH = 2
-# Low floor for avoiding empty-feature sliced windows without skipping quiet speech.
-SLICED_SILENCE_RMS_THRESHOLD = 0.005
 _DEFERRED_SENTENCE_PUNCT = frozenset(".!?")
-
-
-def slice_pcm_range(buffer: Union[bytes, bytearray], start: int, end: int) -> bytes:
-    """Snapshot PCM bytes for an ASR request.
-
-    The resident buffer is a mutable rolling ``bytearray``. Return immutable
-    bytes so later append/compaction cannot change the in-flight audio, and
-    fail fast if absolute-to-local offset bookkeeping produced an invalid range.
-    """
-    if not (0 <= start <= end <= len(buffer)):
-        raise ValueError(
-            f"slice_pcm_range: range=[{start}, {end}) not in [0, {len(buffer)}]"
-        )
-    return bytes(memoryview(buffer)[start:end])
-
-
-def resample_to_target_rate(pcm: bytes, src_rate: int, target_rate: int) -> bytes:
-    if src_rate == target_rate or not pcm:
-        return pcm
-    import torch
-    import torchaudio
-
-    samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-    audio = torch.from_numpy(samples).unsqueeze(0)
-    audio = torchaudio.functional.resample(
-        audio, orig_freq=src_rate, new_freq=target_rate
-    )
-    samples = audio.squeeze(0).numpy()
-    # Clip to int16 range via 2^15 - 1 so a clipped 1.0 stays representable.
-    return (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
-
-
-def pcm_to_float_samples(pcm: bytes) -> np.ndarray:
-    # /32768.0 matches soundfile.read's default int16 normalization so the
-    # samples are bit-equal to the prior PCM->WAV->sf.read path.
-    return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-
-
-def is_near_silent_pcm(pcm: bytes) -> bool:
-    """Whether a PCM window is at/below the near-silence RMS floor."""
-    if not pcm:
-        return True
-    samples = np.frombuffer(pcm, dtype=np.int16)
-    if samples.size == 0:
-        return True
-    float_samples = samples.astype(np.float32) / 32768.0
-    rms = float(np.sqrt(np.mean(float_samples * float_samples)))
-    return rms < SLICED_SILENCE_RMS_THRESHOLD
 
 
 CLIENT_EVENT_TYPES: Dict[str, type] = {
@@ -140,7 +96,6 @@ CLIENT_EVENT_TYPES: Dict[str, type] = {
 
 
 def parse_client_event(raw: Dict[str, Any]) -> Optional[BaseModel]:
-    """Parse known client events, returning None for unknown event types."""
     cls = CLIENT_EVENT_TYPES.get(raw.get("type"))
     if cls is None:
         return None
@@ -149,8 +104,6 @@ def parse_client_event(raw: Dict[str, Any]) -> Optional[BaseModel]:
 
 @dataclass
 class SessionConfig:
-    """Session-level configuration negotiated via session.update."""
-
     input_sample_rate: int = DEFAULT_INPUT_SAMPLE_RATE
     language: Optional[str] = None
     client_model: Optional[str] = None
@@ -159,68 +112,7 @@ class SessionConfig:
 
 
 @dataclass
-class AudioState:
-    """Per-item PCM buffer plus absolute byte offsets.
-
-    Realtime ASR can keep one item open for many chunks. After slicing starts,
-    old PCM should stop growing resident memory, but inference anchors still
-    need to be expressed in the item's original byte timeline.
-    ``pcm_buffer`` stores only the resident bytes still needed for inference.
-    The offset fields stay absolute within the current item, so compaction can
-    drop old bytes without moving inference anchors backward.
-    """
-
-    max_buffer_bytes: int
-    chunk_size_bytes: int
-    left_overlap_bytes: int
-    slicing_min_chunk_index: int
-    state: StreamingASRState
-    # Disabled when overlap leaves no fresh audio window for text dedupe.
-    slicing_enabled: bool = True
-    pcm_buffer: bytearray = field(default_factory=bytearray)
-    pcm_buffer_base_offset_bytes: int = 0
-    total_pcm_bytes_received: int = 0
-    # Scheduled bytes gate append-triggering and advance even on skips.
-    last_scheduled_offset_bytes: int = 0
-    # Inferred bytes gate commit; skipped audio must still be transcribed there.
-    last_inferred_offset_bytes: int = 0
-    last_sliced_buffer_end_bytes: int = 0
-
-    def append_pcm(self, pcm: bytes) -> None:
-        """Append PCM while keeping total received bytes absolute."""
-        self.pcm_buffer.extend(pcm)
-        self.total_pcm_bytes_received += len(pcm)
-
-    def compact_after_sliced_inference(self) -> None:
-        """Bound resident PCM while preserving the next slice's context."""
-        keep_bytes = self.left_overlap_bytes + self.chunk_size_bytes
-        keep_start = max(0, self.last_sliced_buffer_end_bytes - keep_bytes)
-        drop_bytes = keep_start - self.pcm_buffer_base_offset_bytes
-        drop_bytes -= drop_bytes % PCM_SAMPLE_WIDTH
-        if drop_bytes <= 0:
-            return
-
-        del self.pcm_buffer[:drop_bytes]
-        self.pcm_buffer_base_offset_bytes += drop_bytes
-
-    def reset_pcm_offsets(self) -> None:
-        """Clear item-local audio and reset all absolute byte cursors."""
-        self.pcm_buffer.clear()
-        self.pcm_buffer_base_offset_bytes = 0
-        self.total_pcm_bytes_received = 0
-        self.last_scheduled_offset_bytes = 0
-        self.last_inferred_offset_bytes = 0
-        self.last_sliced_buffer_end_bytes = 0
-
-    def global_to_local(self, global_offset: int) -> int:
-        """Translate item-absolute offsets after old PCM has been compacted."""
-        return global_offset - self.pcm_buffer_base_offset_bytes
-
-
-@dataclass
 class ItemState:
-    """Current conversation item ids and already emitted transcript deltas."""
-
     current_item_id: str
     previous_item_id: Optional[str] = None
     emitted_deltas: List[str] = field(default_factory=list)
@@ -228,7 +120,6 @@ class ItemState:
 
 
 def split_trailing_sentence_punctuation(delta: str) -> tuple[str, str]:
-    """Defer sentence punctuation at a sliced window boundary."""
     end = len(delta.rstrip())
     start = end
     while start > 0 and delta[start - 1] in _DEFERRED_SENTENCE_PUNCT:
@@ -239,7 +130,6 @@ def split_trailing_sentence_punctuation(delta: str) -> tuple[str, str]:
 
 
 def should_emit_pending_sentence_punctuation(next_delta: str) -> bool:
-    """Drop pending punctuation only before a lower-case alphabetic continuation."""
     next_delta = next_delta.lstrip()
     if not next_delta:
         return True
@@ -247,11 +137,24 @@ def should_emit_pending_sentence_punctuation(next_delta: str) -> bool:
     return not (first.isalpha() and first.islower())
 
 
-class RealtimeConnection:
-    """One realtime transcription session. Drives the WS receive loop,
-    dispatches typed client events to the matching _on_* handler, and
-    triggers chunked ASR inference at audio buffer thresholds."""
+@dataclass
+class _ASRWindowPlan:
+    is_last: bool
+    use_slicing: bool
+    prompt: Optional[str]
+    dedupe_against: Optional[str]
+    overlap_seconds: float
+    slice_start_global: int
+    slice_end_global: int
 
+
+@dataclass
+class _ASRWindowResult:
+    delta: str
+    skipped: bool
+
+
+class RealtimeConnection:
     def __init__(
         self,
         websocket: WebSocket,
@@ -274,7 +177,6 @@ class RealtimeConnection:
         self.config = SessionConfig()
 
         slicing_cfg = adapter.realtime_slicing_config
-        # Adapter opt-in is still gated by the operator flag and min_audio_sec.
         slicing_requested = bool(slicing_cfg.get("enabled", False)) and not bool(
             getattr(server_args, "asr_disable_input_slicing", False)
         )
@@ -311,7 +213,6 @@ class RealtimeConnection:
         min_audio_sec = max(min_audio_sec, 0.0)
 
         left_overlap_bytes = int(left_overlap_ms / 1000 * self.bytes_per_second)
-        # Keep slice starts aligned to whole PCM16 samples.
         left_overlap_bytes -= left_overlap_bytes % PCM_SAMPLE_WIDTH
         slicing_min_chunk_index = (
             math.ceil(min_audio_sec / state.chunk_size_sec) if slicing_requested else 0
@@ -363,10 +264,6 @@ class RealtimeConnection:
                 pass
 
     async def _run_loop(self) -> None:
-        """Receive-and-dispatch loop. Validation errors emit an error event
-        and continue; fatal append-path errors (buffer overflow, append-time
-        inference failure) close the WebSocket and terminate the loop.
-        """
         while True:
             self._current_client_event_id = None
             message = await self.websocket.receive()
@@ -419,7 +316,6 @@ class RealtimeConnection:
                 return
 
     async def _dispatch(self, event: BaseModel) -> bool:
-        """Returns True if the session should terminate."""
         if isinstance(event, InputAudioBufferAppendEvent):
             return await self._on_input_audio_buffer_append(event)
         if isinstance(event, SessionUpdateEvent):
@@ -476,11 +372,10 @@ class RealtimeConnection:
             )
             return
 
-        new_rate = self.config.input_sample_rate  # default: keep current
+        new_rate = self.config.input_sample_rate
         fmt = audio.format
         if fmt is not None:
             if not isinstance(fmt, AudioPCM):
-                # G.711 (pcmu / pcma): not implemented.
                 await self._send_error(
                     "not_supported",
                     f"audio.input.format.type must be 'audio/pcm'; "
@@ -512,7 +407,6 @@ class RealtimeConnection:
                 )
                 return
 
-        # Mutation pass — no early returns past this point.
         self.config.input_sample_rate = new_rate
         if transcription is not None:
             self.config.client_model = transcription.model
@@ -522,7 +416,6 @@ class RealtimeConnection:
         )
         self.config.configured = True
 
-        # Side effects: log + ack.
         if cfg.include:
             logger.info(
                 "[realtime] %s: include[] received but not implemented; ignoring: %s",
@@ -549,15 +442,12 @@ class RealtimeConnection:
     async def _on_input_audio_buffer_append(
         self, event: InputAudioBufferAppendEvent
     ) -> bool:
-        """Returns True if the session should terminate (buffer overflow or
-        append-time inference failure)."""
         if not self.config.configured:
             await self._send_error(
                 "invalid_state", "Send session.update before audio frames"
             )
             return False
 
-        # Empty audio is a no-op (heartbeat frames); skip b64decode.
         if not event.audio:
             return False
 
@@ -610,7 +500,6 @@ class RealtimeConnection:
         if new_audio_bytes >= self.audio.chunk_size_bytes:
             ok = await self._run_inference(is_last=False)
             if not ok:
-                # WS already closed inside _run_inference.
                 return True
         return False
 
@@ -673,8 +562,6 @@ class RealtimeConnection:
         if has_new_audio:
             ok = await self._run_inference(is_last=True)
             if not ok:
-                # _run_inference already emitted transcription.failed and
-                # rolled the item; don't also emit completed.
                 return
         elif self.audio.state.full_transcript:
             # Audio length was exactly a chunk_size_bytes multiple. Flush
@@ -715,15 +602,32 @@ class RealtimeConnection:
             )
         )
 
+    # Realtime ASR remains stateless at the backend request level: each append
+    # schedules either one cumulative item request or, after the adapter gate, one
+    # bounded tail-window request. Window lifecycle:
+    # 1. prepare: choose cumulative vs sliced and flush cumulative holdback before
+    #    the first sliced request.
+    # 2. execute: run the model, or defer short/silent/unsafe sliced windows
+    #    without mutating transcript state.
+    # 3. emit: publish the accepted delta.
+    # 4. commit: advance scheduling for every attempt, but advance inferred bytes
+    #    and compact PCM only after a real accepted inference.
     async def _run_inference(self, is_last: bool) -> bool:
-        """Run ASR on the current audio window.
+        """Prepare, execute, emit, then commit one ASR window."""
+        plan = await self._prepare_asr_window(is_last)
+        try:
+            result = await self._execute_asr_window(plan)
+        except Exception:
+            return await self._handle_inference_failure(is_last)
+        await self._emit_transcription_delta(
+            result.delta,
+            defer_trailing_sentence_punctuation=plan.use_slicing and not plan.is_last,
+        )
+        self._commit_asr_window(plan, result)
+        return True
 
-        Short/unstable items keep the cumulative path for compatibility. Longer
-        items switch to a tail slice so each chunk sends bounded audio instead
-        of re-encoding the full item. The left overlap preserves acoustic
-        context, and output dedupe removes text repeated from that overlap.
-        Returns False on failure -- commit-time emits
-        transcription.failed and rolls the item; append-time closes the WS."""
+    async def _prepare_asr_window(self, is_last: bool) -> _ASRWindowPlan:
+        """May flush cumulative holdback before switching to a sliced window."""
         committed_text = self.audio.state.get_prefix_text()
         use_slicing = (
             self.audio.slicing_enabled
@@ -731,7 +635,6 @@ class RealtimeConnection:
             and self.audio.state.chunk_index >= self.audio.slicing_min_chunk_index
         )
         if use_slicing:
-            # Flush cumulative holdback before switching to the bare-prompt slice.
             if self.audio.state.confirmed_text != self.audio.state.full_transcript:
                 await self._emit_transcription_delta(
                     self.audio.state.finalize(cumulative=True),
@@ -748,119 +651,131 @@ class RealtimeConnection:
             prompt = None
             dedupe_against = None
             slice_start_global = 0
-        overlap_seconds = (
-            self.audio.left_overlap_bytes / self.bytes_per_second if use_slicing else 0.0
+        return _ASRWindowPlan(
+            is_last=is_last,
+            use_slicing=use_slicing,
+            prompt=prompt,
+            dedupe_against=dedupe_against,
+            overlap_seconds=(
+                self.audio.left_overlap_bytes / self.bytes_per_second
+                if use_slicing
+                else 0.0
+            ),
+            slice_start_global=slice_start_global,
+            slice_end_global=self.audio.total_pcm_bytes_received,
         )
 
-        slice_end_global = self.audio.total_pcm_bytes_received
-        # A sliced->cumulative flip can ask for compacted-away bytes; clamp to
-        # the retained buffer.
-        slice_start = max(0, self.audio.global_to_local(slice_start_global))
-        slice_end = self.audio.global_to_local(slice_end_global)
-
-        skipped = False
-        try:
-            pcm_slice = slice_pcm_range(self.audio.pcm_buffer, slice_start, slice_end)
-            too_short = use_slicing and len(pcm_slice) < self.audio.chunk_size_bytes
-            near_silent = (
-                use_slicing and not too_short and is_near_silent_pcm(pcm_slice)
-            )
-            if (too_short or near_silent) and not is_last:
-                # Keep the slice anchor/PCM intact so the next slice re-covers it.
-                delta = ""
-                skipped = True
-            elif (too_short or near_silent) and is_last:
-                # Commit widens a short/quiet tail so pending audio is not lost.
-                full_slice = slice_pcm_range(self.audio.pcm_buffer, 0, slice_end)
-                if not full_slice or is_near_silent_pcm(full_slice):
-                    delta = ""
-                else:
-                    audio_samples = await asyncio.to_thread(
-                        pcm_to_float_samples, full_slice
-                    )
-                    delta = await process_asr_chunk(
-                        tokenizer_manager=self.tokenizer_manager,
-                        adapter=self.adapter,
-                        state=self.audio.state,
-                        audio_data=audio_samples,
-                        sampling_params=self.config.sampling_params,
-                        is_last=True,
-                        prompt=prompt,
-                        dedupe_against=dedupe_against,
-                        sample_rate=self.model_sample_rate,
-                        overlap_seconds=0.0,
-                    )
-            else:
-                audio_samples = await asyncio.to_thread(pcm_to_float_samples, pcm_slice)
-                verified_out: Dict[str, Any] = {}
-                delta = await process_asr_chunk(
-                    tokenizer_manager=self.tokenizer_manager,
-                    adapter=self.adapter,
-                    state=self.audio.state,
-                    audio_data=audio_samples,
-                    sampling_params=self.config.sampling_params,
-                    is_last=is_last,
-                    prompt=prompt,
-                    dedupe_against=dedupe_against,
-                    sample_rate=self.model_sample_rate,
-                    overlap_seconds=overlap_seconds,
-                    defer_if_unverified=use_slicing and not is_last,
-                    verified_out=verified_out,
-                )
-                if (
-                    use_slicing
-                    and not is_last
-                    and not verified_out.get("verified", True)
-                ):
-                    # Do not ingest an unsafe overlap hypothesis; keep audio recoverable.
-                    delta = ""
-                    skipped = True
-        except Exception:
-            logger.exception(
-                "[realtime] inference failed: session=%s item=%s buffer_bytes=%d",
-                self.session_id,
-                self.item.current_item_id,
-                len(self.audio.pcm_buffer),
-            )
-            if is_last:
-                # Commit-time failure can reference the already-created item.
-                await self._send(
-                    ConversationItemInputAudioTranscriptionFailedEvent(
-                        event_id=f"event_{random_uuid()}",
-                        type="conversation.item.input_audio_transcription.failed",
-                        item_id=self.item.current_item_id,
-                        content_index=0,
-                        error=TranscriptionFailedError(
-                            type="server_error",
-                            code="inference_failed",
-                            message="Transcription failed",
-                        ),
-                    )
-                )
-                self._start_next_item()
-            else:
-                # Append-time failure: the item isn't visible client-side
-                # yet (committed/created fire at commit), so
-                # transcription.failed would reference a ghost id.
-                await self._send_error_and_close(
-                    "inference_failed",
-                    "Transcription failed",
-                    close_code=1011,
-                )
-            return False
-
-        await self._emit_transcription_delta(
-            delta,
-            defer_trailing_sentence_punctuation=use_slicing and not is_last,
+    async def _execute_asr_window(self, plan: _ASRWindowPlan) -> _ASRWindowResult:
+        """Run the planned window, or defer it without consuming audio."""
+        # A sliced->cumulative flip can ask for compacted-away bytes; clamp.
+        slice_start = max(0, self.audio.global_to_local(plan.slice_start_global))
+        slice_end = self.audio.global_to_local(plan.slice_end_global)
+        pcm_slice = slice_pcm_range(self.audio.pcm_buffer, slice_start, slice_end)
+        too_short = plan.use_slicing and len(pcm_slice) < self.audio.chunk_size_bytes
+        near_silent = (
+            plan.use_slicing and not too_short and is_near_silent_pcm(pcm_slice)
         )
-        # Skips advance scheduling only; real inference advances consumption.
-        self.audio.last_scheduled_offset_bytes = slice_end_global
-        if not skipped:
-            self.audio.last_inferred_offset_bytes = slice_end_global
-            self.audio.last_sliced_buffer_end_bytes = slice_end_global
-            if use_slicing and not is_last:
+
+        if (too_short or near_silent) and not plan.is_last:
+            return _ASRWindowResult(delta="", skipped=True)
+
+        if (too_short or near_silent) and plan.is_last:
+            # Commit must not drop a short/quiet tail: widen to the full buffer.
+            full_slice = slice_pcm_range(self.audio.pcm_buffer, 0, slice_end)
+            if not full_slice or is_near_silent_pcm(full_slice):
+                return _ASRWindowResult(delta="", skipped=False)
+            audio_samples = await asyncio.to_thread(pcm_to_float_samples, full_slice)
+            delta = await self._run_asr_on_samples(
+                plan, audio_samples, is_last=True, overlap_seconds=0.0
+            )
+            return _ASRWindowResult(delta=delta, skipped=False)
+
+        audio_samples = await asyncio.to_thread(pcm_to_float_samples, pcm_slice)
+        verified_out: Dict[str, Any] = {}
+        delta = await self._run_asr_on_samples(
+            plan,
+            audio_samples,
+            is_last=plan.is_last,
+            overlap_seconds=plan.overlap_seconds,
+            defer_if_unverified=plan.use_slicing and not plan.is_last,
+            verified_out=verified_out,
+        )
+        if (
+            plan.use_slicing
+            and not plan.is_last
+            and not verified_out.get("verified", True)
+        ):
+            # Unsafe overlap hypothesis: don't ingest; keep audio recoverable.
+            return _ASRWindowResult(delta="", skipped=True)
+        return _ASRWindowResult(delta=delta, skipped=False)
+
+    async def _run_asr_on_samples(
+        self,
+        plan: _ASRWindowPlan,
+        audio_samples: np.ndarray,
+        *,
+        is_last: bool,
+        overlap_seconds: float,
+        defer_if_unverified: bool = False,
+        verified_out: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Shared model call; fills the per-connection args from self and plan."""
+        return await process_asr_chunk(
+            tokenizer_manager=self.tokenizer_manager,
+            adapter=self.adapter,
+            state=self.audio.state,
+            audio_data=audio_samples,
+            sampling_params=self.config.sampling_params,
+            is_last=is_last,
+            prompt=plan.prompt,
+            dedupe_against=plan.dedupe_against,
+            sample_rate=self.model_sample_rate,
+            overlap_seconds=overlap_seconds,
+            defer_if_unverified=defer_if_unverified,
+            verified_out=verified_out,
+        )
+
+    def _commit_asr_window(
+        self, plan: _ASRWindowPlan, result: _ASRWindowResult
+    ) -> None:
+        """Advance scheduling for every attempt, consumption only after inference."""
+        self.audio.last_scheduled_offset_bytes = plan.slice_end_global
+        if not result.skipped:
+            self.audio.last_inferred_offset_bytes = plan.slice_end_global
+            self.audio.last_sliced_buffer_end_bytes = plan.slice_end_global
+            if plan.use_slicing and not plan.is_last:
                 self.audio.compact_after_sliced_inference()
-        return True
+
+    async def _handle_inference_failure(self, is_last: bool) -> bool:
+        """Send the correct failure signal for append-time vs commit-time errors."""
+        logger.exception(
+            "[realtime] inference failed: session=%s item=%s buffer_bytes=%d",
+            self.session_id,
+            self.item.current_item_id,
+            len(self.audio.pcm_buffer),
+        )
+        if is_last:
+            await self._send(
+                ConversationItemInputAudioTranscriptionFailedEvent(
+                    event_id=f"event_{random_uuid()}",
+                    type="conversation.item.input_audio_transcription.failed",
+                    item_id=self.item.current_item_id,
+                    content_index=0,
+                    error=TranscriptionFailedError(
+                        type="server_error",
+                        code="inference_failed",
+                        message="Transcription failed",
+                    ),
+                )
+            )
+            self._start_next_item()
+        else:
+            await self._send_error_and_close(
+                "inference_failed",
+                "Transcription failed",
+                close_code=1011,
+            )
+        return False
 
     async def _flush_pending_sentence_punctuation(self) -> None:
         if not self.item.pending_sentence_punctuation:
@@ -875,9 +790,6 @@ class RealtimeConnection:
         *,
         defer_trailing_sentence_punctuation: bool = False,
     ) -> None:
-        """emitted_deltas stores wire-formatted text (with leading
-        boundary spaces baked in), so "".join(...) reconstructs the
-        cumulative transcript verbatim."""
         if not delta:
             return
         if self.item.pending_sentence_punctuation:
@@ -915,7 +827,6 @@ class RealtimeConnection:
         self._reset_inference_state()
 
     def _reset_inference_state(self) -> None:
-        """Missing any of these resets leaks state across items."""
         self.audio.state = StreamingASRState(**self.adapter.chunked_streaming_config)
         self.audio.reset_pcm_offsets()
         self.item.emitted_deltas.clear()

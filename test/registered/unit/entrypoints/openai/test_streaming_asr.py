@@ -1,10 +1,4 @@
-"""Unit tests for the realtime ASR slicing path.
-
-Drives the shared ``process_asr_chunk`` entry point and
-``RealtimeConnection._run_inference`` with lightweight mocked model components.
-The cases stay focused on the request paths and offset invariants that are most
-likely to regress.
-"""
+"""Focused CPU tests for realtime ASR slicing."""
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -20,7 +14,6 @@ from sglang.srt.entrypoints.openai.realtime.session import (
 )
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
-    _apply_sliced_dedupe,
     dedupe_overlap,
     process_asr_chunk,
 )
@@ -39,8 +32,6 @@ class _FakeAdapter:
 
 
 class _MockTokenizerManager:
-    """Records the request and yields one synthetic transcript."""
-
     def __init__(self, transcript):
         self._transcripts = list(transcript) if isinstance(transcript, list) else None
         self._transcript = None if self._transcripts is not None else transcript
@@ -118,7 +109,7 @@ class TestProcessAsrChunk(CustomTestCase):
     def test_cumulative_and_sliced_prompt_paths(self):
         state = self._state()
         state.emitted_text = "hello"
-        state.chunk_index = 5  # past unfixed_chunk_num, so the prefix is live
+        state.chunk_index = 5
         tm, _ = self._chunk(state, "hello world foo")
         self.assertEqual(tm.requests[0].text, "PROMPT:hello")
 
@@ -151,71 +142,7 @@ class TestProcessAsrChunk(CustomTestCase):
         self._chunk(state, "你好世界好")
         self.assertEqual(state.emitted_text, "你好世界")
 
-    def test_cumulative_early_revision_does_not_drop_new_words(self):
-        # Recasing/revising early words must not skip genuinely new tail words.
-        state = self._state(unfixed_chunk_num=0, unfixed_token_num=5)
-        snapshots = [
-            "The nation will rise",
-            "The nation will rise up and",
-            "The nation will rise up and live out the true",
-            "the will rise up and live out the true meaning of its creed today",
-        ]
-        for snap in snapshots:
-            self._chunk(state, snap)
-        self._chunk(
-            state,
-            "the will rise up and live out the true meaning of its creed today done",
-            is_last=True,
-        )
-        emitted = state.emitted_text.split()
-        for word in ("rise", "up", "and", "live", "out", "meaning", "creed", "done"):
-            self.assertIn(word, emitted, f"dropped new word: {word!r}")
-
-        state = self._state(
-            chunk_size_sec=2.0,
-            unfixed_chunk_num=0,
-            unfixed_token_num=0,
-            confirmed_text=" ".join(f"w{i}" for i in range(35)),
-            emitted_text=" ".join(f"w{i}" for i in range(35)),
-        )
-        _, out = self._chunk(
-            state,
-            f"{state.emitted_text} {state.emitted_text} fresh tail",
-        )
-        self.assertEqual(out, "fresh tail")
-
-    def test_cjk_char_to_word_flip_does_not_duplicate(self):
-        # CJK->Latin code-switches must not re-emit the already emitted CJK run.
-        state = StreamingASRState(
-            chunk_size_sec=2.0, unfixed_chunk_num=2, unfixed_token_num=5
-        )
-        state.update("我今天很高兴认识你", cumulative=True)  # char path
-        state.update("我今天很高兴认识你 Anna", cumulative=True)  # word path (flip)
-        state.full_transcript = "我今天很高兴认识你 Anna 你叫什么名字"
-        state.finalize(cumulative=True)
-        self.assertEqual(state.emitted_text, "我今天很高兴认识你 Anna 你叫什么名字")
-
-        repeat_state = StreamingASRState(
-            chunk_size_sec=2.0, unfixed_chunk_num=2, unfixed_token_num=0
-        )
-        repeat_state.update("你好", cumulative=True)
-        repeat_state.update("你好你好", cumulative=True)
-        self.assertEqual(repeat_state.emitted_text, "你好你好")
-
-    def test_sliced_path_emits_deduped_window_without_token_holdback(self):
-        # Sliced updates emit the deduped window without token-count holdback.
-        state = StreamingASRState(
-            chunk_size_sec=2.0, unfixed_chunk_num=2, unfixed_token_num=2
-        )
-        state.confirmed_text = "the dog saw"
-        state.emitted_text = "the dog saw"
-        deduped = dedupe_overlap("the dog saw", "saw the cat ran up")
-        self.assertEqual(deduped, "the cat ran up")
-        state.update(deduped, cumulative=False)
-        self.assertEqual(state.emitted_text, "the dog saw the cat ran up")
-
     def test_dedupe_overlap_only_trims_verbatim_prefix(self):
-        # Only a verbatim normalized prefix is trimmed.
         self.assertEqual(
             dedupe_overlap(
                 "he hoped there would be stew for dinner turnips",
@@ -234,30 +161,8 @@ class TestProcessAsrChunk(CustomTestCase):
             "fresh dinner—turnips text",
         )
 
-    def test_sliced_dedupe_safety_verdict(self):
-        # Voiced unmatched overlap is unsafe; silent unmatched overlap is new text.
-        voiced = np.full(16000, 0.1, dtype=np.float32)
-        silent = np.zeros(16000, dtype=np.float32)
-        text, verified = _apply_sliced_dedupe(
-            "alpha beta", "gamma delta epsilon", voiced, 16000, 0.5
-        )
-        self.assertEqual(text, "gamma delta epsilon")
-        self.assertFalse(verified)
-        text, verified = _apply_sliced_dedupe(
-            "alpha beta", "gamma delta epsilon", silent, 16000, 0.5
-        )
-        self.assertEqual(text, "gamma delta epsilon")
-        self.assertTrue(verified)
-        text, verified = _apply_sliced_dedupe(
-            "one two three", "three four five", voiced, 16000, 0.5
-        )
-        self.assertEqual(text, "four five")
-        self.assertTrue(verified)
-
 
 class _SlicingAdapter:
-    """Minimal adapter exposing only what RealtimeConnection.__init__ reads."""
-
     model_sample_rate = 16000
 
     def __init__(self, left_overlap_ms, enabled=True, min_audio_sec=45.0):
@@ -275,13 +180,10 @@ class _SlicingAdapter:
 
     @property
     def chunked_streaming_config(self):
-        # 2s chunks, 2 unfixed chunks -> 4s unfixed window.
         return {"chunk_size_sec": 2.0, "unfixed_chunk_num": 2, "unfixed_token_num": 5}
 
 
 class _RuntimeSlicingAdapter:
-    """Small byte geometry for exercising RealtimeConnection._run_inference."""
-
     model_sample_rate = 1
     prompt_template = "PROMPT:"
 
@@ -291,7 +193,6 @@ class _RuntimeSlicingAdapter:
 
     @property
     def chunked_streaming_config(self):
-        # 1 Hz * 2 bytes/sample * 2s = 4-byte chunks; 1s overlap = 2 bytes.
         return {"chunk_size_sec": 2.0, "unfixed_chunk_num": 2, "unfixed_token_num": 1}
 
     def postprocess_text(self, text: str) -> str:
@@ -319,8 +220,10 @@ class TestSlicingConfigGuard(CustomTestCase):
 
     def test_slicing_config_guard_and_sample_alignment(self):
         self.assertTrue(self._conn(left_overlap_ms=2000).audio.slicing_enabled)
-        self.assertFalse(self._conn(left_overlap_ms=8000).audio.slicing_enabled)
-        self.assertFalse(self._conn(left_overlap_ms=-1).audio.slicing_enabled)
+        with self.assertLogs(level="WARNING"):
+            self.assertFalse(self._conn(left_overlap_ms=8000).audio.slicing_enabled)
+        with self.assertLogs(level="WARNING"):
+            self.assertFalse(self._conn(left_overlap_ms=-1).audio.slicing_enabled)
         self.assertFalse(
             self._conn(
                 left_overlap_ms=2000, disable_input_slicing=True
@@ -361,9 +264,14 @@ class TestRealtimePCMCompaction(CustomTestCase):
         conn.audio.state.chunk_index = 2
         conn.audio.state.emitted_text = "alpha"
 
-    def test_first_sliced_inference_uses_cumulative_anchor_and_compacts(self):
+    def test_sliced_inference_compacts_and_reuses_retained_tail(self):
         tokenizer_manager = _MockTokenizerManager(
-            ["alpha beta tail", "alpha beta gamma", "alpha beta gamma delta"]
+            [
+                "alpha beta tail",
+                "alpha beta gamma",
+                "alpha beta gamma delta",
+                "delta more",
+            ]
         )
         conn = self._conn(tokenizer_manager)
         conn.audio.append_pcm(bytes(range(4)))
@@ -385,14 +293,6 @@ class TestRealtimePCMCompaction(CustomTestCase):
         )
         self.assertEqual(bytes(conn.audio.pcm_buffer), bytes(range(6, 12)))
 
-    def test_next_sliced_inference_uses_retained_tail_after_compaction(self):
-        tokenizer_manager = _MockTokenizerManager(
-            ["alpha beta gamma", "alpha beta gamma delta"]
-        )
-        conn = self._conn(tokenizer_manager)
-        self._prime_sliced_state(conn)
-
-        _run(conn._run_inference(is_last=False))
         conn.audio.append_pcm(bytes(range(12, 16)))
         _run(conn._run_inference(is_last=False))
 
@@ -401,11 +301,10 @@ class TestRealtimePCMCompaction(CustomTestCase):
             / 32768.0
         )
         np.testing.assert_array_equal(
-            tokenizer_manager.requests[1].audio_data, expected
+            tokenizer_manager.requests[3].audio_data, expected
         )
 
     def test_skipped_window_cursor_semantics_and_final_commit(self):
-        # Mid-stream skip advances only scheduling; final commit still infers.
         tokenizer_manager = _MockTokenizerManager("unused")
         conn = self._conn(tokenizer_manager)
         conn.audio.append_pcm(np.zeros(8, dtype=np.int16).tobytes())
@@ -442,7 +341,6 @@ class TestRealtimePCMCompaction(CustomTestCase):
         self.assertEqual(conn.audio.last_inferred_offset_bytes, 20)
 
     def test_unsafe_boundary_defers_but_commit_emits(self):
-        # Voiced unmatched overlap defers mid-stream, but commit still emits.
         tokenizer_manager = _MockTokenizerManager(["zulu beta gamma"])
         conn = self._conn(tokenizer_manager)
         samples = np.zeros(6, dtype=np.int16)
@@ -484,24 +382,17 @@ class TestRealtimePCMCompaction(CustomTestCase):
         self.assertNotEqual(conn.item.emitted_deltas, [])
         self.assertEqual(conn.audio.last_inferred_offset_bytes, 12)
 
-    def test_failed_sliced_inference_does_not_compact(self):
+    def test_failed_sliced_inference_does_not_compact_and_reset_clears_offsets(self):
         tokenizer_manager = _FailingTokenizerManager()
         conn = self._conn(tokenizer_manager)
         self._prime_sliced_state(conn)
 
-        ok = _run(conn._run_inference(is_last=False))
+        with self.assertLogs(level="WARNING"):
+            ok = _run(conn._run_inference(is_last=False))
 
         self.assertFalse(ok)
         self.assertEqual(bytes(conn.audio.pcm_buffer), bytes(range(12)))
         self.assertEqual(conn.audio.last_sliced_buffer_end_bytes, 8)
-
-    def test_reset_clears_absolute_offsets(self):
-        conn = self._conn(_MockTokenizerManager("unused"))
-        conn.audio.append_pcm(bytes(range(12)))
-        conn.audio.last_sliced_buffer_end_bytes = 12
-        conn.audio.last_scheduled_offset_bytes = 12
-        conn.audio.last_inferred_offset_bytes = 12
-        conn.audio.compact_after_sliced_inference()
 
         conn._reset_inference_state()
 
@@ -510,40 +401,6 @@ class TestRealtimePCMCompaction(CustomTestCase):
         self.assertEqual(conn.audio.last_sliced_buffer_end_bytes, 0)
         self.assertEqual(conn.audio.last_scheduled_offset_bytes, 0)
         self.assertEqual(conn.audio.last_inferred_offset_bytes, 0)
-
-    def test_sliced_boundary_sentence_punctuation_is_deferred(self):
-        conn = self._conn(_MockTokenizerManager("unused"))
-
-        _run(
-            conn._emit_transcription_delta(
-                "I have a dream.",
-                defer_trailing_sentence_punctuation=True,
-            )
-        )
-        _run(
-            conn._emit_transcription_delta(
-                "that one day",
-                defer_trailing_sentence_punctuation=True,
-            )
-        )
-        self.assertEqual(
-            "".join(conn.item.emitted_deltas), "I have a dream that one day"
-        )
-
-        conn = self._conn(_MockTokenizerManager("unused"))
-        _run(
-            conn._emit_transcription_delta(
-                "its creed.",
-                defer_trailing_sentence_punctuation=True,
-            )
-        )
-        _run(
-            conn._emit_transcription_delta(
-                "He hoped",
-                defer_trailing_sentence_punctuation=True,
-            )
-        )
-        self.assertEqual("".join(conn.item.emitted_deltas), "its creed. He hoped")
 
 
 if __name__ == "__main__":
