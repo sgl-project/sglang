@@ -27,10 +27,19 @@ tier). The context owns the storage: publishing goes through
 ``set_global_server_args_for_scheduler`` / ``get_global_server_args`` in
 ``server_args.py`` are thin shims over this slot), and the object is returned
 by reference — the same live instance everywhere, never a copy.
+
+``get_flags()`` returns the resolved-flags tier: what the system *resolved*
+the configuration to (``server_args`` stays the pristine user input). Flags
+live in typed dataclass groups (``flags.attn`` / ``flags.moe`` / flat generic
+leaves on ``flags`` itself); reads and writes are plain attribute access.
+Static groups are writable during resolution and locked by ``freeze()``;
+``flags.capture`` stays writable (capture-time state). Each group offers a
+transactional, test-only ``override(**kw)`` that also works on frozen groups.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -215,15 +224,125 @@ class ParallelContext:
         return self._v("attn_cp_group", _ps().get_attn_cp_group)
 
 
-class RuntimeContext:
-    """Container for the structured runtime accessors; exposes ``parallel`` and
-    ``server_args``."""
+class _FlagGroupBase:
+    """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 
-    __slots__ = ("parallel", "_server_args")
+    Groups are plain dataclasses; ``__dataclass_fields__`` is the single source
+    of truth for which leaves exist, so a mistyped name fails loudly instead of
+    creating a stray attribute.
+    """
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name not in type(self).__dataclass_fields__:
+            raise AttributeError(
+                f"{type(self).__name__} has no flag '{name}' (leaves are "
+                "declared as dataclass fields; check for typos)"
+            )
+        if getattr(self, "_frozen", False):
+            raise RuntimeError(
+                f"{type(self).__name__} is frozen; cannot write '{name}'. "
+                "Test-scoped changes go through override()."
+            )
+        object.__setattr__(self, name, value)
+
+    @contextmanager
+    def override(self, **kwargs):
+        """Temporarily force flag values, restoring on exit. Transactional
+        (keys validated before any write) and usable on frozen groups — this
+        is the test-only injection primitive."""
+        fields = type(self).__dataclass_fields__
+        unknown = set(kwargs) - set(fields)
+        if unknown:
+            raise ValueError(
+                f"unknown flag(s) for {type(self).__name__}: {sorted(unknown)}"
+            )
+        saved = {name: getattr(self, name) for name in kwargs}
+        for name, value in kwargs.items():
+            object.__setattr__(self, name, value)
+        try:
+            yield self
+        finally:
+            for name, value in saved.items():
+                object.__setattr__(self, name, value)
+
+
+class _StaticFlags(_FlagGroupBase):
+    """Static flag-group: writable during resolution, locked by ``freeze()``."""
+
+    def freeze(self) -> None:
+        object.__setattr__(self, "_frozen", True)
+
+    @property
+    def frozen(self) -> bool:
+        return getattr(self, "_frozen", False)
+
+
+@dataclasses.dataclass
+class AttnFlags(_StaticFlags):
+    """Attention-family resolved flags (leaves arrive with the V3 sweeps)."""
+
+
+@dataclasses.dataclass
+class MoeFlags(_StaticFlags):
+    """MoE-family resolved flags (leaves arrive with the V3 sweeps)."""
+
+
+@dataclasses.dataclass
+class CaptureFlags(_FlagGroupBase):
+    """Capture-time flags; never frozen (written during cuda-graph capture)."""
+
+
+@dataclasses.dataclass
+class Flags(_StaticFlags):
+    """Root of the resolved-flags tier.
+
+    Family groups hang off it (``flags.attn`` / ``flags.moe`` / ``flags.capture``);
+    single generic flags live flat on this container, declared as fields here.
+    ``freeze()`` locks the container and every static sub-group; ``capture``
+    stays writable.
+    """
+
+    attn: AttnFlags = dataclasses.field(default_factory=AttnFlags)
+    moe: MoeFlags = dataclasses.field(default_factory=MoeFlags)
+    capture: CaptureFlags = dataclasses.field(default_factory=CaptureFlags)
+
+    def freeze(self) -> None:
+        for field in dataclasses.fields(self):
+            value = getattr(self, field.name)
+            if isinstance(value, _StaticFlags):
+                value.freeze()
+        super().freeze()
+
+
+# Resolved-config field name → dotted flag-leaf path (e.g. a V3 sweep adds
+# "use_mla_backend": "attn.use_mla_backend"). Fields not listed default to a
+# flat leaf of the same name on the Flags container. Populated per field
+# family as readers migrate; empty in the skeleton.
+FLAG_LEAF_MAP: dict[str, str] = {}
+
+
+def resolve_flag_leaf(
+    flags: Flags, field: str, *, leaf_map: dict[str, str] | None = None
+) -> tuple[Any, str]:
+    """Return ``(owning group, leaf attribute name)`` for a resolved-config field."""
+    path = (FLAG_LEAF_MAP if leaf_map is None else leaf_map).get(field, field)
+    owner: Any = flags
+    *groups, leaf = path.split(".")
+    for part in groups:
+        owner = getattr(owner, part)
+    return owner, leaf
+
+
+class RuntimeContext:
+    """Container for the structured runtime accessors; exposes ``parallel``,
+    ``server_args``, and ``flags``."""
+
+    __slots__ = ("parallel", "_server_args", "flags")
 
     def __init__(self, parallel: ParallelContext):
         self.parallel = parallel
         self._server_args: ServerArgs | None = None
+        self.flags = Flags()
 
     @property
     def server_args(self) -> ServerArgs:
@@ -260,9 +379,15 @@ def get_server_args() -> ServerArgs:
     return _CONTEXT.server_args
 
 
+def get_flags() -> Flags:
+    return _CONTEXT.flags
+
+
 def reset_context() -> None:
-    """Clear the context-owned store (unit-test teardown).
+    """Clear the context-owned store (unit-test teardown): drop the published
+    ``server_args`` and install a fresh, unfrozen ``Flags``.
 
     Wrapper subsystems (``parallel``) hold no state and are unaffected.
     """
     _CONTEXT._server_args = None
+    _CONTEXT.flags = Flags()
