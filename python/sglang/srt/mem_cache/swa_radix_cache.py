@@ -490,9 +490,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         req.swa_prefix_lock_released = False
 
-    def cache_unfinished_req(
-        self, req: Req, chunked=False, from_decode=False
-    ) -> None:
+    def cache_unfinished_req(self, req: Req, chunked=False, from_decode=False) -> None:
         """Cache request when it is unfinished."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -1270,9 +1268,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     # Eager prefill eviction: these newly-allocated SWA slots were
                     # not pre-freed by _evict_swa, so free them here. Full-layer KV
                     # stays in node.value (the tombstone node), preserving reuse.
-                    self.token_to_kv_pool_allocator.free_swa(
-                        value[:swa_tombstone_len]
-                    )
+                    self.token_to_kv_pool_allocator.free_swa(value[:swa_tombstone_len])
                 node = self._add_new_node(
                     node,
                     key[:swa_tombstone_len],
