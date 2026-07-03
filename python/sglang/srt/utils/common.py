@@ -94,6 +94,7 @@ from torch.utils._contextlib import _DecoratorContextManager
 from torchvision.io import decode_jpeg
 from typing_extensions import Literal
 
+from sglang._apple_silicon_memory import apple_gpu_available_memory
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
@@ -689,18 +690,13 @@ def get_available_gpu_memory(
             free_gpu_memory = psutil.virtual_memory().available
         free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
     elif device == "mps":
-        if empty_cache:
-            empty_device_cache(torch.mps)
         # Unified memory: Metal can only keep roughly 65-75% of system RAM
         # resident on the GPU (recommendedMaxWorkingSetSize). Treating all
         # free RAM as GPU-available overcommits that budget, which stalls or
-        # crashes the GPU driver under load (#21443), so report the smaller
-        # of system-available memory and the remaining working-set headroom.
-        max_working_set = int(torch.mps.recommended_max_memory())
-        free_gpu_memory = psutil.virtual_memory().available
-        if max_working_set > 0:
-            headroom = max_working_set - torch.mps.driver_allocated_memory()
-            free_gpu_memory = min(free_gpu_memory, max(headroom, 0))
+        # crashes the GPU driver under load (#21443). The shared helper
+        # reports the remaining working-set headroom as tracked by the
+        # active Apple Silicon runtime (MLX or torch-MPS).
+        free_gpu_memory = apple_gpu_available_memory(empty_cache=empty_cache)
     else:
         if not current_platform.is_out_of_tree():
             raise ValueError(

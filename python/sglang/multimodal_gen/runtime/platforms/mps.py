@@ -2,9 +2,12 @@
 from functools import lru_cache
 from typing import Any
 
-import psutil
 import torch
 
+from sglang._apple_silicon_memory import (
+    apple_gpu_available_memory,
+    apple_gpu_total_memory,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     Platform,
@@ -57,10 +60,7 @@ class MpsPlatform(Platform):
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         # Metal cannot use all of system RAM: cap at the recommended max
         # working set so callers do not overcommit the GPU budget (#21443).
-        total = int(torch.mps.recommended_max_memory())
-        if total > 0:
-            return total
-        return psutil.virtual_memory().total
+        return apple_gpu_total_memory()
 
     @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
@@ -88,16 +88,9 @@ class MpsPlatform(Platform):
         cpu_group: Any = None,
     ) -> float:
 
-        if empty_cache:
-            torch.mps.empty_cache()
-
         # Unified memory: cap at Metal's remaining working-set headroom
         # instead of treating all free system RAM as GPU-available (#21443).
-        free_memory = psutil.virtual_memory().available
-        max_working_set = int(torch.mps.recommended_max_memory())
-        if max_working_set > 0:
-            headroom = max_working_set - torch.mps.driver_allocated_memory()
-            free_memory = min(free_memory, max(headroom, 0))
+        free_memory = apple_gpu_available_memory(empty_cache=empty_cache)
 
         if distributed:
             import torch.distributed as dist
