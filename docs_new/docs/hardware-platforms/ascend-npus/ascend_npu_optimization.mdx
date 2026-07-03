@@ -238,7 +238,7 @@ These arguments and environment variables are critical for tuning decode perform
       <td>Enabled</td>
     </tr>
     <tr>
-      <td>`--cuda-graph-max-bs`</td>
+      <td>`--cuda-graph-max-bs-decode`</td>
       <td>Caps the maximum batch size for which CUDA Graphs are captured. Larger values cover more batch sizes but increase graph capture time and memory overhead. If your `max-running-requests` is high but typical batch sizes are lower, use a smaller value to reduce capture overhead. Tune based on your observed batch size distribution during serving.</td>
       <td>`4`</td>
     </tr>
@@ -390,6 +390,7 @@ The following environment variables are used in other best practice configuratio
 The table shows feature-by-feature compatibility of SGLang capabilities on Ascend NPU. Features that have performance impact on Ascend are included. Each cell at the intersection of two features indicates whether they can be used together.
 
 The symbols used are defined as follows:
+
 - 🟢 = Full compatibility
 - 🟠 = Partial compatibility
 - ❌ = No compatibility
@@ -790,7 +791,6 @@ Enables Expert Parallelism Load Balancing to dynamically redistribute experts ac
 ### NZ Weight Format (`SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT`)
 
 Casts model weight tensors to the Ascend NPU ACL FRACTAL_NZ format (format 29) for improved memory access efficiency on Da Vinci AI cores. Enabled by default globally; disable with `SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT=1` when the format conflicts with other features (e.g., EPLB). Applied to linear weights, MoE weights, quantized weights, MLA QKV projections, and KV Cache (via `PA_NZ` / `nzcache` modes for FIA). Related env var: `SGLANG_USE_FIA_NZ=1` (requires `SGLANG_NPU_USE_MLAPO=1`).
-
 
 ## See Also
 
