@@ -1147,10 +1147,16 @@ class ModelConfig:
 
         if quant_algo == "MIXED_PRECISION":
             architectures = getattr(self.hf_config, "architectures", []) or []
-            if getattr(self.hf_config, "model_type", None) == "nemotron_h" or any(
-                arch.startswith("NemotronH") for arch in architectures
+            has_per_module_rules = bool(json_quant_configs.get("quantized_layers"))
+            if (
+                has_per_module_rules
+                or getattr(self.hf_config, "model_type", None) == "nemotron_h"
+                or any(arch.startswith("NemotronH") for arch in architectures)
             ):
-                return {"quant_method": "modelopt_mixed", "quant_algo": quant_algo}
+                return {
+                    "quant_method": "modelopt_mixed",
+                    "quant_algo": quant_algo,
+                }
             return {"quant_method": "w4afp8", "quant_algo": quant_algo}
         elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
             return {"quant_method": "modelopt_fp4", "quant_algo": quant_algo}

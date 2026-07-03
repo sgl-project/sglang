@@ -33,6 +33,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.triton_ops.softcap import softcap_inplace_logits as fused_softcap
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
@@ -886,6 +887,8 @@ class LogitsProcessor(nn.Module):
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
+        elif not isinstance(lm_head.quant_method, UnquantizedEmbeddingMethod):
+            logits = lm_head.quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
             if self.use_fp32_lm_head:

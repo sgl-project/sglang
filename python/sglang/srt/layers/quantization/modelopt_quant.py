@@ -741,19 +741,21 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         quant_algo = self._resolve_quant_algo(prefix)
 
-        if isinstance(layer, LinearBase):
+        is_lm_head = isinstance(layer, ParallelLMHead)
+        if isinstance(layer, LinearBase) or is_lm_head:
             if is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
-                return UnquantizedLinearMethod()
+                return None if is_lm_head else UnquantizedLinearMethod()
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
-            if quant_algo == "NVFP4":
+            if quant_algo and quant_algo.endswith("NVFP4"):
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
-            return UnquantizedLinearMethod()
+            return None if is_lm_head else UnquantizedLinearMethod()
 
         if self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self.fp8_config)
@@ -763,7 +765,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return None
             if quant_algo == "FP8":
                 return ModelOptFp8MoEMethod(self.fp8_config)
-            if quant_algo == "NVFP4":
+            if quant_algo and quant_algo.endswith("NVFP4"):
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
             return None
 

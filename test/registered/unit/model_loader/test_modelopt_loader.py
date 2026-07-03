@@ -8,6 +8,7 @@ applies NVIDIA Model Optimizer quantization to models during loading.
 import unittest
 from unittest.mock import MagicMock, patch
 
+import torch
 import torch.nn as nn
 
 from sglang.srt.configs.device_config import DeviceConfig
@@ -16,7 +17,12 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
+    ModelOptFp4LinearMethod,
     ModelOptMixedPrecisionConfig,
+)
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
 )
 from sglang.srt.model_loader.loader import ModelOptModelLoader
 from sglang.srt.models.utils import WeightsMapper
@@ -626,14 +632,19 @@ class TestParseQuantHfConfig(CustomTestCase):
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
-    def test_nemotron_mixed_precision_uses_modelopt_mixed(self):
+    def test_per_module_mixed_precision_uses_modelopt_mixed(self):
         model_config = ModelConfig.__new__(ModelConfig)
         model_config.hf_config = MagicMock()
-        model_config.hf_config.model_type = "nemotron_h"
-        model_config.hf_config.architectures = ["NemotronHForCausalLM"]
+        model_config.hf_config.model_type = "qwen3_5"
+        model_config.hf_config.architectures = ["Qwen3_5ForConditionalGeneration"]
 
         result = model_config._parse_modelopt_quant_config(
-            {"quantization": {"quant_algo": "MIXED_PRECISION"}}
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {"lm_head": {"quant_algo": "W4A16_NVFP4"}},
+                }
+            }
         )
 
         self.assertEqual(result["quant_method"], "modelopt_mixed")
@@ -651,6 +662,42 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             ModelOptMixedPrecisionConfig.get_min_capability(),
             ModelOptFp4Config.get_min_capability(),
         )
+
+    def test_nvidia_nvfp4_algorithm_label_quantizes_lm_head(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "lm_head": {
+                        "quant_algo": "W4A16_NVFP4",
+                        "group_size": 16,
+                    },
+                },
+                "packed_modules_mapping": {},
+            }
+        )
+        lm_head = ParallelLMHead.__new__(ParallelLMHead)
+        method = quant_config.get_quant_method(lm_head, "lm_head")
+        self.assertIsInstance(method, ModelOptFp4LinearMethod)
+
+    def test_unquantized_lm_head_uses_default_embedding_method(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.mlp.down_proj": {"quant_algo": "FP8"},
+                },
+                "packed_modules_mapping": {},
+            }
+        )
+        lm_head = ParallelLMHead.__new__(ParallelLMHead)
+        self.assertIsNone(quant_config.get_quant_method(lm_head, "lm_head"))
+
+    def test_vocab_loader_accepts_equivalent_scalar_scale_shape(self):
+        layer = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
+        param = nn.Parameter(torch.zeros(1), requires_grad=False)
+        layer.weight_loader(param, torch.tensor(0.25))
+        self.assertEqual(param.item(), 0.25)
 
     def test_mixed_precision_quant_layer_resolution_after_mapping(self):
         quant_config = ModelOptMixedPrecisionConfig.from_config(

@@ -459,6 +459,9 @@ class VocabParallelEmbedding(torch.nn.Module):
         # If parameter does not have output dim, then it should
         # be copied onto all gpus (e.g. g_idx for act_order gptq).
         if output_dim is None:
+            if param.data.numel() == 1 and loaded_weight.numel() == 1:
+                param.data.reshape(-1).copy_(loaded_weight.reshape(-1))
+                return
             assert param.data.shape == loaded_weight.shape
             param.data.copy_(loaded_weight)
             return
