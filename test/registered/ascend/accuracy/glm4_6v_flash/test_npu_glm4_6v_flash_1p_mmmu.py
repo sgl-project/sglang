@@ -40,7 +40,7 @@ OTHER_ARGS = [
     32,
     "--trust-remote-code",
     "--mem-fraction-static",
-    0.75,
+    0.6,
     "--cuda-graph-bs",
     1,
     2,
