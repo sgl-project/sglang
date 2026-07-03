@@ -1563,6 +1563,9 @@ def channel_quant_to_tensor_quant(
     x_q_channel: torch.Tensor,
     x_s: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # x_s may still be 1-D [N] if called before process_weights_after_loading reshapes it
+    if x_s.dim() == 1:
+        x_s = x_s.unsqueeze(-1)
     x_dq_channel = x_q_channel.to(torch.float32) * x_s
     x_q_tensor, scale = (
         scaled_fp8_quant(x_dq_channel)
