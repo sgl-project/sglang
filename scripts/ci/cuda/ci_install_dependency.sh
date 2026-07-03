@@ -444,6 +444,10 @@ install_extra_deps() {
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
         $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
+        # lmms-eval v0.5 pulls antlr4-python3-runtime==4.7.2, clobbering the
+        # 4.9.3 that sgl-eval's latex2sympy2_extended needs (4.7.2 ImportError
+        # at sgl-eval import). Pin it back so the nightly sgl-eval path works.
+        $PIP_CMD install "antlr4-python3-runtime==4.9.3" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
     $PIP_CMD uninstall xformers || true
 
