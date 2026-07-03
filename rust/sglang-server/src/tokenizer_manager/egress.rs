@@ -4,8 +4,9 @@
 //! the request registered with on ingress — no shared map, no lock.
 //!
 //! The ring carries a 1-byte frame tag: `BATCH` (a whole decode batch, fanned
-//! out here into per-request chunks) or `RESULT` (a single control-request JSON
-//! payload, e.g. `/server_info`).
+//! out here into per-request chunks), `RESULT` (a single control-request JSON
+//! payload, e.g. `/server_info`), or `ERROR` (a terminal per-request failure the
+//! scheduler ingress couldn't decode, routed back as a 400).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 
 use crate::ids::RequestId;
-use crate::message::{EGRESS_TAG_BATCH, EGRESS_TAG_RESULT, decode_batch_frame};
+use crate::message::{EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, decode_batch_frame};
 use crate::runtime::Runnable;
 use crate::runtime::channels::{DetokMsg, Senders};
 use crate::runtime::ring::EgressConsumer;
@@ -72,6 +73,11 @@ impl Runnable for Egress {
                         self.route(rid, msg);
                     }
                 }
+                EGRESS_TAG_ERROR => {
+                    if let Some((rid, msg)) = decode_error(body) {
+                        self.route(rid, msg);
+                    }
+                }
                 other => tracing::warn!(tag = other, "egress: unknown frame tag"),
             }
         }
@@ -100,12 +106,45 @@ fn decode_result(body: &[u8]) -> Option<(RequestId, DetokMsg)> {
     Some((rid, DetokMsg::Result { id: rid, payload }))
 }
 
+/// Per-request failure: `[rid, message]` → terminal `Error` to the sink (→ 400).
+fn decode_error(body: &[u8]) -> Option<(RequestId, DetokMsg)> {
+    let val = rmpv::decode::read_value(&mut &body[..]).ok()?;
+    let arr = val.as_array()?;
+    let rid = parse_rid(arr.first()?.as_str()?)?;
+    let message = arr.get(1)?.as_str()?.to_string();
+    Some((rid, DetokMsg::Fail { id: rid, message }))
+}
+
 fn parse_rid(rid: &str) -> Option<RequestId> {
     match rid.parse::<u64>() {
         Ok(v) => Some(RequestId(v)),
         Err(_) => {
             tracing::warn!(rid = %rid, "egress: unparsable rid");
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::frame_egress_error;
+    use crate::runtime::channels::DetokMsg;
+
+    /// A framed error round-trips: `frame_egress_error` → tag stripped →
+    /// `decode_error` yields the rid + a `Fail` carrying the message.
+    #[test]
+    fn error_frame_roundtrips_to_fail() {
+        let framed = frame_egress_error("42", "invalid request: bad field");
+        assert_eq!(framed[0], EGRESS_TAG_ERROR);
+        let (rid, msg) = decode_error(&framed[1..]).expect("decodes");
+        assert_eq!(rid, RequestId(42));
+        match msg {
+            DetokMsg::Fail { id, message } => {
+                assert_eq!(id, RequestId(42));
+                assert_eq!(message, "invalid request: bad field");
+            }
+            _ => panic!("expected Fail"),
         }
     }
 }
