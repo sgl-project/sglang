@@ -998,6 +998,26 @@ class ModelRunner:
             # would overwrite the target's process-global one.
             return
 
+        if not self.server_args.disable_shared_experts_fusion and hasattr(
+            self.model, "num_fused_shared_experts"
+        ):
+            num_fused_shared_experts = self.model.num_fused_shared_experts
+        else:
+            num_fused_shared_experts = 0
+
+        # Under speculative decoding the decode cuda-graph captures
+        # TARGET_VERIFY with `num_tokens_per_bs` draft tokens per sequence;
+        # size the routed-experts capture buffers for that multi-token layout.
+        if self.spec_algorithm.is_speculative():
+            routed_experts_num_tokens_per_bs = (
+                self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                    self.server_args.speculative_num_draft_tokens,
+                    self.is_draft_worker,
+                )
+            )
+        else:
+            routed_experts_num_tokens_per_bs = 1
+
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
                 model=self.model,
@@ -1005,6 +1025,7 @@ class ModelRunner:
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
+                num_tokens_per_bs=routed_experts_num_tokens_per_bs,
             )
         )
 
@@ -1625,10 +1646,17 @@ class ModelRunner:
 
             # Replay cuda graph if applicable
             if can_run_graph:
-                ret = self.decode_cuda_graph_runner.execute(
-                    forward_batch,
-                    pp_proxy_tensors=pp_proxy_tensors,
+                verify_ctx = (
+                    spec_cycle_profiler.verify_phase(forward_batch)
+                    if forward_batch.forward_mode.is_target_verify()
+                    and spec_cycle_profiler.enabled()
+                    else contextlib.nullcontext()
                 )
+                with verify_ctx:
+                    ret = self.decode_cuda_graph_runner.execute(
+                        forward_batch,
+                        pp_proxy_tensors=pp_proxy_tensors,
+                    )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
@@ -1680,9 +1708,16 @@ class ModelRunner:
                 can_run_graph = True
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
-                ret = self.eager_runner.execute(
-                    forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                verify_ctx = (
+                    spec_cycle_profiler.verify_phase(forward_batch)
+                    if forward_batch.forward_mode.is_target_verify()
+                    and spec_cycle_profiler.enabled()
+                    else contextlib.nullcontext()
                 )
+                with verify_ctx:
+                    ret = self.eager_runner.execute(
+                        forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
 
             if (
                 forward_batch.global_num_tokens_cpu is not None
