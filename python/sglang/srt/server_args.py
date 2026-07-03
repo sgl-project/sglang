@@ -68,7 +68,6 @@ from sglang.srt.utils.common import (
     get_device_sm,
     get_int_env_var,
     get_quantization_config,
-    has_fp8_weights_in_checkpoint,
     human_readable_int,
     is_blackwell_supported,
     is_cpu,
@@ -932,6 +931,7 @@ class ServerArgs:
         Arg(
             help="The attention context parallelism size.",
             aliases=["--attention-context-parallel-size"],
+            model_overridable=True,
         ),
     ] = 1
     moe_dp_size: A[
@@ -966,7 +966,10 @@ class ServerArgs:
     # DP attention
     enable_dp_attention: A[
         bool,
-        "Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported.",
+        Arg(
+            help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported.",
+            model_overridable=True,
+        ),
     ] = False
     enable_dp_attention_local_control_broadcast: A[
         bool,
@@ -974,7 +977,10 @@ class ServerArgs:
     ] = False
     enable_dp_lm_head: A[
         bool,
-        "Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention.",
+        Arg(
+            help="Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention.",
+            model_overridable=True,
+        ),
     ] = False
     enable_attn_tp_input_scattered: A[
         bool,
@@ -1699,6 +1705,7 @@ class ServerArgs:
         Arg(
             help="The expert parallelism size.",
             aliases=["--expert-parallel-size", "--ep"],
+            model_overridable=True,
         ),
     ] = 1
     moe_a2a_backend: A[
@@ -1715,6 +1722,7 @@ class ServerArgs:
         Arg(
             help="Choose the backend for MoE A2A.",
             choices=MOE_A2A_BACKEND_CHOICES,
+            model_overridable=True,
         ),
     ] = "none"
     moe_runner_backend: A[
@@ -1778,7 +1786,10 @@ class ServerArgs:
     ] = None
     moe_dense_tp_size: A[
         Optional[int],
-        "TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
+        Arg(
+            help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
+            model_overridable=True,
+        ),
     ] = None
     elastic_ep_backend: A[
         Literal[None, "mooncake", "nixl"],
@@ -3793,9 +3804,8 @@ class ServerArgs:
                     logger.warning(
                         f"Set dense attention kv len threshold to model index_topk={envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DeepSeek with DSA."
                     )
-                if self.is_attention_backend_not_set():
-                    self.attention_backend = "dsa"
-                    logger.info("Use dsa attention backend for DeepSeek with DSA.")
+                # The "dsa" attention fill moved to the R0 registry
+                # (arg_groups/overrides.py: _deepseek_family_overrides).
 
                 index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
                 index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
@@ -3813,40 +3823,10 @@ class ServerArgs:
 
                 if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
                     if self.enable_prefill_cp:
-                        logger.warning(
-                            "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
-                        )
-                        self.enable_dp_attention = True
-                        self.moe_dense_tp_size = 1
-                        if self.cp_strategy == "zigzag":
-                            self.moe_a2a_backend = "deepep"
-                            self.ep_size = self.tp_size
-                            logger.warning(
-                                "zigzag DSA CP requires moe_dense_tp_size=1, "
-                                "moe_a2a_backend=deepep, ep_size=tp_size, batch_size=1."
-                            )
-                        else:
-                            assert (
-                                self.dp_size == 1
-                            ), "interleave DSA CP does not support DP attention."
-                        assert (
-                            self.tp_size <= 8
-                        ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
-                        # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
-                        # DSACPLayerCommunicator does not all-reduce attention-TP
-                        # partial o_proj outputs before replicated dense FFNs.
-                        self.attn_cp_size = self.tp_size // self.dp_size
+                        # The DSA CP field declarations moved to the R0
+                        # registry (arg_groups/overrides.py:
+                        # _deepseek_family_overrides).
                         self.cuda_graph_config.prefill.backend = Backend.DISABLED
-                        logger.warning(
-                            "Enabled DSA context parallel: "
-                            f"strategy={self.cp_strategy}, dp_size={self.dp_size}, "
-                            f"moe_dense_tp_size={self.moe_dense_tp_size}, "
-                            f"ep_size={self.ep_size}, tp_size={self.tp_size}, "
-                            f"attn_cp_size={self.attn_cp_size}, "
-                            f"kv_cache_dtype={self.kv_cache_dtype}, "
-                            f"moe_a2a_backend={self.moe_a2a_backend}, "
-                            f"cuda_graph_config[prefill].backend=disabled"
-                        )
                     else:
                         # Pure TP and partial DP Attention mode is active for DSA, logging a warning
                         if self.dp_size < self.tp_size:
@@ -3855,25 +3835,8 @@ class ServerArgs:
                                 f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
                             )
 
-                    # Deferred import to avoid a circular import at module-load
-                    # time (dsa.utils imports get_global_server_args).
-                    from sglang.srt.layers.attention.dsa.utils import (
-                        aiter_can_use_preshuffle_paged_mqa,
-                    )
-
-                    if is_hip() and not aiter_can_use_preshuffle_paged_mqa():
-                        # Legacy ROCm DSA path: aiter's gluon paged-MQA kernel is
-                        # unavailable (Triton<3.5 and AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS
-                        # not set, or SGLANG_DSA_HIP_DISABLE_PRESHUFFLE=1 / SGLANG_USE_AITER=0).
-                        self.page_size = 1
-                        logger.warning(
-                            "Setting page size to 1 for DeepSeek DSA on ROCm "
-                            "(aiter preshuffle paged-MQA path unavailable: "
-                            "needs Triton>=3.5.0 or AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1)."
-                        )
-                    else:
-                        self.page_size = 64
-                        logger.warning("Setting page size to 64 for DeepSeek DSA.")
+                    # The DSA page-size selection moved to the R0 registry
+                    # (arg_groups/overrides.py: _deepseek_family_overrides).
 
                     import torch
 
@@ -3891,108 +3854,28 @@ class ServerArgs:
                 if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
                     logger.info("Piecewise CUDA graph is enabled, use MLA for prefill.")
 
-                if is_sm100_supported():
-                    if (
-                        self.attention_backend is None
-                        and self.prefill_attention_backend is None
-                        and self.decode_attention_backend is None
-                    ):
-                        self.attention_backend = "trtllm_mla"
-                        logger.info(
-                            "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
-                        )
+                # The sm100 trtllm_mla fill moved to the R0 registry
+                # (arg_groups/overrides.py: _deepseek_family_overrides).
 
-                # MLA prefill CP auto-config. Mirrors the NSA CP block above
-                # (minus the in-seq/round-robin mode split, which MLA CP does not support)
+                # MLA prefill CP auto-config: the field declarations moved to
+                # the R0 registry (arg_groups/overrides.py:
+                # _deepseek_family_overrides).
                 if self.enable_prefill_cp and self.use_mla_backend():
-                    logger.warning(
-                        "MLA prefill context parallel is still experimental. "
-                        "Verified on Hopper with the fa3 backend."
-                    )
-                    self.enable_dp_attention = True
-                    # TODO(kpham-sgl) Supports moe_dense_tp_size != 1.
-                    self.moe_dense_tp_size = 1
-                    self.moe_a2a_backend = "deepep"
-                    self.ep_size = self.tp_size
-                    logger.warning(
-                        "For MLA CP, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
-                    )
-                    # FIXME(kpham-sgl): Keep attn_tp_size == 1 under MLA CP.
-                    # DSACPLayerCommunicator does not all-reduce attention-TP
-                    # partial o_proj outputs before replicated dense FFNs.
-                    self.attn_cp_size = self.tp_size // self.dp_size
                     self.cuda_graph_config.prefill.backend = Backend.DISABLED
-                    logger.warning(
-                        f"Enable Context Parallel opt for MLA, "
-                        f"Setting dp_size == {self.dp_size} and "
-                        f"attn_cp_size == {self.attn_cp_size}, "
-                        f"moe_dense_tp_size == {self.moe_dense_tp_size}, "
-                        f"ep_size == {self.ep_size}, "
-                        f"tp_size == {self.tp_size}, "
-                        f"moe_a2a_backend {self.moe_a2a_backend}, "
-                        f"cuda_graph_config[prefill].backend=disabled"
-                    )
 
-            # Set moe backend for DeepSeek
-            if is_sm100_supported():
-                quant_method = get_quantization_config(hf_config)
-                quant_cfg = getattr(hf_config, "quantization_config", None) or {}
-                config_groups = quant_cfg.get("config_groups", {})
-                group0 = config_groups.get("group_0", {})
-                weights_cfg = group0.get("weights", {})
-                # this also apply to kimi k2.5
-                # since it follow the compressed tensor int4 recipe
-                # but not kimi k2 instruct or 0905 instruct.
-                is_kimi_k2_k25_thinking_int4 = (
-                    quant_method == "compressed-tensors"
-                    and weights_cfg.get("num_bits") == 4
-                    and weights_cfg.get("group_size") == 32
-                    and weights_cfg.get("strategy") == "group"
-                    and weights_cfg.get("type") == "int"
-                )
-                if (
-                    self.quantization is None
-                    and not self._quantization_explicitly_unset
-                ):
-                    # DeepSeek V3/R1 uses native FP8 MoE experts without
-                    # declaring it in quantization_config.  However, other
-                    # models that share the same architecture class (e.g.
-                    # Moonlight-16B-A3B) are purely BF16.  Check the actual
-                    # safetensors header instead of assuming FP8 by arch name.
-                    if quant_method is None and model_arch in ["DeepseekV3ForCausalLM"]:
-                        if has_fp8_weights_in_checkpoint(self.model_path):
-                            self.quantization = "fp8"
-                            logger.info(
-                                "Detected FP8 expert weights in checkpoint, "
-                                "default to fp8 for DeepSeek on sm100"
-                            )
-                        else:
-                            logger.info(
-                                "No FP8 expert weights found in checkpoint, "
-                                "keeping bf16 for DeepSeek-arch model on sm100"
-                            )
-                    else:
-                        self.quantization = quant_method
-                if (
-                    self.moe_a2a_backend == "none"
-                    and self.moe_runner_backend == "auto"
-                    and (
-                        self.quantization
-                        in ["fp8", "modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
-                        or is_kimi_k2_k25_thinking_int4
-                        or self.quantization is None
-                    )
-                ):
-                    self.moe_runner_backend = "flashinfer_trtllm"
-                    if is_kimi_k2_k25_thinking_int4:
-                        logger.info(
-                            "Use flashinfer_trtllm as MoE runner backend on Blackwell for Kimi K2 / K2.5 thinking int4"
-                        )
-                    else:
-                        logger.info(
-                            "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
-                        )
-            elif is_hip():
+            # Set moe backend for DeepSeek: the sm100 quant/moe resolution
+            # moved to the resolution pipeline (arg_groups/overrides.py:
+            # _deepseek_moe_quant_resolution -- a slot pass, because the DSA
+            # kv-cache-dtype default above must read the pristine
+            # quantization). The HIP arm (fusion log + spec_moe writes, the
+            # latter awaiting the speculative-hook migration) stays below.
+            from sglang.srt.arg_groups.overrides import (
+                _deepseek_moe_quant_resolution,
+                run_post_process_pass,
+            )
+
+            run_post_process_pass(self, _deepseek_moe_quant_resolution)
+            if is_hip():
                 if not self.enable_dp_attention and self.nnodes == 1:
                     # TODO (Hubert): Put this back later
                     # self.enable_aiter_allreduce_fusion = True
@@ -5065,9 +4948,14 @@ class ServerArgs:
         init_cp_strategy(self)
 
     def _handle_data_parallelism(self):
-        if self.dp_size == 1:
-            self.enable_dp_attention = False
-            self.enable_dp_lm_head = False
+        # The dp_size==1 resets moved to the resolution pipeline
+        # (arg_groups/overrides.py: _data_parallelism_defaults).
+        from sglang.srt.arg_groups.overrides import (
+            _data_parallelism_defaults,
+            run_post_process_pass,
+        )
+
+        run_post_process_pass(self, _data_parallelism_defaults)
 
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
@@ -5241,25 +5129,20 @@ class ServerArgs:
             )
 
     def _handle_a2a_moe(self):
-        if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
-            logger.warning(
-                "moe_a2a_backend is overridden to 'deepep' because DeepEP "
-                "Waterfill requires the DeepEP backend."
-            )
-            self.moe_a2a_backend = "deepep"
+        # The backend overrides and the ep_size=tp_size adjustments moved to
+        # the resolution pipeline (arg_groups/overrides.py:
+        # _a2a_backend_overrides / _a2a_ep_size); the per-backend logs,
+        # asserts, fusion/deepep_mode/env/cuda-graph writes stay below.
+        from sglang.srt.arg_groups.overrides import (
+            _a2a_backend_overrides,
+            _a2a_ep_size,
+            run_post_process_pass,
+        )
 
-        if (
-            envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
-            and self.moe_a2a_backend != "megamoe"
-        ):
-            self.moe_a2a_backend = "megamoe"
-            logger.info(
-                "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE is set, "
-                "auto-configuring --moe-a2a-backend megamoe."
-            )
+        run_post_process_pass(self, _a2a_backend_overrides)
+        run_post_process_pass(self, _a2a_ep_size)
 
         if self.moe_a2a_backend == "megamoe":
-            self.ep_size = self.tp_size
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
             logger.info(
@@ -5272,7 +5155,6 @@ class ServerArgs:
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
-            self.ep_size = self.tp_size
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
@@ -5288,19 +5170,16 @@ class ServerArgs:
                 )
 
         if self.moe_a2a_backend == "mooncake":
-            self.ep_size = self.tp_size
             logger.warning(
                 f"Mooncake MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
         if self.moe_a2a_backend == "nixl":
-            self.ep_size = self.tp_size
             logger.warning(
                 f"Nixl MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
         if self.moe_a2a_backend == "ascend_fuseep":
-            self.ep_size = self.tp_size
             logger.warning(
                 f"Ascend fused EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
@@ -5317,7 +5196,6 @@ class ServerArgs:
             assert (
                 self.enable_dp_attention and self.dp_size == self.tp_size
             ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
-            self.ep_size = self.tp_size
             logger.warning(
                 f"Flashinfer MoE A2A is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
@@ -5342,7 +5220,6 @@ class ServerArgs:
             ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass, flashinfer_cutedsl or flashinfer_trtllm_routed moe runner backend"
 
         if self.moe_a2a_backend == "mori":
-            self.ep_size = self.tp_size
             if self.deepep_mode == "auto":
                 self.deepep_mode = "normal"
                 logger.warning("auto set deepep_mode=`normal` for MORI EP")

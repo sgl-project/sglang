@@ -325,6 +325,14 @@ class Flags(_StaticFlags):
     sampling_backend: str | None = None
     page_size: int | None = None
     quantization: str | None = None
+    # Parallel-request fields: flat transitional home, to be re-homed by the
+    # Parallel Parameters Clarification module.
+    enable_dp_attention: bool = False
+    enable_dp_lm_head: bool = False
+    moe_a2a_backend: str = "none"
+    ep_size: int = 1
+    moe_dense_tp_size: int | None = None
+    attn_cp_size: int = 1
 
     def freeze(self) -> None:
         for field in dataclasses.fields(self):
