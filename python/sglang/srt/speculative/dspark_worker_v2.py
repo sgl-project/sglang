@@ -20,6 +20,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -515,6 +516,42 @@ class DSparkWorkerV2(BaseSpecWorker):
                     )
             finally:
                 attn_backend.forward_metadata = old_metadata
+
+    def _materialize_disagg_prefill_hidden_to_draft_kv(
+        self,
+        *,
+        draft_input: DSparkDraftInputV2,
+        batch: ScheduleBatch,
+        prefix_lens: torch.Tensor,
+    ) -> None:
+        hidden = draft_input.hidden_states
+        bs = len(prefix_lens)
+        if hidden.numel() == 0 or bs == 0:
+            return
+        if hidden.dim() != 2 or hidden.shape[0] != bs:
+            logger.warning(
+                "Skip DSpark PD hidden bootstrap due to shape mismatch: "
+                "hidden_shape=%s bs=%s",
+                tuple(hidden.shape),
+                bs,
+            )
+            return
+
+        cache_loc = get_last_loc(
+            self.model_runner.req_to_token_pool.req_to_token,
+            batch.req_pool_indices,
+            prefix_lens,
+        )
+        positions = prefix_lens.to(torch.int64) - 1
+        valid = (prefix_lens > 0) & (cache_loc >= 0)
+        if not valid.any():
+            return
+
+        self._materialize_main_hidden_to_draft_kv(
+            main_hidden=hidden[valid],
+            cache_loc=cache_loc[valid],
+            positions=positions[valid],
+        )
 
     def _write_draft_kv_from_projected_kv(
         self,
@@ -1146,6 +1183,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch_size=bs,
             draft_token_num=block_size,
             device=device,
+        )
+        self._materialize_disagg_prefill_hidden_to_draft_kv(
+            draft_input=draft_input,
+            batch=model_worker_batch,
+            prefix_lens=prefix_lens,
         )
 
         with (

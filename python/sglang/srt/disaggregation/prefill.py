@@ -645,6 +645,19 @@ class SchedulerDisaggregationPrefillMixin:
                     req.hidden_states_tensor = (
                         batch.spec_info.hidden_states[i].cpu().clone()
                     )
+                elif self.spec_algorithm.is_dspark():
+                    req.output_topk_p = None
+                    req.output_topk_index = None
+                    hidden_states = getattr(logits_output, "hidden_states", None)
+                    if hidden_states is None:
+                        req.hidden_states_tensor = None
+                    elif hidden_states.shape[0] == len(batch.reqs):
+                        req.hidden_states_tensor = hidden_states[i].cpu().clone()
+                    elif extend_input_len_per_req is None:
+                        req.hidden_states_tensor = None
+                    else:
+                        offset = sum(extend_input_len_per_req[: i + 1]) - 1
+                        req.hidden_states_tensor = hidden_states[offset].cpu().clone()
                 else:
                     req.hidden_states_tensor = None
                 if req.return_logprob:

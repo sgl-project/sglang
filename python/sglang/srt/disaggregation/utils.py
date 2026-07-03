@@ -381,17 +381,19 @@ class MetadataBuffers:
                     dtype=torch.int32,
                     device="cpu",
                 )
-        # For PD + spec decode
-        if req.hidden_states_tensor is not None:
-            # speculative_eagle_topk should not be greater than 16 currently
+        # For PD + spec decode. EAGLE carries topk + hidden; DSpark only needs
+        # the target hidden row to bootstrap draft-side cache on the decode node.
+        if req.output_topk_p is not None and req.output_topk_index is not None:
             topk = req.output_topk_p.size(0)
-
-            self.output_topk_p[req.metadata_buffer_index, :topk].copy_(
-                req.output_topk_p
-            )
-            self.output_topk_index[req.metadata_buffer_index, :topk].copy_(
-                req.output_topk_index
-            )
+            if topk > 0:
+                # speculative_eagle_topk should not be greater than 16 currently
+                self.output_topk_p[req.metadata_buffer_index, :topk].copy_(
+                    req.output_topk_p
+                )
+                self.output_topk_index[req.metadata_buffer_index, :topk].copy_(
+                    req.output_topk_index
+                )
+        if req.hidden_states_tensor is not None:
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )

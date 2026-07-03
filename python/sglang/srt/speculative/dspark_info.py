@@ -400,6 +400,8 @@ class DSparkDraftInputV2(SpecInput):
 
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
+            if self.hidden_states.numel() > 0:
+                self.hidden_states = self.hidden_states[new_indices]
             if self.transfer_warmup_rounds.numel() > 0:
                 self.transfer_warmup_rounds = self.transfer_warmup_rounds[new_indices]
             self.direct_carry_valid = False
@@ -448,6 +450,12 @@ class DSparkDraftInputV2(SpecInput):
             self.future_indices = torch.cat(
                 [self.future_indices, spec_info.future_indices]
             )
+            if self.hidden_states.numel() == 0:
+                self.hidden_states = spec_info.hidden_states
+            elif spec_info.hidden_states.numel() > 0:
+                self.hidden_states = torch.cat(
+                    [self.hidden_states, spec_info.hidden_states], dim=0
+                )
             self.transfer_warmup_rounds = torch.cat(
                 [self.transfer_warmup_rounds, spec_info.transfer_warmup_rounds],
                 dim=0,
@@ -469,9 +477,14 @@ class DSparkDraftInputV2(SpecInput):
             self.confidence = torch.cat([self.confidence, spec_info.confidence], dim=0)
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p], dim=0)
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index], dim=0)
-        self.hidden_states = torch.cat(
-            [self.hidden_states, spec_info.hidden_states], dim=0
-        )
+        if self.hidden_states.numel() == 0:
+            self.hidden_states = spec_info.hidden_states
+        elif spec_info.hidden_states.numel() == 0:
+            pass
+        else:
+            self.hidden_states = torch.cat(
+                [self.hidden_states, spec_info.hidden_states], dim=0
+            )
         self.transfer_warmup_rounds = torch.cat(
             [self.transfer_warmup_rounds, spec_info.transfer_warmup_rounds], dim=0
         )
