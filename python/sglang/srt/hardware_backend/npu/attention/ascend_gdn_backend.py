@@ -109,6 +109,13 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         self._prepare_mamba_track_metadata(forward_batch)
         self.graph_mode = False
 
+    def _get_conv_weights_t(self, layer: RadixLinearAttention) -> torch.Tensor:
+        w = getattr(layer, "_conv_weights_t", None)
+        if w is None:
+            w = layer.conv_weights.transpose(0, 1).contiguous()
+            layer._conv_weights_t = w
+        return w
+
     def forward_decode(
         self,
         layer: RadixLinearAttention,
@@ -127,7 +134,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         assert isinstance(mixed_qkv, torch.Tensor)
         mixed_qkv = torch.ops.npu.causal_conv1d(
             mixed_qkv,
-            layer.conv_weights.transpose(0, 1).contiguous(),
+            self._get_conv_weights_t(layer),
             conv_states=conv_states,
             bias=layer.bias,
             query_start_loc=query_start_loc,
@@ -222,7 +229,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             )
             mixed_qkv = torch.ops.npu.causal_conv1d(
                 mixed_qkv,
-                layer.conv_weights.transpose(0, 1).contiguous(),
+                self._get_conv_weights_t(layer),
                 conv_states=conv_states,
                 bias=layer.bias,
                 query_start_loc=query_start_loc,
@@ -244,7 +251,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             ].contiguous()
             mixed_qkv = torch.ops.npu.causal_conv1d(
                 mixed_qkv,
-                layer.conv_weights.transpose(0, 1).contiguous(),
+                self._get_conv_weights_t(layer),
                 conv_states=conv_states_for_prefill,
                 bias=layer.bias,
                 query_start_loc=query_start_loc,
