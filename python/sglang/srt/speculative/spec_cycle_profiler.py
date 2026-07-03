@@ -62,7 +62,9 @@ def _emit_cycle(now: float) -> None:
     draft_ms = _pending_draft_ms
     gap1_ms = _pending_gap1_ms if _pending_gap1_ms is not None else float("nan")
     verify_ms = _pending_verify_ms
-    overhead_ms = (now - _prev_verify_end) * 1000.0 if _prev_verify_end else float("nan")
+    overhead_ms = (
+        (now - _prev_verify_end) * 1000.0 if _prev_verify_end else float("nan")
+    )
     cycle_ms = draft_ms + gap1_ms + verify_ms + overhead_ms
     _cycle_ct += 1
     logger.info(

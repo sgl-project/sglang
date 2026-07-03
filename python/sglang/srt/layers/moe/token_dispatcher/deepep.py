@@ -172,7 +172,9 @@ def _log_low_latency_dispatch_inputs(
             f"  topk_weights:  shape={tuple(topk_weights.shape)} dtype={topk_weights.dtype}"
         )
     if num_max_dispatch_tokens_per_rank is not None:
-        parts.append(f"  num_max_dispatch_tokens_per_rank={num_max_dispatch_tokens_per_rank}")
+        parts.append(
+            f"  num_max_dispatch_tokens_per_rank={num_max_dispatch_tokens_per_rank}"
+        )
     if num_experts is not None:
         parts.append(f"  num_experts={num_experts}")
     if expected_m is not None:

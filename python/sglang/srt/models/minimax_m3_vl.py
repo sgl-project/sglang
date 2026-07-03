@@ -216,24 +216,23 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             return
 
         self.capture_aux_hidden_states = True
+        # MiniMaxM3Model.forward captures at layer ENTRY (= previous layer's
+        # output), so to capture layer L's output we must mark layer L+1. Apply
+        # +1 on both paths so EAGLE3 works out-of-the-box even when the draft
+        # config omits ``eagle_aux_hidden_state_layer_ids`` (the upstream
+        # Inferact/MiniMax-M3-EAGLE3 checkpoint does not ship it); otherwise the
+        # default-path layers are off by one and draft accept collapses.
         if layer_ids is None:
             num_layers = self.config.text_config.num_hidden_layers
-            self.model.layers_to_capture = [
-                2,
-                num_layers // 2,
-                num_layers - 3,
-            ]  # Specific layers for EAGLE3 support
-        else:
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            layer_ids = [2, num_layers // 2, num_layers - 3]
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
         # MiniMaxM3Model.forward checks each layer's ``_is_layer_to_capture``
         # attribute (not ``i in layers_to_capture``); set it explicitly so the
         # (hidden, aux) tuple is actually returned during capture-enabled forwards.
         for layer_id in self.model.layers_to_capture:
             if 0 <= layer_id < len(self.model.layers):
-                setattr(
-                    self.model.layers[layer_id], "_is_layer_to_capture", True
-                )
+                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
 
     def forward(
         self,

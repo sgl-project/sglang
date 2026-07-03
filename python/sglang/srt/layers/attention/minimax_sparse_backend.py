@@ -925,7 +925,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     )
                 except Exception as _e:  # noqa: BLE001
                     logger.warning(
-                        "[MiniMax/NPU triton-vs-pytorch] reference compute failed: %s", _e
+                        "[MiniMax/NPU triton-vs-pytorch] reference compute failed: %s",
+                        _e,
                     )
         return idx_o, o
 
@@ -997,9 +998,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_v_bnsd = idx_v_cache
         else:
             idx_kv_heads = idx_k_cache.shape[1]
-            idx_k_bnsd = idx_k_cache.view(
-                num_pages, page_size, idx_kv_heads, idx_dim
-            )
+            idx_k_bnsd = idx_k_cache.view(num_pages, page_size, idx_kv_heads, idx_dim)
             idx_v_bnsd = (
                 None
                 if idx_v_cache is None
@@ -1045,9 +1044,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 self.max_context_len,
             )
         max_cols = self.req_to_token.shape[1]
-        blk_cols = torch.arange(max_blocks, device=q.device, dtype=torch.long) * page_size
+        blk_cols = (
+            torch.arange(max_blocks, device=q.device, dtype=torch.long) * page_size
+        )
         blk_cols = blk_cols.clamp(max=max_cols - 1)
-        token_slots = self.req_to_token[per_query_req][:, blk_cols]  # [bs*ndt, max_blocks]
+        token_slots = self.req_to_token[per_query_req][
+            :, blk_cols
+        ]  # [bs*ndt, max_blocks]
         block_table = (token_slots // page_size).to(torch.int32)
 
         disable_index_value = idx_v_cache is None
@@ -1068,7 +1071,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             topk=self.topk_blocks,
             init_blocks=0,
             local_blocks=0,
-            sm_scale=idx_dim ** -0.5,
+            sm_scale=idx_dim**-0.5,
             score_type=self.score_type,
             disable_index_value=disable_index_value,
         )
@@ -1099,7 +1102,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             seq_lens=per_query_seq_lens,
             block_size=page_size,
             topk_idx=topk_idx,
-            sm_scale=head_dim ** -0.5,
+            sm_scale=head_dim**-0.5,
         )
         return idx_o, o
 
@@ -1177,9 +1180,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             # prefill kernel receives correct cu_seqlens instead of crashing on
             # the None .device access.
             _bs = forward_batch.seq_lens.shape[0]
-            _ndt = self.speculative_num_draft_tokens or (
-                q.shape[0] // max(_bs, 1)
-            )
+            _ndt = self.speculative_num_draft_tokens or (q.shape[0] // max(_bs, 1))
             forward_batch.extend_seq_lens = torch.full(
                 (_bs,),
                 int(_ndt),
@@ -1282,9 +1283,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                             _id = (
                                 0.0
                                 if idx_o_t is None or idx_o is None
-                                else (
-                                    idx_o_t.float() - idx_o.float()
-                                ).abs().max().item()
+                                else (idx_o_t.float() - idx_o.float())
+                                .abs()
+                                .max()
+                                .item()
                             )
                             logger.warning(
                                 "[MiniMax/NPU triton-verify-vs-pytorch] call #%d: "
