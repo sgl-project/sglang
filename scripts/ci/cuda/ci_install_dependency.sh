@@ -202,7 +202,17 @@ install_flashinfer_cubin_wheel() {
     # (flashinfer-ai/flashinfer#3808), so we pull it from the GitHub release
     # instead of PyPI, which would 404 at install_sglang. Delete this function
     # and its call in main() once cubin 0.6.14 lands on PyPI.
-    $PIP_CMD install --no-deps "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.14/flashinfer_cubin-0.6.14-py3-none-any.whl" $PIP_INSTALL_SUFFIX
+    CUBIN_WHEEL_URL="https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.14/flashinfer_cubin-0.6.14-py3-none-any.whl"
+    CUBIN_WHEEL_NAME="flashinfer_cubin-0.6.14-py3-none-any.whl"
+    # Cache on the runner (~/.cache/flashinfer-wheels, same dir as the
+    # jit-cache helper) to avoid re-downloading the ~458 MB wheel every run.
+    CUBIN_CACHE_DIR="${HOME}/.cache/flashinfer-wheels"
+    CUBIN_WHEEL="${CUBIN_CACHE_DIR}/${CUBIN_WHEEL_NAME}"
+    if [ ! -f "$CUBIN_WHEEL" ]; then
+        mkdir -p "$CUBIN_CACHE_DIR"
+        pip download "$CUBIN_WHEEL_URL" -d "$CUBIN_CACHE_DIR"
+    fi
+    $PIP_CMD install --no-deps "$CUBIN_WHEEL" $PIP_INSTALL_SUFFIX
     mark_step_done "${FUNCNAME[0]}"
 }
 
