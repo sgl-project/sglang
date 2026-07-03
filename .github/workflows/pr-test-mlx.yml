@@ -3,32 +3,50 @@ name: PR Test (MLX)
 on:
   pull_request:
     branches: [ main ]
-    types: [opened, synchronize, reopened, labeled]
 
 concurrency:
   group: pr-test-mlx-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-
 jobs:
+  # ==================== Check Changes ==================== #
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      main_package: ${{ steps.filter.outputs.main_package }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            main_package:
+              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
+              - "python/pyproject_other.toml"
+              - "test/**/!(*.md)"
+              - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
+              - ".github/workflows/pr-test-mlx.yml"
+
+  # ==================== PR Gate ==================== #
+  pr-gate:
+    needs: check-changes
+    if: needs.check-changes.outputs.main_package == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+    secrets: inherit
+
   mlx-unit-test:
-    # Label-gated on 'apple-silicon', reusing the repo's run-ci label-gate mechanism
-    # (pr-test-rust.yml). The gate keys on the PR's current label set, so any
-    # event on a labeled PR re-runs the tests and a later unrelated label can't
-    # mask a prior result. The non-pull_request clause covers push / dispatch.
-    if: |
-      github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'apple-silicon')
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.main_package == 'true'
     runs-on: macos-26
     timeout-minutes: 60
     env:
       SGLANG_IS_IN_CI: true
-      # use_mlx() needs this var (and mlx importable); without it the profiler
-      # takes the MPS branch and the MLX capture path goes untested.
+      # use_mlx() needs this; without it the profiler takes the MPS branch.
       SGLANG_USE_MLX: 1
-      # Forbid HF downloads so the model-free guarantee is enforced, not assumed.
+      # Forbid HF downloads to enforce the model-free guarantee.
       HF_HUB_OFFLINE: 1
     steps:
       - name: Checkout code
@@ -54,9 +72,7 @@ jobs:
         timeout-minutes: 30
         run: |
           test -f python/pyproject_other.toml || { echo "alt pyproject_other.toml missing"; exit 1; }
-          # Swap in the Apple Silicon project metadata, then install the srt_mps
-          # extra (mlx, mlx-lm, runtime_common, torch) into an isolated uv venv.
-          # The all_mps diffusion chain is not needed here.
+          # Swap in the Apple Silicon pyproject; srt_mps skips the all_mps diffusion chain.
           rm -f python/pyproject.toml
           mv python/pyproject_other.toml python/pyproject.toml
           uv venv
@@ -71,10 +87,6 @@ jobs:
       - name: Run model-free MLX unit tests
         timeout-minutes: 15
         run: |
-          # Model-free MLX unit tests via pytest, like MUSA's unit-test jobs
-          # (its model and server suites use run_suite.py). None load a model:
-          # signature contracts, mocked Metal capture, dummy ServerArgs patching,
-          # and quant-config dicts.
           uv run python -m pytest -v \
             test/registered/unit/hardware_backend/mlx/test_runner_init_contract.py \
             test/registered/unit/hardware_backend/mlx/test_metal_profiler.py \
