@@ -36,6 +36,10 @@ from sglang.srt.observability.trace import (
     TraceSliceContext,
     get_global_tracing_enabled,
 )
+from sglang.srt.observability.trace_async import (
+    TraceReqContextAsync,
+    is_async_tracing_available,
+)
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -276,13 +280,22 @@ class ReqTimeStatsBase:
         bootstrap_room: Optional[int],
         external_trace_header: Optional[Dict[str, str]] = None,
     ):
-        self.trace_ctx = TraceReqContext(
-            rid=rid,
-            bootstrap_room=bootstrap_room,
-            role=self.disagg_mode_str(),
-            module_name="request",
-            external_trace_header=external_trace_header,
-        )
+        if is_async_tracing_available():
+            self.trace_ctx = TraceReqContextAsync(
+                rid=rid,
+                bootstrap_room=bootstrap_room,
+                role=self.disagg_mode_str(),
+                module_name="request",
+                external_trace_header=external_trace_header,
+            )
+        else:
+            self.trace_ctx = TraceReqContext(
+                rid=rid,
+                bootstrap_room=bootstrap_room,
+                role=self.disagg_mode_str(),
+                module_name="request",
+                external_trace_header=external_trace_header,
+            )
 
         if not self.trace_ctx.tracing_enable:
             self.trace_ctx = TraceNullContext()
@@ -329,8 +342,12 @@ class ReqTimeStatsBase:
         trace_ctx_state = state.get("trace_ctx")
         if isinstance(trace_ctx_state, dict):
             if trace_ctx_state.get("tracing_enable"):
-                trace_ctx = object.__new__(TraceReqContext)
-                trace_ctx.__setstate__(trace_ctx_state)
+                if trace_ctx_state.get("is_async"):
+                    trace_ctx = object.__new__(TraceReqContextAsync)
+                    trace_ctx.__setstate__(trace_ctx_state)
+                else:
+                    trace_ctx = object.__new__(TraceReqContext)
+                    trace_ctx.__setstate__(trace_ctx_state)
                 state["trace_ctx"] = trace_ctx
             else:
                 state["trace_ctx"] = TraceNullContext()
@@ -1233,3 +1250,15 @@ def set_time_batch(
             method(ts)
         else:
             method(ts, attrs)
+
+
+def flush_trace_batch(reqs: List[Any]):
+    """Proactively flush buffered trace ops for a batch of requests.
+
+    Call at natural CPU/GPU overlap points (e.g., right before run_batch)
+    so the ZMQ send overlaps with GPU forward compute.
+    """
+    if reqs is None or not get_global_tracing_enabled():
+        return
+    for req in reqs:
+        req.time_stats.trace_ctx.flush()

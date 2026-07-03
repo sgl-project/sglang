@@ -232,6 +232,7 @@ from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
+    flush_trace_batch,
     set_schedule_time_batch,
     set_time_batch,
 )
@@ -3426,6 +3427,9 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        # Flush async trace ops here: in overlap mode this CPU work runs while
+        # the next batch's GPU forward is in flight, giving free overlap.
+        flush_trace_batch(batch.reqs)
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():

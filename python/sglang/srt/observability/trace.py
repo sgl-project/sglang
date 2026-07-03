@@ -115,10 +115,29 @@ class TraceThreadContext:
 
 
 class TraceCustomIdGenerator(id_generator.IdGenerator):
+    """Custom ID generator with support for pre-setting the next span ID.
+
+    Why custom IDs are needed:
+      The default IdGenerator may produce duplicate trace IDs across
+      multiple TP scheduler processes.
+
+    Preset mechanism (used by async tracing):
+      When SGLANG_TRACE_ASYNC=1, span creation is deferred to an exporter
+      process while the caller process needs to know span IDs in advance
+      for cross-process span linking.  The caller pre-generates a span ID
+      and sends it to the exporter.  Before calling tracer.start_span(),
+      the exporter calls preset_next_span_id(id) — the next
+      generate_span_id() call consumes it, then falls back to random
+      generation.  This avoids modifying the standard OTel start_span()
+      API while giving the caller full control over span IDs.
+
+      Thread-safety: _preset_local is a threading.local(), so concurrent
+      callers in different threads cannot interfere.  The exporter process
+      is single-threaded, so no additional locking is needed.
     """
-    The default IdGenerator may produce duplicate trace IDs across multiple TP scheduler processes,
-    hence a custom IdGenerator is implemented.
-    """
+
+    # Thread-local storage for the next span ID to use preset.
+    _preset_local = threading.local()
 
     def __init__(self):
         super().__init__()
@@ -129,11 +148,29 @@ class TraceCustomIdGenerator(id_generator.IdGenerator):
         return self.local_random.getrandbits(64)
 
     def generate_span_id(self) -> int:
+        # If a preset span ID was injected, consume it (one-shot).
+        preset = getattr(self._preset_local, "span_id", None)
+        if preset is not None:
+            self._preset_local.span_id = None
+            return preset
         return self.local_random.getrandbits(64)
+
+    @classmethod
+    def preset_next_span_id(cls, span_id: int):
+        """Inject a pre-generated span ID for the next start_span() call.
+
+        The ID is consumed exactly once by generate_span_id() and then
+        cleared.  Call this immediately before tracer.start_span().
+        """
+        cls._preset_local.span_id = span_id
 
 
 # global variables
 threads_info: Dict[int, TraceThreadInfo] = {}
+
+# Optional callback invoked when a new thread registers its trace info.
+# Used by trace_async to forward thread info to the exporter process.
+_on_thread_info_set = None
 
 get_cur_time_ns = lambda: int(time.time() * 1e9)
 if hasattr(time, "time_ns"):
@@ -213,6 +250,12 @@ def process_tracing_init(
     opentelemetry_initialized = True
     tracer = trace.get_tracer("sglang server")
 
+    # Auto-start async trace exporter when SGLANG_TRACE_ASYNC=1
+    if os.environ.get("SGLANG_TRACE_ASYNC", "0") == "1":
+        from sglang.srt.observability.trace_async import start_trace_exporter
+
+        start_trace_exporter(otlp_endpoint, server_name, trace_modules=trace_modules)
+
 
 def get_global_tracing_enabled():
     return opentelemetry_initialized
@@ -256,6 +299,9 @@ def trace_set_thread_info(
         dp_rank=dp_rank,
         pp_rank=pp_rank,
     )
+
+    if _on_thread_info_set is not None:
+        _on_thread_info_set(threads_info[pid])
 
 
 class TraceReqContext:
@@ -444,7 +490,7 @@ class TraceReqContext:
         copied.trace_level = self.trace_level
         copied.module_name = self.module_name
         copied.is_copy = True  # Mark as copy
-        copied.pid = self.pid
+        copied.pid = None
 
         # thread_context is None, will be rebuilt via rebuild_thread_context()
         copied.thread_context = None
@@ -467,11 +513,14 @@ class TraceReqContext:
 
         return copied
 
-    def rebuild_thread_context(self, ts: Optional[int] = None):
+    def rebuild_thread_context(
+        self, ts: Optional[int] = None, pid: Optional[int] = None
+    ):
         if not self.tracing_enable:
             return
 
         ts = ts or get_cur_time_ns()
+        self.pid = pid if pid is not None else threading.get_native_id()
         self.thread_context = self.__create_thread_context(ts)
 
     def trace_req_start(
@@ -760,6 +809,9 @@ class TraceReqContext:
 
             self.thread_context.thread_span.end(end_time=ts)
         self.thread_context = None
+
+    def flush(self):
+        pass
 
     def __del__(self):
         self.abort(abort_info={"reason": "have unclosed span, auto closed"})

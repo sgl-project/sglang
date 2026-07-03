@@ -181,6 +181,8 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_PROFILE_RECORD_SHAPES` | Set `record_shapes` option (bool) for PyTorch profiler (record shapes) | `true` |
 | `SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS` | Config BatchSpanProcessor.schedule_delay_millis if tracing is enabled | `500` |
 | `SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE` | Config BatchSpanProcessor.max_export_batch_size if tracing is enabled | `64` |
+| `SGLANG_TRACE_ASYNC` | Enable async tracing: span creation is offloaded to a dedicated exporter process via ZMQ, reducing OTel overhead on the inference hot path | `false` |
+| `SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD` | Number of buffered trace operations before an automatic flush to the exporter process | `100` |
 
 ## Storage & Caching
 
