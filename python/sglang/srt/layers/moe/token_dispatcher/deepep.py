@@ -399,68 +399,103 @@ class _DeepEPDispatcherImplBase:
         self.set_deepep_dispatcher_dtype()
 
     def set_deepep_dispatcher_dtype(self) -> None:
+        # 1. Resolve the initial desired output dtype
         self.deepep_output_dtype = get_deepep_output_dtype(self)
 
-        # Configuration mapping for each dtype
-        config_map = {
-            DispatcherOutputDtype.BF16: {
-                "use_fp8": False,
-                "use_nvfp4": False,
-            },
-            DispatcherOutputDtype.FP8: {
-                "use_fp8": True,
-                "use_nvfp4": False,
-            },
-            # Needed for Ascend A2/A3 NPU case,
-            # despite the use_fp8 flag,
-            # quantization will be performed in int8
-            DispatcherOutputDtype.INT8: {
-                "use_fp8": True,
-                "use_nvfp4": False,
-            },
-            DispatcherOutputDtype.NVFP4: {
-                "use_fp8": False,
-                "use_nvfp4": True,
-            },
-        }
-
-        # Validate and apply hardware-specific adjustments
+        # 2. Validate and adjust dtype according to hardware capabilities
         self._validate_and_adjust_dtype()
 
-        # Apply configuration
-        config = config_map[self.deepep_output_dtype]
-        self.use_fp8 = config["use_fp8"]
-        self.use_nvfp4 = config["use_nvfp4"]
+        # 3. Always set use_fp8 / use_nvfp4 / fp8_configs
+        self._apply_low_latency_quantization_flags()
 
-        # Handle environment variables
-        if _is_npu:
-            self._update_int8_quant_env()
+        # 4. NPU quant tensor for normal dispatch (only on Ascend)
+        if _is_npu and (self.deepep_mode.enable_normal()):
+            self.npu_quant_tensor = self._get_npu_normal_quant_tensor()
+        else:
+            self.npu_quant_tensor = None
+
+    def _apply_low_latency_quantization_flags(self) -> None:
+        """Set use_fp8, use_nvfp4, and fp8_configs from the resolved output dtype."""
+        dtype = self.deepep_output_dtype
+        self.fp8_configs = dict()
+
+        if dtype == DeepEPOutputDtype.BF16:
+            self.use_fp8 = False
+            self.use_nvfp4 = False
+        elif dtype == DeepEPOutputDtype.FP8:
+            self.use_fp8 = True
+            self.use_nvfp4 = False
+            self.fp8_configs = dict(
+                round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+            )
+        elif dtype == DeepEPOutputDtype.INT8:
+            self.use_fp8 = True
+            self.use_nvfp4 = False
+            self.fp8_configs = dict(round_scale=False, use_ue8m0=False)
+        elif dtype == DeepEPOutputDtype.NVFP4:
+            self.use_fp8 = False
+            self.use_nvfp4 = True
+        elif dtype in (
+            DeepEPOutputDtype.MXFP8_e4m3fn,
+            DeepEPOutputDtype.MXFP8_e5m2,
+        ):
+            self.use_fp8 = True
+            self.use_nvfp4 = False
+            self.fp8_configs = dict(round_scale=True, use_ue8m0=True)
+        elif dtype == DeepEPOutputDtype.MXFP4_e2m1fn_x2:
+            # Ascend NPU supports MXFP4 only in normal dispatch mode
+            if isinstance(self, _DeepEPDispatcherImplLowLatency):
+                raise ValueError(
+                    "Ascend does not support MXFP4_e2m1fn_x2 quantization in low_latency mode"
+                )
+            self.use_fp8 = False
+            self.use_nvfp4 = False
+        else:
+            raise ValueError(f"Unsupported DeepEP output dtype: {dtype}")
+
+    def _get_npu_normal_quant_tensor(self):
+        """
+        Build a reference tensor of the quantisation data type used on NPU.
+        Returns None if no quantisation is required (e.g., bf16).
+        """
+        dtype = self.deepep_output_dtype
+        if dtype == DeepEPOutputDtype.BF16:
+            return None
+        elif dtype == DeepEPOutputDtype.INT8:
+            return torch.tensor([], dtype=torch.int8, device="npu")
+        elif dtype == DeepEPOutputDtype.MXFP8_e4m3fn:
+            return torch.tensor([], dtype=torch.float8_e4m3fn, device="npu")
+        elif dtype == DeepEPOutputDtype.MXFP8_e5m2:
+            return torch.tensor([], dtype=torch.float8_e5m2, device="npu")
+        elif dtype == DeepEPOutputDtype.MXFP4_e2m1fn_x2:
+            return torch.tensor([], dtype=torch.float4_e2m1fn_x2, device="npu")
+        else:
+            raise RuntimeError(f"Unexpected output dtype for NPU quant tensor: {dtype}")
 
     def _validate_and_adjust_dtype(self) -> None:
         """Validate dtype against hardware and adjust if necessary."""
         if _is_npu:
-            if self.deepep_output_dtype == DispatcherOutputDtype.FP8:
+            if self.deepep_output_dtype == DeepEPOutputDtype.FP8:
                 logger.warning_once(
                     "Ascend A2/A3 NPU does not support fp8 "
                     "deepep_dispatcher_output_dtype, switching to int8..."
                 )
-                self.deepep_output_dtype = DispatcherOutputDtype.INT8
-            elif self.deepep_output_dtype == DispatcherOutputDtype.NVFP4:
+                self.deepep_output_dtype = DeepEPOutputDtype.INT8
+            elif self.deepep_output_dtype == DeepEPOutputDtype.NVFP4:
                 raise RuntimeError(
                     "Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype."
                 )
         else:
-            if self.deepep_output_dtype == DispatcherOutputDtype.INT8:
+            if self.deepep_output_dtype == DeepEPOutputDtype.INT8:
                 logger.warning_once(
                     "GPU does not support int8 "
                     "deepep_dispatcher_output_dtype, switching to fp8..."
                 )
-                self.deepep_output_dtype = DispatcherOutputDtype.FP8
+                self.deepep_output_dtype = DeepEPOutputDtype.FP8
             # NVFP4 is supported on GPU, no adjustment needed
-
-    def _update_int8_quant_env(self) -> None:
-        """TODO adapt different quantization schemes for base model and draft model on NPU"""
-        pass
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
