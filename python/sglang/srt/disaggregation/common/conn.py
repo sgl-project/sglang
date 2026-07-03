@@ -145,15 +145,10 @@ class CommonKVManager(BaseKVManager):
         hybrid_mla_needs_all_cp_ranks = self.is_hybrid_mla_backend and (
             self.attn_cp_size > 1 or disaggregation_mode == DisaggregationMode.DECODE
         )
-
-        layer_split_needs_all_cp_ranks = (
-            getattr(server_args, "enable_dsa_cache_layer_split", False)
-            and self.attn_cp_size > 1
-        )
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
             or hybrid_mla_needs_all_cp_ranks
-            or layer_split_needs_all_cp_ranks
+            or (server_args.enable_dsa_cache_layer_split and self.attn_cp_size > 1)
         )
 
         # bind zmq socket
@@ -346,8 +341,9 @@ class CommonKVManager(BaseKVManager):
             target_cp_ranks = [self.attn_cp_rank]
         else:
             target_cp_ranks = list(range(info.attn_cp_size))
-            pull_from_all_cp_ranks = self.enable_all_cp_ranks_for_transfer or getattr(
-                info, "enable_dsa_cache_layer_split", False
+            pull_from_all_cp_ranks = (
+                self.enable_all_cp_ranks_for_transfer
+                or info.enable_dsa_cache_layer_split
             )
             if not pull_from_all_cp_ranks:
                 # Only retrieve from prefill CP rank 0 when not using all ranks

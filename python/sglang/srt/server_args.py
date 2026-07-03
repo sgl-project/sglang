@@ -949,7 +949,7 @@ class ServerArgs:
     # Split DSA GPU KV/indexer cache layers across CP ranks.
     enable_dsa_cache_layer_split: A[
         bool,
-        "Split DSA (DeepSeek Sparse Attention) GPU KV/indexer cache layers across context-parallel ranks to reduce per-rank KV memory.",
+        "Split DSA (DeepSeek Sparse Attention) GPU KV/indexer cache layers across context-parallel ranks to reduce per-rank KV memory. Currently only supported with the mooncake transfer backend (mooncake / mooncake_tcp); mori/nixl support will be added later by the community.",
     ] = False
     enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
     dsa_prefill_cp_mode: A[str, Arg(no_cli=True)] = "round-robin-split"
@@ -3868,6 +3868,20 @@ class ServerArgs:
                         "--enable-prefill-cp and --cp-strategy interleave "
                         "(or legacy --enable-nsa-prefill-context-parallel with "
                         "--nsa-prefill-cp-mode round-robin-split)."
+                    )
+                # Layer split relies on the mooncake all-CP-rank KV/indexer
+                # transfer path. mori/nixl support is a temporary limitation
+                # and will be added later by the community.
+                if (
+                    self.enable_dsa_cache_layer_split
+                    and self.disaggregation_transfer_backend != "mooncake"
+                ):
+                    raise ValueError(
+                        "--enable-dsa-cache-layer-split currently only supports "
+                        "the mooncake transfer backend (mooncake / mooncake_tcp). "
+                        f"Got --disaggregation-transfer-backend "
+                        f"{self.disaggregation_transfer_backend!r}. mori/nixl "
+                        "support will be added later by the community."
                     )
 
             else:
