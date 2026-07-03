@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -344,3 +344,27 @@ class DSparkDraftInputV2(SpecInput):
         self.hidden_states = torch.cat(
             [self.hidden_states, spec_info.hidden_states], dim=0
         )
+
+
+def validate_dspark_request(req: Req) -> Optional[str]:
+    if req.return_logprob:
+        return "DSpark speculative decoding does not support return_logprob yet."
+
+    # DSpark consumes and nulls the target hidden states in both prefill and
+    # decode, so they can never be returned. This is unconditional, unlike
+    # DFLASH's overlap-gated rule.
+    if req.return_hidden_states:
+        return "DSpark speculative decoding does not support return_hidden_states yet."
+
+    if (
+        req.sampling_params.json_schema is not None
+        or req.sampling_params.regex is not None
+        or req.sampling_params.ebnf is not None
+        or req.sampling_params.structural_tag is not None
+    ):
+        return (
+            "DSpark speculative decoding does not support "
+            "grammar-constrained decoding yet."
+        )
+
+    return None

@@ -178,5 +178,53 @@ class TestDSparkDraftInputBatch(CustomTestCase):
         self.assertEqual(len(a.bonus_tokens), 1)
 
 
+class TestDSparkRequestValidation(CustomTestCase):
+    """validate_dspark_request rejects features DSpark cannot serve and accepts a
+    plain request. Kept import-light: requests are duck-typed namespaces."""
+
+    def setUp(self):
+        try:
+            from sglang.srt.speculative.dspark_info import validate_dspark_request
+        except Exception as e:  # pragma: no cover - GPU-only deps on some runners
+            self.skipTest(f"dspark_info unavailable on this runner: {e}")
+        self.validate = validate_dspark_request
+
+    @staticmethod
+    def _make_req(**overrides):
+        sampling = SimpleNamespace(
+            json_schema=None, regex=None, ebnf=None, structural_tag=None
+        )
+        base = dict(
+            return_logprob=False,
+            return_hidden_states=False,
+            sampling_params=sampling,
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def test_accepts_plain_request(self):
+        self.assertIsNone(self.validate(self._make_req()))
+
+    def test_rejects_return_logprob(self):
+        msg = self.validate(self._make_req(return_logprob=True))
+        self.assertIsNotNone(msg)
+        self.assertIn("return_logprob", msg)
+
+    def test_rejects_return_hidden_states(self):
+        msg = self.validate(self._make_req(return_hidden_states=True))
+        self.assertIsNotNone(msg)
+        self.assertIn("return_hidden_states", msg)
+
+    def test_rejects_grammar_constrained(self):
+        for field_name in ("json_schema", "regex", "ebnf", "structural_tag"):
+            sampling = SimpleNamespace(
+                json_schema=None, regex=None, ebnf=None, structural_tag=None
+            )
+            setattr(sampling, field_name, "x")
+            msg = self.validate(self._make_req(sampling_params=sampling))
+            self.assertIsNotNone(msg, field_name)
+            self.assertIn("grammar", msg)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=3)
