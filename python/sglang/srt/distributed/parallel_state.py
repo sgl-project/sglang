@@ -250,6 +250,7 @@ class GroupCoordinator:
     )
     # communicators are only created for world size > 1
     pynccl_comm: Optional[Any]  # PyNccl communicator
+    pyxccl_comm: Optional[Any]  # PyXccl (XPU oneCCL) communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
     torch_symm_mem_comm: Optional[Any]  # Torch symm mem communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
@@ -359,6 +360,9 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.pymscclpp import (
             PyMscclppCommunicator,
         )
+        from sglang.srt.distributed.device_communicators.pyxccl import (
+            PyXcclCommunicator,
+        )
         from sglang.srt.distributed.device_communicators.pynccl import (
             PyNcclCommunicator,
         )
@@ -388,6 +392,41 @@ class GroupCoordinator:
                 group=self.cpu_group,
                 device=self.device,
             )
+
+        # pyxccl is the XPU counterpart of pynccl: it calls Intel oneCCL directly
+        # instead of routing collectives through torch.distributed's XCCL
+        # backend. It is OFF by default (XPU uses torch.distributed / XCCL) and
+        # opted into via SGLANG_ENABLE_PYXCCL=1 — the path to use when the torch
+        # build has no usable XCCL backend. Once initialized it is the live
+        # collective path in both eager and graph modes (so, unlike pynccl, it
+        # is not gated behind graph_capture's change_state toggle).
+        self.pyxccl_comm: Optional[PyXcclCommunicator] = None
+        if (
+            _is_xpu
+            and use_xpu_communicator
+            and self.world_size > 1
+            and envs.SGLANG_ENABLE_PYXCCL.get()
+        ):
+            self.pyxccl_comm = PyXcclCommunicator(
+                group=self.cpu_group,
+                device=self.device,
+            )
+            if self.pyxccl_comm.disabled:
+                # The user explicitly opted into pyxccl (SGLANG_ENABLE_PYXCCL=1),
+                # typically because torch.distributed / XCCL is unavailable, so
+                # a silent fallback is not appropriate. Fail loudly with setup
+                # guidance instead.
+                raise RuntimeError(
+                    "SGLANG_ENABLE_PYXCCL=1 was set but PyXcclCommunicator "
+                    "failed to initialize, so XPU tensor parallelism (tp>1) "
+                    "cannot run. Set up pyxccl + oneCCL correctly (see "
+                    "docs/platforms/xpu.pyxccl.md), point SGLANG_PYXCCL_SO_PATH "
+                    "at a SYCL-built libccl.so.1, and ensure the required OFI "
+                    "environment variables (CCL_ATL_TRANSPORT=ofi, "
+                    "FI_PROVIDER_PATH) are set. To use torch.distributed "
+                    "instead, unset SGLANG_ENABLE_PYXCCL (requires a torch build "
+                    "with a working XCCL backend)."
+                )
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
         if use_pymscclpp and self.world_size > 1:
@@ -610,9 +649,9 @@ class GroupCoordinator:
             # an opaque call and does not decompose it into _c10d_functional primitives
             # (which invoke sycl_event.wait() and break XPU graph capture).
             # Keeps the operation in-place; the all-reduce is performed by
-            # _all_reduce_in_place, which for XPU falls through to
-            # torch.distributed.all_reduce on self.device_group (the same group
-            # used by xpu_communicator).
+            # _all_reduce_in_place, which for XPU uses torch.distributed on
+            # self.device_group by default and only calls pyxccl_comm.all_reduce
+            # (direct oneCCL) when it is enabled (SGLANG_ENABLE_PYXCCL=1).
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
@@ -771,6 +810,10 @@ class GroupCoordinator:
         return out
 
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
+        pyxccl_comm = self.pyxccl_comm
+        if pyxccl_comm is not None and not pyxccl_comm.disabled:
+            pyxccl_comm.all_reduce(input_)
+            return
         pynccl_comm = self.pynccl_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
@@ -826,6 +869,10 @@ class GroupCoordinator:
         output: torch.Tensor,
         input: torch.Tensor,
     ) -> torch.Tensor:
+        pyxccl_comm = self.pyxccl_comm
+        if pyxccl_comm is not None and not pyxccl_comm.disabled:
+            pyxccl_comm.reduce_scatter(output, input)
+            return output
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
@@ -980,6 +1027,11 @@ class GroupCoordinator:
             else:
                 ca_comm.all_gather_unreg(input, out=output, dim=0)
                 return
+
+        pyxccl_comm = self.pyxccl_comm
+        if pyxccl_comm is not None and not pyxccl_comm.disabled:
+            pyxccl_comm.all_gather(output, input)
+            return
 
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (
@@ -1228,6 +1280,10 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
         # Broadcast.
+        pyxccl_comm = self.pyxccl_comm
+        if pyxccl_comm is not None and not pyxccl_comm.disabled:
+            pyxccl_comm.broadcast(input_, src=src)
+            return input_
         torch.distributed.broadcast(
             input_, src=self.ranks[src], group=self.device_group
         )
@@ -1580,6 +1636,10 @@ class GroupCoordinator:
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
 
+        pyxccl_comm = self.pyxccl_comm
+        if pyxccl_comm is not None and not pyxccl_comm.disabled:
+            pyxccl_comm.send(tensor, dst)
+            return
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.send(tensor, dst)
@@ -1595,6 +1655,10 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
 
         tensor = torch.empty(size, dtype=dtype, device=self.device)
+        pyxccl_comm = self.pyxccl_comm
+        if pyxccl_comm is not None and not pyxccl_comm.disabled:
+            pyxccl_comm.recv(tensor, src)
+            return tensor
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.recv(tensor, src)
@@ -1611,6 +1675,9 @@ class GroupCoordinator:
             self.cpu_group = None
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
+        if self.pyxccl_comm is not None:
+            self.pyxccl_comm.destroy()
+            self.pyxccl_comm = None
         if self.pymscclpp_comm is not None:
             self.pymscclpp_comm.destroy()
         if self.ca_comm is not None:

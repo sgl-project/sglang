@@ -1003,6 +1003,20 @@ class Envs:
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
+    # XPU oneCCL (pyxccl) direct-binding communicator. pyxccl is the XPU
+    # counterpart of pynccl: it calls Intel oneCCL directly, bypassing
+    # torch.distributed. It is OFF by default (XPU collectives use
+    # torch.distributed's XCCL backend); set SGLANG_ENABLE_PYXCCL=1 to route XPU
+    # tp>1 collectives through oneCCL directly. This is the path to use when the
+    # torch build has no usable XCCL backend. SGLANG_PYXCCL_SO_PATH points at an
+    # explicit libccl.so.1 (SYCL-built oneCCL v2 with the oneccl* C shim),
+    # otherwise the loader falls back to the dynamic-linker default.
+    SGLANG_ENABLE_PYXCCL = EnvBool(False)
+    SGLANG_PYXCCL_SO_PATH = EnvStr(None)
+    # Debug: when set, PyXcclCommunicator logs every collective call
+    # (all_reduce/all_gather/reduce_scatter/broadcast/send/recv) so you can
+    # confirm at runtime that collectives flow through the oneCCL path.
+    SGLANG_DEBUG_PYXCCL = EnvBool(False)
 
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
