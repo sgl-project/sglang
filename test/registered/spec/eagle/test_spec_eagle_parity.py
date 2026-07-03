@@ -26,6 +26,7 @@ _is_xpu = is_xpu()
 class _Eagle3ParityBase(Eagle3Base):
     """Shared knobs for EAGLE3 parity variants; no test methods."""
 
+    enable_deterministic_inference = True
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
