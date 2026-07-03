@@ -43,6 +43,7 @@ from sglang.srt.utils.common import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_musa,
     is_npu,
     is_sm90_supported,
     is_sm100_supported,
@@ -380,6 +381,53 @@ def _lfm2_overrides(server_args: Any, hf_config: Any) -> dict:
     return {}
 
 
+@_register_for(
+    "Qwen3NextForCausalLM",
+    "Qwen3_5MoeForConditionalGeneration",
+    "InternS2PreviewForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
+)
+def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
+    if not is_sm100_supported() or server_args.attention_backend is not None:
+        return {}
+    sm100_default_attn_backend = "triton"
+    # trtllm_mha requires speculative_eagle_topk == 1 and page_size > 1.
+    # _get_default_attn_backend handles the eagle_topk check.
+    # There is only one case where page_size=1 is required,
+    # which is when radix cache is enabled and both extra_buffer
+    # and spec decoding are disabled.
+    default_attn_backend = server_args._get_default_attn_backend(
+        use_mla_backend=server_args.use_mla_backend(),
+        model_config=server_args.get_model_config(),
+    )
+    if default_attn_backend == "trtllm_mha" and not (
+        not server_args.enable_mamba_extra_buffer()
+        and not server_args.disable_radix_cache
+        and server_args.speculative_algorithm is None
+    ):
+        sm100_default_attn_backend = "trtllm_mha"
+    return {
+        "attention_backend": sm100_default_attn_backend,
+        "page_size": 64 if sm100_default_attn_backend == "trtllm_mha" else 1,
+    }
+
+
+@_register_for("Qwen3VLForConditionalGeneration")
+def _qwen3vl_overrides(server_args: Any, hf_config: Any) -> dict:
+    from sglang.srt.environ import envs
+
+    if (
+        is_hip()
+        and envs.SGLANG_USE_AITER_UNIFIED_ATTN.get()
+        and server_args.page_size is None
+    ):
+        logger.info(
+            "Setting page_size=16 for aiter unified attention on Qwen3VLForConditionalGeneration."
+        )
+        return {"page_size": 16}
+    return {}
+
+
 @_register_for("Glm4MoeForCausalLM")
 def _glm4_moe_overrides(server_args: Any, hf_config: Any) -> dict:
     logger.info(
@@ -538,6 +586,72 @@ def _attention_backend_default(view: Any) -> dict:
 
 
 @register_post_process
+def _mla_backend_page_constraints(view: Any) -> dict:
+    """Page-size constraints of the MLA/TRTLLM backend family (the raises and
+    the cutedsl prefill fallback stay in the handler; only the page snaps are
+    declared). The snaps chain on a local value exactly as the legacy blocks
+    chained on self.page_size."""
+    page_size = view.page_size
+    if (
+        view.attention_backend == "flashmla"
+        or view.decode_attention_backend == "flashmla"
+    ):
+        logger.warning(
+            "FlashMLA only supports a page_size of 64, change page_size to 64."
+        )
+        page_size = 64
+    if (
+        view.attention_backend == "cutlass_mla"
+        or view.decode_attention_backend == "cutlass_mla"
+    ):
+        logger.warning(
+            "Cutlass MLA only supports a page_size of 128, change page_size to 128."
+        )
+        page_size = 128
+    if (
+        view.attention_backend == "trtllm_mla"
+        or view.decode_attention_backend == "trtllm_mla"
+    ):
+        if page_size not in [32, 64]:
+            logger.warning(
+                f"TensorRT-LLM MLA only supports page_size of 32 or 64, changing page_size from {page_size} to 64."
+            )
+            page_size = 64
+    if (
+        view.attention_backend == "tokenspeed_mla"
+        or view.decode_attention_backend == "tokenspeed_mla"
+    ):
+        if page_size not in [32, 64]:
+            logger.warning(
+                f"tokenspeed_mla only supports page_size of 32 or 64, changing page_size from {page_size} to 64."
+            )
+            page_size = 64
+    if (
+        view.attention_backend == "cutedsl_mla"
+        or view.decode_attention_backend == "cutedsl_mla"
+        or view.prefill_attention_backend == "cutedsl_mla"
+    ):
+        if page_size not in [32, 64]:
+            logger.warning(
+                f"CuteDSL MLA only supports page_size of 32 or 64, changing page_size from {page_size} to 64."
+            )
+            page_size = 64
+    if (
+        view.attention_backend == "trtllm_mha"
+        or view.decode_attention_backend == "trtllm_mha"
+        or view.prefill_attention_backend == "trtllm_mha"
+    ):
+        if page_size not in [16, 32, 64]:
+            logger.warning(
+                f"TensorRT-LLM MHA only supports page_size of 16, 32 or 64, changing page_size from {page_size} to 64."
+            )
+            page_size = 64
+    if page_size != view.page_size:
+        return {"page_size": page_size}
+    return {}
+
+
+@register_post_process
 def _attention_backend_fa3_fp8_fallback(view: Any) -> dict:
     if view.attention_backend == "fa3" and view.kv_cache_dtype == "fp8_e5m2":
         logger.warning(
@@ -545,6 +659,28 @@ def _attention_backend_fa3_fp8_fallback(view: Any) -> dict:
             "Setting attention backend to triton."
         )
         return {"attention_backend": "triton"}
+    return {}
+
+
+@register_post_process
+def _fa4_page_constraint(view: Any) -> dict:
+    if (
+        (
+            view.attention_backend == "fa4"
+            or view.decode_attention_backend == "fa4"
+            or view.prefill_attention_backend == "fa4"
+        )
+        and not view.use_mla_backend()
+        and is_sm100_supported()
+        # EAGLE topk>1 spec runs the two-pass page-tree cascade, which the FA4
+        # CUTLASS kernel aborts on at page_size>1. That path only works at
+        # page_size==1, so skip the 128 auto-force for it and keep the default.
+        and (view.speculative_eagle_topk or 0) <= 1
+    ):
+        logger.warning(
+            f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {view.page_size} to 128."
+        )
+        return {"page_size": 128}
     return {}
 
 
@@ -572,6 +708,24 @@ def _attention_backend_platform_fallbacks(view: Any) -> dict:
 
 
 @register_post_process
+def _intel_xpu_page_constraint(view: Any) -> dict:
+    _, decode_backend = view.get_attention_backends()
+    if decode_backend == "intel_xpu":
+        if view.use_mla_backend():
+            supported_page_sizes = [16, 32, 64, 128]
+            msg = "Intel XPU attention backend for MLA Decode"
+        else:
+            supported_page_sizes = [64, 128]
+            msg = "Intel XPU attention backend"
+        if view.page_size not in supported_page_sizes:
+            logger.warning(
+                f"{msg} only supports page_sizes of {supported_page_sizes}, changing page_size from {view.page_size} to 128."
+            )
+            return {"page_size": 128}
+    return {}
+
+
+@register_post_process
 def _attention_backend_dual_chunk(view: Any) -> dict:
     if (
         getattr(view.get_model_config().hf_config, "dual_chunk_attention_config", None)
@@ -586,6 +740,30 @@ def _attention_backend_dual_chunk(view: Any) -> dict:
                 f"{view.attention_backend}. Please set it to 'dual_chunk_flash_attn'."
             )
     return {}
+
+
+@register_post_process
+def _page_size_default(view: Any) -> dict:
+    if view.page_size is not None:
+        return {}
+    from sglang.srt.environ import envs
+
+    # SHUFFLE 5D vectorized KV layout (aiter backend + pa_decode_gluon)
+    # is tuned for and prefers page_size=64 — making it the default
+    # when the layout flag is set avoids users having to pass
+    # --page-size 64 explicitly. The env var is only consumed by the
+    # ROCm AITER backend, so the auto-bump is gated on HIP; on other
+    # platforms the SHUFFLE 5D pool has no consumer kernels and the
+    # env var is silently ignored (see MHATokenToKVPool).
+    if is_hip() and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d":
+        logger.info(
+            "Setting page_size=64 as default for "
+            "SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d."
+        )
+        return {"page_size": 64}
+    if not is_musa():
+        return {"page_size": 1}
+    return {"page_size": 64}
 
 
 @register_post_process
@@ -610,6 +788,21 @@ def _dllm_attention_backend(view: Any) -> dict:
                 "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
             )
             return {"attention_backend": "flashinfer"}
+    return {}
+
+
+@register_post_process
+def _dllm_page_size(view: Any) -> dict:
+    if view.dllm_algorithm is None or view.disable_radix_cache:
+        return {}
+    from sglang.srt.dllm.config import DllmConfig
+
+    config = DllmConfig.from_server_args(view)
+    if view.page_size % config.block_size != 0:
+        logger.warning(
+            f"Setting page size to {config.block_size} for diffusion LLM inference"
+        )
+        return {"page_size": config.block_size}
     return {}
 
 
