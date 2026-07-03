@@ -934,6 +934,28 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.AUDIO:
                 audios[idx] = result
 
+        if images:
+            # Detect whether images are split across CPU and GPU.
+            # If mixed, move all GPU tensors to CPU for consistency.
+            has_gpu = has_cpu = False
+            for img in images:
+                if isinstance(img, torch.Tensor) and img.device.type == "cuda":
+                    has_gpu = True
+                else:
+                    has_cpu = True
+                if has_gpu and has_cpu:
+                    break
+
+            if has_gpu and has_cpu:
+                images = [
+                    (
+                        img.cpu()
+                        if isinstance(img, torch.Tensor) and img.device.type == "cuda"
+                        else img
+                    )
+                    for img in images
+                ]
+
         logger.debug(
             "[load_mm_data(simple)] loaded counts: images=%d, videos=%d, audios=%d",
             len(images),
