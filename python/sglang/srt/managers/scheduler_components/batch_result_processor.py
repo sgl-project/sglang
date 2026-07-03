@@ -893,7 +893,7 @@ class SchedulerBatchResultProcessor:
 
         req.mamba_last_track_seqlen = track_seqlen
         if lazy:
-            self.mamba_lazy_post_decode_at_boundary(req, batch)
+            self.mamba_lazy_post_decode_at_boundary(req, batch, i)
         else:
             req.mamba_next_track_idx = (
                 batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
@@ -929,7 +929,9 @@ class SchedulerBatchResultProcessor:
 
         return False, 0
 
-    def mamba_lazy_post_decode_at_boundary(self, req: Req, batch: ScheduleBatch):
+    def mamba_lazy_post_decode_at_boundary(
+        self, req: Req, batch: ScheduleBatch, i: int
+    ):
         """Post-decode cleanup at a lazy-mode track boundary.
 
         Finished reqs: if prealloc failed (other slot is -1), the forward
@@ -941,7 +943,10 @@ class SchedulerBatchResultProcessor:
         Running reqs: free the old ping-pong slot so we go back to
         holding only 1 slot until the next boundary.
         """
-        other_idx = 1 - req.mamba_next_track_idx
+        track_idx = batch.mamba_track_buffer_indices[i]
+        req.mamba_last_track_idx = track_idx
+        req.mamba_next_track_idx = track_idx
+        other_idx = 1 - track_idx
         other_val = req.mamba_ping_pong_track_buffer[other_idx].item()
         if other_val != -1:
             pool = batch.req_to_token_pool

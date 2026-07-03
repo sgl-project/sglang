@@ -998,7 +998,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
         In normal mode it is at the "other" index (swapped after each track).
         """
         if self.enable_mamba_extra_buffer_lazy:
-            return req.mamba_next_track_idx
+            return (
+                req.mamba_last_track_idx
+                if req.mamba_last_track_idx is not None
+                else req.mamba_next_track_idx
+            )
         return self.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)
 
     def _alloc_ping_pong_buffer(self, req: Req):
@@ -1026,6 +1030,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         buf[:n] = slots
         req.mamba_ping_pong_track_buffer = buf
         req.mamba_next_track_idx = 0
+        req.mamba_last_track_idx = 0
 
     def set_mamba_ping_pong_slot(self, req: Req, idx: int, value):
         """Update a ping-pong slot value and sync the device-side mapping.
@@ -1114,6 +1119,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             # tensor on the req side while the new pool slot leaks).
             req.mamba_ping_pong_track_buffer = None
             req.mamba_next_track_idx = None
+            req.mamba_last_track_idx = None
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")

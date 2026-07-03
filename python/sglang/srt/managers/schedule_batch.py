@@ -794,6 +794,7 @@ class Req(ReqDllmMixin):
         self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
         self.mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
         self.mamba_next_track_idx: Optional[int] = None  # 0 or 1
+        self.mamba_last_track_idx: Optional[int] = None  # 0 or 1
         self.mamba_last_track_seqlen: Optional[int] = (
             None  # seq len of the last cached mamba state
         )
@@ -1463,6 +1464,7 @@ class Req(ReqDllmMixin):
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
+        self.mamba_last_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
         self.mamba_cow_src_index = None
@@ -1573,9 +1575,11 @@ def set_mamba_track_indices_from_reqs(batch):
     all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
         batch.req_pool_indices
     ]  # (bs, ping_pong_size), int64, on device
+    track_buffer_indices = [req.mamba_next_track_idx for req in batch.reqs]
+    batch.mamba_track_buffer_indices = track_buffer_indices
     idx = (
         torch.tensor(
-            [req.mamba_next_track_idx for req in batch.reqs],
+            track_buffer_indices,
             dtype=torch.int64,
             pin_memory=True,
         )
@@ -1759,6 +1763,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For hybrid GDN prefix cache
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
+    mamba_track_buffer_indices: Optional[List[int]] = None  # shape: [b], 0 or 1
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
@@ -2339,6 +2344,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req.mamba_next_track_idx
                     )
                 )
+            else:
+                req.mamba_last_track_idx = req.mamba_next_track_idx
             if req.mamba_branching_seqlen is not None:
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
@@ -2680,6 +2687,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.mamba_track_indices = torch.empty(
                     (0,), dtype=torch.int64, device=self.device
                 )
+                self.mamba_track_buffer_indices = []
             else:
                 if get_global_server_args().enable_mamba_extra_buffer_lazy():
                     self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
@@ -2747,6 +2755,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
 
         self.mamba_track_indices = None
+        self.mamba_track_buffer_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
         self.mamba_cow_src_indices = None
@@ -2804,6 +2813,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.mamba_track_indices = None
+        self.mamba_track_buffer_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
         if self.return_logprob and other.return_logprob:
@@ -2858,6 +2868,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
             mamba_track_indices=self.mamba_track_indices,
+            mamba_track_buffer_indices=(
+                self.mamba_track_buffer_indices[:]
+                if self.mamba_track_buffer_indices is not None
+                else None
+            ),
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
