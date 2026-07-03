@@ -26,6 +26,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    SetLoraReq,
+    UnmergeLoraWeightsReq,
+)
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
@@ -201,6 +205,23 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             [False, True, True] * 2,
         )
         self.assertEqual([req.save_output for req in reqs], [False] * 6)
+
+    def test_lightweight_warmup_result_ignores_control_requests(self):
+        scheduler = _make_bare_scheduler(enable_cfg_parallel=False)
+
+        self.assertFalse(
+            scheduler._should_return_lightweight_warmup_result(SetLoraReq("test"))
+        )
+        self.assertFalse(
+            scheduler._should_return_lightweight_warmup_result(UnmergeLoraWeightsReq())
+        )
+
+    def test_lightweight_warmup_result_returns_internal_prewarm(self):
+        scheduler = _make_bare_scheduler(enable_cfg_parallel=False)
+        req = _make_generation_req()
+        req.extra["server_internal_prewarm"] = True
+
+        self.assertTrue(scheduler._should_return_lightweight_warmup_result(req))
 
     def test_req_based_warmup_remains_explicit_legacy_entry(self):
         scheduler = _make_bare_scheduler(enable_cfg_parallel=False)
