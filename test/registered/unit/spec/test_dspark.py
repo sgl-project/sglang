@@ -36,7 +36,9 @@ class TestDSparkPredicates(CustomTestCase):
     def test_capability_predicates(self):
         self.assertTrue(self.algo.supports_target_verify_for_draft())
         self.assertTrue(self.algo.has_draft_kv())
-        self.assertTrue(self.algo.carries_draft_hidden_states())
+        # DSpark hands target context to its draft via KV materialization, never
+        # through spec_info.hidden_states, so it does not carry draft hidden states.
+        self.assertFalse(self.algo.carries_draft_hidden_states())
         self.assertFalse(self.algo.need_topk())
 
     def test_from_string_resolves(self):
@@ -144,30 +146,27 @@ class TestDSparkDraftInputBatch(CustomTestCase):
         self.torch = torch
         self.cls = DSparkDraftInputV2
 
-    def _make(self, bs, with_cur=True):
+    def _make(self, bs):
         t = self.torch
         return self.cls(
             bonus_tokens=t.arange(bs, dtype=t.int64),
             new_seq_lens=t.full((bs,), 10, dtype=t.int64),
-            cur_allocated_seq_lens_cpu=(
-                t.full((bs,), 12, dtype=t.int32) if with_cur else None
-            ),
         )
 
-    def test_merge_then_filter_asymmetric_cur_allocated(self):
-        a = self._make(2, with_cur=True)
-        b = self._make(1, with_cur=False)
+    def test_merge_then_filter_concatenates_and_indexes(self):
+        a = self._make(2)
+        b = self._make(1)
         a.merge_batch(b)
         self.assertEqual(len(a.bonus_tokens), 3)
-        self.assertIsNone(a.cur_allocated_seq_lens_cpu)
+        self.assertEqual(len(a.new_seq_lens), 3)
         a.filter_batch(self.torch.tensor([0, 2], dtype=self.torch.int64))
         self.assertEqual(len(a.bonus_tokens), 2)
 
-    def test_filter_batch_indexes_cur_allocated(self):
-        a = self._make(4, with_cur=True)
+    def test_filter_batch_indexes_tensors(self):
+        a = self._make(4)
         a.filter_batch(self.torch.tensor([1, 3], dtype=self.torch.int64))
         self.assertEqual(a.bonus_tokens.tolist(), [1, 3])
-        self.assertEqual(len(a.cur_allocated_seq_lens_cpu), 2)
+        self.assertEqual(a.new_seq_lens.tolist(), [10, 10])
 
     def test_overlap_placeholders_inert_without_future_indices(self):
         a = self._make(2)

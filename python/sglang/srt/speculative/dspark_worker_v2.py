@@ -233,17 +233,19 @@ class DSparkWorkerV2(BaseSpecWorker):
         verify_out_cache_loc: torch.Tensor,
         prefix_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
-        reserved_seq_lens_cpu: Optional[torch.Tensor] = None,
-        reserved_seq_lens_sum: Optional[int] = None,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
+        seq_lens_sum: Optional[int] = None,
     ) -> torch.Tensor:
         device = self.device
-        if reserved_seq_lens_cpu is not None:
-            seq_lens_cpu = reserved_seq_lens_cpu
-        else:
+        # Host seq lengths must be committed (mirror the committed device
+        # seq_lens=prefix_lens), not the reserved over-allocation:
+        # DeepseekV4AttnBackend.init_forward_metadata adds +block itself for
+        # TARGET_VERIFY, so committed+block is the true verify extent. Passing the
+        # reserved (committed + 2*block) host bound would overshoot the allocated
+        # req_to_token range by one block.
+        if seq_lens_cpu is None:
             seq_lens_cpu = prefix_lens.to(device="cpu", dtype=torch.int32)
-        if reserved_seq_lens_sum is not None:
-            seq_lens_sum = int(reserved_seq_lens_sum)
-        else:
+        if seq_lens_sum is None:
             seq_lens_sum = int(seq_lens_cpu.sum().item())
         draft_block_spec_info = DSparkVerifyInput(
             draft_token=block_ids.reshape(-1),
@@ -329,12 +331,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         *,
         bonus_tokens: torch.Tensor,
         seq_lens: torch.Tensor,
-        cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> DSparkDraftInputV2:
         return DSparkDraftInputV2(
             bonus_tokens=bonus_tokens.to(dtype=torch.int64),
             new_seq_lens=seq_lens.to(dtype=torch.int64),
-            cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
         )
 
     def _make_next_draft_input_decode(
@@ -342,12 +342,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         *,
         bonus_tokens: torch.Tensor,
         new_seq_lens: torch.Tensor,
-        cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> DSparkDraftInputV2:
         return DSparkDraftInputV2(
             bonus_tokens=bonus_tokens.to(dtype=torch.int64),
             new_seq_lens=new_seq_lens.to(dtype=torch.int64),
-            cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
         )
 
     def forward_batch_generation(
@@ -433,7 +431,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch_output.next_draft_input = self._make_next_draft_input_prefill(
             bonus_tokens=next_token_ids,
             seq_lens=model_worker_batch.seq_lens,
-            cur_allocated_seq_lens_cpu=model_worker_batch.seq_lens_cpu,
         )
         verify_done = torch.get_device_module(device).Event()
         verify_done.record()
@@ -492,8 +489,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_out_cache_loc=verify_out_cache_loc,
             prefix_lens=prefix_lens,
             req_pool_indices=req_pool_indices,
-            reserved_seq_lens_cpu=draft_input.reserved_seq_lens_cpu,
-            reserved_seq_lens_sum=draft_input.reserved_seq_lens_sum,
+            seq_lens_cpu=model_worker_batch.seq_lens_cpu,
+            seq_lens_sum=model_worker_batch.seq_lens_sum,
         )
 
         candidates, confidence = self._refine_block_markov(
@@ -630,7 +627,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         next_draft_input = self._make_next_draft_input_decode(
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
-            cur_allocated_seq_lens_cpu=draft_input.reserved_seq_lens_cpu,
         )
         verify_done = torch.get_device_module(device).Event()
         verify_done.record()

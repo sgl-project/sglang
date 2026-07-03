@@ -200,8 +200,27 @@ class DeepseekV4DSparkModel(nn.Module):
         return self.collapse_block_hidden(hidden_states)
 
 
+DSPARK_DEFAULT_NUM_LAYERS = 3
+_warned_dspark_num_layers_fallback = False
+
+
 def get_dspark_num_layers(config: PretrainedConfig) -> int:
-    return int(getattr(config, "dspark_num_layers", 0) or 3)
+    # `dspark_num_layers` is a genuinely-optional HF config key; the released
+    # DeepSeek-V4 DSpark checkpoints set it explicitly. This is the single source
+    # of truth for the draft depth; fall back to DSPARK_DEFAULT_NUM_LAYERS only
+    # when the key is absent or non-positive.
+    num_layers = getattr(config, "dspark_num_layers", None)
+    if num_layers is None or int(num_layers) <= 0:
+        global _warned_dspark_num_layers_fallback
+        if not _warned_dspark_num_layers_fallback:
+            _warned_dspark_num_layers_fallback = True
+            logger.warning(
+                "DSpark draft config has no positive dspark_num_layers; "
+                "falling back to %d layers.",
+                DSPARK_DEFAULT_NUM_LAYERS,
+            )
+        return DSPARK_DEFAULT_NUM_LAYERS
+    return int(num_layers)
 
 
 class DeepseekV4ForCausalLMDSpark(DeepseekV4ForCausalLM):

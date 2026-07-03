@@ -130,8 +130,11 @@ class SpeculativeAlgorithm(Enum):
 
     def carries_draft_hidden_states(self) -> bool:
         """Whether the disagg prefill->decode transfer carries draft hidden
-        states (EAGLE-family and DSpark; STANDALONE's vanilla draft ignores them)."""
-        return self.is_eagle() or self.is_dspark()
+        states (EAGLE-family only). STANDALONE's vanilla draft ignores them, and
+        DSpark hands the target context to its draft via KV materialization, never
+        through spec_info.hidden_states, so it matches spec_need_hidden_states()==False.
+        """
+        return self.is_eagle()
 
     def create_future_map(
         self,
