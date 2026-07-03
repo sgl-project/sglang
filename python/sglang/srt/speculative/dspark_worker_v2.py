@@ -1238,11 +1238,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                         "falling back to SWA-only materialization: %s",
                         e,
                     )
-                self._clear_unaccepted_c128_draft_states(
-                    batch=model_worker_batch,
-                    prefix_lens=prefix_lens,
-                    commit_lens=commit_lens,
-                )
+            self._clear_unaccepted_c128_draft_states(
+                batch=model_worker_batch,
+                prefix_lens=prefix_lens,
+                commit_lens=commit_lens,
+            )
             commit_mask = (
                 self._block_pos_offsets.unsqueeze(0)
                 < commit_lens.unsqueeze(1).to(torch.int64)
