@@ -281,6 +281,10 @@ class _StaticFlags(_FlagGroupBase):
 class AttnFlags(_StaticFlags):
     """Attention-family resolved flags (leaves arrive with the V3 sweeps)."""
 
+    # Resolved attention backend; the pristine user request stays on
+    # server_args.attention_backend.
+    backend: str | None = None
+
 
 @dataclasses.dataclass
 class MoeFlags(_StaticFlags):
@@ -327,8 +331,10 @@ class Flags(_StaticFlags):
 # Resolved-config field name → dotted flag-leaf path (e.g. a V3 sweep adds
 # "use_mla_backend": "attn.use_mla_backend"). Fields not listed default to a
 # flat leaf of the same name on the Flags container. Populated per field
-# family as readers migrate; empty in the skeleton.
-FLAG_LEAF_MAP: dict[str, str] = {}
+# family as readers migrate.
+FLAG_LEAF_MAP: dict[str, str] = {
+    "attention_backend": "attn.backend",
+}
 
 
 def resolve_flag_leaf(
