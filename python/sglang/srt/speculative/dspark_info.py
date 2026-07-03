@@ -142,6 +142,10 @@ class DSparkDraftInputV2(SpecInput):
     new_seq_lens: torch.Tensor
     main_hidden: Optional[torch.Tensor] = None
     confidence: Optional[torch.Tensor] = None
+    # Per-decode-step top-k scalars, precomputed in prepare_for_decode so the
+    # sampling-verify helper avoids a GPU->CPU .item() sync (mirrors DFlash).
+    max_top_k: int = 1
+    uniform_top_k_value: Optional[int] = None
     verify_done: Optional[torch.cuda.Event] = None
     cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None
     reserved_seq_lens_cpu: Optional[torch.Tensor] = None
@@ -199,6 +203,9 @@ class DSparkDraftInputV2(SpecInput):
         committed_sum = 0
         reserved_sum = 0
         num_needed_tokens = 0
+        max_top_k = 1
+        uniform_top_k_value = None
+        uniform_top_k = True
         for i, req in enumerate(batch.reqs):
             committed_len = int(req.kv_committed_len)
             if cur_alloc is not None and i < len(cur_alloc):
@@ -212,6 +219,14 @@ class DSparkDraftInputV2(SpecInput):
             committed_sum += committed_len
             reserved_sum += reserved_len
             num_needed_tokens += reserved_len - cur_alloc_len
+
+            top_k = int(req.sampling_params.top_k)
+            if top_k > max_top_k:
+                max_top_k = top_k
+            if i == 0:
+                uniform_top_k_value = top_k
+            elif uniform_top_k and top_k != uniform_top_k_value:
+                uniform_top_k = False
 
         cur_kv_lens = cur_kv_lens_cpu.to(device, non_blocking=True)
         nxt_kv_lens = nxt_kv_lens_cpu.to(device, non_blocking=True)
@@ -250,6 +265,8 @@ class DSparkDraftInputV2(SpecInput):
         batch.seq_lens_sum = committed_sum
         self.reserved_seq_lens_cpu = nxt_kv_lens_cpu
         self.reserved_seq_lens_sum = reserved_sum
+        self.max_top_k = max(max_top_k, 1)
+        self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         cpu_indices = new_indices.cpu()

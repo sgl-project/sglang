@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -116,6 +117,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._block_pos_offsets = torch.arange(
             self.block_size, device=self.device, dtype=torch.int64
         )
+        self._sampling_verify_logged = False
 
         if self.tp_rank == 0:
             logger.info(
@@ -533,14 +535,41 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
         ):
+            if self.tp_rank == 0 and not self._sampling_verify_logged:
+                self._sampling_verify_logged = True
+                logger.info(
+                    "DSpark target-only sampling verify is engaged for "
+                    "temperature>0 requests."
+                )
             accept_len, sampled_bonus = (
                 compute_dflash_sampling_correct_drafts_and_bonus(
                     candidates=candidates,
                     next_token_logits=logits_output.next_token_logits,
                     sampling_info=sampling_info,
+                    max_top_k=draft_input.max_top_k,
+                    uniform_top_k_value=draft_input.uniform_top_k_value,
                 )
             )
+            # TP consistency: per-rank float nondeterminism in softmax/top_k/top_p
+            # can select different sampled tokens on each rank; broadcast rank 0's
+            # accept length and bonus token so every rank commits identical tokens
+            # and seq_lens stay in lockstep (diverging lengths hang later
+            # collectives). DSpark rejects dp_attention, so use the plain TP group.
+            if get_tensor_model_parallel_world_size() > 1:
+                packed = torch.stack(
+                    [accept_len.to(torch.int64), sampled_bonus.to(torch.int64)],
+                    dim=0,
+                )
+                get_tp_group().broadcast(packed, src=0)
+                accept_len, sampled_bonus = packed[0], packed[1]
             accept_len = accept_len.to(torch.int64)
+            # Losslessness under confidence truncation: the sampling-verify kernel
+            # already accepted `accept_len` drafts against the target distribution.
+            # When confidence truncates to correct_len < accept_len, the draft at
+            # candidates[correct_len + 1] is exactly the token the kernel accepted
+            # at that position (prob p(t)); emitting it as the bonus composes with
+            # the kernel's rejection-residual (target minus the rejected mass) to
+            # reproduce the target distribution, so truncation stays lossless.
             correct_len = torch.minimum(accept_len, confident_prefix.to(torch.int64))
             truncated = correct_len < accept_len
             next_draft = (
