@@ -461,6 +461,39 @@ class Lfm2ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        """Return (input_dim, output_dim) of a LoRA target module, per layer type.
+
+        LFM2 is a hybrid model: `config.layer_types[layer_idx]` is either
+        "full_attention" (Lfm2Attention: qkv_proj/out_proj) or "conv"
+        (Lfm2ShortConv: in_proj/out_proj). The generic fallback in lora/utils.py
+        only knows llama-style names, so out_proj/in_proj need this method.
+        """
+        config = self.config
+        hidden_size = config.hidden_size
+        is_attention = config.layer_types[layer_idx] == "full_attention"
+        head_dim = getattr(config, "head_dim", None) or (
+            hidden_size // config.num_attention_heads
+        )
+        if module_name == "qkv_proj":
+            return hidden_size, head_dim * (
+                config.num_attention_heads + config.num_key_value_heads * 2
+            )
+        elif module_name == "out_proj":
+            if is_attention:
+                return head_dim * config.num_attention_heads, hidden_size
+            return hidden_size, hidden_size  # conv mixer: hidden -> hidden
+        elif module_name == "in_proj":
+            return hidden_size, hidden_size * 3  # conv mixer: B, C, x gates
+        elif module_name == "gate_up_proj":
+            return hidden_size, config.intermediate_size * 2
+        elif module_name == "down_proj":
+            return config.intermediate_size, hidden_size
+        else:
+            raise NotImplementedError(
+                f"get_hidden_dim not implemented for {module_name}"
+            )
+
     @torch.no_grad()
     def forward(
         self,
