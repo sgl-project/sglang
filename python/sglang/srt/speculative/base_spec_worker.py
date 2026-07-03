@@ -156,13 +156,6 @@ class EagleDraftWorkerBase(ABC):
             forward_batch
         )
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
-            if gpu_only:
-                # DSA draft-extend eager fallback needs host-side lengths for
-                # metadata planning. Keep graph replay sync-free.
-                forward_batch.extend_seq_lens_cpu = [num_draft_tokens] * bs
-                forward_batch.extend_prefix_lens_cpu = batch.prefix_lens.tolist()
-                forward_batch.seq_lens_cpu = forward_batch.seq_lens.cpu()
-                forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
             # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
             # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch
