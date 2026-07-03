@@ -8,7 +8,6 @@ import torch.nn.functional as F
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
-    tensor_model_parallel_all_gather,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -37,6 +36,143 @@ from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_loc
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
 logger = logging.getLogger(__name__)
+
+# Masked-out (vocab-padding) logit columns are pushed to -inf, which maps to the
+# smallest radix key, so a padding column can never win the shard-local argmax.
+_DSPARK_NEG_INF = float("-inf")
+
+
+def _dspark_pack_value_index(
+    values: torch.Tensor, global_indices: torch.Tensor
+) -> torch.Tensor:
+    """Pack a bf16 value and its global vocab index into one positive int64 whose
+    natural order is lexicographic (value DESC, index ASC), so a MAX reduction
+    across shards reproduces torch.argmax's first-index tie-break.
+
+    The 16-bit order-preserving radix key of the bf16 value goes in bits [32, 48)
+    and the index goes in bits [0, 32) inverted (0xFFFFFFFF - idx) so the smallest
+    index wins ties. key16 < 2**16 keeps the packed value < 2**48, i.e. a positive
+    signed int64.
+    """
+    # Bitcast bf16 -> int16 -> int64 (sign-extended), then apply the IEEE
+    # order-preserving flip: set the sign bit for non-negative values, invert all
+    # bits for negative values, and keep only the unsigned low 16 bits.
+    bits = values.view(torch.int16).to(torch.int64)
+    mask = (bits >> 15) | 0x8000
+    key16 = (bits ^ mask) & 0xFFFF
+    inv_index = 0xFFFFFFFF - global_indices
+    return (key16 << 32) | inv_index
+
+
+def _dspark_decode_index(packed: torch.Tensor) -> torch.Tensor:
+    """Recover the winning global vocab index from a packed int64 produced by
+    _dspark_pack_value_index."""
+    return 0xFFFFFFFF - (packed & 0xFFFFFFFF)
+
+
+def _dspark_shard_argmax_pack(
+    refined_shard: torch.Tensor,
+    org_vocab_start: int,
+    pad_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Shard-local argmax packed for a cross-shard MAX reduction. Returns one
+    packed int64 per row (see _dspark_pack_value_index).
+
+    Adding 0.0 collapses -0.0 to +0.0 so the packed order matches torch.argmax,
+    which treats +0.0 and -0.0 as equal; the row-slice max over the bf16 shard is
+    bit-identical to the same columns of a full-vocab argmax (matmul rows are
+    independent and max is associative), so shard-max-then-MAX-reduce equals the
+    full-vocab argmax.
+    """
+    refined = refined_shard + 0.0
+    if pad_mask is not None:
+        refined = refined.masked_fill(pad_mask, _DSPARK_NEG_INF)
+    local_val, local_arg = refined.max(dim=-1)
+    global_indices = local_arg.to(torch.int64) + org_vocab_start
+    return _dspark_pack_value_index(local_val, global_indices)
+
+
+class _DSparkRefineRefs:
+    """Static references and precomputed shard geometry shared by the eager and
+    cuda-graph-captured Markov refine paths (see _refine_block_markov_sharded)."""
+
+    def __init__(
+        self,
+        *,
+        norm,
+        lm_head_weight,
+        markov_w1,
+        markov_w2_weight,
+        confidence_head,
+        org_vocab_start,
+        pad_mask,
+        block_size,
+        tp_size,
+        tp_group_device,
+        use_confidence,
+    ):
+        self.norm = norm
+        self.lm_head_weight = lm_head_weight
+        self.markov_w1 = markov_w1
+        self.markov_w2_weight = markov_w2_weight
+        self.confidence_head = confidence_head
+        self.org_vocab_start = int(org_vocab_start)
+        self.pad_mask = pad_mask
+        self.block_size = int(block_size)
+        self.tp_size = int(tp_size)
+        self.tp_group_device = tp_group_device
+        self.use_confidence = bool(use_confidence)
+
+
+def _refine_block_markov_sharded(
+    block_hidden: torch.Tensor,
+    seeds: torch.Tensor,
+    refs: _DSparkRefineRefs,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Collective-free block Markov refine.
+
+    Each iteration computes a vocab-shard of the refined logits (sharded base
+    logits + sharded Markov bias from the replicated w1 lookup), takes a
+    shard-local argmax, and under TP resolves the global argmax with a single
+    tiny int64 MAX all-reduce (skipped at tp_size==1). Returns the block
+    candidates [bs, block_size] and the per-position confidence [bs, block_size]
+    (or None when the confidence head is gated off).
+    """
+    bs = int(block_hidden.shape[0])
+    block_size = refs.block_size
+    out_tokens = torch.empty(
+        (bs, block_size + 1), dtype=torch.int64, device=block_hidden.device
+    )
+    out_tokens[:, 0] = seeds.view(-1).to(torch.int64)
+    markov_embeds = [] if refs.use_confidence else None
+
+    normed_hidden = refs.norm(block_hidden)
+    base_shard = F.linear(normed_hidden, refs.lm_head_weight)
+    for i in range(block_size):
+        prev_embed = refs.markov_w1(out_tokens[:, i])
+        bias_shard = F.linear(prev_embed, refs.markov_w2_weight)
+        refined_shard = base_shard[:, i] + bias_shard
+        packed = _dspark_shard_argmax_pack(
+            refined_shard, refs.org_vocab_start, refs.pad_mask
+        )
+        if refs.tp_size > 1:
+            torch.distributed.all_reduce(
+                packed,
+                op=torch.distributed.ReduceOp.MAX,
+                group=refs.tp_group_device,
+            )
+        out_tokens[:, i + 1] = _dspark_decode_index(packed)
+        if refs.use_confidence:
+            markov_embeds.append(prev_embed)
+
+    if refs.use_confidence:
+        stacked_embed = torch.stack(markov_embeds, dim=1)
+        confidence = refs.confidence_head(block_hidden, stacked_embed)
+    else:
+        confidence = None
+
+    candidates = out_tokens[:, :block_size].contiguous()
+    return candidates, confidence
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -134,17 +270,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._commit_lens_bufs = []
         self._new_seq_lens_bufs = []
 
+        self._refine_refs = self._build_refine_refs()
+
         if self.tp_rank == 0:
             logger.info(
                 "Initialized DSpark draft runner. model=%s, block_size=%s, "
                 "num_dspark_layers=%s, noise_token_id=%s, markov_rank=%s, "
-                "confidence_threshold=%s",
+                "confidence_threshold=%s, collective_free_refine=True, "
+                "use_confidence=%s",
                 self.draft_model.__class__.__name__,
                 self.block_size,
                 self.num_dspark_layers,
                 self.noise_token_id,
                 self.markov_rank,
                 self.confidence_threshold,
+                self.use_confidence,
             )
 
     @property
@@ -294,52 +434,61 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise RuntimeError("DSpark draft model returned no block hidden states.")
         return block_hidden.view(bs, int(self.block_size), -1)
 
-    def _refine_block_markov(
-        self,
-        *,
-        block_hidden: torch.Tensor,
-        bonus_tokens: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        bs = int(block_hidden.shape[0])
-        block_size = int(self.block_size)
-        markov_head = self._draft_inner.markov_head
-        confidence_head = self._draft_inner.confidence_head
+    def _build_refine_refs(self) -> _DSparkRefineRefs:
         lm_head = self.draft_model.lm_head
-
-        tp_size = get_tensor_model_parallel_world_size()
+        markov_head = self._draft_inner.markov_head
+        markov_w2 = markov_head.markov_w2
         vocab_size = int(self._draft_inner.vocab_size)
 
-        def _gather_full_vocab(logits_shard: torch.Tensor) -> torch.Tensor:
-            if tp_size == 1:
-                return logits_shard
-            return tensor_model_parallel_all_gather(logits_shard, dim=-1)[
-                ..., :vocab_size
-            ]
+        # The sharded base logits (from lm_head) and the sharded Markov bias (from
+        # markov_w2) must live on the same vocab partition for the shard-local
+        # refine to add aligned columns. DSpark rejects dp_attention, so both are
+        # plain-TP ParallelLMHeads over the same vocab and this always holds; fail
+        # loudly if a future config breaks the invariant.
+        lm_shard = lm_head.shard_indices
+        w2_shard = markov_w2.shard_indices
+        if (
+            lm_shard.org_vocab_start_index != w2_shard.org_vocab_start_index
+            or lm_shard.num_org_elements_padded != w2_shard.num_org_elements_padded
+            or int(lm_shard.num_added_elements) != 0
+            or int(w2_shard.num_added_elements) != 0
+        ):
+            raise RuntimeError(
+                "DSpark shard-local refine requires markov_w2 and the tied lm_head "
+                "to share the vocab partition with no added vocab, but got "
+                f"lm_head(start={lm_shard.org_vocab_start_index}, "
+                f"added={lm_shard.num_added_elements}) vs "
+                f"markov_w2(start={w2_shard.org_vocab_start_index}, "
+                f"added={w2_shard.num_added_elements})."
+            )
 
-        out_tokens = torch.empty(
-            (bs, block_size + 1), dtype=torch.int64, device=block_hidden.device
+        org_vocab_start = int(lm_shard.org_vocab_start_index)
+        shard_width = int(lm_head.weight.shape[0])
+        # Shard column c holds global vocab id org_vocab_start + c; columns whose
+        # global id reaches vocab_size are padding and must never win the argmax.
+        pad_mask = (
+            org_vocab_start
+            + torch.arange(shard_width, device=self.device, dtype=torch.int64)
+        ) >= vocab_size
+        if not bool(pad_mask.any()):
+            pad_mask = None
+
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_group_device = get_tp_group().device_group if tp_size > 1 else None
+
+        return _DSparkRefineRefs(
+            norm=self._draft_inner.shared_head.norm,
+            lm_head_weight=lm_head.weight,
+            markov_w1=markov_head.markov_w1,
+            markov_w2_weight=markov_w2.weight,
+            confidence_head=self._draft_inner.confidence_head,
+            org_vocab_start=org_vocab_start,
+            pad_mask=pad_mask,
+            block_size=self.block_size,
+            tp_size=tp_size,
+            tp_group_device=tp_group_device,
+            use_confidence=self.use_confidence,
         )
-        out_tokens[:, 0] = bonus_tokens.view(-1).to(torch.int64)
-        markov_embeds = [] if self.use_confidence else None
-        with torch.inference_mode():
-            normed_hidden = self._draft_inner.shared_head.norm(block_hidden)
-            base_logits = _gather_full_vocab(F.linear(normed_hidden, lm_head.weight))
-            for i in range(block_size):
-                prev_embed = markov_head.get_prev_embeddings(out_tokens[:, i])
-                bias = _gather_full_vocab(markov_head.project_bias(prev_embed))
-                refined = base_logits[:, i] + bias
-                out_tokens[:, i + 1] = torch.argmax(refined, dim=-1)
-                if self.use_confidence:
-                    markov_embeds.append(prev_embed)
-
-            if self.use_confidence:
-                stacked_embed = torch.stack(markov_embeds, dim=1)
-                confidence = confidence_head(block_hidden, stacked_embed)
-            else:
-                confidence = None
-
-        candidates = out_tokens[:, :block_size].contiguous()
-        return candidates, confidence
 
     def _confident_prefix(self, confidence: torch.Tensor) -> torch.Tensor:
         keep = torch.sigmoid(confidence) >= self.confidence_threshold
@@ -549,10 +698,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             seq_lens_sum=model_worker_batch.seq_lens_sum,
         )
 
-        candidates, confidence = self._refine_block_markov(
-            block_hidden=block_hidden,
-            bonus_tokens=draft_input.bonus_tokens,
-        )
+        with torch.inference_mode():
+            candidates, confidence = _refine_block_markov_sharded(
+                block_hidden, draft_input.bonus_tokens, self._refine_refs
+            )
 
         verify_input = DSparkVerifyInput(
             draft_token=candidates.reshape(-1),

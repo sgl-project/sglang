@@ -560,5 +560,103 @@ class TestDSparkConfidentPrefix(_DSparkMathBase):
         self.assertEqual(self._confident_prefix(conf, self.THRESH).tolist(), [3, 0, 1])
 
 
+class TestDSparkShardArgmaxPack(_DSparkMathBase):
+    """Exactness of the shard-local argmax packing used by the collective-free
+    Markov refine: pack (bf16 value, global index) into one int64 whose MAX
+    across vocab shards reproduces torch.argmax's first-index tie-break exactly.
+    Tests the real helpers from dspark_worker_v2."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            from sglang.srt.speculative.dspark_worker_v2 import (
+                _dspark_decode_index,
+                _dspark_pack_value_index,
+                _dspark_shard_argmax_pack,
+            )
+        except Exception as e:  # pragma: no cover - GPU-only deps on some runners
+            self.skipTest(f"dspark_worker_v2 unavailable on this runner: {e}")
+        self.pack = _dspark_pack_value_index
+        self.decode = _dspark_decode_index
+        self.shard_pack = _dspark_shard_argmax_pack
+
+    def _sharded_argmax(self, full_padded, real_vocab, tp):
+        t = self.torch
+        width = full_padded.shape[1] // tp
+        merged = None
+        for r in range(tp):
+            shard = full_padded[:, r * width : (r + 1) * width]
+            cols = r * width + t.arange(width)
+            mask = cols >= real_vocab
+            packed = self.shard_pack(
+                shard, r * width, mask if bool(mask.any()) else None
+            )
+            # Elementwise max across shards simulates the NCCL MAX all-reduce.
+            merged = packed if merged is None else t.maximum(merged, packed)
+        return self.decode(merged)
+
+    def _check(self, full_padded, real_vocab, tp):
+        t = self.torch
+        ref = t.argmax(full_padded[:, :real_vocab].float(), dim=-1)
+        got = self._sharded_argmax(full_padded, real_vocab, tp)
+        self.assertTrue(bool((got == ref).all()), f"tp={tp}: {got} vs {ref}")
+
+    def test_padded_vocab_with_forced_ties(self):
+        t = self.torch
+        t.manual_seed(7)
+        vocab, padded, tp = 1000, 1024, 4
+        for _ in range(20):
+            x = t.randn(256, padded).to(t.bfloat16)
+            # Hostile garbage in the padding columns must never win.
+            x[:, vocab:] = t.randn(256, padded - vocab).to(t.bfloat16) * 100
+            row_max = x[:, :vocab].max(dim=-1).values
+            for _ in range(3):
+                idx = t.randint(0, vocab, (256,))
+                x[t.arange(256), idx] = row_max
+            self._check(x, vocab, tp)
+
+    def test_all_negative_and_signed_zero_ties(self):
+        t = self.torch
+        t.manual_seed(11)
+        vocab, padded = 1000, 1024
+        x = (-t.rand(512, padded) - 0.5).to(t.bfloat16)
+        zi = t.randint(0, vocab, (512, 2))
+        x[t.arange(512), zi[:, 0]] = t.tensor(-0.0, dtype=t.bfloat16)
+        x[t.arange(512), zi[:, 1]] = t.tensor(0.0, dtype=t.bfloat16)
+        self._check(x, vocab, 4)
+
+    def test_real_vocab_shape_tp8(self):
+        t = self.torch
+        t.manual_seed(13)
+        x = (t.randn(64, 129280) * 4).to(t.bfloat16)
+        row_max = x.max(dim=-1).values
+        idx = t.randint(0, 129280, (64,))
+        x[t.arange(64), idx] = row_max
+        self._check(x, 129280, 8)
+        self._check(x, 129280, 1)
+
+    def test_key_order_monotone_across_bf16_range(self):
+        t = self.torch
+        vals = t.tensor(
+            [
+                float("-inf"),
+                -3e38,
+                -1.0,
+                -1e-38,
+                -0.0,
+                0.0,
+                1e-38,
+                1.0,
+                3e38,
+                float("inf"),
+            ],
+            dtype=t.bfloat16,
+        )
+        vals = vals + 0.0  # the -0.0 normalize applied by _dspark_shard_argmax_pack
+        keys = self.pack(vals, t.zeros(len(vals), dtype=t.int64))
+        self.assertTrue(bool((keys[1:] >= keys[:-1]).all()), keys.tolist())
+        self.assertEqual(int(keys[4]), int(keys[5]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=3)

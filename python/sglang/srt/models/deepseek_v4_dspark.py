@@ -36,12 +36,19 @@ class DSparkMarkovHead(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # markov_w1 is replicated (enable_tp=False) so the per-refine-step token
+        # lookup is a local gather with no embedding all-reduce. It was already
+        # non-TP under dp_attention; now it is always non-TP. The full table costs
+        # a few tens of MB per rank, trivial against the target weights.
         self.markov_w1 = VocabParallelEmbedding(
             vocab_size,
             markov_rank,
-            enable_tp=not is_dp_attention_enabled(),
+            enable_tp=False,
             prefix=add_prefix("markov_w1", prefix),
         )
+        # markov_w2 stays vocab-sharded: F.linear(prev_embed, markov_w2.weight)
+        # yields a bias shard aligned with the sharded base logits, so the
+        # shard-local refine adds matching columns and needs no all-gather.
         self.markov_w2 = ParallelLMHead(
             vocab_size,
             markov_rank,
