@@ -35,7 +35,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 from unittest.mock import patch
 
 import torch
@@ -1448,9 +1448,15 @@ class GroupCoordinator:
         dst: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
         async_send: bool = False,
+        all_gather_exclude: Optional[Set[str]] = None,
     ) -> Optional[List[P2PWork]]:
         """Send the input tensor dictionary.
         NOTE: `dst` is the local rank of the source rank.
+
+        `all_gather_exclude` lists keys of tensors that are NOT replicated
+        across `all_gather_group` (e.g. TP-sharded tensors). These tensors
+        are sent whole instead of using the send-slice/all-gather
+        optimization, which is only lossless for replicated tensors.
         """
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
@@ -1482,13 +1488,21 @@ class GroupCoordinator:
         send_func = torch.distributed.isend if async_send else torch.distributed.send
         p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
 
-        for tensor in tensor_list:
+        # Keys of the tensors in `tensor_list`, in matching order.
+        tensor_keys = [
+            key for key, value in metadata_list if isinstance(value, TensorMetadata)
+        ]
+        for key, tensor in zip(tensor_keys, tensor_list):
             if tensor.numel() == 0:
                 # Skip sending empty tensors.
                 continue
 
             # send-allgather: send only a slice, then do allgather.
-            if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
+            if (
+                all_gather_group is not None
+                and tensor.numel() % all_gather_size == 0
+                and (all_gather_exclude is None or key not in all_gather_exclude)
+            ):
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             comm_group = metadata_group if tensor.is_cpu else group
@@ -1501,9 +1515,15 @@ class GroupCoordinator:
         self,
         src: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
+        all_gather_exclude: Optional[Set[str]] = None,
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
         """Recv the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
+
+        `all_gather_exclude` must match the value passed to
+        `send_tensor_dict` on the sending rank: the listed keys are received
+        whole instead of being reassembled with the slice/all-gather
+        optimization.
         """
         # Bypass the function if we are using only 1 GPU.
         if not torch.distributed.is_initialized() or self.world_size == 1:
@@ -1535,6 +1555,7 @@ class GroupCoordinator:
                 use_all_gather = (
                     all_gather_group is not None
                     and tensor.numel() % all_gather_size == 0
+                    and (all_gather_exclude is None or key not in all_gather_exclude)
                 )
 
                 if use_all_gather:
