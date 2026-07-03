@@ -60,6 +60,9 @@ class KVArgs:
     kv_head_num: int
     total_kv_head_num: int
     page_size: int
+    # Optional SWA page size for heterogeneous KV pools such as DeepSeek V4.
+    # DSV4 compressor states are indexed from SWA locs, not full-KV page locs.
+    swa_page_size: Optional[int] = None
     # for system dp
     system_dp_rank: int
     # for pp prefill
@@ -79,6 +82,14 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
+    # Decode-Context-Parallel topology of *this* engine. Required so the
+    # transfer layer can convert the logical token loc carried in KV
+    # indices into the per-rank physical offset that the underlying buffer
+    # actually uses (DCP storage rule: token loc i lives on rank
+    # ``i % dcp_size`` at local offset ``i // dcp_size``). Defaults to a
+    # no-DCP topology so non-DCP backends remain bit-identical.
+    dcp_size: int = 1
+    dcp_rank: int = 0
 
 
 class KVPoll:
@@ -131,6 +142,7 @@ class BaseKVSender(ABC):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        token_position_offset: int = 0,
     ):
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.

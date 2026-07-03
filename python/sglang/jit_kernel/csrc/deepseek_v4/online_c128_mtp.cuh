@@ -34,6 +34,7 @@ struct OnlineC128MTPWritePrefixParams {
   int64_t layer_bs;
   int64_t num_verify_tokens;
   int64_t state_slot_stride;
+  int64_t max_num_reqs;
 };
 
 template <typename TSeq, typename TReq>
@@ -87,6 +88,7 @@ online_c128_mtp_commit_pending_kernel(const OnlineC128MTPCommitPendingParams<TSe
   if (old_seq < 0) return;
 
   const int64_t cur_seq = static_cast<int64_t>(params.cur_seq_lens[bid]);
+  if (cur_seq < 0) return;
   const int64_t accept = clamp_accept_len(cur_seq - old_seq, params.num_verify_tokens);
   if (accept <= 0) return;
 
@@ -110,6 +112,7 @@ online_c128_mtp_write_prefix_kernel(const OnlineC128MTPWritePrefixParams<TSeq, T
 
   const int64_t seq_before = static_cast<int64_t>(params.seq_lens[bid]);
   const int64_t req_idx = static_cast<int64_t>(params.req_pool_indices[bid]);
+  if (seq_before < 0 || req_idx < 0 || req_idx >= params.max_num_reqs) return;
   const int64_t start_pos = seq_before & 127;
   const bool has_partial = seq_before > 0 && start_pos != 0;
 
@@ -207,6 +210,7 @@ struct OnlineC128MTPWritePrefixKernel {
       int64_t layer_bs,
       int64_t num_verify_tokens,
       int64_t state_slot_stride,
+      int64_t max_num_reqs,
       DLDevice device) {
     using namespace host;
 
@@ -224,6 +228,7 @@ struct OnlineC128MTPWritePrefixKernel {
         .layer_bs = layer_bs,
         .num_verify_tokens = num_verify_tokens,
         .state_slot_stride = state_slot_stride,
+        .max_num_reqs = max_num_reqs,
     };
 
     static_assert(kHeadDim == 512, "online c128 MTP write-prefix only supports head_dim=512");
@@ -241,7 +246,8 @@ struct OnlineC128MTPWritePrefixKernel {
       tvm::ffi::TensorView state,
       int64_t layer_bs,
       int64_t num_verify_tokens,
-      int64_t state_slot_stride) {
+      int64_t state_slot_stride,
+      int64_t max_num_reqs) {
     using namespace host;
 
     auto device = SymbolicDevice{};
@@ -260,6 +266,11 @@ struct OnlineC128MTPWritePrefixKernel {
     RuntimeCheck(layer_bs <= seq_lens.shape()[0], "layer_bs exceeds seq_lens rows");
     RuntimeCheck(layer_bs <= req_pool_indices.shape()[0], "layer_bs exceeds req_pool_indices rows");
     RuntimeCheck(layer_bs * num_verify_tokens <= kv_score_input.shape()[0], "kv_score_input is too small");
+    RuntimeCheck(max_num_reqs > 0, "max_num_reqs must be positive");
+    RuntimeCheck(max_num_reqs <= req_to_token.shape()[0], "max_num_reqs exceeds req_to_token rows");
+    RuntimeCheck(
+        state_slot_stride * (num_verify_tokens + 1) <= state.shape()[0],
+        "state buffer is too small for online MTP slots");
 
     launch(
         kv_score_input,
@@ -271,6 +282,7 @@ struct OnlineC128MTPWritePrefixKernel {
         layer_bs,
         num_verify_tokens,
         state_slot_stride,
+        max_num_reqs,
         device.unwrap());
   }
 };
@@ -387,6 +399,10 @@ struct OnlineC128MTPCommitPendingKernel {
     RuntimeCheck(cur_bs <= cur_seq_lens.shape()[0], "cur_bs exceeds seq_lens rows");
     RuntimeCheck(cur_bs <= cur_req_pool_indices.shape()[0], "cur_bs exceeds req rows");
     RuntimeCheck(max_num_reqs <= pending_seq_lens.shape()[0], "max_num_reqs exceeds pending rows");
+    RuntimeCheck(max_num_reqs <= req_to_token.shape()[0], "max_num_reqs exceeds req_to_token rows");
+    RuntimeCheck(
+        state_slot_stride * (num_verify_tokens + 1) <= state.shape()[0],
+        "state buffer is too small for online MTP slots");
 
     launch(
         cur_seq_lens,

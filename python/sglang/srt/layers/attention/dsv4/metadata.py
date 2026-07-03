@@ -12,6 +12,52 @@ from sglang.srt.utils import is_hip, is_xpu
 if TYPE_CHECKING:
     pass
 
+_TOPK_V2_MAX_SUPPORTED_LENGTH = 262144
+
+
+def _maybe_copy_flashmla_sched_meta(dst, src) -> bool:
+    if not (
+        hasattr(dst, "have_initialized")
+        and hasattr(src, "have_initialized")
+        and hasattr(dst, "tile_scheduler_metadata")
+        and hasattr(src, "tile_scheduler_metadata")
+        and hasattr(dst, "num_splits")
+        and hasattr(src, "num_splits")
+    ):
+        return False
+
+    if dst is None or src is None:
+        return False
+
+    # CUDA graphs capture the initialized FlashMLA metadata tensors by pointer.
+    # Replay preparation often builds a fresh, uninitialized metadata object;
+    # replacing the captured object would drop the tensors still referenced by
+    # the graph. Keep the captured object alive in that case.
+    if getattr(dst, "have_initialized", False) and not getattr(
+        src, "have_initialized", False
+    ):
+        return True
+
+    if not getattr(dst, "have_initialized", False) or not getattr(
+        src, "have_initialized", False
+    ):
+        return False
+
+    for field_name in ("tile_scheduler_metadata", "num_splits"):
+        src_val = getattr(src, field_name)
+        dst_val = getattr(dst, field_name)
+        if src_val is None and dst_val is None:
+            continue
+        if src_val is None or dst_val is None or not hasattr(dst_val, "copy_"):
+            return False
+        if tuple(src_val.shape) != tuple(dst_val.shape):
+            return False
+        dst_val.copy_(src_val)
+
+    dst.have_initialized = src.have_initialized
+    dst.config = src.config
+    return True
+
 
 """
 Some comments on the common terms used in DeepSeekV4Backend:
@@ -81,7 +127,10 @@ def copy_metadata(
             setattr(dst, field_name, src_val)
 
     for field_name in assign_fields:
-        setattr(dst, field_name, getattr(src, field_name))
+        src_val = getattr(src, field_name)
+        dst_val = getattr(dst, field_name)
+        if not _maybe_copy_flashmla_sched_meta(dst_val, src_val):
+            setattr(dst, field_name, src_val)
 
     provided_fields = check_eq_fields + copy_fields + assign_fields
     provided_fields_unique = set(provided_fields)
@@ -168,7 +217,23 @@ class PagedIndexerMetadata:
 
     @property
     def max_c4_seq_len(self) -> int:
-        return self.page_table.shape[1] * self.c4_page_size
+        if self.c4_seq_lens.numel() == 0:
+            return self.c4_page_size
+
+        # During CUDA graph capture, ``.item()`` forces a device->host sync,
+        # which is illegal on a capturing stream. The captured logits buffer
+        # must also be sized for the worst case so replay shapes stay valid.
+        # Fall back to the static max-capacity bound in that case.
+        if torch.cuda.is_current_stream_capturing():
+            return self.page_table.shape[1] * self.c4_page_size
+
+        # CUDA graph/raw metadata may keep a max-capacity page table. The indexer
+        # should only materialize logits up to the active compressed length.
+        max_c4_seq_len = int(self.c4_seq_lens.max().item())
+        max_c4_pages = max(
+            1, (max_c4_seq_len + self.c4_page_size - 1) // self.c4_page_size
+        )
+        return min(max_c4_pages, self.page_table.shape[1]) * self.c4_page_size
 
     def copy_(self, other: PagedIndexerMetadata):
         if is_hip():

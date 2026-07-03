@@ -38,6 +38,18 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
+def _get_dcp_world_rank() -> tuple[int, int]:
+    try:
+        from sglang.srt.distributed.parallel_state import get_dcp_group_no_assert
+
+        group = get_dcp_group_no_assert()
+        if group is not None and group.world_size > 1:
+            return int(group.world_size), int(group.rank_in_group)
+    except Exception:
+        pass
+    return 1, 0
+
+
 @cache_once
 def _jit_compress_norm_rope_module(
     dtype: torch.dtype,
@@ -55,7 +67,7 @@ def _jit_compress_norm_rope_module(
             ("forward_fp4", f"FusedNormRopeKernel<{args}>::forward_fp4")
         )
     return load_jit(
-        make_name(f"fused_norm_rope_v2"),
+        make_name(f"fused_norm_rope_v2_dcp"),
         *args,
         cuda_files=[f"deepseek_v4/fused_norm_rope_v2.cuh"],
         cuda_wrappers=cuda_wrappers,
@@ -94,7 +106,7 @@ def _jit_compress_128_online_module(
     args = make_cpp_args(head_dim, dtype_buffer, is_arch_support_pdl())
     kernel_class = f"FlashCompress128OnlineKernel<{args}>"
     return load_jit(
-        make_name(f"compress_128_online_v2"),
+        make_name(f"compress_128_online_v2_activebs"),
         *args,
         cuda_files=["deepseek_v4/c128_online_v2.cuh"],
         cuda_wrappers=[
@@ -110,7 +122,7 @@ def _jit_compress_128_online_module(
 @cache_once
 def _jit_compress_plan_module() -> Module:
     return load_jit(
-        make_name(f"compress_plan"),
+        make_name(f"compress_plan_activebs_v4"),
         cuda_files=[f"deepseek_v4/c_plan.cuh"],
         cuda_wrappers=[
             ("plan_prefill", "plan_compress_prefill"),
@@ -222,6 +234,8 @@ class CompressorPrefillPlan(NamedTuple):
     def copy_(self, other) -> None:
         assert isinstance(other, CompressorPrefillPlan)
         assert self.compress_ratio == other.compress_ratio
+        if self.pin_buffer is not None and other.pin_buffer is not None:
+            self.pin_buffer.copy_(other.pin_buffer)
         self.plan_c.copy_(other.plan_c)
         self.plan_w.copy_(other.plan_w)
 
@@ -237,6 +251,7 @@ class CompressorPrefillPlan(NamedTuple):
         ring_size: int,
         num_q_tokens: int,
         use_cuda_graph: bool = False,
+        active_bs: Optional[int] = None,
     ) -> CompressorPrefillPlan:
         is_gpu_input = seq_lens.device.type in ["cuda", "xpu"]
         pin_buffer = torch.empty(
@@ -276,6 +291,7 @@ class CompressorPrefillPlan(NamedTuple):
             int(swa_page_size),
             int(ring_size),
             bool(use_cuda_graph),
+            int(seq_lens.shape[0] if active_bs is None else active_bs),
         )
         return CompressorPrefillPlan(
             compress_ratio,
@@ -330,6 +346,7 @@ class CompressorPrefillPlan(NamedTuple):
         num_q_tokens: int,
         use_cuda_graph: bool = False,
         state_slot_offset: int = 0,
+        active_bs: Optional[int] = None,
     ) -> CompressorPrefillPlan:
         seq_lens_cpu = seq_lens.detach().to(torch.int64).cpu()
         extend_lens_cpu = extend_lens.detach().to(torch.int64).cpu()
@@ -354,6 +371,7 @@ class CompressorPrefillPlan(NamedTuple):
             plan_w_dev,
             int(state_slot_offset),
             bool(use_cuda_graph),
+            int(seq_lens.shape[0] if active_bs is None else active_bs),
         )
         return CompressorPrefillPlan(
             128,
@@ -438,6 +456,7 @@ def compress_norm_rope_store(
             kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
         )
         fn = module.forward_fp4 if use_fp4 else module.forward
+        dcp_world_size, dcp_rank = _get_dcp_world_rank()
         fn(
             kv,
             plan[1],
@@ -448,4 +467,6 @@ def compress_norm_rope_store(
             kvcache,
             plan.is_decode,
             plan.compress_ratio,
+            int(dcp_world_size),
+            int(dcp_rank),
         )

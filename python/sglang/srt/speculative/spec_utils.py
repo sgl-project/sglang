@@ -654,9 +654,17 @@ def move_accept_tokens_to_target_kvcache(
         accept_out_cache_loc,
         size,
     )
-    token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-        tgt_cache_loc, accept_out_cache_loc
-    )
+    kvcache = token_to_kv_pool_allocator.get_kvcache()
+    move_accepted_kv_cache = getattr(kvcache, "move_accepted_kv_cache", None)
+    if move_accepted_kv_cache is not None:
+        accept_offsets = torch.arange(
+            accept_index.shape[1], dtype=batch.seq_lens.dtype, device=device
+        )
+        accepted_seq_lens = batch.seq_lens[:, None] + accept_offsets[None, :] + 1
+        accepted_seq_lens = accepted_seq_lens[accept_index != -1]
+        move_accepted_kv_cache(tgt_cache_loc, accept_out_cache_loc, accepted_seq_lens)
+    else:
+        kvcache.move_kv_cache(tgt_cache_loc, accept_out_cache_loc)
 
 
 def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:

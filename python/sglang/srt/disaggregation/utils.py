@@ -692,6 +692,34 @@ def page_indices_to_cp_rank_page_indices(
     return np.asarray(page_indices)[mask]
 
 
+def filter_kv_indices_for_dcp_rank(
+    kv_indices: np.ndarray, dcp_size: int, dcp_rank: int
+) -> np.ndarray:
+    """Filter token-level KV indices to those owned by this DCP rank, mapped
+    to per-rank-physical (local) offsets.
+
+    DCP storage rule: a global token loc ``i`` is persisted by rank
+    ``i % dcp_size`` at local offset ``i // dcp_size``. KV indices flowing
+    through the PD transfer protocol are *global* (cluster-wide) loc values
+    coming straight out of ``req_to_token``; backends, however, address GPU
+    buffers using local offsets. This helper performs the conversion at the
+    boundary so the rest of the transfer path can stay unchanged.
+
+    Note this works at *token* granularity. Page-level conversion is the
+    caller's responsibility (typically via ``kv_to_page_indices`` *after*
+    this filter).
+
+    Returns local-loc indices in the same dtype as the input. When
+    ``dcp_size <= 1`` the input is returned unchanged.
+    """
+    if dcp_size <= 1:
+        return kv_indices
+    if kv_indices.size == 0:
+        return kv_indices
+    mask = (kv_indices % dcp_size) == dcp_rank
+    return (kv_indices[mask] // dcp_size).astype(kv_indices.dtype, copy=False)
+
+
 def filter_kv_indices_for_cp_rank(
     kv_mgr: CommonKVManager,
     kv_indices: np.ndarray,

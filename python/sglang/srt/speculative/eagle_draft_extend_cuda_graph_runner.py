@@ -73,6 +73,7 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
+    dcp_kv_mask: Optional[torch.Tensor] = None
 
 
 class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
@@ -194,6 +195,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             num_accept_tokens = torch.full(
                 (self.max_bs,), self.captured_req_width, dtype=torch.int32
             )
+            dcp_kv_mask = (
+                torch.zeros((self.max_num_token,), dtype=torch.bool)
+                if getattr(self.model_runner, "dcp_size", 1) > 1
+                else None
+            )
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -266,6 +272,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dsa_seed_topk_capture=dsa_seed_topk_capture,
+            dcp_kv_mask=dcp_kv_mask,
         )
         self.buffers.share_buffers()
 
@@ -346,6 +353,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         num_correct_drafts = buffers.num_correct_drafts[:bs]
         num_accept_tokens = buffers.num_accept_tokens[:bs]
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        dcp_kv_mask = (
+            buffers.dcp_kv_mask[:num_tokens]
+            if buffers.dcp_kv_mask is not None
+            else None
+        )
 
         # pruned_states = num_tokens (all tokens)
         num_tokens_for_logprob = num_tokens
@@ -406,6 +418,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
+            dcp_kv_mask=dcp_kv_mask,
         )
 
         if self.buffers.dsa_seed_topk_capture is not None:
@@ -510,6 +523,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.num_correct_drafts.fill_(self.captured_req_width)
             buffers.num_accept_tokens.fill_(self.captured_req_width)
             buffers.extend_seq_lens.fill_(self.captured_req_width)
+            if buffers.dcp_kv_mask is not None:
+                buffers.dcp_kv_mask.zero_()
 
         # Batch the small per-field device copies into a grouped foreach copy
         # (one foreach call per dtype pair) to cut launch overhead. hidden_states
@@ -543,6 +558,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
         # DMA engine; foreach would force the ~3x slower compute-kernel copy.
+        if (
+            buffers.dcp_kv_mask is not None
+            and forward_batch.dcp_kv_mask is not None
+        ):
+            buffers.dcp_kv_mask[:num_tokens].copy_(forward_batch.dcp_kv_mask)
+        elif buffers.dcp_kv_mask is not None:
+            buffers.dcp_kv_mask[:num_tokens].zero_()
         if (
             buffers.hidden_states is not None
             and forward_batch.spec_info.hidden_states is not None
@@ -603,6 +625,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             spec_info=forward_batch.spec_info,
+            dcp_kv_mask=(
+                buffers.dcp_kv_mask[:num_tokens]
+                if buffers.dcp_kv_mask is not None
+                else None
+            ),
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 

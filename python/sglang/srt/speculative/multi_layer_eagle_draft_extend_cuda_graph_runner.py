@@ -116,6 +116,7 @@ class MultiLayerEagleDraftExtendInputBuffers(ForwardInputBuffers):
     # of draft_probs selects the in-graph proposal branch in _run_step_body).
     temperatures: Optional[torch.Tensor]
     draft_probs: Optional[torch.Tensor]
+    dcp_kv_mask: Optional[torch.Tensor]
 
 
 class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
@@ -269,6 +270,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             next_token_logits_buffer = buffers.next_token_logits_buffer[:bs]
         else:
             next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        dcp_kv_mask = (
+            buffers.dcp_kv_mask[:num_tokens]
+            if buffers.dcp_kv_mask is not None
+            else None
+        )
 
         if self.require_mlp_tp_gather:
             global_num_tokens_cpu = [num_tokens] * self.dp_size
@@ -344,6 +350,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             extend_num_tokens=self.captured_req_width * bs,
             num_token_non_padded_cpu=self.captured_req_width * bs,
             return_hidden_states_before_norm=True,
+            dcp_kv_mask=dcp_kv_mask,
         )
         return forward_batch
 
@@ -480,6 +487,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             # per-step write target; out_cache_loc is frozen at prepare() time.
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             spec_info=spec_info,
+            dcp_kv_mask=(
+                buffers.dcp_kv_mask[:num_tokens]
+                if buffers.dcp_kv_mask is not None
+                else None
+            ),
         )
         if not self.metadata_captured_in_graph:
             self.eagle_worker.draft_extend_attn_backend_list[
@@ -644,6 +656,11 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
                 ),
                 dtype=torch.float,
             )
+            dcp_kv_mask = (
+                torch.zeros((max_num_token,), dtype=torch.bool)
+                if getattr(model_runner, "dcp_size", 1) > 1
+                else None
+            )
 
             if (
                 self.rotates_in_graph
@@ -694,6 +711,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             temperatures=temperatures,
             draft_probs=draft_probs,
+            dcp_kv_mask=dcp_kv_mask,
         )
 
     def _prepare_extra(self, forward_batch: ForwardBatch) -> None:
@@ -754,6 +772,12 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             self.num_front_tokens,
             self.seq_len_fill_value,
         )
+
+        if buffers.dcp_kv_mask is not None:
+            if forward_batch.dcp_kv_mask is not None:
+                buffers.dcp_kv_mask[:num_tokens].copy_(forward_batch.dcp_kv_mask)
+            else:
+                buffers.dcp_kv_mask[:num_tokens].zero_()
 
         # Refresh the host mirror only when published; hand replay None
         # otherwise so no consumer reads a stale buffer.

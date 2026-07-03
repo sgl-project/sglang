@@ -259,7 +259,7 @@ class SetKAndS:
         cls.triton(*args, **kwargs, buf=buf)
 
     @classmethod
-    def triton(cls, pool, buf, loc, index_k, index_k_scale):
+    def triton(cls, pool, buf, loc, index_k, index_k_scale, write_mask=None):
         loc = loc.to(torch.int64)
 
         _set_k_and_s_triton(
@@ -268,6 +268,7 @@ class SetKAndS:
             index_k=index_k,
             index_k_scale=index_k_scale,
             page_size=pool.page_size,
+            write_mask=write_mask,
         )
 
 
@@ -277,6 +278,7 @@ def _set_k_and_s_triton(
     index_k: torch.Tensor,
     index_k_scale: torch.Tensor,
     page_size: int,
+    write_mask: torch.Tensor | None = None,
 ):
     """
     :param buf: (num_pages, page_size 64 * (128B data + 4B scale)), uint8
@@ -323,6 +325,14 @@ def _set_k_and_s_triton(
     assert loc.is_contiguous()
     assert index_k.is_contiguous()
     assert index_k_scale.is_contiguous()
+    if write_mask is None:
+        write_mask = loc
+        has_write_mask = False
+    else:
+        assert write_mask.shape == loc.shape, f"{write_mask.shape=} {loc.shape=}"
+        assert write_mask.dtype == torch.bool, f"{write_mask.dtype=}"
+        assert write_mask.is_contiguous()
+        has_write_mask = True
 
     if _is_fp8_fnuz:
         buf_fp8 = buf.view(torch.float8_e4m3fnuz)
@@ -334,6 +344,7 @@ def _set_k_and_s_triton(
         buf_fp8,
         buf_fp32,
         loc,
+        write_mask,
         index_k,
         index_k_scale,
         index_k.stride(0),
@@ -341,6 +352,7 @@ def _set_k_and_s_triton(
         BUF_NUMEL_PER_PAGE=buf_numel_per_page,
         NUM_K_ELEMS_PER_TOKEN=index_head_dim,
         S_OFFSET_NBYTES_IN_PAGE=page_size * index_head_dim,
+        HAS_WRITE_MASK=has_write_mask,
     )
 
 
@@ -349,6 +361,7 @@ def _set_k_and_s_triton_kernel(
     buf_fp8_ptr,
     buf_fp32_ptr,
     loc_ptr,
+    write_mask_ptr,
     index_k_ptr,
     index_k_scale_ptr,
     index_k_ptr_stride_0,
@@ -356,8 +369,12 @@ def _set_k_and_s_triton_kernel(
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     NUM_K_ELEMS_PER_TOKEN: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    HAS_WRITE_MASK: tl.constexpr,
 ):
     token_id = tl.program_id(0)
+    if HAS_WRITE_MASK:
+        if not tl.load(write_mask_ptr + token_id):
+            return
 
     loc = tl.load(loc_ptr + token_id)
 

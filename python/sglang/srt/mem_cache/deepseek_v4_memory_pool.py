@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_server_args
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import ceil_div, is_hip
 
 logger = logging.getLogger(__name__)
@@ -128,12 +129,18 @@ class DeepSeekV4SingleKVPool(KVCache):
         layer_id: int,
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+        dcp_world_size: int = 1,
+        dcp_rank: int = 0,
+        write_mask: Optional[torch.Tensor] = None,
     ):
         dsv4_index_buf_accessor.SetKAndS.execute(
             pool=self,
             buf=self.kv_buffer[layer_id],
             loc=loc,
             nope_fp8_rope_bf16_pack=cache_nope_fp8_rope_bf16_pack,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
+            write_mask=write_mask,
         )
 
     def set_key_buffer_fused(
@@ -150,6 +157,34 @@ class DeepSeekV4SingleKVPool(KVCache):
             type="flashmla",
         )
 
+    def set_key_buffer_fused_fallback_triton(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        dcp_world_size: int = 1,
+        dcp_rank: int = 0,
+        write_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        """DCP fallback path: quantize the bf16 ``cache_k`` to a NopeFp8RopeBf16
+        pack on-device, then write through the Triton kernel which honors
+        ``dcp_world_size``/``dcp_rank``. Used when ``dcp_size > 1`` because the
+        fused C++ flashmla store kernel is not yet DCP-aware.
+        """
+        from sglang.srt.layers.attention.dsv4.quant_k_cache import (
+            quant_to_nope_fp8_rope_bf16_pack_triton,
+        )
+
+        pack = quant_to_nope_fp8_rope_bf16_pack_triton(cache_k.bfloat16())
+        self.set_key_buffer(
+            layer_id,
+            loc,
+            pack,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
+            write_mask=write_mask,
+        )
+
     def get_key_buffer(self, layer_id: int):
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
@@ -164,6 +199,124 @@ class DeepSeekV4SingleKVPool(KVCache):
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError("Use get_key_buffer instead.")
+
+    def _value_bytes_per_token(self) -> int:
+        return (
+            self.qk_nope_head_dim
+            + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
+        )
+
+    def _scale_bytes_per_token(self) -> int:
+        return self.qk_nope_head_dim // self.quantize_block_size + self.scale_pad
+
+    def _copy_token_rows_to_cpu(self, buf: torch.Tensor, indices: torch.Tensor):
+        value_bytes = self._value_bytes_per_token()
+        scale_bytes = self._scale_bytes_per_token()
+        pages = (indices // self.page_size).to(torch.long)
+        offsets = (indices % self.page_size).to(torch.long)
+
+        value_byte_offsets = torch.arange(value_bytes, device=buf.device)
+        value_offsets = offsets[:, None] * value_bytes + value_byte_offsets[None, :]
+        values_cpu = buf[pages[:, None], value_offsets].to("cpu", non_blocking=True)
+
+        scale_byte_offsets = torch.arange(scale_bytes, device=buf.device)
+        scale_base = self.page_size * value_bytes
+        scale_offsets = (
+            scale_base
+            + offsets[:, None] * scale_bytes
+            + scale_byte_offsets[None, :]
+        )
+        scales_cpu = buf[pages[:, None], scale_offsets].to("cpu", non_blocking=True)
+        return values_cpu, scales_cpu
+
+    def _load_token_rows_from_cpu(
+        self,
+        buf: torch.Tensor,
+        indices: torch.Tensor,
+        values_cpu: torch.Tensor,
+        scales_cpu: torch.Tensor,
+    ) -> None:
+        value_bytes = self._value_bytes_per_token()
+        scale_bytes = self._scale_bytes_per_token()
+        pages = (indices // self.page_size).to(torch.long)
+        offsets = (indices % self.page_size).to(torch.long)
+
+        value_byte_offsets = torch.arange(value_bytes, device=buf.device)
+        value_offsets = offsets[:, None] * value_bytes + value_byte_offsets[None, :]
+        values = values_cpu.to(buf.device, non_blocking=True)
+        buf[pages[:, None], value_offsets] = values
+
+        scale_byte_offsets = torch.arange(scale_bytes, device=buf.device)
+        scale_base = self.page_size * value_bytes
+        scale_offsets = (
+            scale_base
+            + offsets[:, None] * scale_bytes
+            + scale_byte_offsets[None, :]
+        )
+        scales = scales_cpu.to(buf.device, non_blocking=True)
+        buf[pages[:, None], scale_offsets] = scales
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Move packed DSV4 token rows between cache slots."""
+        if self.layer_num == 0 or tgt_loc.numel() == 0:
+            return
+
+        tgt_loc = tgt_loc.view(-1).long()
+        src_loc = src_loc.view(-1).long()
+
+        value_bytes = self._value_bytes_per_token()
+        scale_bytes = self._scale_bytes_per_token()
+        value_byte_offsets = torch.arange(value_bytes, device=self.device)
+        scale_byte_offsets = torch.arange(scale_bytes, device=self.device)
+        scale_base = self.page_size * value_bytes
+
+        pages_t = tgt_loc // self.page_size
+        offsets_t = tgt_loc % self.page_size
+        pages_s = src_loc // self.page_size
+        offsets_s = src_loc % self.page_size
+
+        value_offsets_t = offsets_t[:, None] * value_bytes + value_byte_offsets[None, :]
+        value_offsets_s = offsets_s[:, None] * value_bytes + value_byte_offsets[None, :]
+        scale_offsets_t = (
+            scale_base + offsets_t[:, None] * scale_bytes + scale_byte_offsets[None, :]
+        )
+        scale_offsets_s = (
+            scale_base + offsets_s[:, None] * scale_bytes + scale_byte_offsets[None, :]
+        )
+
+        for buf in self.kv_buffer:
+            values = buf[pages_s[:, None], value_offsets_s].clone()
+            scales = buf[pages_s[:, None], scale_offsets_s].clone()
+            buf[pages_t[:, None], value_offsets_t] = values
+            buf[pages_t[:, None], scale_offsets_t] = scales
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        current_platform.synchronize()
+        kv_cache_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            layer_chunks = []
+            buf = self.kv_buffer[layer_id]
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                layer_chunks.append(self._copy_token_rows_to_cpu(buf, chunk_indices))
+            kv_cache_cpu.append(layer_chunks)
+        current_platform.synchronize()
+        return kv_cache_cpu
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        current_platform.synchronize()
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            buf = self.kv_buffer[layer_id]
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                values_cpu, scales_cpu = kv_cache_cpu[layer_id][i // chunk_size]
+                assert values_cpu.shape[0] == scales_cpu.shape[0] == len(chunk_indices)
+                self._load_token_rows_from_cpu(
+                    buf, chunk_indices, values_cpu, scales_cpu
+                )
+        current_platform.synchronize()
 
 
 class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
@@ -229,9 +382,19 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         layer_id: int,
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack,
+        dcp_world_size: int = 1,
+        dcp_rank: int = 0,
+        write_mask: Optional[torch.Tensor] = None,
     ):
         loc = self.translate_loc_to_hisparse_device(loc)
-        super().set_key_buffer(layer_id, loc, cache_nope_fp8_rope_bf16_pack)
+        super().set_key_buffer(
+            layer_id,
+            loc,
+            cache_nope_fp8_rope_bf16_pack,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
+            write_mask=write_mask,
+        )
 
     def set_key_buffer_fused(
         self,
@@ -241,6 +404,25 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
     ) -> None:
         loc = self.translate_loc_to_hisparse_device(loc)
         return super().set_key_buffer_fused(layer_id, loc, cache_k)
+
+    def set_key_buffer_fused_fallback_triton(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        dcp_world_size: int = 1,
+        dcp_rank: int = 0,
+        write_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        loc = self.translate_loc_to_hisparse_device(loc)
+        return super().set_key_buffer_fused_fallback_triton(
+            layer_id,
+            loc,
+            cache_k,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
+            write_mask=write_mask,
+        )
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError("HiSparseC4DevicePool does not support get_cpu_copy")
@@ -303,6 +485,42 @@ class DeepSeekV4IndexerPool(KVCache):
                     for _ in range(self.layer_num)
                 ]
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Move C4 indexer key+scale rows between cache slots."""
+        if self.layer_num == 0 or tgt_loc.numel() == 0:
+            return
+
+        tgt_loc = tgt_loc.view(-1).long()
+        src_loc = src_loc.view(-1).long()
+
+        k_bytes = (
+            self.index_head_dim // 2 if self.use_fp4_indexer else self.index_head_dim
+        )
+        scale_bytes = 4
+        k_offsets = torch.arange(k_bytes, device=self.device)
+        scale_offsets = torch.arange(scale_bytes, device=self.device)
+        scale_base = self.page_size * k_bytes
+
+        pages_t = tgt_loc // self.page_size
+        offsets_t = tgt_loc % self.page_size
+        pages_s = src_loc // self.page_size
+        offsets_s = src_loc % self.page_size
+
+        k_offsets_t = offsets_t[:, None] * k_bytes + k_offsets[None, :]
+        k_offsets_s = offsets_s[:, None] * k_bytes + k_offsets[None, :]
+        scale_offsets_t = (
+            scale_base + offsets_t[:, None] * scale_bytes + scale_offsets[None, :]
+        )
+        scale_offsets_s = (
+            scale_base + offsets_s[:, None] * scale_bytes + scale_offsets[None, :]
+        )
+
+        for buf in self.index_k_with_scale_buffer:
+            keys = buf[pages_s[:, None], k_offsets_s].clone()
+            scales = buf[pages_s[:, None], scale_offsets_s].clone()
+            buf[pages_t[:, None], k_offsets_t] = keys
+            buf[pages_t[:, None], scale_offsets_t] = scales
+
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError()
 
@@ -342,10 +560,18 @@ class DeepSeekV4IndexerPool(KVCache):
         loc: torch.Tensor,
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
+        dcp_world_size: int = 1,
+        dcp_rank: int = 0,
+        write_mask: Optional[torch.Tensor] = None,
     ) -> None:
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         index_buf_accessor.SetKAndS.execute(
-            pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
+            pool=self,
+            buf=buf,
+            loc=loc,
+            index_k=index_k,
+            index_k_scale=index_k_scale,
+            write_mask=write_mask,
         )
 
     def set_index_fused(
@@ -378,6 +604,84 @@ class DeepSeekV4IndexerPool(KVCache):
             loc=loc,
             page_size=self.page_size,
         )
+
+    def _scale_bytes_per_token(self) -> int:
+        return (self.index_head_dim // self.quant_block_size) * 4
+
+    def _copy_token_rows_to_cpu(self, buf: torch.Tensor, indices: torch.Tensor):
+        value_bytes = self.index_head_dim
+        scale_bytes = self._scale_bytes_per_token()
+        pages = (indices // self.page_size).to(torch.long)
+        offsets = (indices % self.page_size).to(torch.long)
+
+        value_byte_offsets = torch.arange(value_bytes, device=buf.device)
+        value_offsets = offsets[:, None] * value_bytes + value_byte_offsets[None, :]
+        values_cpu = buf[pages[:, None], value_offsets].to("cpu", non_blocking=True)
+
+        scale_byte_offsets = torch.arange(scale_bytes, device=buf.device)
+        scale_base = self.page_size * value_bytes
+        scale_offsets = (
+            scale_base
+            + offsets[:, None] * scale_bytes
+            + scale_byte_offsets[None, :]
+        )
+        scales_cpu = buf[pages[:, None], scale_offsets].to("cpu", non_blocking=True)
+        return values_cpu, scales_cpu
+
+    def _load_token_rows_from_cpu(
+        self,
+        buf: torch.Tensor,
+        indices: torch.Tensor,
+        values_cpu: torch.Tensor,
+        scales_cpu: torch.Tensor,
+    ) -> None:
+        value_bytes = self.index_head_dim
+        scale_bytes = self._scale_bytes_per_token()
+        pages = (indices // self.page_size).to(torch.long)
+        offsets = (indices % self.page_size).to(torch.long)
+
+        value_byte_offsets = torch.arange(value_bytes, device=buf.device)
+        value_offsets = offsets[:, None] * value_bytes + value_byte_offsets[None, :]
+        values = values_cpu.to(buf.device, non_blocking=True)
+        buf[pages[:, None], value_offsets] = values
+
+        scale_byte_offsets = torch.arange(scale_bytes, device=buf.device)
+        scale_base = self.page_size * value_bytes
+        scale_offsets = (
+            scale_base
+            + offsets[:, None] * scale_bytes
+            + scale_byte_offsets[None, :]
+        )
+        scales = scales_cpu.to(buf.device, non_blocking=True)
+        buf[pages[:, None], scale_offsets] = scales
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        current_platform.synchronize()
+        kv_cache_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            layer_chunks = []
+            buf = self.index_k_with_scale_buffer[layer_id]
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                layer_chunks.append(self._copy_token_rows_to_cpu(buf, chunk_indices))
+            kv_cache_cpu.append(layer_chunks)
+        current_platform.synchronize()
+        return kv_cache_cpu
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        current_platform.synchronize()
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            buf = self.index_k_with_scale_buffer[layer_id]
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                values_cpu, scales_cpu = kv_cache_cpu[layer_id][i // chunk_size]
+                assert values_cpu.shape[0] == scales_cpu.shape[0] == len(chunk_indices)
+                self._load_token_rows_from_cpu(
+                    buf, chunk_indices, values_cpu, scales_cpu
+                )
+        current_platform.synchronize()
 
 
 class DeepSeekV4LayerItem(NamedTuple):
@@ -479,6 +783,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         end_layer: Optional[int] = None,
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
+        c4_indexer_size: Optional[int] = None,
+        c4_indexer_state_pool_size: Optional[int] = None,
         num_req_slots: Optional[int] = None,
     ):
         super().__init__(
@@ -491,13 +797,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             start_layer,
             end_layer,
         )
-        c4_logical_size = c128_size * 32
+        c4_logical_size = (
+            c4_indexer_size if c4_indexer_size is not None else c128_size * 32
+        )
 
         logger.info(
             "Initialize DeepSeekV4TokenToKVPool with "
             f"{max_num_reqs=} {swa_size=} {c4_size=} "
             f"{c4_logical_size=} {c128_size=} "
-            f"{c4_state_pool_size=} {c128_state_pool_size=}"
+            f"{c4_state_pool_size=} "
+            f"{c4_indexer_state_pool_size=} "
+            f"{c128_state_pool_size=}"
         )
 
         self.max_num_reqs = max_num_reqs
@@ -511,6 +821,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
         self.c4_state_pool_size = c4_state_pool_size
+        self.c4_indexer_state_pool_size = (
+            c4_indexer_state_pool_size
+            if c4_indexer_state_pool_size is not None
+            else c4_state_pool_size
+        )
         c128_ring_size = self.get_ring_size(128)
         if ONLINE_C128:
             # Request-scoped online C128 state is indexed by req_pool_idx.
@@ -533,6 +848,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.online_c128_mtp_pending_seq_lens = torch.empty(
                 self.online_c128_state_num_req_slots, dtype=torch.int64, device=device
             )
+            self.online_c128_mtp_pending_seq_lens.fill_(-1)
 
         # Determine this PP stage's absolute layer range
         if (
@@ -668,6 +984,130 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self.full_to_swa_index_mapping is not None
         return self.full_to_swa_index_mapping[kv_indices]
+
+    def _localize_dcp_move_locs(
+        self, tgt_loc: torch.Tensor, src_loc: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        dcp_world_size, dcp_rank = self._dcp_world_rank()
+        if dcp_world_size == 1 or tgt_loc.numel() == 0:
+            return tgt_loc, src_loc
+
+        local_mask = (tgt_loc % dcp_world_size == dcp_rank) & (
+            src_loc % dcp_world_size == dcp_rank
+        )
+        if not torch.any(local_mask):
+            return tgt_loc.new_empty((0,)), src_loc.new_empty((0,))
+        return (
+            tgt_loc[local_mask] // dcp_world_size,
+            src_loc[local_mask] // dcp_world_size,
+        )
+
+    @staticmethod
+    def _compressed_move_locs_from_full(
+        tgt_loc: torch.Tensor, src_loc: torch.Tensor, compress_ratio: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if tgt_loc.numel() == 0:
+            return tgt_loc, src_loc
+        mask = ((tgt_loc + 1) % compress_ratio == 0) & (
+            (src_loc + 1) % compress_ratio == 0
+        )
+        return (
+            (tgt_loc[mask] // compress_ratio).to(tgt_loc.dtype),
+            (src_loc[mask] // compress_ratio).to(src_loc.dtype),
+        )
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Move accepted speculative DSV4 KV rows into their committed slots."""
+        if tgt_loc.numel() == 0:
+            return
+
+        tgt_loc = tgt_loc.view(-1).long()
+        src_loc = src_loc.view(-1).long()
+
+        if self._unified_kv:
+            raise NotImplementedError("DSV4 unified KV move is not supported yet.")
+
+        tgt_swa = self.translate_loc_from_full_to_swa(tgt_loc)
+        src_swa = self.translate_loc_from_full_to_swa(src_loc)
+        tgt_swa_local, src_swa_local = self._localize_dcp_move_locs(tgt_swa, src_swa)
+        self.swa_kv_pool.move_kv_cache(tgt_swa_local, src_swa_local)
+
+        tgt_c4, src_c4 = self._compressed_move_locs_from_full(tgt_loc, src_loc, 4)
+        if tgt_c4.numel() and src_c4.numel():
+            # C4 indexer cache is replicated in global c4-index space.
+            self.c4_indexer_kv_pool.move_kv_cache(tgt_c4, src_c4)
+            tgt_c4_local, src_c4_local = self._localize_dcp_move_locs(tgt_c4, src_c4)
+            self.c4_kv_pool.move_kv_cache(tgt_c4_local, src_c4_local)
+
+        tgt_c128, src_c128 = self._compressed_move_locs_from_full(tgt_loc, src_loc, 128)
+        if tgt_c128.numel() and src_c128.numel():
+            tgt_c128_local, src_c128_local = self._localize_dcp_move_locs(
+                tgt_c128, src_c128
+            )
+            self.c128_kv_pool.move_kv_cache(tgt_c128_local, src_c128_local)
+
+    def move_accepted_kv_cache(
+        self,
+        tgt_loc: torch.Tensor,
+        src_loc: torch.Tensor,
+        accepted_seq_lens: torch.Tensor,
+    ):
+        """Move speculative accepted rows using logical seq-len boundaries.
+
+        DSV4 compressed KV is written when the logical sequence length hits a
+        compression boundary. The physical full-cache slot number is allocator
+        state and must not be used to infer C4/C128 boundaries.
+        """
+        if tgt_loc.numel() == 0:
+            return
+
+        tgt_loc = tgt_loc.view(-1).long()
+        src_loc = src_loc.view(-1).long()
+        accepted_seq_lens = accepted_seq_lens.view(-1).to(device=tgt_loc.device)
+
+        if self._unified_kv:
+            raise NotImplementedError("DSV4 unified KV move is not supported yet.")
+
+        tgt_swa = self.translate_loc_from_full_to_swa(tgt_loc)
+        src_swa = self.translate_loc_from_full_to_swa(src_loc)
+        tgt_swa_local, src_swa_local = self._localize_dcp_move_locs(tgt_swa, src_swa)
+        self.swa_kv_pool.move_kv_cache(tgt_swa_local, src_swa_local)
+
+        tgt_c4, src_c4 = self._compressed_move_locs_from_boundary_mask(
+            tgt_loc, src_loc, accepted_seq_lens, 4
+        )
+        if tgt_c4.numel() and src_c4.numel():
+            self.c4_indexer_kv_pool.move_kv_cache(tgt_c4, src_c4)
+            tgt_c4_local, src_c4_local = self._localize_dcp_move_locs(tgt_c4, src_c4)
+            self.c4_kv_pool.move_kv_cache(tgt_c4_local, src_c4_local)
+
+        tgt_c128, src_c128 = self._compressed_move_locs_from_boundary_mask(
+            tgt_loc, src_loc, accepted_seq_lens, 128
+        )
+        if tgt_c128.numel() and src_c128.numel():
+            tgt_c128_local, src_c128_local = self._localize_dcp_move_locs(
+                tgt_c128, src_c128
+            )
+            self.c128_kv_pool.move_kv_cache(tgt_c128_local, src_c128_local)
+
+    @staticmethod
+    def _compressed_move_locs_from_boundary_mask(
+        tgt_loc: torch.Tensor,
+        src_loc: torch.Tensor,
+        accepted_seq_lens: torch.Tensor,
+        compress_ratio: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if tgt_loc.numel() == 0:
+            return tgt_loc, src_loc
+        token_len = min(tgt_loc.numel(), src_loc.numel(), accepted_seq_lens.numel())
+        tgt_loc = tgt_loc[:token_len]
+        src_loc = src_loc[:token_len]
+        accepted_seq_lens = accepted_seq_lens[:token_len]
+        mask = accepted_seq_lens % compress_ratio == 0
+        return (
+            (tgt_loc[mask] // compress_ratio).to(tgt_loc.dtype),
+            (src_loc[mask] // compress_ratio).to(src_loc.dtype),
+        )
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
@@ -919,6 +1359,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def _init_paged_compress_states(self, enable_memory_saver: bool):
         c4_state_pool_size = self.c4_state_pool_size
+        c4_indexer_state_pool_size = self.c4_indexer_state_pool_size
         c128_state_pool_size = self.c128_state_pool_size
         total_L = len(self.compression_ratios)
         self.compress_state_pools: List[Optional[CompressStatePool]] = [None] * total_L
@@ -1009,16 +1450,25 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
             state = pool.kv_score_buffer.kv_score
             if ONLINE_C128:
-                row = state[req_pool_idx]
-                head_dim = row.shape[-1] // 3
-                row[:head_dim].fill_(float("-inf"))
-                row[head_dim:].zero_()
+                rows = [req_pool_idx]
+                if pool.online_mtp_max_draft_tokens > 0:
+                    rows = [
+                        req_pool_idx + i * pool.online_mtp_state_slot_offset
+                        for i in range(pool.online_mtp_max_draft_tokens + 1)
+                    ]
+                rows = torch.as_tensor(rows, dtype=torch.long, device=state.device)
+                head_dim = state.shape[-1] // 3
+                state[rows, :head_dim] = float("-inf")
+                state[rows, head_dim:] = 0
             else:
                 start = req_pool_idx * pool.ring_size
                 rows = state[start : start + pool.ring_size]
                 half = rows.shape[-1] // 2
                 rows[:, :half].zero_()
                 rows[:, half:].fill_(float("-inf"))
+
+        if self.online_c128_mtp_pending_seq_lens is not None:
+            self.online_c128_mtp_pending_seq_lens[req_pool_idx] = -1
 
     def clear_unaccepted_c128_draft_states(
         self,
@@ -1064,14 +1514,52 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.wait_layer_transfer(layer_id)
         return self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id))
 
+    def _dcp_world_rank(self) -> Tuple[int, int]:
+        """Resolve current DCP (decode context parallel) world size and rank.
+
+        Imported lazily so non-DCP setups don't pay an import cost. Returns
+        ``(world_size, rank)``; when DCP is disabled the group is ``None``
+        and we fall back to ``(1, 0)`` which makes the Triton kernel a no-op
+        on the dcp dimension.
+        """
+        from sglang.srt.distributed.parallel_state import get_dcp_group_no_assert
+
+        group = get_dcp_group_no_assert()
+        if group is None or group.world_size == 1:
+            return 1, 0
+        return group.world_size, group.rank_in_group
+
+    def _dcp_write_context(self) -> Tuple[int, int, bool]:
+        dcp_world_size, dcp_rank = self._dcp_world_rank()
+        return dcp_world_size, dcp_rank, dcp_world_size > 1
+
+    @staticmethod
+    def _dcp_loc_write_mask(loc: torch.Tensor) -> torch.Tensor:
+        # Keep only the validity part here: full-cache loc 0 is the allocator's
+        # dummy/padding slot and must not be persisted as KV. Callers that write
+        # translated locations (for example SWA ring slots) must pass the raw
+        # full-cache loc instead, because translated slot 0 can be valid.
+        return (loc > 0).contiguous()
+
     def set_swa_key_buffer(
         self,
         layer_id: int,
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
+        dcp_world_size, dcp_rank, dcp_enabled = self._dcp_write_context()
+        if dcp_enabled or dcp_kv_mask is not None:
+            write_mask = self._dcp_loc_write_mask(loc)
+        else:
+            write_mask = None
         self.swa_kv_pool.set_key_buffer(
-            self._swa_local_layer_id(layer_id), loc, cache_nope_fp8_rope_bf16_pack
+            self._swa_local_layer_id(layer_id),
+            loc,
+            cache_nope_fp8_rope_bf16_pack,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
+            write_mask=write_mask,
         )
 
     def get_extra_key_page_size(self, layer_id: int) -> int:
@@ -1090,11 +1578,19 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         layer_id: int,
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
+        write_mask: Optional[torch.Tensor] = None,
     ) -> None:
+        dcp_world_size, dcp_rank, _ = self._dcp_write_context()
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         compress_kv_pool.set_key_buffer(
-            compress_layer_id, loc, cache_nope_fp8_rope_bf16_pack
+            compress_layer_id,
+            loc,
+            cache_nope_fp8_rope_bf16_pack,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
+            write_mask=(write_mask.contiguous() if write_mask is not None else None),
         )
 
     def get_index_k_page_size(self) -> int:
@@ -1131,11 +1627,20 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
+        write_mask: Optional[torch.Tensor] = None,
     ) -> None:
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
+        # The c4 indexer is a scoring cache used by paged_mqa_logits with the
+        # global c4 page_table, and its topk result is later localized for DCP
+        # attention. Keep this cache replicated in global c4-index space.
         self.c4_indexer_kv_pool.set_index_k_scale_buffer(
-            compress_layer_id, loc, index_k, index_k_scale
+            compress_layer_id,
+            loc,
+            index_k,
+            index_k_scale,
+            write_mask=write_mask.contiguous() if write_mask is not None else None,
         )
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
@@ -1155,9 +1660,23 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         layer_id: int,
         swa_loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
+        raw_loc: Optional[torch.Tensor] = None,
     ) -> None:
+        dcp_world_size, dcp_rank, dcp_enabled = self._dcp_write_context()
+        if dcp_enabled or dcp_kv_mask is not None:
+            write_mask = self._dcp_loc_write_mask(
+                raw_loc if raw_loc is not None else swa_loc
+            )
+        else:
+            write_mask = None
         self.swa_kv_pool.set_key_buffer(
-            self._swa_local_layer_id(layer_id), swa_loc, cache_nope_fp8_rope_bf16_pack
+            self._swa_local_layer_id(layer_id),
+            swa_loc,
+            cache_nope_fp8_rope_bf16_pack,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
+            write_mask=write_mask,
         )
 
     def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:
@@ -1169,7 +1688,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         layer_id: int,
         swa_loc: torch.Tensor,
         cache_k: torch.Tensor,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
+        raw_loc: Optional[torch.Tensor] = None,
     ) -> None:
+        dcp_world_size, dcp_rank, dcp_enabled = self._dcp_write_context()
+        if dcp_enabled or dcp_kv_mask is not None:
+            return self.swa_kv_pool.set_key_buffer_fused_fallback_triton(
+                self._swa_local_layer_id(layer_id),
+                swa_loc,
+                cache_k,
+                dcp_world_size=dcp_world_size,
+                dcp_rank=dcp_rank,
+                write_mask=self._dcp_loc_write_mask(
+                    raw_loc if raw_loc is not None else swa_loc
+                ),
+            )
         return self.swa_kv_pool.set_key_buffer_fused(
             self._swa_local_layer_id(layer_id), swa_loc, cache_k
         )
@@ -1183,7 +1716,25 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         eps: float,
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
+        raw_loc: Optional[torch.Tensor] = None,
     ) -> None:
+        dcp_world_size, dcp_rank, dcp_enabled = self._dcp_write_context()
+        if dcp_enabled or dcp_kv_mask is not None:
+            from sglang.jit_kernel.dsv4 import fused_norm_rope_inplace
+
+            kv = kv.contiguous()
+            fused_norm_rope_inplace(kv, kv_weight, eps, freqs_cis, positions)
+            return self.swa_kv_pool.set_key_buffer_fused_fallback_triton(
+                self._swa_local_layer_id(layer_id),
+                swa_loc,
+                kv,
+                dcp_world_size=dcp_world_size,
+                dcp_rank=dcp_rank,
+                write_mask=self._dcp_loc_write_mask(
+                    raw_loc if raw_loc is not None else swa_loc
+                ),
+            )
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,
@@ -1200,9 +1751,24 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
+        write_mask: Optional[torch.Tensor] = None,
     ) -> None:
-        _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
+        compress_ratio, compress_layer_id, compress_kv_pool = self.layer_mapping[
+            layer_id
+        ]
         assert compress_kv_pool is not None
+        dcp_world_size, dcp_rank, dcp_enabled = self._dcp_write_context()
+
+        if dcp_enabled or dcp_kv_mask is not None or write_mask is not None:
+            return compress_kv_pool.set_key_buffer_fused_fallback_triton(
+                compress_layer_id,
+                loc,
+                cache_k,
+                dcp_world_size=dcp_world_size,
+                dcp_rank=dcp_rank,
+                write_mask=write_mask.contiguous() if write_mask is not None else None,
+            )
         return compress_kv_pool.set_key_buffer_fused(compress_layer_id, loc, cache_k)
 
     def set_index_k_fused(
@@ -1210,9 +1776,24 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
+        write_mask: Optional[torch.Tensor] = None,
     ) -> None:
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
+        if write_mask is not None:
+            from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+
+            index_k, index_k_scale = act_quant(cache_k)
+            return self.c4_indexer_kv_pool.set_index_k_scale_buffer(
+                compress_layer_id,
+                loc,
+                index_k,
+                index_k_scale,
+                write_mask=write_mask.contiguous(),
+            )
+        # See set_index_k_scale_buffer: the indexer KV must stay global because
+        # the logits path reads it through the global c4 page_table.
         return self.c4_indexer_kv_pool.set_index_fused(compress_layer_id, loc, cache_k)
 
     def set_index_k_fp4(
@@ -1224,3 +1805,190 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.set_index_fp4(compress_layer_id, loc, cache_k)
+
+    def _compressed_indices_from_full_indices(
+        self, indices: torch.Tensor, compress_ratio: int
+    ) -> torch.Tensor:
+        if len(indices) == 0:
+            return indices
+        positions = torch.arange(
+            1, len(indices) + 1, dtype=torch.long, device=indices.device
+        )
+        mask = (positions % compress_ratio) == 0
+        return (indices[mask] // compress_ratio).to(indices.dtype)
+
+    def _copy_state_pool_to_cpu(
+        self, pool: Optional[CompressStatePool], indices: torch.Tensor
+    ):
+        if (
+            pool is None
+            or self.full_to_swa_index_mapping is None
+            or len(indices) == 0
+        ):
+            return None
+        swa_indices = self.full_to_swa_index_mapping[indices]
+        mask = swa_indices >= 0
+        if not torch.any(mask):
+            return None
+        state_locs = pool.translate_from_swa_loc_to_state_loc(swa_indices[mask])
+        bank_offsets = [0]
+        if pool.online_mtp_max_draft_tokens > 0:
+            bank_offsets = [
+                i * pool.online_mtp_state_slot_offset
+                for i in range(pool.online_mtp_max_draft_tokens + 1)
+            ]
+        cpu_banks = [
+            pool.kv_score_buffer.kv_score[state_locs + offset].to(
+                "cpu", non_blocking=True
+            )
+            for offset in bank_offsets
+        ]
+        return {
+            "mask": mask.cpu(),
+            "bank_offsets": bank_offsets,
+            "kv_score": cpu_banks,
+        }
+
+    def _load_state_pool_from_cpu(
+        self,
+        pool: Optional[CompressStatePool],
+        state_cpu,
+        indices: torch.Tensor,
+    ) -> None:
+        if (
+            pool is None
+            or state_cpu is None
+            or self.full_to_swa_index_mapping is None
+            or len(indices) == 0
+        ):
+            return
+        old_mask = state_cpu["mask"].to(indices.device)
+        if not torch.any(old_mask):
+            return
+        swa_indices = self.full_to_swa_index_mapping[indices]
+        new_mask = swa_indices >= 0
+        row_mask = new_mask[old_mask]
+        if not torch.any(row_mask):
+            return
+        state_locs = pool.translate_from_swa_loc_to_state_loc(
+            swa_indices[old_mask][row_mask]
+        )
+        for bank_cpu, offset in zip(
+            state_cpu["kv_score"], state_cpu["bank_offsets"]
+        ):
+            pool.kv_score_buffer.kv_score[state_locs + offset] = bank_cpu[
+                row_mask.cpu()
+            ].to(pool.kv_score_buffer.kv_score.device, non_blocking=True)
+        pool.kv_score_buffer[-1].clear()
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        current_platform.synchronize()
+        swa_cpu = None
+        swa_mask = None
+        if self.full_to_swa_index_mapping is not None and len(indices) > 0:
+            swa_indices = self.full_to_swa_index_mapping[indices]
+            swa_mask = swa_indices >= 0
+            if torch.any(swa_mask):
+                swa_cpu = self.swa_kv_pool.get_cpu_copy(swa_indices[swa_mask])
+                swa_mask = swa_mask.cpu()
+
+        c4_indices = self._compressed_indices_from_full_indices(indices, 4)
+        c128_indices = self._compressed_indices_from_full_indices(indices, 128)
+        c4_cpu = (
+            self.c4_kv_pool.get_cpu_copy(c4_indices)
+            if len(c4_indices) > 0
+            else None
+        )
+        c128_cpu = (
+            self.c128_kv_pool.get_cpu_copy(c128_indices)
+            if len(c128_indices) > 0
+            else None
+        )
+        c4_indexer_cpu = (
+            self.c4_indexer_kv_pool.get_cpu_copy(c4_indices)
+            if len(c4_indices) > 0
+            else None
+        )
+        state_cpu = [
+            self._copy_state_pool_to_cpu(pool, indices)
+            for pool in self.compress_state_pools
+        ]
+        indexer_state_cpu = [
+            self._copy_state_pool_to_cpu(pool, indices)
+            for pool in self.indexer_compress_state_pools
+        ]
+        current_platform.synchronize()
+        return {
+            "swa": swa_cpu,
+            "swa_mask": swa_mask,
+            "c4": c4_cpu,
+            "c4_indices_len": len(c4_indices),
+            "c128": c128_cpu,
+            "c128_indices_len": len(c128_indices),
+            "c4_indexer": c4_indexer_cpu,
+            "state": state_cpu,
+            "indexer_state": indexer_state_cpu,
+        }
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        current_platform.synchronize()
+        swa_cpu = kv_cache_cpu["swa"]
+        if swa_cpu is not None and self.full_to_swa_index_mapping is not None:
+            swa_indices = self.full_to_swa_index_mapping[indices]
+            new_swa_mask = swa_indices >= 0
+            old_swa_mask = kv_cache_cpu.get("swa_mask")
+            if old_swa_mask is not None:
+                old_swa_mask = old_swa_mask.to(indices.device)
+                row_mask = new_swa_mask[old_swa_mask].cpu()
+                swa_indices = swa_indices[old_swa_mask][row_mask.to(indices.device)]
+            else:
+                row_mask = new_swa_mask.cpu()
+                swa_indices = swa_indices[new_swa_mask]
+            if swa_indices.numel() > 0:
+                swa_cpu = self._filter_layer_chunks(swa_cpu, row_mask)
+                self.swa_kv_pool.load_cpu_copy(swa_cpu, swa_indices)
+
+        c4_indices = self._compressed_indices_from_full_indices(indices, 4)
+        c128_indices = self._compressed_indices_from_full_indices(indices, 128)
+        if kv_cache_cpu["c4"] is not None and len(c4_indices) > 0:
+            c4_indices = c4_indices[: kv_cache_cpu["c4_indices_len"]]
+            self.c4_kv_pool.load_cpu_copy(kv_cache_cpu["c4"], c4_indices)
+        if kv_cache_cpu["c4_indexer"] is not None and len(c4_indices) > 0:
+            c4_indices = c4_indices[: kv_cache_cpu["c4_indices_len"]]
+            self.c4_indexer_kv_pool.load_cpu_copy(
+                kv_cache_cpu["c4_indexer"], c4_indices
+            )
+        if kv_cache_cpu["c128"] is not None and len(c128_indices) > 0:
+            c128_indices = c128_indices[: kv_cache_cpu["c128_indices_len"]]
+            self.c128_kv_pool.load_cpu_copy(kv_cache_cpu["c128"], c128_indices)
+
+        for pool, state_cpu in zip(self.compress_state_pools, kv_cache_cpu["state"]):
+            self._load_state_pool_from_cpu(pool, state_cpu, indices)
+        for pool, state_cpu in zip(
+            self.indexer_compress_state_pools, kv_cache_cpu["indexer_state"]
+        ):
+            self._load_state_pool_from_cpu(pool, state_cpu, indices)
+        current_platform.synchronize()
+
+    def _filter_layer_chunks(self, kv_cpu, row_mask: torch.Tensor):
+        if kv_cpu is None:
+            return None
+        if row_mask is None or bool(torch.all(row_mask).item()):
+            return kv_cpu
+        chunk_size = self.cpu_offloading_chunk_size
+        filtered = []
+        for layer_chunks in kv_cpu:
+            if len(layer_chunks) == 0:
+                filtered.append([])
+                continue
+            values_cpu = torch.cat([chunk[0] for chunk in layer_chunks], dim=0)
+            scales_cpu = torch.cat([chunk[1] for chunk in layer_chunks], dim=0)
+            values_cpu = values_cpu[row_mask]
+            scales_cpu = scales_cpu[row_mask]
+            filtered_layer = []
+            for i in range(0, len(values_cpu), chunk_size):
+                filtered_layer.append(
+                    (values_cpu[i : i + chunk_size], scales_cpu[i : i + chunk_size])
+                )
+            filtered.append(filtered_layer)
+        return filtered

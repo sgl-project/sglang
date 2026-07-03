@@ -3155,9 +3155,9 @@ class ServerArgs:
         handle_pd_disaggregation(self)
 
     def _handle_dcp_validation(self):
-        # Decode context parallel (DCP) is currently implemented and validated
-        # only on AMD HIP/ROCm. Reject invalid or unverified configurations
-        # early instead of letting them fail deeper in model initialization.
+        # Decode context parallel (DCP) is implemented on AMD HIP/ROCm and
+        # CUDA. Reject invalid sizes or unsupported platforms early instead of
+        # letting them fail deeper in model initialization.
         if self.dcp_size < 1:
             raise ValueError(
                 "Decode context parallel size (--dcp-size / "
@@ -3166,24 +3166,14 @@ class ServerArgs:
             )
         if not self.dcp_size > 1:
             return
-        if is_hip():
+        if is_hip() or is_cuda():
             return
-        elif is_cuda():
-            if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "Decode context parallel (--dcp-size / "
-                    "--decode-context-parallel-size > 1) on CUDA platform "
-                    "does not support any speculative algorithm, but got "
-                    f"dcp_size={self.dcp_size} on a CUDA platform with "
-                    "speculative decoding enabled."
-                )
-        else:
-            raise ValueError(
-                "Decode context parallel (--dcp-size / "
-                "--decode-context-parallel-size > 1) is currently only "
-                f"supported on the AMD HIP platform, but got dcp_size="
-                f"{self.dcp_size} on a non-HIP platform."
-            )
+        raise ValueError(
+            "Decode context parallel (--dcp-size / "
+            "--decode-context-parallel-size > 1) is currently only "
+            "supported on AMD HIP or CUDA platforms, but got dcp_size="
+            f"{self.dcp_size} on a non-HIP/CUDA platform."
+        )
 
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
@@ -7631,6 +7621,30 @@ class ServerArgs:
             assert (
                 self.disable_overlap_schedule and self.speculative_algorithm is None
             ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+
+        if self.dcp_size > 1:
+            assert (
+                self.tp_size % self.dcp_size == 0
+            ), f"tp_size ({self.tp_size}) must be divisible by dcp_size ({self.dcp_size})"
+            assert (
+                self.pp_size == 1
+            ), "Decode context parallelism is not compatible with pipeline parallelism"
+            # DCP + PD disaggregation: only the mooncake transfer backend
+            # has been adapted to the per-rank physical offset remap
+            # (token-level RDMA path). Other backends still address GPU
+            # buffers using the cluster-wide global loc and would silently
+            # corrupt the transferred KV cache. Backends without DCP
+            # support also bail out at runtime via
+            # ``CommonKVManager._check_dcp_compat``; this assertion is the
+            # earlier, friendlier failure.
+            if self.disaggregation_mode != "null":
+                assert self.disaggregation_transfer_backend == "mooncake", (
+                    "Decode context parallelism (--dcp-size > 1) with PD "
+                    "disaggregation only supports "
+                    "--disaggregation-transfer-backend=mooncake right now "
+                    f"(got {self.disaggregation_transfer_backend!r}). Use "
+                    "--dcp-size 1 or switch to mooncake."
+                )
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention

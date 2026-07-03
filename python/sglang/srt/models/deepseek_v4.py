@@ -38,6 +38,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
+    get_dcp_group_no_assert,
     get_pp_group,
     get_tp_group,
 )
@@ -64,7 +65,6 @@ from sglang.srt.layers.dp_attention import (
     _tbo_event,
     attn_tp_all_gather,
     attn_tp_all_reduce,
-    dp_gather_partial,
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_reduce_scatterv_async,
@@ -192,6 +192,7 @@ def _get_mhc_ops() -> MhcOps:
 
 
 logger = logging.getLogger(__name__)
+
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
@@ -343,7 +344,10 @@ def deepseek_v4_attention_with_output(
     key_value = key_value[:real_num_tokens]
 
     original_out_cache_loc = forward_batch.out_cache_loc
+    original_dcp_kv_mask = forward_batch.dcp_kv_mask
     forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    if original_dcp_kv_mask is not None:
+        forward_batch.dcp_kv_mask = original_dcp_kv_mask[:real_num_tokens]
 
     attn_backend = get_attn_backend()
     try:
@@ -359,6 +363,7 @@ def deepseek_v4_attention_with_output(
         )
     finally:
         forward_batch.out_cache_loc = original_out_cache_loc
+        forward_batch.dcp_kv_mask = original_dcp_kv_mask
 
     assert (
         output[:real_num_tokens].numel() == ret.numel()
@@ -695,6 +700,8 @@ class MQALayer(MqaAttentionBase):
             eps=self.eps,
             freqs_cis=self.freqs_cis,
             positions=positions,
+            dcp_kv_mask=forward_batch.dcp_kv_mask,
+            raw_loc=forward_batch.out_cache_loc,
         )
 
     def _compute_kv_bf16(
@@ -1165,6 +1172,29 @@ class MQALayer(MqaAttentionBase):
                 x_quant=x_quant,
             )
 
+        attn_q_base = q_out if q_out is not None else q
+        dcp_group = get_dcp_group_no_assert()
+        use_dcp = dcp_group is not None and dcp_group.world_size > 1
+        if use_dcp:
+            # DCP shards KV tokens across ranks, but every rank must evaluate
+            # attention for the same full set of query heads before the backend
+            # LSE-merge/reduce-scatter step. ``q_padded`` only has this rank's
+            # TP slice initialized, so gather local heads from the DCP group.
+            q_for_attn = dcp_group.all_gather(attn_q_base.contiguous(), dim=1)
+            attn_sink_for_attn = dcp_group.all_gather(
+                self._attn_sink_local[: self.n_local_heads].contiguous(), dim=0
+            )
+            if dcp_group.rank_in_group != 0:
+                # The sink is a global virtual KV item. Folding it into every
+                # DCP shard would count it multiple times during LSE merge.
+                attn_sink_for_attn = torch.full_like(
+                    attn_sink_for_attn,
+                    torch.finfo(attn_sink_for_attn.dtype).min,
+                )
+        else:
+            q_for_attn = q_padded if q_padded is not None else attn_q_base
+            attn_sink_for_attn = self._attn_sink_local
+
         # The cache write is always fused / already done by _forward_prepare* --
         # tell the backend to skip its own store_cache. When `kv is None`
         # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
@@ -1176,17 +1206,17 @@ class MQALayer(MqaAttentionBase):
 
         if is_unified_kv_triton():
             o = attn_backend.forward(
-                q=q_out if q_out is not None else q,
+                q=q_for_attn,
                 k=attn_k,
                 v=attn_k,
                 layer=self.attn_mqa,
                 forward_batch=forward_batch,
                 compress_ratio=self.compress_ratio,
-                attn_sink=self.attn_sink,
+                attn_sink=attn_sink_for_attn,
                 save_kv_cache=kv is not None,
             )
         else:
-            attn_q = q_padded if q_padded is not None else q
+            attn_q = q_for_attn
             save_kv_cache = False
             if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
                 o = attn_q.new_empty(
@@ -1198,7 +1228,7 @@ class MQALayer(MqaAttentionBase):
                     o,
                     self.attn_mqa.layer_id,
                     self.compress_ratio,
-                    self._attn_sink_local,
+                    attn_sink_for_attn,
                     save_kv_cache,
                 )
             else:
@@ -1209,10 +1239,17 @@ class MQALayer(MqaAttentionBase):
                     layer=self.attn_mqa,
                     forward_batch=forward_batch,
                     compress_ratio=self.compress_ratio,
-                    attn_sink=self._attn_sink_local,
+                    attn_sink=attn_sink_for_attn,
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
+        if positions.shape[0] != o.shape[0]:
+            if o.shape[0] < positions.shape[0]:
+                raise RuntimeError(
+                    "DSV4 attention returned fewer tokens than requested: "
+                    f"output={o.shape[0]}, positions={positions.shape[0]}"
+                )
+            o = o[: positions.shape[0]]
         if _is_npu:
             v4_rope_inplace_npu(
                 o[..., -self.qk_rope_head_dim :],
@@ -1762,7 +1799,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if _do_shared_local and local_hidden_states.shape[0] > 0:
                 _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            # The DSV4 attention path has already reduced across the attention-TP
+            # group and applied the post-attention mHC/norm locally, so the same
+            # hidden states are replicated on each attention-TP rank. Gather them
+            # as replicated inputs; treating them as TP partials would sum
+            # duplicate rows when attention_tp_size > 1.
+            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank

@@ -2480,6 +2480,7 @@ class NixlKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        token_position_offset: int = 0,
     ):
         if self._send_failed:
             return

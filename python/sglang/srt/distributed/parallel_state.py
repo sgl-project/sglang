@@ -1751,7 +1751,7 @@ def get_attn_tp_group() -> GroupCoordinator:
 def get_attn_cp_group() -> GroupCoordinator:
     assert (
         _ATTN_CP is not None
-    ), "attention context model parallel group is not initialized"
+    ), "attention context parallel group is not initialized"
     return _ATTN_CP
 
 
@@ -2401,7 +2401,6 @@ def initialize_model_parallel(
         max_world_size=max_world_size,
     )
 
-
 def create_custom_parallel_group(
     group_ranks: List[int], backend: str = "gloo"
 ) -> Optional[torch.distributed.ProcessGroup]:
@@ -2539,17 +2538,20 @@ def get_tensor_model_parallel_world_size():
     return get_tp_group().world_size
 
 
-def get_dcp_world_size():
-    return get_dcp_group().world_size
-
-
-def get_dcp_rank():
-    return get_dcp_group().rank_in_group
-
-
 def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
     return get_tp_group().rank_in_group
+
+
+# DCP helpers (return 1 / 0 when DCP is not enabled)
+def get_dcp_world_size() -> int:
+    """Return world size for the decode context parallel group, or 1 when off."""
+    return _DCP.world_size if _DCP is not None else 1
+
+
+def get_dcp_rank() -> int:
+    """Return my rank for the decode context parallel group, or 0 when off."""
+    return _DCP.rank_in_group if _DCP is not None else 0
 
 
 # ATTN_TP
@@ -2669,7 +2671,6 @@ def destroy_model_parallel():
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
         _PDMUX_PREFILL_TP_GROUP.destroy()
     _PDMUX_PREFILL_TP_GROUP = None
-
 
 def destroy_distributed_environment():
     global _WORLD, _MODEL_PARALLEL_GROUP_TIMEOUT

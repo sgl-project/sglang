@@ -78,6 +78,7 @@ class FakeKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        token_position_offset: int = 0,
     ):
         self.has_sent = True
         logger.debug(

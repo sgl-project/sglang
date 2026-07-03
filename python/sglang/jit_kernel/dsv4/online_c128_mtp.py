@@ -22,7 +22,7 @@ def _jit_online_c128_mtp_module(
 ) -> Module:
     args = make_cpp_args(head_dim, seq_dtype, req_dtype, dtype_buffer)
     return load_jit(
-        make_name(f"online_c128_mtp_{head_dim}"),
+        make_name(f"online_c128_mtp_bounds_{head_dim}"),
         *args,
         cuda_files=["deepseek_v4/online_c128_mtp.cuh"],
         cuda_wrappers=[
@@ -112,11 +112,12 @@ class OnlineC128MTPController:
             self.clear()
             return 0
 
+        if verify_bs is None and logical_forward_mode.is_target_verify():
+            verify_bs = req_pool_indices.shape[0]
+
         active_req_pool_indices = req_pool_indices
         active_seq_lens = seq_lens
-        if logical_forward_mode.is_target_verify():
-            if verify_bs is None:
-                verify_bs = req_pool_indices.shape[0]
+        if verify_bs is not None:
             active_req_pool_indices = req_pool_indices[:verify_bs]
             active_seq_lens = seq_lens[:verify_bs]
             if verify_bs == 0:
@@ -179,6 +180,7 @@ class OnlineC128MTPController:
             layer_bs,
             num_verify_tokens,
             state_pool.online_mtp_state_slot_offset,
+            token_to_kv_pool.get_online_c128_state_num_req_slots(),
         )
 
     def commit_pending(

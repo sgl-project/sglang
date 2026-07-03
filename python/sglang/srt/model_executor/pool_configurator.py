@@ -55,6 +55,7 @@ class MemoryPoolConfig:
     c4_max_total_num_tokens: int = 0
     c128_max_total_num_tokens: int = 0
     c4_state_pool_size: int = 0
+    c4_indexer_state_pool_size: int = 0
     c128_state_pool_size: int = 0
 
     mem_fraction_static: Optional[float] = None
@@ -568,6 +569,7 @@ class _DSV4PoolSizes:
     c4_max_total_num_tokens: int
     c128_max_total_num_tokens: int
     c4_state_pool_size: int
+    c4_indexer_state_pool_size: int
     c128_state_pool_size: int
 
 
@@ -714,12 +716,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
         swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
+        c4_state_pool_size = swa_tokens // self.swa_page_size * self.c4_ring_size
         return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,
             c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),
             c128_max_total_num_tokens=full_token // 128,
-            c4_state_pool_size=swa_tokens // self.swa_page_size * self.c4_ring_size,
+            c4_state_pool_size=c4_state_pool_size,
+            c4_indexer_state_pool_size=c4_state_pool_size,
             c128_state_pool_size=0,
         )
 
@@ -771,6 +775,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             f"c4={sizes.c4_max_total_num_tokens}, "
             f"c128={sizes.c128_max_total_num_tokens}, "
             f"c4_state={sizes.c4_state_pool_size}, "
+            f"c4_indexer_state={sizes.c4_indexer_state_pool_size}, "
             f"c128_state={sizes.c128_state_pool_size}"
         )
         return MemoryPoolConfig(
@@ -780,6 +785,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             c4_max_total_num_tokens=sizes.c4_max_total_num_tokens,
             c128_max_total_num_tokens=sizes.c128_max_total_num_tokens,
             c4_state_pool_size=sizes.c4_state_pool_size,
+            c4_indexer_state_pool_size=sizes.c4_indexer_state_pool_size,
             c128_state_pool_size=sizes.c128_state_pool_size,
         )
 
