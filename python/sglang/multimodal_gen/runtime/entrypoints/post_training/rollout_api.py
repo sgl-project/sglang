@@ -49,12 +49,16 @@ def _extract_single_sample_tensor(
         if current_key == "img_shapes" and len(obj) == batch_size:
             return [obj[sample_idx]]
         return [
-            _extract_single_sample_tensor(v, sample_idx, batch_size, current_key=current_key)
+            _extract_single_sample_tensor(
+                v, sample_idx, batch_size, current_key=current_key
+            )
             for v in obj
         ]
     if isinstance(obj, tuple):
         return tuple(
-            _extract_single_sample_tensor(v, sample_idx, batch_size, current_key=current_key)
+            _extract_single_sample_tensor(
+                v, sample_idx, batch_size, current_key=current_key
+            )
             for v in obj
         )
     return obj
