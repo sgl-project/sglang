@@ -1831,17 +1831,11 @@ class FlashInferIndicesUpdaterPrefill:
         )
 
 
-class FlashInferMultiStepDraftBackend:
-    """
-    Wrap multiple flashinfer attention backends as one for multiple consecutive
-    draft decoding steps.
-    """
+class BaseMultiStepDraftBackend:
+    """Base class handling multi-step draft speculative decoding bookkeeping."""
 
     def __init__(
-        self,
-        model_runner: ModelRunner,
-        topk: int,
-        speculative_num_steps: int,
+        self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
     ):
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
@@ -1852,30 +1846,15 @@ class FlashInferMultiStepDraftBackend:
             model_runner.server_args, model_runner.req_to_token_pool.size * self.topk
         )
         self.kv_indptr = torch.zeros(
-            (
-                self.speculative_num_steps,
-                max_bs + 1,
-            ),
+            (self.speculative_num_steps, max_bs + 1),
             dtype=torch.int32,
             device=model_runner.device,
         )
         self.kv_last_page_len = torch.ones(
             (max_bs,), dtype=torch.int32, device=model_runner.device
         )
-        self.attn_backends: List[FlashInferAttnBackend] = []
-        for i in range(self.speculative_num_steps - 1):
-            self.attn_backends.append(
-                FlashInferAttnBackend(
-                    model_runner,
-                    skip_prefill=True,
-                    kv_indptr_buf=self.kv_indptr[i],
-                    kv_last_page_len_buf=self.kv_last_page_len,
-                )
-            )
-
-        self.max_context_len = self.attn_backends[0].max_context_len
-
-        # Cached variables for generate_draft_decode_kv_indices
+        self.attn_backends = []
+        self.max_context_len = model_runner.model_config.context_len
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.req_to_token_pool = model_runner.req_to_token_pool
 
@@ -1957,9 +1936,6 @@ class FlashInferMultiStepDraftBackend:
         self.common_template(forward_batch, kv_indices, call_fn)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        # generate_draft_decode_kv_indices packs topk per-branch sequences per row,
-        # so the row needs the topk factor -- same as the eager init_forward_metadata
-        # (batch_size * topk * max_context_len). Dropping it overflows the buffer.
         kv_indices_width = draft_kv_indices_buffer_width(
             max_bs, self.topk, self.max_context_len
         )
@@ -1968,10 +1944,31 @@ class FlashInferMultiStepDraftBackend:
             dtype=torch.int32,
             device="cuda",
         )
-
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(
                 max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
+            )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata_in_graph(forward_batch)
+
+
+class FlashInferMultiStepDraftBackend(BaseMultiStepDraftBackend):
+    """FlashInfer-specific multi-step draft implementation."""
+
+    def __init__(
+        self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
+    ):
+        super().__init__(model_runner, topk, speculative_num_steps)
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends.append(
+                FlashInferAttnBackend(
+                    model_runner,
+                    skip_prefill=True,
+                    kv_indptr_buf=self.kv_indptr[i],
+                    kv_last_page_len_buf=self.kv_last_page_len,
+                )
             )
 
     def init_forward_metadata_out_graph(
