@@ -28,6 +28,12 @@ COMPRESS_RATIO_DSPARK_LAYER = 0
 
 
 class DSparkMarkovHead(nn.Module):
+    """Low-rank Markov refine head.
+
+    markov_w1 is replicated so the per-step token lookup is a local gather;
+    markov_w2 is vocab-sharded so its bias aligns with the sharded base logits.
+    """
+
     def __init__(
         self,
         vocab_size: int,
@@ -36,19 +42,12 @@ class DSparkMarkovHead(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        # markov_w1 is replicated (enable_tp=False) so the per-refine-step token
-        # lookup is a local gather with no embedding all-reduce. It was already
-        # non-TP under dp_attention; now it is always non-TP. The full table costs
-        # a few tens of MB per rank, trivial against the target weights.
         self.markov_w1 = VocabParallelEmbedding(
             vocab_size,
             markov_rank,
             enable_tp=False,
             prefix=add_prefix("markov_w1", prefix),
         )
-        # markov_w2 stays vocab-sharded: F.linear(prev_embed, markov_w2.weight)
-        # yields a bias shard aligned with the sharded base logits, so the
-        # shard-local refine adds matching columns and needs no all-gather.
         self.markov_w2 = ParallelLMHead(
             vocab_size,
             markov_rank,
@@ -212,10 +211,7 @@ _warned_dspark_num_layers_fallback = False
 
 
 def get_dspark_num_layers(config: PretrainedConfig) -> int:
-    # `dspark_num_layers` is a genuinely-optional HF config key; the released
-    # DeepSeek-V4 DSpark checkpoints set it explicitly. This is the single source
-    # of truth for the draft depth; fall back to DSPARK_DEFAULT_NUM_LAYERS only
-    # when the key is absent or non-positive.
+    """Draft depth from the checkpoint config, or DSPARK_DEFAULT_NUM_LAYERS if unset."""
     num_layers = getattr(config, "dspark_num_layers", None)
     if num_layers is None or int(num_layers) <= 0:
         global _warned_dspark_num_layers_fallback
@@ -238,10 +234,7 @@ class DeepseekV4ForCausalLMDSpark(DeepseekV4ForCausalLM):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
-        # The parent load_weights ends with a load-time MHC prewarm gated on
-        # self._mhc_prewarmed_at_load, which the parent __init__ (bypassed here)
-        # initializes. Mark it done: the draft never runs the prewarmed kernels
-        # standalone and the target model prewarms its own.
+        # Parent load_weights prewarms MHC gated on this flag; parent __init__ (bypassed) would set it.
         self._mhc_prewarmed_at_load = True
         self.config = config
         self.tp_size = get_parallel().tp_size

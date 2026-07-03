@@ -37,26 +37,20 @@ from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
 logger = logging.getLogger(__name__)
 
-# Masked-out (vocab-padding) logit columns are pushed to -inf, which maps to the
-# smallest radix key, so a padding column can never win the shard-local argmax.
+# -inf maps to the smallest radix key, so a masked padding column never wins the argmax.
 _DSPARK_NEG_INF = float("-inf")
 
 
 def _dspark_pack_value_index(
     values: torch.Tensor, global_indices: torch.Tensor
 ) -> torch.Tensor:
-    """Pack a bf16 value and its global vocab index into one positive int64 whose
-    natural order is lexicographic (value DESC, index ASC), so a MAX reduction
-    across shards reproduces torch.argmax's first-index tie-break.
+    """Pack a bf16 value and global vocab index into a positive int64 ordered
+    value DESC, index ASC, so a cross-shard MAX reproduces argmax's first-index tie-break.
 
-    The 16-bit order-preserving radix key of the bf16 value goes in bits [32, 48)
-    and the index goes in bits [0, 32) inverted (0xFFFFFFFF - idx) so the smallest
-    index wins ties. key16 < 2**16 keeps the packed value < 2**48, i.e. a positive
-    signed int64.
+    The order-preserving 16-bit key of the value goes in bits [32, 48); the index
+    goes in bits [0, 32) inverted so the smallest index wins ties.
     """
-    # Bitcast bf16 -> int16 -> int64 (sign-extended), then apply the IEEE
-    # order-preserving flip: set the sign bit for non-negative values, invert all
-    # bits for negative values, and keep only the unsigned low 16 bits.
+    # IEEE order-preserving flip so the 16-bit key sorts like the bf16 value.
     bits = values.view(torch.int16).to(torch.int64)
     mask = (bits >> 15) | 0x8000
     key16 = (bits ^ mask) & 0xFFFF
@@ -75,14 +69,10 @@ def _dspark_shard_argmax_pack(
     org_vocab_start: int,
     pad_mask: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """Shard-local argmax packed for a cross-shard MAX reduction. Returns one
-    packed int64 per row (see _dspark_pack_value_index).
+    """Shard-local argmax packed for a cross-shard MAX reduction. One packed int64
+    per row (see _dspark_pack_value_index).
 
-    Adding 0.0 collapses -0.0 to +0.0 so the packed order matches torch.argmax,
-    which treats +0.0 and -0.0 as equal; the row-slice max over the bf16 shard is
-    bit-identical to the same columns of a full-vocab argmax (matmul rows are
-    independent and max is associative), so shard-max-then-MAX-reduce equals the
-    full-vocab argmax.
+    The +0.0 collapses -0.0 to +0.0 so ties match torch.argmax.
     """
     refined = refined_shard + 0.0
     if pad_mask is not None:
@@ -131,12 +121,10 @@ def _refine_block_markov_sharded(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Collective-free block Markov refine.
 
-    Each iteration computes a vocab-shard of the refined logits (sharded base
-    logits + sharded Markov bias from the replicated w1 lookup), takes a
-    shard-local argmax, and under TP resolves the global argmax with a single
-    tiny int64 MAX all-reduce (skipped at tp_size==1). Returns the block
-    candidates [bs, block_size] and the per-position confidence [bs, block_size]
-    (or None when the confidence head is gated off).
+    Each step computes a vocab-shard of the refined logits, takes a shard-local
+    argmax, and under TP resolves the global argmax with one int64 MAX all-reduce
+    (skipped at tp_size==1). Returns candidates [bs, block_size] and per-position
+    confidence [bs, block_size] (None when the confidence head is gated off).
     """
     bs = int(block_hidden.shape[0])
     block_size = refs.block_size
@@ -176,13 +164,11 @@ def _refine_block_markov_sharded(
 
 
 class _DSparkDraftSampler:
-    """Runs the collective-free Markov refine inside the draft decode cuda
-    graph, mirroring _DflashDraftSampler. The per-iteration int64 MAX
-    all-reduce is captured with the graph exactly like the model's own TP
-    collectives, so unlike DFLASH this sampler supports tp > 1. Candidates
-    (and confidence) land in persistent buffers the worker reads after
-    replay; they are consumed into the verify input before the next draft
-    replay, so the single buffer cannot be overwritten while still in use.
+    """Runs the Markov refine inside the draft decode cuda graph.
+
+    Candidates and confidence land in persistent buffers; the worker consumes
+    them into the verify input before the next replay, so the buffers are never
+    overwritten while still in use.
     """
 
     def __init__(self, *, refs: _DSparkRefineRefs, max_bs: int, device):
@@ -202,8 +188,7 @@ class _DSparkDraftSampler:
         block_size = self.refs.block_size
         bs = hidden_states.shape[0] // block_size
         block_hidden = hidden_states.view(bs, block_size, -1)
-        # The graph's static input buffer holds the block ids; column 0 is the
-        # seeded bonus token the worker wrote before replay.
+        # Column 0 is the seed bonus token the worker wrote into the static input before replay.
         seeds = input_ids.view(bs, block_size)[:, 0]
         candidates, confidence = _refine_block_markov_sharded(
             block_hidden, seeds, self.refs
@@ -287,9 +272,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.confidence_threshold = float(
             server_args.speculative_dspark_confidence_threshold
         )
-        # The default threshold is 0.0 and sigmoid(x) >= 0 always holds, so the
-        # confident prefix is always the full block and never truncates the
-        # accepted run. Skip the whole confidence head in that case.
+        # sigmoid(x) >= 0, so a 0.0 threshold never truncates; skip the confidence head then.
         self.use_confidence = self.confidence_threshold > 0.0
 
         self._block_pos_offsets = torch.arange(
@@ -297,10 +280,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         self._sampling_verify_logged = False
 
-        # Two-slot ping-pong device buffers for the per-step commit tensors. The
-        # previous step's tensors may still be read / copied D2H by the scheduler,
-        # so the current step writes the other slot instead of overwriting them.
-        # Grown on demand with doubling.
+        # Ping-pong slots: the previous step's tensors may still be read D2H, so alternate.
         self._decode_buffer_cap = 0
         self._decode_buffer_slot = 0
         self._block_ids_bufs = []
@@ -449,12 +429,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         seq_lens_sum: Optional[int] = None,
     ) -> Tuple[torch.Tensor, bool]:
         device = self.device
-        # Host seq lengths must be committed (mirror the committed device
-        # seq_lens=prefix_lens), not the reserved over-allocation:
-        # DeepseekV4AttnBackend.init_forward_metadata adds +block itself for
-        # TARGET_VERIFY, so committed+block is the true verify extent. Passing the
-        # reserved (committed + 2*block) host bound would overshoot the allocated
-        # req_to_token range by one block.
+        # Host seq_lens must be the committed lengths, not the reserved over-alloc:
+        # the backend adds +block for TARGET_VERIFY, so committed+block is the verify extent.
         if seq_lens_cpu is None:
             seq_lens_cpu = prefix_lens.to(device="cpu", dtype=torch.int32)
         if seq_lens_sum is None:
@@ -500,11 +476,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         markov_w2 = markov_head.markov_w2
         vocab_size = int(self._draft_inner.vocab_size)
 
-        # The sharded base logits (from lm_head) and the sharded Markov bias (from
-        # markov_w2) must live on the same vocab partition for the shard-local
-        # refine to add aligned columns. DSpark rejects dp_attention, so both are
-        # plain-TP ParallelLMHeads over the same vocab and this always holds; fail
-        # loudly if a future config breaks the invariant.
+        # lm_head base logits and markov_w2 bias must share the vocab partition, else
+        # the shard-local refine adds misaligned columns.
         lm_shard = lm_head.shard_indices
         w2_shard = markov_w2.shard_indices
         if (
@@ -524,8 +497,8 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         org_vocab_start = int(lm_shard.org_vocab_start_index)
         shard_width = int(lm_head.weight.shape[0])
-        # Shard column c holds global vocab id org_vocab_start + c; columns whose
-        # global id reaches vocab_size are padding and must never win the argmax.
+        # Shard column c is global id org_vocab_start + c; ids >= vocab_size are padding
+        # and must never win the argmax.
         pad_mask = (
             org_vocab_start
             + torch.arange(shard_width, device=self.device, dtype=torch.int64)
@@ -823,11 +796,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     uniform_top_k_value=draft_input.uniform_top_k_value,
                 )
             )
-            # TP consistency: per-rank float nondeterminism in softmax/top_k/top_p
-            # can select different sampled tokens on each rank; broadcast rank 0's
-            # accept length and bonus token so every rank commits identical tokens
-            # and seq_lens stay in lockstep (diverging lengths hang later
-            # collectives). DSpark rejects dp_attention, so use the plain TP group.
+            # Broadcast rank 0's result so ranks commit identical tokens; diverging seq_lens hang collectives.
             if get_tensor_model_parallel_world_size() > 1:
                 packed = torch.stack(
                     [accept_len.to(torch.int64), sampled_bonus.to(torch.int64)],
@@ -837,14 +806,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 accept_len, sampled_bonus = packed[0], packed[1]
             accept_len = accept_len.to(torch.int64)
             if confident_prefix is not None:
-                # Losslessness under confidence truncation: the sampling-verify
-                # kernel already accepted `accept_len` drafts against the target
-                # distribution. When confidence truncates to correct_len <
-                # accept_len, the draft at candidates[correct_len + 1] is exactly
-                # the token the kernel accepted at that position (prob p(t));
-                # emitting it as the bonus composes with the kernel's
-                # rejection-residual (target minus the rejected mass) to reproduce
-                # the target distribution, so truncation stays lossless.
+                # Lossless truncation: the bonus at candidates[correct_len+1] is a
+                # kernel-accepted token, so emitting it preserves the target distribution.
                 correct_len = torch.minimum(
                     accept_len, confident_prefix.to(torch.int64)
                 )
@@ -897,14 +860,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DSpark verify requires target main_hidden states, but got None."
             )
-        # Materialize draft KV for every block position unconditionally (a fixed
-        # [bs * block] shape each step), not just the committed prefix. Writing
-        # the uncommitted (rejected) positions is safe: the next draft block
-        # attends only to committed context (< prefix + commit_len), so those
-        # slots are never read before the next verify overwrites the exact same
-        # slots. This mirrors the target verify's own unconditional KV write at
-        # verify_out_cache_loc above, and drops the data-dependent torch.nonzero
-        # host syncs that the masked-select path incurred.
+        # Write KV for all block positions, not just the committed prefix: uncommitted
+        # slots are never read before the next verify overwrites them.
         hidden = hidden.view(bs, block_size, -1)
         self._materialize_main_hidden_to_draft_kv(
             main_hidden=hidden.reshape(-1, hidden.shape[-1]),

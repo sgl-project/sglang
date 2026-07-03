@@ -845,9 +845,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     self.model_runner, "dspark_draft_sampler", None
                 )
                 if dspark_sampler is not None:
-                    # Same discipline as the DFLASH sampler above: capture the
-                    # refine here or fail loudly, else replay would leave stale
-                    # candidate buffers the worker reads as valid tokens.
+                    # Capture the refine into the graph, else replay leaves stale
+                    # candidate buffers the worker reads as tokens.
                     if (
                         not isinstance(out, LogitsProcessorOutput)
                         or out.hidden_states is None

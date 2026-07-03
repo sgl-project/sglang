@@ -36,8 +36,6 @@ class TestDSparkPredicates(CustomTestCase):
     def test_capability_predicates(self):
         self.assertTrue(self.algo.supports_target_verify_for_draft())
         self.assertTrue(self.algo.has_draft_kv())
-        # DSpark hands target context to its draft via KV materialization, never
-        # through spec_info.hidden_states, so it does not carry draft hidden states.
         self.assertFalse(self.algo.carries_draft_hidden_states())
         self.assertFalse(self.algo.need_topk())
 
@@ -226,12 +224,10 @@ class TestDSparkRequestValidation(CustomTestCase):
 
 
 class _DSparkMathBase(CustomTestCase):
-    """Base for the DSpark block-verify commit-math unit tests.
+    """Base for the DSpark block-verify commit-math tests.
 
-    Imports torch lazily (mirrors TestDSparkDraftInputBatch) so the file still
-    collects on torch-less runners, and exposes small replicas of the pure
-    commit helpers in python/sglang/srt/speculative/dspark_worker_v2.py. These
-    tests lock in the exact commit math; they do not import any GPU-only module.
+    Imports torch lazily so the file collects on torch-less runners, and holds
+    python replicas of the pure commit helpers from dspark_worker_v2.
     """
 
     def setUp(self):
@@ -242,19 +238,14 @@ class _DSparkMathBase(CustomTestCase):
         self.torch = torch
 
     def _confident_prefix(self, confidence, threshold):
-        # Replica of DSparkWorkerV2._confident_prefix: the length of the leading
-        # run of positions whose sigmoid(confidence) >= threshold. cumprod zeroes
-        # everything after the first below-threshold position, so later
-        # above-threshold positions never count.
+        # Replica of DSparkWorkerV2._confident_prefix: leading run of sigmoid >= threshold
+        # (cumprod zeroes everything after the first fail).
         keep = self.torch.sigmoid(confidence) >= threshold
         return keep.to(self.torch.int32).cumprod(dim=1).sum(dim=1)
 
     def _assemble_out_tokens(self, candidates, correct_len, bonus_tokens):
-        # Replica of the out_tokens assembly in _forward_decode: the drafts
-        # candidates[:, 1:] land in columns [0, block_size-2], a 0 pad fills the
-        # last column, then the bonus is scattered at column correct_len. The
-        # committed prefix out_tokens[:, :correct_len+1] is therefore
-        # [draft_1, ..., draft_correct_len, bonus].
+        # Replica of the out_tokens assembly in _forward_decode: drafts candidates[:, 1:]
+        # then a 0 pad, with the bonus scattered at correct_len -> prefix [drafts.., bonus].
         t = self.torch
         bs, block_size = candidates.shape
         out_tokens = t.empty((bs, block_size), dtype=t.int64)
@@ -426,18 +417,13 @@ class TestDSparkGreedyVerifyMath(_DSparkMathBase):
 
 
 class TestDSparkSampledCommitMath(_DSparkMathBase):
-    """Lock in the post-kernel logic of the SAMPLED verify branch of
-    _forward_decode. The kernel result (accept_len, sampled_bonus) is supplied
-    synthetically -- compute_dflash_sampling_correct_drafts_and_bonus needs
-    sgl_kernel and is never called here.
+    """Post-kernel logic of the SAMPLED verify branch of _forward_decode. The
+    kernel result (accept_len, sampled_bonus) is supplied synthetically.
 
-    Losslessness invariant this test guards: the confidence threshold only
-    SHORTENS the committed block, it never substitutes a token the target
-    rejection kernel would not have produced. When a row is truncated
-    (correct_len < accept_len), the committed bonus is candidates[correct_len+1];
-    because correct_len + 1 <= accept_len, that column is a draft the kernel
-    already accepted, so the committed sequence stays inside the kernel's
-    accepted prefix and the output distribution is preserved.
+    Losslessness invariant: confidence only shortens the committed block. A
+    truncated row commits candidates[correct_len+1], and correct_len+1 <=
+    accept_len, so that token is one the kernel already accepted; the output
+    distribution is preserved.
     """
 
     def _sampled_pipeline(

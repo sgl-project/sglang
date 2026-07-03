@@ -769,9 +769,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         _nnpl = self.model_config.num_nextn_predict_layers
         model_has_mtp_layers = _nnpl is not None and _nnpl > 0
         if self.is_draft_worker and self.spec_algorithm.is_dspark():
-            # `num_dspark_layers` routes through get_dspark_num_layers, the single
-            # source of truth for the draft depth (config key with a documented
-            # fallback), so read it directly rather than defaulting again here.
             model_num_layers = int(self.model.num_dspark_layers)
         elif self.is_draft_worker and model_has_mtp_layers:
             model_num_layers = self.model_config.num_nextn_predict_layers

@@ -142,8 +142,7 @@ class DSparkDraftInputV2(SpecInput):
     new_seq_lens: torch.Tensor
     main_hidden: Optional[torch.Tensor] = None
     confidence: Optional[torch.Tensor] = None
-    # Per-decode-step top-k scalars, precomputed in prepare_for_decode so the
-    # sampling-verify helper avoids a GPU->CPU .item() sync (mirrors DFlash).
+    # Top-k scalars precomputed in prepare_for_decode to avoid a GPU->CPU sync at verify.
     max_top_k: int = 1
     uniform_top_k_value: Optional[int] = None
     topk_p: torch.Tensor = field(
@@ -198,9 +197,7 @@ class DSparkDraftInputV2(SpecInput):
         uniform_top_k = True
         for i, req in enumerate(batch.reqs):
             committed_len = int(req.kv_committed_len)
-            # Read the authoritative allocation watermark from the req (like DFlash).
-            # A carried CPU copy would underestimate real allocation under page_size>1
-            # page-rounding and orphan KV slots.
+            # req.kv_allocated_len is the real watermark; a carried CPU copy underestimates under page_size>1 rounding.
             cur_alloc_len = int(req.kv_allocated_len)
             reserved_len = max(cur_alloc_len, committed_len + 2 * block_size)
             cur_kv_lens_cpu[i] = cur_alloc_len
@@ -306,9 +303,7 @@ def validate_dspark_request(req: Req) -> Optional[str]:
     if req.return_logprob:
         return "DSpark speculative decoding does not support return_logprob yet."
 
-    # DSpark consumes and nulls the target hidden states in both prefill and
-    # decode, so they can never be returned. This is unconditional, unlike
-    # DFLASH's overlap-gated rule.
+    # The target hidden states are consumed and nulled during draft, so they cannot be returned.
     if req.return_hidden_states:
         return "DSpark speculative decoding does not support return_hidden_states yet."
 
