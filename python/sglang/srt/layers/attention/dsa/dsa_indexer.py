@@ -739,6 +739,13 @@ class Indexer(MultiPlatformOp):
 
         current_stream.wait_stream(self.alt_stream)
         self.alt_stream.wait_stream(current_stream)
+        q_fp8, weights = fused_q_indexer_rope_first_quant(
+            q.contiguous(),
+            weights_raw,
+            q_scale_gate,
+            self._indexer_cos_sin_cache,
+            positions,
+        )
         with torch.cuda.stream(self.alt_stream):
             self._fused_k_prepare_and_store(
                 key,
@@ -748,14 +755,6 @@ class Indexer(MultiPlatformOp):
                 act_quant,
                 out_cache_loc=out_cache_loc,
             )
-
-        q_fp8, weights = fused_q_indexer_rope_first_quant(
-            q.contiguous(),
-            weights_raw,
-            q_scale_gate,
-            self._indexer_cos_sin_cache,
-            positions,
-        )
 
         current_stream.wait_stream(self.alt_stream)
         return q_fp8, weights
