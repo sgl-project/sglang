@@ -23,7 +23,7 @@ class TestGLM52NVFP4DPMTP(
     dp_size = 4
     mem_fraction_static = 0.88
     enable_dp_attention = True
-    bs_1_speed_thres = 100
+    bs_1_speed_thres = 180
     extra_server_args = [
         "--moe-runner-backend",
         "flashinfer_trtllm",
