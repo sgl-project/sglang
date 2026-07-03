@@ -2735,12 +2735,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.model.model = resolve_language_model(self.model)
         language_model = getattr(self.model, "language_model", self.model)
 
-        # Resolve model with layers: handle CausalLM wrapper (.model.layers) and direct TextModel (.layers)
-        if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
-            layer_model = language_model.model
-        elif hasattr(language_model, "layers"):
-            layer_model = language_model
-        else:
+        # Find the module that owns the decoder `layers`. Models wrap it at
+        # varying depths: a direct text model exposes `.layers`, a CausalLM
+        # wraps it as `.model.layers`, and some multimodal models add another
+        # level (e.g. DeepSeek-OCR: OCR wrapper -> Deepseek*ForCausalLM ->
+        # text model -> `.layers`). Descend the `.model` chain until we find it.
+        layer_model = language_model
+        while not hasattr(layer_model, "layers") and hasattr(layer_model, "model"):
+            layer_model = layer_model.model
+
+        if not hasattr(layer_model, "layers"):
             logger.warning(
                 "Disable prefill CUDA graph because the model does not have a 'layers' attribute"
             )
