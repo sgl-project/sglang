@@ -108,11 +108,12 @@ async fn main() -> Result<()> {
         {
             let mut headers = reqwest::header::HeaderMap::new();
             if let Some(key) = cfg.proxy.worker_api_key.as_deref() {
-                if let Ok(mut v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
-                {
-                    v.set_sensitive(true);
-                    headers.insert(reqwest::header::AUTHORIZATION, v);
-                }
+                let mut v = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+                    .expect(
+                        "worker api key must be a valid HTTP header value (validated at startup)",
+                    );
+                v.set_sensitive(true);
+                headers.insert(reqwest::header::AUTHORIZATION, v);
             }
             reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(2))

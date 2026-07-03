@@ -415,6 +415,24 @@ mod tests {
         assert_eq!(c.model.tokenizer_path, "Qwen/Qwen3-0.6B");
     }
 
+    /// Keys that cannot form a valid HTTP header value are rejected at
+    /// startup instead of silently producing an unauthenticated client.
+    #[test]
+    fn invalid_worker_api_key_is_rejected() {
+        let err = into_config(&[
+            "--model-id",
+            "qwen3",
+            "--worker-urls",
+            "http://x:30000",
+            "--worker-api-key",
+            "bad
+key",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("worker-api-key"), "got: {err}");
+    }
+
     /// `--worker-api-key` lands in `proxy.worker_api_key`; absent by default.
     #[test]
     fn worker_api_key_flag_parses_into_proxy_config() {

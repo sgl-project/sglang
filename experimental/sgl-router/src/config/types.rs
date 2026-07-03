@@ -21,7 +21,7 @@ pub struct Config {
 /// Outbound proxy tuning. Default mirrors SGLang's typical prefill /
 /// decode latency budget; e2e tests lower it so per-request failures
 /// trip the circuit breaker within the test's wall-time.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProxyConfig {
     /// Maximum time to wait for a single upstream HTTP request to
     /// return headers + body. Default 300 s. The circuit breaker
@@ -37,6 +37,20 @@ pub struct ProxyConfig {
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
     300
+}
+
+// Manual `Debug`: `worker_api_key` is a credential and must never appear in
+// logs or panic output, however `Config` gets printed.
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .field(
+                "worker_api_key",
+                &self.worker_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for ProxyConfig {

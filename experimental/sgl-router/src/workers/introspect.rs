@@ -100,10 +100,10 @@ impl WorkerIntrospector {
     /// whose workers enforce `--api-key`.
     pub fn with_worker_api_key(key: &str) -> Self {
         let mut headers = reqwest::header::HeaderMap::new();
-        if let Ok(mut v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")) {
-            v.set_sensitive(true);
-            headers.insert(reqwest::header::AUTHORIZATION, v);
-        }
+        let mut v = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+            .expect("worker api key must be a valid HTTP header value (validated at startup)");
+        v.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, v);
         let client = reqwest::Client::builder()
             .timeout(SERVER_INFO_TIMEOUT)
             .default_headers(headers)
