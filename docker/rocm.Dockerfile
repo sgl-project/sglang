@@ -581,6 +581,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       librdmacm-dev rdmacm-utils infiniband-diags ibverbs-utils perftest ethtool \
       libibverbs-dev rdma-core \
       openssh-server openmpi-bin openmpi-common libopenmpi-dev \
+      libgrpc++-dev protobuf-compiler-grpc \
   && rm -rf /var/lib/apt/lists/*; \
   \
   # NIC backend deps — mori auto-detects NIC at runtime (MORI_DEVICE_NIC env var override).
