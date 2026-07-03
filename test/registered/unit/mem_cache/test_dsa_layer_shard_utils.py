@@ -67,9 +67,7 @@ class TestDSALayerShardUtils(CustomTestCase):
             pending_remote_kv_layer_id=7,
             remote_kv_layer_id=None,
             device_module=SimpleNamespace(
-                current_stream=lambda: SimpleNamespace(
-                    wait_stream=lambda _stream: None
-                )
+                current_stream=lambda: SimpleNamespace(wait_stream=lambda _stream: None)
             ),
             kv_broadcast_stream=object(),
         )

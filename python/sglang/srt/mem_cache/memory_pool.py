@@ -3080,10 +3080,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         return (
             num_pages,
             self.page_size
-            * (
-                self.index_head_dim
-                + self.index_head_dim // self.quant_block_size * 4
-            ),
+            * (self.index_head_dim + self.index_head_dim // self.quant_block_size * 4),
         )
 
     def _create_index_buffers(self):

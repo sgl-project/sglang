@@ -344,7 +344,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     def prefetch_kv_buffer(
         self,
         layer_id: int,
-        layer_transfer_counter: Optional["LayerDoneCounter"] = None,
+        layer_transfer_counter: Optional[LayerDoneCounter] = None,
         layer_transfer_idx: Optional[int] = None,
     ) -> None:
         """Kick off an async owner-broadcast of ``layer_id``'s latent KV.
@@ -463,9 +463,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             max_seq_len=max_seq_len,
         )
 
-    def set_index_k_scale_buffer(
-        self, layer_id, loc, index_k, index_k_scale
-    ) -> None:
+    def set_index_k_scale_buffer(self, layer_id, loc, index_k, index_k_scale) -> None:
         self.invalidate_index_buffer_for_layer(layer_id)
         if not self._is_layer_owned(layer_id):
             return

@@ -126,8 +126,6 @@ def get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) ->
     )
 
 
-
-
 def enable_cp_v2() -> bool:
     """Return whether the CP-v2 path is enabled for this process."""
     from sglang.srt.environ import envs

@@ -185,9 +185,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # args to config cell size
         model_config = mr.model_config
         kv_cache_dtype = mr.kv_cache_dtype
-        effective_num_layers = _get_layer_split_effective_num_layers(
-            mr, num_layers
-        )
+        effective_num_layers = _get_layer_split_effective_num_layers(mr, num_layers)
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_attention_tp_size()

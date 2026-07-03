@@ -64,9 +64,7 @@ def maybe_prefetch_next_full_attention_kv(
     if next_full_attention_layer_id is None or not dsa_use_prefill_cp(forward_batch):
         return
 
-    prefetch_kv_buffer = getattr(
-        get_token_to_kv_pool(), "prefetch_kv_buffer", None
-    )
+    prefetch_kv_buffer = getattr(get_token_to_kv_pool(), "prefetch_kv_buffer", None)
     if prefetch_kv_buffer is not None:
         prefetch_kv_buffer(next_full_attention_layer_id)
 

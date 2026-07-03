@@ -2422,7 +2422,7 @@ class DeepseekV2Model(nn.Module):
                 ),
             ),
         )
-        
+
         local_layer_ids = list(range(self.start_layer, self.end_layer))
         self.next_full_attention_layer_id = dict(
             zip(local_layer_ids, local_layer_ids[1:])
