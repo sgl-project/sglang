@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""A single structured accessor for process-static parallel-topology state.
+"""A single structured accessor for process-static runtime state.
 
 ``get_parallel()`` returns a ``ParallelContext`` whose attributes — tp / pp /
 moe / attn size and rank, plus the process-group handles — each delegate live to
@@ -20,12 +20,20 @@ Returned values are exactly what those getters return; this is a read-through
 wrapper, not a cache. It gives call-sites one import and one naming scheme in
 place of a dozen free functions, plus a test-only ``override()`` hook to force a
 topology without monkeypatching the underlying getters.
+
+``get_server_args()`` returns the process-wide ``ServerArgs`` (the config tier).
+It is a read-through to ``server_args.get_global_server_args()`` — same object,
+same pre-publish error — so new code can adopt the context accessor while the
+legacy getter remains canonical.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
 
 
 # Imported lazily so this module has no import-time dependencies: any module can
@@ -40,6 +48,12 @@ def _dp():
     from sglang.srt.layers import dp_attention
 
     return dp_attention
+
+
+def _sa():
+    from sglang.srt import server_args
+
+    return server_args
 
 
 _PARALLEL_FIELDS = frozenset(
@@ -206,12 +220,18 @@ class ParallelContext:
 
 
 class RuntimeContext:
-    """Container for the structured runtime accessors; currently exposes ``parallel``."""
+    """Container for the structured runtime accessors; exposes ``parallel`` and
+    ``server_args``."""
 
     __slots__ = ("parallel",)
 
     def __init__(self, parallel: ParallelContext):
         self.parallel = parallel
+
+    @property
+    def server_args(self) -> ServerArgs:
+        """The process-wide ``ServerArgs``, read through the global getter."""
+        return _sa().get_global_server_args()
 
 
 _PARALLEL = ParallelContext()
@@ -224,3 +244,7 @@ def get_context() -> RuntimeContext:
 
 def get_parallel() -> ParallelContext:
     return _PARALLEL
+
+
+def get_server_args() -> ServerArgs:
+    return _CONTEXT.server_args

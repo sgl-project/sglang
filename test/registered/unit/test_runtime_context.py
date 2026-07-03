@@ -12,11 +12,13 @@ from sglang.srt.runtime_context import (
     RuntimeContext,
     get_context,
     get_parallel,
+    get_server_args,
 )
 from sglang.test.test_utils import CustomTestCase
 
 _PS = "sglang.srt.distributed.parallel_state"
 _DP = "sglang.srt.layers.dp_attention"
+_SA = "sglang.srt.server_args"
 
 SIZE_RANK_DELEGATIONS = [
     ("world_size", f"{_PS}.get_world_size"),
@@ -140,6 +142,43 @@ class TestParallelOverride(_IsolatedOverrides):
             with p.override(tp_sizee=1):  # typo
                 pass
         self.assertEqual(p._overrides, {})
+
+
+class TestServerArgsReadThrough(CustomTestCase):
+    """``server_args`` delegates live to the global getter (read-through, V2a)."""
+
+    def test_delegates_to_global_getter(self):
+        sentinel = object()
+        with patch(f"{_SA}.get_global_server_args", return_value=sentinel):
+            self.assertIs(get_server_args(), sentinel)
+            self.assertIs(get_context().server_args, sentinel)
+
+    def test_identity_with_global_getter(self):
+        import sglang.srt.server_args as server_args_module
+
+        # Identity (not equality) is the contract; publish accepts any object.
+        sentinel = object()
+        saved = server_args_module._global_server_args
+        try:
+            server_args_module.set_global_server_args_for_scheduler(sentinel)
+            self.assertIs(
+                get_server_args(), server_args_module.get_global_server_args()
+            )
+            self.assertIs(get_server_args(), sentinel)
+        finally:
+            server_args_module._global_server_args = saved
+
+    def test_pre_publish_error_passes_through(self):
+        import sglang.srt.server_args as server_args_module
+
+        saved = server_args_module._global_server_args
+        server_args_module._global_server_args = None
+        try:
+            with self.assertRaises(ValueError) as cm:
+                get_server_args()
+            self.assertEqual(str(cm.exception), "Global server args is not set yet!")
+        finally:
+            server_args_module._global_server_args = saved
 
 
 if __name__ == "__main__":
