@@ -747,7 +747,7 @@ def create_paged_compressor_data(
             seq_lens=seq_lens_planner,
             extend_lens=extend_lens_planner,
             req_to_token=req_to_token,
-            full_to_swa=full_to_swa,
+            full_to_state=full_to_swa,
             swa_page_size=swa_page_size,
             ring_size=ring_size,
             num_q_tokens=num_q_tokens,
@@ -758,7 +758,7 @@ def create_paged_compressor_data(
             compress_ratio=compress_ratio,
             req_pool_indices=req_pool_indices_i64,
             req_to_token=req_to_token,
-            full_to_swa=full_to_swa,
+            full_to_state=full_to_swa,
             seq_lens=seq_lens.to(torch.int64),
             swa_page_size=swa_page_size,
             ring_size=ring_size,
@@ -779,8 +779,6 @@ def _create_online_paged_compressor_data(
     num_q_tokens: Optional[int],
     online_state_slot_offset: int = 0,
 ) -> CompressMetadata:
-    swa_page_size = int(token_to_kv_pool.swa_page_size)
-    full_to_swa = token_to_kv_pool.full_to_swa_index_mapping.detach()
     req_pool_indices = req_pool_indices.to(torch.int64)
 
     if is_prefill:
@@ -803,9 +801,7 @@ def _create_online_paged_compressor_data(
             extend_lens=extend_lens_planner,
             req_pool_indices=req_pool_indices,
             req_to_token=req_to_token,
-            full_to_swa=full_to_swa,
             num_q_tokens=int(num_q_tokens_planner),
-            swa_page_size=swa_page_size,
             use_cuda_graph=use_prefill_cuda_graph,
             state_slot_offset=online_state_slot_offset,
         )
@@ -814,7 +810,5 @@ def _create_online_paged_compressor_data(
             seq_lens=seq_lens.to(torch.int64),
             req_pool_indices=req_pool_indices,
             req_to_token=req_to_token,
-            full_to_swa=full_to_swa,
-            swa_page_size=swa_page_size,
             state_slot_offset=online_state_slot_offset,
         )

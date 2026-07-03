@@ -115,8 +115,8 @@ class TurboWanT2V1_3B480PConfig(TurboWanT2V480PConfig):
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             auto_dit_layerwise_offload=True,
-            auto_disable_component_offload_min_available_memory_gb=60,
-            auto_disable_component_offload_components=(
+            keep_resident_min_available_gb=60,
+            keep_resident_components=(
                 "text_encoder",
                 "image_encoder",
                 "vae",
@@ -202,8 +202,8 @@ class FastWan2_1_T2V_480P_Config(WanT2V480PConfig):
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             auto_dit_layerwise_offload=True,
-            auto_disable_component_offload_min_available_memory_gb=60,
-            auto_disable_component_offload_components=(
+            keep_resident_min_available_gb=60,
+            keep_resident_components=(
                 "text_encoder",
                 "image_encoder",
                 "vae",

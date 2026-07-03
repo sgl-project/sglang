@@ -453,8 +453,6 @@ class ModelConfig:
         # Verify quantization
         self._verify_quantization()
 
-        self._verify_transformers_version()
-
         # Verify dual-chunk attention config
         self._verify_dual_chunk_attention_config()
 
@@ -1433,34 +1431,6 @@ class ModelConfig:
                     "sparse_attention_enabled"
                 ] = True
 
-    def _verify_transformers_version(self):
-        import transformers
-        from packaging import version
-
-        tf_version_str = getattr(transformers, "__version__", None)
-        if tf_version_str is None:
-            return
-
-        vision_config = getattr(self.hf_config, "vision_config", None)
-        is_glm_46vmoe = "glm-4.6v" in self.model_path.lower() or (
-            vision_config is not None
-            and getattr(vision_config, "model_type", None) == "glm4v_moe_vision"
-            # The vision config model type for GLM-4.5v is 'glm4v_moe',
-            # while for GLM-4.6v, it is 'glm4v_moe_vision'.
-        )
-        needs_tf_v5 = is_glm_46vmoe
-
-        tf_version = version.parse(tf_version_str)
-        required_version = version.parse("5.0.0dev0")
-
-        if tf_version < required_version:
-            if needs_tf_v5:
-                raise ValueError(
-                    f"Transformers version {tf_version_str} is not supported for model {self.model_path} "
-                    f"or model type {self.hf_config.model_type}. "
-                    "Please upgrade transformers to >= 5.0.0."
-                )
-
     def _get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
         if eos_ids is not None:
@@ -1693,6 +1663,7 @@ multimodal_model_archs = [
     "Qwen3ASRForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
+    "LocateAnythingForConditionalGeneration",
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
     "InternS1ProForConditionalGeneration",

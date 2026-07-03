@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.environ import envs
+
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
@@ -12,6 +14,19 @@ logger = logging.getLogger(__name__)
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
     """Apply DeepSeek V4 model-specific server arg defaults and constraints."""
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.utils import is_hip
+
+    # FlashMLA sparse prefill (SGLANG_OPT_FLASHMLA_SPARSE_PREFILL, default on)
+    # currently returns incorrect output for DeepSeek-V4-Flash on ROCm/HIP
+    # (MI355X), which breaks the disaggregation nightly. Keep the previous
+    # (dense prefill) behavior on ROCm until the sparse kernel is validated
+    # there; an explicit env var still overrides this.
+    if is_hip() and not envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.is_set():
+        logger.warning(
+            "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL by default on ROCm/HIP "
+            f"for {model_arch}; set it explicitly to override."
+        )
+        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
 
     server_args.attention_backend = "dsv4"
     server_args.page_size = 256
@@ -93,6 +108,11 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     assert (
         server_args.tp_size <= 8
     ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+    logger.warning(
+        "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
+        "context parallelism is enabled."
+    )
+    envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
     logger.warning(
         f"Enable Context Parallel for DeepSeekV4, "
         f"dp_size={server_args.dp_size}, moe_dense_tp_size={server_args.moe_dense_tp_size}, "
