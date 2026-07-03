@@ -306,6 +306,13 @@ class Flags(_StaticFlags):
     moe: MoeFlags = dataclasses.field(default_factory=MoeFlags)
     capture: CaptureFlags = dataclasses.field(default_factory=CaptureFlags)
 
+    # -- resolved config leaves (flat; materialized at publish) --------------
+    # Pristine user requests stay on the matching server_args fields; these
+    # leaves carry the model-resolved values.
+    dtype: str = "auto"
+    enable_tf32_matmul: bool = False
+    enable_multi_layer_eagle: bool = False
+
     def freeze(self) -> None:
         for field in dataclasses.fields(self):
             value = getattr(self, field.name)

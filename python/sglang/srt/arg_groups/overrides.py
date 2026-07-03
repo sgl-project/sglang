@@ -29,13 +29,21 @@ Two declaration forms, keyed on ``hf_config.architectures[0]``:
 from __future__ import annotations
 
 import dataclasses
+import logging
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from sglang.srt.arg_groups.arg_utils import model_overridable_fields
 from sglang.srt.runtime_context import resolve_flag_leaf
 
+logger = logging.getLogger(__name__)
+
 # Constant per-architecture overrides (populated by the migration sweeps).
-MODEL_OVERRIDES: Dict[str, Dict[str, Any]] = {}
+MODEL_OVERRIDES: Dict[str, Dict[str, Any]] = {
+    # These models run in bfloat16 regardless of the requested dtype
+    # (faithful port of the legacy unconditional arch branch).
+    "MistralLarge3ForCausalLM": {"dtype": "bfloat16"},
+    "PixtralForConditionalGeneration": {"dtype": "bfloat16"},
+}
 
 # Derived per-architecture override providers, in registration order.
 _MODEL_OVERRIDE_FNS: Dict[str, List[Callable[..., dict]]] = {}
@@ -81,6 +89,41 @@ def collect_model_override_declarations(
         if declared:
             declarations.append((fn.__qualname__, dict(declared)))
     return declarations
+
+
+# ---------------------------------------------------------------------------
+# Derived per-family declarations (faithful ports of legacy arch branches).
+# Callables read the PRISTINE server_args, never write; logging is kept
+# verbatim from the legacy branch for operator-visible fidelity.
+# ---------------------------------------------------------------------------
+
+
+def _register_for(*architectures: str):
+    """Register one provider for several architectures (family lists)."""
+
+    def decorator(fn: Callable[..., dict]) -> Callable[..., dict]:
+        for architecture in architectures:
+            register_model_override(architecture)(fn)
+        return fn
+
+    return decorator
+
+
+# Keep in sync with MIMO_V2_MODEL_ARCHS (server_args.py / configs/hf_config.py).
+@_register_for("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
+def _mimo_v2_overrides(server_args: Any, hf_config: Any) -> dict:
+    if server_args.speculative_algorithm == "EAGLE":
+        logger.info("Enable multi-layer EAGLE speculative decoding for MiMoV2 model.")
+        return {"enable_multi_layer_eagle": True}
+    return {}
+
+
+@_register_for("MiniMaxM2ForCausalLM")
+def _minimax_m2_overrides(server_args: Any, hf_config: Any) -> dict:
+    logger.info(
+        "Enable TF32 matmul for MiniMaxM2ForCausalLM model to improve gate gemm performance."
+    )
+    return {"enable_tf32_matmul": True}
 
 
 @dataclasses.dataclass(frozen=True)
