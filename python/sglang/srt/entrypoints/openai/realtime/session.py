@@ -433,10 +433,7 @@ class RealtimeConnection:
     async def _on_session_update(self, event: SessionUpdateEvent) -> None:
         cfg = event.session
 
-        # Normalize audio to an empty input cfg if absent so downstream
-        # `audio.X is not None` reads as a business rule, not an existence check.
-        # transcription stays nullable so partial-update can detect whether
-        # the client sent the block.
+        # Keep `transcription` nullable so partial updates can detect it.
         audio = (
             cfg.audio.input if cfg.audio else None
         ) or TranscriptionSessionAudioInput()
@@ -709,11 +706,7 @@ class RealtimeConnection:
     async def _on_input_audio_buffer_clear(
         self, event: InputAudioBufferClearEvent
     ) -> None:
-        # Reserve a fresh current_item_id so post-clear pre-commit deltas
-        # don't share an item_id with deltas the client already received
-        # for the abandoned audio. previous_item_id is NOT touched — the
-        # cleared item was never committed, so the prior-commit chain
-        # shouldn't include it.
+        # Use a fresh item id for post-clear pre-commit deltas.
         self._reset_inference_state()
         self.item.current_item_id = f"item_{random_uuid()}"
         await self._send(
@@ -830,11 +823,7 @@ class RealtimeConnection:
                 len(self.audio.pcm_buffer),
             )
             if is_last:
-                # Commit-time failure: committed + created already emitted,
-                # so the item exists client-side and transcription.failed
-                # can reference it. Wire message is hardcoded "Transcription
-                # failed" — don't leak backend traces to the client; full
-                # error is in the logger.exception above.
+                # Commit-time failure can reference the already-created item.
                 await self._send(
                     ConversationItemInputAudioTranscriptionFailedEvent(
                         event_id=f"event_{random_uuid()}",

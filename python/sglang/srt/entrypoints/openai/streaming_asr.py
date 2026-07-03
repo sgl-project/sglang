@@ -112,28 +112,13 @@ class StreamingASRState:
         return delta
 
     def _trim_cjk_emitted_overlap(self, delta: str) -> str:
-        """Drop a leading all-CJK run of ``delta`` that duplicates the tail of
-        ``emitted_text``.
-
-        The whitespace-word path (``str.split``) and the CJK char path store
-        ``confirmed_text`` in incompatible encodings (space-delimited words vs a
-        spaceless char run). When a stream flips between them -- code-switching
-        CJK<->Latin, or a slicing item disarming back to the cumulative path --
-        the reconciler yields ``common_count == 0`` and re-emits an already-sent
-        CJK prefix. Only ever trims an all-CJK overlap ending on a CJK/space
-        boundary, so Latin word extension ("world"->"worldly") and legitimate
-        repeats (reconciled with ``common_count > 0``) are never touched.
-        """
+        """Drop an already-emitted leading CJK run after char/word path flips."""
         if not delta or not self.emitted_text:
             return delta
         max_k = min(len(delta), len(self.emitted_text))
         for k in range(max_k, 0, -1):
             if self.emitted_text[-k:] != delta[:k]:
                 continue
-            # Require the overlap to be all-CJK. That alone guarantees the cut is
-            # a valid boundary (CJK chars are self-delimiting, so delta[k] -- even
-            # a glued Latin token like "abc" in "你好abc" -- starts a fresh unit),
-            # while a Latin overlap ("cat"/"cats") is rejected and never trimmed.
             if all(_is_cjk(c) for c in delta[:k]):
                 return delta[k:].lstrip()
         return delta
@@ -179,30 +164,17 @@ class StreamingASRState:
             self.confirmed_text = new_transcript
         self.full_transcript = new_transcript
         self.chunk_index += 1
-        # Word-level common prefix, not char-level startswith: startswith
-        # sliced mid-word when a confirmed word was extended ("world" ->
-        # "worldly" emitted "ly").
+        # Compare full words so mid-word extensions emit the corrected word.
         old_words = old_confirmed.split()
         new_words = self.confirmed_text.split()
         if cumulative:
-            # Normalized compare so recasing/repunctuation of an already-emitted
-            # word (He->he, But->but, .->,) does not reset the common prefix.
-            # Emit from the first genuinely-different word: this can re-send an
-            # early word the model revised, but never DROPS a new one (all new
-            # words are at the tail, at index >= common_count).
+            # Normalize recasing/repunctuation without dropping new tail words.
             common_count = _norm_common_prefix_len(old_words, new_words)
         else:
-            # Sliced path: each slice is a disjoint audio window and
-            # dedupe_overlap already removed the emitted overlap, so a word
-            # prefix match against the previous slice's confirmed_text is
-            # spurious. No token-count holdback here: the sliced window is
-            # already acoustically bounded, and holding a word back risks it
-            # being deferred past the next (time-based) overlap and dropped.
+            # Sliced windows rely on acoustic overlap, not token-count holdback.
             common_count = 0
         delta = " ".join(new_words[common_count:])
         if common_count == 0:
-            # Full re-emit: guard against re-sending an already-emitted CJK
-            # prefix when the char<->word encoding flipped.
             delta = self._trim_cjk_emitted_overlap(delta)
         if cumulative:
             delta = self._trim_large_cumulative_prompt_echo(delta)
@@ -218,8 +190,7 @@ class StreamingASRState:
             cut = len(new_transcript) - holdback
         else:
             cut = 0
-        # Never split a Latin/alnum run embedded in CJK text. Back the cut up to
-        # the nearest boundary between two word characters.
+        # Avoid splitting a Latin/alnum run embedded in CJK text.
         while (
             0 < cut < len(new_transcript)
             and _is_word_char(new_transcript[cut - 1])
@@ -230,14 +201,10 @@ class StreamingASRState:
         self.full_transcript = new_transcript
         self.chunk_index += 1
 
-        # Character common prefix: emit from the first differing char so a
-        # rewritten early character never drops the new characters after it.
-        # (No case folding -- CJK text has no case.)
+        # Emit from the first differing char so revisions do not drop the tail.
         common_count = _common_prefix_len(old_confirmed, self.confirmed_text)
         delta = self.confirmed_text[common_count:]
         if common_count == 0:
-            # Full re-emit (e.g. a sliced->cumulative flip re-transcribed the
-            # tail window): drop an already-emitted CJK prefix.
             delta = self._trim_cjk_emitted_overlap(delta)
         return self._record_emit(delta)
 
@@ -245,7 +212,6 @@ class StreamingASRState:
         if _is_cjk_no_whitespace(self.full_transcript):
             old_confirmed = self.confirmed_text
             self.confirmed_text = self.full_transcript
-            # Emit from the first differing char; never drop the finalized tail.
             common_count = _common_prefix_len(old_confirmed, self.full_transcript)
             delta = self.full_transcript[common_count:]
             if common_count == 0:
@@ -254,13 +220,9 @@ class StreamingASRState:
 
         confirmed_words = self.confirmed_text.split()
         all_words = self.full_transcript.split()
-        # Word-level common prefix (normalized on the cumulative path) absorbs
-        # casing/punctuation differences between the last chunk and the final
-        # transcription without dropping any newly-finalized word.
         if cumulative:
             common_count = _norm_common_prefix_len(confirmed_words, all_words)
         else:
-            # Sliced path: dedupe_overlap is the only intended dedup (see update).
             common_count = 0
         self.confirmed_text = self.full_transcript
         delta = " ".join(all_words[common_count:])
