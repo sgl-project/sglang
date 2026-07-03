@@ -3,6 +3,7 @@ from typing import Iterator, Optional, Union
 
 import torch
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 
@@ -70,7 +71,11 @@ def resolve_component_precision(server_args, module_name: str) -> Optional[torch
 
 
 def autocast_enabled(dtype: torch.dtype, disable_autocast: bool) -> bool:
-    return dtype != torch.float32 and not disable_autocast
+    return (
+        dtype != torch.float32
+        and not disable_autocast
+        and current_platform.is_amp_supported()
+    )
 
 
 def get_module_dtype(module, default: torch.dtype = torch.float32) -> torch.dtype:

@@ -5,6 +5,7 @@
 Denoising stage for diffusion pipelines.
 """
 
+import gc
 import inspect
 import math
 import os
@@ -1111,13 +1112,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # 5. Advance the scheduler state with the predicted noise.
         with maybe_nvtx_range("scheduler_step", use_nvtx):
-            ctx.latents = ctx.scheduler.step(
+            latents_dtype = ctx.latents.dtype
+            latents = ctx.scheduler.step(
                 model_output=noise_pred,
                 timestep=step.t_device,
                 sample=ctx.latents,
                 **ctx.extra_step_kwargs,
                 return_dict=False,
             )[0]
+            if latents.dtype != latents_dtype and latents.device.type == "mps":
+                latents = latents.to(latents_dtype)
+            ctx.latents = latents
 
         # 6. Re-apply any model-specific latent constraints after the update.
         ctx.latents = self.post_forward_for_ti2v_task(
@@ -1242,10 +1247,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 self._component_residency_manager.remove_nvtx_hooks_for_module(
                     self.transformer
                 )
+                self._component_residency_manager.strategy_for.cache_clear()
             del self.transformer
             if pipeline is not None and "transformer" in pipeline.modules:
                 del pipeline.modules["transformer"]
             server_args.model_loaded["transformer"] = False
+            gc.collect()
+            torch.mps.empty_cache()
             logger.info(
                 "Memory after deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
@@ -1547,6 +1555,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 (denoising_end_time - denoising_start_time) / len(ctx.timesteps),
             )
 
+        if "step" in locals():
+            del step
         self._finish_active_component_use()
 
         # Rollout postprocessing must run BEFORE _finalize_denoising_loop so

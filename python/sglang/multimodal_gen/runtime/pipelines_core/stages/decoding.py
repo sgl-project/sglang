@@ -6,6 +6,7 @@ Decoding stage for diffusion pipelines.
 """
 
 import weakref
+from contextlib import nullcontext
 
 import torch
 
@@ -190,13 +191,21 @@ class DecodingStage(PipelineStage):
         latents = server_args.pipeline_config.preprocess_decoding(
             latents, server_args, vae=self.vae
         )
+        if latents.device.type == "mps":
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
 
         # Decode latents
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=vae_dtype,
-            enabled=vae_autocast_enabled,
-        ):
+        autocast_context = (
+            torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=vae_dtype,
+                enabled=True,
+            )
+            if vae_autocast_enabled
+            else nullcontext()
+        )
+        with autocast_context:
             try:
                 # TODO: make it more specific
                 if server_args.pipeline_config.vae_tiling:

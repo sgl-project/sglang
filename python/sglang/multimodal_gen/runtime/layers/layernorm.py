@@ -155,9 +155,24 @@ class RMSNorm(CustomOp):
 
             x_var = x[..., : self.variance_size_override]
 
+        if x.device.type == "mps" and self.variance_size_override is None:
+            weight = self.weight.to(dtype=torch.float32)
+            x = F.rms_norm(
+                x,
+                (self.hidden_size,),
+                weight,
+                self.variance_epsilon,
+            ).to(orig_dtype)
+            if residual is None:
+                return x
+            return x, residual
+
         variance = x_var.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
-        x = (x * self.weight).to(orig_dtype)
+        weight = self.weight
+        if x.device.type == "mps" and weight.dtype != torch.float32:
+            weight = weight.to(dtype=torch.float32)
+        x = (x * weight).to(orig_dtype)
         if residual is None:
             return x
         else:

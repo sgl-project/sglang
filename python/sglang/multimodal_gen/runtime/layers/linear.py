@@ -155,6 +155,17 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
+        if x.device.type == "mps" and (
+            x.dtype != torch.float32
+            or layer.weight.dtype != torch.float32
+            or (bias is not None and bias.dtype != torch.float32)
+        ):
+            return F.linear(
+                x.to(torch.float32),
+                layer.weight.to(torch.float32),
+                None if bias is None else bias.to(torch.float32),
+            )
+
         output = (
             F.linear(x, layer.weight, bias)
             if IS_AMP_SUPPORTED or bias is None
