@@ -394,15 +394,18 @@ class HybridCacheController(BaseHiCacheController):
         if not self.write_queue:
             return
         op = CacheOperation.merge_ops(self.write_queue)
-        # Page-first write-back JIT kernels can keep destination host indices on CPU.
-        if (
-            self.io_backend == "kernel"
-            and self.mem_pool_host.layout == "page_first"
-            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+        # Write-back index device is per-pool, not per-group: a HostPoolGroup
+        # can mix a staged-JIT anchor (needs CPU/cuda_host indices) with side
+        # pools using plain sgl_kernel transfer (need CUDA indices). Gating on
+        # the group-level all(...) capability would push the anchor's host
+        # indices onto CUDA and crash the staged JIT with a device mismatch.
+        anchor_pool = self._writeback_anchor_pool()
+        if anchor_pool is not None and self._writeback_uses_cpu_host_indices(
+            anchor_pool
         ):
             host_indices = op.host_indices
             device_indices = op.device_indices
-            resolved_pool_transfers = self.move_kernel_page_first_pool_transfers(
+            resolved_pool_transfers = self._normalize_writeback_pool_transfers(
                 op.pool_transfers
             )
         else:
@@ -438,9 +441,29 @@ class HybridCacheController(BaseHiCacheController):
             )
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
-    def move_kernel_page_first_pool_transfers(
+    def _writeback_anchor_pool(self):
+        """Host pool governing the main KV write-back device policy (the
+        group's primary-index anchor, or the pool itself when ungrouped)."""
+        anchor_entry = getattr(self.mem_pool_host, "anchor_entry", None)
+        if anchor_entry is not None:
+            return anchor_entry.host_pool
+        return self.mem_pool_host
+
+    def _writeback_uses_cpu_host_indices(self, host_pool) -> bool:
+        """True when `host_pool`'s staged page-first JIT keeps host indices on
+        CPU/cuda_host; other kernels use the normal device placement."""
+        return (
+            self.io_backend == "kernel"
+            and getattr(host_pool, "layout", None) == "page_first"
+            and getattr(host_pool, "can_use_write_back_jit", False)
+        )
+
+    def _normalize_writeback_pool_transfers(
         self, pool_transfers: Optional[list[PoolTransfer]]
     ) -> Optional[list[PoolTransfer]]:
+        """Return execution-time PoolTransfer copies, keeping each side pool's
+        host indices on CPU only when its own host pool uses staged JIT (so a
+        KV-slot-sharing pool can still differ in device from the anchor)."""
         if not pool_transfers:
             return None
 
@@ -448,15 +471,16 @@ class HybridCacheController(BaseHiCacheController):
         for transfer in pool_transfers:
             transfer_host_indices = transfer.host_indices
             transfer_device_indices = transfer.device_indices
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            host_pool = entry.host_pool if entry is not None else None
             if (
-                transfer.name == PoolName.INDEXER
-                and transfer_host_indices is not None
+                transfer_host_indices is not None
                 and transfer_device_indices is not None
+                and not (
+                    host_pool is not None
+                    and self._writeback_uses_cpu_host_indices(host_pool)
+                )
             ):
-                # Main KV page_first write-back keeps CPU/CUDAHost destination
-                # indices for the staged JIT path; DSA indexer uses sgl_kernel
-                # transfer kernels that require CUDA indices even when sharing
-                # KV slot ids.
                 transfer_host_indices, transfer_device_indices = self.move_indices(
                     transfer_host_indices, transfer_device_indices
                 )

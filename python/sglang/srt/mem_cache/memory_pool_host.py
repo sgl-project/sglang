@@ -342,6 +342,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     )
             elif self.layout == "page_first":
                 if self.can_use_write_back_jit:
+                    # Staged JIT requires CPU/cuda_host dst indices; fail
+                    # clearly instead of an opaque TVM device mismatch.
+                    if host_indices.is_cuda:
+                        raise RuntimeError(
+                            "HiCache staged write-back expects CPU/cuda_host "
+                            f"dst_indices, got {host_indices.device}. The "
+                            "write-back index-device policy moved main KV "
+                            "host indices onto CUDA."
+                        )
                     jit_transfer_hicache_all_layer_mla_staged_lf_pf(
                         ptr_src=device_pool.data_ptrs,
                         src_indices=device_indices,
@@ -2301,6 +2310,14 @@ class DSAIndexerPoolHost(HostKVCache):
                 )
             elif self.layout == "page_first":
                 if self.can_use_write_back_jit:
+                    # Staged JIT requires CPU/cuda_host dst indices; fail
+                    # clearly instead of an opaque TVM device mismatch.
+                    if host_page_indices.is_cuda:
+                        raise RuntimeError(
+                            "HiCache DSA indexer staged write-back expects "
+                            "CPU/cuda_host dst_indices, got "
+                            f"{host_page_indices.device}."
+                        )
                     jit_transfer_hicache_all_layer_mla_staged_lf_pf(
                         ptr_src=self.index_k_device_ptrs,
                         src_indices=device_page_indices,
