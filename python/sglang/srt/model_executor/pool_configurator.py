@@ -32,7 +32,10 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.common import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    dsa_compact_indexer_layer_mask,
+)
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
@@ -209,7 +212,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                indexer_layers = num_layers
+                _compact_mask = (
+                    dsa_compact_indexer_layer_mask(model_config.hf_config, num_layers)
+                    if not getattr(mr, "enable_hisparse", False)
+                    else None  # hisparse pool ignores the mask -- keep sizing honest
+                )
+                if _compact_mask is not None:
+                    # real buffers + one shared alias -- must match the pool actual
+                    # allocation or the freed VRAM never becomes extra tokens
+                    indexer_layers = sum(_compact_mask) + 1
+                cell_size += indexer_size_per_token * indexer_layers * element_size
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
             # (sparse-only, single-head; kv layers store K+V, k-only layers store K).

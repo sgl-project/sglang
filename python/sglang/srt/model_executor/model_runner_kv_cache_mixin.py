@@ -852,6 +852,20 @@ class ModelRunnerKVCacheMixin:
                 pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                     self.server_args
                 ).host_to_device_ratio
+            if not self.enable_hisparse:
+                # SGLANG_DSA_COMPACT_INDEXER: hisparse subclass does not forward the
+                # kwarg — feature is mutually exclusive with hisparse by design.
+                from sglang.srt.mem_cache.memory_pool import (
+                    dsa_compact_indexer_layer_mask,
+                )
+
+                _compact_mask = dsa_compact_indexer_layer_mask(
+                    self.model_config.hf_config,
+                    self.num_effective_layers,
+                    self.start_layer,
+                )
+                if _compact_mask is not None:
+                    pool_kwargs["indexer_layer_mask"] = _compact_mask
             self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,

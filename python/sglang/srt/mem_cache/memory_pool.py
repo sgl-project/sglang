@@ -3002,6 +3002,56 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             )
 
 
+def dsa_compact_indexer_layer_mask(hf_config, layer_num: int, start_layer: int = 0):
+    """SGLANG_DSA_COMPACT_INDEXER=1: per-layer mask of layers that actually run the
+    DSA indexer (True = allocate a real index_k buffer). Skip-topk ("shared") layers
+    carry no indexer weights in the checkpoint and never run the indexer
+    (attention_forward_methods/forward_mla.py), so their index_k buffers have no
+    writer or reader — they are replaced by a single shared full-size alias tensor.
+    Mirrors the skip_topk derivation in models/deepseek_v2.py. Returns None when the
+    feature is off or the pool does not span the full model (e.g. the NEXTN draft
+    pool, whose single layer owns real indexer weights).
+    """
+    if not envs.SGLANG_DSA_COMPACT_INDEXER.get():
+        return None
+    num_hidden = getattr(hf_config, "num_hidden_layers", None)
+    if num_hidden is None or layer_num != num_hidden or (start_layer or 0) != 0:
+        return None
+    # Mirror the model's skip_topk gate priority exactly (models/deepseek_v2.py):
+    # index_topk_pattern > index_skip_topk_offset > index_topk_freq. The mask MUST
+    # equal the set of layers that actually write/read index_k — a mismatch means
+    # a live layer shares the alias and silently corrupts topk.
+    pattern = getattr(hf_config, "index_topk_pattern", None)
+    if pattern is not None:
+        if len(pattern) < layer_num:
+            return None
+        mask = [pattern[i] != "S" for i in range(layer_num)]
+    else:
+        freq = getattr(hf_config, "index_topk_freq", None)
+        if not freq or freq <= 1:
+            return None
+        offset = getattr(hf_config, "index_skip_topk_offset", None)
+        if offset is not None and offset > 0:
+            mask = [max(i - offset + 1, 0) % freq == 0 for i in range(layer_num)]
+        else:
+            mask = [max(i - 1, 0) % freq == 0 for i in range(layer_num)]
+    # indexer_types (when present) is a cross-check, not a source: a mismatch is a
+    # contradictory config — fail safe to stock allocation instead of guessing.
+    indexer_types = getattr(hf_config, "indexer_types", None)
+    if indexer_types is not None and len(indexer_types) >= layer_num:
+        if [t == "full" for t in indexer_types[:layer_num]] != mask:
+            logger.warning(
+                "SGLANG_DSA_COMPACT_INDEXER disabled: indexer_types disagrees with "
+                "the skip_topk derivation — falling back to full allocation."
+            )
+            return None
+    n_full = sum(mask)
+    assert (
+        0 < n_full < layer_num
+    ), f"DSA compact indexer mask degenerate: {n_full}/{layer_num} full layers"
+    return mask
+
+
 class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
@@ -3022,7 +3072,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
+        indexer_layer_mask: Optional[List[bool]] = None,
     ):
+        self.indexer_layer_mask = indexer_layer_mask
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
         )
@@ -3065,26 +3117,59 @@ class DSATokenToKVPool(MLATokenToKVPool):
             if self.custom_mem_pool
             else nullcontext()
         ):
-            self.index_k_with_scale_buffer = [
-                torch.zeros(
-                    # Layout:
-                    #     ref: test_attention.py :: kv_cache_cast_to_fp8
-                    #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
-                    #     data: for page i,
-                    #         * buf[i, :page_size * head_dim] for fp8 data
-                    #         * buf[i, page_size * head_dim:].view(float32) for scale
-                    (
-                        (index_buf_size + page_size + 1) // self.page_size,
-                        self.page_size
-                        * (
-                            index_head_dim + index_head_dim // self.quant_block_size * 4
-                        ),
-                    ),
+            # Layout:
+            #     ref: test_attention.py :: kv_cache_cast_to_fp8
+            #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
+            #     data: for page i,
+            #         * buf[i, :page_size * head_dim] for fp8 data
+            #         * buf[i, page_size * head_dim:].view(float32) for scale
+            _index_k_shape = (
+                (index_buf_size + page_size + 1) // self.page_size,
+                self.page_size
+                * (index_head_dim + index_head_dim // self.quant_block_size * 4),
+            )
+            if self.indexer_layer_mask is None:
+                self.index_k_with_scale_buffer = [
+                    torch.zeros(
+                        _index_k_shape,
+                        dtype=self.index_k_with_scale_buffer_dtype,
+                        device=device,
+                    )
+                    for _ in range(layer_num)
+                ]
+            else:
+                # Compact mode: skip-topk layers never touch their index buffer —
+                # point them all at one full-size alias so every full-layer-sweep
+                # code path (move_kv_cache / retract offload / host backup) stays
+                # in-bounds while only (n_full + 1) buffers consume VRAM.
+                assert len(self.indexer_layer_mask) == layer_num
+                _alias = torch.zeros(
+                    _index_k_shape,
                     dtype=self.index_k_with_scale_buffer_dtype,
                     device=device,
                 )
-                for _ in range(layer_num)
-            ]
+                self.index_k_with_scale_buffer = [
+                    (
+                        torch.zeros(
+                            _index_k_shape,
+                            dtype=self.index_k_with_scale_buffer_dtype,
+                            device=device,
+                        )
+                        if m
+                        else _alias
+                    )
+                    for m in self.indexer_layer_mask
+                ]
+                self.indexer_layer_ids = [
+                    i for i, m in enumerate(self.indexer_layer_mask) if m
+                ]
+                logger.info(
+                    "DSA compact indexer: %d real + 1 alias buffers / %d skip-topk "
+                    "layers share the alias (of %d total layers)",
+                    len(self.indexer_layer_ids),
+                    layer_num - len(self.indexer_layer_ids),
+                    layer_num,
+                )
         self._finalize_allocation_log(size)
 
     def _clear_buffers(self):
@@ -3237,7 +3322,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
     def get_kv_size_bytes(self):
         kv_size_bytes = super().get_kv_size_bytes()
+        seen_ids = set()
         for index_k_cache in self.index_k_with_scale_buffer:
+            if id(index_k_cache) in seen_ids:
+                continue  # compact mode: the shared alias must be counted once
+            seen_ids.add(id(index_k_cache))
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
 

@@ -579,6 +579,7 @@ def build_anchor_sidecar_stack(
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
     sidecar_host_pool_factory: Callable[[Any], Any],
+    sidecar_layer_mapping: Optional[dict[int, int]] = None,
     prefetch_threshold: int = 256,
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
@@ -606,7 +607,13 @@ def build_anchor_sidecar_stack(
             name=sidecar_pool_name,
             host_pool=sidecar_host_pool,
             device_pool=kv_pool,
-            layer_mapping=full_layer_mapping,
+            # Compact indexer sidecar: map only real indexer layers; the mapper
+            # returns None for skip-topk layers so their transfer is skipped.
+            layer_mapping=(
+                sidecar_layer_mapping
+                if sidecar_layer_mapping is not None
+                else full_layer_mapping
+            ),
             transfer_layer_num=transfer_layer_num,
         ),
     ]
@@ -922,12 +929,19 @@ class _DsaStrategy(StackStrategy):
         full_kv_pool = kvcache
         use_mla = isinstance(kvcache, MLATokenToKVPool)
         full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
+        _indexer_ids = getattr(full_kv_pool, "indexer_layer_ids", None)
+        sidecar_layer_mapping = (
+            {gid: local for local, gid in enumerate(_indexer_ids)}
+            if _indexer_ids is not None
+            else None
+        )
         host_pool_group, cache_controller = build_anchor_sidecar_stack(
             params=params,
             server_args=server_args,
             kv_pool=full_kv_pool,
             sidecar_pool_name=PoolName.INDEXER,
             full_layer_mapping=full_layer_mapping,
+            sidecar_layer_mapping=sidecar_layer_mapping,
             page_size=cache.page_size,
             tp_group=params.tp_cache_group,
             load_cache_event=load_cache_event,
@@ -1403,12 +1417,19 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
     try:
         kv = radix_cache.kv_cache
         layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
+        _indexer_ids = getattr(kv, "indexer_layer_ids", None)
+        sidecar_layer_mapping = (
+            {gid: local for local, gid in enumerate(_indexer_ids)}
+            if _indexer_ids is not None
+            else None
+        )
         host_pool_group, cache_controller = build_anchor_sidecar_stack(
             params=params,
             server_args=server_args,
             kv_pool=kv,
             sidecar_pool_name=PoolName.INDEXER,
             full_layer_mapping=layer_mapping,
+            sidecar_layer_mapping=sidecar_layer_mapping,
             page_size=radix_cache.page_size,
             tp_group=radix_cache.tp_group,
             load_cache_event=load_cache_event,
