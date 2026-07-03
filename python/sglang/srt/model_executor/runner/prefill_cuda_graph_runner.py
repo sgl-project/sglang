@@ -22,7 +22,7 @@ Backend selection comes from cuda_graph_config.prefill:
                       prefill in can_run_graph.
   - "full"      — FullCudaGraphBackend: one whole-forward graph per
                       num_tokens bucket, captured with a fixed number of
-                      request slots (cuda_graph_config.prefill.req_slots). Replay
+                      request slots (cuda_graph_config.prefill.full_prefill_max_req). Replay
                       pads num_tokens up to the nearest bucket and pads
                       the request axis with zero-length sentinel requests;
                       bs > slots falls back to eager. Attention metadata
@@ -273,10 +273,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             raise
         self._is_full_backend = isinstance(self.backend, FullCudaGraphBackend)
         if self._is_full_backend:
-            self._capture_req_slots = min(
-                model_runner.server_args.cuda_graph_config.prefill.req_slots,
-                self.max_bs,
+            max_req = (
+                model_runner.server_args.cuda_graph_config.prefill.full_prefill_max_req
             )
+            if max_req is None:
+                # Auto: scale request slots with the chunked prefill size.
+                max_req = max(model_runner.server_args.chunked_prefill_size // 512, 1)
+            self._capture_req_slots = min(max_req, self.max_bs)
         self._full_cg_seq_lens_cpu = (
             torch.zeros((self._capture_req_slots,), dtype=torch.int64, device="cpu")
             if self._is_full_backend
