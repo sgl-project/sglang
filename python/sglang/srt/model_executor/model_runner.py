@@ -529,11 +529,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.model_specific_adjustment()
 
         # Set the global server_args in the scheduler process
-        set_global_server_args_for_scheduler(server_args)
-        global_server_args = get_global_server_args()
-
-        # FIXME: hacky set `use_mla_backend`
-        global_server_args.use_mla_backend = self.use_mla_backend
+        self.maybe_init_global_server_args(server_args)
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
@@ -620,6 +616,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             model_revision=model_revision,
             is_draft_model=is_draft_model,
         )
+
+    def maybe_init_global_server_args(self, server_args: ServerArgs):
+        """Publish `server_args` as the scheduler-process global (target only).
+
+        Draft workers are constructed from the scheduler's ServerArgs object,
+        so re-publishing would be a no-op at best; skipping it guarantees a
+        draft init can never clobber target-derived global state such as
+        `use_mla_backend`.
+        """
+        if self.is_draft_worker:
+            return
+        set_global_server_args_for_scheduler(server_args)
+        # FIXME: hacky set `use_mla_backend`
+        get_global_server_args().use_mla_backend = self.use_mla_backend
 
     def init_msprobe(self):
         # Init the msprobe

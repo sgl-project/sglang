@@ -241,6 +241,7 @@ class TpModelWorker(BaseTpWorker):
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
+        context_length: Optional[int] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -261,6 +262,10 @@ class TpModelWorker(BaseTpWorker):
         self.moe_dp_rank = moe_dp_rank
         # Draft worker: target's resolved MemoryPoolConfig (forwarded to ModelRunner).
         self.memory_pool_config = memory_pool_config
+        # Draft worker: target's effective context length, so the draft
+        # ModelConfig covers the target's position range even when the draft
+        # checkpoint declares a shorter one. None keeps server_args.context_length.
+        self.context_length = context_length
 
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
@@ -273,7 +278,10 @@ class TpModelWorker(BaseTpWorker):
 
         self._init_dllm_algorithm()
 
-        if server_args.skip_tokenizer_init:
+        if server_args.skip_tokenizer_init or self.is_draft_worker:
+            # A draft worker's tokenizer would only duplicate the target's
+            # (tokenizer_path always points at the target model); spec workers
+            # that need a tokenizer use the target worker's.
             self.tokenizer = self.processor = None
         else:
             if self.model_config.is_multimodal:
@@ -370,6 +378,7 @@ class TpModelWorker(BaseTpWorker):
                 else self.server_args.speculative_draft_model_revision
             ),
             is_draft_model=self.is_draft_worker,
+            context_length=self.context_length,
         )
 
     def _init_model_runner(self):
