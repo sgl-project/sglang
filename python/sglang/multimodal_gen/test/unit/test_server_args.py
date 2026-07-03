@@ -1477,6 +1477,40 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
 
+    def test_speed_mode_enables_torch_compile_by_default(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "performance_mode": "speed",
+            },
+        )
+
+        self.assertTrue(args.enable_torch_compile)
+
+    def test_speed_mode_preserves_explicit_torch_compile_off(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "performance_mode": "speed",
+                "enable_torch_compile": False,
+            },
+        )
+
+        self.assertFalse(args.enable_torch_compile)
+
+    def test_auto_mode_leaves_torch_compile_off(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.enable_torch_compile)
+
     def test_memory_mode_wan_uses_layerwise_offload(self):
         args = self._from_dict_with_pipeline_config(
             WanT2V480PConfig(),
