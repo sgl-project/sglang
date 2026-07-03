@@ -1222,25 +1222,27 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark verify requires target main_hidden states, but got None."
             )
         if bs > 0:
+            is_pd_decode = self.server_args.disaggregation_mode == "decode"
             hidden = hidden.view(bs, block_size, -1)
             hidden_flat = hidden.reshape(-1, hidden.shape[-1])
-            try:
-                self._materialize_main_hidden_to_draft_compressors(
-                    main_hidden=hidden_flat,
-                    draft_forward_batch=draft_forward_batch,
+            if not is_pd_decode:
+                try:
+                    self._materialize_main_hidden_to_draft_compressors(
+                        main_hidden=hidden_flat,
+                        draft_forward_batch=draft_forward_batch,
+                    )
+                except Exception as e:
+                    self._materialize_draft_compressors_enabled = False
+                    logger.warning(
+                        "DSpark draft compressor materialization failed; "
+                        "falling back to SWA-only materialization: %s",
+                        e,
+                    )
+                self._clear_unaccepted_c128_draft_states(
+                    batch=model_worker_batch,
+                    prefix_lens=prefix_lens,
+                    commit_lens=commit_lens,
                 )
-            except Exception as e:
-                self._materialize_draft_compressors_enabled = False
-                logger.warning(
-                    "DSpark draft compressor materialization failed; "
-                    "falling back to SWA-only materialization: %s",
-                    e,
-                )
-            self._clear_unaccepted_c128_draft_states(
-                batch=model_worker_batch,
-                prefix_lens=prefix_lens,
-                commit_lens=commit_lens,
-            )
             commit_mask = (
                 self._block_pos_offsets.unsqueeze(0)
                 < commit_lens.unsqueeze(1).to(torch.int64)
