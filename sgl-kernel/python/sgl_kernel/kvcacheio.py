@@ -1,3 +1,4 @@
+import os
 from typing import List
 
 import torch
@@ -8,6 +9,23 @@ def is_hip() -> bool:
 
 
 _is_hip = is_hip()
+
+
+def _default_mla_block_quota() -> int:
+    """CU (block) quota for the MLA page_first KV gather kernel.
+
+    Defaults to 16 on ROCm / 2 on CUDA. Override with the
+    SGLANG_HICACHE_BLOCK_QUOTA environment variable to tune how many CUs the
+    kernel is launched with.
+    """
+    default = 16 if _is_hip else 2
+    override = os.environ.get("SGLANG_HICACHE_BLOCK_QUOTA")
+    if override is None:
+        return default
+    try:
+        return int(override)
+    except ValueError:
+        return default
 
 
 def transfer_kv_per_layer(
@@ -245,7 +263,7 @@ def transfer_kv_per_layer_mla_pf_lf(
     layer_id: int,
     item_size: int,
     src_layout_dim: int,
-    block_quota: int = 16 if _is_hip else 2,
+    block_quota: int = _default_mla_block_quota(),
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_per_layer_mla_pf_lf.default(

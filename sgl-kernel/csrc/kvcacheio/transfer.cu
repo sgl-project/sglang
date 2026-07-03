@@ -793,6 +793,63 @@ inline void transfer_kv_page_first_direct_impl(
   };
 
 #if defined(USE_ROCM) || !defined(CUDA_VERSION) || CUDA_VERSION < 12080
+#if defined(USE_ROCM)
+  // Opt-in HIP batch copy path (mirrors cudaMemcpyBatchAsync); disabled by
+  // default, falls back to per-page copy below.
+  constexpr bool kEnableHipBatch = false;
+  if (kEnableHipBatch) {
+    std::vector<void*> b_srcs, b_dsts;
+    std::vector<size_t> b_sizes;
+    auto batch_append = [&](const at::Tensor& s, const at::Tensor& d, int64_t si, int64_t di, int64_t ps) {
+      const int64_t esz = s.element_size();
+      b_srcs.push_back(static_cast<char*>(s.data_ptr()) + si * s.stride(0) * esz);
+      b_dsts.push_back(static_cast<char*>(d.data_ptr()) + di * d.stride(0) * esz);
+      b_sizes.push_back(static_cast<size_t>(ps) * static_cast<size_t>(s.stride(0)) * static_cast<size_t>(esz));
+    };
+    if constexpr (IsLf2Pf) {
+      const bool is_mla = dst_ptrs.size() == 1;
+      const int64_t num_layers = is_mla ? src_ptrs.size() : src_ptrs.size() / 2;
+      for (const auto i : c10::irange(num_pages)) {
+        const int64_t s_index = src_indices_ptr[i * page_size];
+        const int64_t d_index = dst_indices_ptr[i * page_size] / page_size;
+        for (int64_t j = 0; j < num_layers; ++j) {
+          batch_append(src_ptrs[j], dst_ptrs[0].select(0, d_index).select(0, start_layer_id + j), s_index, 0, page_size);
+          if (!is_mla) {
+            batch_append(
+                src_ptrs[j + num_layers], dst_ptrs[1].select(0, d_index).select(0, start_layer_id + j), s_index, 0,
+                page_size);
+          }
+        }
+      }
+    } else {
+      const bool is_mla = src_ptrs.size() == 1;
+      const int64_t num_layers = is_mla ? dst_ptrs.size() : dst_ptrs.size() / 2;
+      for (const auto i : c10::irange(num_pages)) {
+        const int64_t s_index = src_indices_ptr[i * page_size] / page_size;
+        const int64_t d_index = dst_indices_ptr[i * page_size];
+        for (int64_t j = 0; j < num_layers; ++j) {
+          batch_append(src_ptrs[0].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j], 0, d_index, page_size);
+          if (!is_mla) {
+            batch_append(
+                src_ptrs[1].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j + num_layers], 0, d_index,
+                page_size);
+          }
+        }
+      }
+    }
+    if (!b_srcs.empty()) {
+      size_t fail_idx = std::numeric_limits<size_t>::max();
+      hipError_t err = hipMemcpyBatchAsync(
+          b_dsts.data(), b_srcs.data(), b_sizes.data(), b_srcs.size(), nullptr, nullptr, 0, &fail_idx,
+          at::cuda::getCurrentCUDAStream().stream());
+      if (err != hipSuccess) {
+        TORCH_WARN_ONCE("hipMemcpyBatchAsync failed (", hipGetErrorString(err), "), falling back to per-page copy");
+        fallback_to_page_copy();
+      }
+    }
+    return;
+  }
+#endif
   fallback_to_page_copy();
   return;
 
