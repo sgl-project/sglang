@@ -610,7 +610,13 @@ def get_available_gpu_memory(
 
         if empty_cache:
             empty_device_cache(torch.xpu)
-        used_memory = torch.xpu.memory_allocated()
+        # memory_allocated() only counts active tensors; it misses the XPU caching
+        # allocator's pre-claimed Level Zero pool.  memory_reserved() covers both
+        # active tensors and the allocator pool, giving a conservative (correct)
+        # estimate that prevents KV-cache over-allocation on Intel XPU devices.
+        # Note: torch.xpu.mem_get_info() is unreliable on Intel XPU — it always
+        # returns the full hardware capacity as free regardless of allocations.
+        used_memory = torch.xpu.memory_reserved(gpu_id)
         total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
         free_gpu_memory = total_gpu_memory - used_memory
 
