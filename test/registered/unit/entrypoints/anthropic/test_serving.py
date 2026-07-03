@@ -743,6 +743,38 @@ class TestAnthropicServing(unittest.TestCase):
             )
         self.assertIn("display", str(ctx.exception))
 
+    def test_request_without_thinking_defaults_reasoning_off(self):
+        """An absent ``thinking`` field means thinking off (Anthropic default),
+        regardless of the chat template's own default."""
+        serving = self._serving()
+        request = self._anthropic_request(stream=False)
+        serving._convert_to_chat_completion_request(request)
+        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [False])
+
+    def test_request_without_thinking_tolerates_always_on_parser(self):
+        """Default-off is best-effort: an always-on reasoning parser cannot be
+        disabled, so an absent ``thinking`` field must not reject the request
+        the way an explicit ``thinking: disabled`` does."""
+        import logging
+
+        class _AlwaysOnOpenAIServingChat(_FakeOpenAIServingChat):
+            def apply_reasoning_enabled(self, chat_request, enabled):
+                super().apply_reasoning_enabled(chat_request, enabled)
+                if not enabled:
+                    raise ValueError("always-on reasoning cannot be disabled")
+
+        serving = AnthropicServing(_AlwaysOnOpenAIServingChat())
+        request = self._anthropic_request(stream=False)
+        with self.assertLogs(
+            "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
+        ) as log:
+            chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertIsNotNone(chat_request)
+        self.assertTrue(
+            any("always-on" in r for r in log.output),
+            f"expected always-on warning: {log.output}",
+        )
+
     def test_request_thinking_disabled_with_budget_is_rejected(self):
         """SDK ``ThinkingConfigDisabledParam`` has no ``budget_tokens`` field."""
         from pydantic import ValidationError
