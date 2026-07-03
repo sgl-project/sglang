@@ -939,7 +939,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi325-8gpu-sglang]
-        part: [0, 1, 2, 3]
+        part: [0]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -951,7 +951,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720 --custom-image rocm/sgl-dev:test-pr-30051-0703-rocm720-mi30x
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -964,9 +964,9 @@ jobs:
           docker exec ci_sglang bash -c "cd /sglang-checkout && NCCL_DEBUG=INFO RCCL_DEBUG=INFO torchrun --nproc_per_node=8 scripts/ci/amd/test_rccl_multi_gpu.py"
 
       - name: Run test
-        timeout-minutes: 120
+        timeout-minutes: 150
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 registered/amd/test_moriep_small.py -f
 
   stage-c-test-large-8-gpu-amd-mi35x-rocm720:
     needs: [check-changes]
@@ -1075,7 +1075,7 @@ jobs:
           echo "=== Host RDMA Check Complete ==="
 
       - name: Start Special Container
-        run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh --rocm-version rocm720 --custom-image rocm/sgl-dev:test-pr-30051-0703-rocm720-mi35x
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 

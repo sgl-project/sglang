@@ -28,11 +28,13 @@ LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
 MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
+CUSTOM_IMAGE=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --mi30x-base-tag) MI30X_BASE_TAG="$2"; shift 2;;
     --mi35x-base-tag) MI35X_BASE_TAG="$2"; shift 2;;
+    --custom-image) CUSTOM_IMAGE="$2"; shift 2;;
     --rocm-version)
       ROCM_VERSION="$2"
       MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
@@ -40,7 +42,7 @@ while [[ $# -gt 0 ]]; do
       echo "Using ROCm version override: ${ROCM_VERSION}"
       shift 2;;
     -h|--help)
-      echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG] [--rocm-version VERSION]"
+      echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG] [--custom-image IMAGE] [--rocm-version VERSION]"
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -212,20 +214,26 @@ find_latest_image() {
   esac
 }
 
-# Pull and run the latest image
-IMAGE=$(find_latest_image "${GPU_ARCH}")
-# Try the local docker registry first (avoids Docker Hub rate limits and is
-# faster on the LAN); if that fails for any reason, fall back to the
-# public registry with exponential-backoff retries. Capture stderr so the
-# real failure reason (TLS handshake, 404, connection refused, etc.) is
-# visible in the job log instead of being silently swallowed.
-if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
-  echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
-  docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
-else
-  echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
-  printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
+if [[ -n "${CUSTOM_IMAGE}" ]]; then
+  IMAGE="${CUSTOM_IMAGE}"
+  echo "Using custom image: ${IMAGE}"
   retry_with_backoff 6 docker pull "${IMAGE}"
+else
+  # Pull and run the latest image
+  IMAGE=$(find_latest_image "${GPU_ARCH}")
+  # Try the local docker registry first (avoids Docker Hub rate limits and is
+  # faster on the LAN); if that fails for any reason, fall back to the
+  # public registry with exponential-backoff retries. Capture stderr so the
+  # real failure reason (TLS handshake, 404, connection refused, etc.) is
+  # visible in the job log instead of being silently swallowed.
+  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
+    echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
+    docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
+  else
+    echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
+    printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
+    retry_with_backoff 6 docker pull "${IMAGE}"
+  fi
 fi
 
 # CACHE_HOST=/home/runner/sgl-data
