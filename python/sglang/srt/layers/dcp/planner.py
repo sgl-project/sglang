@@ -21,13 +21,13 @@ from typing import Optional
 import torch
 
 from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
-from sglang.srt.layers.cp.dcp.comm import dcp_enabled
-from sglang.srt.layers.cp.dcp.kernels import (
+from sglang.srt.layers.dcp.comm import dcp_enabled
+from sglang.srt.layers.dcp.kernels import (
     create_dcp_kv_indices,
     update_kv_lens_and_indices,
 )
-from sglang.srt.layers.cp.dcp.layout import update_local_kv_lens_for_dcp
-from sglang.srt.layers.cp.dcp.metadata import DecodeContextParallelMetadata
+from sglang.srt.layers.dcp.layout import update_local_kv_lens_for_dcp
+from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.server_args import get_global_server_args
 
 

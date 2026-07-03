@@ -34,7 +34,7 @@ from sglang.srt.distributed.parallel_state import (
     get_dcp_rank,
     get_dcp_world_size,
 )
-from sglang.srt.layers.cp.dcp.kernels import CPTritonContext, correct_attn_out
+from sglang.srt.layers.dcp.kernels import CPTritonContext, correct_attn_out
 from sglang.srt.utils import is_cuda
 
 

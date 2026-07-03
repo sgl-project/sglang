@@ -71,8 +71,8 @@ from sglang.srt.layers.communicator import (
     get_attn_tp_context,
 )
 from sglang.srt.layers.communicator_dsa_cp import DSACPLayerCommunicator
-from sglang.srt.layers.cp.dcp import dcp_enabled, get_attention_dcp_world_size
-from sglang.srt.layers.cp.dcp.planner import (
+from sglang.srt.layers.dcp import dcp_enabled, get_attention_dcp_world_size
+from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
 from sglang.srt.layers.layernorm import RMSNorm

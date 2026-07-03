@@ -1,7 +1,7 @@
 """CPU unit test for the decode-context-parallel (DCP) per-rank KV-length math.
 
 Pins ``get_dcp_lens`` (the single, superset implementation in
-``layers/cp/dcp/layout.py``) to a brute-force owner-count reference, and proves
+``layers/dcp/layout.py``) to a brute-force owner-count reference, and proves
 it is bit-identical to the legacy in-place formula that
 ``update_local_kv_lens_for_dcp`` used before it was collapsed into a wrapper:
 
@@ -16,7 +16,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.cp.dcp.layout import get_dcp_lens
+from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")

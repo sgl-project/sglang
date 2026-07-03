@@ -18,7 +18,7 @@ the owner-rule local-index filter."""
 import torch
 
 from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
-from sglang.srt.layers.cp.dcp.comm import dcp_enabled
+from sglang.srt.layers.dcp.comm import dcp_enabled
 
 
 def get_dcp_lens(

@@ -17,7 +17,7 @@ from sglang.srt.layers.attention.utils import (
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
 )
-from sglang.srt.layers.cp.dcp import (
+from sglang.srt.layers.dcp import (
     dcp_enabled,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
