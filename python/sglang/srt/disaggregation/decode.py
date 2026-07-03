@@ -1905,7 +1905,7 @@ class SchedulerDisaggregationDecodeMixin:
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
-        self._process_ready_grammar_requests_non_pp()
+        self._process_ready_grammar_requests_without_pp_consensus()
 
         if len(self.waiting_queue) == 0:
             return None

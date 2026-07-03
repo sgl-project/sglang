@@ -2738,7 +2738,7 @@ class Scheduler(
 
         return ret
 
-    def _process_ready_grammar_requests_non_pp(self):
+    def _process_ready_grammar_requests_without_pp_consensus(self):
         if self.ps.pp_size > 1 or not self.grammar_manager.has_waiting_grammars():
             return
 
@@ -2750,7 +2750,7 @@ class Scheduler(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
-        self._process_ready_grammar_requests_non_pp()
+        self._process_ready_grammar_requests_without_pp_consensus()
 
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()

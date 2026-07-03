@@ -23,7 +23,7 @@ class TestSchedulerGrammarNonPPGate(CustomTestCase):
         scheduler.grammar_manager.has_waiting_grammars.return_value = True
         scheduler._add_request_to_queue = MagicMock()
 
-        Scheduler._process_ready_grammar_requests_non_pp(scheduler)
+        Scheduler._process_ready_grammar_requests_without_pp_consensus(scheduler)
 
         scheduler.grammar_manager.get_ready_grammar_requests.assert_not_called()
         scheduler._add_request_to_queue.assert_not_called()
