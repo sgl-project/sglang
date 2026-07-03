@@ -359,8 +359,39 @@ class RuntimeContext:
         Overwrite-allowed: a re-publish replaces the slot (test kits re-publish
         per test; production ordering discipline lives at the call-sites, e.g.
         the draft-worker guard in ``ModelRunner.__init__``).
+
+        Publishing also resolves the stashed R0 model-override declarations
+        into the flags tier (skipped for objects without the stash — dummy /
+        "none" fixture ServerArgs and test-kit mocks never compute it).
+        Resolution runs first: if it fails, the previous publish stays intact.
         """
+        self._resolve_flags(server_args)
         self._server_args = server_args
+
+    def _resolve_flags(self, server_args: ServerArgs) -> None:
+        declarations = getattr(server_args, "_resolved_overrides", None)
+        if declarations is None:
+            return
+        from sglang.srt.arg_groups.overrides import (
+            apply_model_overrides,
+            assert_flag_parity,
+        )
+
+        # Resolve into a fresh container and only install it once everything
+        # passed: a failed resolution (gate validation or the parity assert)
+        # must not leave the process-global flags half-written for callers
+        # that catch the error or republish (same install-fresh semantics as
+        # reset_context()).
+        flags = Flags()
+        apply_model_overrides(flags, server_args, declarations)
+        # Transition-period drift guard: dual-apply keeps the declared fields
+        # on server_args byte-identical to the resolved flag leaves.
+        assert_flag_parity(
+            flags,
+            server_args,
+            {field for _source, decl in declarations for field in decl},
+        )
+        self.flags = flags
 
 
 _PARALLEL = ParallelContext()

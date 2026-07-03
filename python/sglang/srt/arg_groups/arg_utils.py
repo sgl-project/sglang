@@ -85,7 +85,12 @@ class Arg:
 @functools.lru_cache(maxsize=None)
 def model_overridable_fields(cls) -> frozenset:
     """Names of ``cls`` dataclass fields whose ``Arg`` metadata declares
-    ``model_overridable=True`` — the whitelist for model-override resolution."""
+    ``model_overridable=True`` — the whitelist for model-override resolution.
+
+    Non-dataclass types (e.g. mock config objects in tests) have no Arg
+    metadata and yield an empty whitelist."""
+    if not dataclasses.is_dataclass(cls):
+        return frozenset()
     hints = get_type_hints(cls, include_extras=True)
     names = set()
     for field in dataclasses.fields(cls):

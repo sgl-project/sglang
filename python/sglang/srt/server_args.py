@@ -2569,6 +2569,12 @@ class ServerArgs:
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
 
+        # R0 stash for override/post-process declarations. Set before any
+        # short-circuit (none/dummy model paths) so run_post_process_pass and
+        # direct handler invocations can rely on it even when
+        # _handle_model_specific_adjustments never runs.
+        self._resolved_overrides = []
+
         self._maybe_download_model_for_runai()
 
         # Normalize load balancing defaults early (before dummy-model short-circuit).
@@ -3709,6 +3715,7 @@ class ServerArgs:
 
         self.uses_mamba_radix_cache = False
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
+            self._resolved_overrides = []
             return
 
         hf_config = self.get_model_config().hf_config
@@ -3717,6 +3724,22 @@ class ServerArgs:
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
             self._handle_mamba_radix_cache(model_arch=model_arch)
+
+        # R0: collect the declarative model overrides (registry) on the
+        # pristine config and stash them for publish-time flags resolution.
+        # Transition dual-apply: the same declarations are applied to
+        # server_args right here, byte-identical to the imperative arch
+        # branches this dispatch gradually replaces (dual-apply is retired
+        # per field once that field's readers migrate to the flags tier).
+        from sglang.srt.arg_groups.overrides import (
+            apply_declarations_to_server_args,
+            collect_model_override_declarations,
+        )
+
+        self._resolved_overrides = collect_model_override_declarations(
+            model_arch, self, hf_config
+        )
+        apply_declarations_to_server_args(self, self._resolved_overrides)
 
         if model_arch in [
             "MistralLarge3ForCausalLM",
