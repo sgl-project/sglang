@@ -3519,14 +3519,14 @@ class ServerArgs:
                     # activations already funded by the chunked-prefill
                     # activation term above, and per-bucket captured
                     # metadata is deduplicated into max-bucket-size
-                    # backings by the attention backend — neither needs
-                    # extra reserve. What remains: segment-bridge buffers
-                    # (~30 MB per capture bucket), one-time DeepGEMM JIT
-                    # workspaces (~1.5 GB), and runtime headroom for the
-                    # per-replay static-metadata rebuild + NCCL buffers
-                    # (booting with <1 GB free OOMs on the first real
-                    # prefill). Measured on 4x B200 tp=4.
-                    reserved_mem += len(prefill_cuda_graph_config.bs) * 30 + 1536 + 2048
+                    # backings by the attention backend, and the c4-indexer
+                    # logits scratch is bounded by row-chunking in the
+                    # indexer — none of those need extra reserve. What
+                    # remains: segment-bridge buffers (~30 MB per capture
+                    # bucket) and one-time DeepGEMM JIT workspaces.
+                    # Measured on 4x B200 tp=4; leaves ~4 GB post-capture
+                    # for the per-replay static-metadata rebuild + NCCL.
+                    reserved_mem += len(prefill_cuda_graph_config.bs) * 30 + 1024
 
             if gpu_mem is not None and gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
