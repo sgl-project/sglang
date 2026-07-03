@@ -113,6 +113,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.confidence_threshold = float(
             server_args.speculative_dspark_confidence_threshold
         )
+        # The default threshold is 0.0 and sigmoid(x) >= 0 always holds, so the
+        # confident prefix is always the full block and never truncates the
+        # accepted run. Skip the whole confidence head in that case.
+        self.use_confidence = self.confidence_threshold > 0.0
 
         self._block_pos_offsets = torch.arange(
             self.block_size, device=self.device, dtype=torch.int64
@@ -305,7 +309,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             (bs, block_size + 1), dtype=torch.int64, device=block_hidden.device
         )
         out_tokens[:, 0] = bonus_tokens.view(-1).to(torch.int64)
-        markov_embeds = []
+        markov_embeds = [] if self.use_confidence else None
         with torch.inference_mode():
             normed_hidden = self._draft_inner.shared_head.norm(block_hidden)
             base_logits = _gather_full_vocab(F.linear(normed_hidden, lm_head.weight))
@@ -314,10 +318,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 bias = _gather_full_vocab(markov_head.project_bias(prev_embed))
                 refined = base_logits[:, i] + bias
                 out_tokens[:, i + 1] = torch.argmax(refined, dim=-1)
-                markov_embeds.append(prev_embed)
+                if self.use_confidence:
+                    markov_embeds.append(prev_embed)
 
-            stacked_embed = torch.stack(markov_embeds, dim=1)
-            confidence = confidence_head(block_hidden, stacked_embed)
+            if self.use_confidence:
+                stacked_embed = torch.stack(markov_embeds, dim=1)
+                confidence = confidence_head(block_hidden, stacked_embed)
+            else:
+                confidence = None
 
         candidates = out_tokens[:, :block_size].contiguous()
         return candidates, confidence
@@ -522,7 +530,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 draft_token_num=block_size,
             )
-        confident_prefix = self._confident_prefix(confidence)
+        confident_prefix = (
+            self._confident_prefix(confidence) if confidence is not None else None
+        )
 
         if (
             sampling_info is not None
@@ -557,25 +567,32 @@ class DSparkWorkerV2(BaseSpecWorker):
                 get_tp_group().broadcast(packed, src=0)
                 accept_len, sampled_bonus = packed[0], packed[1]
             accept_len = accept_len.to(torch.int64)
-            # Losslessness under confidence truncation: the sampling-verify kernel
-            # already accepted `accept_len` drafts against the target distribution.
-            # When confidence truncates to correct_len < accept_len, the draft at
-            # candidates[correct_len + 1] is exactly the token the kernel accepted
-            # at that position (prob p(t)); emitting it as the bonus composes with
-            # the kernel's rejection-residual (target minus the rejected mass) to
-            # reproduce the target distribution, so truncation stays lossless.
-            correct_len = torch.minimum(accept_len, confident_prefix.to(torch.int64))
-            truncated = correct_len < accept_len
-            next_draft = (
-                candidates.gather(
-                    1, (correct_len + 1).clamp(max=block_size - 1).unsqueeze(1)
+            if confident_prefix is not None:
+                # Losslessness under confidence truncation: the sampling-verify
+                # kernel already accepted `accept_len` drafts against the target
+                # distribution. When confidence truncates to correct_len <
+                # accept_len, the draft at candidates[correct_len + 1] is exactly
+                # the token the kernel accepted at that position (prob p(t));
+                # emitting it as the bonus composes with the kernel's
+                # rejection-residual (target minus the rejected mass) to reproduce
+                # the target distribution, so truncation stays lossless.
+                correct_len = torch.minimum(
+                    accept_len, confident_prefix.to(torch.int64)
                 )
-                .squeeze(1)
-                .to(torch.int64)
-            )
-            bonus_tokens = torch.where(
-                truncated, next_draft, sampled_bonus.to(torch.int64)
-            )
+                truncated = correct_len < accept_len
+                next_draft = (
+                    candidates.gather(
+                        1, (correct_len + 1).clamp(max=block_size - 1).unsqueeze(1)
+                    )
+                    .squeeze(1)
+                    .to(torch.int64)
+                )
+                bonus_tokens = torch.where(
+                    truncated, next_draft, sampled_bonus.to(torch.int64)
+                )
+            else:
+                correct_len = accept_len
+                bonus_tokens = sampled_bonus.to(torch.int64)
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, block_size
@@ -584,9 +601,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 candidates=candidates,
                 target_predict=target_predict,
             )
-            correct_len = torch.minimum(
-                correct_len.to(torch.int64), confident_prefix.to(torch.int64)
-            )
+            correct_len = correct_len.to(torch.int64)
+            if confident_prefix is not None:
+                correct_len = torch.minimum(
+                    correct_len, confident_prefix.to(torch.int64)
+                )
             bonus_tokens = target_predict.gather(1, correct_len.unsqueeze(1)).squeeze(1)
 
         commit_lens = correct_len.to(torch.int32) + 1
