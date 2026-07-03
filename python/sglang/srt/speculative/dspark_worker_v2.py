@@ -46,7 +46,7 @@ from sglang.srt.speculative.triton_ops.dspark import (
     _compute_dspark_accept_bonus_triton_unchecked,
 )
 from sglang.srt.utils import is_cuda, is_hip
-from sglang.srt.utils.common import empty_context
+from sglang.srt.utils.common import empty_context, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +166,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._markov_embeds_buf: Optional[torch.Tensor] = None
         self._materialize_draft_compressors_enabled = True
         self._draft_bootstrap_forward_enabled = _env_flag(
-            "SGLANG_DSPARK_DRAFT_BOOTSTRAP_FORWARD", False
+            "SGLANG_DSPARK_DRAFT_BOOTSTRAP_FORWARD", True
         )
         self._accept_anomaly_enabled = _env_flag("SGLANG_DSPARK_DEBUG_ACCEPT", True)
         self._accept_anomaly_threshold = max(
@@ -616,13 +616,34 @@ class DSparkWorkerV2(BaseSpecWorker):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
-        forward_mode: ForwardMode,
         seq_lens: Optional[torch.Tensor] = None,
         req_pool_indices: Optional[torch.Tensor] = None,
+        prefix_lens: Optional[torch.Tensor] = None,
+        extend_lens: Optional[torch.Tensor] = None,
         num_tokens_per_req: int = 1,
+        use_draft_extend_v2: bool = False,
     ) -> None:
         if main_hidden.numel() == 0:
             return
+
+        bs = int(len(seq_lens if seq_lens is not None else batch.seq_lens))
+        num_tokens = int(input_ids.numel())
+        if bs == 0 or num_tokens == 0:
+            return
+        if main_hidden.shape[0] != num_tokens:
+            raise RuntimeError(
+                "DSpark draft bootstrap hidden/input size mismatch: "
+                f"hidden={tuple(main_hidden.shape)} input_tokens={num_tokens}"
+            )
+        if use_draft_extend_v2:
+            if num_tokens % bs != 0:
+                raise RuntimeError(
+                    "DSpark draft-extend-v2 bootstrap requires fixed tokens per "
+                    f"request: num_tokens={num_tokens} bs={bs}"
+                )
+            inferred_tokens_per_req = num_tokens // bs
+            if int(num_tokens_per_req) != inferred_tokens_per_req:
+                num_tokens_per_req = inferred_tokens_per_req
 
         old_input_ids = batch.input_ids
         old_out_cache_loc = batch.out_cache_loc
@@ -633,6 +654,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         old_seq_lens_cpu = batch.seq_lens_cpu
         old_seq_lens_sum = batch.seq_lens_sum
         old_req_pool_indices = batch.req_pool_indices
+        old_prefix_lens = batch.prefix_lens
+        old_extend_lens = batch.extend_lens
+        old_extend_num_tokens = batch.extend_num_tokens
         try:
             batch.input_ids = input_ids.to(device=self.device, dtype=torch.int64)
             batch.out_cache_loc = out_cache_loc.to(device=self.device)
@@ -641,7 +665,19 @@ class DSparkWorkerV2(BaseSpecWorker):
                 num_tokens_per_req=num_tokens_per_req,
                 num_tokens_for_logprob_per_req=num_tokens_per_req,
             )
-            batch.forward_mode = forward_mode
+            batch.forward_mode = (
+                ForwardMode.DRAFT_EXTEND_V2
+                if use_draft_extend_v2
+                else (
+                    ForwardMode.IDLE
+                    if old_forward_mode.is_idle()
+                    else (
+                        ForwardMode.EXTEND
+                        if prefix_lens is not None or extend_lens is not None
+                        else ForwardMode.DECODE
+                    )
+                )
+            )
             batch.capture_hidden_mode = CaptureHiddenMode.NULL
             if seq_lens is not None:
                 batch.seq_lens = seq_lens.to(
@@ -653,10 +689,33 @@ class DSparkWorkerV2(BaseSpecWorker):
                 batch.req_pool_indices = req_pool_indices.to(
                     device=self.device, dtype=old_req_pool_indices.dtype
                 )
+            if use_draft_extend_v2:
+                batch.prefix_lens = batch.seq_lens_cpu.tolist()
+                batch.extend_lens = [int(num_tokens_per_req)] * bs
+                batch.extend_num_tokens = num_tokens
+            elif prefix_lens is not None or extend_lens is not None:
+                if prefix_lens is None or extend_lens is None:
+                    raise RuntimeError(
+                        "DSpark prefill bootstrap requires both prefix_lens and "
+                        "extend_lens."
+                    )
+                prefix_lens = prefix_lens.to(device=self.device, dtype=torch.int32)
+                extend_lens = extend_lens.to(device=self.device, dtype=torch.int32)
+                batch.prefix_lens = prefix_lens.detach().cpu().tolist()
+                batch.extend_lens = extend_lens.detach().cpu().tolist()
+                batch.extend_num_tokens = int(num_tokens)
 
             forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
             forward_batch.return_logprob = False
             forward_batch.lora_ids = [None] * forward_batch.batch_size
+            if use_draft_extend_v2:
+                forward_batch.seq_lens = forward_batch.seq_lens + int(
+                    num_tokens_per_req
+                )
+                forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + int(
+                    num_tokens_per_req
+                )
+                forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
 
             with (
                 self.draft_tp_context(self.draft_model_runner.tp_group),
@@ -664,6 +723,18 @@ class DSparkWorkerV2(BaseSpecWorker):
                 speculative_moe_a2a_backend_context(),
                 torch.inference_mode(),
             ):
+                if (
+                    not forward_batch.forward_mode.is_idle()
+                    and (
+                        forward_batch.forward_mode.is_draft_extend_v2()
+                        or forward_batch.forward_mode.is_extend()
+                    )
+                ):
+                    self.draft_model_runner.attn_backend.init_forward_metadata(
+                        forward_batch
+                    )
+                    if not is_npu():
+                        forward_batch.mark_forward_metadata_ready()
                 self.draft_model_runner.forward(forward_batch)
         finally:
             batch.input_ids = old_input_ids
@@ -675,6 +746,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch.seq_lens_cpu = old_seq_lens_cpu
             batch.seq_lens_sum = old_seq_lens_sum
             batch.req_pool_indices = old_req_pool_indices
+            batch.prefix_lens = old_prefix_lens
+            batch.extend_lens = old_extend_lens
+            batch.extend_num_tokens = old_extend_num_tokens
 
     def _materialize_disagg_prefill_hidden_to_draft_state(
         self,
@@ -732,7 +806,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                     positions=positions[valid],
                     out_cache_loc=cache_loc[valid],
-                    forward_mode=ForwardMode.DECODE,
                     seq_lens=seq_lens_before,
                     req_pool_indices=batch.req_pool_indices[valid],
                 )
@@ -1323,7 +1396,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                     input_ids=model_worker_batch.input_ids,
                     positions=positions,
                     out_cache_loc=model_worker_batch.out_cache_loc,
-                    forward_mode=model_worker_batch.forward_mode,
+                    prefix_lens=draft_seq_lens,
+                    extend_lens=ctx_lens,
                 )
             except Exception as e:
                 logger.warning(
@@ -1575,22 +1649,44 @@ class DSparkWorkerV2(BaseSpecWorker):
         if bs > 0:
             hidden = hidden.view(bs, block_size, -1)
             hidden_flat = hidden.reshape(-1, hidden.shape[-1])
+            commit_mask = (
+                self._block_pos_offsets.unsqueeze(0)
+                < commit_lens.unsqueeze(1).to(torch.int64)
+            ).reshape(-1)
+            used_bootstrap_forward = False
+            if self._draft_bootstrap_forward_enabled:
+                try:
+                    self._run_draft_bootstrap_forward(
+                        batch=model_worker_batch,
+                        main_hidden=hidden_flat,
+                        input_ids=candidates.reshape(-1),
+                        positions=positions,
+                        out_cache_loc=verify_out_cache_loc,
+                        seq_lens=prefix_lens,
+                        num_tokens_per_req=block_size,
+                        use_draft_extend_v2=True,
+                    )
+                    used_bootstrap_forward = True
+                except Exception as e:
+                    logger.warning(
+                        "DSpark decode draft-extend bootstrap failed; "
+                        "falling back to materialization: %s",
+                        e,
+                    )
+
             self._clear_unaccepted_c128_draft_states(
                 batch=model_worker_batch,
                 prefix_lens=prefix_lens,
                 commit_lens=commit_lens,
             )
-            commit_mask = (
-                self._block_pos_offsets.unsqueeze(0)
-                < commit_lens.unsqueeze(1).to(torch.int64)
-            ).reshape(-1)
-            self._materialize_main_hidden_to_draft_state(
-                main_hidden=hidden_flat,
-                cache_loc=verify_out_cache_loc[commit_mask],
-                positions=positions[commit_mask],
-                draft_forward_batch=draft_forward_batch,
-                kv_main_hidden=hidden_flat[commit_mask],
-            )
+            if not used_bootstrap_forward:
+                self._materialize_main_hidden_to_draft_state(
+                    main_hidden=hidden_flat,
+                    cache_loc=verify_out_cache_loc[commit_mask],
+                    positions=positions[commit_mask],
+                    draft_forward_batch=draft_forward_batch,
+                    kv_main_hidden=hidden_flat[commit_mask],
+                )
 
         logits_output.hidden_states = None
         if on_publish is not None:
