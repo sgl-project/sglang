@@ -78,6 +78,12 @@ logger = logging.getLogger(__name__)
 
 # PCM16: 16-bit samples -> 2 bytes each.
 PCM_SAMPLE_WIDTH = 2
+# Near-silence RMS floor. A sliced window at/below this yields too few audio
+# features for the model to match the audio placeholders in the text prompt (an
+# MM embedding length mismatch), so slicing treats it as silence. Kept low and
+# keep-biased: quiet-but-real speech (RMS above the floor) is still transcribed.
+SLICED_SILENCE_RMS_THRESHOLD = 0.005
+_DEFERRED_SENTENCE_PUNCT = frozenset(".!?")
 
 
 def slice_pcm_range(buffer: Union[bytes, bytearray], start: int, end: int) -> bytes:
@@ -114,6 +120,23 @@ def pcm_to_float_samples(pcm: bytes) -> np.ndarray:
     # /32768.0 matches soundfile.read's default int16 normalization so the
     # samples are bit-equal to the prior PCM->WAV->sf.read path.
     return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def is_near_silent_pcm(pcm: bytes) -> bool:
+    """Whether a PCM window is at/below the near-silence RMS floor.
+
+    An amplitude check only; it does NOT prove the model produced no audio
+    features. Near-silent windows are treated as silence by the slicing path
+    (deferred mid-stream, or "" for a commit on pure silence); quiet-but-real
+    speech stays above the floor and is transcribed."""
+    if not pcm:
+        return True
+    samples = np.frombuffer(pcm, dtype=np.int16)
+    if samples.size == 0:
+        return True
+    float_samples = samples.astype(np.float32) / 32768.0
+    rms = float(np.sqrt(np.mean(float_samples * float_samples)))
+    return rms < SLICED_SILENCE_RMS_THRESHOLD
 
 
 CLIENT_EVENT_TYPES: Dict[str, type] = {
@@ -165,7 +188,14 @@ class AudioState:
     pcm_buffer: bytearray = field(default_factory=bytearray)
     pcm_buffer_base_offset_bytes: int = 0
     total_pcm_bytes_received: int = 0
-    last_inference_offset_bytes: int = 0
+    # How far inference has been *scheduled* (advances even for a skipped
+    # short/featureless window) -- gates the append trigger so a skip can't
+    # busy-loop re-scheduling the same bytes.
+    last_scheduled_offset_bytes: int = 0
+    # How far audio has *actually been inferred* (does NOT advance on a skip) --
+    # gates commit's has_new_audio so a window that was skipped, not transcribed,
+    # still gets a final inference at commit.
+    last_inferred_offset_bytes: int = 0
     last_sliced_buffer_end_bytes: int = 0
 
     def append_pcm(self, pcm: bytes) -> None:
@@ -190,7 +220,8 @@ class AudioState:
         self.pcm_buffer.clear()
         self.pcm_buffer_base_offset_bytes = 0
         self.total_pcm_bytes_received = 0
-        self.last_inference_offset_bytes = 0
+        self.last_scheduled_offset_bytes = 0
+        self.last_inferred_offset_bytes = 0
         self.last_sliced_buffer_end_bytes = 0
 
     def global_to_local(self, global_offset: int) -> int:
@@ -205,6 +236,38 @@ class ItemState:
     current_item_id: str
     previous_item_id: Optional[str] = None
     emitted_deltas: List[str] = field(default_factory=list)
+    pending_sentence_punctuation: str = ""
+
+
+def split_trailing_sentence_punctuation(delta: str) -> tuple[str, str]:
+    """Defer sentence punctuation at a sliced window boundary.
+
+    A non-final audio slice can make the model close an unfinished sentence
+    with "."/"!"/"?". Dropping it immediately loses real sentence boundaries;
+    emitting it immediately can create "dream. that". Keep it pending until the
+    next text arrives and the session can decide whether it starts a new
+    sentence.
+    """
+    end = len(delta.rstrip())
+    start = end
+    while start > 0 and delta[start - 1] in _DEFERRED_SENTENCE_PUNCT:
+        start -= 1
+    if start == end:
+        return delta, ""
+    return delta[:start].rstrip(), delta[start:end]
+
+
+def should_emit_pending_sentence_punctuation(next_delta: str) -> bool:
+    """Keep deferred sentence punctuation unless the next text clearly continues
+    the same sentence. Only a lower-case *alphabetic* continuation counts as a
+    mid-utterance boundary artifact; everything else -- upper-case, digit, quote,
+    symbol, CJK, or empty -- keeps the punctuation. This biases toward preserving
+    the model's punctuation and only drops the narrow, unambiguous case."""
+    next_delta = next_delta.lstrip()
+    if not next_delta:
+        return True
+    first = next_delta[0]
+    return not (first.isalpha() and first.islower())
 
 
 class RealtimeConnection:
@@ -234,8 +297,14 @@ class RealtimeConnection:
         self.config = SessionConfig()
 
         slicing_cfg = adapter.realtime_slicing_config
-        slicing_opt_in = bool(slicing_cfg.get("enabled", False)) and not getattr(
-            server_args, "asr_disable_input_slicing", False
+        # Slicing is ON by default for adapters that support it (adapter config
+        # sets enabled=True). The operator can force cumulative inference with
+        # --asr-disable-input-slicing for A/B testing. Slicing bounds
+        # prefill/memory on long sessions; the adapter's min_audio_sec gate keeps
+        # short/mid clips on the cumulative path so only genuinely long sessions
+        # cross it and switch to slicing.
+        slicing_requested = bool(slicing_cfg.get("enabled", False)) and not bool(
+            getattr(server_args, "asr_disable_input_slicing", False)
         )
         left_overlap_ms = int(slicing_cfg.get("left_overlap_ms", 0))
         min_audio_sec = float(slicing_cfg.get("min_audio_sec", 0.0))
@@ -259,13 +328,13 @@ class RealtimeConnection:
             invalid_slicing_fields.append(f"left_overlap_ms={left_overlap_ms!r}")
         if min_audio_sec < 0:
             invalid_slicing_fields.append(f"min_audio_sec={min_audio_sec!r}")
-        if slicing_opt_in and invalid_slicing_fields:
+        if slicing_requested and invalid_slicing_fields:
             logger.warning(
                 "[realtime] invalid realtime_slicing_config (%s); "
                 "audio slicing disabled, falling back to cumulative inference",
                 ", ".join(invalid_slicing_fields),
             )
-            slicing_opt_in = False
+            slicing_requested = False
         left_overlap_ms = max(left_overlap_ms, 0)
         min_audio_sec = max(min_audio_sec, 0.0)
 
@@ -275,13 +344,13 @@ class RealtimeConnection:
         # a PCM sample, which raises in pcm_to_float_samples (np.int16 view).
         left_overlap_bytes -= left_overlap_bytes % PCM_SAMPLE_WIDTH
         slicing_min_chunk_index = (
-            math.ceil(min_audio_sec / state.chunk_size_sec) if slicing_opt_in else 0
+            math.ceil(min_audio_sec / state.chunk_size_sec) if slicing_requested else 0
         )
         slicing_enabled = (
-            slicing_opt_in
+            slicing_requested
             and left_overlap_bytes < state.unfixed_chunk_num * chunk_size_bytes
         )
-        if slicing_opt_in and not slicing_enabled:
+        if slicing_requested and not slicing_enabled:
             logger.warning(
                 "[realtime] left_overlap=%dms >= unfixed_chunks_duration=%dms; "
                 "audio slicing disabled, falling back to cumulative inference",
@@ -572,7 +641,7 @@ class RealtimeConnection:
         self.audio.append_pcm(data)
 
         new_audio_bytes = (
-            self.audio.total_pcm_bytes_received - self.audio.last_inference_offset_bytes
+            self.audio.total_pcm_bytes_received - self.audio.last_scheduled_offset_bytes
         )
         if new_audio_bytes >= self.audio.chunk_size_bytes:
             ok = await self._run_inference(is_last=False)
@@ -597,7 +666,7 @@ class RealtimeConnection:
             return
 
         has_new_audio = (
-            self.audio.total_pcm_bytes_received > self.audio.last_inference_offset_bytes
+            self.audio.total_pcm_bytes_received > self.audio.last_inferred_offset_bytes
         )
         item_id = self.item.current_item_id
         prev_item_id = self.item.previous_item_id
@@ -648,6 +717,8 @@ class RealtimeConnection:
             # the tail tokens update() held back.
             tail = self.audio.state.finalize()
             await self._emit_transcription_delta(tail)
+
+        await self._flush_pending_sentence_punctuation()
 
         # Rebuild from emitted_deltas: both paths leave full_transcript only a
         # partial tail, while the deltas together are the whole transcript.
@@ -702,11 +773,22 @@ class RealtimeConnection:
             and self.audio.state.chunk_index >= self.audio.slicing_min_chunk_index
         )
         if use_slicing:
+            # Flush any tokens the cumulative path held back before switching to
+            # slice dedupe, so committed_text is the full emitted prefix. This
+            # flush feeds straight into a slice of the same (uncommitted)
+            # utterance, so -- exactly like a non-last sliced window -- defer a
+            # trailing "."/"!"/"?": it is the model closing a sentence at the
+            # chunk's audio edge ("dinner." before the "turnips" slice), not a
+            # real boundary.
             if self.audio.state.confirmed_text != self.audio.state.full_transcript:
                 await self._emit_transcription_delta(
-                    self.audio.state.finalize(cumulative=True)
+                    self.audio.state.finalize(cumulative=True),
+                    defer_trailing_sentence_punctuation=True,
                 )
                 committed_text = self.audio.state.get_prefix_text()
+            # Bare prompt: the retained overlap + the conservative exact-prefix
+            # overlap dedupe (in process_asr_chunk) replace injecting emitted_text
+            # as a continuation prefix.
             prompt: Optional[str] = self.adapter.prompt_template
             dedupe_against: Optional[str] = committed_text
             slice_start_global = max(
@@ -717,6 +799,13 @@ class RealtimeConnection:
             prompt = None
             dedupe_against = None
             slice_start_global = 0
+        # Duration of the re-transcribed overlap at the front of the slice. Used to
+        # judge dedupe safety: a non-matching candidate over a voiced overlap means
+        # the model reworded it (unsafe). Constant (~left overlap) once slicing is
+        # active, since the gate keeps us well past it.
+        overlap_seconds = (
+            self.audio.left_overlap_bytes / self.bytes_per_second if use_slicing else 0.0
+        )
 
         slice_end_global = self.audio.total_pcm_bytes_received
         # Clamp to the retained buffer. A within-item sliced->cumulative flip
@@ -728,19 +817,94 @@ class RealtimeConnection:
         slice_start = max(0, self.audio.global_to_local(slice_start_global))
         slice_end = self.audio.global_to_local(slice_end_global)
 
+        skipped = False
         try:
             pcm_slice = slice_pcm_range(self.audio.pcm_buffer, slice_start, slice_end)
-            audio_samples = await asyncio.to_thread(pcm_to_float_samples, pcm_slice)
-            delta = await process_asr_chunk(
-                tokenizer_manager=self.tokenizer_manager,
-                adapter=self.adapter,
-                state=self.audio.state,
-                audio_data=audio_samples,
-                sampling_params=self.config.sampling_params,
-                is_last=is_last,
-                prompt=prompt,
-                dedupe_against=dedupe_against,
+            too_short = use_slicing and len(pcm_slice) < self.audio.chunk_size_bytes
+            near_silent = (
+                use_slicing and not too_short and is_near_silent_pcm(pcm_slice)
             )
+            if (too_short or near_silent) and not is_last:
+                # Mid-stream: skip a short/near-silent sliced window. The slice
+                # cursor and PCM are left intact (see below), so the next slice
+                # re-covers this audio.
+                logger.debug(
+                    "[realtime] skip %s sliced window: session=%s item=%s "
+                    "range=[%d,%d) bytes=%d",
+                    "short" if too_short else "near-silent",
+                    self.session_id,
+                    self.item.current_item_id,
+                    slice_start_global,
+                    slice_end_global,
+                    len(pcm_slice),
+                )
+                delta = ""
+                skipped = True
+            elif (too_short or near_silent) and is_last:
+                # Commit must transcribe pending audio -- never silently skip it.
+                # The bounded window is too short/quiet, so widen to the full
+                # retained buffer. Only if even that is near-silent (a commit on
+                # pure silence) is there nothing to transcribe; return "".
+                full_slice = slice_pcm_range(self.audio.pcm_buffer, 0, slice_end)
+                if not full_slice or is_near_silent_pcm(full_slice):
+                    delta = ""
+                else:
+                    audio_samples = await asyncio.to_thread(
+                        pcm_to_float_samples, full_slice
+                    )
+                    delta = await process_asr_chunk(
+                        tokenizer_manager=self.tokenizer_manager,
+                        adapter=self.adapter,
+                        state=self.audio.state,
+                        audio_data=audio_samples,
+                        sampling_params=self.config.sampling_params,
+                        is_last=True,
+                        prompt=prompt,
+                        dedupe_against=dedupe_against,
+                        sample_rate=self.model_sample_rate,
+                        # Widened final slice starts at the buffer base (not a 2s
+                        # overlap), so exact-prefix dedupe handles this rare edge.
+                        # is_last: never defer -- the commit must emit pending audio.
+                        overlap_seconds=0.0,
+                    )
+            else:
+                audio_samples = await asyncio.to_thread(pcm_to_float_samples, pcm_slice)
+                verified_out: Dict[str, Any] = {}
+                delta = await process_asr_chunk(
+                    tokenizer_manager=self.tokenizer_manager,
+                    adapter=self.adapter,
+                    state=self.audio.state,
+                    audio_data=audio_samples,
+                    sampling_params=self.config.sampling_params,
+                    is_last=is_last,
+                    prompt=prompt,
+                    dedupe_against=dedupe_against,
+                    sample_rate=self.model_sample_rate,
+                    overlap_seconds=overlap_seconds,
+                    # Mid-stream: if the overlap trim can't be proven safe, defer
+                    # rather than emit a duplicate guess. The commit (is_last) never
+                    # defers so pending audio is always transcribed.
+                    defer_if_unverified=use_slicing and not is_last,
+                    verified_out=verified_out,
+                )
+                if (
+                    use_slicing
+                    and not is_last
+                    and not verified_out.get("verified", True)
+                ):
+                    # Unsafe boundary: do not emit or ingest this hypothesis. The
+                    # slice anchor and PCM stay intact so a later slice / the commit
+                    # can still recover the full audio.
+                    logger.debug(
+                        "[realtime] defer unverified sliced overlap: session=%s "
+                        "item=%s range=[%d,%d)",
+                        self.session_id,
+                        self.item.current_item_id,
+                        slice_start_global,
+                        slice_end_global,
+                    )
+                    delta = ""
+                    skipped = True
         except Exception:
             logger.exception(
                 "[realtime] inference failed: session=%s item=%s buffer_bytes=%d",
@@ -779,22 +943,58 @@ class RealtimeConnection:
                 )
             return False
 
-        await self._emit_transcription_delta(delta)
-        # Held-back tokens are re-covered only if their audio span fits the
-        # left overlap; slower speech can drop the earliest (see known limits).
-        self.audio.last_sliced_buffer_end_bytes = slice_end_global
-
-        self.audio.last_inference_offset_bytes = slice_end_global
-        if use_slicing and not is_last:
-            self.audio.compact_after_sliced_inference()
+        # A non-final sliced window ends mid-utterance, so a trailing "."/"!"/"?"
+        # is often the model closing an unfinished sentence; defer it and let the
+        # next delta decide (dropped if that delta continues, kept if it starts a
+        # new sentence). Restricted to genuine slices, not the cumulative pre-gate.
+        await self._emit_transcription_delta(
+            delta,
+            defer_trailing_sentence_punctuation=use_slicing and not is_last,
+        )
+        # Always advance the scheduling cursor so a skip doesn't busy-loop the
+        # append trigger. Only a real (non-skipped) inference advances the
+        # inferred cursor + slice cursor and reclaims PCM; a skipped window stays
+        # unconsumed so commit still runs a final inference over it and the next
+        # slice re-covers its (possibly quiet) audio.
+        self.audio.last_scheduled_offset_bytes = slice_end_global
+        if not skipped:
+            self.audio.last_inferred_offset_bytes = slice_end_global
+            self.audio.last_sliced_buffer_end_bytes = slice_end_global
+            if use_slicing and not is_last:
+                self.audio.compact_after_sliced_inference()
         return True
 
-    async def _emit_transcription_delta(self, delta: str) -> None:
+    async def _flush_pending_sentence_punctuation(self) -> None:
+        if not self.item.pending_sentence_punctuation:
+            return
+        punctuation = self.item.pending_sentence_punctuation
+        self.item.pending_sentence_punctuation = ""
+        await self._emit_transcription_delta_text(punctuation)
+
+    async def _emit_transcription_delta(
+        self,
+        delta: str,
+        *,
+        defer_trailing_sentence_punctuation: bool = False,
+    ) -> None:
         """emitted_deltas stores wire-formatted text (with leading
         boundary spaces baked in), so "".join(...) reconstructs the
         cumulative transcript verbatim."""
         if not delta:
             return
+        if self.item.pending_sentence_punctuation:
+            punctuation = self.item.pending_sentence_punctuation
+            self.item.pending_sentence_punctuation = ""
+            if should_emit_pending_sentence_punctuation(delta):
+                await self._emit_transcription_delta_text(punctuation)
+        if defer_trailing_sentence_punctuation:
+            delta, punctuation = split_trailing_sentence_punctuation(delta)
+            self.item.pending_sentence_punctuation = punctuation
+            if not delta:
+                return
+        await self._emit_transcription_delta_text(delta)
+
+    async def _emit_transcription_delta_text(self, delta: str) -> None:
         for word in delta.split(" "):
             if not word:
                 continue
@@ -821,6 +1021,7 @@ class RealtimeConnection:
         self.audio.state = StreamingASRState(**self.adapter.chunked_streaming_config)
         self.audio.reset_pcm_offsets()
         self.item.emitted_deltas.clear()
+        self.item.pending_sentence_punctuation = ""
 
     def _build_session_info(self) -> TranscriptionSessionConfig:
         # id / object aren't SDK fields; round-trip via extra='allow' so

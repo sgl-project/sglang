@@ -19,11 +19,71 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 logger = logging.getLogger(__name__)
 
 
+# Overlap region RMS above which we treat the re-sent audio as containing real
+# speech. Used only to decide dedupe *safety*, never to skip/drop audio.
+_OVERLAP_VOICE_RMS = 0.02
+
+
+def _overlap_has_voice(
+    samples: Any, sample_rate: Optional[int], overlap_seconds: float
+) -> bool:
+    """Whether the leading overlap region of a slice carries voiced speech.
+
+    Used to disambiguate a ``cut == 0`` exact-prefix result: if the overlap audio
+    was silent there was nothing to repeat, so a non-matching candidate is
+    genuinely new (safe to emit); if it was voiced, a non-match means the model
+    reworded the overlap and emitting verbatim would duplicate (unsafe). Biased
+    toward "no voice" (safe/emit) when the audio payload can't be inspected."""
+    if (
+        not isinstance(samples, np.ndarray)
+        or not sample_rate
+        or overlap_seconds <= 0
+    ):
+        return False
+    n = int(overlap_seconds * sample_rate)
+    if n <= 0:
+        return False
+    region = samples[:n]
+    if region.size == 0:
+        return False
+    rms = float(np.sqrt(np.mean(region.astype(np.float32) ** 2)))
+    return rms >= _OVERLAP_VOICE_RMS
+
+
+def _apply_sliced_dedupe(
+    committed_text: str,
+    text: str,
+    samples: Any,
+    sample_rate: Optional[int],
+    overlap_seconds: float,
+) -> "tuple[str, bool]":
+    """Conservative sliced-overlap dedupe.
+
+    Returns ``(deduped_text, overlap_verified)``. Trims only a verbatim
+    (normalized) copy of the committed tail from the start of the candidate --
+    never guesses, and never deletes an unmatched leading word.
+
+    ``overlap_verified`` reports whether the trim is provably safe:
+      * a verbatim overlap prefix was matched and trimmed -> safe;
+      * no match, but the overlap audio was silent        -> safe (new content);
+      * no match over a *voiced* overlap                  -> UNSAFE: the model
+        reworded the re-sent audio, so the caller defers instead of emitting a
+        duplicate guess.
+    """
+    if not committed_text or not text:
+        return text, True
+    deduped, matched = _dedupe_by_word(committed_text, text)
+    if matched:
+        return deduped, True
+    if _overlap_has_voice(samples, sample_rate, overlap_seconds):
+        return deduped, False
+    return deduped, True
+
+
 # Collapse whitespace before punctuation so batched-inference token
 # boundary jitter (" ," vs ",") doesn't leak into deltas. Covers both
 # ASCII punctuation and the CJK / fullwidth equivalents.
 _PUNCT_WS_RE = re.compile(r"\s+([,.;:!?，。！？；：、])")
-_SLICED_BOUNDARY_PUNCT = frozenset(".,;:!?")
 
 
 @dataclass
@@ -97,6 +157,38 @@ class StreamingASRState:
                 return delta[k:].lstrip()
         return delta
 
+    def _trim_large_cumulative_prompt_echo(self, delta: str) -> str:
+        """Drop obvious full-prefix echoes from cumulative chunked ASR.
+
+        HTTP SSE chunked ASR prompts the next cumulative audio snapshot with
+        already emitted text. On repetitive audio, Qwen3-ASR can copy that
+        prompt text back before the new words. A short chunk should not add
+        dozens of words at once, so this only trims unusually large deltas that
+        start with a long normalized copy of the emitted prefix.
+        """
+        if not delta or not self.emitted_text:
+            return delta
+
+        delta_words = delta.split()
+        emitted_words = self.emitted_text.split()
+        max_words_for_chunk = max(24, int(self.chunk_size_sec * 16))
+        if len(delta_words) <= max_words_for_chunk or not emitted_words:
+            return delta
+
+        while len(delta_words) > max_words_for_chunk:
+            max_match = min(len(delta_words), len(emitted_words))
+            match = 0
+            for i in range(max_match):
+                if _dedupe_norm(delta_words[i]) != _dedupe_norm(emitted_words[i]):
+                    break
+                match += 1
+
+            if match < max_words_for_chunk:
+                break
+            delta_words = delta_words[match:]
+
+        return " ".join(delta_words)
+
     def update(self, new_transcript: str, *, cumulative: bool = True) -> str:
         if _is_cjk_no_whitespace(new_transcript):
             return self._update_chars(new_transcript)
@@ -129,15 +221,17 @@ class StreamingASRState:
             # Sliced path: each slice is a disjoint audio window and
             # dedupe_overlap already removed the emitted overlap, so a word
             # prefix match against the previous slice's confirmed_text is
-            # spurious. Sliced output is already acoustic-window bounded, so do
-            # not apply token-count holdback here; otherwise words at a slow
-            # boundary can be held back past the next overlap and disappear.
+            # spurious. No token-count holdback here: the sliced window is
+            # already acoustically bounded, and holding a word back risks it
+            # being deferred past the next (time-based) overlap and dropped.
             common_count = 0
         delta = " ".join(new_words[common_count:])
         if common_count == 0:
             # Full re-emit: guard against re-sending an already-emitted CJK
             # prefix when the char<->word encoding flipped.
             delta = self._trim_cjk_emitted_overlap(delta)
+        if cumulative:
+            delta = self._trim_large_cumulative_prompt_echo(delta)
         return self._record_emit(delta)
 
     def _update_chars(self, new_transcript: str) -> str:
@@ -198,6 +292,8 @@ class StreamingASRState:
         delta = " ".join(all_words[common_count:])
         if common_count == 0:
             delta = self._trim_cjk_emitted_overlap(delta)
+        if cumulative:
+            delta = self._trim_large_cumulative_prompt_echo(delta)
         return self._record_emit(delta)
 
 
@@ -321,37 +417,53 @@ def _norm_common_prefix_len(left_words: List[str], right_words: List[str]) -> in
     return count
 
 
-def _dedupe_by_word(committed_text: str, candidate_out: str) -> str:
-    """Remove text repeated because a sliced audio request includes overlap.
+def _dedupe_by_word(committed_text: str, candidate_out: str) -> "tuple[str, bool]":
+    """Trim a verbatim overlap prefix repeated by a sliced audio request.
 
-    The model may re-transcribe the committed tail from the left-overlap audio.
-    Compare the committed suffix with the candidate prefix, then drop the
-    longest word-level match from the candidate.
+    Returns ``(trimmed_text, matched)`` where ``matched`` is True iff a non-empty
+    normalized overlap prefix was found and trimmed. ``matched == False`` means
+    the candidate did not verifiably start on the committed tail (the model
+    reworded it, or there was no overlap): nothing is deleted, and the caller
+    decides whether emitting verbatim is safe.
+
+    The model re-transcribes the committed tail from the left-overlap audio, so
+    the candidate can begin with a copy of the committed tail. Trim only the
+    longest *normalized prefix* of the candidate that exactly matches a suffix of
+    the committed tail: the candidate must START on the overlap, so genuine new
+    speech -- which always follows the overlap in a sliced request -- is never
+    deleted, and unmatched leading words are never dropped.
+
+    This is deliberately conservative. Re-worded overlap ("ladled" -> "laid") is
+    left as-is rather than guessed at: a reworded copy can't be told from genuinely
+    repeated speech by text alone, so ``matched`` stays False and the caller keeps
+    the audio and defers instead of guessing. When nothing overlaps, the candidate
+    is returned verbatim (never re-tokenized or rewritten).
     """
     candidate_words = candidate_out.split()
     if not candidate_words:
-        return candidate_out
+        return candidate_out, False
     # Only the last len(candidate_words) committed words can overlap, so rsplit
     # the tail instead of tokenizing the whole (growing) committed transcript.
     committed_tail = committed_text.rsplit(maxsplit=len(candidate_words))[
         -len(candidate_words) :
     ]
     if not committed_tail:
-        return candidate_out
-    # Normalize the committed tail and candidate prefix once, then compare slices.
-    max_overlap = min(len(committed_tail), len(candidate_words))
+        return candidate_out, False
     committed_tail_norm = [_dedupe_norm(w) for w in committed_tail]
-    candidate_norm = [_dedupe_norm(w) for w in candidate_words[:max_overlap]]
-    # Longest overlap first; the first match wins.
-    for overlap in range(max_overlap, 0, -1):
-        if committed_tail_norm[-overlap:] != candidate_norm[:overlap]:
-            continue
-        # Skip all-punctuation overlaps: lone "@"/"#" both normalize to "" and
-        # would otherwise match.
-        if not any(candidate_norm[:overlap]):
-            continue
-        return " ".join(candidate_words[overlap:])
-    return candidate_out
+    candidate_norm = [_dedupe_norm(w) for w in candidate_words]
+    max_overlap = min(len(committed_tail_norm), len(candidate_norm))
+
+    cut = 0
+    for length in range(max_overlap, 0, -1):
+        if committed_tail_norm[-length:] == candidate_norm[:length] and any(
+            committed_tail_norm[-length:]
+        ):
+            cut = length
+            break
+    if cut == 0:
+        # No overlap trimmed -- return the model output untouched.
+        return candidate_out, False
+    return " ".join(candidate_words[cut:]), True
 
 
 def dedupe_overlap(committed_text: str, candidate_out: str) -> str:
@@ -361,18 +473,14 @@ def dedupe_overlap(committed_text: str, candidate_out: str) -> str:
     continuity. That overlap can make the model repeat already-emitted words,
     so trim the repeated prefix before updating streaming state.
     Trims words at the start of ``candidate_out`` that re-transcribe
-    ``committed_text``'s tail. It matches whitespace-delimited words only;
-    repeated-speech edge cases need timestamp/token alignment for exact handling.
+    ``committed_text``'s tail. It matches whitespace-delimited words only and only
+    a verbatim (normalized) prefix; when the overlap can't be matched it is left
+    untouched rather than guessed at.
 
     CJK has no inter-word spaces, so those streams stay on the cumulative path."""
     if not committed_text or not candidate_out:
         return candidate_out
-    return _dedupe_by_word(committed_text, candidate_out)
-
-
-def _strip_sliced_boundary_punctuation(text: str) -> str:
-    """Drop punctuation the model adds only because a non-final slice ended."""
-    return text.rstrip("".join(_SLICED_BOUNDARY_PUNCT)).rstrip()
+    return _dedupe_by_word(committed_text, candidate_out)[0]
 
 
 async def process_asr_chunk(
@@ -386,14 +494,24 @@ async def process_asr_chunk(
     routing_key: Optional[str] = None,
     prompt: Optional[str] = None,
     dedupe_against: Optional[str] = None,
+    sample_rate: Optional[int] = None,
+    overlap_seconds: float = 0.0,
+    defer_if_unverified: bool = False,
+    verified_out: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Run inference on one audio chunk. Shared by the HTTP and WS paths.
 
     ``audio_data`` accepts WAV bytes or pre-decoded float samples.
     ``prompt`` overrides the default ``adapter.prompt_template + state.get_prefix_text()``.
-    ``dedupe_against`` triggers ``dedupe_overlap`` on raw model output before ``state`` ingests it.
-    Realtime sliced calls pass both: the bare prompt avoids text-prefix injection,
-    and the dedupe target removes text repeated from the acoustic overlap.
+    ``dedupe_against`` triggers the sliced overlap dedupe on raw model output
+    before ``state`` ingests it. Realtime sliced calls pass both: the bare prompt
+    avoids text-prefix injection, and the dedupe target removes text repeated from
+    the acoustic overlap.
+
+    ``defer_if_unverified``: when the overlap trim can't be proven safe, return ""
+    WITHOUT ingesting into ``state`` so a later slice or the commit re-covers the
+    audio instead of emitting a duplicate guess. ``verified_out``, if given,
+    receives the verdict under key ``"verified"``.
     """
     if prompt is None:
         prompt = adapter.prompt_template + state.get_prefix_text()
@@ -426,9 +544,16 @@ async def process_asr_chunk(
 
     text = normalize_whitespace(adapter.postprocess_text(ret.get("text", "")))
     if dedupe_against is not None:
-        text = dedupe_overlap(dedupe_against, text)
-        if not is_last:
-            text = _strip_sliced_boundary_punctuation(text)
+        text, overlap_verified = _apply_sliced_dedupe(
+            dedupe_against, text, audio_data, sample_rate, overlap_seconds
+        )
+        if verified_out is not None:
+            verified_out["verified"] = overlap_verified
+        if defer_if_unverified and not overlap_verified:
+            # Unsafe boundary: do not ingest into streaming state. The caller
+            # leaves the slice anchor/PCM intact so a later slice or the commit
+            # re-covers this audio instead of emitting a duplicate guess.
+            return ""
 
     if is_last:
         state.full_transcript = text

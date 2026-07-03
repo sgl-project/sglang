@@ -37,11 +37,14 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
 
     @property
     def realtime_slicing_config(self) -> dict:
-        # Empirically tuned for Qwen3-ASR: in our fixtures a 2s left overlap
-        # gave enough acoustic context for the K=5 (unfixed_token_num) rollback
-        # window; 16s min audio keeps slicing off on short inputs, where sliced
-        # output diverged from cumulative.
-        return {"enabled": True, "left_overlap_ms": 2000, "min_audio_sec": 16.0}
+        # Empirically tuned for Qwen3-ASR: a 2s left overlap gives enough acoustic
+        # context for the K=5 (unfixed_token_num) rollback window; the 45s min
+        # audio gate keeps short/mid utterances on the cumulative path, which
+        # matches HTTP SSE word-for-word (sliced boundaries can re-word the
+        # re-sent overlap and leave a residual duplicate). Only truly long
+        # sessions pay the sliced path's boundary risk in exchange for bounded
+        # prefill/memory.
+        return {"enabled": True, "left_overlap_ms": 2000, "min_audio_sec": 45.0}
 
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:
         temperature = request.temperature
