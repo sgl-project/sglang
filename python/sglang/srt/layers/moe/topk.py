@@ -652,6 +652,8 @@ def fused_topk_torch_native(
             return gating_output.softmax(dim=-1)
         elif scoring_func == "sigmoid":
             return gating_output.sigmoid()
+        elif scoring_func == "sqrtsoftplus":
+            return F.softplus(gating_output).sqrt()
         else:
             raise ValueError(f"Invalid scoring function: {scoring_func}")
 
