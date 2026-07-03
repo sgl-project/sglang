@@ -929,8 +929,16 @@ class ModelConfig:
                 self.hf_text_config, "decoder_layers", self.num_hidden_layers
             )
             self.num_attention_layers = encoder_layers + 2 * decoder_layers
+        # The draft-model architecture rewrites set num_nextn_predict_layers on
+        # the outer hf_config; for wrapper configs (e.g.
+        # Qwen3_5ForConditionalGeneration) hf_text_config is a different,
+        # nested object, so fall back to the outer config. Missing this made
+        # the EAGLE/MTP draft look like a full-depth model and shrank the KV
+        # pool by the draft/target layer ratio (#29857).
         self.num_nextn_predict_layers = getattr(
-            self.hf_text_config, "num_nextn_predict_layers", None
+            self.hf_text_config,
+            "num_nextn_predict_layers",
+            getattr(self.hf_config, "num_nextn_predict_layers", None),
         )
         self.vocab_size = self.hf_text_config.vocab_size
 
