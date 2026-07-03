@@ -108,6 +108,35 @@ def test_remote_image_gt_falls_back_to_sglang_when_official_missing(monkeypatch)
     ]
 
 
+def test_remote_image_gt_skips_official_for_quarantined_case(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+    official_prefix = test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE + "/"
+    sglang_prefix = test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE + "/"
+    case_id = "qwen_image_edit_2509_ti2i"
+    expected_filename = f"{case_id}_1gpu.{test_utils.output_format_to_ext(None)}"
+    monkeypatch.setattr(
+        test_utils,
+        "_remote_file_exists",
+        lambda url: url.startswith(official_prefix) or url.startswith(sglang_prefix),
+    )
+
+    files = test_utils._find_remote_consistency_gt_files(
+        case_id,
+        1,
+        is_video=False,
+    )
+
+    assert files == [
+        (
+            expected_filename,
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                f"/{expected_filename}"
+            ),
+        )
+    ]
+
+
 def test_remote_platform_video_gt_prefers_platform_sglang_before_default_official(
     monkeypatch,
 ):
@@ -151,6 +180,48 @@ def test_remote_platform_video_gt_prefers_platform_sglang_before_default_officia
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
                 "/5090/unit_video_1gpu_frame_last.png"
+            ),
+        ),
+    ]
+
+
+def test_remote_video_gt_skips_official_for_quarantined_case(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+    official_prefix = test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE + "/"
+    sglang_prefix = test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE + "/"
+    case_id = "ltx_2_two_stage_t2v"
+    monkeypatch.setattr(
+        test_utils,
+        "_remote_file_exists",
+        lambda url: url.startswith(official_prefix) or url.startswith(sglang_prefix),
+    )
+
+    files = test_utils._find_remote_consistency_gt_files(
+        case_id,
+        2,
+        is_video=True,
+    )
+
+    assert files == [
+        (
+            f"{case_id}_2gpu_frame_0.png",
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                f"/{case_id}_2gpu_frame_0.png"
+            ),
+        ),
+        (
+            f"{case_id}_2gpu_frame_mid.png",
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                f"/{case_id}_2gpu_frame_mid.png"
+            ),
+        ),
+        (
+            f"{case_id}_2gpu_frame_last.png",
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                f"/{case_id}_2gpu_frame_last.png"
             ),
         ),
     ]

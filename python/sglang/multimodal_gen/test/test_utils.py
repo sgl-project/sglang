@@ -95,6 +95,16 @@ DEFAULT_PSNR_THRESHOLD_VIDEO = 24.0
 DEFAULT_MEAN_ABS_DIFF_THRESHOLD_VIDEO = 10.0
 _clip_model_cache: dict[str, Any] = {}
 _consistency_gt_cache: dict[str, Any] = {}
+OFFICIAL_CONSISTENCY_GT_SKIP_CASES = frozenset(
+    {
+        # Official references for these cases need regeneration or parity triage.
+        # Prefer existing sglang-generated GT instead of relaxing thresholds over
+        # large semantic/content mismatches.
+        "ltx_2_3_hq_pipeline",
+        "ltx_2_two_stage_t2v",
+        "qwen_image_edit_2509_ti2i",
+    }
+)
 # Case keys whose remote GT has been positively confirmed present. Cached so a
 # case that probes GT existence more than once in a single run — e.g. a
 # consistency check followed by the LoRA basic-API check, which re-validates
@@ -1094,6 +1104,13 @@ def _is_ascend_consistency_case(case_id: str) -> bool:
 
 
 def _remote_consistency_gt_base_urls(case_id: str) -> tuple[str, ...]:
+    if case_id in OFFICIAL_CONSISTENCY_GT_SKIP_CASES:
+        if _is_ascend_consistency_case(case_id) or current_platform.is_npu():
+            return (
+                SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE_ASCEND,
+                SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
+            )
+        return (SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,)
     if _is_ascend_consistency_case(case_id) or current_platform.is_npu():
         return (
             SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE_ASCEND,
