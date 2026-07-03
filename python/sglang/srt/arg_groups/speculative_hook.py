@@ -279,6 +279,8 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             fallback_backend,
         )
         draft_backend = fallback_backend
+    # FIXME: avoid overriding server args directly; pass the resolved draft
+    # backend to the draft worker explicitly instead.
     server_args.speculative_draft_attention_backend = draft_backend
 
 
