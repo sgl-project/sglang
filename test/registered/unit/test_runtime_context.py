@@ -7,18 +7,19 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import unittest
 from unittest.mock import patch
 
+import sglang.srt.server_args as server_args_module
 from sglang.srt.runtime_context import (
     ParallelContext,
     RuntimeContext,
     get_context,
     get_parallel,
     get_server_args,
+    reset_context,
 )
 from sglang.test.test_utils import CustomTestCase
 
 _PS = "sglang.srt.distributed.parallel_state"
 _DP = "sglang.srt.layers.dp_attention"
-_SA = "sglang.srt.server_args"
 
 SIZE_RANK_DELEGATIONS = [
     ("world_size", f"{_PS}.get_world_size"),
@@ -144,41 +145,67 @@ class TestParallelOverride(_IsolatedOverrides):
         self.assertEqual(p._overrides, {})
 
 
-class TestServerArgsReadThrough(CustomTestCase):
-    """``server_args`` delegates live to the global getter (read-through, V2a)."""
+class _IsolatedServerArgs(CustomTestCase):
+    """Save/restore the published ServerArgs around each test (the slot is
+    process-global; another test file sharing the process may have published)."""
 
-    def test_delegates_to_global_getter(self):
-        sentinel = object()
-        with patch(f"{_SA}.get_global_server_args", return_value=sentinel):
-            self.assertIs(get_server_args(), sentinel)
-            self.assertIs(get_context().server_args, sentinel)
+    def setUp(self):
+        super().setUp()
+        self._saved_server_args = get_context()._server_args
 
-    def test_identity_with_global_getter(self):
-        import sglang.srt.server_args as server_args_module
+    def tearDown(self):
+        if self._saved_server_args is None:
+            reset_context()
+        else:
+            get_context().set_server_args(self._saved_server_args)
+        super().tearDown()
 
+
+class TestServerArgsOwnership(_IsolatedServerArgs):
+    """V2b: the context owns the slot; the legacy getters are identity shims."""
+
+    def test_legacy_setter_publishes_into_context(self):
         # Identity (not equality) is the contract; publish accepts any object.
         sentinel = object()
-        saved = server_args_module._global_server_args
-        try:
-            server_args_module.set_global_server_args_for_scheduler(sentinel)
-            self.assertIs(
-                get_server_args(), server_args_module.get_global_server_args()
-            )
-            self.assertIs(get_server_args(), sentinel)
-        finally:
-            server_args_module._global_server_args = saved
+        server_args_module.set_global_server_args_for_scheduler(sentinel)
+        self.assertIs(server_args_module.get_global_server_args(), sentinel)
+        self.assertIs(get_server_args(), sentinel)
+        self.assertIs(get_context().server_args, sentinel)
 
-    def test_pre_publish_error_passes_through(self):
-        import sglang.srt.server_args as server_args_module
+    def test_context_publish_visible_through_legacy_getter(self):
+        sentinel = object()
+        get_context().set_server_args(sentinel)
+        self.assertIs(server_args_module.get_global_server_args(), sentinel)
 
-        saved = server_args_module._global_server_args
-        server_args_module._global_server_args = None
-        try:
+    def test_tokenizer_alias_is_same_function(self):
+        self.assertIs(
+            server_args_module.set_global_server_args_for_tokenizer,
+            server_args_module.set_global_server_args_for_scheduler,
+        )
+
+    def test_pre_publish_error_verbatim(self):
+        reset_context()
+        for accessor in (get_server_args, server_args_module.get_global_server_args):
             with self.assertRaises(ValueError) as cm:
-                get_server_args()
+                accessor()
             self.assertEqual(str(cm.exception), "Global server args is not set yet!")
-        finally:
-            server_args_module._global_server_args = saved
+
+    def test_republish_overwrite_allowed(self):
+        first, second = object(), object()
+        server_args_module.set_global_server_args_for_scheduler(first)
+        server_args_module.set_global_server_args_for_scheduler(second)
+        self.assertIs(get_server_args(), second)
+
+    def test_reset_context_clears_owned_store(self):
+        server_args_module.set_global_server_args_for_scheduler(object())
+        reset_context()
+        with self.assertRaises(ValueError):
+            get_server_args()
+
+    def test_module_global_removed(self):
+        # The legacy storage must not survive: a stale _global_server_args would
+        # silently fork the config into two objects.
+        self.assertFalse(hasattr(server_args_module, "_global_server_args"))
 
 
 if __name__ == "__main__":
