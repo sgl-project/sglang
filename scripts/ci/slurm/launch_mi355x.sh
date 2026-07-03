@@ -231,10 +231,10 @@ docker run $DOCKER_COMMON --name mi355x_decode \
   $COMMON_FLAGS --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
 EOF
 
-# Smoke-test payload + validator (separate files to avoid quoting inside the
+# Probe payload + validator (separate files to avoid quoting inside the
 # bench.sh `bash -lc '...'` block). One real request exercises the full
 # prefill->decode KV handoff before we commit to the whole sweep.
-cat > "$WORKDIR/smoke.json" <<'JSON'
+cat > "$WORKDIR/probe.json" <<'JSON'
 {"text": "The capital of France is", "sampling_params": {"max_new_tokens": 16, "temperature": 0.0}}
 JSON
 cat > "$WORKDIR/assert_nonempty.py" <<'PY'
@@ -242,9 +242,9 @@ import sys, json
 d = json.load(sys.stdin)
 t = d.get("text", "") if isinstance(d, dict) else ""
 if not (t and t.strip()):
-    print("[smoke] empty/invalid output:", str(d)[:200])
+    print("[probe] empty/invalid output:", str(d)[:200])
     sys.exit(1)
-print("[smoke] ok:", t[:80].replace("\n", " "))
+print("[probe] ok:", t[:80].replace("\n", " "))
 PY
 
 # Bench script runs on the prefill node; \$PIP/\$DIP injected at srun time.
@@ -267,12 +267,12 @@ docker run $DOCKER_COMMON --name mi355x_bench \
       --disable-circuit-breaker &
     for i in \$(seq 1 30); do curl -sf http://127.0.0.1:$LBPORT/health >/dev/null && break; sleep 2; done
     CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
-    echo "[smoke] PD end-to-end check via LB"
+    echo "[probe] PD end-to-end check via LB"
     curl -sf -X POST http://127.0.0.1:$LBPORT/generate \
-      -H "content-type: application/json" -d @\$CIDIR/smoke.json > \$CIDIR/smoke_out.json \
-      || { echo "[smoke] request failed -- PD path not serving; aborting before sweep"; exit 1; }
-    python3 \$CIDIR/assert_nonempty.py < \$CIDIR/smoke_out.json \
-      || { echo "[smoke] empty/invalid generation; aborting before sweep"; exit 1; }
+      -H "content-type: application/json" -d @\$CIDIR/probe.json > \$CIDIR/probe_out.json \
+      || { echo "[probe] request failed -- PD path not serving; aborting before sweep"; exit 1; }
+    python3 \$CIDIR/assert_nonempty.py < \$CIDIR/probe_out.json \
+      || { echo "[probe] empty/invalid generation; aborting before sweep"; exit 1; }
     # Correctness gate runs BEFORE the perf sweep: if the model is wrong there
     # is no point spending ~15min measuring how fast it is wrong, so a failure
     # here exits immediately and the sweep never runs.
