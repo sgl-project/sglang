@@ -68,6 +68,53 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 
+# ----------------------------------------------------------------------------
+# AMD quark (GLM-5.2-MXFP4) NextN/MTP handling — kept separate from the common
+# nextn logic below. The quark checkpoint keeps the whole MTP layer in bf16 by
+# listing it in the quark `exclude` (keyed by full module name,
+# e.g. "model.layers.<N>.eh_proj"). Two consequences the common path must honor,
+# both gated on quant_config being quark:
+#   * eh_proj must be built with its layer-indexed prefix so quark's per-module
+#     exclude check resolves (a bare "eh_proj" prefix never matches).
+#   * the whole nextn draft must be built unquantized when that layer is excluded.
+# ----------------------------------------------------------------------------
+def _is_quark(quant_config: Optional[QuantizationConfig]) -> bool:
+    return quant_config is not None and quant_config.get_name() == "quark"
+
+
+def nextn_eh_proj_prefix(
+    quant_config: Optional[QuantizationConfig], config: PretrainedConfig, prefix: str
+) -> str:
+    """eh_proj weight-loader prefix. For quark, use the checkpoint's layer-indexed
+    name so the per-module `exclude` resolves and eh_proj stays bf16; otherwise the
+    bare name. (Prefix only drives the quant-method lookup; the param name comes
+    from the module path.)"""
+    if _is_quark(quant_config):
+        return add_prefix(f"layers.{config.num_hidden_layers}.eh_proj", prefix)
+    return add_prefix("eh_proj", prefix)
+
+
+def resolve_nextn_quant_config(
+    quant_config: Optional[QuantizationConfig],
+    config: PretrainedConfig,
+    hf_to_sglang_mapper,
+) -> Optional[QuantizationConfig]:
+    """Return the quant_config the nextn draft should build with. For quark, if the
+    MTP layer is in the `exclude` list (GLM-5.2-MXFP4 keeps it bf16), return None so
+    the whole draft is unquantized. Probes the concrete model.layers.<N>.eh_proj
+    module because should_ignore_layer matches full module names — a bare layer
+    prefix never matches."""
+    if not _is_quark(quant_config):
+        return quant_config
+    from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
+
+    ckpt_prefix = f"model.layers.{config.num_hidden_layers}.eh_proj"
+    mapped_prefix = hf_to_sglang_mapper._map_name(ckpt_prefix)
+    if should_ignore_layer(mapped_prefix, quant_config.exclude_layers):
+        return None
+    return quant_config
+
+
 class DeepseekModelNextN(nn.Module):
 
     def __init__(
@@ -104,13 +151,13 @@ class DeepseekModelNextN(nn.Module):
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        if quant_config is not None and quant_config.get_name() == "quark":
+        if _is_quark(quant_config):
             self.eh_proj = ReplicatedLinear(
                 2 * config.hidden_size,
                 config.hidden_size,
                 bias=False,
                 quant_config=quant_config,
-                prefix=add_prefix("eh_proj", prefix),
+                prefix=nextn_eh_proj_prefix(quant_config, config, prefix),
             )
         else:
             self.eh_proj = nn.Linear(
@@ -301,17 +348,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             self.cp_rank = None
             self.cp_size = None
 
-        nextn_quant_config = quant_config
-        # For quark, if the MTP layer is listed in exclude_layers, set quant_config to None.
-        if nextn_quant_config is not None and nextn_quant_config.get_name() == "quark":
-            from sglang.srt.layers.quantization.quark.utils import (
-                should_ignore_layer,
-            )
-
-            ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
-            mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
-            if should_ignore_layer(mapped_prefix, nextn_quant_config.exclude_layers):
-                nextn_quant_config = None
+        nextn_quant_config = resolve_nextn_quant_config(
+            quant_config, config, self.hf_to_sglang_mapper
+        )
 
         self.model = DeepseekModelNextN(
             config, nextn_quant_config, prefix=add_prefix("model", prefix)
