@@ -483,6 +483,7 @@ class ModelConfig:
         model_path: str = None,
         model_revision: str = None,
         is_draft_model: bool = False,
+        context_length: Optional[int] = None,
         **kwargs,
     ):
         quantization = (
@@ -499,7 +500,11 @@ class ModelConfig:
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=model_revision or server_args.revision,
-            context_length=server_args.context_length,
+            context_length=(
+                context_length
+                if context_length is not None
+                else server_args.context_length
+            ),
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
             enable_multimodal=server_args.enable_multimodal,
