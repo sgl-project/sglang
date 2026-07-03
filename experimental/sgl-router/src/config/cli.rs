@@ -45,6 +45,12 @@ pub struct Cli {
     /// as the repo id (download honors `HF_TOKEN` / `HF_HOME`).
     #[arg(long)]
     pub tokenizer_path: Option<String>,
+    /// Api key sent as `Authorization: Bearer <key>` on router-originated
+    /// worker requests (`/server_info` introspection, KV-event discovery),
+    /// for fleets whose workers enforce `--api-key`. Proxied client
+    /// requests still forward the caller's own `authorization` header.
+    #[arg(long)]
+    pub worker_api_key: Option<String>,
     /// Routing policy.
     #[arg(long, value_enum, default_value = "round_robin")]
     pub policy: PolicyKind,
@@ -271,6 +277,7 @@ impl Cli {
             discovery,
             proxy: ProxyConfig {
                 request_timeout_secs: self.request_timeout_secs,
+                worker_api_key: self.worker_api_key,
             },
             active_load: ActiveLoadConfig {
                 stale_request_timeout_secs: self.stale_request_timeout_secs,
@@ -406,6 +413,23 @@ mod tests {
         .unwrap();
         assert_eq!(c.model.id, "Qwen/Qwen3-0.6B");
         assert_eq!(c.model.tokenizer_path, "Qwen/Qwen3-0.6B");
+    }
+
+    /// `--worker-api-key` lands in `proxy.worker_api_key`; absent by default.
+    #[test]
+    fn worker_api_key_flag_parses_into_proxy_config() {
+        let c = into_config(&[
+            "--model-id",
+            "qwen3",
+            "--worker-urls",
+            "http://x:30000",
+            "--worker-api-key",
+            "sk-test",
+        ])
+        .unwrap();
+        assert_eq!(c.proxy.worker_api_key.as_deref(), Some("sk-test"));
+        let c = into_config(&["--model-id", "qwen3", "--worker-urls", "http://x:30000"]).unwrap();
+        assert_eq!(c.proxy.worker_api_key, None);
     }
 
     #[test]

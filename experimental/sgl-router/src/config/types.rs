@@ -21,12 +21,18 @@ pub struct Config {
 /// Outbound proxy tuning. Default mirrors SGLang's typical prefill /
 /// decode latency budget; e2e tests lower it so per-request failures
 /// trip the circuit breaker within the test's wall-time.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ProxyConfig {
     /// Maximum time to wait for a single upstream HTTP request to
     /// return headers + body. Default 300 s. The circuit breaker
     /// records a failure when this fires.
     pub request_timeout_secs: u64,
+    /// Api key sent as `Authorization: Bearer <key>` on router-originated
+    /// worker requests (`/server_info` introspection and KV-event
+    /// discovery), for fleets whose workers enforce `--api-key`.
+    /// Proxied client requests are unaffected: their inbound
+    /// `authorization` header is forwarded as-is.
+    pub worker_api_key: Option<String>,
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
@@ -37,6 +43,7 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_proxy_request_timeout_secs(),
+            worker_api_key: None,
         }
     }
 }

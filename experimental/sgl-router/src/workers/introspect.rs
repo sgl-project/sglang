@@ -95,6 +95,23 @@ impl WorkerIntrospector {
         Self { client }
     }
 
+    /// Like [`Self::default`], but attach `Authorization: Bearer <key>`
+    /// as a default header on every introspection request, for fleets
+    /// whose workers enforce `--api-key`.
+    pub fn with_worker_api_key(key: &str) -> Self {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Ok(mut v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")) {
+            v.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, v);
+        }
+        let client = reqwest::Client::builder()
+            .timeout(SERVER_INFO_TIMEOUT)
+            .default_headers(headers)
+            .build()
+            .expect("introspector http client builds");
+        Self { client }
+    }
+
     /// Fetch `/server_info` for the worker.  Never returns an error:
     /// any failure is logged at `warn!` and yields a default
     /// `ServerInfo` with both halves `None`. Callers register the
