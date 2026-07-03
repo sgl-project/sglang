@@ -151,7 +151,7 @@ class TestMoERunner(CustomTestCase):
             "other_args": [
                 "--trust-remote-code",
                 "--moe-runner-backend",
-                "triton",
+                "hpc",
                 "--quantization",
                 "fp8",
                 "--attention-backend",
