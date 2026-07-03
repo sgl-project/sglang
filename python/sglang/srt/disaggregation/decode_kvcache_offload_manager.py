@@ -139,7 +139,8 @@ class DecodeKVCacheOffloadManager:
             len(req.origin_input_ids) // self.page_size * self.page_size
         )
         state = self.offloaded_state.get(req.rid)
-        if state is None:
+        is_first_offload = state is None
+        if is_first_offload:
             prefill_hashes = self._compute_prefix_hash(
                 req.origin_input_ids[:prefill_offloaded_len]
             )
@@ -151,7 +152,6 @@ class DecodeKVCacheOffloadManager:
                 inc_len=0,
                 last_hash=last_prefill_hash,
             )
-            self.offloaded_state[req.rid] = state
         incremental_total = len(all_tokens) - state.prefill_len
         incremental_new = incremental_total - state.inc_len
         incremental_aligned_len = (
@@ -183,6 +183,9 @@ class DecodeKVCacheOffloadManager:
         if host_indices is None:
             logger.error(f"Not enough host memory for request {req.rid}")
             return False
+
+        if is_first_offload:
+            self.offloaded_state[req.rid] = state
 
         self._mark_offload_started(req.rid)
         self.ongoing_offload[ack_id] = (
