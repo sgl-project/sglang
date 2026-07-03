@@ -6089,16 +6089,11 @@ class ServerArgs:
             if model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
 
+        # XPU platforms backends
+        run_post_process_pass(self, _intel_xpu_page_constraint)
+
         # Other platforms backends
         run_post_process_pass(self, _attention_backend_platform_fallbacks)
-
-        prefill_backend, decode_backend = self._resolved_attention_backends()
-        if self.use_mla_backend() and prefill_backend == "intel_xpu":
-            raise ValueError(
-                "intel_xpu backend is only supported on decode for MLA models, please set --decode-attention-backend to intel_xpu and do not set --attention-backend or --prefill-attention-backend to intel_xpu for prefill instead use triton."
-            )
-
-        run_post_process_pass(self, _intel_xpu_page_constraint)
 
         # Dual chunk flash attention backend
         run_post_process_pass(self, _attention_backend_dual_chunk)
