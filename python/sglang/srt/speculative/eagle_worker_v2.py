@@ -1535,7 +1535,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             if vocab_mask is not None:
                 assert verify_input.grammar is not None
-                vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
+                vocab_mask = vocab_mask.to(
+                    verify_input.retrieve_next_token.device, non_blocking=True
+                )
                 # NOTE: otherwise, this vocab mask will be the one from the previous extend stage
                 # and will be applied to produce wrong results
                 batch.sampling_info.vocab_mask = None
