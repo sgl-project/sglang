@@ -2172,17 +2172,37 @@ class MooncakeKVManager(CommonKVManager):
                 sample_bytes,
                 " ".join(per_layer),
             )
-            state_ptrs = getattr(self.kv_args, "state_data_ptrs", []) or []
-            state_item_lens = getattr(self.kv_args, "state_item_lens", []) or []
-            state_type_str = getattr(self.kv_args, "state_type", "none")
-            if state_ptrs and state_type_str == "nsa":
+            # DSA indexer-state fingerprint. state_types/state_data_ptrs/
+            # state_item_lens are per-component lists (setup_state_kv_args);
+            # DSA is one component whose inner list is one ptr per indexer
+            # layer. DSA state shares page numbering with main KV, so
+            # sampled_pages index the indexer buffer directly.
+            state_types = getattr(self.kv_args, "state_types", []) or []
+            state_ptrs_all = getattr(self.kv_args, "state_data_ptrs", []) or []
+            state_item_lens_all = (
+                getattr(self.kv_args, "state_item_lens", []) or []
+            )
+            dsa_comp = None
+            for comp_idx, st in enumerate(state_types):
+                # StateType is a str-enum; compare by value so both the enum
+                # and a plain "dsa" string match.
+                if str(getattr(st, "value", st)) == "dsa":
+                    dsa_comp = comp_idx
+                    break
+            if (
+                dsa_comp is not None
+                and dsa_comp < len(state_ptrs_all)
+                and dsa_comp < len(state_item_lens_all)
+            ):
+                sptrs = state_ptrs_all[dsa_comp] or []
+                sitem_lens = state_item_lens_all[dsa_comp] or []
                 per_layer_state = []
-                num_state_layers = len(state_ptrs)
+                num_state_layers = len(sptrs)
                 for layer_id in range(num_state_layers):
-                    if layer_id >= len(state_item_lens):
+                    if layer_id >= len(sitem_lens):
                         continue
-                    sptr = int(state_ptrs[layer_id])
-                    sitem_len = int(state_item_lens[layer_id])
+                    sptr = int(sptrs[layer_id])
+                    sitem_len = int(sitem_lens[layer_id])
                     if sitem_len <= 0:
                         continue
                     page_hashes = []
@@ -2193,7 +2213,7 @@ class MooncakeKVManager(CommonKVManager):
                             ctypes.cast(sbuf, ctypes.c_void_p),
                             ctypes.c_void_p(addr),
                             ctypes.c_size_t(sample_bytes),
-                            ctypes.c_int(2),
+                            ctypes.c_int(2),  # cudaMemcpyDeviceToHost
                         )
                         if err != 0:
                             page_hashes.append(f"err{err}")
