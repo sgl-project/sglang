@@ -1225,6 +1225,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             is_pd_decode = self.server_args.disaggregation_mode == "decode"
             hidden = hidden.view(bs, block_size, -1)
             hidden_flat = hidden.reshape(-1, hidden.shape[-1])
+            # PD decode uses overlap/future-map scheduling; rebuilding draft C128
+            # from target hidden can observe stale draft batch indices there.
             if not is_pd_decode:
                 try:
                     self._materialize_main_hidden_to_draft_compressors(
