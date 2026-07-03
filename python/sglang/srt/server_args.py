@@ -7595,10 +7595,14 @@ class ServerArgs:
 
 
 # NOTE: The process-wide ServerArgs is owned by the runtime context
-# (sglang.srt.runtime_context). The two functions below are thin shims kept for
-# the existing call-sites; they publish/read the same live object by reference.
+# (sglang.srt.runtime_context). The two functions below are LEGACY shims kept
+# for the existing call-sites; they publish/read the same live object by
+# reference. Do not add new call-sites — the counts are ratcheted
+# (decrease-only) by test/registered/unit/test_legacy_global_ratchet.py.
 # Imports are in-function so the two modules stay cycle-free at import time.
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
+    """Legacy publish shim — prefer ``get_context().set_server_args()`` from
+    ``sglang.srt.runtime_context`` in new code."""
     from sglang.srt.runtime_context import get_context
 
     get_context().set_server_args(server_args)
@@ -7608,6 +7612,8 @@ set_global_server_args_for_tokenizer = set_global_server_args_for_scheduler
 
 
 def get_global_server_args() -> ServerArgs:
+    """Legacy accessor shim — prefer ``get_server_args()`` from
+    ``sglang.srt.runtime_context`` in new code."""
     from sglang.srt.runtime_context import get_context
 
     return get_context().server_args
