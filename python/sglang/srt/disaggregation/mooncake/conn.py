@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -65,56 +65,25 @@ FAILED_SESSION_RECOVERIES = Counter(
     "Number of mooncake_session_ids un-blacklisted via probe.",
 )
 
-# Sentinels for `add_transfer_request` fields that don't apply to the
-# draft (MTP/EAGLE NEXTN) KV chunk: draft is not part of the main
-# layer-pipeline group sequence and never carries a `total_layer_groups`
-# value (the trailing aux finalizer in `send()` carries that). Stored on
-# `TransferKVChunk` for observability / log readability; never consumed
-# for routing or watermark decisions.
+# Draft KV is outside the main layer-group sequence.
 DRAFT_LAYER_GROUP_ID = -1
 DRAFT_TOTAL_LAYER_GROUPS_SENTINEL = -1
 
 
 @dataclasses.dataclass
 class _RoomLayerPipelineProgress:
-    """Per-room watermark state for layer-pipelined KV transfer.
+    """Per-room LP watermark: every dst must finish chunks and aux."""
 
-    Lifetime: created on first chunk arrival for a room (gated by
-    `layer_pipeline_progress_lock`), removed by
-    `_clear_layer_pipeline_progress` on terminal status (Success /
-    Failed) or on the three failure-exit paths in the transfer worker.
-
-    The watermark closes — and the room moves to KVPoll.Success —
-    iff every dst rank has reported both its full chunk count AND its
-    aux finalizer.
-    """
-
-    # Count of layer-group chunks acknowledged delivered, keyed by
-    # (mooncake_session_id, dst_pp_rank). A chunk is counted when the
-    # transfer_worker calls `_record_chunk_done` post-RDMA. Required to
-    # reach `total_chunks_expected` for every dst before Success fires.
     chunks_done_per_dst: Dict[Tuple[str, int], int] = dataclasses.field(
         default_factory=dict
     )
-    # Aux finalizer status per dst rank. Populated by `_record_aux_sent`.
-    # Each dst must report exactly once before Success can fire — both
-    # CP0 (real aux RDMA) and non-CP0 ranks (status-only, skip_aux_rdma)
-    # call this so the per-rank watermark slot closes uniformly.
     aux_results_per_dst: Dict[Tuple[str, int], int] = dataclasses.field(
         default_factory=dict
     )
-    # Set by the trailing aux finalizer's `total_chunks_in_request`
-    # field on the sender side. The watermark sync loop compares each
-    # dst's `chunks_done_per_dst` count against this value. None until
-    # the finalizer has been enqueued — chunk arrivals that race the
-    # finalizer get deferred at sync-check time.
+    # From the trailing aux finalizer; chunks may arrive before this is known.
     total_chunks_expected: Optional[int] = None
-    # How many dst ranks must report before Success fires. Set once at
-    # bootstrap from the request's dst-rank set (CP, TP, PP fan-out).
+    # Number of dst ranks in the request fan-out.
     required_dst_info_num: Optional[int] = None
-    # One-shot guard so `_maybe_sync_success_locked` fires
-    # `KVPoll.Success` exactly once per room, even if late-arriving
-    # chunks call the sync path again post-close.
     success_synced: bool = False
 
 
@@ -203,11 +172,7 @@ class KVArgsRegisterInfo:
     layer_pipeline_enabled: bool = False
     layer_group_size: int = 0
     kv_dtype: str = "auto"
-    # Decode-side local main KV layer count (logical layers, excludes
-    # draft tail). ``None`` when the dst side did not advertise it
-    # (legacy / no-draft) — receivers fall back to inferring from total
-    # length, which is unsafe when the two sides disagree on draft
-    # presence; see ``get_state_ptrs_with_pp``.
+    # Logical main-layer count; None keeps legacy length-based inference.
     dst_num_main_kv_layers: Optional[int] = None
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
@@ -270,8 +235,7 @@ class MooncakeKVManager(CommonKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
-            # Reserved for the staging-path GPU copy; unused on the current
-            # RDMA path (mooncake transfer is CPU-side).
+            # Reserved for staging-path GPU copies.
             try:
                 import torch as _torch
                 self.transfer_stream = (
@@ -279,14 +243,8 @@ class MooncakeKVManager(CommonKVManager):
                 )
             except ImportError:
                 self.transfer_stream = None
-            # LP-only state. Kept off the LP-disabled path so the runtime
-            # matches the pre-LP build: no watermark dict/lock, no hook
-            # timing counters, no LP metrics buffers. Helpers that touch
-            # these fields no-op when they are absent.
+            # LP-only state; absent when LP is disabled.
             if self.layer_pipeline_enabled:
-                # Per-room watermark state for layer-pipeline chunks. Tracks
-                # per-dst-rank chunk completion + aux send so Success fires
-                # regardless of completion order. Cleared on Success/Failed.
                 self.layer_pipeline_progress: Dict[int, _RoomLayerPipelineProgress] = {}
                 self.layer_pipeline_progress_lock = threading.Lock()
                 self._hook_timing_total_ns: int = 0
@@ -294,9 +252,7 @@ class MooncakeKVManager(CommonKVManager):
                 self._hook_timing_dispatch_count: int = 0
                 self._HOOK_TIMING_LOG_EVERY_FIRES: int = 200
                 self._hook_instrumentation_logged_init: bool = False
-                # When True, hook skips add_transfer_request and sender's
-                # hook_expected branch short-circuits to Success without RDMA.
-                # Prefill-side diagnostic only; decode side will fail.
+                # Prefill-only diagnostic: skip RDMA and fake Success.
                 self._lp_hook_noop_fake_success: bool = (
                     envs.SGLANG_DISAGG_LAYER_PIPELINE_HOOK_NOOP.get()
                 )
@@ -307,24 +263,11 @@ class MooncakeKVManager(CommonKVManager):
                         "any RDMA submit; decode side WILL fail. NEVER set in "
                         "production."
                     )
-                # Periodic LP-chunk metrics: bumped by transfer worker on each
-                # successful chunk, snapshot+reset by pop_layer_pipeline_metrics.
                 self._lp_metrics_lock = threading.Lock()
                 self._lp_chunks_total: int = 0
                 self._lp_chunks_periodic: int = 0
                 self._lp_chunk_ms_samples: List[float] = []
-                # Bound buffer memory if the scheduler snapshot loop stalls;
-                # the Counter is unaffected.
                 self._LP_SAMPLE_BUFFER_CAP: int = 4096
-            # SGLANG_DISAGG_KV_HASH_VERIFY: accumulate per-room prefill
-            # src page_indices (dedup on tobytes), emit one log line per
-            # room when watermark closes to Success. NEVER enable in
-            # production — adds D2H memcpy per layer.
-            self._kv_hash_lock = threading.Lock()
-            self._kv_hash_prefill_chunks: Dict[int, List[Any]] = {}
-            self._kv_hash_prefill_seen: Dict[int, set] = {}
-            self._kv_hash_prefill_layer_ranges: Dict[int, List[Tuple[int, int]]] = {}
-            self._kv_hash_layout_logged_prefill: bool = False
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -388,12 +331,6 @@ class MooncakeKVManager(CommonKVManager):
                 self._init_staging_allocator()
                 self._staging_handler = None
                 self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
-            # SGLANG_DISAGG_KV_HASH_VERIFY: stash dst page indices on
-            # send_metadata; emit decode-side hash on first Success poll.
-            self._kv_hash_lock = threading.Lock()
-            self._kv_hash_decode_indices: Dict[int, Any] = {}
-            self._kv_hash_decode_emitted: set = set()
-            self._kv_hash_layout_logged_decode: bool = False
             self.start_decode_thread()
 
     def init_engine(self):
@@ -569,18 +506,8 @@ class MooncakeKVManager(CommonKVManager):
         mooncake_session_id: str,
         target_info: "KVArgsRegisterInfo",
     ) -> None:
-        """Fail-loud (once per session) when prefill and decode disagree
-        on layer-pipeline settings that silently disable LP.
-
-        `_room_supports_layer_pipeline` covers the same checks but only
-        in the hot path — and returning False there just falls back to
-        the legacy fan-out without surfacing the misconfiguration.
-        Operators tuning `--disagg-layer-group-size` would never see
-        that their setting is being silently overridden.
-        """
+        """Warn once when handshake settings would silently disable LP."""
         if not self.layer_pipeline_enabled:
-            # Prefill has LP off — nothing to warn about even if decode
-            # has it on; the prefill side is authoritative.
             return
         if not getattr(target_info, "layer_pipeline_enabled", False):
             logger.warning(
@@ -824,20 +751,7 @@ class MooncakeKVManager(CommonKVManager):
         force_flat: bool = False,
         dst_num_main: Optional[int] = None,
     ) -> int:
-        """
-        Generic KV cache transfer supporting both MHA and MLA architectures.
-        This method is used by both send_kvcache (full pool) and maybe_send_extra.
-
-        ``force_flat`` uses the MLA-style flat (single-buffer-per-layer) layout
-        even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
-        index) whose per-layer list must not be half-split into K/V.
-        ``dst_num_main`` is the decode-side advertised main KV layer
-        count (from registration); needed so the KV helpers can slice
-        dst's main and draft regions independently when src has a
-        draft tail (DSA + EAGLE + PP > 1). ``None`` for legacy decode
-        or non-draft deployments — see helper docstrings for the
-        fallback behavior.
-        """
+        """Generic MHA/MLA transfer; `force_flat` keeps K-only state flat."""
         # Group by indices for optimization
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_data_indices, dst_data_indices
@@ -901,14 +815,6 @@ class MooncakeKVManager(CommonKVManager):
             ]
         assert layers_params is not None
 
-        _b1_trace_on = (
-            envs.SGLANG_DISAGG_KV_HASH_VERIFY.get()
-            and not getattr(self, "_kv_hash_rdma_trace_logged", False)
-            and layers_params
-            and len(self.kv_args.kv_data_ptrs) > 0
-            and int(layers_params[-1][0]) == int(self.kv_args.kv_data_ptrs[-1])
-        )
-
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
         ) -> List[Tuple[int, int, int]]:
@@ -954,34 +860,6 @@ class MooncakeKVManager(CommonKVManager):
             # compared to using multiple threads
             ret = process_layers(layers_params)
 
-        if _b1_trace_on:
-            try:
-                self._kv_hash_rdma_trace_logged = True
-                last_src_ptr, last_dst_ptr, last_item_len = layers_params[-1]
-                first_blk = (
-                    set_transfer_blocks(last_src_ptr, last_dst_ptr, last_item_len)[0]
-                    if prefill_kv_blocks and dst_kv_blocks
-                    else (0, 0, 0)
-                )
-                logger.info(
-                    "[KV_HASH_DBG] RDMA_TRACE_ONE_SHOT side=prefill "
-                    "submit_layer_count=%d last_layer_src_ptr=0x%x "
-                    "last_layer_dst_ptr=0x%x item_len=%d "
-                    "first_block_src=0x%x first_block_dst=0x%x first_block_len=%d "
-                    "prefill_first_page=%s decode_first_page=%s rdma_ret=%d",
-                    len(layers_params),
-                    int(last_src_ptr),
-                    int(last_dst_ptr),
-                    int(last_item_len),
-                    int(first_blk[0]),
-                    int(first_blk[1]),
-                    int(first_blk[2]),
-                    int(prefill_kv_blocks[0][0]) if prefill_kv_blocks else -1,
-                    int(dst_kv_blocks[0][0]) if dst_kv_blocks else -1,
-                    int(ret),
-                )
-            except Exception as exc:
-                logger.warning("[KV_HASH_DBG] RDMA_TRACE log failed: %r", exc)
         return ret
 
     def _send_kvcache_layer_group(
@@ -1471,7 +1349,7 @@ class MooncakeKVManager(CommonKVManager):
                 ):
                     continue
                 if len(src_indices) != len(dst_indices_local):
-                    # Position-indexed state cannot be truncated safely.
+                    # Positional state layouts cannot be safely truncated.
                     if st in (StateType.SWA_RING, StateType.C128_STATE) or (
                         st == StateType.DSA
                         and getattr(self, "layer_pipeline_enabled", False)
@@ -1491,42 +1369,11 @@ class MooncakeKVManager(CommonKVManager):
                 transfer_dst_ptrs = dst_data_ptrs
                 transfer_item_lens = src_item_lens
                 if layer_range is not None and st is StateType.DSA:
-                    # Only DSA wires LP state shipping in production today
-                    # (see `_draft_layer_range` + the hook's state dispatch),
-                    # and only DSA's state layout is validated for the
-                    # main-vs-draft PP split that `get_state_ptrs_with_pp`
-                    # performs (one ptr per main KV layer + optional draft
-                    # tail). SWA / SWA_RING state has a different layout
-                    # (e.g. unified-KV ring slots), so keep them on the
-                    # legacy contiguous path until they grow LP coverage
-                    # with their own alignment tests.
-                    #
-                    # Align dst to the prefill PP slice BEFORE the local
-                    # layer_range slice. `layer_range` is in local
-                    # coordinates (the LP hook subtracts
-                    # `prefill_start_layer` before computing the group
-                    # boundaries); without this alignment, a prefill
-                    # PP rank > 0 against a decode full-model dst would
-                    # silently pick dst layers [0, len(src)) instead of
-                    # [prefill_start_layer, prefill_start_layer+len(src)).
-                    #
-                    # `num_main_local` lets the helper detect a draft
-                    # tail in src (`setup_state_kv_args` appends draft
-                    # state ptrs to main) so the helper slices main and
-                    # draft portions independently. For a PP rank with
-                    # `prefill_num_main_kv_layers` < `len(src)`, the
-                    # draft layer is `dst[dst_num_main]`, NOT
-                    # `dst[start_layer + local_main_count]` (which is
-                    # the next stage's main layer in the dst list).
+                    # DSA LP state uses the same local layer_range as main KV;
+                    # align the dst PP slice before applying that range.
                     num_main_local = getattr(
                         self.kv_args, "prefill_num_main_kv_layers", None
                     )
-                    # Decode advertises its own main count on registration
-                    # so the helper can fail loud on cross-side draft
-                    # disagreement (e.g. prefill has draft but decode
-                    # doesn't, or vice versa). ``None`` ⇒ legacy decode
-                    # didn't ship the field — fall back to length-based
-                    # inference inside the helper.
                     dst_num_main = (
                         target_rank_registration_info.dst_num_main_kv_layers
                         if target_rank_registration_info is not None
@@ -1731,11 +1578,7 @@ class MooncakeKVManager(CommonKVManager):
             ]
         )
 
-    # ------------------------------------------------------------------
-    # Per-(room, dst-rank) chunk + aux completion tracking. The helpers
-    # below own all reads/writes of `self.layer_pipeline_progress`
-    # under a single lock.
-    # ------------------------------------------------------------------
+    # Layer-pipeline completion watermark.
 
     def _record_chunk_done(
         self,
@@ -1744,11 +1587,7 @@ class MooncakeKVManager(CommonKVManager):
         required_dst_info_num: int,
         prefill_unique_rank: int,
     ) -> None:
-        """Bump the per-dst chunk counter after a successful KV transfer.
-
-        May trigger Success sync if this completion brings the room over
-        the watermark line.
-        """
+        """Record one KV chunk completion and maybe close the watermark."""
         with self.layer_pipeline_progress_lock:
             prog = self.layer_pipeline_progress.setdefault(
                 room, _RoomLayerPipelineProgress()
@@ -1756,7 +1595,6 @@ class MooncakeKVManager(CommonKVManager):
             prog.required_dst_info_num = required_dst_info_num
             prog.chunks_done_per_dst[dst] = prog.chunks_done_per_dst.get(dst, 0) + 1
             sync = self._maybe_sync_success_locked(room, prog, prefill_unique_rank)
-        # ZMQ notify must happen OUTSIDE the lock.
         if sync is not None:
             self._dispatch_sync_outside_lock(room, prefill_unique_rank, *sync)
 
@@ -1769,22 +1607,16 @@ class MooncakeKVManager(CommonKVManager):
         aux_ret: int,
         prefill_unique_rank: int,
     ) -> None:
-        """Record that aux/state RDMA finished for one (room, dst_rank) pair.
-
-        `aux_ret == 0` = success; non-zero drives final status to Failed
-        once all dst ranks have reported.
-        """
+        """Record aux completion and maybe close the watermark."""
         with self.layer_pipeline_progress_lock:
             prog = self.layer_pipeline_progress.setdefault(
                 room, _RoomLayerPipelineProgress()
             )
             prog.required_dst_info_num = required_dst_info_num
             if total_chunks_in_request is not None:
-                # All dst ranks carry the same total from the sender.
                 prog.total_chunks_expected = total_chunks_in_request
             prog.aux_results_per_dst[dst] = aux_ret
             sync = self._maybe_sync_success_locked(room, prog, prefill_unique_rank)
-        # ZMQ notify must happen OUTSIDE the lock.
         if sync is not None:
             self._dispatch_sync_outside_lock(room, prefill_unique_rank, *sync)
 
@@ -1794,14 +1626,7 @@ class MooncakeKVManager(CommonKVManager):
         prog: _RoomLayerPipelineProgress,
         prefill_unique_rank: int,
     ) -> Optional[Tuple[int, List[Tuple[str, int]]]]:
-        """Decide whether the watermark is satisfied; return the snapshot the
-        caller should dispatch OUTSIDE the lock, or `None` if no sync fires.
-
-        MUST be called with `layer_pipeline_progress_lock` held. Idempotent
-        via `prog.success_synced` — at most one non-None snapshot per room.
-        The actual ZMQ notify must run outside the lock so a blocked decode
-        endpoint cannot stall progress on other rooms.
-        """
+        """Return final status/endpoints when the locked watermark closes."""
         if prog.success_synced:
             return None
         if (
@@ -1811,7 +1636,6 @@ class MooncakeKVManager(CommonKVManager):
             return None
         if len(prog.aux_results_per_dst) < prog.required_dst_info_num:
             return None
-        # All required dst ranks have aux'd. Verify chunk counts too.
         for dst, _aux_ret in prog.aux_results_per_dst.items():
             if (
                 prog.chunks_done_per_dst.get(dst, 0)
@@ -1821,7 +1645,6 @@ class MooncakeKVManager(CommonKVManager):
         any_aux_failed = any(r != 0 for r in prog.aux_results_per_dst.values())
         final_status = KVPoll.Failed if any_aux_failed else KVPoll.Success
         prog.success_synced = True
-        # Snapshot endpoints inside the lock; caller dispatches outside.
         return final_status, list(prog.aux_results_per_dst.keys())
 
     def _dispatch_sync_outside_lock(
@@ -1831,16 +1654,7 @@ class MooncakeKVManager(CommonKVManager):
         final_status: int,
         endpoints: List[Tuple[str, int]],
     ) -> None:
-        """Apply final status + notify all decode endpoints.
-
-        MUST be called with `layer_pipeline_progress_lock` NOT held.
-        `endpoints` is already a snapshot taken under the lock.
-        """
-        if envs.SGLANG_DISAGG_KV_HASH_VERIFY.get():
-            if final_status == KVPoll.Success:
-                self._kv_hash_emit_prefill(room)
-            else:
-                self._kv_hash_drop(room)
+        """Notify decode endpoints outside `layer_pipeline_progress_lock`."""
         self.update_status(room, final_status)
         for endpoint, dst_port in endpoints:
             self.sync_status_to_decode_endpoint(
@@ -1853,23 +1667,14 @@ class MooncakeKVManager(CommonKVManager):
         self._clear_layer_pipeline_progress(room)
 
     def _clear_layer_pipeline_progress(self, room: int) -> None:
-        """Drop a room's watermark state. Safe to call on rooms that never
-        registered any progress (no-op). Also a no-op when LP is disabled
-        and the watermark dict was never allocated.
-        """
+        """Drop a room's LP watermark state if it exists."""
         progress = getattr(self, "layer_pipeline_progress", None)
         if progress is not None:
             with self.layer_pipeline_progress_lock:
                 progress.pop(room, None)
-        if envs.SGLANG_DISAGG_KV_HASH_VERIFY.get():
-            self._kv_hash_drop(room)
 
     def _record_layer_group_metric(self, enqueue_ns: int) -> None:
-        """Record one successful LP-chunk RDMA completion for metrics.
-
-        Non-LP chunks carry `enqueue_ns=0` and are silently skipped.
-        Protected by `_lp_metrics_lock` to serialize with snapshot+reset.
-        """
+        """Record one successful LP chunk for periodic metrics."""
         if enqueue_ns <= 0:
             return
         metrics_lock = getattr(self, "_lp_metrics_lock", None)
@@ -1882,401 +1687,8 @@ class MooncakeKVManager(CommonKVManager):
             if len(self._lp_chunk_ms_samples) < self._LP_SAMPLE_BUFFER_CAP:
                 self._lp_chunk_ms_samples.append(elapsed_ms)
 
-    def _log_lp_kv_byte_hash(self, kv_chunk: "TransferKVChunk") -> None:
-        """Env-gated CRC32 fingerprint of sample bytes per layer.
-
-        Called after `event.synchronize()` and before mooncake RDMA submit,
-        only when `SGLANG_DISAGG_LAYER_PIPELINE_HASH_LOG=1`. MLA only.
-        NEVER enable in production — D2H memcpy breaks zero-copy.
-        """
-        try:
-            import ctypes
-            import zlib
-
-            if not self.is_mla_backend or kv_chunk.layer_range is None:
-                return
-            cudart = self._get_cudart_lib()
-            if cudart is None:
-                return
-            layer_start, layer_end = kv_chunk.layer_range
-            src_kv_ptrs, _, layers_pp = self.get_mla_kv_ptrs_with_pp(
-                self.kv_args.kv_data_ptrs, []
-            )
-            item_lens = self.kv_args.kv_item_lens
-            page_indices = kv_chunk.prefill_kv_indices
-            if len(page_indices) == 0 or layer_end > layers_pp:
-                return
-            # Sample 3 pages each from FRONT + MIDDLE + BACK (deduped).
-            n = len(page_indices)
-            sample_idx = sorted(set([
-                0,
-                min(1, n - 1),
-                min(2, n - 1),
-                n // 2,
-                min(n // 2 + 1, n - 1),
-                min(n // 2 + 2, n - 1),
-                n - 3 if n >= 3 else 0,
-                n - 2 if n >= 2 else 0,
-                n - 1,
-            ]))
-            sampled_pages = [int(page_indices[i]) for i in sample_idx]
-            sample_bytes = 32
-            per_layer = []
-            for layer_id in range(layer_start, layer_end):
-                if layer_id >= len(src_kv_ptrs) or layer_id >= len(item_lens):
-                    continue
-                src_ptr = int(src_kv_ptrs[layer_id])
-                item_len = int(item_lens[layer_id])
-                if item_len <= 0:
-                    continue
-                page_hashes = []
-                for pidx in sampled_pages:
-                    addr = src_ptr + int(pidx) * item_len
-                    buf = (ctypes.c_uint8 * sample_bytes)()
-                    err = cudart.cudaMemcpy(
-                        ctypes.cast(buf, ctypes.c_void_p),
-                        ctypes.c_void_p(addr),
-                        ctypes.c_size_t(sample_bytes),
-                        ctypes.c_int(2),  # cudaMemcpyDeviceToHost
-                    )
-                    if err != 0:
-                        page_hashes.append(f"err{err}")
-                    else:
-                        page_hashes.append(f"{zlib.crc32(bytes(buf)):08x}")
-                per_layer.append(f"L{layer_id}:[{','.join(page_hashes)}]")
-            logger.info(
-                "[LP_HASH] room=%s layer_range=(%s,%s) pages_sample=%s "
-                "sample_bytes=%d hashes=%s",
-                kv_chunk.room,
-                layer_start,
-                layer_end,
-                sampled_pages,
-                sample_bytes,
-                " ".join(per_layer),
-            )
-        except Exception as exc:
-            logger.warning("[LP_HASH] failed: %r", exc)
-
-    # ------------------------------------------------------------------
-    # KV_HASH_VERIFY (SGLANG_DISAGG_KV_HASH_VERIFY): per-request CRC32
-    # sampling for offline prefill-vs-decode diff. MLA only.
-    # ------------------------------------------------------------------
-
-    _KV_HASH_SAMPLE_BYTES = 32
-
-    @staticmethod
-    def _kv_hash_sample_indices(n: int) -> List[int]:
-        if n <= 0:
-            return []
-        cand = [
-            0,
-            min(1, n - 1),
-            min(2, n - 1),
-            n // 2,
-            min(n // 2 + 1, n - 1),
-            min(n // 2 + 2, n - 1),
-            n - 3 if n >= 3 else 0,
-            n - 2 if n >= 2 else 0,
-            n - 1,
-        ]
-        return sorted(set(cand))
-
-    def _kv_hash_record_prefill_chunk(
-        self,
-        room: int,
-        prefill_kv_indices,
-        layer_range: Optional[Tuple[int, int]] = None,
-    ) -> None:
-        """Accumulate per-room src page_indices for prefill-side hash.
-
-        Same chunk arrives once per dst-session; dedup on tobytes so each
-        chunk's pages count exactly once. `layer_range` is appended on
-        every call (outside the dedup) so single-chunk LP with multiple
-        layer-groups still reports every group fire.
-        """
-        try:
-            if prefill_kv_indices is None or len(prefill_kv_indices) == 0:
-                return
-            key = bytes(prefill_kv_indices.tobytes())
-            with self._kv_hash_lock:
-                if layer_range is not None:
-                    self._kv_hash_prefill_layer_ranges.setdefault(
-                        room, []
-                    ).append(tuple(layer_range))
-                seen = self._kv_hash_prefill_seen.setdefault(room, set())
-                if key in seen:
-                    return
-                seen.add(key)
-                self._kv_hash_prefill_chunks.setdefault(room, []).append(
-                    prefill_kv_indices
-                )
-        except Exception as exc:
-            logger.warning("[KV_HASH_REQ] prefill record failed: %r", exc)
-
-    def _kv_hash_emit_prefill(self, room: int) -> None:
-        """Pop accumulated chunks and emit the per-room prefill hash line.
-
-        Called only when the watermark closes to Success.
-        """
-        try:
-            import numpy as _np
-
-            with self._kv_hash_lock:
-                chunks = self._kv_hash_prefill_chunks.pop(room, None)
-                self._kv_hash_prefill_seen.pop(room, None)
-                layer_ranges = self._kv_hash_prefill_layer_ranges.pop(room, None)
-            if not chunks:
-                return
-            full_indices = _np.concatenate(chunks)
-            if layer_ranges:
-                logger.info(
-                    "[KV_HASH_DBG] side=prefill rank=%d room=%s "
-                    "layer_ranges_seen=%s",
-                    getattr(self.kv_args, "engine_rank", -1),
-                    room,
-                    layer_ranges,
-                )
-            self._log_kv_hash_req("prefill", room, full_indices)
-        except Exception as exc:
-            logger.warning("[KV_HASH_REQ] prefill emit failed: %r", exc)
-
-    def _kv_hash_drop(self, room: int) -> None:
-        """Drop prefill-side hash accumulator for a room (failure / cleanup)."""
-        with self._kv_hash_lock:
-            self._kv_hash_prefill_chunks.pop(room, None)
-            self._kv_hash_prefill_seen.pop(room, None)
-            self._kv_hash_prefill_layer_ranges.pop(room, None)
-
-    def _kv_hash_save_decode_indices(self, room: int, kv_indices) -> None:
-        """Stash dst page indices for decode-side hash emit on Success poll."""
-        try:
-            if kv_indices is None or len(kv_indices) == 0:
-                return
-            with self._kv_hash_lock:
-                # First non-dummy registration wins; all bootstrap infos for
-                # a single send_metadata call carry the SAME dst indices.
-                if room in self._kv_hash_decode_indices:
-                    return
-                self._kv_hash_decode_indices[room] = kv_indices
-        except Exception as exc:
-            logger.warning("[KV_HASH_REQ] decode save failed: %r", exc)
-
-    def _kv_hash_emit_decode_once(self, room: int) -> None:
-        """Emit decode-side hash once per room. Idempotent via `_emitted` set."""
-        try:
-            with self._kv_hash_lock:
-                if room in self._kv_hash_decode_emitted:
-                    return
-                indices = self._kv_hash_decode_indices.pop(room, None)
-                if indices is None:
-                    return
-                self._kv_hash_decode_emitted.add(room)
-            self._log_kv_hash_req("decode", room, indices)
-        except Exception as exc:
-            logger.warning("[KV_HASH_REQ] decode emit failed: %r", exc)
-
-    def _kv_hash_clear_decode(self, room: int) -> None:
-        """Drop decode-side hash state on receiver clear()."""
-        with self._kv_hash_lock:
-            self._kv_hash_decode_indices.pop(room, None)
-            self._kv_hash_decode_emitted.discard(room)
-
-    def _log_kv_hash_req(self, side: str, room: int, page_indices) -> None:
-        """Sample CRC32 of 32 bytes at 9 positions in `page_indices` for
-        every layer in this PP-stage's `kv_data_ptrs`, log one line.
-
-        MLA backend only; MHA double-pointer layout not implemented.
-        """
-        try:
-            import ctypes
-            import zlib
-
-            if not self.is_mla_backend:
-                logger.info(
-                    "[KV_HASH_REQ] side=%s room=%s skipped (non-MLA backend)",
-                    side, room,
-                )
-                return
-            cudart = self._get_cudart_lib()
-            if cudart is None:
-                return
-            n = len(page_indices)
-            sample_idx = self._kv_hash_sample_indices(n)
-            if not sample_idx:
-                return
-            sampled_pages = [int(page_indices[i]) for i in sample_idx]
-            kv_ptrs = self.kv_args.kv_data_ptrs
-            kv_data_lens = getattr(self.kv_args, "kv_data_lens", []) or []
-            item_lens = self.kv_args.kv_item_lens
-            num_layers = len(kv_ptrs)
-            sample_bytes = self._KV_HASH_SAMPLE_BYTES
-            rank = getattr(self.kv_args, "engine_rank", -1)
-            log_layout = False
-            with self._kv_hash_lock:
-                if side == "prefill" and not self._kv_hash_layout_logged_prefill:
-                    self._kv_hash_layout_logged_prefill = True
-                    log_layout = True
-                elif side == "decode" and not self._kv_hash_layout_logged_decode:
-                    self._kv_hash_layout_logged_decode = True
-                    log_layout = True
-            if log_layout:
-                layout_summary = []
-                for L in range(num_layers):
-                    p = int(kv_ptrs[L]) if L < len(kv_ptrs) else 0
-                    dlen = int(kv_data_lens[L]) if L < len(kv_data_lens) else 0
-                    ilen = int(item_lens[L]) if L < len(item_lens) else 0
-                    max_pages = dlen // ilen if ilen > 0 else 0
-                    layout_summary.append(
-                        f"L{L}:(ptr=0x{p:x},data_len={dlen},item_len={ilen},"
-                        f"max_pages={max_pages})"
-                    )
-                logger.info(
-                    "[KV_HASH_DBG] side=%s rank=%d ONE_SHOT_LAYOUT "
-                    "num_kv_layers=%d layers=%s",
-                    side, rank, num_layers, " ".join(layout_summary),
-                )
-            per_layer = []
-            for layer_id in range(num_layers):
-                if layer_id >= len(item_lens):
-                    continue
-                src_ptr = int(kv_ptrs[layer_id])
-                item_len = int(item_lens[layer_id])
-                if item_len <= 0:
-                    continue
-                page_hashes = []
-                for pidx in sampled_pages:
-                    addr = src_ptr + int(pidx) * item_len
-                    buf = (ctypes.c_uint8 * sample_bytes)()
-                    err = cudart.cudaMemcpy(
-                        ctypes.cast(buf, ctypes.c_void_p),
-                        ctypes.c_void_p(addr),
-                        ctypes.c_size_t(sample_bytes),
-                        ctypes.c_int(2),  # cudaMemcpyDeviceToHost
-                    )
-                    if err != 0:
-                        page_hashes.append(f"err{err}")
-                    else:
-                        page_hashes.append(f"{zlib.crc32(bytes(buf)):08x}")
-                per_layer.append(f"L{layer_id}:[{','.join(page_hashes)}]")
-            logger.info(
-                "[KV_HASH_REQ] side=%s rank=%d room=%s num_pages=%d "
-                "num_layers=%d sample_idx=%s sample_pages=%s sample_bytes=%d "
-                "hashes=%s",
-                side,
-                rank,
-                room,
-                n,
-                num_layers,
-                sample_idx,
-                sampled_pages,
-                sample_bytes,
-                " ".join(per_layer),
-            )
-            # DSA indexer-state fingerprint. state_types/state_data_ptrs/
-            # state_item_lens are per-component lists (setup_state_kv_args);
-            # DSA is one component whose inner list is one ptr per indexer
-            # layer. DSA state shares page numbering with main KV, so
-            # sampled_pages index the indexer buffer directly.
-            state_types = getattr(self.kv_args, "state_types", []) or []
-            state_ptrs_all = getattr(self.kv_args, "state_data_ptrs", []) or []
-            state_item_lens_all = (
-                getattr(self.kv_args, "state_item_lens", []) or []
-            )
-            dsa_comp = None
-            for comp_idx, st in enumerate(state_types):
-                # StateType is a str-enum; compare by value so both the enum
-                # and a plain "dsa" string match.
-                if str(getattr(st, "value", st)) == "dsa":
-                    dsa_comp = comp_idx
-                    break
-            if (
-                dsa_comp is not None
-                and dsa_comp < len(state_ptrs_all)
-                and dsa_comp < len(state_item_lens_all)
-            ):
-                sptrs = state_ptrs_all[dsa_comp] or []
-                sitem_lens = state_item_lens_all[dsa_comp] or []
-                per_layer_state = []
-                num_state_layers = len(sptrs)
-                for layer_id in range(num_state_layers):
-                    if layer_id >= len(sitem_lens):
-                        continue
-                    sptr = int(sptrs[layer_id])
-                    sitem_len = int(sitem_lens[layer_id])
-                    if sitem_len <= 0:
-                        continue
-                    page_hashes = []
-                    for pidx in sampled_pages:
-                        addr = sptr + int(pidx) * sitem_len
-                        sbuf = (ctypes.c_uint8 * sample_bytes)()
-                        err = cudart.cudaMemcpy(
-                            ctypes.cast(sbuf, ctypes.c_void_p),
-                            ctypes.c_void_p(addr),
-                            ctypes.c_size_t(sample_bytes),
-                            ctypes.c_int(2),  # cudaMemcpyDeviceToHost
-                        )
-                        if err != 0:
-                            page_hashes.append(f"err{err}")
-                        else:
-                            page_hashes.append(
-                                f"{zlib.crc32(bytes(sbuf)):08x}"
-                            )
-                    per_layer_state.append(
-                        f"L{layer_id}:[{','.join(page_hashes)}]"
-                    )
-                logger.info(
-                    "[STATE_HASH_REQ] side=%s rank=%d room=%s "
-                    "num_pages=%d num_state_layers=%d sample_idx=%s "
-                    "sample_pages=%s sample_bytes=%d hashes=%s",
-                    side,
-                    rank,
-                    room,
-                    n,
-                    num_state_layers,
-                    sample_idx,
-                    sampled_pages,
-                    sample_bytes,
-                    " ".join(per_layer_state),
-                )
-        except Exception as exc:
-            logger.warning("[KV_HASH_REQ] %s emit failed: %r", side, exc)
-
-    _cudart_lib = None
-    _cudart_lib_init = False
-
-    @classmethod
-    def _get_cudart_lib(cls):
-        """Load libcudart via ctypes (torch.cuda.cudart() doesn't expose
-        cudaMemcpy). Cached after first successful load. Returns None on
-        platforms without libcudart — hash logging silently skipped.
-        """
-        if cls._cudart_lib_init:
-            return cls._cudart_lib
-        cls._cudart_lib_init = True
-        try:
-            import ctypes.util
-
-            name = ctypes.util.find_library("cudart") or "libcudart.so"
-            lib = ctypes.CDLL(name)
-            lib.cudaMemcpy.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_size_t,
-                ctypes.c_int,
-            ]
-            lib.cudaMemcpy.restype = ctypes.c_int
-            cls._cudart_lib = lib
-        except Exception as exc:
-            logger.warning("[LP_HASH] libcudart load failed: %r", exc)
-            cls._cudart_lib = None
-        return cls._cudart_lib
-
     def pop_layer_pipeline_metrics(self) -> Tuple[int, List[float]]:
-        """Snapshot+reset periodic LP metrics for the scheduler's stats loop.
-
-        Lifetime total `_lp_chunks_total` is preserved across calls.
-        Returns `(chunk_delta, samples_ms)`.
-        """
+        """Snapshot and reset periodic LP metrics."""
         metrics_lock = getattr(self, "_lp_metrics_lock", None)
         if metrics_lock is None:
             return 0, []
@@ -2291,30 +1703,15 @@ class MooncakeKVManager(CommonKVManager):
         self,
         dispatch: List["_LayerPipelineRequestDispatch"],
     ) -> Callable[[int, "ForwardBatch"], None]:
-        """Build the per-batch forward hook the scheduler attaches to
-        `ForwardBatch.layer_pipeline_hook`.
-
-        Fires from `RadixAttention.forward` once per layer; only does work
-        on layer-group boundaries (or the last main layer), at which point
-        it records a CUDA event on the compute stream and enqueues one
-        `TransferKVChunk` per dispatch entry. The trailing aux/state chunk
-        is still owned by `MooncakeKVSender.send`.
-        """
+        """Build the per-batch hook that enqueues LP layer-group chunks."""
         group_size = self.layer_group_size
         if group_size <= 0:
-            # Misconfigured group_size; degrade safely to legacy path.
             return lambda layer_id, _fb: None
-        # Dummy CP rank: sender.send early-returns, so hook fires would
-        # advance the chunk counter without a finalizer and deadlock the
-        # receiver-side watermark.
         if getattr(self, "is_dummy_cp_rank", False):
             return lambda layer_id, _fb: None
         import torch as _torch
 
         num_layers = self.local_num_kv_layers()
-        # Hard-fail when group_size exceeds this PP stage's layer count:
-        # split_layer_groups would collapse to a single group and silently
-        # offer zero overlap.
         if group_size > num_layers:
             raise ValueError(
                 f"--disagg-layer-group-size={group_size} exceeds the "
@@ -2325,28 +1722,16 @@ class MooncakeKVManager(CommonKVManager):
                 f"total_kv_layers / pp_size, NOT the global model's "
                 f"layer count."
             )
-        # When a draft (MTP/EAGLE NEXTN) model is loaded, its KV pool ptrs
-        # are appended to the main pool's ptrs. The main model's forward
-        # only iterates main layers, so pin `last_layer_idx` to the LAST
-        # MAIN layer; the draft KV ships via `send_draft_kv` after the
-        # draft forward completes.
         num_main_kv_layers = getattr(
             self.kv_args, "prefill_num_main_kv_layers", None
         )
         if num_main_kv_layers is None or num_main_kv_layers > num_layers:
-            num_main_kv_layers = num_layers  # safe default: no draft
+            num_main_kv_layers = num_layers
         last_layer_idx = num_main_kv_layers - 1
-        # Snapshot the PP-stage offset into closure scope so the hook can
-        # convert global `RadixAttention.layer_id` to the local index used
-        # by `kv_data_ptrs`.
         prefill_start_layer = self.kv_args.prefill_start_layer
-        # Ceil division so non-multiple num_main_kv_layers reports the
-        # correct count (e.g. 10/4 = 3 groups).
-        total_layer_groups = (
-            num_main_kv_layers + group_size - 1
-        ) // group_size
+        layer_groups = split_layer_groups(num_main_kv_layers, group_size)
+        total_layer_groups = len(layer_groups)
         if not getattr(self, "_lp_layer_geom_logged", False):
-            _groups_dbg = split_layer_groups(num_main_kv_layers, group_size)
             logger.info(
                 "[layer-pipeline GEOM] num_kv_layers=%d "
                 "num_main_kv_layers=%d num_draft_kv_layers=%d "
@@ -2357,19 +1742,12 @@ class MooncakeKVManager(CommonKVManager):
                 num_layers - num_main_kv_layers,
                 group_size, total_layer_groups,
                 prefill_start_layer,
-                _groups_dbg[-1] if _groups_dbg else None,
-                _groups_dbg,
+                layer_groups[-1] if layer_groups else None,
+                layer_groups,
             )
             self._lp_layer_geom_logged = True
 
-        # Snapshot CP layer-shard ownership state into closure scope so
-        # each fire pays only a local-int branch. In layer-shard mode
-        # each CP rank owns layer groups whose id mod attn_cp_size
-        # equals attn_cp_rank; non-owner fires skip both enqueue and
-        # the sender counter bump (so empty-owner ranks reach send()
-        # with _hook_enqueued_chunks=0 and take the empty-finalizer path).
-        # Defensive `getattr` so callers that mock the manager surface
-        # (older unit tests) keep working — missing helper ⇒ shard off.
+        # Snapshot CP layer-shard ownership into the hook closure.
         use_layer_cp_shard = getattr(
             self, "use_layer_cp_shard_for_transfer", lambda: False
         )()
@@ -2380,8 +1758,6 @@ class MooncakeKVManager(CommonKVManager):
             getattr(self, "attn_cp_rank", 0) if use_layer_cp_shard else 0
         )
 
-        # Snapshot diagnostic env-vars into closure scope so each fire
-        # pays only a local-bool branch (not os.environ.get).
         instrumentation_timing = envs.SGLANG_DISAGG_LAYER_PIPELINE_HOOK_TIMING.get()
         instrumentation_noop = envs.SGLANG_DISAGG_LAYER_PIPELINE_HOOK_NOOP.get()
         if (instrumentation_timing or instrumentation_noop) and not getattr(
@@ -2396,33 +1772,20 @@ class MooncakeKVManager(CommonKVManager):
             self._hook_instrumentation_logged_init = True
 
         def _hook(layer_id: int, _fb: "ForwardBatch") -> None:
-            # `RadixAttention.forward` is shared with decode and draft
-            # forwards; bail on non-extend batches as a safety net.
             if not _fb.forward_mode.is_extend():
                 return
-            # `RadixAttention.layer_id` is global; subtract the PP stage
-            # offset to get the local index into `kv_data_ptrs`.
             local_id = layer_id - prefill_start_layer
-            # Drop fires from PP foreign layers and from draft slots: the
-            # draft pool's trailing ptrs are never iterated by main
-            # RadixAttention.
             if local_id < 0 or local_id >= num_main_kv_layers:
                 return
             is_group_boundary = (local_id + 1) % group_size == 0
-            is_last = local_id == last_layer_idx  # = num_main_kv_layers - 1
+            is_last = local_id == last_layer_idx
             if not is_group_boundary and not is_last:
                 return
             layer_end = local_id + 1
             if is_last and not is_group_boundary:
-                # Final main partial group (num_main_kv_layers % group_size
-                # != 0). Use the canonical splitter so layer_start lines
-                # up with prior boundaries.
-                groups = split_layer_groups(num_main_kv_layers, group_size)
-                layer_start, _ = groups[-1]
+                layer_start, _ = layer_groups[-1]
             else:
                 layer_start = layer_end - group_size
-            # Env-gated KV visibility reconfirm: forces an all-streams
-            # barrier at the hook site. NEVER set in production.
             if envs.SGLANG_DISAGG_LAYER_PIPELINE_VERIFY_KV.get():
                 _torch.cuda.synchronize()
                 logger.info(
@@ -2437,11 +1800,6 @@ class MooncakeKVManager(CommonKVManager):
             if ev is not None:
                 ev.record()
             layer_group_id = local_id // group_size
-            # Layer-shard CP ownership: only the owner CP rank enqueues
-            # this group's KV (+ matching NSA state). Non-owner ranks skip
-            # both add_transfer_request AND the per-sender chunk counter
-            # bump so sender.send's `_chunks_sent = hook_enqueued + 1`
-            # accounting stays per-rank correct.
             if (
                 cp_size_for_shard > 1
                 and layer_group_id % cp_size_for_shard != cp_rank_for_shard
@@ -2456,20 +1814,15 @@ class MooncakeKVManager(CommonKVManager):
                         bootstrap_room=entry.room,
                         kv_indices=entry.page_indices,
                         index_slice=entry.index_slice,
-                        is_last_chunk=False,            # KV-only — aux via sender.send
+                        is_last_chunk=False,
                         aux_index=None,
-                        # Per-LP state indices for NSA hybrid models;
-                        # None for non-NSA or scheduler opt-out.
                         state_indices=entry.state_indices,
                         layer_group_id=layer_group_id,
                         layer_range=(layer_start, layer_end),
                         total_layer_groups=total_layer_groups,
-                        total_chunks_in_request=None,   # set on aux chunk only
+                        total_chunks_in_request=None,
                         transfer_event=ev,
                     )
-                # Sender owns the running count so its trailing aux chunk
-                # can declare `total_chunks_in_request` correctly. MUST
-                # advance even in NOOP mode so the fail-loud check passes.
                 entry.sender._hook_enqueued_chunks += 1
             if instrumentation_timing:
                 elapsed_ns = time.perf_counter_ns() - t_start_ns
@@ -2517,17 +1870,7 @@ class MooncakeKVManager(CommonKVManager):
             ]
         ],
     ) -> Optional[Callable[[int, "ForwardBatch"], None]]:
-        """Scheduler entry point: filter senders for layer-pipeline
-        eligibility, mark them, and build the hook closure.
-
-        Each tuple is `(sender, page_indices, index_slice, state_indices)`
-        for one request. `state_indices` is None when state ships one-shot
-        via the aux finalizer. Three-tuples (no `state_indices`) are also
-        accepted for back-compat.
-
-        Returns `None` when no req qualifies — caller must NOT install a
-        hook in that case.
-        """
+        """Filter eligible senders and build the batch LP hook."""
         if not self.layer_pipeline_enabled or self.is_dummy_cp_rank:
             return None
         dispatches: List[_LayerPipelineRequestDispatch] = []
@@ -2538,32 +1881,14 @@ class MooncakeKVManager(CommonKVManager):
             else:
                 sender, page_indices, index_slice, state_indices = tup
             if len(page_indices) == 0:
-                # Already filtered upstream, but keep the guard so a
-                # future caller that forgets it cannot wedge the watermark.
                 continue
             layer_groups = sender._layer_groups_for_send()
             if len(layer_groups) == 1 and layer_groups[0] is None:
-                # Keep scheduler hook eligibility exactly aligned with
-                # sender.send's legacy fallback gate. This covers short
-                # requests below min_prefill_len, staging fallback, room
-                # capability mismatches, and group_size <= 0.
                 continue
-            # Contract with `MooncakeKVSender.send`: this flag means the
-            # next `send()` for this room MUST take the aux-only path
-            # and will fail loudly if no hook fire bumped the counter.
             sender._hook_handled_in_current_send = True
-            # Tells the aux finalizer to skip state (already shipped per
-            # layer-group by the hook), avoiding a double-send.
             sender._hook_handles_state = state_indices is not None
             if state_indices is not None:
-                # Latch the persistent variant so the empty-last-chunk
-                # aux-only fallback (in send()) knows state was hook-shipped
-                # in some prior round even after the per-send flag is cleared.
                 sender._hook_handles_state_persistent = True
-            # Layer-shard: relax send()'s "hook fired but counter didn't move"
-            # guard only for a rank that owns ZERO main groups this request.
-            # Ranks that own groups keep the strict guard (an unmoved counter
-            # there is a real missed-hook bug, maskable by a draft-chunk bump).
             sender._hook_layer_shard_active = getattr(
                 self, "rank_owns_no_main_groups_for_transfer", lambda: False
             )()
@@ -2620,11 +1945,7 @@ class MooncakeKVManager(CommonKVManager):
                         )
                     continue
 
-                # If the forward hook recorded an event after the layer
-                # group's KV write, block this worker until the GPU has
-                # committed those bytes. `event.synchronize()` is the
-                # right barrier because mooncake's RDMA call is CPU-side
-                # — `event.wait(stream=...)` would not gate it.
+                # Mooncake RDMA is CPU-side, so wait on the recorded CUDA event.
                 if kv_chunk.transfer_event is not None:
                     try:
                         kv_chunk.transfer_event.synchronize()
@@ -2650,13 +1971,7 @@ class MooncakeKVManager(CommonKVManager):
                                 thread_finish_flag=True,
                             )
                         continue
-                # Env-gated KV byte-hash sample logging, after GPU sync and
-                # before RDMA submit. LP KV chunks only.
-                if envs.SGLANG_DISAGG_LAYER_PIPELINE_HASH_LOG.get():
-                    self._log_lp_kv_byte_hash(kv_chunk)
-                # Aux-only finalizer: hook already enqueued every
-                # layer-group KV chunk; sender.send queues a single
-                # trailing aux/state chunk. Skip the KV-send paths.
+                # Hook already enqueued KV; this chunk only closes aux/state.
                 is_aux_only_chunk = (
                     kv_chunk.layer_range is None
                     and len(kv_chunk.prefill_kv_indices) == 0
@@ -2673,19 +1988,12 @@ class MooncakeKVManager(CommonKVManager):
                     if kv_chunk.room in self.transfer_infos
                     else []
                 )
-                # Unique id per prefill sender so decode's response set size matches expected_response_num.
                 prefill_unique_rank = (
                     self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
                     + self.pp_rank * self.attn_cp_size
                     + self.attn_cp_rank
                 )
-                # When staging transfer is not yet ready (watermark/allocation pending),
-                # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
-                # LP-off restores the pre-LP completion path: per-chunk
-                # success accumulated locally and synced once every dst
-                # rank has received KV + aux, with no watermark dict.
-                # The LP watermark helpers run only when LP is enabled.
                 use_lp_completion = self.layer_pipeline_enabled
                 polls: List[bool] = []
                 dst_ranks_infos: List[Tuple[str, int, int]] = []
@@ -2707,17 +2015,12 @@ class MooncakeKVManager(CommonKVManager):
                                     KVPoll.Failed,
                                     prefill_unique_rank,
                                 )
-                                # Drop watermark state so a stale
-                                # `success_synced=False` entry cannot
-                                # resurrect a Success notification on
-                                # later chunks for the same room.
                                 self._clear_layer_pipeline_progress(kv_chunk.room)
                                 break
 
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
 
-                        # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
-                        # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
+                        # Temporary guard for page-size > 1 index mismatches.
                         if len(chunked_dst_kv_indice) < len(
                             kv_chunk.prefill_kv_indices
                         ):
@@ -2732,10 +2035,6 @@ class MooncakeKVManager(CommonKVManager):
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
                         if is_aux_only_chunk:
-                            # Hook owns all KV bytes; pretend KV send
-                            # succeeded so the chunk-count watermark
-                            # advances (aux-only is the (N+1)-th chunk
-                            # accounted for by the sender's total).
                             ret = 0
                         elif self.is_mla_backend or (
                             self.attn_tp_size
@@ -2767,7 +2066,6 @@ class MooncakeKVManager(CommonKVManager):
                             )
                             if deferred:
                                 staging_deferred = True
-                                # Chunk re-enqueued; stop processing remaining reqs for this chunk
                                 break
                         else:
                             ret = self.send_kvcache_slice(
@@ -2783,9 +2081,7 @@ class MooncakeKVManager(CommonKVManager):
                                 dst_num_main=target_rank_registration_info.dst_num_main_kv_layers,
                             )
 
-                        # Per-LP-chunk state pipeline: when the hook
-                        # dispatched state alongside KV, ship the state
-                        # slice right after KV using the same layer_range.
+                        # Hook-dispatched LP state follows the matching KV slice.
                         if (
                             ret == 0
                             and kv_chunk.layer_range is not None
@@ -2797,16 +2093,11 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                                 target_rank_registration_info,
                                 layer_range=kv_chunk.layer_range,
-                                # NSA state shares page numbering with KV,
-                                # so the same slice that indexes
-                                # `dst_kv_indices` indexes the matching
-                                # `dst_state_indices` slice.
                                 dst_state_index_slice=kv_chunk.index_slice,
                             )
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
                                 if self.session_failures[req.mooncake_session_id] >= 1:
                                     self.failed_sessions.add(req.mooncake_session_id)
                                     logger.error(
@@ -2828,9 +2119,6 @@ class MooncakeKVManager(CommonKVManager):
                             self._clear_layer_pipeline_progress(kv_chunk.room)
                             break
 
-                        # Chunk RDMA succeeded for this dst rank; may
-                        # trigger Success sync if this completion crosses
-                        # the watermark (LP-only; legacy finalizes below).
                         if use_lp_completion:
                             self._record_chunk_done(
                                 kv_chunk.room,
@@ -2838,14 +2126,6 @@ class MooncakeKVManager(CommonKVManager):
                                 req.required_dst_info_num,
                                 prefill_unique_rank,
                             )
-                            if envs.SGLANG_DISAGG_KV_HASH_VERIFY.get():
-                                self._kv_hash_record_prefill_chunk(
-                                    kv_chunk.room,
-                                    kv_chunk.prefill_kv_indices,
-                                    kv_chunk.layer_range,
-                                )
-                            # Only LP chunks contribute (legacy / aux-only
-                            # carry enqueue_ns=0, filtered inside the helper).
                             self._record_layer_group_metric(kv_chunk.enqueue_ns)
 
                         if kv_chunk.is_last_chunk:
@@ -2857,13 +2137,7 @@ class MooncakeKVManager(CommonKVManager):
                                     target_rank_registration_info,
                                 )
 
-                            # Only the last chunk we need to send the aux data
-                            # Layer-shard CP optimization: aux content is
-                            # identical across CP ranks (per-request, not
-                            # per-page) and CP0 is the single writer.
-                            # Non-CP0 ranks still call `_record_aux_sent`
-                            # so their per-rank watermark closes, but skip
-                            # send_aux to avoid N-fold metadata writes.
+                            # In layer-shard CP mode, only CP0 writes aux bytes.
                             if kv_chunk.skip_aux_rdma:
                                 aux_ret = 0
                             else:
@@ -2873,10 +2147,6 @@ class MooncakeKVManager(CommonKVManager):
                                     target_rank_registration_info.dst_aux_ptrs,
                                 )
                             if use_lp_completion:
-                                # `_record_aux_sent` emits Success/Failed
-                                # sync once every dst rank's aux is in AND
-                                # its chunk count reaches
-                                # `total_chunks_in_request`.
                                 self._record_aux_sent(
                                     kv_chunk.room,
                                     (req.endpoint, req.dst_port),
@@ -2886,9 +2156,6 @@ class MooncakeKVManager(CommonKVManager):
                                     prefill_unique_rank,
                                 )
                             else:
-                                # Legacy path: a single full-layer chunk per
-                                # request, so finalize once all dst ranks have
-                                # reported — identical to the pre-LP sync timing.
                                 polls.append(True if aux_ret == 0 else False)
                                 dst_ranks_infos.append(
                                     (req.endpoint, req.dst_port, req.room)
@@ -2907,8 +2174,7 @@ class MooncakeKVManager(CommonKVManager):
                                             prefill_unique_rank,
                                         )
                     else:
-                        # Dummy request means the decode instance is not used, so its status can be marked as success directly
-                        # Dummy request does not need to sync status to decode endpoint
+                        # Dummy decode ranks are local bookkeeping only.
                         if kv_chunk.is_last_chunk and req.room in self.request_status:
                             self.update_status(req.room, KVPoll.Success)
 
@@ -2937,7 +2203,6 @@ class MooncakeKVManager(CommonKVManager):
                         self.transfer_infos.pop(kv_chunk.room)
                     if hasattr(self, "req_to_decode_prefix_len"):
                         self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
-                    # Drop watermark state on terminal status.
                     self._clear_layer_pipeline_progress(kv_chunk.room)
 
             except Exception as e:
@@ -3017,11 +2282,7 @@ class MooncakeKVManager(CommonKVManager):
                             self.failed_sessions.remove(mooncake_session_id)
                         if mooncake_session_id in self.session_failures:
                             del self.session_failures[mooncake_session_id]
-                    # Loud-fail on LP misconfiguration at handshake time.
-                    # `_room_supports_layer_pipeline` silently falls back to
-                    # legacy fan-out on size mismatches; surface it here
-                    # ONCE per registering session so a bad deployment is
-                    # visible in startup logs.
+                    # Surface LP handshake mismatches once per session.
                     self._maybe_warn_lp_handshake_mismatch(
                         mooncake_session_id,
                         self.decode_kv_args_table[mooncake_session_id],
@@ -3253,53 +2514,20 @@ class MooncakeKVSender(CommonKVSender):
         self.conclude_state = None
         self.init_time = time.time()
         self._init_trace_ctx()
-        # Total chunks enqueued for this request across its whole lifecycle.
-        # The last enqueued chunk carries this value so the receiver knows
-        # how many completions to wait for before Success. Survives across
-        # `send()` calls (chunked-prefill). A request runs in exactly one
-        # mode: legacy fan-out (per-call increment) OR hook-driven (set
-        # once to `_hook_enqueued_chunks + 1`).
+        # Total chunks across chunked-prefill sends; finalizer carries it.
         self._chunks_sent: int = 0
-        # Bumped by the forward hook on every KV-only chunk it enqueues.
-        # The trailing aux finalizer uses it to compute
-        # `total_chunks_in_request = _hook_enqueued_chunks + 1`. No lock:
-        # hook fires on the compute thread, `send()` on the scheduler
-        # thread AFTER forward returns — they never overlap.
+        # Hook-enqueued KV chunks; the aux finalizer adds one.
         self._hook_enqueued_chunks: int = 0
-        # Per-`send()` mode signal set by the scheduler ahead of forward
-        # when it built a hook dispatch entry. `send()` consumes (and
-        # resets) it on entry; `_hook_chunks_at_last_send` snapshots the
-        # counter so we can fail loudly when hook mode was dispatched but
-        # the hook never fired this round.
+        # Per-send hook contract state.
         self._hook_handled_in_current_send: bool = False
         self._hook_chunks_at_last_send: int = 0
-        # Per-`send()` flag for the NSA state buffer: when True the aux
-        # finalizer passes `state_indices=None` (per-layer-group state was
-        # already shipped by the hook); when False the legacy aux
-        # finalizer ships the one-shot state.
         self._hook_handles_state: bool = False
-        # Persistent (never auto-cleared) variant of `_hook_handles_state`:
-        # latches True once the hook ever shipped state for this sender.
-        # Read by the empty-last-chunk aux-only finalizer, where the
-        # per-`send()` flag is no longer available.
         self._hook_handles_state_persistent: bool = False
-        # Per-`send()` flag set when scheduler installed the LP hook under
-        # CP layer-shard mode. Empty-owner CP ranks legitimately see
-        # _hook_enqueued_chunks unchanged across send() calls; the default
-        # contract guard would mistake that for a missed fire.
         self._hook_layer_shard_active: bool = False
 
     def _layer_groups_for_send(self) -> List[Optional[Tuple[int, int]]]:
-        # Gate by the request-level prefill length (in page units) so
-        # chunked-prefill cannot push individual chunks below
-        # `min_prefill_len` and force fallback.
         prefill_len = self.num_kv_indices * self.kv_mgr.kv_args.page_size
-        # The runtime staging branch in `transfer_worker` only fires for
-        # non-MLA + TP-mismatched dst ranks, so MLA can safely use LP even
-        # when `enable_staging=True`. For non-MLA + matched-TP + staging
-        # the staging path is registered but unused per-dst at runtime; we
-        # still fall back conservatively because we don't yet know each
-        # dst's `dst_attn_tp_size` here.
+        # Non-MLA staging may need runtime TP-dependent fallback.
         staging_path_active = (
             self.kv_mgr.enable_staging and not self.kv_mgr.is_mla_backend
         )
@@ -3316,15 +2544,7 @@ class MooncakeKVSender(CommonKVSender):
         )
 
     def _draft_layer_range(self) -> Optional[Tuple[int, int]]:
-        """Return `(num_main, num_total)` if a draft (MTP/EAGLE NEXTN) KV
-        pool is appended to `kv_data_ptrs`, else `None`.
-
-        Units are **logical layers** to match `prefill_num_main_kv_layers`
-        (which `prefill.py:148` already divides by 2 for MHA) and the
-        `layer_range` semantics. Using raw `len(kv_data_ptrs)` would
-        double-count MHA's K/V split and yield an out-of-bounds
-        `(num_main, 2*num_main)` for MHA-no-draft.
-        """
+        """Return the appended draft KV layer range, if any."""
         num_total = self.kv_mgr.local_num_kv_layers()
         num_main = getattr(
             self.kv_mgr.kv_args, "prefill_num_main_kv_layers", None
@@ -3337,62 +2557,24 @@ class MooncakeKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
     ) -> None:
-        """Ship the draft (MTP/EAGLE NEXTN) KV slice for this token chunk.
-
-        Called by the scheduler after `forward_batch_generation` returns
-        (so the draft forward has written its KV bytes) and before
-        `sender.send()`. The main LP hook does not cover draft layers.
-
-        Enqueues one TransferKVChunk with
-        `layer_range=(num_main, num_total)`, sharing `kv_indices` with
-        main. Counts toward `_hook_enqueued_chunks` so the trailing aux
-        finalizer's chunk-total accounting stays correct.
-
-        No-op when: kv_indices is empty (empty-last-chunk under chunked
-        prefill), no draft pool, LP path inactive, or dummy CP rank.
-        """
-        # Empty-last-chunk: chunked prefill's page-alignment leftover
-        # produces a final send() with no new pages. Calling here would
-        # enqueue a phantom draft chunk and break the aux-only finalizer
-        # contract. Defend at the source.
+        """Ship draft KV after draft forward; main LP hook does not cover it."""
         if len(kv_indices) == 0:
             return
         draft_range = self._draft_layer_range()
         if draft_range is None:
             return
         if self.kv_mgr.is_dummy_cp_rank:
-            # Dummy CP rank short-circuits all transfer; draft must match
-            # or watermark accounting diverges from live transfer.
             return
-        # If LP is not active for this request the legacy fan-out path
-        # will ship all layers at once — do not pre-empt with a
-        # draft-only chunk.
         layer_groups = self._layer_groups_for_send()
         lp_active = not (len(layer_groups) == 1 and layer_groups[0] is None)
         if not lp_active:
             return
-        # CP layer-shard mode: treat draft as the (N_main_groups)-th group
-        # and route it to a single owner CP rank. Main groups use local
-        # layer ids; draft layers sit AFTER all main layers so
-        # `draft_group_id == ceil(num_main / group_size)`. Non-owner ranks
-        # skip both enqueue and counter bump.
         use_layer_cp_shard = self.kv_mgr.use_layer_cp_shard_for_transfer()
         if use_layer_cp_shard:
             num_main_kv_layers = getattr(
                 self.kv_mgr.kv_args, "prefill_num_main_kv_layers", None
             )
-            if num_main_kv_layers is None or num_main_kv_layers <= 0:
-                # No main layer info ⇒ cannot compute a deterministic draft
-                # owner. Fall through to page-shard behavior: EVERY CP rank
-                # ships the same draft chunk. This is N-fold redundant RDMA
-                # write to the same dst buffer (correct, since draft KV is
-                # per-request, not per-page), but the receiver-side
-                # watermark still closes because every rank reports its
-                # chunk. We accept the redundancy over the alternative
-                # (skipping draft entirely on non-CP0), which would diverge
-                # from the main-LP layer-shard accounting.
-                pass
-            else:
+            if num_main_kv_layers is not None and num_main_kv_layers > 0:
                 group_size = self.kv_mgr.layer_group_size
                 total_main_layer_groups = (
                     num_main_kv_layers + group_size - 1
@@ -3403,12 +2585,7 @@ class MooncakeKVSender(CommonKVSender):
                     != self.kv_mgr.attn_cp_rank
                 ):
                     return
-        # Match sender.send's index_slice contract WITHOUT advancing
-        # curr_idx — the following sender.send(kv_indices) advances it.
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
-        # CP filter: when all_cp_ranks transfer is enabled with page shard,
-        # restrict to this rank's share. Layer-shard mode keeps the full
-        # page set (only one CP rank ships draft).
         if (
             self.kv_mgr.enable_all_cp_ranks_for_transfer
             and not use_layer_cp_shard
@@ -3421,8 +2598,6 @@ class MooncakeKVSender(CommonKVSender):
             )
             if len(kv_indices) == 0:
                 return
-        # Record an event so the worker synchronizes before RDMA, in case
-        # draft_fwd's KV writes haven't yet committed to the pool.
         ev = None
         try:
             import torch as _torch
@@ -3433,9 +2608,6 @@ class MooncakeKVSender(CommonKVSender):
         except ImportError:
             ev = None
         self._hook_enqueued_chunks += 1
-        # Ship draft state alongside KV: state and KV share page numbering;
-        # transfer_worker's LP path will chain
-        # maybe_send_extra(state_indices=kv_indices, layer_range=draft_range).
         self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             kv_indices,
@@ -3450,21 +2622,35 @@ class MooncakeKVSender(CommonKVSender):
             transfer_event=ev,
         )
 
+    def _enqueue_aux_only_finalizer(
+        self,
+        index_slice: slice,
+        state_indices: Optional[List],
+        total_chunks: int,
+        skip_aux_rdma: bool,
+    ) -> None:
+        self.kv_mgr.add_transfer_request(
+            self.bootstrap_room,
+            kv_indices=np.array([], dtype=np.int32),
+            index_slice=index_slice,
+            is_last_chunk=True,
+            aux_index=self.aux_index,
+            state_indices=state_indices,
+            layer_group_id=0,
+            layer_range=None,
+            total_layer_groups=1,
+            total_chunks_in_request=total_chunks,
+            transfer_event=None,
+            trace_ctx=self.trace_ctx.copy_for_thread(),
+            skip_aux_rdma=skip_aux_rdma,
+        )
+
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
     ):
-        # The read-and-clear below is the FIRST thing send() does. Once
-        # cleared, the flag cannot leak into a subsequent send() on this
-        # sender — even if any later step raises. The scheduler resets
-        # the flag every round via `make_layer_pipeline_hook_for_reqs`.
-        # `_hook_chunks_at_last_send` is snapshotted in the `finally`
-        # below; harmless on top-of-send exceptions (try never entered →
-        # no update; next round's contract guard accommodates the
-        # accumulated count since hook fires that DID issue RDMA stay
-        # reflected in `_hook_enqueued_chunks`).
         hook_expected = self._hook_handled_in_current_send
         self._hook_handled_in_current_send = False
         hook_handled_state = self._hook_handles_state
@@ -3473,52 +2659,17 @@ class MooncakeKVSender(CommonKVSender):
         self._hook_layer_shard_active = False
 
         use_layer_cp_shard = self.kv_mgr.use_layer_cp_shard_for_transfer()
-        index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
-        self.curr_idx += len(kv_indices)
-        is_last_chunk = self.curr_idx == self.num_kv_indices
-
-        # Special handling for cp
-        if (
-            self.kv_mgr.enable_all_cp_ranks_for_transfer
-            and not use_layer_cp_shard
-        ):
-            # Page-shard mode: every CP rank's send() filters its share of
-            # pages at the top so both hook and legacy branches see the
-            # partitioned indices. Layer-shard mode skips this: the hook
-            # already enqueued full pages per owned group, and rewriting
-            # `index_slice` here would leak a stale shard rectangle into
-            # the aux finalizer / any future state code. It also must not
-            # call filter_kv_indices_for_cp_rank because that helper
-            # assumes a contiguous page range.
-            kv_indices, index_slice = filter_kv_indices_for_cp_rank(
-                self.kv_mgr,
-                kv_indices,
-                index_slice,
-                total_pages=self.num_kv_indices,
-            )
-        elif self.kv_mgr.is_dummy_cp_rank:
-            if not is_last_chunk:
-                return
-            else:
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
-                return
+        skip_aux_rdma = use_layer_cp_shard and self.kv_mgr.attn_cp_rank != 0
+        kv_indices, index_slice, is_last_chunk, should_skip = (
+            self._prepare_send_indices(kv_indices, state_indices)
+        )
+        if should_skip:
+            return
 
         try:
             if hook_expected:
-                # Layer-pipeline path: the hook already streamed every
-                # layer group's KV bytes. Only the very last token chunk
-                # of the whole request needs the trailing aux/state
-                # finalizer.
                 if self._hook_enqueued_chunks <= self._hook_chunks_at_last_send:
-                    # Empty-main-owner CP rank (layer-shard): legitimately
-                    # never bumped the counter. hook_layer_shard is set only
-                    # for such ranks; ranks that own groups keep the strict
-                    # guard. Aux-only finalizer still fires to close the
-                    # receiver's chunk-count watermark.
                     if not hook_layer_shard:
-                        # Fail-loud: scheduler told us to expect hook-driven
-                        # enqueue this round, but no hook fire bumped the
-                        # counter. Refusing to emit a malformed aux finalizer.
                         raise RuntimeError(
                             f"Layer-pipeline contract violated for room "
                             f"{self.bootstrap_room}: scheduler dispatched hook "
@@ -3531,61 +2682,21 @@ class MooncakeKVSender(CommonKVSender):
                         )
                 if not is_last_chunk:
                     return
-                # Hook NOOP mode skipped add_transfer_request; mirror
-                # is_dummy_cp_rank by marking Success directly. Decode
-                # side will fail; documented for this dev tool.
                 if self.kv_mgr._lp_hook_noop_fake_success:
                     self.kv_mgr.update_status(
                         self.bootstrap_room, KVPoll.Success
                     )
                     return
                 self._chunks_sent = self._hook_enqueued_chunks + 1
-                # When the hook shipped state per layer-group, the aux
-                # finalizer MUST pass state_indices=None or decode
-                # receives two overlapping writes (last-writer wins).
                 aux_state_indices = None if hook_handled_state else state_indices
-                # Layer-shard CP optimization: only CP0 issues the actual
-                # aux RDMA (aux content is identical across CP ranks,
-                # per-request not per-page). Other CP ranks still call
-                # _record_aux_sent so their per-rank watermark closes,
-                # but skipping the RDMA avoids N-fold metadata writes.
-                skip_aux_rdma = (
-                    use_layer_cp_shard and self.kv_mgr.attn_cp_rank != 0
-                )
-                self.kv_mgr.add_transfer_request(
-                    self.bootstrap_room,
-                    # Empty kv_indices + layer_range=None signals
-                    # "aux-only finalizer" to the worker.
-                    kv_indices=np.array([], dtype=np.int32),
-                    index_slice=index_slice,
-                    is_last_chunk=True,
-                    aux_index=self.aux_index,
-                    state_indices=aux_state_indices,
-                    layer_group_id=0,
-                    layer_range=None,
-                    total_layer_groups=1,
-                    total_chunks_in_request=self._chunks_sent,
-                    transfer_event=None,
-                    trace_ctx=self.trace_ctx.copy_for_thread(),
-                    skip_aux_rdma=skip_aux_rdma,
+                self._enqueue_aux_only_finalizer(
+                    index_slice, aux_state_indices, self._chunks_sent, skip_aux_rdma
                 )
                 return
         finally:
-            # Snapshot AFTER both branches so the next `send()`'s
-            # baseline reflects everything enqueued so far.
             self._hook_chunks_at_last_send = self._hook_enqueued_chunks
 
-        # Empty-last-chunk LP fallthrough: chunked prefill can produce a
-        # final send() whose token range was fully covered by prior
-        # chunks (page-alignment leftover ⇒ end_idx == start_idx). The
-        # scheduler's hook skipped this round, so `hook_expected` is
-        # False and `kv_indices` is empty — but prior rounds DID
-        # hook-enqueue real KV chunks. The legacy fan-out below would
-        # emit N empty layer-group chunks with a stale
-        # `total_chunks_in_request = N`, clobbering the receiver-side
-        # watermark (which already counted `_hook_enqueued_chunks` real
-        # arrivals). Emit a single aux-only finalizer instead, with the
-        # correct cumulative chunk total.
+        # Empty final chunk after prior LP hook sends: emit only the finalizer.
         if (
             is_last_chunk
             and len(kv_indices) == 0
@@ -3596,29 +2707,11 @@ class MooncakeKVSender(CommonKVSender):
             aux_state_indices = (
                 None if self._hook_handles_state_persistent else state_indices
             )
-            skip_aux_rdma = (
-                use_layer_cp_shard and self.kv_mgr.attn_cp_rank != 0
-            )
-            self.kv_mgr.add_transfer_request(
-                self.bootstrap_room,
-                kv_indices=np.array([], dtype=np.int32),
-                index_slice=index_slice,
-                is_last_chunk=True,
-                aux_index=self.aux_index,
-                state_indices=aux_state_indices,
-                layer_group_id=0,
-                layer_range=None,
-                total_layer_groups=1,
-                total_chunks_in_request=self._chunks_sent,
-                transfer_event=None,
-                trace_ctx=self.trace_ctx.copy_for_thread(),
-                skip_aux_rdma=skip_aux_rdma,
+            self._enqueue_aux_only_finalizer(
+                index_slice, aux_state_indices, self._chunks_sent, skip_aux_rdma
             )
             return
 
-        # Legacy path: hook is disabled (or this request didn't qualify
-        # for layer pipeline at scheduler time). Enqueue the full N×M
-        # layer-group fan-out exactly as before.
         layer_groups = self._layer_groups_for_send()
         for layer_group_id, layer_range in enumerate(layer_groups):
             is_last_layer_group = layer_group_id == len(layer_groups) - 1
@@ -3635,8 +2728,6 @@ class MooncakeKVSender(CommonKVSender):
                 layer_group_id=layer_group_id,
                 layer_range=layer_range,
                 total_layer_groups=len(layer_groups),
-                # Only the very last enqueued chunk carries the running
-                # total so the worker can finalize deterministically.
                 total_chunks_in_request=self._chunks_sent if chunk_is_last else None,
             )
         self._record_transfer_indices(kv_indices, state_indices)
@@ -3732,11 +2823,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
             )
             layer_group_size = str(self.kv_mgr.layer_group_size).encode("ascii")
             kv_dtype = self.kv_mgr.server_args.kv_cache_dtype.encode("ascii")
-            # Decode-side local main KV layer count (excludes draft tail);
-            # prefill receives it as ``dst_num_main_kv_layers`` to fail
-            # loud when the cross-side draft layout disagrees. Empty ⇒
-            # legacy decode / no draft pool (receivers fall back to
-            # inferring from total length).
+            # Empty means legacy/no draft; prefill falls back to length inference.
             num_main_kv_layers_attr = getattr(
                 self.kv_mgr.kv_args, "num_main_kv_layers", None
             )
@@ -3835,12 +2922,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     ]
                 )
         self.init_time = time.time()
-        # Stash dst page indices for the decode-side hash emit on first
-        # Success poll. Save once per room.
-        if envs.SGLANG_DISAGG_KV_HASH_VERIFY.get():
-            self.kv_mgr._kv_hash_save_decode_indices(
-                self.bootstrap_room, kv_indices
-            )
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
@@ -3849,11 +2930,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
         status = self.kv_mgr.check_status(self.bootstrap_room)
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
-            if envs.SGLANG_DISAGG_KV_HASH_VERIFY.get():
-                if status == KVPoll.Success:
-                    self.kv_mgr._kv_hash_emit_decode_once(self.bootstrap_room)
-                else:
-                    self.kv_mgr._kv_hash_clear_decode(self.bootstrap_room)
         elif status == KVPoll.WaitingForInput:
             timeout_result = self._check_waiting_timeout()
             if timeout_result is not None:
@@ -3865,8 +2941,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
 
-        if envs.SGLANG_DISAGG_KV_HASH_VERIFY.get():
-            self.kv_mgr._kv_hash_clear_decode(self.bootstrap_room)
         self.clear()
 
         with self.kv_mgr.failure_lock:
