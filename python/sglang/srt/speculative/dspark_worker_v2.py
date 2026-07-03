@@ -34,6 +34,7 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import compute_dflash_correct_drafts_and_bonus
+from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.dspark_info import (
     DSparkDraftBlockInput,
     DSparkDraftExtendInput,
@@ -165,28 +166,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._markov_candidates_buf: Optional[torch.Tensor] = None
         self._markov_embeds_buf: Optional[torch.Tensor] = None
         self._materialize_draft_compressors_enabled = True
-        self._prefill_bootstrap_forward_enabled = _env_flag(
-            "SGLANG_DSPARK_PREFILL_BOOTSTRAP_FORWARD", False
-        )
-        self._decode_bootstrap_forward_enabled = _env_flag(
-            "SGLANG_DSPARK_DECODE_BOOTSTRAP_FORWARD", False
-        )
-        if (
-            server_args.enable_dp_attention
-            and (
-                self._prefill_bootstrap_forward_enabled
-                or self._decode_bootstrap_forward_enabled
-            )
-            and not _env_flag("SGLANG_DSPARK_FORCE_UNSAFE_BOOTSTRAP_FORWARD", False)
-        ):
-            logger.warning(
-                "Disable DSpark draft bootstrap forward under DP attention. "
-                "Nested draft forward can hang DP/EP/MoE collectives; use "
-                "SGLANG_DSPARK_FORCE_UNSAFE_BOOTSTRAP_FORWARD=1 only for "
-                "debugging."
-            )
-            self._prefill_bootstrap_forward_enabled = False
-            self._decode_bootstrap_forward_enabled = False
+        self.draft_attn_backend = None
+        self.draft_extend_attn_backend = None
         self._accept_anomaly_enabled = _env_flag("SGLANG_DSPARK_DEBUG_ACCEPT", True)
         self._accept_anomaly_threshold = max(
             1, _env_int("SGLANG_DSPARK_DEBUG_ACCEPT_THRESHOLD", 8)
@@ -385,6 +366,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         return (
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
+            self.draft_extend_attn_backend or self.draft_model_runner.attn_backend,
         )
 
     def alloc_memory_pool(
@@ -406,6 +388,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_moe_a2a_backend_context(),
         ):
             self._draft_worker.init_attention_backends()
+            self.draft_attn_backend = self.draft_model_runner.attn_backend
+            draft_backend_factory = DraftBackendFactory(
+                self.server_args,
+                self.draft_model_runner,
+                topk=1,
+                speculative_num_steps=1,
+            )
+            self.draft_extend_attn_backend = (
+                draft_backend_factory.create_draft_extend_backend()
+            )
 
     def init_cuda_graphs(self):
         with (
@@ -676,7 +668,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         old_prefix_lens = batch.prefix_lens
         old_extend_lens = batch.extend_lens
         old_extend_num_tokens = batch.extend_num_tokens
+        old_attn_backend = self.draft_model_runner.attn_backend
         try:
+            if self.draft_extend_attn_backend is None:
+                raise RuntimeError(
+                    "DSpark draft_extend_attn_backend is not initialized."
+                )
             batch.input_ids = input_ids.to(device=self.device, dtype=torch.int64)
             batch.out_cache_loc = out_cache_loc.to(device=self.device)
             batch.spec_info = DSparkDraftExtendInput(
@@ -742,6 +739,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 speculative_moe_a2a_backend_context(),
                 torch.inference_mode(),
             ):
+                self.draft_model_runner.attn_backend = self.draft_extend_attn_backend
                 if (
                     not forward_batch.forward_mode.is_idle()
                     and (
@@ -768,6 +766,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch.prefix_lens = old_prefix_lens
             batch.extend_lens = old_extend_lens
             batch.extend_num_tokens = old_extend_num_tokens
+            self.draft_model_runner.attn_backend = old_attn_backend
 
     def _materialize_disagg_prefill_hidden_to_draft_state(
         self,
@@ -813,28 +812,27 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
 
         seq_lens_before = (prefix_lens[valid].to(torch.int64) - 1).clamp_min(0)
-        if self._prefill_bootstrap_forward_enabled:
-            try:
-                self._run_draft_bootstrap_forward(
-                    batch=batch,
-                    main_hidden=hidden[valid],
-                    input_ids=torch.zeros(
-                        (int(valid.sum().item()),),
-                        dtype=torch.int64,
-                        device=self.device,
-                    ),
-                    positions=positions[valid],
-                    out_cache_loc=cache_loc[valid],
-                    seq_lens=seq_lens_before,
-                    req_pool_indices=batch.req_pool_indices[valid],
-                )
-                return
-            except Exception as e:
-                logger.warning(
-                    "DSpark PD draft bootstrap forward failed; "
-                    "falling back to materialization: %s",
-                    e,
-                )
+        try:
+            self._run_draft_bootstrap_forward(
+                batch=batch,
+                main_hidden=hidden[valid],
+                input_ids=torch.zeros(
+                    (int(valid.sum().item()),),
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                positions=positions[valid],
+                out_cache_loc=cache_loc[valid],
+                seq_lens=seq_lens_before,
+                req_pool_indices=batch.req_pool_indices[valid],
+            )
+            return
+        except Exception as e:
+            logger.warning(
+                "DSpark PD draft bootstrap forward failed; "
+                "falling back to materialization: %s",
+                e,
+            )
 
         draft_forward_batch = self._make_draft_decode_forward_batch_for_materialize(
             batch=batch,
@@ -1407,35 +1405,34 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(extend_lens)),
         )
-        if self._prefill_bootstrap_forward_enabled:
-            try:
-                self._run_draft_bootstrap_forward(
-                    batch=model_worker_batch,
-                    main_hidden=logits_output.hidden_states,
-                    input_ids=model_worker_batch.input_ids,
-                    positions=positions,
-                    out_cache_loc=model_worker_batch.out_cache_loc,
-                    prefix_lens=draft_seq_lens,
-                    extend_lens=ctx_lens,
-                )
-            except Exception as e:
-                logger.warning(
-                    "DSpark prefill draft bootstrap forward failed; "
-                    "falling back to materialization: %s",
-                    e,
-                )
-            else:
-                logits_output.hidden_states = None
+        try:
+            self._run_draft_bootstrap_forward(
+                batch=model_worker_batch,
+                main_hidden=logits_output.hidden_states,
+                input_ids=model_worker_batch.input_ids,
+                positions=positions,
+                out_cache_loc=model_worker_batch.out_cache_loc,
+                prefix_lens=draft_seq_lens,
+                extend_lens=ctx_lens,
+            )
+        except Exception as e:
+            logger.warning(
+                "DSpark prefill draft bootstrap forward failed; "
+                "falling back to materialization: %s",
+                e,
+            )
+        else:
+            logits_output.hidden_states = None
 
-                batch_output.next_draft_input = self._make_next_draft_input_prefill(
-                    bonus_tokens=next_token_ids,
-                    seq_lens=model_worker_batch.seq_lens,
-                    cur_allocated_seq_lens_cpu=model_worker_batch.seq_lens_cpu,
-                )
-                verify_done = torch.get_device_module(device).Event()
-                verify_done.record()
-                batch_output.next_draft_input.verify_done = verify_done
-                return batch_output
+            batch_output.next_draft_input = self._make_next_draft_input_prefill(
+                bonus_tokens=next_token_ids,
+                seq_lens=model_worker_batch.seq_lens,
+                cur_allocated_seq_lens_cpu=model_worker_batch.seq_lens_cpu,
+            )
+            verify_done = torch.get_device_module(device).Event()
+            verify_done.record()
+            batch_output.next_draft_input.verify_done = verify_done
+            return batch_output
 
         draft_forward_batch = self._make_draft_prefill_forward_batch_for_materialize(
             model_worker_batch
@@ -1659,6 +1656,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
             ignore_mask=transfer_warmup_mask,
         )
+        if on_publish is not None:
+            on_publish(new_seq_lens)
 
         hidden = logits_output.hidden_states
         if hidden is None:
@@ -1673,25 +1672,24 @@ class DSparkWorkerV2(BaseSpecWorker):
                 < commit_lens.unsqueeze(1).to(torch.int64)
             ).reshape(-1)
             used_bootstrap_forward = False
-            if self._decode_bootstrap_forward_enabled:
-                try:
-                    self._run_draft_bootstrap_forward(
-                        batch=model_worker_batch,
-                        main_hidden=hidden_flat,
-                        input_ids=candidates.reshape(-1),
-                        positions=positions,
-                        out_cache_loc=verify_out_cache_loc,
-                        seq_lens=prefix_lens,
-                        num_tokens_per_req=block_size,
-                        use_draft_extend_v2=True,
-                    )
-                    used_bootstrap_forward = True
-                except Exception as e:
-                    logger.warning(
-                        "DSpark decode draft-extend bootstrap failed; "
-                        "falling back to materialization: %s",
-                        e,
-                    )
+            try:
+                self._run_draft_bootstrap_forward(
+                    batch=model_worker_batch,
+                    main_hidden=hidden_flat,
+                    input_ids=candidates.reshape(-1),
+                    positions=positions,
+                    out_cache_loc=verify_out_cache_loc,
+                    seq_lens=prefix_lens,
+                    num_tokens_per_req=block_size,
+                    use_draft_extend_v2=True,
+                )
+                used_bootstrap_forward = True
+            except Exception as e:
+                logger.warning(
+                    "DSpark decode draft-extend bootstrap failed; "
+                    "falling back to materialization: %s",
+                    e,
+                )
 
             self._clear_unaccepted_c128_draft_states(
                 batch=model_worker_batch,
@@ -1708,8 +1706,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
 
         logits_output.hidden_states = None
-        if on_publish is not None:
-            on_publish(new_seq_lens)
 
         next_draft_input = self._make_next_draft_input_decode(
             bonus_tokens=bonus_tokens,
