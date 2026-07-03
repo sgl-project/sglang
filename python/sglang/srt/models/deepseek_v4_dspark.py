@@ -231,6 +231,11 @@ class DeepseekV4ForCausalLMDSpark(DeepseekV4ForCausalLM):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
+        # The parent load_weights ends with a load-time MHC prewarm gated on
+        # self._mhc_prewarmed_at_load, which the parent __init__ (bypassed here)
+        # initializes. Mark it done: the draft never runs the prewarmed kernels
+        # standalone and the target model prewarms its own.
+        self._mhc_prewarmed_at_load = True
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.pp_group = get_pp_group()
