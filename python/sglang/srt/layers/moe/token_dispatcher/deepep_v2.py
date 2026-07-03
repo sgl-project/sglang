@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import Enum, auto
 from typing import List, NamedTuple, Optional, Tuple
 
@@ -171,6 +172,15 @@ class DeepEPV2Buffer:
         if cls._buffer is not None:
             cls.destroy()
 
+        # DeepEP reuses the torch process group's internal NCCL communicator
+        # when EP_REUSE_NCCL_COMM=1 (its default). That path requires the group
+        # to be device-bound at init_process_group time (eager comm init),
+        # which SGLang's shared init does not do -- reusing then reads an
+        # uninitialized communicator and ElasticBuffer sizing segfaults in
+        # ncclTeamWorld. Default to letting DeepEP create its own communicator
+        # (it binds to the already-set current device); setdefault keeps any
+        # explicit user override.
+        os.environ.setdefault("EP_REUSE_NCCL_COMM", "0")
         cls._buffer = ElasticBuffer(
             group,
             num_max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
