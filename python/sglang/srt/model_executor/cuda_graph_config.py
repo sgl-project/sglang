@@ -92,6 +92,15 @@ class PhaseConfig:
     req_slots: int = 64
 
 
+def default_prefill_backend() -> str:
+    """BCG (breakable) is the prefill default on CUDA only; other platforms
+    (HIP/NPU/...) keep tc_piecewise until BCG is validated there. Lazy import
+    keeps this module's stdlib-only import invariant (see module docstring)."""
+    from sglang.srt.utils import is_cuda
+
+    return Backend.BREAKABLE if is_cuda() else Backend.TC_PIECEWISE
+
+
 @dataclass
 class CudaGraphConfig:
     """Top-level CUDA graph config: one PhaseConfig per phase."""
@@ -100,7 +109,7 @@ class CudaGraphConfig:
         default_factory=lambda: PhaseConfig(backend=Backend.FULL)
     )
     prefill: PhaseConfig = field(
-        default_factory=lambda: PhaseConfig(backend=Backend.TC_PIECEWISE)
+        default_factory=lambda: PhaseConfig(backend=default_prefill_backend())
     )
 
     def __getitem__(self, phase: str) -> PhaseConfig:

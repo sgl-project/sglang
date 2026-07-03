@@ -78,15 +78,16 @@ class EagleDraftWorkerBase(ABC):
     def alloc_memory_pool(self, **kwargs):
         pass
 
-    def init_backends(self):
-        """Initialize standard backends (no cuda graphs) then draft-specific backends.
-
-        Subclasses should wrap this with their context managers (draft_tp_context,
-        speculative_moe_backend_context, etc.) rather than reimplementing the logic.
-        """
-        self.draft_worker.init_backends(disable_cuda_graph=True)
+    def init_attention_backends(self):
+        """Subclasses wrap this with their context managers (draft_tp_context,
+        speculative_moe_backend_context, etc.) rather than reimplementing it."""
+        self.draft_worker.init_attention_backends()
         self.init_attention_backend()
-        self.init_cuda_graphs()
+
+    def init_cuda_graphs(self):
+        """Capture draft graphs (decode disabled on the draft TpModelWorker)."""
+        self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
+        self._capture_cuda_graphs()
 
     def prepare_for_draft_extend(
         self,
@@ -111,9 +112,11 @@ class EagleDraftWorkerBase(ABC):
         gpu_only = batch.seq_lens_cpu is None
 
         batch.spec_info = draft_extend_input
-        # Normalize draft token ids before ForwardBatch construction; DeepSeekV4 DP
-        # gather requires input_ids to have a consistent integer dtype across ranks.
-        batch.input_ids = predict.to(torch.int64)
+        # Do NOT cast predict dtype here. The caller (e.g., _draft_extend_for_decode)
+        # may run this under a plan stream; casting inside the plan stream creates a
+        # cross-stream dependency that can lead to data races and break MTP acceptance.
+        # The caller should cast to int64 before entering the plan stream context.
+        batch.input_ids = predict
         maybe_detect_oob(
             batch.input_ids,
             0,
@@ -153,7 +156,9 @@ class EagleDraftWorkerBase(ABC):
             # Supply CPU mirror (extend_seq_lens are all num_draft_tokens) so
             # backend max() reads from list without a per-iter D2H sync.
             forward_batch.extend_seq_lens_cpu = [num_draft_tokens] * bs
-        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
+        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
+            forward_batch
+        )
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
             # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
@@ -260,7 +265,9 @@ class EagleDraftWorkerBase(ABC):
         draft_input.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         batch.capture_hidden_mode = capture_mode
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
-        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
+        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
+            forward_batch
+        )
         return forward_batch, can_cuda_graph
 
 
@@ -276,6 +283,14 @@ class BaseSpecWorker(ABC):
         pass
 
     @property
+    def war_fastpath_runner(self):
+        # The runner that runs the step's LAST shared-buffer-reading phase --
+        # it owns the read-done event the scheduler's WAR barrier waits on.
+        # Default is the target runner; override if the last phase runs
+        # elsewhere (eagle's draft_extend runs on the draft runner).
+        return self.target_worker.model_runner
+
+    @property
     def spec_v2_attn_backends(self) -> tuple:
         """Attn backends touched by spec_v2 forward; OR-ed by decide_needs_cpu_seq_lens.
         Default returns target only; subclasses extend with draft backends."""
@@ -289,7 +304,10 @@ class BaseSpecWorker(ABC):
     def alloc_memory_pool(self, **kwargs):
         pass
 
-    def init_backends(self):
+    def init_attention_backends(self):
+        pass
+
+    def init_cuda_graphs(self):
         pass
 
     def on_verify_complete_cpu(
