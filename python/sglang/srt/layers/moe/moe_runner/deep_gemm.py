@@ -28,8 +28,8 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
 )
-from sglang.srt.utils.offloader import get_offloader
 from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.offloader import get_offloader
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -398,11 +398,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             # non-TMA-aligned strides. Apply TMA alignment for SM120's
             # grouped GEMM which validates strides in check_sf_layout.
             if is_sm120_supported():
-                hidden_states_scale = (
-                    deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
-                        hidden_states_scale.view(torch.float32)
-                    ).view(torch.int32)
-                )
+                hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
+                    hidden_states_scale.view(torch.float32)
+                ).view(torch.int32)
         elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 hidden_states_scale
@@ -946,11 +944,9 @@ def _varlen_deep_gemm_silu_mul_quant(
             down_input_scale = _cast_to_e8m0_with_rounding_up(down_input_scale)
             # SM120: apply TMA alignment to the packed INT32 scales
             if is_sm120_supported():
-                down_input_scale = (
-                    deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
-                        down_input_scale.view(torch.float32)
-                    ).view(torch.int32)
-                )
+                down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
+                    down_input_scale.view(torch.float32)
+                ).view(torch.int32)
     return down_input, down_input_scale
 
 

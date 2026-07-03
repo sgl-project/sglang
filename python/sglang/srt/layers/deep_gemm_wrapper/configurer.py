@@ -39,5 +39,7 @@ def _compute_enable_deep_gemm():
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
 DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and is_sm100_supported()
-DEEPGEMM_SCALE_UE8M0 = ENABLE_JIT_DEEPGEMM and (is_sm100_supported() or get_device_sm() == 120)
+DEEPGEMM_SCALE_UE8M0 = ENABLE_JIT_DEEPGEMM and (
+    is_sm100_supported() or get_device_sm() == 120
+)
 DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
