@@ -34,7 +34,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 from sglang.srt.arg_groups.arg_utils import model_overridable_fields
 from sglang.srt.runtime_context import resolve_flag_leaf
-from sglang.srt.utils.common import is_xpu
+from sglang.srt.utils.common import is_flashinfer_available, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,72 @@ def _invoke_provider(
             f"got {type(declared).__name__}"
         )
     return declared
+
+
+class ResolvedView:
+    """Read-only view of the resolving configuration handed to post-process
+    passes.
+
+    During the dual-apply transition the view forwards every read to the live
+    ``server_args`` — the pristine input plus the declarations replayed so far
+    plus any residual imperative writes — which is exactly the state the
+    legacy handler at the same slot observed. In the end state (dual-apply
+    retired) the same type overlays the accumulated declarations on the
+    pristine object. Writes are rejected: passes return declarations.
+    """
+
+    __slots__ = ("_server_args", "_overlay")
+
+    def __init__(self, server_args: Any, overlay: Optional[Dict[str, Any]] = None):
+        object.__setattr__(self, "_server_args", server_args)
+        object.__setattr__(self, "_overlay", overlay or {})
+
+    def __getattr__(self, name: str) -> Any:
+        overlay = object.__getattribute__(self, "_overlay")
+        if name in overlay:
+            return overlay[name]
+        return getattr(object.__getattribute__(self, "_server_args"), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError(
+            "ResolvedView is read-only; post-process passes return declarations"
+        )
+
+
+# Ordered post-process passes (the normalization stage). List order is the
+# end-state execution order and mirrors today's handler call sequence in
+# __post_init__; during the transition each pass is invoked from its legacy
+# slot via run_post_process_pass, so ordering is preserved byte-for-byte.
+POST_PROCESS_PASSES: List[Callable[..., dict]] = []
+
+
+def register_post_process(fn: Callable[..., dict]) -> Callable[..., dict]:
+    """Register a post-process pass: ``fn(view) -> {field: resolved_value}``.
+
+    The pass reads a :class:`ResolvedView` (post-model-override state) and
+    must not mutate anything; validations may live in a pass (read + raise).
+    """
+    POST_PROCESS_PASSES.append(fn)
+    return fn
+
+
+def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
+    """Transition-period invocation of one pass at its legacy handler slot.
+
+    Evaluates the pass on the live state (through a read-only view), appends
+    its declaration to the R0 stash, and dual-applies it in place —
+    byte-identical to the imperative handler write this replaces.
+    """
+    declared = fn(ResolvedView(server_args))
+    if not isinstance(declared, dict):
+        raise TypeError(
+            f"post-process pass {fn.__qualname__} must return a dict, "
+            f"got {type(declared).__name__}"
+        )
+    if declared:
+        entry = (fn.__qualname__, dict(declared))
+        server_args._resolved_overrides.append(entry)
+        apply_declarations_to_server_args(server_args, [entry])
 
 
 def collect_model_override_declarations(
@@ -237,6 +303,34 @@ def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:
         )
         overrides["disable_hybrid_swa_memory"] = True
     return overrides
+
+
+# ---------------------------------------------------------------------------
+# Post-process passes (normalization stage), in end-state execution order.
+# Faithful ports of the legacy __post_init__ handlers; each is invoked from
+# its legacy slot via run_post_process_pass during the transition.
+# ---------------------------------------------------------------------------
+
+
+@register_post_process
+def _sampling_backend_default(view: Any) -> dict:
+    if view.sampling_backend is None:
+        return {
+            "sampling_backend": (
+                "flashinfer" if is_flashinfer_available() else "pytorch"
+            )
+        }
+    return {}
+
+
+@register_post_process
+def _deterministic_sampling_backend(view: Any) -> dict:
+    if view.enable_deterministic_inference and view.sampling_backend != "ascend":
+        logger.warning(
+            "Sampling backend is set to pytorch for deterministic inference."
+        )
+        return {"sampling_backend": "pytorch"}
+    return {}
 
 
 @dataclasses.dataclass(frozen=True)

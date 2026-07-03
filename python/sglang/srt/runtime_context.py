@@ -314,6 +314,7 @@ class Flags(_StaticFlags):
     enable_multi_layer_eagle: bool = False
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
+    sampling_backend: str | None = None
 
     def freeze(self) -> None:
         for field in dataclasses.fields(self):
