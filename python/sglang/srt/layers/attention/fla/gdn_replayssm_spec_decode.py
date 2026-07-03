@@ -32,10 +32,13 @@ Closed-loop exact fold (the state / output error split):
   gain is ``exp(g) * |1 - beta| < 1`` along ``k`` and ``exp(g) < 1`` elsewhere),
   so given identical inputs the replayed checkpoint is bit-identical to the
   recurrent baseline's committed state and carries NO length-dependent error.
-  The chunked transform is kept only for the non-accumulating output, whose
-  dots run with ``input_precision="ieee"`` to match the recurrent kernel's
-  plain-fp32 arithmetic class (requires the fp32 SSM checkpoint; enforced in
-  server_args).
+  The chunked transform is kept only for the non-accumulating output. Its
+  dots therefore need only stay below the bf16 OUTPUT-cast floor (eps ~ 2^-8
+  ~ 4e-3 relative), not match fp32 exactly: ``DOT_PRECISION`` defaults to
+  ``"tf32"`` (~5e-4, tensor-core path; worst case through the (I+A)^{-1}
+  amplification 2^(BS-1) still lands at the floor). ``"ieee"`` / ``"tf32x3"``
+  remain selectable for ablations. The committed state is untouched by any of
+  these dots (requires the fp32 SSM checkpoint; enforced in server_args).
 
 Differences from the vLLM reference:
   * SGLang passes **split** ``q`` / ``k`` / ``v`` tensors (already split + post
@@ -110,6 +113,7 @@ def gdn_replayssm_spec_circular_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_FLUSH: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -292,14 +296,14 @@ def gdn_replayssm_spec_circular_kernel(
 
         qT = tl.trans(q_tile)
         kT = tl.trans(k_tile)
-        kk_mat += tl.dot(k_tile, kT, input_precision="ieee")
-        kq_mat += tl.dot(k_tile, qT, input_precision="ieee")
+        kk_mat += tl.dot(k_tile, kT, input_precision=DOT_PRECISION)
+        kq_mat += tl.dot(k_tile, qT, input_precision=DOT_PRECISION)
 
         # Checkpoint projection. On flush steps the exact-fold kernel (launched
         # first) has already folded the committed history into h0, so this is
         # the whole non-window contribution and no d-fold happens here anymore.
-        hw_q += tl.dot(sc_tile, qT, input_precision="ieee")
-        hw_k += tl.dot(sc_tile, kT, input_precision="ieee")
+        hw_q += tl.dot(sc_tile, qT, input_precision=DOT_PRECISION)
+        hw_k += tl.dot(sc_tile, kT, input_precision=DOT_PRECISION)
 
         if not IS_FLUSH:
             # cached-key history load -> phys_c (output reconstruction only)
@@ -311,8 +315,8 @@ def gdn_replayssm_spec_circular_kernel(
             khist_tile = tl.load(
                 p_k, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
             ).to(h0.dtype.element_ty)
-            scores_q += tl.dot(khist_tile, qT, input_precision="ieee")
-            scores_k += tl.dot(khist_tile, kT, input_precision="ieee")
+            scores_q += tl.dot(khist_tile, qT, input_precision=DOT_PRECISION)
+            scores_k += tl.dot(khist_tile, kT, input_precision=DOT_PRECISION)
 
         if write_k:
             spec_kt_mask = (
@@ -346,10 +350,10 @@ def gdn_replayssm_spec_circular_kernel(
 
     if not IS_FLUSH:
         hw_q = b_total_decay * hw_q + tl.dot(
-            b_d_scaled, scores_q.to(b_d_scaled.dtype), input_precision="ieee"
+            b_d_scaled, scores_q.to(b_d_scaled.dtype), input_precision=DOT_PRECISION
         )
         hw_k = b_total_decay * hw_k + tl.dot(
-            b_d_scaled, scores_k.to(b_d_scaled.dtype), input_precision="ieee"
+            b_d_scaled, scores_k.to(b_d_scaled.dtype), input_precision=DOT_PRECISION
         )
 
     # ------------------------------------------------------------------
@@ -668,6 +672,7 @@ def _launch_gdn_spec(
     nk,
     bs_min,
     null_block_id,
+    dot_precision,
 ):
     num_slots, HV, V, K = checkpoint_state.shape
     H = k.shape[1]
@@ -742,6 +747,7 @@ def _launch_gdn_spec(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_FLUSH=is_flush_kernel,
         NULL_BLOCK_ID=null_block_id,
+        DOT_PRECISION=dot_precision,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -841,6 +847,7 @@ def gdn_replayssm_spec_decode(
     num_stages_flush: int = 2,
     nk_flush: int = 2,
     launch_mode: str = "both",
+    dot_precision: str = "tf32",
 ):
     """GDN cached speculative-decode on a CIRCULAR ring cache (split-qkv varlen).
 
@@ -911,6 +918,7 @@ def gdn_replayssm_spec_decode(
             nk,
             bs_min,
             null_block_id,
+            dot_precision,
         )
     if launch_mode in ("both", "flush"):
         _launch_gdn_spec(
@@ -945,6 +953,7 @@ def gdn_replayssm_spec_decode(
             nk_flush,
             bs_min,
             null_block_id,
+            dot_precision,
         )
     return out
 

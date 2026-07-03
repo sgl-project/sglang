@@ -527,15 +527,24 @@ class MambaPool:
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
                 L = linear_replayssm_cache_len
                 num_slots = size + 1
-                # Ring records live in the SSM dtype (bf16/fp32) except g (fp32).
+                # Ring dtype. DECODE ring (--enable-linear-replayssm): records
+                # follow the SSM dtype -- its flush folds `d` directly into the
+                # state. SPEC-verify ring (--enable-gdn-replayssm-spec): d/k feed
+                # ONLY the one-shot output reconstruction (the closed-loop exact
+                # fold replays the raw rings for state instead), so their
+                # quantization noise stays below the bf16 output cast; keep them
+                # in the conv/activation dtype instead of the (fp32-enforced)
+                # SSM dtype to halve the ring traffic. g stays fp32 everywhere
+                # (exact-fold input). The two flags are mutually exclusive.
+                ring_dtype = conv_dtype if enable_gdn_replayssm_spec else ssm_dtype
                 replayssm_d = torch.zeros(
                     size=(num_mamba_layers, num_slots, hv, L, v_dim),
-                    dtype=ssm_dtype,
+                    dtype=ring_dtype,
                     device=device,
                 )
                 replayssm_k = torch.zeros(
                     size=(num_mamba_layers, num_slots, h_k, L, k_dim),
-                    dtype=ssm_dtype,
+                    dtype=ring_dtype,
                     device=device,
                 )
                 # The log-decay gate ring (fp32): per-head SCALAR for the GDN
