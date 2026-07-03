@@ -736,9 +736,7 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
 
     @staticmethod
     def _script_empty_return(t: ScriptedContext):
-        if False:
-            yield
-        return
+        yield from ()
 
     def test_failing_script_surfaces_and_session_survives(self):
         with self.assertRaises(AssertionError) as ctx:
@@ -753,7 +751,7 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
 
     @staticmethod
     def _script_minimal_ok(t: ScriptedContext):
-        r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=2)
+        t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=2)
         yield
         yield
 
