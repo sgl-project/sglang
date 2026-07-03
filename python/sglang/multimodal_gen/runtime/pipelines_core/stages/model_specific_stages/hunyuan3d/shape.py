@@ -388,8 +388,7 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
         guidance,
         latents,
     ):
-        """Hunyuan3D-specific CFG: concat latents, single forward, then split.
-        """
+        """Hunyuan3D-specific CFG: concat latents, single forward, then split."""
         cond = pos_cond_kwargs.get("encoder_hidden_states")
         do_cfg = batch.do_classifier_free_guidance
 
