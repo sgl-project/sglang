@@ -196,26 +196,6 @@ setup_pip_toolchain() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-install_flashinfer_cubin_wheel() {
-    # TEMP workaround — delete me once flashinfer-cubin 0.6.14 is on PyPI.
-    # cubin 0.6.14 is stuck behind PyPI's 10 GB/project limit
-    # (flashinfer-ai/flashinfer#3808), so we pull it from the GitHub release
-    # instead of PyPI, which would 404 at install_sglang. Delete this function
-    # and its call in main() once cubin 0.6.14 lands on PyPI.
-    CUBIN_WHEEL_URL="https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.14/flashinfer_cubin-0.6.14-py3-none-any.whl"
-    CUBIN_WHEEL_NAME="flashinfer_cubin-0.6.14-py3-none-any.whl"
-    # Cache on the runner (~/.cache/flashinfer-wheels, same dir as the
-    # jit-cache helper) to avoid re-downloading the ~458 MB wheel every run.
-    CUBIN_CACHE_DIR="${HOME}/.cache/flashinfer-wheels"
-    CUBIN_WHEEL="${CUBIN_CACHE_DIR}/${CUBIN_WHEEL_NAME}"
-    if [ ! -f "$CUBIN_WHEEL" ]; then
-        mkdir -p "$CUBIN_CACHE_DIR"
-        pip download "$CUBIN_WHEEL_URL" -d "$CUBIN_CACHE_DIR"
-    fi
-    $PIP_CMD install --no-deps "$CUBIN_WHEEL" $PIP_INSTALL_SUFFIX
-    mark_step_done "${FUNCNAME[0]}"
-}
-
 uninstall_stale_flashinfer() {
     # Keep flashinfer packages if version matches to avoid re-downloading:
     # - flashinfer-cubin: 150+ MB
@@ -544,7 +524,6 @@ main() {
     install_apt_packages
     clean_site_packages
     setup_pip_toolchain
-    install_flashinfer_cubin_wheel
     uninstall_stale_flashinfer
     install_sglang
     install_sglang_kernel
