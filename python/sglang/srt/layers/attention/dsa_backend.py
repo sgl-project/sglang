@@ -592,25 +592,6 @@ class DeepseekSparseAttnBackend(
             "num_kv_splits": self.aiter_dsa_max_split_per_batch,
         }
 
-    def _ensure_draft_extend_v2_cpu_metadata(
-        self, forward_batch: ForwardBatch, batch_size: int
-    ) -> None:
-        """Populate host lengths only for DSA draft-extend eager metadata planning."""
-        if forward_batch.extend_seq_lens_cpu is None:
-            forward_batch.extend_seq_lens_cpu = [
-                self.speculative_num_draft_tokens
-            ] * batch_size
-
-        if forward_batch.extend_prefix_lens_cpu is None:
-            assert forward_batch.extend_prefix_lens is not None
-            forward_batch.extend_prefix_lens_cpu = (
-                forward_batch.extend_prefix_lens.cpu().tolist()
-            )
-
-        if forward_batch.seq_lens_cpu is None:
-            forward_batch.seq_lens_cpu = forward_batch.seq_lens.cpu()
-            forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
-
     def _build_paged_mqa_schedule_2d_ctx_lens(
         self,
         forward_mode: ForwardMode,
@@ -774,7 +755,18 @@ class DeepseekSparseAttnBackend(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
             )
         elif forward_batch.forward_mode.is_draft_extend_v2():
-            self._ensure_draft_extend_v2_cpu_metadata(forward_batch, batch_size)
+            if forward_batch.extend_seq_lens_cpu is None:
+                forward_batch.extend_seq_lens_cpu = [
+                    self.speculative_num_draft_tokens
+                ] * batch_size
+            if forward_batch.extend_prefix_lens_cpu is None:
+                assert forward_batch.extend_prefix_lens is not None
+                forward_batch.extend_prefix_lens_cpu = (
+                    forward_batch.extend_prefix_lens.cpu().tolist()
+                )
+            if forward_batch.seq_lens_cpu is None:
+                forward_batch.seq_lens_cpu = forward_batch.seq_lens.cpu()
+                forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens is not None
