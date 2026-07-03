@@ -91,6 +91,7 @@ class TestNPUQwen3_6_35BA3B_1P_In64k_Out1k_50ms(TestNpuPerformanceTestCaseBase):
     input_len = 64000
     output_len = 1000
     random_range_ratio = 1
+    seed = 1
     tpot = 50
     output_token_throughput = 141.72
 

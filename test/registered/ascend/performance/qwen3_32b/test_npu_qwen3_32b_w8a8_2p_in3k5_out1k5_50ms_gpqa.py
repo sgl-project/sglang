@@ -99,6 +99,7 @@ class TestQwen32B(TestNpuPerformanceTestCaseBase):
     input_len = 3584
     output_len = 1536
     random_range_ratio = 1
+    seed = 1
     tpot = 50
     output_token_throughput = 1600
 

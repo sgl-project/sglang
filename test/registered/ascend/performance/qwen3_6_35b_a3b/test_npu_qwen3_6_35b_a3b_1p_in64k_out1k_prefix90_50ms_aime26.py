@@ -123,6 +123,7 @@ class TestNPUQwen3_6_35BA3B_1P_In64k_Out1k_Prefix90_50ms(
     input_len = 65536
     output_len = 1024
     random_range_ratio = 1
+    seed = 1
     repeat_rate = 0.9
     tpot = 50
     request_rate = float("inf")
