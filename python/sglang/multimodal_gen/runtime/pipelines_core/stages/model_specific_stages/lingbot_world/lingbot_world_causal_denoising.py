@@ -12,13 +12,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_ulysses_parallel_world_size,
 )
-from sglang.multimodal_gen.runtime.lingbot_world.constants import (
-    LINGBOT_C2WS_PLUCKER_EMB_CACHE,
-    LINGBOT_CAM_CONDITIONER_CACHE,
-    LINGBOT_CAMERA_ACTIONS_CONDITION,
-    LINGBOT_INTERACTIVE_KV_WINDOW_CACHE,
-    LINGBOT_PROMPT_UPDATED_CONDITION,
-)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
@@ -26,6 +19,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import
     CausalDMDDenoisingStage,
     CausalDMDForwardContext,
     CausalDMDRealtimeCacheContext,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.constants import (
+    LINGBOT_C2WS_PLUCKER_EMB_CACHE,
+    LINGBOT_CAM_CONDITIONER_CACHE,
+    LINGBOT_CAMERA_ACTIONS_CONDITION,
+    LINGBOT_INTERACTIVE_KV_WINDOW_CACHE,
+    LINGBOT_PROMPT_UPDATED_CONDITION,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,

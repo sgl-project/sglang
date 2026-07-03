@@ -14,7 +14,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter 
     build_realtime_sampling_params,
     save_realtime_first_frame,
 )
-from sglang.multimodal_gen.runtime.lingbot_world.constants import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.constants import (
     LINGBOT_CAMERA_ACTIONS_CONDITION,
     LINGBOT_PROMPT_UPDATED_CONDITION,
 )

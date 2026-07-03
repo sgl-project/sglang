@@ -11,12 +11,6 @@ from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import 
     CausalSelfAttentionKVCache,
     CrossAttentionKVCache,
 )
-from sglang.multimodal_gen.runtime.lingbot_world.constants import (
-    LINGBOT_C2WS_PLUCKER_EMB_CACHE,
-    LINGBOT_CAM_CONDITIONER_CACHE,
-    LINGBOT_PROMPT_UPDATED_CONDITION,
-    LINGBOT_ROPE_CACHE,
-)
 from sglang.multimodal_gen.runtime.models.dits import (
     lingbot_world as lingbot_world_module,
 )
@@ -28,7 +22,13 @@ from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CausalDMDCachePolicy,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.constants import (
+    LINGBOT_C2WS_PLUCKER_EMB_CACHE,
+    LINGBOT_CAM_CONDITIONER_CACHE,
+    LINGBOT_PROMPT_UPDATED_CONDITION,
+    LINGBOT_ROPE_CACHE,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.lingbot_world_causal_denoising import (
     LingBotWorldCausalDMDDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.realtime.states import RealtimeCausalDiTState
