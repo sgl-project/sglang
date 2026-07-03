@@ -34,6 +34,7 @@
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //! | `sgl_router_backpressure_rejected_total` | Counter | `model_id` |
+//! | `sgl_router_engine_aborts_total` | Counter | `reason` |
 //! | `sgl_router_queued_requests` | Gauge | (none) |
 //! | `sgl_router_admission_wait_seconds` | Histogram | `model_id` |
 //!
@@ -45,6 +46,7 @@
 //!
 //! The exposition is text/plain; version=0.0.4 per the Prometheus spec.
 
+use crate::proxy::{AbortReason, ABORT_REASON_COUNT};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -248,7 +250,7 @@ impl ActiveLoadKind {
 
 /// The shared metrics registry, held on `AppContext`. Cheap to clone — all
 /// internal state is `Arc`/`Atomic`/`Mutex`-protected.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MetricsRegistry {
     // Edge intake, counted at the `access_log_and_record` middleware BEFORE the
     // handler runs, so it includes requests parked/shed/cancelled/dropped before
@@ -275,6 +277,21 @@ pub struct MetricsRegistry {
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
     backpressure_rejected_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    /// Per-reason count of `/abort_request` POSTs the router has sent to
+    /// engines. Fixed-length array indexed by [`AbortReason::as_index`], so
+    /// the hot path is a single `AtomicU64::fetch_add` with **zero locks and
+    /// zero allocations** — deliberately not the `Mutex<HashMap<_, Arc<_>>>`
+    /// pattern used by the model-labelled counters above. At 300 RPS ×
+    /// 50 % abort rate that's ~150 aborts/s already; sharing a hashmap mutex
+    /// with every other request path on the process would be exactly the
+    /// tokenizer-BPE-cache-lock story we already had to fix once, so
+    /// don't do it again for engine aborts.
+    ///
+    /// Population is compile-time bounded by [`ABORT_REASON_COUNT`], read
+    /// via `AbortReason::as_index`; the two must stay in sync (adding a
+    /// variant without bumping the constant fails compilation on the array
+    /// size).
+    engine_aborts_total: [AtomicU64; ABORT_REASON_COUNT],
     /// Current admission wait-queue depth (parked requests). A single
     /// router-wide gauge — the queue is shared across the router, so this is a
     /// global count, not per-model.
@@ -282,6 +299,35 @@ pub struct MetricsRegistry {
     /// Time a parked request waited before admission (seconds), per model.
     /// Only parked-then-admitted requests are recorded.
     admission_wait_seconds: Mutex<HashMap<String, Histogram>>,
+}
+
+/// Manual `Default` because `[AtomicU64; N]: Default` isn't guaranteed by
+/// stable Rust for arbitrary N on every MSRV in the wild (it landed in
+/// std relatively recently), and this crate targets edition 2021 without
+/// pinning a min stable version. `std::array::from_fn` is stable since 1.63
+/// and gives us a zero-initialized array without an intermediate `Vec` or
+/// unsafe. Every other field defers to its own `Default`, keeping this
+/// impl minimally intrusive.
+impl Default for MetricsRegistry {
+    fn default() -> Self {
+        Self {
+            requests_total: Default::default(),
+            worker_requests_total: Default::default(),
+            request_duration: Default::default(),
+            ttft_seconds: Default::default(),
+            responses_total: Default::default(),
+            overlap_blocks: Default::default(),
+            active_load: Default::default(),
+            stale_requests_total: Default::default(),
+            decode_affinity_total: Default::default(),
+            sticky_total: Default::default(),
+            ingress_tokenize_errors_total: Default::default(),
+            backpressure_rejected_total: Default::default(),
+            engine_aborts_total: std::array::from_fn(|_| AtomicU64::new(0)),
+            queued_requests: Default::default(),
+            admission_wait_seconds: Default::default(),
+        }
+    }
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -579,6 +625,38 @@ impl MetricsRegistry {
             .clone();
         drop(guard);
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_engine_aborts_total{reason}` — one increment per
+    /// `/abort_request` POST the router sends to an engine, labelled with
+    /// the router-side trigger (see [`crate::proxy::AbortReason`]).
+    ///
+    /// **Lock-free hot path.** Reasons are known at compile time, so the
+    /// storage is a fixed-length `[AtomicU64; ABORT_REASON_COUNT]` indexed
+    /// by `AbortReason::as_index`. Under a burst of aborts (150 aborts/s at
+    /// 300 RPS × 50 % is the current production baseline, but we want
+    /// headroom for at least 10× that under retry storms) this must NOT
+    /// serialise on a shared mutex the way the model-labelled counters do.
+    /// The `[AtomicU64]::fetch_add` compiles to a single `lock xadd` on
+    /// x86-64 / an `ldaddl` on aarch64 — same cycle-cost as a private
+    /// counter, no cross-core cache-line ping-ponging under contention
+    /// beyond the one line this counter itself lives on.
+    ///
+    /// Paired one-for-one with the "sending /abort_request to engine" WARN
+    /// log emitted at the same drop site: the log gives per-event
+    /// attribution (rid, reason, abort_url), the counter gives aggregate
+    /// rate ("how many `stream_client_gone` aborts per second?") without
+    /// full log parsing.
+    pub(crate) fn record_engine_abort(&self, reason: AbortReason) {
+        // Bounds-safe by construction: `as_index()` is derived from a
+        // `#[repr(u8)]` enum with explicit discriminants 0..ABORT_REASON_COUNT-1,
+        // and the array is sized by the same constant.
+        //
+        // `pub(crate)` (not `pub`) matches the visibility of `AbortReason`
+        // itself — the label set is a crate-private detail; external
+        // consumers observe engine aborts through the `/metrics` scrape,
+        // not through this method.
+        self.engine_aborts_total[reason.as_index()].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Adjust `sgl_router_queued_requests` by `delta` (+1 when a request parks,
@@ -928,6 +1006,35 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // engine_aborts_total (per-reason). Iterate the fixed-length array
+        // by index; every AbortReason variant always emits a series, starting
+        // at 0 (unlike model-keyed counters where series appear only after
+        // first bump). Reason: predictable dashboards — an operator that
+        // aliases `stream_client_gone` in Grafana doesn't want a
+        // "no data" panel just because production hasn't had a client
+        // disconnect this scrape window. Sort by label for deterministic
+        // output.
+        out.push_str(
+            "# HELP sgl_router_engine_aborts_total Router-side /abort_request POSTs sent to engines, labelled with the router-side trigger (see AbortReason).\n",
+        );
+        out.push_str("# TYPE sgl_router_engine_aborts_total counter\n");
+        let mut abort_entries: Vec<(&'static str, u64)> = (0..ABORT_REASON_COUNT)
+            .map(|i| {
+                let reason = AbortReason::from_u8(i as u8);
+                (
+                    reason.as_label(),
+                    self.engine_aborts_total[i].load(Ordering::Relaxed),
+                )
+            })
+            .collect();
+        abort_entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (reason, value) in abort_entries {
+            out.push_str(&format!(
+                "sgl_router_engine_aborts_total{{reason=\"{}\"}} {}\n",
+                reason, value,
+            ));
+        }
+
         // queued_requests (router-wide gauge, no labels)
         out.push_str(
             "# HELP sgl_router_queued_requests Requests currently parked in the admission wait queue (router-wide).\n",
@@ -1025,6 +1132,15 @@ mod tests {
         assert!(out.contains("# TYPE sgl_router_decode_affinity_total counter"));
         assert!(out.contains("# TYPE sgl_router_sticky_total counter"));
         assert!(out.contains("# TYPE sgl_router_ingress_tokenize_errors_total counter"));
+        // engine_aborts always emits one series per AbortReason variant,
+        // starting at 0 — deliberately, so a Grafana panel aliased on
+        // `reason="stream_client_gone"` doesn't go blank during a healthy
+        // scrape window where no aborts fired.
+        assert!(out.contains("# TYPE sgl_router_engine_aborts_total counter"));
+        assert!(out.contains(r#"sgl_router_engine_aborts_total{reason="stream_client_gone"} 0"#));
+        assert!(
+            out.contains(r#"sgl_router_engine_aborts_total{reason="stale_request_expired"} 0"#)
+        );
         // Pool-size series exist (at 0) for all three modes even with no
         // workers, so dashboards have a stable series to graph.
         assert!(out.contains(r#"sgl_router_workers{mode="plain"} 0"#));
@@ -1069,6 +1185,70 @@ mod tests {
         let out = reg.render();
         assert!(out.contains(r#"sgl_router_request_duration_seconds_count{model_id="a"} 1"#));
         assert!(out.contains(r#"sgl_router_request_duration_seconds_count{model_id="b"} 1"#));
+    }
+
+    /// `record_engine_abort` bumps only the requested reason's counter and
+    /// leaves the others at 0. The rendered output holds one series per
+    /// variant (verified against the empty-registry test above); this test
+    /// checks that increments land on the right slot.
+    #[test]
+    fn engine_aborts_bumps_only_requested_reason() {
+        let reg = MetricsRegistry::new();
+        reg.record_engine_abort(AbortReason::StreamClientGone);
+        reg.record_engine_abort(AbortReason::StreamClientGone);
+        reg.record_engine_abort(AbortReason::StaleRequestExpired);
+        let out = reg.render();
+        assert!(out.contains(r#"sgl_router_engine_aborts_total{reason="stream_client_gone"} 2"#));
+        assert!(
+            out.contains(r#"sgl_router_engine_aborts_total{reason="stale_request_expired"} 1"#)
+        );
+        // Every other reason must remain at 0 — a fixed-size counter array
+        // with a zero-init default guarantees this, but pin it in a test so
+        // a future refactor to a dynamic map doesn't silently lose the
+        // "series exist even at zero" property.
+        assert!(out.contains(r#"sgl_router_engine_aborts_total{reason="handler_cancelled"} 0"#));
+        assert!(out.contains(r#"sgl_router_engine_aborts_total{reason="upstream_timeout"} 0"#));
+        assert!(out.contains(r#"sgl_router_engine_aborts_total{reason="transport_error"} 0"#));
+        assert!(
+            out.contains(r#"sgl_router_engine_aborts_total{reason="stream_downstream_stall"} 0"#)
+        );
+        assert!(out.contains(r#"sgl_router_engine_aborts_total{reason="stream_pump_panicked"} 0"#));
+        assert!(out.contains(r#"sgl_router_engine_aborts_total{reason="unknown"} 0"#));
+    }
+
+    /// The per-reason counter must not serialise increments on a shared
+    /// mutex — that was exactly the tokenizer BPE-cache-lock story we
+    /// already had to fix once. This test doesn't measure wall-clock
+    /// (unreliable in CI); it just verifies a burst of concurrent bumps
+    /// from many tasks all land, i.e. no fetch_add is lost. If a future
+    /// refactor puts a `Mutex` back on the hot path, correctness stays but
+    /// the perf assumption breaks — pair this with `cargo bench` numbers
+    /// in `bench/` if you re-add a lock.
+    #[tokio::test]
+    async fn engine_aborts_counter_is_lock_free_under_concurrent_bumps() {
+        let reg = MetricsRegistry::new();
+        let n_tasks: usize = 32;
+        let per_task: usize = 500;
+        let mut handles = Vec::with_capacity(n_tasks);
+        for _ in 0..n_tasks {
+            let r = Arc::clone(&reg);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..per_task {
+                    r.record_engine_abort(AbortReason::StreamClientGone);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let expected = (n_tasks * per_task) as u64;
+        let out = reg.render();
+        assert!(
+            out.contains(&format!(
+                r#"sgl_router_engine_aborts_total{{reason="stream_client_gone"}} {expected}"#,
+            )),
+            "expected {expected} bumps; got:\n{out}",
+        );
     }
 
     #[test]

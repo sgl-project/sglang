@@ -79,6 +79,12 @@ impl AppContext {
         // after the policy registry, so inject it now. No-op for policies
         // that don't emit metrics.
         policies.attach_metrics(Arc::clone(&metrics));
+        // Same rationale for the proxy's `sgl_router_engine_aborts_total`
+        // counter: the drop-side of `AbortOnDrop` reads the metrics handle
+        // stashed on `Proxy`, and this is the one place where both objects
+        // are alive together. Without this wire-in the abort counter is
+        // permanently zero even though the WARN log still fires per abort.
+        proxy.attach_metrics(Arc::clone(&metrics));
         let admission = Arc::new(AdmissionQueue::new(config.admission, Arc::clone(&metrics)));
         Self {
             config,

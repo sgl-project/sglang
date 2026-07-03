@@ -4,13 +4,15 @@
 //! SSE passthrough — bridges a reqwest `bytes_stream()` into an axum Body.
 
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
+
+use crate::proxy::AbortReason;
 
 /// Sampling counter for the diagnostic `sse_pump_timing` log. ~1-in-`SAMPLE`
 /// pump completions are logged with their first-byte / drain / exit timing and
@@ -127,6 +129,7 @@ pub fn bytes_stream_to_body<S, E>(
     stream_guards: Option<Box<dyn Send + 'static>>,
     on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>>,
     on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
+    abort_reason: Option<Arc<AtomicU8>>,
 ) -> Body
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
@@ -138,6 +141,44 @@ where
     // Total buffered bytes stay ≤ STREAM_READAHEAD_MAX_BYTES; see the type doc.
     let readahead = Arc::new(tokio::sync::Semaphore::new(STREAM_READAHEAD_MAX_BYTES));
     let readahead_pump = Arc::clone(&readahead);
+    // Helper: stamp the shared abort-reason handle inside `AbortOnDrop` before
+    // the pump's `_hold` (which owns the guard) drops. Cheap when the pump
+    // wasn't given a handle (`abort_reason` is `None` for non-streaming callers
+    // like tests), lock-free when it was.
+    fn set_abort_reason(handle: &Option<Arc<AtomicU8>>, reason: AbortReason) {
+        if let Some(h) = handle.as_ref() {
+            h.store(reason as u8, Ordering::Relaxed);
+        }
+    }
+    // Local scope guard: on drop, stamp `StreamPumpPanicked` into the shared
+    // abort-reason handle UNLESS `defuse()` has been called. Every normal
+    // pump exit path defuses (its `set_abort_reason` at the break site is the
+    // narrow reason; the marker's default would just clobber it). Only a
+    // panic — where control flow never reaches the defuse — leaves the marker
+    // armed, so the guard's `Drop` fires with the specific `StreamPumpPanicked`
+    // label instead of the constructor's `StreamClientGone` default. Declared
+    // AFTER `_hold` in the pump body so LIFO drop order runs this marker
+    // BEFORE `_hold` (which owns the `AbortOnDrop`) drops — i.e. the reason is
+    // committed before the guard reads it.
+    struct PanicReasonMarker {
+        handle: Option<Arc<AtomicU8>>,
+        defused: bool,
+    }
+    impl PanicReasonMarker {
+        fn defuse(&mut self) {
+            self.defused = true;
+        }
+    }
+    impl Drop for PanicReasonMarker {
+        fn drop(&mut self) {
+            if !self.defused {
+                if let Some(h) = self.handle.as_ref() {
+                    h.store(AbortReason::StreamPumpPanicked as u8, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    let abort_reason_for_pump = abort_reason.clone();
     tokio::spawn(async move {
         let tx_for_panic = tx.clone();
         // Capture the pump's outcome so we can report it through `on_complete`
@@ -151,6 +192,14 @@ where
             // underscore suppresses the "unused variable" lint while
             // keeping intent explicit.
             let _hold = stream_guards;
+            // Declared AFTER `_hold` so its Drop runs BEFORE `_hold` (LIFO).
+            // See `PanicReasonMarker`'s type-level doc for why this ordering
+            // matters. Mutable so `defuse()` can flip its flag before we
+            // exit through any of the non-panic paths below.
+            let mut panic_marker = PanicReasonMarker {
+                handle: abort_reason_for_pump.clone(),
+                defused: false,
+            };
             // Diagnostic timing for this stream's lifetime. `task_start` ≈ when
             // upstream headers landed (the task is spawned right after). These
             // localize whether the admission slot (held by `_hold`) lingers
@@ -226,6 +275,10 @@ where
                             // budget — clean client-side cancel, not a fault.
                             tracing::debug!("SSE client disconnected mid-stream");
                             exit_reason = "client_disconnect_blocked";
+                            set_abort_reason(
+                                &abort_reason_for_pump,
+                                AbortReason::StreamClientGone,
+                            );
                             break;
                         }
                         res = tokio::time::timeout(
@@ -249,6 +302,14 @@ where
                                 "SSE read-ahead semaphore closed unexpectedly; aborting pump"
                             );
                             exit_reason = "semaphore_closed";
+                            // Treated as a pump-side invariant violation, not a
+                            // client-side event: the same bucket as
+                            // `StreamPumpPanicked` so it stands out separately
+                            // from routine disconnects in metrics/logs.
+                            set_abort_reason(
+                                &abort_reason_for_pump,
+                                AbortReason::StreamPumpPanicked,
+                            );
                             break;
                         }
                         Err(_elapsed) => {
@@ -272,6 +333,10 @@ where
                                 "SSE downstream stalled; stream aborted before completion",
                             )));
                             exit_reason = "downstream_stall";
+                            set_abort_reason(
+                                &abort_reason_for_pump,
+                                AbortReason::StreamDownstreamStall,
+                            );
                             break;
                         }
                     }
@@ -290,6 +355,10 @@ where
                         tracing::debug!("SSE client disconnected mid-stream");
                     }
                     exit_reason = "client_gone";
+                    set_abort_reason(
+                        &abort_reason_for_pump,
+                        AbortReason::StreamClientGone,
+                    );
                     break;
                 }
                 if is_err_chunk {
@@ -298,6 +367,12 @@ where
                     break;
                 }
             }
+            // Every non-panic exit reaches this line. Defuse the marker so its
+            // Drop is a no-op: whatever narrow reason the specific exit path
+            // set (or the constructor default, for the "upstream_end" /
+            // "upstream_error" cases where `mark_terminal` flipped
+            // `reached_end` and the abort won't fire at all) stays as-is.
+            panic_marker.defuse();
             // Diagnostic: this stream's lifetime, sampled. `pump_exit_ms` is how
             // long the admission slot (held by `_hold`, dropped when this block
             // exits) was occupied by the pump; compare to the engine's own
@@ -328,6 +403,12 @@ where
                 .or_else(|| panic_payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "<non-string panic payload>".to_string());
             tracing::error!(error = %msg, "SSE pump task panicked");
+            // The `PanicReasonMarker` declared inside the pump already stamped
+            // `StreamPumpPanicked` into the abort-reason handle during unwind
+            // (its Drop runs BEFORE `_hold`'s, by LIFO drop order), so by the
+            // time we reach here the abort has already fired with the correct
+            // reason. Nothing to write from the outer scope; documenting the
+            // ordering here so nobody re-adds a stamp that would come too late.
             let _ = tx_for_panic.send(Err(std::io::Error::other(format!(
                 "SSE pump panicked: {msg}"
             ))));
@@ -456,7 +537,7 @@ mod tests {
             Ok(Bytes::from_static(b"world")),
         ];
         let s = stream::iter(chunks);
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, None);
         let bytes = body.collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], b"hello world");
     }
@@ -480,6 +561,7 @@ mod tests {
             Some(Box::new(move || {
                 fired_c.fetch_add(1, Ordering::SeqCst);
             })),
+            None,
         );
         let _ = body.collect().await.unwrap();
         assert_eq!(
@@ -507,6 +589,7 @@ mod tests {
             Some(Box::new(move || {
                 fired_c.fetch_add(1, Ordering::SeqCst);
             })),
+            None,
         );
         let _ = body.collect().await;
         assert_eq!(
@@ -523,7 +606,7 @@ mod tests {
             Err(std::io::Error::other("upstream blew up mid-stream")),
         ];
         let s = stream::iter(chunks);
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, None);
         // Collecting a body that terminates with an error must return Err.
         let result = body.collect().await;
         assert!(
@@ -585,7 +668,7 @@ mod tests {
         // that arm, the closure unwrap-or-elses would panic itself or
         // produce an empty message, which this test catches.
         let s = PanicAnyOnSecondPoll { polls: 0 };
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, None);
         let result = body.collect().await;
         assert!(
             result.is_err(),
@@ -608,7 +691,7 @@ mod tests {
         // The pump task panics mid-stream. The client must see a loud Err,
         // NOT a silently-truncated success.
         let s = PanicOnSecondPoll { polls: 0 };
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, None);
         let result = body.collect().await;
         assert!(
             result.is_err(),
@@ -619,6 +702,41 @@ mod tests {
         assert!(
             msg.contains("pump panicked") || msg.contains("SSE pump panicked"),
             "expected error message to mention pump panic, got: {msg}"
+        );
+    }
+
+    /// End-to-end verification that a panic inside the pump stamps
+    /// `AbortReason::StreamPumpPanicked` into the shared reason atom BEFORE
+    /// the pump task's `_hold` drops the guard. This is the whole point of
+    /// the `PanicReasonMarker`: its Drop runs BEFORE `_hold`'s Drop (LIFO
+    /// order of local variables), so the guard's own Drop reads the
+    /// panic-tagged reason instead of the constructor default
+    /// `StreamClientGone`.
+    ///
+    /// A regression here — someone reordering the marker vs. `_hold`
+    /// declarations, or moving the panic-reason stamp to AFTER `catch_unwind`
+    /// (which runs after `_hold` has dropped and is too late) — silently
+    /// mislabels every panic-induced abort as `stream_client_gone`, sending
+    /// operators looking at the wrong dashboards during an incident.
+    #[tokio::test]
+    async fn pump_stamps_stream_pump_panicked_on_panic() {
+        use std::sync::atomic::AtomicU8;
+
+        // Start with the streaming constructor default so we can prove the
+        // panic path actively overwrites it (a no-op wouldn't).
+        let reason = Arc::new(AtomicU8::new(AbortReason::StreamClientGone as u8));
+        let s = PanicOnSecondPoll { polls: 0 };
+        let body =
+            bytes_stream_to_body(s, None, None, None, Some(Arc::clone(&reason)));
+        // Drain the body so the pump task runs to completion (panics, gets
+        // caught by `catch_unwind`, and the panic marker's Drop has fired).
+        let _ = body.collect().await;
+        assert_eq!(
+            reason.load(Ordering::Relaxed),
+            AbortReason::StreamPumpPanicked as u8,
+            "PanicReasonMarker must have stamped StreamPumpPanicked before \
+             the pump task's _hold dropped — got {}",
+            reason.load(Ordering::Relaxed),
         );
     }
 
@@ -681,7 +799,7 @@ mod tests {
             yielded: 0,
             max: 1000, // way more than we'll let it consume
         };
-        let body = bytes_stream_to_body(stream, None, None, None);
+        let body = bytes_stream_to_body(stream, None, None, None, None);
 
         // Read exactly one frame, then drop the body to simulate client disconnect.
         let mut data_stream = body.into_data_stream();
@@ -733,7 +851,7 @@ mod tests {
             stream::pending::<Result<Bytes, std::io::Error>>(),
             std::time::Duration::from_millis(50),
         );
-        let body = bytes_stream_to_body(stalled, Some(guard), None, None);
+        let body = bytes_stream_to_body(stalled, Some(guard), None, None, None);
         tokio::spawn(async move {
             let _ = body.collect().await;
         });
@@ -782,7 +900,7 @@ mod tests {
         let s = stream::iter(chunks);
 
         // Build the Body but DO NOT read it: the client never drains a byte.
-        let _body = bytes_stream_to_body(s, Some(guard), None, None);
+        let _body = bytes_stream_to_body(s, Some(guard), None, None, None);
 
         // Let the pump run. It should race ahead of the (absent) client, reach
         // upstream-`None`, and drop the guards — all well within STREAM_SEND_STALL.
@@ -841,7 +959,7 @@ mod tests {
         // Hold the Body WITHOUT reading it: the receiver stays open (no clean
         // disconnect) but undrained, so the pump parks acquiring read-ahead
         // permits once the buffer is full.
-        let _body = bytes_stream_to_body(s, Some(guard), None, None);
+        let _body = bytes_stream_to_body(s, Some(guard), None, None, None);
 
         // Advance past the send-stall timeout. The pump must give up on the
         // non-draining client and drop its guards.
@@ -851,6 +969,47 @@ mod tests {
             "a client that stops reading (without disconnecting) must not pin \
              stream_guards — the pump must time out the blocked permit acquire \
              and release the admission slot",
+        );
+    }
+
+    /// End-to-end verification that a downstream stall (client stops draining
+    /// for `STREAM_SEND_STALL` while the connection stays open) stamps
+    /// `AbortReason::StreamDownstreamStall` into the shared reason atom before
+    /// the pump exits. Without this stamp, the guard's Drop would fire with
+    /// the constructor default `StreamClientGone`, which is a lie — the
+    /// client didn't disconnect, it just stopped consuming — and would send
+    /// operators looking at "client cancel" volume when the real signal is
+    /// "consumer backpressure / slow client."
+    ///
+    /// Mirror of `stalled_downstream_releases_stream_guards` above, adding
+    /// the reason-handle assertion the log/metric side depends on.
+    #[tokio::test(start_paused = true)]
+    async fn pump_stamps_stream_downstream_stall_on_send_stall() {
+        use std::sync::atomic::AtomicU8;
+
+        let reason = Arc::new(AtomicU8::new(AbortReason::StreamClientGone as u8));
+        // Same shape as the sibling stall test: > read-ahead budget worth
+        // of bytes to a client that never drains, so the pump parks
+        // acquiring permits and the STREAM_SEND_STALL timeout trips.
+        let chunks: Vec<Result<Bytes, std::io::Error>> = (0..20)
+            .map(|_| Ok(Bytes::from(vec![b'x'; 64 * 1024])))
+            .collect();
+        let s = stream::iter(chunks);
+        let _body =
+            bytes_stream_to_body(s, None, None, None, Some(Arc::clone(&reason)));
+        // Advance past send-stall so the pump gives up on the non-draining
+        // client. `_body` is held to keep the receiver alive during the wait
+        // — a Drop here would masquerade as a client_gone.
+        tokio::time::sleep(STREAM_SEND_STALL + std::time::Duration::from_secs(1)).await;
+        // Give the pump task a scheduling tick to finish its exit path
+        // after the timeout fires.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            reason.load(Ordering::Relaxed),
+            AbortReason::StreamDownstreamStall as u8,
+            "downstream_stall path must stamp StreamDownstreamStall, not the \
+             constructor default (a stalled client is not a gone client) — got {}",
+            reason.load(Ordering::Relaxed),
         );
     }
 
@@ -880,6 +1039,7 @@ mod tests {
             Some(Box::new(move |ok| {
                 outcome_c.store(if ok { 1 } else { 2 }, Ordering::SeqCst);
             })),
+            None,
             None,
         );
 
@@ -926,7 +1086,7 @@ mod tests {
         // guards — even though the client never read a byte.
         let big = Bytes::from(vec![b'x'; 2 * STREAM_READAHEAD_MAX_BYTES]);
         let s = stream::iter(vec![Ok::<Bytes, std::io::Error>(big)]);
-        let _body = bytes_stream_to_body(s, Some(guard), None, None);
+        let _body = bytes_stream_to_body(s, Some(guard), None, None, None);
 
         for _ in 0..1000 {
             if dropped.load(Ordering::SeqCst) {
@@ -949,7 +1109,7 @@ mod tests {
     async fn oversized_single_chunk_streams_through_intact() {
         let big = vec![b'x'; 2 * STREAM_READAHEAD_MAX_BYTES];
         let s = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(big.clone()))]);
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, None);
         let bytes = body.collect().await.unwrap().to_bytes();
         assert_eq!(
             bytes.len(),
