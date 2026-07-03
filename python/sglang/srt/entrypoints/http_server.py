@@ -104,6 +104,7 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
 from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
+from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -173,6 +174,7 @@ from sglang.srt.utils.json_response import (
     dumps_json,
     orjson_response,
 )
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
@@ -336,6 +338,10 @@ async def lifespan(fast_api_app: FastAPI):
 
         tool_server = MCPToolServer()
         await tool_server.add_tool_server(server_args.tool_server)
+    elif envs.EXA_API_KEY.get():
+        from sglang.srt.entrypoints.openai.tool_server import NativeToolServer
+
+        tool_server = NativeToolServer()
 
     try:
         from sglang.srt.entrypoints.openai.serving_responses import (
@@ -380,6 +386,8 @@ async def lifespan(fast_api_app: FastAPI):
     try:
         yield
     finally:
+        if tool_server is not None and hasattr(tool_server, "aclose"):
+            await tool_server.aclose()
         warmup_thread.join()
 
 
@@ -395,6 +403,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
+    from sglang.srt.entrypoints.http_request_decompression import (
+        RequestDecompressionMiddleware,
+    )
+
+    app.add_middleware(RequestDecompressionMiddleware)
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -698,16 +713,18 @@ async def server_info():
     server_args = _global_state.tokenizer_manager.server_args
 
     # server_args.model_config is not serializable but should be excluded by asdict.
-    return {
-        **dataclasses.asdict(server_args),
-        **_global_state.scheduler_info,
-        "internal_states": internal_states,
-        "version": __version__,
-        # Structured KV-event publisher descriptor for KV-aware routers.
-        # `None` when publishing is disabled or misconfigured; see
-        # `ServerArgs.describe_kv_events_publisher` for the precise contract.
-        "kv_events": server_args.describe_kv_events_publisher(),
-    }
+    return msgspec_to_builtins(
+        {
+            **dataclasses.asdict(server_args),
+            **_global_state.scheduler_info,
+            "internal_states": internal_states,
+            "version": __version__,
+            # Structured KV-event publisher descriptor for KV-aware routers.
+            # `None` when publishing is disabled or misconfigured; see
+            # `ServerArgs.describe_kv_events_publisher` for the precise contract.
+            "kv_events": server_args.describe_kv_events_publisher(),
+        }
+    )
 
 
 @app.get("/get_load")
@@ -772,6 +789,8 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 )
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+    if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
+        apply_header_overrides(obj, request.headers)
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -1417,7 +1436,7 @@ async def load_lora_adapter(
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
-    return ORJSONResponse(result, status_code=status_code)
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
@@ -1429,7 +1448,7 @@ async def load_lora_adapter_from_tensors(
         obj, request
     )
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
-    return ORJSONResponse(result, status_code=status_code)
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
 @app.api_route("/unload_lora_adapter", methods=["POST"])
@@ -1440,7 +1459,7 @@ async def unload_lora_adapter(
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
-    return ORJSONResponse(result, status_code=status_code)
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
 @app.api_route("/open_session", methods=["GET", "POST"])
