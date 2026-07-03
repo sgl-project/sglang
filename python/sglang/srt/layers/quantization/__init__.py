@@ -34,6 +34,7 @@ from sglang.srt.layers.quantization.gptq import (
     GPTQAscendConfig,
     GPTQConfig,
     GPTQMarlinConfig,
+    GPTQXPUConfig,
 )
 from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -60,6 +61,7 @@ from sglang.srt.utils import (
     is_hip,
     is_mps,
     is_npu,
+    is_xpu,
     mxfp_supported,
 )
 
@@ -113,6 +115,14 @@ if is_npu():
     BASE_QUANTIZATION_METHODS.update(
         {
             "gptq": GPTQAscendConfig,
+        }
+    )
+
+
+if is_xpu():
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "gptq": GPTQXPUConfig,
         }
     )
 

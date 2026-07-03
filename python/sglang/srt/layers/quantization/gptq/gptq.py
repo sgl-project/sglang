@@ -28,6 +28,7 @@ from .schemes import (
     GPTQMarlinLinearScheme,
     GPTQMarlinMoEScheme,
     GPTQMoEAscendScheme,
+    GPTQXPULinearScheme,
 )
 
 if TYPE_CHECKING:
@@ -259,6 +260,34 @@ class CPUGPTQConfig(GPTQConfig):
 
         assert isinstance(layer, FusedMoE)
         return GPTQIntelAMXMoEScheme(self)
+
+
+class GPTQXPUConfig(GPTQConfig):
+    """Config class for GPTQ on Intel XPU.
+
+    Dense int4 GPTQ lowers to torch's native ``_weight_int4pack_mm`` op (no
+    Marlin on XPU). MoE is out of scope for the dense phase.
+    """
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+        return [torch.half, torch.bfloat16]
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[LinearMethodBase]:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if isinstance(layer, FusedMoE):
+            raise NotImplementedError(
+                "GPTQ MoE is not yet supported on XPU (dense-only phase)."
+            )
+        return get_linear_quant_method(
+            self, layer, prefix=prefix, linear_method_cls=GPTQLinearMethod
+        )
+
+    def get_linear_scheme(self, layer: torch.nn.Module):
+        return GPTQXPULinearScheme(self)
 
 
 class GPTQMarlinConfig(QuantizationConfig):

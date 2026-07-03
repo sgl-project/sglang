@@ -33,6 +33,7 @@ from .schemes import (
     AWQLinearScheme,
     AWQMarlinLinearScheme,
     AWQMoEScheme,
+    AWQXPULinearScheme,
 )
 
 if TYPE_CHECKING:
@@ -102,7 +103,9 @@ class AWQConfig(QuantizationConfig):
         return "awq"
 
     def get_supported_act_dtypes(self) -> List[torch.dtype]:
-        return [torch.float16] if not _is_npu else [torch.float16, torch.bfloat16]
+        if _is_npu or _is_xpu:
+            return [torch.float16, torch.bfloat16]
+        return [torch.float16]
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -164,6 +167,8 @@ class AWQConfig(QuantizationConfig):
         # plugin factory once quantization hooks are available there.
         if _is_npu:
             return AWQAscendLinearScheme(self)
+        if _is_xpu:
+            return AWQXPULinearScheme(self)
         return AWQLinearScheme(self)
 
     def get_moe_scheme(self, layer: torch.nn.Module):
