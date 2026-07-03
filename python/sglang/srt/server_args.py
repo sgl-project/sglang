@@ -754,14 +754,20 @@ class ServerArgs:
     page_size: A[Optional[int], "The number of tokens in a page."] = None
     swa_full_tokens_ratio: A[
         float,
-        (
-            "The ratio of SWA layer KV tokens / full layer KV tokens, regardless "
-            "of the number of swa:full layers. It should be between 0 and 1. "
-            "E.g. 0.5 means if each swa layer has 50 tokens, then each full "
-            "layer has 100 tokens."
+        Arg(
+            help=(
+                "The ratio of SWA layer KV tokens / full layer KV tokens, regardless "
+                "of the number of swa:full layers. It should be between 0 and 1. "
+                "E.g. 0.5 means if each swa layer has 50 tokens, then each full "
+                "layer has 100 tokens."
+            ),
+            model_overridable=True,
         ),
     ] = 0.8
-    disable_hybrid_swa_memory: A[bool, "Disable the hybrid SWA memory pool."] = False
+    disable_hybrid_swa_memory: A[
+        bool,
+        Arg(help="Disable the hybrid SWA memory pool.", model_overridable=True),
+    ] = False
     radix_eviction_policy: A[
         str,
         Arg(
@@ -4235,20 +4241,8 @@ class ServerArgs:
                     logger.info(
                         "Auto-select fa3 attention backend for Step3p7 on Hopper."
                     )
-            if self.speculative_algorithm == "EAGLE":
-                self.enable_multi_layer_eagle = True
-                logger.info(
-                    "Enable multi-layer EAGLE speculative decoding for Step3p5ForCausalLM model."
-                )
-            if self.enable_hierarchical_cache:
-                self.swa_full_tokens_ratio = 1.0
-                logger.warning(
-                    "Reset swa_full_tokens_ratio to 1.0 for Step3p5ForCausalLM model with hierarchical cache"
-                )
-                self.disable_hybrid_swa_memory = True
-                logger.warning(
-                    "Disable hybrid SWA memory for Step3p5ForCausalLM model with hierarchical cache"
-                )
+            # EAGLE multi-layer + hierarchical-cache SWA writes moved to the
+            # R0 registry (arg_groups/overrides.py: _step3p_overrides).
         elif model_arch in LLAMA4_MODEL_ARCHS and self.device != "cpu":
             # Auto-select attention backend for Llama4 if not specified
             if self.attention_backend is None:
