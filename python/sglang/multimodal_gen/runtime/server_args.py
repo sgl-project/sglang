@@ -938,8 +938,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 or self.vae_cpu_offload
             ):
                 logger.warning(
-                    "Disabling component CPU offload on MPS because CPU-to-MPS "
-                    "module relocation can produce invalid diffusion outputs."
+                    "Disabling component CPU offload on MPS because the component "
+                    "residency offload strategy is only validated on CUDA."
                 )
             self.dit_cpu_offload = False
             self.text_encoder_cpu_offload = False

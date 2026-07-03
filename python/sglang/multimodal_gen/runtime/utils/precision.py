@@ -1,4 +1,4 @@
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Iterator, Optional, Union
 
 import torch
@@ -75,6 +75,16 @@ def autocast_enabled(dtype: torch.dtype, disable_autocast: bool) -> bool:
         dtype != torch.float32
         and not disable_autocast
         and current_platform.is_amp_supported()
+    )
+
+
+def autocast_context(dtype: torch.dtype, disable_autocast: bool):
+    if not autocast_enabled(dtype, disable_autocast):
+        return nullcontext()
+    return torch.autocast(
+        device_type=current_platform.device_type,
+        dtype=dtype,
+        enabled=True,
     )
 
 

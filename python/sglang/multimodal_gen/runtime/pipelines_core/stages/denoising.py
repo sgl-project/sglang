@@ -108,6 +108,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context as precision_autocast_context,
+)
+from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled as precision_autocast_enabled,
 )
 from sglang.multimodal_gen.runtime.utils.precision import (
@@ -1489,11 +1492,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         use_nvtx = self._apply_nvtx_gate(ctx.is_warmup)
 
         with (
-            torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=ctx.target_dtype,
-                enabled=ctx.autocast_enabled,
-            ),
+            precision_autocast_context(ctx.target_dtype, server_args.disable_autocast),
             maybe_nvtx_range("denoising_loop", use_nvtx),
         ):
             with self.progress_bar(
