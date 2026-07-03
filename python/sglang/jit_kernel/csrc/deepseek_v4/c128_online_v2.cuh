@@ -237,8 +237,8 @@ SGL_DEVICE void c128_prefill_segment_softmax(
 ///   Reads optional prior state from `read_page_0` (-1 = none), emits compressed
 ///   kv to `kv_compressed_output[plan_id]` (compact).
 /// `kWrite=true`  (write pass)   : handles trailing partial segments.
-///   Reads optional prior state from `read_page_0` (-1 = none), writes new
-///   running state to `read_page_1`.
+///   Reads optional prior state from `read_page_1` (-1 = fallback to
+///   `read_page_0`), writes new running state to `read_page_0`.
 template <int64_t kHeadDim, bool kWrite, bool kUsePDL>
 __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
     void flash_c128_online_prefill_v2(const __grid_constant__ Compress128OnlinePrefillParams params) {
@@ -279,13 +279,13 @@ __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
 
   constexpr int64_t kElementSize = kHeadDim * 2;  // | kv | score |
 
-  // The plan stores last-token coordinates; segment start is recoverable as
-  // ragged_id - window_len + 1.
+  // `j` below is a chunk-local offset. Convert it to the ragged-input row by
+  // anchoring on the last token in this segment: ragged_id - pos_in_chunk_end + 1 + j.
   const uint32_t window_len = plan.buffer_len;
   const uint32_t position = plan.seq_len - 1;
   const uint32_t pos_in_chunk_end = (position % 128u) + 1u;     // exclusive, in [1, 128]
   const uint32_t chunk_offset = pos_in_chunk_end - window_len;  // in [0, 127]
-  const int32_t segment_start_ragged = static_cast<int32_t>(plan.ragged_id) - static_cast<int32_t>(position % 128u);
+  const int32_t chunk_start_ragged = static_cast<int32_t>(plan.ragged_id) - static_cast<int32_t>(pos_in_chunk_end) + 1;
 
   // --- Stage 1: load kv / score / bias for this warp's 8 chunk positions.
   PrefillStorage kv[kElementsPerWarp];
@@ -297,7 +297,8 @@ __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
   for (uint32_t i = 0; i < kElementsPerWarp; ++i) {
     const uint32_t j = i + warp_offset;
     if (j >= chunk_offset && j < pos_in_chunk_end) {
-      const auto kv_src_ptr = kv_score_input + (segment_start_ragged + j) * kElementSize + split_offset;
+      const int32_t ragged_id = chunk_start_ragged + static_cast<int32_t>(j);
+      const auto kv_src_ptr = kv_score_input + ragged_id * kElementSize + split_offset;
       const auto score_src_ptr = kv_src_ptr + kHeadDim;
       const auto bias_src_ptr = score_bias_base + j * kHeadDim + split_offset;
       kv[i].load(kv_src_ptr, lane_id);
@@ -334,9 +335,10 @@ __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
     out_max_vec.load(seg_max, lane_id);
     out_sum_vec.load(seg_sum, lane_id);
 
-    if (chunk_offset != 0 && plan.read_page_0 >= 0) {
+    const int32_t read_page = plan.read_page_1 >= 0 ? plan.read_page_1 : plan.read_page_0;
+    if (chunk_offset != 0 && read_page >= 0) {
       // Combine with prior partial state for this slot.
-      const auto buf_load = kv_score_buffer + plan.read_page_0 * (kHeadDim * 3) + split_offset;
+      const auto buf_load = kv_score_buffer + read_page * (kHeadDim * 3) + split_offset;
       PrefillStorage buf_max_vec, buf_sum_vec, buf_kv_vec;
       buf_max_vec.load(buf_load + 0 * kHeadDim, lane_id);
       buf_sum_vec.load(buf_load + 1 * kHeadDim, lane_id);
@@ -467,8 +469,8 @@ struct FlashCompress128OnlineKernel {
         .with_device(device_)
         .verify(ape);
 
-    // Both compress and write segments use PlanC layout. plan_c uses
-    // read_page_1=-1 (unused); plan_w uses read_page_1=store_slot.
+    // Both compress and write segments use PlanC layout. Stage 1 stores the
+    // committed-bank load slot in read_page_1 and the write slot in read_page_0.
     const auto plan_c = compress::verify_plan_c(plan_c_, C, device_);
     const auto plan_w = compress::verify_plan_c(plan_w_, W, device_);
     const auto device = device_.unwrap();
@@ -512,8 +514,9 @@ struct FlashCompress128OnlineKernel {
 //     GPU kernel that finalizes `read_page_0` to `req_to_token[rid][chunk_start]`,
 //     so the slot tensors never leave GPU memory. The online state pool keeps
 //     a single in-progress chunk per request, so each segment's load and
-//     store slot collapse to one value (the slot for the segment's own chunk),
-//     and `read_page_1` is unused.
+//     store slot collapse to one value (the slot for the segment's own chunk).
+//     For online-c128 MTP, stage 1 keeps that write slot in `read_page_0` and
+//     stores the committed-bank load slot in `read_page_1`.
 // ===========================================================================
 
 namespace host::compress {
@@ -530,9 +533,8 @@ struct OnlineDecodePlanParams {
   const int64_t* __restrict__ seq_lens;
   const int64_t* __restrict__ req_pool_indices;
   const int32_t* __restrict__ req_to_token;
-  const int64_t* __restrict__ full_to_swa;  // (full_cache_size,) int64
   int64_t stride_r2t;
-  int32_t swa_page_size;
+  int32_t state_slot_offset;
   uint32_t batch_size;
 };
 
@@ -541,10 +543,7 @@ __global__ void plan_c128_online_decode_kernel(const OnlineDecodePlanParams para
   if (idx >= params.batch_size) return;
   const auto seq_len = static_cast<uint32_t>(params.seq_lens[idx]);
   const auto rid = params.req_pool_indices[idx];
-  const int32_t chunk_start = static_cast<int32_t>((seq_len - 1u) / 128u * 128u);
-  const int32_t full_loc = params.req_to_token[rid * params.stride_r2t + chunk_start];
-  const int32_t swa_loc = static_cast<int32_t>(params.full_to_swa[full_loc]);
-  const int32_t slot = swa_loc / params.swa_page_size;
+  const int32_t slot = static_cast<int32_t>(rid) + params.state_slot_offset;
   params.plan_d[idx] = DecodePlan{
       .seq_len = seq_len,
       .write_loc = slot,
@@ -562,9 +561,8 @@ inline void plan_online_decode(
     const tvm::ffi::TensorView seq_lens,
     const tvm::ffi::TensorView req_pool_indices,
     const tvm::ffi::TensorView req_to_token,
-    const tvm::ffi::TensorView full_to_swa,
     const tvm::ffi::TensorView plan_d_dev_,
-    const int32_t swa_page_size) {
+    const int32_t state_slot_offset) {
   auto B = SymbolicSize{"batch_size"};
   auto device_ = SymbolicDevice{};
   device_.set_options<kDLCUDA>();
@@ -582,15 +580,11 @@ inline void plan_online_decode(
       .with_dtype<int32_t>()
       .with_device(device_)
       .verify(req_to_token);
-  TensorMatcher({-1})  //
-      .with_dtype<int64_t>()
-      .with_device(device_)
-      .verify(full_to_swa);
   TensorMatcher({B, sizeof(DecodePlan)})  //
       .with_dtype<uint8_t>()
       .with_device(device_)
       .verify(plan_d_dev_);
-  RuntimeCheck(swa_page_size > 0);
+  RuntimeCheck(state_slot_offset >= 0);
 
   const auto batch_size = static_cast<uint32_t>(B.unwrap());
   if (batch_size == 0) return;
@@ -604,9 +598,8 @@ inline void plan_online_decode(
       .seq_lens = static_cast<const int64_t*>(seq_lens.data_ptr()),
       .req_pool_indices = static_cast<const int64_t*>(req_pool_indices.data_ptr()),
       .req_to_token = static_cast<const int32_t*>(req_to_token.data_ptr()),
-      .full_to_swa = static_cast<const int64_t*>(full_to_swa.data_ptr()),
       .stride_r2t = stride_r2t,
-      .swa_page_size = swa_page_size,
+      .state_slot_offset = state_slot_offset,
       .batch_size = batch_size,
   };
   LaunchKernel(num_blocks, kBlockSize, device)(plan_c128_online_decode_kernel, params);
@@ -654,7 +647,7 @@ inline std::tuple<uint32_t, uint32_t> _plan_prefill_partial(const OnlinePrefillS
           .ragged_id = static_cast<uint16_t>(last_ragged),
           .buffer_len = static_cast<uint16_t>(seg_len),
           .read_page_0 = static_cast<int32_t>(i),  // batch_id placeholder
-          .read_page_1 = -1,                       // unused, kept so MSB layout is stable
+          .read_page_1 = -1,                       // filled by stage 1 with committed-bank slot
       };
       if (chunk_off + seg_len == 128u) {
         // close-chunk segment
@@ -678,9 +671,8 @@ struct OnlinePrefillStage1Params {
   CompressPlan* __restrict__ plan_w;
   const int64_t* __restrict__ req_pool_indices;  // (batch_size,)
   const int32_t* __restrict__ req_to_token;      // (num_reqs, max_tokens)
-  const int64_t* __restrict__ full_to_swa;       // (full_cache_size,)
   int64_t stride_r2t;
-  int32_t swa_page_size;
+  int32_t state_slot_offset;
   uint32_t num_c;
   uint32_t num_w;
 };
@@ -693,13 +685,12 @@ __global__ void plan_c128_online_prefill_kernel(const OnlinePrefillStage1Params 
   const bool is_compress = idx < params.num_c;
   CompressPlan* const plan_ptr = is_compress ? &params.plan_c[idx] : &params.plan_w[idx - params.num_c];
   auto plan = *plan_ptr;
+  if (plan.is_invalid()) return;
   const auto batch_id = plan.read_page_0;
   const auto rid = params.req_pool_indices[batch_id];
-  const int32_t position = static_cast<int32_t>(plan.seq_len - 1u);
-  const int32_t chunk_start = (position / 128) * 128;
-  const int32_t full_loc = params.req_to_token[rid * params.stride_r2t + chunk_start];
-  const int32_t swa_loc = static_cast<int32_t>(params.full_to_swa[full_loc]);
-  plan.read_page_0 = swa_loc / params.swa_page_size;
+  const int32_t main_slot = static_cast<int32_t>(rid);
+  plan.read_page_0 = main_slot + params.state_slot_offset;
+  plan.read_page_1 = main_slot;
   *plan_ptr = plan;
 }
 
@@ -710,12 +701,12 @@ inline OnlinePrefillPlan plan_online_prefill(
     const tvm::ffi::TensorView extend_lens,
     const tvm::ffi::TensorView req_pool_indices,
     const tvm::ffi::TensorView req_to_token,
-    const tvm::ffi::TensorView full_to_swa,
     const tvm::ffi::TensorView plan_c_pin,
     const tvm::ffi::TensorView plan_w_pin,
     const tvm::ffi::TensorView plan_c_dev_,
     const tvm::ffi::TensorView plan_w_dev_,
-    const int32_t swa_page_size) {
+    const int32_t state_slot_offset,
+    const bool use_cuda_graph) {
   auto B = SymbolicSize{"batch_size"};
   auto N = SymbolicSize{"num_q_tokens"};
   auto cpu = SymbolicDevice{};
@@ -736,10 +727,6 @@ inline OnlinePrefillPlan plan_online_prefill(
       .with_dtype<int32_t>()
       .with_device(device_)
       .verify(req_to_token);
-  TensorMatcher({-1})  //
-      .with_dtype<int64_t>()
-      .with_device(device_)
-      .verify(full_to_swa);
   TensorMatcher({N, sizeof(CompressPlan)})  //
       .with_dtype<uint8_t>()
       .with_device(cpu)
@@ -750,6 +737,7 @@ inline OnlinePrefillPlan plan_online_prefill(
       .with_device(device_)
       .verify(plan_c_dev_)
       .verify(plan_w_dev_);
+  RuntimeCheck(state_slot_offset >= 0);
 
   const auto stage0_params = OnlinePrefillStage0Params{
       .plan_c = static_cast<CompressPlan*>(plan_c_pin.data_ptr()),
@@ -784,6 +772,8 @@ inline OnlinePrefillPlan plan_online_prefill(
   }
 
   const auto [num_c, num_w] = _plan_prefill_partial(stage0_params);
+  const auto num_c_padded = use_cuda_graph ? static_cast<uint32_t>(N.unwrap()) : num_c;
+  const auto num_w_padded = use_cuda_graph ? static_cast<uint32_t>(N.unwrap()) : num_w;
 
   if (kGuard) {
     // Verify stage 0 wrote ONLY to the [0, num_c*16) and [0, num_w*16) prefix.
@@ -821,7 +811,19 @@ inline OnlinePrefillPlan plan_online_prefill(
   auto* const plan_c_dev_ptr = static_cast<CompressPlan*>(plan_c_dev_.data_ptr());
   auto* const plan_w_dev_ptr = static_cast<CompressPlan*>(plan_w_dev_.data_ptr());
 
-  if (const auto total = num_c + num_w) {
+  if (use_cuda_graph) {
+    const auto kInvalidPlan = CompressPlan::invalid();
+    auto* const plan_c_pin_ptr = static_cast<CompressPlan*>(plan_c_pin.data_ptr());
+    auto* const plan_w_pin_ptr = static_cast<CompressPlan*>(plan_w_pin.data_ptr());
+    for (const auto i : irange(num_c, num_c_padded)) {
+      plan_c_pin_ptr[i] = kInvalidPlan;
+    }
+    for (const auto i : irange(num_w, num_w_padded)) {
+      plan_w_pin_ptr[i] = kInvalidPlan;
+    }
+  }
+
+  if (const auto total = num_c_padded + num_w_padded) {
     const auto stream = LaunchKernel::resolve_device(device);
     // SGLANG_DEBUG_C128_ONLINE_SYNC_H2D=1 forces a synchronous H2D copy.
     static const bool kSyncH2D = []() {
@@ -842,25 +844,24 @@ inline OnlinePrefillPlan plan_online_prefill(
         RuntimeDeviceCheck(::cudaMemcpyAsync(dst, src, bytes, ::cudaMemcpyHostToDevice, stream));
       }
     };
-    if (num_c) copy_to_device(plan_c_dev_ptr, plan_c_pin.data_ptr(), num_c);
-    if (num_w) copy_to_device(plan_w_dev_ptr, plan_w_pin.data_ptr(), num_w);
+    if (num_c_padded) copy_to_device(plan_c_dev_ptr, plan_c_pin.data_ptr(), num_c_padded);
+    if (num_w_padded) copy_to_device(plan_w_dev_ptr, plan_w_pin.data_ptr(), num_w_padded);
 
     const auto stage1_params = OnlinePrefillStage1Params{
         .plan_c = plan_c_dev_ptr,
         .plan_w = plan_w_dev_ptr,
         .req_pool_indices = static_cast<const int64_t*>(req_pool_indices.data_ptr()),
         .req_to_token = static_cast<const int32_t*>(req_to_token.data_ptr()),
-        .full_to_swa = static_cast<const int64_t*>(full_to_swa.data_ptr()),
         .stride_r2t = req_to_token.stride(0),
-        .swa_page_size = swa_page_size,
-        .num_c = num_c,
-        .num_w = num_w,
+        .state_slot_offset = state_slot_offset,
+        .num_c = num_c_padded,
+        .num_w = num_w_padded,
     };
     constexpr uint32_t kBlockSize = 128;
     const auto num_blocks = host::div_ceil(total, kBlockSize);
     LaunchKernel(num_blocks, kBlockSize, device)(plan_c128_online_prefill_kernel, stage1_params);
   }
-  return OnlinePrefillPlan{num_c, num_w};
+  return OnlinePrefillPlan{num_c_padded, num_w_padded};
 }
 
 }  // namespace host::compress

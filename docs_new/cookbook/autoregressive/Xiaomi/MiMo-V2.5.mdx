@@ -88,6 +88,7 @@ import { MiMoV25Deployment } from '/src/snippets/autoregressive/mimo-v25-deploym
 **MiMo-V2.5 (310B):**
 - The checkpoint has a TP=4-interleaved fused `qkv_proj`; attention-TP per DP group **must** be 4. Use `--dp = TP / 4`; for TP > 4 this also requires DP-attention. Total GPUs must be a multiple of 4. A bare `--tp 8` without `--dp 2` will fail to load with `MiMoV2 fused qkv_proj checkpoint is TP=4-interleaved; got attention tp_size=8`.
 - Single-node deployments: H100/H200 8× GPUs (`--tp 8 --dp 2`), B200 4× GPUs (`--tp 4`, dp=1, no DP-attn flag needed), GB300 4× GPUs (`--tp 4`, single NVL4 node). FP8 quantization.
+- On Blackwell, pass `--mm-attention-backend fa4` for the V2.5 vision encoder. The checkpoint config requests FlashAttention-3 internally, but SGLang rejects FA3 on Blackwell and expects FA4 for multimodal attention.
 - `--enable-dp-lm-head` and `--mm-enable-dp-encoder` are required whenever `--enable-dp-attention` is on, to keep LM head and encoder sharding consistent.
 - EAGLE MTP uses the checkpoint's MTP weights. Enable with `--speculative-algorithm EAGLE` and `--enable-multi-layer-eagle` (both Hopper and Blackwell).
 - **Multimodal**: Supports image, video, and audio understanding; see Section 4.3 for invocation examples.

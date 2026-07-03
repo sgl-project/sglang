@@ -36,7 +36,7 @@ from sglang.benchmark.datasets.sharegpt import sample_sharegpt_requests
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
-register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
 
 class _DummyTokenTensor:
@@ -985,7 +985,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         # flags with the rank-based Zipf formula and the alpha constraint,
         # and argparse rejects an unknown distribution choice.
         help_res = subprocess.run(
-            [sys.executable, "-m", "sglang.bench_serving", "--help"],
+            [sys.executable, "-m", "sglang.benchmark.serving", "--help"],
             capture_output=True,
             text=True,
             timeout=90,
@@ -1005,7 +1005,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "sglang.bench_serving",
+                "sglang.benchmark.serving",
                 "--dataset-name",
                 "generated-shared-prefix",
                 "--gsp-group-distribution",
@@ -1026,7 +1026,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "sglang.bench_serving",
+                "sglang.benchmark.serving",
                 "--dataset-name",
                 "generated-shared-prefix",
                 "--gsp-group-distribution",
@@ -1061,7 +1061,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "sglang.bench_serving",
+                "sglang.benchmark.serving",
                 "--dataset-name",
                 "generated-shared-prefix",
                 "--gsp-group-distribution",

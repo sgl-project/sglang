@@ -464,7 +464,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             compile_kwargs = {
                 "mode": "default",
                 "fullgraph": False,
-                "dynamic": True,
+                "dynamic": False,
             }
 
         gen_layers = getattr(transformer, "gen_layers", None)

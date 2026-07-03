@@ -382,17 +382,36 @@ class TestNixlUnified(CustomTestCase):
                 num_pages * mock_host.page_size, dtype=torch.int64
             )
 
+            # Distinct data per key so a round trip that mixes keys up (e.g. a
+            # FILE registration that collapses every desc onto one file) is
+            # caught, not just the pass/fail return codes. Non-zero-copy only:
+            # the layer_first layout makes per-page seeding straightforward.
+            if not is_zero_copy_mode:
+                ps = mock_host.page_size
+                for p in range(num_pages):
+                    mock_host.kv_buffer[:, :, p * ps : (p + 1) * ps] = float(p + 1)
+                expected = mock_host.kv_buffer.clone()
+
             set_results = hicache.batch_set_v1(keys, host_indices)
             self.assertTrue(
                 all(set_results),
                 f"batch_set_v1 failed (zero_copy={is_zero_copy_mode}): {set_results}",
             )
 
+            if not is_zero_copy_mode:
+                mock_host.kv_buffer.zero_()
+
             get_results = hicache.batch_get_v1(keys, host_indices)
             self.assertTrue(
                 all(get_results),
                 f"batch_get_v1 failed (zero_copy={is_zero_copy_mode}): {get_results}",
             )
+
+            if not is_zero_copy_mode:
+                self.assertTrue(
+                    torch.equal(mock_host.kv_buffer, expected),
+                    "round trip corrupted or mixed up per-key data",
+                )
         finally:
             agent.get_reg_descs = orig_get_reg
             agent.register_memory = orig_register
@@ -784,7 +803,7 @@ class TestNixlFileLayout(CustomTestCase):
 
     def test_route_key_is_stable_and_bucketed(self):
         from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
-            _BUCKET_HEX_CHARS,
+            BUCKET_HEX_CHARS,
             route_key,
         )
 
@@ -792,8 +811,8 @@ class TestNixlFileLayout(CustomTestCase):
         disk_idx, bucket = route_key("page-123", 4)
         self.assertGreaterEqual(disk_idx, 0)
         self.assertLess(disk_idx, 4)
-        self.assertEqual(len(bucket), _BUCKET_HEX_CHARS)
-        self.assertRegex(bucket, rf"^[0-9a-f]{{{_BUCKET_HEX_CHARS}}}$")
+        self.assertEqual(len(bucket), BUCKET_HEX_CHARS)
+        self.assertRegex(bucket, rf"^[0-9a-f]{{{BUCKET_HEX_CHARS}}}$")
 
     def test_route_key_rejects_empty_disk_set(self):
         from sglang.srt.mem_cache.storage.nixl.nixl_routing import route_key

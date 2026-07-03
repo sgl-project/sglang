@@ -39,9 +39,14 @@ export const Playground = ({ config }) => {
   const STORAGE_KEY = "sglang-deploy-env";
 
   const pgFeatures = config.playgroundFeatures || {};
+  // Single-host PD runs prefill + decode as two engines on one box. Each derives
+  // 5 consecutive ZMQ/dist ports from its --port (port+233, see server_args.py
+  // ZMQ_TCP_PORT_DELTA), so the serve ports are spaced 100 apart to keep those
+  // derived ranges from overlapping — no --dist-init-addr needed single-host.
+  // `dist` is only used by the multi-node renderer (cross-node rendezvous).
   const PD_PORTS = {
     prefill: { serve: 30000, dist: 30335 },
-    decode:  { serve: 30001, dist: 30435 },
+    decode:  { serve: 30100, dist: 30435 },
   };
 
   // ==========================================================================
@@ -698,12 +703,10 @@ export const Playground = ({ config }) => {
           if (value.ibDevice && value.ibDevice !== "auto") {
             adds.push(`--disaggregation-ib-device ${value.ibDevice}`);
           }
-          // Single-host bootstrap port only (multi-node gets --dist-init-addr
-          // from the renderer).
-          if (sel.nodes === "single"
-              && !flags.some((f) => f.startsWith("--dist-init-addr"))) {
-            adds.push(`--dist-init-addr 127.0.0.1:${PD_PORTS[value.mode].dist}`);
-          }
+          // Single-host needs no --dist-init-addr: prefill/decode derive their
+          // ZMQ/dist ports from the role-specific --port (spaced 100 apart, see
+          // PD_PORTS), so the ranges don't overlap. Multi-node still gets a
+          // cross-node --dist-init-addr from the renderer.
           flags = h.insertBeforeTail(flags, adds);
 
           // Role-specific serving port so the router's prefill / decode targets
@@ -1074,7 +1077,9 @@ export const Playground = ({ config }) => {
     }
     let cmd;
     if (mode === "docker") {
-      const image = (config.dockerImages && config.dockerImages[sel.hw]) || "lmsysorg/sglang:dev";
+      // Image keyed by `hw|quant` (most specific) then `hw`; `:dev` if unmapped (matches _deployment.jsx).
+      const di = config.dockerImages || {};
+      const image = di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const portFlag = f.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const dockerLines = [
@@ -1305,6 +1310,16 @@ export const Playground = ({ config }) => {
       fontSize: "12px", lineHeight: "1.5",
       color: isDark ? "#e5e7eb" : "#374151",
       whiteSpace: "pre-wrap", overflowX: "auto", margin: 0,
+    },
+    // Amber callout under the playground command when the effective (post-
+    // override) command turns speculative decoding on without setting
+    // --max-running-requests (SGLang then caps it at 48).
+    mtpWarn: {
+      margin: "8px 0 0", padding: "8px 12px", borderRadius: "8px",
+      fontSize: "12px", lineHeight: "1.45",
+      background: isDark ? "#78350f" : "#fef3c7",
+      color: isDark ? "#fde68a" : "#92400e",
+      border: `1px solid ${isDark ? "#92400e" : "#fcd34d"}`,
     },
     diffLineUnchanged: { display: "block" },
     diffLineAdded: {
@@ -1652,6 +1667,12 @@ export const Playground = ({ config }) => {
   const playgroundVerified = !!(matchedCell && matchedCell.verified);
   const matchedSiblingCell = (matchedCell && matchedCell !== baseCell)
     ? matchedCell : null;
+  // MTP hint on the EFFECTIVE (post-override) command — fires when the user
+  // toggles speculative decoding on without setting --max-running-requests
+  // (NOT keyed on strategy). Mirrors the Deploy panel's hint.
+  const pgMtpHint =
+    pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--speculative-algorithm") &&
+    !pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--max-running-requests");
 
   // Submission snippets: proposed cell + existing cell at the same match.
   const proposedCellSnippet = baseCell
@@ -1901,6 +1922,11 @@ export const Playground = ({ config }) => {
               </span>
             )) : "# No verified base cell at the current Deployment selection.\n# Pick a supported hardware/variant in the Deployment panel to populate the playground base."}
           </pre>
+          {pgMtpHint && (
+            <div style={s.mtpWarn}>
+              ⚠️ Speculative decoding (MTP) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
+            </div>
+          )}
         </div>
       </div>
 

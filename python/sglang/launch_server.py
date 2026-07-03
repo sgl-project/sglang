@@ -34,6 +34,7 @@ def run_server(server_args):
 
         asyncio.run(serve_grpc(server_args))
     elif server_args.use_ray:
+        # Ray mode: HTTP mode with Ray backend.
         try:
             from sglang.srt.ray.http_server import launch_server
         except ImportError:

@@ -761,15 +761,22 @@ def _merged_experts_fused_moe_lora_add_impl(
 
         # Fused LoRA-local align: one kernel does inline virtual id + EP skip +
         # compact (local experts) + single-block scatter, replacing the 3-kernel
-        # (_fused_virtual_topk_ids + moe_align + count_and_sort) pipeline. Only the
-        # supported per-expert single-adapter EP path; everything else falls back.
+        # (_fused_virtual_topk_ids + moe_align + count_and_sort) pipeline. Two
+        # single-adapter (max_loras==1) regimes are fused; everything else falls back:
+        #   - per-expert EP path (ep_local): compact local-expert histogram.
+        #   - shared-outer path (shared_outer): lora-id routing (compute_virtual_id
+        #     uses base=0; the kernel + launcher already size num_experts_for_weight=1
+        #     and have no bucket-count blocker, so it just needs compact=False — compact
+        #     + shared_outer would mis-map the id as base-offset). This is the opt1
+        #     align/sort fusion: shared-outer used to fall through to the unfused
+        #     _fused_virtual_topk_ids + moe_align_block_size_small_batch pair (~10.2us/
+        #     layer at decode bs16); now it takes the single fused launch.
         # Decode-only: the fused kernel's single-block scatter targets the small
         # decode batch; prefill (>= 512 tokens) keeps the multi-block old path.
         if (
             lora_envs.SGLANG_OPT_LORA_FUSED_MERGED_ALIGN.get()
             and max_loras == 1
-            and not shared_outer
-            and ep_local
+            and (shared_outer or ep_local)
             and topk_ids.shape[0] < 512
         ):
             from sglang.jit_kernel.trtllm_lora_temp.moe_lora_merged_align import (
@@ -792,7 +799,9 @@ def _merged_experts_fused_moe_lora_add_impl(
                 local_expert_offset,
                 local_num_experts,
                 do_skip=True,
-                compact=True,
+                # compact local-expert histogram is only valid for the per-expert EP
+                # path; shared_outer routes by lora id (base=0) so it must stay global.
+                compact=not shared_outer,
             )
             result = (
                 sorted_token_ids,
@@ -859,12 +868,44 @@ def _merged_experts_fused_moe_lora_add_impl(
         invoke_fused_moe_kernel,
     )
 
-    assert stage in ("all", "shrink", "expand"), f"invalid stage {stage!r}"
+    assert stage in (
+        "all",
+        "shrink",
+        "expand",
+        "routing",
+    ), f"invalid stage {stage!r}"
     lora_a_virtual = _merge_lora_expert_weight(lora_a)
     lora_b_virtual = _merge_lora_expert_weight(lora_b)
     num_experts_a = lora_a.shape[1]
     num_experts_b = lora_b.shape[1]
     b_stage_config = _get_stage_config(lora_b_virtual, 1)
+
+    if stage == "routing":
+        # Pre-warm the routing cache on the CALLER'S (main) stream so the
+        # side-stream chain performs no allocations. Tensors allocated inside a
+        # side-stream context during cuda-graph capture can be pool-reused by
+        # later allocations on other streams with no cross-stream guard (the
+        # allocator's stream tracking is disabled while capturing), corrupting
+        # replays. Routing needs only topk_ids + token_lora_mapping, which are
+        # both ready before the side-stream fork, so it can run on main.
+        a_cfg = _get_shrink_stage_config(lora_a_virtual, token_lora_mapping.shape[0])
+        if lora_envs.SGLANG_OPT_LORA_SHRINK_TUNE.get():
+            a_cfg = {**a_cfg, "BLOCK_SIZE_M": 16}
+        _get_routing(
+            topk_ids,
+            token_lora_mapping,
+            num_experts_a,
+            experts_shared_outer_loras_a,
+            a_cfg["BLOCK_SIZE_M"],
+        )
+        _get_routing(
+            topk_ids,
+            token_lora_mapping,
+            num_experts_b,
+            experts_shared_outer_loras_b,
+            b_stage_config["BLOCK_SIZE_M"],
+        )
+        return None
 
     intermediate = intermediate_buffer
     if stage != "expand":
@@ -880,6 +921,18 @@ def _merged_experts_fused_moe_lora_add_impl(
                 "num_warps": 4,
                 "num_stages": 4,
             }
+        # F1-① prefill routing reuse: the A stage routes with BLOCK_SIZE_M 32 at prefill
+        # but the B stage with the tuned fused-moe config (typically 64), so the
+        # (num_experts, shared_outer, block_size) routing_cache key never matches across
+        # stages and the align/sort pipeline reruns per stage (4x/layer at prefill).
+        # Matching the A stage's routing block to the B stage's collapses them to one
+        # align/sort per layer-forward. Decode (<512 tokens) keeps the opt1 fused
+        # merged-align path and its tuned shrink block untouched.
+        if (
+            lora_envs.SGLANG_OPT_LORA_PREFILL_ROUTING_REUSE.get()
+            and token_lora_mapping.shape[0] >= 512
+        ):
+            a_stage_config["BLOCK_SIZE_M"] = b_stage_config["BLOCK_SIZE_M"]
         (
             sorted_token_ids,
             expert_ids,

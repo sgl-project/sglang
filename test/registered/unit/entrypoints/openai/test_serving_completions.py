@@ -61,9 +61,15 @@ class ServingCompletionTestCase(unittest.TestCase):
 
     # ---------- prompt-handling ----------
     def test_single_string_prompt(self):
-        req = CompletionRequest(model="x", prompt="Hello world", max_tokens=100)
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello world",
+            max_tokens=100,
+            session_id="session-1",
+        )
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.text, "Hello world")
+        self.assertEqual(internal.session_id, "session-1")
 
     def test_single_token_ids_prompt(self):
         req = CompletionRequest(model="x", prompt=[1, 2, 3, 4], max_tokens=100)
@@ -139,6 +145,17 @@ class ServingCompletionTestCase(unittest.TestCase):
         # The schema should be converted to string by convert_json_schema_to_str
         self.assertIn("json_schema", sampling_params)
         self.assertIsInstance(sampling_params["json_schema"], str)
+
+    def test_response_format_json_schema_missing_schema(self):
+        """Test that json_schema response_format without a schema raises a ValueError."""
+        req = CompletionRequest(
+            model="x",
+            prompt="Generate a JSON object:",
+            max_tokens=100,
+            response_format={"type": "json_schema"},
+        )
+        with self.assertRaises(ValueError):
+            self.sc._build_sampling_params(req)
 
     def test_response_format_structural_tag(self):
         """Test that response_format structural_tag is correctly processed in sampling params."""

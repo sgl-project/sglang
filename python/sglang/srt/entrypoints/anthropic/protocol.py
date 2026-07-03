@@ -124,7 +124,7 @@ AnthropicContentBlock = Annotated[
 
 
 class AnthropicMessage(BaseModel):
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     content: Union[str, list[AnthropicContentBlock]]
 
 

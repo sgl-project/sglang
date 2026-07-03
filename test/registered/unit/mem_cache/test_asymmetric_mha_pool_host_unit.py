@@ -30,6 +30,22 @@ def _make_host(layout: str) -> AsymmetricMHATokenToKVPoolHost:
     if layout == "page_first":
         k_dims = (8, host.layer_num, host.head_num, host.head_dim)
         v_dims = (8, host.layer_num, host.head_num, host.v_head_dim)
+    elif layout == "page_first_direct":
+        host.page_num = 4
+        k_dims = (
+            host.page_num,
+            host.layer_num,
+            host.page_size,
+            host.head_num,
+            host.head_dim,
+        )
+        v_dims = (
+            host.page_num,
+            host.layer_num,
+            host.page_size,
+            host.head_num,
+            host.v_head_dim,
+        )
     else:
         raise ValueError(f"Unsupported test layout: {layout}")
 
@@ -121,15 +137,18 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         self.assertEqual(v_call.kwargs["item_size"], 24)
         self.assertEqual(v_call.kwargs["dst_layout_dim"], 72)
 
-    def test_direct_load_is_rejected(self):
-        # Direct single-buffer D2H is not reliable for asymmetric K/V in the
-        # current sgl-kernel fast path, so the asymmetric host pool is kernel-only.
-        host = _make_host("page_first")
+    def test_direct_load_splits_k_and_v_for_page_first_direct(self):
+        # Direct kernels derive copy size from each call's first tensor, so K/V
+        # must be dispatched separately when their head dims differ.
+        host = _make_host("page_first_direct")
         device_pool = _make_device_pool(host)
         host_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
         device_indices = torch.tensor([4, 5, 6, 7], dtype=torch.int64)
 
-        with self.assertRaisesRegex(ValueError, "expected 'kernel'"):
+        with mock.patch(
+            "sglang.srt.mem_cache.memory_pool_host.transfer_kv_per_layer_direct_pf_lf",
+            create=True,
+        ) as transfer:
             host.load_to_device_per_layer(
                 device_pool,
                 host_indices,
@@ -138,17 +157,55 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
                 io_backend="direct",
             )
 
-    def test_direct_backup_is_rejected(self):
-        # Same restriction for D2H backup: asymmetric MHA uses the kernel path
-        # until the direct kernel has an explicit safe asymmetric mode.
+        self.assertEqual(transfer.call_count, 2)
+        k_call, v_call = transfer.call_args_list
+        self.assertEqual(len(k_call.kwargs["src_ptrs"]), 1)
+        self.assertEqual(len(k_call.kwargs["dst_ptrs"]), 1)
+        self.assertIs(k_call.kwargs["src_ptrs"][0], host.k_buffer)
+        self.assertIs(k_call.kwargs["dst_ptrs"][0], device_pool.k_buffer[2])
+        self.assertEqual(len(v_call.kwargs["src_ptrs"]), 1)
+        self.assertEqual(len(v_call.kwargs["dst_ptrs"]), 1)
+        self.assertIs(v_call.kwargs["src_ptrs"][0], host.v_buffer)
+        self.assertIs(v_call.kwargs["dst_ptrs"][0], device_pool.v_buffer[2])
+
+    def test_direct_backup_splits_k_and_v_for_page_first_direct(self):
+        host = _make_host("page_first_direct")
+        device_pool = _make_device_pool(host)
+        host_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+        device_indices = torch.tensor([4, 5, 6, 7], dtype=torch.int64)
+
+        with mock.patch(
+            "sglang.srt.mem_cache.memory_pool_host.transfer_kv_all_layer_direct_lf_pf",
+            create=True,
+        ) as transfer:
+            host.backup_from_device_all_layer(
+                device_pool, host_indices, device_indices, io_backend="direct"
+            )
+
+        self.assertEqual(transfer.call_count, 2)
+        k_call, v_call = transfer.call_args_list
+        self.assertEqual(len(k_call.kwargs["src_ptrs"]), host.layer_num)
+        self.assertEqual(len(k_call.kwargs["dst_ptrs"]), 1)
+        self.assertIs(k_call.kwargs["src_ptrs"][0], device_pool.k_buffer[0])
+        self.assertIs(k_call.kwargs["dst_ptrs"][0], host.k_buffer)
+        self.assertEqual(len(v_call.kwargs["src_ptrs"]), host.layer_num)
+        self.assertEqual(len(v_call.kwargs["dst_ptrs"]), 1)
+        self.assertIs(v_call.kwargs["src_ptrs"][0], device_pool.v_buffer[0])
+        self.assertIs(v_call.kwargs["dst_ptrs"][0], host.v_buffer)
+
+    def test_direct_requires_page_first_direct_layout(self):
         host = _make_host("page_first")
         device_pool = _make_device_pool(host)
         host_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
         device_indices = torch.tensor([4, 5, 6, 7], dtype=torch.int64)
 
-        with self.assertRaisesRegex(ValueError, "expected 'kernel'"):
-            host.backup_from_device_all_layer(
-                device_pool, host_indices, device_indices, io_backend="direct"
+        with self.assertRaisesRegex(ValueError, "expected 'page_first_direct'"):
+            host.load_to_device_per_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id=2,
+                io_backend="direct",
             )
 
 

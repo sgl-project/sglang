@@ -297,8 +297,6 @@ class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         self.out_channels = arch.out_channels
         self.inner_dim = self.hidden_size
 
-        tp_size = get_tp_world_size()
-
         self.x_embedder = nn.ModuleDict(
             {
                 "proj": nn.Conv2d(

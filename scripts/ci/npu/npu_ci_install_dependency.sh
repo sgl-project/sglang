@@ -37,8 +37,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bash "${SCRIPT_DIR}/../utils/install_rustup.sh"
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
 
-# Pin wheel to 0.45.1, REF: https://github.com/pypa/wheel/issues/662
-${UV_PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil
+${UV_PIP_INSTALL} pybind11 pyyaml decorator scipy attrs psutil
 
 
 ### Install MemFabric
@@ -58,11 +57,11 @@ ${PIP_INSTALL} ${PTA_URL}
 ${UV_PIP_INSTALL} memfabric-zbal==1.1.1
 
 ### Install Triton-Ascend
-${PIP_INSTALL} "https://gitcode.com/Ascend/triton-ascend/releases/download/v3.2.1/triton_ascend-3.2.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl"
+${PIP_INSTALL} triton-ascend==3.2.1.dev20260530 --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly --trusted-host triton-ascend.osinfra.cn
 
 
 ### Install sgl-kernel-npu
-SGLANG_KERNEL_NPU_TAG="2026.05.01.post3"
+SGLANG_KERNEL_NPU_TAG="2026.6.2"
 mkdir sgl-kernel-npu
 (cd sgl-kernel-npu && wget "${GITHUB_PROXY_URL:=""}https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py311-cann9.0.0-${DEVICE_TYPE}-$(arch).zip" \
 && unzip ./sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py311-cann9.0.0-${DEVICE_TYPE}-$(arch).zip \

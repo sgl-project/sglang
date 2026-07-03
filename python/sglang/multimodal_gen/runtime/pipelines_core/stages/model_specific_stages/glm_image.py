@@ -24,6 +24,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    align_tensor_to_module_dtype,
+    get_module_dtype,
+)
 
 logger = init_logger(__name__)
 
@@ -733,7 +737,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         attention_kwargs = {}
         prompt_embeds = None
         do_classifier_free_guidance = True
-        dtype = torch.bfloat16
+        dtype = get_module_dtype(self.transformer, torch.bfloat16)
 
         self._guidance_scale = guidance_scale
         self._current_timestep = None
@@ -799,14 +803,15 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                 1, self.vae.config.latent_channels, 1, 1
             )
 
-            latents_mean = latents_mean.to(device=device, dtype=prompt_embeds.dtype)
-            latents_std = latents_std.to(device=device, dtype=prompt_embeds.dtype)
+            vae_dtype = get_module_dtype(self.vae, prompt_embeds.dtype)
+            latents_mean = latents_mean.to(device=device, dtype=vae_dtype)
+            latents_std = latents_std.to(device=device, dtype=vae_dtype)
 
             for condition_image, condition_image_prior_token_id in zip(
                 ar_condition_images, prior_token_image_ids
             ):
-                condition_image = condition_image.to(
-                    device=device, dtype=prompt_embeds.dtype
+                condition_image = align_tensor_to_module_dtype(
+                    condition_image, self.vae, device=device
                 )
 
                 condition_latent = retrieve_latents(

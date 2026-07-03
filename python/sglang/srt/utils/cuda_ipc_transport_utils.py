@@ -10,6 +10,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,9 @@ def _pool_handle_cache_clear():
 
 class ShmSyncBuffer:
     def __init__(self, byte_size: int = 4):
-        self.buffer = shared_memory.SharedMemory(create=True, size=byte_size)
+        self.buffer = shared_memory.SharedMemory(
+            create=True, size=byte_size, name=make_shm_name("sync")
+        )
         self.buffer_wrapper = np.ndarray(1, dtype=np.float32, buffer=self.buffer.buf)
         self.buffer_wrapper *= 0
         self.meta_data = {
@@ -119,9 +122,9 @@ class MmItemMemoryChunk:
 
 
 class MmItemMemoryPool:
-    def __init__(self, memory_size, recycle_interval):
+    def __init__(self, memory_size, recycle_interval, base_gpu_id):
         self.memory_pool = torch.empty(
-            memory_size, dtype=torch.int8, device="cuda"
+            memory_size, dtype=torch.int8, device=f"cuda:{base_gpu_id}"
         ).contiguous()
         storage = self.memory_pool.untyped_storage()
         self._pool_ipc_handle = storage._share_cuda_()
@@ -361,7 +364,7 @@ class CudaIpcTensorTransportProxy:
                 "recons_dtype": info_data.dtype,
             }
             state["tensor_data"] = None
-        except Exception as e:
+        except Exception:
             # Failed to get CUDA IPC handle (possibly tp). Falling back to default transport.
             state["ipc_extra"] = None
             state["tensor_data"] = data

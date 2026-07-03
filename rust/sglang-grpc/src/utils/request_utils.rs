@@ -128,6 +128,9 @@ pub(crate) fn build_text_generate_dict(
     if let Some(rank) = req.routed_dp_rank {
         d.insert("routed_dp_rank".into(), serde_json::json!(rank));
     }
+    if let Some(ref session_id) = req.session_id {
+        d.insert("session_id".into(), serde_json::json!(session_id));
+    }
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
     }
@@ -171,6 +174,9 @@ pub(crate) fn build_generate_dict(
     }
     if let Some(rank) = req.routed_dp_rank {
         d.insert("routed_dp_rank".into(), serde_json::json!(rank));
+    }
+    if let Some(ref session_id) = req.session_id {
+        d.insert("session_id".into(), serde_json::json!(session_id));
     }
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
@@ -236,4 +242,31 @@ pub(crate) fn build_classify_dict(
     }
     d.insert("received_time".into(), serde_json::json!(now_timestamp()));
     d
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_dicts_include_session_id() {
+        let session_id = Some("session-1".to_string());
+        let text_req = proto::TextGenerateRequest {
+            session_id: session_id.clone(),
+            ..Default::default()
+        };
+        let token_req = proto::GenerateRequest {
+            session_id,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            build_text_generate_dict("request-1", &text_req).get("session_id"),
+            Some(&serde_json::json!("session-1"))
+        );
+        assert_eq!(
+            build_generate_dict("request-2", &token_req).get("session_id"),
+            Some(&serde_json::json!("session-1"))
+        );
+    }
 }

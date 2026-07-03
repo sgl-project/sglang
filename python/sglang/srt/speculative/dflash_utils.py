@@ -9,7 +9,6 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
@@ -54,36 +53,6 @@ else:
 
 def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
-
-
-def resolve_dflash_prefill_refill_target(max_running_requests: int) -> int:
-    """Choose how many free running-request slots DFlash waits for before refill."""
-    override = envs.SGLANG_DFLASH_PREFILL_REFILL_TARGET.get()
-    if override is not None:
-        return override
-
-    max_running_requests = max(0, int(max_running_requests))
-    if max_running_requests < 8:
-        return 1
-    return min(4, max(2, (max_running_requests + 5) // 6))
-
-
-def should_delay_dflash_prefill_for_batching(
-    *,
-    running_bs: int,
-    num_allocatable_reqs: int,
-    max_running_requests: int,
-    prefill_refill_target: int,
-) -> bool:
-    if running_bs <= 0:
-        return False
-
-    target_prefill_bs = int(prefill_refill_target)
-    if target_prefill_bs <= 1:
-        return False
-
-    target_prefill_bs = min(target_prefill_bs, int(max_running_requests))
-    return int(num_allocatable_reqs) < target_prefill_bs
 
 
 def scale_kv_cell_size_per_token_for_dflash(

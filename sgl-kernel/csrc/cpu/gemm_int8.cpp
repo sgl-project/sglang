@@ -473,7 +473,6 @@ at::Tensor int8_scaled_mm_cpu(
   return out;
 }
 
-#ifndef __aarch64__
 // fused `per_token_quant_int8_cpu` and `int8_scaled_mm_cpu`
 at::Tensor int8_scaled_mm_with_quant(
     at::Tensor& mat1,
@@ -540,4 +539,3 @@ at::Tensor int8_scaled_mm_with_quant(
   });
   return out;
 }
-#endif  // #ifndef __aarch64__

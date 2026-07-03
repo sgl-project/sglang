@@ -26,7 +26,7 @@ class TestEagle3Page64Topk8(Eagle3Base, SpecAccuracyKit, SpecFeatureKit):
     spec_topk = 8
     spec_tokens = 32
     disable_overlap = False
-    cuda_graph_max_bs = 5
+    cuda_graph_max_bs_decode = 5
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 

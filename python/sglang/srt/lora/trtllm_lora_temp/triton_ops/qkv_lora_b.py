@@ -234,6 +234,8 @@ def qkv_lora_b_fwd(
             or lora_envs.SGLANG_OPT_LORA_CUBLAS_QKV.get()
         )
         and batch_info.max_len >= _CUBLAS_MIN_MAX_LEN
+        and qkv_lora_b.shape[0]
+        == 1  # single-adapter fast path: only valid with one resident slot
     ):
         return _qkv_lora_b_cublas(
             x, qkv_lora_b, batch_info, output_offset_cpu, base_output, n_slices

@@ -60,7 +60,11 @@ SERVER_WARMUP_BYPASS_PATHS = (
 async def _wait_until_http_ready(server_args: ServerArgs) -> None:
     """for server warmup"""
     health_url = f"{server_args.url()}/health"
-    async with httpx.AsyncClient() as client:
+    # Probe the local server directly: a loopback readiness check must never be
+    # routed through an HTTP proxy. trust_env=False also avoids crashing startup
+    # on a malformed proxy env var, since httpx parses *_PROXY/NO_PROXY when the
+    # client is constructed (raising httpx.InvalidURL before any request). See #28493.
+    async with httpx.AsyncClient(trust_env=False) as client:
         for _ in range(120):
             try:
                 response = await client.get(health_url, timeout=5.0)

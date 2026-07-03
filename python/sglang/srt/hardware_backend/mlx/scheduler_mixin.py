@@ -86,6 +86,16 @@ class SchedulerMlxOverlapMixin:
     """Mixin that adds MLX overlap scheduling to :class:`Scheduler`."""
 
     def _finalize_mlx_pending_job(self: Scheduler, pending: MlxPendingJob):
+        # Account for this completed forward step. The standard scheduler does
+        # this inside run_batch(), but the MLX overlap loop bypasses run_batch,
+        # so without this forward_ct never advances on MLX. That stalls the
+        # watchdog liveness counter and, more importantly, breaks step-bounded
+        # profiling: _profile_batch_predicate auto-starts/stops based on
+        # forward_ct, so `--profile-steps` (and the server /start_profile
+        # num_steps path) only takes effect once the counter moves here.
+        self.forward_ct += 1
+        self.profiler_manager._profile_batch_predicate(pending.schedule_batch)
+
         result = self.tp_worker.finalize_mlx_result(
             pending.prefills,
             pending.extends,

@@ -36,6 +36,7 @@ from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
+    DSA_INDEXER_LORA_NAMES,
     EMBEDDING_NAMES,
     LoRAType,
     auto_detect_lora_target_modules,
@@ -604,6 +605,21 @@ class LoRAManager:
             else:
                 # Otherwise, infer target_modules from adapter configs.
                 self.target_modules.update(adapter_target_modules)
+
+        # Fusion folds wk + weights_proj into wk_weights_proj, so the modules
+        # LoRA wraps are absent and an indexer-targeted adapter is silently dropped.
+        indexer_targets = self.target_modules & DSA_INDEXER_LORA_NAMES
+        if indexer_targets:
+            from sglang.srt.layers.attention.dsa.dsa_indexer import (
+                _use_dsa_indexer_fusion,
+            )
+
+            if _use_dsa_indexer_fusion:
+                raise ValueError(
+                    f"LoRA targets the DSA indexer ({sorted(indexer_targets)}), which is "
+                    "incompatible with DSA indexer Q/K fusion. Set "
+                    "SGLANG_DISABLE_DSA_INDEXER_FUSION=1 to disable fusion and use indexer LoRA."
+                )
 
         if max_lora_rank is not None:
             self.max_lora_rank = max_lora_rank

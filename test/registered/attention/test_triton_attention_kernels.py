@@ -312,11 +312,31 @@ class TestTritonAttention(CustomTestCase):
     def test_extend_attention(self):
 
         # Define the varying parameter values
-        attention_values = [128, 96, 80, 13]
+        # 256 covers the head_dim > 128 block-size branch (tuned on gfx95)
+        attention_values = [256, 128, 96, 80, 13]
 
         # Loop through the values and call the method
         for value in attention_values:
             self._test_extend_attention_once(19, 12331, 12, 4, value)
+
+    def test_extend_attention_block_sizes(self):
+        from sglang.srt.layers.attention.triton_ops import extend_attention as ea
+
+        if not ea._is_hip:
+            self.skipTest("HIP-only block-size selection")
+        # head_dim <= 128 keeps the default config on all HIP archs
+        self.assertEqual(
+            ea._get_block_sizes_for_extend_attention(128, 128)[3:], (64, 64, 4)
+        )
+        # 128 < head_dim <= 256: tuned tile on gfx95, default elsewhere
+        expected = (128, 64, 8) if ea._is_gfx95 else (64, 64, 4)
+        self.assertEqual(
+            ea._get_block_sizes_for_extend_attention(256, 256)[3:], expected
+        )
+        # head_dim > 256: falls back to the default on all HIP archs
+        self.assertEqual(
+            ea._get_block_sizes_for_extend_attention(576, 576)[3:], (64, 64, 4)
+        )
 
     def _test_extend_attention_sliding_window_once(
         self, B, N_CTX, H_Q, H_KV, D, WINDOW_SIZE

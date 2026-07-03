@@ -4,6 +4,7 @@
 #include <sgl_kernel/utils.h>   // For div_ceil, RuntimeCheck
 
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE
+#include <sgl_kernel/warp.cuh>   // For device::warp::reduce_sum
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -124,11 +125,13 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
     }
   }
 
-  uint32_t warp_active_count = local_active_count;
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    warp_active_count += __shfl_down_sync(0xFFFFFFFFu, warp_active_count, offset);
-  }
-  if ((threadIdx.x & 31u) == 0u && warp_active_count != 0u) {
+  // Warp-size-agnostic reduction: device::warp::reduce_sum performs a width-kWarpThreads (32) xor
+  // all-reduce, so each 32-lane sub-group gets its own total with its own lane-0 leader. Correct on
+  // both CUDA (warp=32) and ROCm wave64 (two 32-lane sub-groups per wavefront); a hand-rolled
+  // __shfl_down over the full wavefront would cross the 32-lane boundary on wave64.
+  const uint32_t warp_active_count = device::warp::reduce_sum<device::kWarpThreads>(local_active_count);
+  const bool is_subgroup_leader = (threadIdx.x % device::kWarpThreads) == 0u;
+  if (is_subgroup_leader && warp_active_count != 0u) {
     atomicAdd(
         reinterpret_cast<unsigned long long*>(p.slot_run_counter), static_cast<unsigned long long>(warp_active_count));
   }
@@ -173,29 +176,29 @@ struct CanaryVerifyKernel {
     SymbolicSize N_stride = {"slot_stride_bytes"};
     SymbolicSize N_verify = {"verify_capacity"};
     SymbolicDevice device_;
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
-    TensorMatcher({N_slots, N_stride}).with_dtype<uint8_t>().with_device<kDLCUDA>(device_).verify(canary_buf);
+    TensorMatcher({N_slots, N_stride}).with_dtype<uint8_t>().with_device<kDLGPU>(device_).verify(canary_buf);
 
     TensorMatcher({N_verify})
         .with_dtype<int64_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(verify_slot_indices)
         .verify(verify_expected_tokens)
         .verify(verify_expected_positions)
         .verify(verify_prev_slot_indices);
-    TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(verify_num_valid);
-    TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(verify_enable);
+    TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(verify_num_valid);
+    TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(verify_enable);
 
-    TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(violation_write_index);
+    TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(violation_write_index);
     SymbolicSize N_ring = {"ring_capacity"};
     TensorMatcher({N_ring, static_cast<int64_t>(kViolationFields)})
         .with_dtype<int64_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(violation_ring);
     TensorMatcher({1})
         .with_dtype<int64_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(slot_run_counter)
         .verify(kernel_run_counter);
 
@@ -205,25 +208,25 @@ struct CanaryVerifyKernel {
     SymbolicSize N_real_kv_cols_0 = {"real_kv_cols_0"};
     TensorMatcher({N_real_kv_rows_0, N_real_kv_cols_0})
         .with_dtype<uint8_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(real_kv_buf_0);
     SymbolicSize N_real_kv_rows_1 = {"real_kv_rows_1"};
     SymbolicSize N_real_kv_cols_1 = {"real_kv_cols_1"};
     TensorMatcher({N_real_kv_rows_1, N_real_kv_cols_1})
         .with_dtype<uint8_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(real_kv_buf_1);
     SymbolicSize N_real_kv_rows_2 = {"real_kv_rows_2"};
     SymbolicSize N_real_kv_cols_2 = {"real_kv_cols_2"};
     TensorMatcher({N_real_kv_rows_2, N_real_kv_cols_2})
         .with_dtype<uint8_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(real_kv_buf_2);
     SymbolicSize N_real_kv_rows_3 = {"real_kv_rows_3"};
     SymbolicSize N_real_kv_cols_3 = {"real_kv_cols_3"};
     TensorMatcher({N_real_kv_rows_3, N_real_kv_cols_3})
         .with_dtype<uint8_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(real_kv_buf_3);
     TensorMatcher({static_cast<int64_t>(kMaxRealKvSources), static_cast<int64_t>(kRealKvSourceFieldsPerEntry)})
         .with_dtype<int32_t>()

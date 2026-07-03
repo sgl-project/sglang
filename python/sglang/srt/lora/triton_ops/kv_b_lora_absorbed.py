@@ -90,7 +90,11 @@ def _max_segment_len(batch_info: LoRABatchInfo) -> int:
 
 
 def _segment_grid_size(batch_info: LoRABatchInfo, num_segments: int) -> int:
-    return batch_info.bs if batch_info.use_cuda_graph else num_segments
+    return (
+        batch_info.weight_indices.shape[0]
+        if batch_info.use_cuda_graph
+        else num_segments
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +277,7 @@ def step_a_q_fwd(
         batch_info.weight_indices,
         batch_info.lora_ranks,
         batch_info.permutation,
-        num_segments,
+        segment_grid,
         FULL_K=full_K_per_head,
         SORTED_BY_ADAPTER=sorted_by_adapter,
         BLOCK_S=_BLOCK_S,
@@ -462,7 +466,7 @@ def step_b_q_fwd(
         batch_info.lora_ranks,
         batch_info.permutation,
         batch_info.scalings,
-        num_segments,
+        segment_grid,
         SORTED_BY_ADAPTER=sorted_by_adapter,
         BLOCK_S=_BLOCK_S,
         BLOCK_N=_STEP_B_BLOCK_N,
@@ -641,7 +645,7 @@ def step_a_v_fwd(
         batch_info.weight_indices,
         batch_info.lora_ranks,
         batch_info.permutation,
-        num_segments,
+        segment_grid,
         SORTED_BY_ADAPTER=sorted_by_adapter,
         BLOCK_S=_BLOCK_S,
         BLOCK_N=_STEP_A_BLOCK_N,
@@ -838,7 +842,7 @@ def step_b_v_fwd(
         batch_info.lora_ranks,
         batch_info.permutation,
         batch_info.scalings,
-        num_segments,
+        segment_grid,
         FULL_K=full_K_per_head,
         QK_NOPE_OFFSET=qk_nope_head_dim,
         SORTED_BY_ADAPTER=sorted_by_adapter,

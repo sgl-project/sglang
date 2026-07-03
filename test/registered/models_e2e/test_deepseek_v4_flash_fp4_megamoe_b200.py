@@ -95,7 +95,7 @@ class TestDSV4FlashFP4B200W4A4MegaMoE(
     """Balanced recipe: TP=4, DP=4, MegaMoE."""
 
     gsm8k_accuracy_thres = 0.93
-    accept_length_thres = 2.6
+    accept_length_thres = 2.8
     bs_1_speed_thres = 100
 
     @classmethod

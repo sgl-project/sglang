@@ -29,6 +29,7 @@ def _make_ctx(
     enable_hierarchical_cache=False,
     disable_radix_cache=False,
     effective_chunked_prefill_size=None,
+    full_tokens_per_layer=None,
 ):
     server_args = MagicMock()
     server_args.radix_cache_backend = backend
@@ -47,6 +48,7 @@ def _make_ctx(
         tp_size=1,
         tp_rank=0,
         tp_group=MagicMock(),
+        full_tokens_per_layer=full_tokens_per_layer,
     )
 
 
@@ -172,6 +174,21 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             SWAChunkCache.assert_called_once_with(ctx.params)
             self.assertIs(result, SWAChunkCache.return_value)
 
+    def test_pure_swa_chunk_cache_when_chunked_prefill_disable_and_all_swa(self):
+        ctx = _make_ctx(
+            effective_chunked_prefill_size=512,
+            disable_radix_cache=True,
+            is_hybrid_swa=True,
+            full_tokens_per_layer=0,
+        )
+        with patch(
+            "sglang.srt.mem_cache.chunk_cache.PureSWAChunkCache"
+        ) as PureSWAChunkCache:
+            PureSWAChunkCache.return_value = MagicMock()
+            result = default_radix_cache_factory(ctx)
+            PureSWAChunkCache.assert_called_once_with(ctx.params)
+            self.assertIs(result, PureSWAChunkCache.return_value)
+
     def test_cpp_radix_cache_when_env_flag_set(self):
         ctx = _make_ctx()
         # `radix_cache_cpp` requires ninja + C++ extension to import, so
@@ -280,6 +297,16 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             result = default_radix_cache_factory(ctx)
             SWA.assert_called_once_with(params=ctx.params)
             self.assertIs(result, SWA.return_value)
+
+    def test_pure_swa_radix_cache_when_all_swa(self):
+        ctx = _make_ctx(is_hybrid_swa=True, full_tokens_per_layer=0)
+        with patch(
+            "sglang.srt.mem_cache.pure_swa_radix_cache.PureSWARadixCache"
+        ) as PureSWA:
+            PureSWA.return_value = MagicMock()
+            result = default_radix_cache_factory(ctx)
+            PureSWA.assert_called_once_with(params=ctx.params)
+            self.assertIs(result, PureSWA.return_value)
 
     def test_mamba_radix_cache_when_hybrid_ssm(self):
         ctx = _make_ctx(is_hybrid_ssm=True)

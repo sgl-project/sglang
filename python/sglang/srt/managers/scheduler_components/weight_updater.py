@@ -116,12 +116,14 @@ class SchedulerWeightUpdaterManager:
                 self.flush_cache_after_weight_update(recv_req)
             if not success:
                 logger.error(message)
-            return UpdateWeightFromDiskReqOutput(success, message, 0)
+            return UpdateWeightFromDiskReqOutput(
+                success=success, message=message, num_paused_requests=0
+            )
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
-        return InitWeightsUpdateGroupReqOutput(success, message)
+        return InitWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def destroy_weights_update_group(
         self,
@@ -129,7 +131,7 @@ class SchedulerWeightUpdaterManager:
     ):
         """Destroy the online model parameter update group."""
         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
-        return DestroyWeightsUpdateGroupReqOutput(success, message)
+        return DestroyWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def update_weights_from_distributed(
         self,
@@ -142,7 +144,9 @@ class SchedulerWeightUpdaterManager:
                 self.flush_cache_after_weight_update(recv_req)
             else:
                 logger.error(message)
-            return UpdateWeightsFromDistributedReqOutput(success, message)
+            return UpdateWeightsFromDistributedReqOutput(
+                success=success, message=message
+            )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
@@ -157,7 +161,7 @@ class SchedulerWeightUpdaterManager:
             else:
                 logger.error(message)
             torch.distributed.barrier(group=self.tp_cpu_group)
-            return UpdateWeightsFromTensorReqOutput(success, message)
+            return UpdateWeightsFromTensorReqOutput(success=success, message=message)
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
@@ -171,11 +175,11 @@ class SchedulerWeightUpdaterManager:
             if not success:
                 logger.error(message)
             torch.distributed.barrier(group=self.tp_cpu_group)
-            return UpdateWeightsFromIPCReqOutput(success, message)
+            return UpdateWeightsFromIPCReqOutput(success=success, message=message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
-        return GetWeightsByNameReqOutput(parameter)
+        return GetWeightsByNameReqOutput(parameter=parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         assert (
@@ -264,12 +268,17 @@ class SchedulerWeightUpdaterManager:
 
     def check_weights(self, recv_req: CheckWeightsReqInput):
         try:
-            payload = self.tp_worker.model_runner.check_weights(action=recv_req.action)
+            payload = self.tp_worker.model_runner.check_weights(
+                action=recv_req.action, allow_quant_error=recv_req.allow_quant_error
+            )
 
             if self.draft_worker is not None:
                 draft_runner = _get_draft_model_runner(self.draft_worker)
                 if draft_runner is not None:
-                    draft_payload = draft_runner.check_weights(action=recv_req.action)
+                    draft_payload = draft_runner.check_weights(
+                        action=recv_req.action,
+                        allow_quant_error=recv_req.allow_quant_error,
+                    )
                     if payload is not None and draft_payload is not None:
                         payload = _merge_checksum_payloads(payload, draft_payload)
 

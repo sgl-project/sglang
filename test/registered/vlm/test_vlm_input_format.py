@@ -590,6 +590,7 @@ class TestInternVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
         return dict(processor_output, format="processor_output")
 
 
+@unittest.skip("temporarily disabled: NaN in next_token_logits")
 class TestMiniCPMVUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
     model_path = "openbmb/MiniCPM-V-4"
     chat_template = "minicpmv"

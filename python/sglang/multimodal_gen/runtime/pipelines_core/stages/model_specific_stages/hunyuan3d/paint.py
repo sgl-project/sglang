@@ -571,15 +571,7 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
         else:
             raise FileNotFoundError(f"No VAE weights in {vae_dir}")
         self.vae.load_state_dict(state_dict)
-        # Resolve VAE/DiT dtypes from config with simple CPU/MPS fallback
-        vae_dtype = PRECISION_TO_TYPE.get(
-            getattr(self.config, "vae_precision", "fp32"), torch.float32
-        )
-        if self.device.type in ("cpu", "mps") and vae_dtype in (
-            torch.float16,
-            torch.bfloat16,
-        ):
-            vae_dtype = torch.float32
+        # Resolve the DiT (multiview UNet) dtype from config, with CPU/MPS fallback.
         dit_dtype = PRECISION_TO_TYPE.get(
             getattr(self.config, "dit_precision", "fp16"), torch.float16
         )
@@ -588,6 +580,13 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
             torch.bfloat16,
         ):
             dit_dtype = torch.float32
+        # The multiview (Stable-Diffusion) AutoencoderKL must share the UNet dtype.
+        # Reference attention feeds its VAE-encoded ref_latents straight into the
+        # fp16 UNet, and the official HunyuanPaint pipeline runs VAE+UNet entirely
+        # in fp16. The `vae_precision` knob targets the 3D ShapeVAE (geometry
+        # precision) — applying it to this 2D texture VAE produces an
+        # fp32-input / fp16-weight mismatch that crashes the paint UNet.
+        vae_dtype = dit_dtype
 
         self.vae = self.vae.to(device=self.device, dtype=vae_dtype).eval()
         self.transformer = UNet2p5DConditionModel.from_pretrained(
@@ -616,8 +615,11 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
             ddim_timesteps=30,
         ).to(self.device)
         if server_args.enable_torch_compile:
-            compile_mode = os.environ.get(
-                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+            dit_config = getattr(server_args.pipeline_config, "dit_config", None)
+            compile_mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE") or getattr(
+                dit_config,
+                "torch_compile_mode",
+                "max-autotune-no-cudagraphs",
             )
             logger.info("Compiling paint transformer with mode: %s", compile_mode)
             self.transformer.compile(mode=compile_mode, fullgraph=False, dynamic=None)

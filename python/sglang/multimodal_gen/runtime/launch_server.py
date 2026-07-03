@@ -200,7 +200,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             http_server_process = mp.Process(
                 target=launch_http_server_only,
                 args=(server_args,),
-                name=f"sglang-diffusion-webui",
+                name="sglang-diffusion-webui",
                 daemon=True,
             )
             http_server_process.start()

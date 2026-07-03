@@ -235,7 +235,12 @@ class MOVADenoisingStage(PipelineStage):
             partial = (1 - guidance_scale) * neg
         return cfg_model_parallel_all_reduce(partial)
 
-    def _maybe_enable_torch_compile(self, module: nn.Module, server_args: ServerArgs):
+    def _maybe_enable_torch_compile(
+        self,
+        module: nn.Module,
+        server_args: ServerArgs,
+        model_config: object | None = None,
+    ):
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object is not a nn.Module.
@@ -266,8 +271,10 @@ class MOVADenoisingStage(PipelineStage):
                 _inductor_cfg.reorder_for_compute_comm_overlap = True
             except ImportError:
                 pass
-            mode = os.environ.get(
-                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+            mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE") or getattr(
+                model_config,
+                "torch_compile_mode",
+                "max-autotune-no-cudagraphs",
             )
             compile_kwargs["mode"] = mode
             logger.info("Compiling %s with mode: %s", module.__class__.__name__, mode)
@@ -278,8 +285,14 @@ class MOVADenoisingStage(PipelineStage):
     def _maybe_compile_dits(self, server_args: ServerArgs):
         if self._torch_compiled or not server_args.enable_torch_compile:
             return
-        for module in filter(None, [self.video_dit, self.video_dit_2, self.audio_dit]):
-            self._maybe_enable_torch_compile(module, server_args)
+        module_configs = [
+            (self.video_dit, server_args.pipeline_config.dit_config),
+            (self.video_dit_2, server_args.pipeline_config.dit_config),
+            (self.audio_dit, server_args.pipeline_config.audio_dit_config),
+        ]
+        for module, model_config in module_configs:
+            if module is not None:
+                self._maybe_enable_torch_compile(module, server_args, model_config)
         self._torch_compiled = True
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
@@ -875,7 +888,6 @@ class MOVADenoisingStage(PipelineStage):
         """
         min_layers = min(len(visual_dit.blocks), len(self.audio_dit.blocks))
         visual_layers = len(visual_dit.blocks)
-        sp_size = get_sp_world_size()
 
         # Build RoPE frequencies for cross-attention if needed (only used when SP == 1)
         # When SP > 1, we rebuild freqs inside the loop after gathering full sequences

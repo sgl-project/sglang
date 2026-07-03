@@ -101,6 +101,7 @@ def chunk_gated_delta_rule_cpu(
     cu_seqlens,
     head_first,
     use_qk_l2norm_in_kernel,
+    initial_state_indices,
 ):
     core_attn_out, last_recurrent_state = (
         torch.ops.sgl_kernel.chunk_gated_delta_rule_cpu(
@@ -114,6 +115,7 @@ def chunk_gated_delta_rule_cpu(
             cu_seqlens,
             head_first,
             use_qk_l2norm_in_kernel,
+            initial_state_indices,
         )
     )
     h = None  # Todo: add return h support

@@ -12,9 +12,9 @@ from sglang.jit_kernel.activation import (
 from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=20, suite="base-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=30, suite="nightly-kernel-1-gpu", nightly=True)
-register_amd_ci(est_time=20, suite="jit-kernel-unit-test-amd")
+register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 
 OPS = SUPPORTED_ACTIVATIONS
@@ -26,10 +26,13 @@ SHAPES = get_ci_test_range(
         (3, 5, 16),
         (2, 3, 512),
         (1, 17, 4096),
+        (48, 3072),
+        (38, 8192),
+        (39, 32768),
         *[(2**x, 2048) for x in range(0, 15, 2)],
         *[(2**x, 65536) for x in range(0, 5, 2)],
     ],
-    ci_range=[(7, 16), (2, 3, 512)],
+    ci_range=[(7, 16), (2, 3, 512), (48, 3072), (38, 8192)],
 )
 
 
@@ -167,9 +170,10 @@ UNARY_SHAPES = get_ci_test_range(
         (3, 5, 16),
         (2, 3, 512),
         (1, 17, 4096),
+        (38, 4096),
         *[(2**x, 2048) for x in range(0, 15, 2)],
     ],
-    ci_range=[(7, 16), (2, 3, 512)],
+    ci_range=[(7, 16), (2, 3, 512), (38, 4096)],
 )
 
 

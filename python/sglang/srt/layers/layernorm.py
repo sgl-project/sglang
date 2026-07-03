@@ -31,6 +31,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -85,11 +86,28 @@ if _is_cuda or _is_xpu or _is_musa:
     else:
         _flashinfer_layernorm_available = False
 
-    from sgl_kernel import (
-        fused_add_rmsnorm,
-        gemma_fused_add_rmsnorm,
-        gemma_rmsnorm,
-        rmsnorm,
+    from sgl_kernel import fused_add_rmsnorm as _sgl_fused_add_rmsnorm
+    from sgl_kernel import gemma_fused_add_rmsnorm as _sgl_gemma_fused_add_rmsnorm
+    from sgl_kernel import gemma_rmsnorm as _sgl_gemma_rmsnorm
+    from sgl_kernel import rmsnorm as _sgl_rmsnorm
+
+    from sglang.srt.utils.custom_op import register_custom_op_from_extern
+
+    rmsnorm = register_custom_op_from_extern(
+        _sgl_rmsnorm, op_name="sgl_rmsnorm", out_shape="input"
+    )
+    fused_add_rmsnorm = register_custom_op_from_extern(
+        _sgl_fused_add_rmsnorm,
+        op_name="sgl_fused_add_rmsnorm",
+        mutates_args=["input", "residual"],
+    )
+    gemma_rmsnorm = register_custom_op_from_extern(
+        _sgl_gemma_rmsnorm, op_name="sgl_gemma_rmsnorm", out_shape="input"
+    )
+    gemma_fused_add_rmsnorm = register_custom_op_from_extern(
+        _sgl_gemma_fused_add_rmsnorm,
+        op_name="sgl_gemma_fused_add_rmsnorm",
+        mutates_args=["input", "residual"],
     )
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
@@ -153,9 +171,6 @@ def _forward_with_allreduce_fusion(
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
-            get_attn_tensor_model_parallel_world_size,
-            get_moe_expert_parallel_world_size,
-            get_moe_tensor_parallel_world_size,
             tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
@@ -164,12 +179,12 @@ def _forward_with_allreduce_fusion(
         )
 
         if use_attn_tp_group:
-            world_size = get_attn_tensor_model_parallel_world_size()
+            world_size = get_parallel().attn_tp_size
         else:
-            if get_moe_expert_parallel_world_size() > 1:
-                world_size = get_moe_expert_parallel_world_size()
+            if get_parallel().moe_ep_size > 1:
+                world_size = get_parallel().moe_ep_size
             else:
-                world_size = get_moe_tensor_parallel_world_size()
+                world_size = get_parallel().moe_tp_size
 
         if world_size > 1:
             if post_residual_addition is not None:

@@ -74,7 +74,15 @@ SGL_DEVICE uint8_t cvt_float_to_fp8_e4m3(float val) {
   uint8_t mant3;
 
   if (exp32 < kMinSubnormExp) {
+#if HIP_FP8_TYPE_FNUZ
+    // E4M3FNUZ (gfx942) has no negative zero: byte 0x80 is NaN, not -0.0.
+    // Returning `sign` (0x80) for an underflowing negative injects NaN into the
+    // fp8 KV cache -> NaN attention/logits. Flush underflow to +0 instead.
+    return 0;
+#else
+    // E4M3FN (gfx950): 0x80 == -0.0, harmless.
     return sign;
+#endif
   } else if (exp32 < kMinNormExp) {
     // Subnormal range
     int32_t shift = -(kBias - 1) - exp32;  // 1..3

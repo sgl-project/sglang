@@ -194,7 +194,6 @@ def get_quant_config(
         return quant_cls.from_config(hf_quant_config)
 
     model_name_or_path = model_config["model_path"]
-    is_local = os.path.isdir(model_name_or_path)
     hf_folder = model_name_or_path
 
     possible_config_filenames = quant_cls.get_config_filenames()
@@ -299,6 +298,22 @@ def get_metadata_from_safetensors_file(file_path: str):
             return metadata
     except Exception as e:
         logger.warning(e)
+
+
+def _canonicalize_modulation_exclude(module_name: str) -> str:
+    """Map a serialized modulation weight's parent to the runtime linear prefix.
+
+    Qwen-Image wraps the modulation projection in ``nn.Sequential(SiLU, Linear)``,
+    so its weights serialize as ``...img_mod.1.weight`` while the runtime
+    ReplicatedLinear advertises ``...img_mod`` as its quant/exclusion prefix.
+    Strip the trailing Sequential index so a safetensors-inferred BF16 exclude
+    entry actually matches the linear (mirrors the ModelOpt FP8 converter, which
+    canonicalizes ``.img_mod.1``/``.txt_mod.1`` to ``.img_mod``/``.txt_mod``).
+    No-op for any other module name.
+    """
+    if module_name.endswith((".img_mod.1", ".txt_mod.1")):
+        return module_name.removesuffix(".1")
+    return module_name
 
 
 def _build_nvfp4_config_from_safetensors_files(
@@ -470,7 +485,9 @@ def _build_nvfp4_config_from_safetensors_files(
 
         exclude_modules.append(module_bfl)
 
-    exclude_modules = sorted(set(exclude_modules))
+    exclude_modules = sorted(
+        {_canonicalize_modulation_exclude(m) for m in exclude_modules}
+    )
 
     try:
         quant_cls = get_quantization_config("modelopt_fp4")

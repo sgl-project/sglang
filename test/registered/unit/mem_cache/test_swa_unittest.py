@@ -27,6 +27,10 @@ register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
+def _event_hashes(events):
+    return [block_hash for event in events for block_hash in event.block_hashes]
+
+
 class _DummyReq:
     def __init__(self):
         self._kv_committed_len = 0
@@ -73,7 +77,6 @@ def _build_swa_tree(
         head_dim=head_dim,
         swa_attention_layer_ids=swa_attention_layer_ids,
         full_attention_layer_ids=full_attention_layer_ids,
-        enable_kvcache_transpose=False,
         device=device,
     )
     allocator = SWATokenToKVPoolAllocator(
@@ -172,9 +175,9 @@ class TestSWA(unittest.TestCase):
 
         result = tree.evict(EvictParams(num_tokens=1, swa_num_tokens=0))
         self.assertGreaterEqual(result.num_tokens_evicted, 1)
-        removed_hashes = [
-            e.block_hashes[0] for e in tree.take_events() if isinstance(e, BlockRemoved)
-        ]
+        removed_hashes = _event_hashes(
+            [e for e in tree.take_events() if isinstance(e, BlockRemoved)]
+        )
         self.assertCountEqual(removed_hashes, stored_hashes)
 
     def test_swa_radix_cache_kv_events_split_hash(self):
@@ -222,7 +225,6 @@ class TestSWA(unittest.TestCase):
             head_dim=head_dim,
             swa_attention_layer_ids=swa_attention_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
         )
         alloc = SWATokenToKVPoolAllocator(
@@ -306,7 +308,6 @@ class TestSWA(unittest.TestCase):
             head_dim=head_dim,
             swa_attention_layer_ids=swa_attention_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
         )
         # setup token to kv pool allocator
@@ -464,7 +465,6 @@ class TestSWA(unittest.TestCase):
             head_dim=head_dim,
             swa_attention_layer_ids=swa_attention_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
         )
         # setup token to kv pool allocator

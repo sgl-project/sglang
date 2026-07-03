@@ -39,7 +39,7 @@ Then run the **Python** output of the command panel below in that environment. T
 docker pull lmsysorg/sglang:dev-cu13-minimax-m3
 ```
 
-The command panel below fills in the right tag per platform: `dev-cu13-minimax-m3` (CUDA 13 — B300, GB200, GB300), `dev-cu12-minimax-m3` (CUDA 12 — Hopper H200), or `dev-minimax-m3` (default). On AMD Instinct it uses the matching ROCm image (MI300X/MI325X → `…-rocm700-mi30x`, MI350X/MI355X → `…-rocm720-mi35x`). For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker), substituting the inner `sglang serve ...` with what the command generator produces.
+The command panel below fills in the right tag per platform: `dev-cu13-minimax-m3` (CUDA 13 — B300, GB200, GB300), `dev-cu12-minimax-m3` (CUDA 12 — Hopper H200), or `dev-minimax-m3` (default). On AMD Instinct it uses the matching ROCm image (MI300X/MI325X → `aigmkt/minimax-m3-sglang-rocm700-mi30x`, MI350X/MI355X → `aigmkt/minimax-m3-sglang-rocm720-mi35x`). For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker), substituting the inner `sglang serve ...` with what the command generator produces.
 
 <Note>
 These M3 dev images now **bundle MiniMax's MSA sparse-attention kernel** (`fmha_sm100`), so Blackwell users get the recommended fast path automatically — no manual install needed (see **§2.1**). On a custom image without it, the same recipe still serves on the built-in Triton sparse path.
@@ -117,10 +117,10 @@ The first import JIT-compiles the kernels, which can take 30 s to a few minutes 
 **Warm the JIT cache before a multi-GPU launch.** On a *cold* cache, several tensor-parallel ranks racing to JIT-compile MSA's plan kernel can leave one rank loading a half-linked module (`AttributeError: Module has no function 'plan'` at CUDA-graph capture). Run the gate-check `python -c "..."` (or any single-process `fmha_sm100_plan` call) once before launching the server — that compiles the kernel single-process, and every rank then hits the warm cache.
 </Warning>
 
-The gate requires `--attention-backend fa4 --page-size 128` (already part of the Blackwell recipe above; on current `main` these are also the auto-selected M3 defaults on SM100 GPUs). Force the Triton path at any time with the env var `SGLANG_DISABLE_MSA=1`. MSA is a Blackwell (SM100) kernel and does not apply to the AMD ROCm paths.
+The gate requires `--attention-backend fa4` (MSA's sparse blocks are 128 tokens, so the page size must be 128). SGLang auto-forces `page_size` to 128 for the `fa4` backend — including the combined `--attention-backend fa4` the M3 recipe uses (#28976) — so `--page-size 128` is omitted from the Blackwell cells below. Force the Triton path at any time with the env var `SGLANG_DISABLE_MSA=1`. MSA is a Blackwell (SM100) kernel and does not apply to the AMD ROCm paths.
 
 <Note>
-For multimodal (image) serving, keep the same text recipe above — `--attention-backend fa4 --page-size 128` (MSA) is unchanged — and add `--mm-attention-backend flashinfer_cudnn` for the vision tower. The text and vision-tower attention backends are independent knobs; MSA only touches the language-model sparse attention, not image handling.
+For multimodal (image) serving, keep the same text recipe above — `--attention-backend fa4` (MSA) is unchanged — and add `--mm-attention-backend flashinfer_cudnn` for the vision tower. The text and vision-tower attention backends are independent knobs; MSA only touches the language-model sparse attention, not image handling.
 </Note>
 
 ### 2.2 Memory and workload tuning

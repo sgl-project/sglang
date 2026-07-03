@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers import dp_attention as _dp_attention
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
@@ -22,12 +21,15 @@ from sglang.srt.model_executor.forward_context import (
     forward_context,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 
 from ..mock_server_args import make_mock_server_args
 
-_dp_attention.get_attention_tp_size = lambda: 1
+_parallel_override = get_parallel().override(attn_tp_size=1)
+_parallel_override.__enter__()
 
 DEFAULT_HIDDEN_SIZE = 64
 DEFAULT_KV_LORA_RANK = 32
@@ -177,6 +179,7 @@ class TinyMLAModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = False
         self.is_local_attention_model = False
         self.attention_chunk_size = None
@@ -305,6 +308,12 @@ class MockMLAModelRunner(ModelRunner):
         self.sliding_window_size = None
         self.use_mla_backend = True
         self.is_draft_worker = False
+        self._kernel_warmed_up = True
+        # Runner-mode helpers mutate speculative graph sizes after construction.
+        self.graph_shared_output = GraphSharedOutput(
+            device=self.device,
+            max_rows=pool_batch_size * max_context_len,
+        )
 
     @property
     def hybrid_gdn_config(self):

@@ -159,6 +159,27 @@ class SpeculativeAlgorithm(Enum):
     def need_topk(self) -> bool:
         return self.is_eagle() or self.is_standalone()
 
+    def handle_server_args(self, server_args: ServerArgs) -> None:
+        """Hook for per-algorithm server args mutation.
+
+        In-place updated.
+        """
+        from sglang.srt.arg_groups.speculative_hook import (
+            _handle_dflash,
+            _handle_eagle_family,
+            _handle_frozen_kv_mtp,
+            _handle_ngram,
+        )
+
+        if self.is_dflash():
+            _handle_dflash(server_args)
+        elif self.is_frozen_kv_mtp():
+            _handle_frozen_kv_mtp(server_args)
+        elif self.is_eagle() or self.is_standalone():
+            _handle_eagle_family(server_args)
+        elif self.is_ngram():
+            _handle_ngram(server_args)
+
     def get_num_tokens_per_bs_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
     ) -> int:

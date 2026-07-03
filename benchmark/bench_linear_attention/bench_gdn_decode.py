@@ -131,7 +131,7 @@ def run_baseline(inp):
 
 def run_packed(inp):
     """Packed path: single fused kernel directly on mixed_qkv."""
-    B, HV, K, V = inp["B"], inp["HV"], inp["K"], inp["V"]
+    B, HV, V = inp["B"], inp["HV"], inp["V"]
     ssm_states = inp["ssm_states"].clone()
     out = inp["mixed_qkv"].new_empty(B, 1, HV, V)
 
@@ -173,7 +173,7 @@ def check_correctness(B, H, HV, K, V, pool_size, device, dtype, seed=42):
     try:
         torch.testing.assert_close(o_packed, o_baseline, atol=atol, rtol=rtol)
         output_ok = True
-    except AssertionError as e:
+    except AssertionError:
         output_ok = False
         out_diff = (o_packed - o_baseline).abs().max().item()
 

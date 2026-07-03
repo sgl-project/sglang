@@ -222,12 +222,49 @@ class CacheDitConfig:
     steps_computation_policy: str = "dynamic"
 
 
+# Custom BlockAdapter for DiT models absent from cache-dit's BlockAdapterRegister.
+# Value: (blocks attr, forward_pattern). forward_pattern must
+# match the block's forward signature (see cache_dit.ForwardPattern; e.g., ERNIE
+# uses Pattern_3). has_separate_cfg follows the run (passed by
+# enable_cache_on_transformer); cache-dit auto-resolves the remaining
+# fields.
+_CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, tuple[str, ForwardPattern]] = {
+    "ErnieImageTransformer2DModel": ("layers", ForwardPattern.Pattern_3),
+    "Krea2Transformer2DModel": ("transformer_blocks", ForwardPattern.Pattern_3),
+}
+
+
+def _build_custom_block_adapter(
+    transformer: torch.nn.Module,
+    has_separate_cfg: bool = False,
+) -> Optional[BlockAdapter]:
+    """Build a manual BlockAdapter for a model absent from cache-dit's registry,
+    or None if the class is unknown."""
+    spec = _CUSTOM_BLOCK_ADAPTER_SPECS.get(transformer.__class__.__name__)
+    if spec is None:
+        return None
+    blocks_attr, forward_pattern = spec
+    blocks = getattr(transformer, blocks_attr, None)
+    if blocks is None:
+        raise ValueError(
+            f"Transformer {transformer.__class__.__name__} has no attribute "
+            f"{blocks_attr!r} for cache-dit blocks."
+        )
+    return BlockAdapter(
+        transformer=transformer,
+        blocks=blocks,
+        forward_pattern=forward_pattern,
+        has_separate_cfg=has_separate_cfg,
+    )
+
+
 def enable_cache_on_transformer(
     transformer: torch.nn.Module,
     config: CacheDitConfig,
     model_name: str = "transformer",
     sp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    has_separate_cfg: bool = False,
 ) -> torch.nn.Module:
     """Enable cache-dit on a transformer module, by wrapping the module with cache-dit
 
@@ -238,6 +275,9 @@ def enable_cache_on_transformer(
         model_name: Name of the model for logging purposes.
         sp_group: Sequence parallel process group (for Ulysses/Ring).
         tp_group: Tensor parallel process group.
+        has_separate_cfg: Whether the run issues separate conditional/unconditional
+            passes per step (CFG). Used by custom adapters (ERNIE, Krea-2); a
+            mismatch only disables caching, never corrupts output.
 
     """
     if not config.enabled:
@@ -249,16 +289,23 @@ def enable_cache_on_transformer(
             "Please provide it in CacheDitConfig."
         )
 
-    # Check if the transformer is pre-registered in cache-dit
+    # Prefer the standard path (transformer pre-registered in cache-dit). For
+    # models absent from the registry, fall back to a manual BlockAdapter (see
+    # _build_custom_block_adapter).
+    custom_adapter = None
     if not BlockAdapterRegister.is_supported(transformer):
-        transformer_cls_name = transformer.__class__.__name__
-        raise ValueError(
-            f"{transformer_cls_name} is not officially supported by cache-dit. "
-            "Supported cache-dit DiT families include Flux, QwenImage, HunyuanDiT, "
-            "HunyuanVideo, Wan, CogVideoX, Mochi, and others. "
-            "Please ensure your transformer belongs to one of these families or "
-            "define a custom BlockAdapter."
+        custom_adapter = _build_custom_block_adapter(
+            transformer, has_separate_cfg=has_separate_cfg
         )
+        if custom_adapter is None:
+            transformer_cls_name = transformer.__class__.__name__
+            raise ValueError(
+                f"{transformer_cls_name} is not officially supported by cache-dit. "
+                "Supported cache-dit DiT families include Flux, QwenImage, HunyuanDiT, "
+                "HunyuanVideo, Wan, CogVideoX, Mochi, and others. "
+                "Please ensure your transformer belongs to one of these families or "
+                "define a custom BlockAdapter."
+            )
 
     # Build cache config (including SCM fields if provided)
     cache_config = DBCacheConfig(
@@ -312,8 +359,18 @@ def enable_cache_on_transformer(
 
     _mark_transformer_parallelized(transformer, parallelism_config, sp_group, tp_group)
 
+    # Custom path: pass a pre-built BlockAdapter, bypassing the registry.
+    # Standard path: let enable_cache discover the registered adapter.
+    target = transformer
+    if custom_adapter is not None:
+        target = custom_adapter
+        logger.info(
+            "Enabling cache-dit on %s via custom BlockAdapter (%s).",
+            model_name,
+            custom_adapter.forward_pattern,
+        )
     cache_dit.enable_cache(
-        transformer,
+        target,
         cache_config=cache_config,
         calibrator_config=calibrator_config,
         parallelism_config=None,

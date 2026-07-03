@@ -69,7 +69,7 @@ class TestPCGWithNGRAM(PCGSpecBase, unittest.TestCase):
         "NGRAM",
         "--speculative-num-draft-tokens",
         "16",
-        "--cuda-graph-max-bs",
+        "--cuda-graph-max-bs-decode",
         "8",
         "--mem-fraction-static",
         "0.8",

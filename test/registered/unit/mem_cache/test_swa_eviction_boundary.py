@@ -7,7 +7,7 @@ handling for this, creating an incorrect non-tombstone node that caused
 inflated swa_evictable_size_, negative usage, and potential double-free.
 
 Two-sided fix:
-1. _evict_swa subtracts extra page_size (preventive).
+1. _evict_swa subtracts max(window, page) on the radix path (preventive).
 2. _insert_helper early-returns on case 3 (defensive).
 
 Tests use real tree/allocator/pool with mock Req/ScheduleBatch wrappers.
@@ -75,7 +75,6 @@ def _build_swa_tree(page_size, sliding_window_size, kv_size=1024, kv_size_swa=51
         head_dim=head_dim,
         swa_attention_layer_ids=swa_ids,
         full_attention_layer_ids=full_ids,
-        enable_kvcache_transpose=False,
         device=device,
     )
     allocator = SWATokenToKVPoolAllocator(
@@ -196,7 +195,7 @@ class TestSWAEvictionBoundary(unittest.TestCase):
     # -- Eviction formula: page_size == 1 --
 
     def test_formula_page_size_1(self):
-        """page_size=1: no floor alignment, -1 just means one less token evicted."""
+        """page_size=1: radix keeps max(window, page)=window, so the frontier is pre_len - window."""
         page_size, window = 1, 4
         tree, allocator, pool = _build_swa_tree(
             page_size=page_size, sliding_window_size=window
@@ -211,7 +210,9 @@ class TestSWAEvictionBoundary(unittest.TestCase):
             ScheduleBatch._evict_swa(batch, req, seq_len - 1)
 
             self.assertLess(req.swa_evicted_seqlen, seq_len)
-            self.assertEqual(req.swa_evicted_seqlen, max(0, seq_len - 1 - window - 1))
+            self.assertEqual(
+                req.swa_evicted_seqlen, max(0, seq_len - 1 - max(window, page_size))
+            )
 
             tree.cache_finished_req(req, is_insert=True)
             tree.sanity_check()
@@ -384,7 +385,9 @@ class TestSWAEvictionBoundary(unittest.TestCase):
             batch = _make_batch(tree, allocator, pool)
             ScheduleBatch._evict_swa(batch, req, seq_len - 1)
 
-            self.assertEqual(req.swa_evicted_seqlen, max(0, seq_len - 1 - window - 1))
+            self.assertEqual(
+                req.swa_evicted_seqlen, max(0, seq_len - 1 - max(window, page_size))
+            )
 
             tree.cache_finished_req(req, is_insert=True)
             tree.sanity_check()

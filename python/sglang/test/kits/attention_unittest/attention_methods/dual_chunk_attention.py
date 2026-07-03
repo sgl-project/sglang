@@ -18,6 +18,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 
 from ..mock_server_args import make_mock_server_args
@@ -78,7 +79,8 @@ DUAL_CHUNK_SPARSE_SUB_WINDOW_CONFIG = {
 
 # Unit tests run without distributed initialization. Sparse dual-chunk config
 # lookup should see the single-rank default.
-_dual_chunk_backend.get_tensor_model_parallel_rank = lambda: 0
+_parallel_override = get_parallel().override(tp_rank=0)
+_parallel_override.__enter__()
 
 
 @dataclass(frozen=True)
@@ -272,6 +274,7 @@ class TinyDualChunkModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = False
         self.attention_chunk_size = None
         self.sliding_window_size = None
@@ -319,6 +322,7 @@ class DualChunkMockModelRunner(ModelRunner):
         self.page_size = case.page_size
         self.model_config = model_config
         self.tp_size = 1
+        self._kernel_warmed_up = True
         self.dp_size = 1
         self.pp_size = 1
         self.server_args = make_mock_server_args(

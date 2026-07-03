@@ -19,14 +19,16 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_mps, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
+from sglang.srt.utils.profile_utils import ProfileManager
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 _is_npu = is_npu()
+_is_mps = is_mps()
 if _is_npu:
     import torch_npu
 
@@ -36,11 +38,12 @@ if _is_npu:
         ["profiler.ProfilerActivity.CPU", torch_npu.profiler.ProfilerActivity.CPU],
     ]
     apply_torch_npu_patches(torch_npu, patches)
+elif _is_mps:
+    from sglang.srt.hardware_backend.mlx.profiler import apply_metal_profiler_patches
+
+    apply_metal_profiler_patches()
 
 logger = logging.getLogger(__name__)
-
-
-from sglang.srt.utils.profile_utils import ProfileManager
 
 
 @dataclass(kw_only=True)
@@ -230,7 +233,11 @@ class SchedulerProfilerManager:
                     )
                 ),
             )
-            self.torch_profiler.start()
+            try:
+                self.torch_profiler.start()
+            except RuntimeError as e:
+                self.torch_profiler = None
+                return ProfileReqOutput(success=False, message=str(e))
             self.profile_in_progress = True
 
         if "MEM" in activities:
@@ -405,7 +412,7 @@ class SchedulerProfilerManager:
                 self._start_profile()
 
     def _profile(self, recv_req: ProfileReq):
-        if recv_req.type == ProfileReqType.START_PROFILE:
+        if recv_req.req_type == ProfileReqType.START_PROFILE:
             if recv_req.profile_by_stage or recv_req.start_step:
                 return self._init_profile(
                     recv_req.output_dir,

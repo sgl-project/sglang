@@ -214,7 +214,7 @@ template <
     bool SCALE_UE8M0,
     bool FUSE_SILU_AND_MUL,
     bool kUsePDL,
-    typename scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>>
+    typename scale_packed_t = std::conditional_t<SCALE_UE8M0 && IS_COLUMN_MAJOR, uint32_t, float>>
 __global__ void per_token_group_quant_8bit_v2_kernel(
     const T* __restrict__ input,
     DST_DTYPE* __restrict__ output_q,
@@ -226,7 +226,7 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
     const int scale_hidden_stride,
     const int num_tokens_per_expert) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
-  using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
+  using scale_element_t = std::conditional_t<SCALE_UE8M0 && IS_COLUMN_MAJOR, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
   device::PDLWaitPrimary<kUsePDL>();
@@ -279,8 +279,8 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
                           hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
                           token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
         } else {
-          static_assert(!SCALE_UE8M0);
-          scale_output = output_s + offset_num_groups;
+          static_assert(!SCALE_UE8M0 || std::is_same_v<scale_packed_t, float>);
+          scale_output = reinterpret_cast<scale_element_t*>(output_s) + offset_num_groups;
         }
 
         if constexpr (IS_COLUMN_MAJOR and SCALE_UE8M0) {
@@ -309,12 +309,16 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
         local_absmax = GroupReduceMax<THREADS_PER_SUBWARP>(local_absmax);
 
         float y_scale, y_scale_inv;
+        // When SCALE_UE8M0, always quantize with the rounded (power-of-2) scale
+        // — not with the exact scale followed by post-hoc rounding.
+        // This matches the official DeepSeek-V4 kernel.py act_quant(scale_fmt="ue8m0")
+        // and avoids a scale mismatch between quantization and downstream GEMM dequant,
+        // which otherwise amplifies error ~14x and degrades EAGLE accept rate on Blackwell.
         calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
-        float2 y_scale_repeated = {y_scale, y_scale};
-
         if (lane_id == 0) {
-          *scale_output = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
+          *scale_output = extract_required_scale_format < SCALE_UE8M0 && IS_COLUMN_MAJOR > (y_scale_inv);
         }
+        float2 y_scale_repeated = {y_scale, y_scale};
 
         int4 output_buf;
         if constexpr (std::is_same_v<DST_DTYPE, fp8_e4m3_t>) {
@@ -378,7 +382,7 @@ struct PerTokenGroupQuant8bitV2Kernel {
       void* output_q,
       void* output_s,
       const int32_t* masked_m) {
-    using scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>;
+    using scale_packed_t = std::conditional_t<SCALE_UE8M0 && IS_COLUMN_MAJOR, uint32_t, float>;
     auto kernel = per_token_group_quant_8bit_v2_kernel<
         SCHEDULER,
         GROUP_SIZE,
@@ -463,7 +467,11 @@ struct PerTokenGroupQuant8bitV2Kernel {
         launch_with_config(TypeTag<NaiveScheduler>{}, std::true_type{}, std::false_type{}, std::false_type{});
       }
     } else {
-      launch_with_config(TypeTag<NaiveScheduler>{}, std::false_type{}, std::false_type{}, std::false_type{});
+      if (scale_ue8m0) {
+        launch_with_config(TypeTag<NaiveScheduler>{}, std::false_type{}, std::true_type{}, std::false_type{});
+      } else {
+        launch_with_config(TypeTag<NaiveScheduler>{}, std::false_type{}, std::false_type{}, std::false_type{});
+      }
     }
   }
 

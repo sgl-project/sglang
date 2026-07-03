@@ -20,6 +20,9 @@ from typing import Any, List, Literal, Optional, Union, get_args, get_type_hints
 
 import torch
 import torch.distributed as dist
+import zmq
+
+from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 
 # -------------------------------------- config base ------------------------------------------
 
@@ -1419,8 +1422,6 @@ def _create_zmq_rpc_broadcast(
     handler, timeout_seconds: int = 60
 ) -> Optional["_ZmqRpcBroadcast"]:
     """A general-purpose minimal RPC to support broadcasting executions to multi processes"""
-    import zmq
-
     rank = _get_rank()
     world_size = dist.get_world_size() if dist.is_initialized() else 1
 
@@ -1433,13 +1434,13 @@ def _create_zmq_rpc_broadcast(
     def serve_loop():
         while True:
             try:
-                req = sock.recv_pyobj()
+                req = sock_recv(sock)
                 result = getattr(handler, req["method"])(*req["args"], **req["kwargs"])
                 resp = {"result": result, "error": None}
             except Exception as e:
                 _log(f"[ZmqRpc] error inside handler: {e}")
                 resp = {"result": None, "error": str(e)}
-            sock.send_pyobj(resp)
+            sock_send(sock, wrap_as_pickle(resp))
 
     thread = threading.Thread(target=serve_loop, daemon=True)
     thread.start()
@@ -1476,14 +1477,17 @@ class _ZmqRpcHandle:
 
     def __getattr__(self, method_name: str):
         def call(*args, **kwargs):
-            self._socket.send_pyobj(
-                {
-                    "method": method_name,
-                    "args": args,
-                    "kwargs": kwargs,
-                }
+            sock_send(
+                self._socket,
+                wrap_as_pickle(
+                    {
+                        "method": method_name,
+                        "args": args,
+                        "kwargs": kwargs,
+                    }
+                ),
             )
-            response = self._socket.recv_pyobj()
+            response = sock_recv(self._socket)
             if response["error"]:
                 raise RuntimeError(
                     f"RPC error on {self._debug_name}: {response['error']}"

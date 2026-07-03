@@ -12,7 +12,7 @@ import unittest
 import torch
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -24,21 +24,7 @@ from sglang.test.test_utils import (
 
 # CI Registration — large suite to fit the integration test's server startup.
 register_cuda_ci(est_time=79, stage="base-b", runner_config="1-gpu-large")
-
-
-def _skip_if_no_cuda(test_func):
-    return unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")(
-        test_func
-    )
-
-
-def _skip_if_no_cuda_bindings(test_func):
-    try:
-        from cuda.bindings import runtime as rt  # noqa: F401
-
-        return test_func
-    except ImportError:
-        return unittest.skip("cuda-python not installed")(test_func)
+register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 
 class TestBreakableCUDAGraphBasic(CustomTestCase):
@@ -48,10 +34,6 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA not available")
-        try:
-            from cuda.bindings import runtime  # noqa: F401
-        except ImportError:
-            raise unittest.SkipTest("cuda-python not installed")
 
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             BreakableCUDAGraph,
@@ -194,10 +176,6 @@ class TestCopyOutput(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA not available")
-        try:
-            from cuda.bindings import runtime  # noqa: F401
-        except ImportError:
-            raise unittest.SkipTest("cuda-python not installed")
 
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             _copy_output,
@@ -256,10 +234,6 @@ class TestBreakGraphHelper(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA not available")
-        try:
-            from cuda.bindings import runtime  # noqa: F401
-        except ImportError:
-            raise unittest.SkipTest("cuda-python not installed")
 
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             BreakableCUDAGraph,

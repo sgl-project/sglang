@@ -11,6 +11,9 @@ if not is_cpu():
     from sglang.srt.layers.attention.fla.fused_recurrent import (
         fused_recurrent_kda_packed_decode,
     )
+    from sglang.srt.layers.attention.fla.fused_recurrent_linear_replayssm import (
+        fused_recurrent_linear_replayssm_decode,
+    )
     from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
@@ -45,13 +48,52 @@ class TritonKDAKernel(LinearAttnKernelBase):
         decode kernel output layout.
         """
         B = mixed_qkv.shape[0]
+        out = mixed_qkv.new_empty(B, 1, num_v_heads, head_v_dim)
+
+        # KDA ReplaySSM buffered decode: drop-in for the packed decode, same
+        # args plus the three per-layer ring caches + the per-row write cursor
+        # (and optional radix-track force-flush). Uses the gate-generic kernel
+        # with is_kda=True (per-K gate); g_cache is [num_slots, HV, L, K].
+        # When any ring tensor / cursor is None (flag off) we fall through to
+        # the byte-identical legacy path below.
+        replayssm_d = kwargs.get("replayssm_d")
+        replayssm_k = kwargs.get("replayssm_k")
+        replayssm_g = kwargs.get("replayssm_g")
+        replayssm_write_pos = kwargs.get("replayssm_write_pos")
+        replayssm_force_flush = kwargs.get("replayssm_force_flush")
+        if (
+            replayssm_d is not None
+            and replayssm_k is not None
+            and replayssm_g is not None
+            and replayssm_write_pos is not None
+        ):
+            K = ssm_states.shape[-1]  # ssm_states: [num_slots, HV, V, K]
+            fused_recurrent_linear_replayssm_decode(
+                mixed_qkv=mixed_qkv,
+                a=a.reshape(B, num_v_heads, K).contiguous(),
+                b=b.reshape(B, num_v_heads).contiguous(),
+                A_log=A_log.reshape(-1),
+                dt_bias=dt_bias.reshape(num_v_heads, K).contiguous(),
+                scale=scale,
+                initial_state=ssm_states,
+                d_cache=replayssm_d,
+                k_cache=replayssm_k,
+                g_cache=replayssm_g,
+                out=out,
+                ssm_state_indices=cache_indices,
+                write_pos=replayssm_write_pos,
+                force_flush=replayssm_force_flush,
+                use_qk_l2norm_in_kernel=True,
+                is_kda=True,
+            )
+            return out.transpose(0, 1)
+
         # a may come in as [B, HV, K] (or [B, 1, HV*K]); b may come in as
         # [B, 1, HV]. Flatten both to the 2D shapes the kernel expects.
         if a.dim() != 2:
             a = a.reshape(B, -1)
         if b.dim() != 2:
             b = b.reshape(B, -1)
-        out = mixed_qkv.new_empty(B, 1, num_v_heads, head_v_dim)
         fused_recurrent_kda_packed_decode(
             mixed_qkv=mixed_qkv,
             a=a,

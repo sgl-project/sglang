@@ -9,6 +9,7 @@ export const LLaDA21Deployment = () => {
         { id: 'h100', label: 'H100', default: true },
         { id: 'h200', label: 'H200', default: false },
         { id: 'b200', label: 'B200', default: false },
+        { id: 'b300', label: 'B300', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false }
@@ -34,7 +35,7 @@ export const LLaDA21Deployment = () => {
     if (modelsize === 'mini') {
       tpSize = 1;
     } else {
-      if (hardware === 'b200') {
+      if (hardware === 'b200' || hardware === 'b300') {
         tpSize = 2;
       } else {
         tpSize = 4;
@@ -48,7 +49,7 @@ export const LLaDA21Deployment = () => {
     args.push(`--trust-remote-code`);
     args.push(`--mem-fraction-static 0.8`);
     args.push(`--max-running-requests 1`);
-    if (hardware === 'h100' || hardware === 'h200' || hardware === 'b200') {
+    if (hardware === 'h100' || hardware === 'h200' || hardware === 'b200' || hardware === 'b300') {
       args.push(`--attention-backend flashinfer`);
     }
 

@@ -122,9 +122,9 @@ __device__ __forceinline__ void fused_quant_one_row(
     if constexpr (SF_LAYOUT == tensorrt_llm::QuantizationSFLayout::LINEAR) {
       sfOffset = static_cast<int64_t>(writeRow) * num_sf_vecs_per_row + vecIdx;
     } else if constexpr (SF_LAYOUT == tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4) {
-      sfOffset = tk::get_sf_out_offset_128x4(std::nullopt, writeRow, vecIdx, numRowsSf, num_sf_vecs_per_row);
+      sfOffset = tk::get_sf_out_offset_128x4(/*batchIdx=*/0, writeRow, vecIdx, numRowsSf, num_sf_vecs_per_row);
     } else {
-      sfOffset = tk::get_sf_out_offset_8x4(std::nullopt, writeRow, vecIdx, numRowsSf, num_sf_vecs_per_row);
+      sfOffset = tk::get_sf_out_offset_8x4(/*batchIdx=*/0, writeRow, vecIdx, numRowsSf, num_sf_vecs_per_row);
     }
     scaleOutput[sfOffset] = fp8Scale;
   }
@@ -227,9 +227,9 @@ __global__ void fusedPermuteNvfp4QuantDedupKernel(
       if constexpr (SF_LAYOUT == tensorrt_llm::QuantizationSFLayout::LINEAR) {
         sfOffset = static_cast<int64_t>(writeRow) * num_sf_vecs_per_row + vecIdx;
       } else if constexpr (SF_LAYOUT == tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4) {
-        sfOffset = tk::get_sf_out_offset_128x4(std::nullopt, writeRow, vecIdx, numRowsSf, num_sf_vecs_per_row);
+        sfOffset = tk::get_sf_out_offset_128x4(/*batchIdx=*/0, writeRow, vecIdx, numRowsSf, num_sf_vecs_per_row);
       } else {
-        sfOffset = tk::get_sf_out_offset_8x4(std::nullopt, writeRow, vecIdx, numRowsSf, num_sf_vecs_per_row);
+        sfOffset = tk::get_sf_out_offset_8x4(/*batchIdx=*/0, writeRow, vecIdx, numRowsSf, num_sf_vecs_per_row);
       }
       scaleOutput[sfOffset] = fp8Scale;
     }

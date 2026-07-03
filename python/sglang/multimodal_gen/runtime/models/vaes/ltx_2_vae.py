@@ -1647,26 +1647,45 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
             config.arch_config, "timestep_conditioning", False
         )
         use_ltx23_video_decoder = (
-            str(getattr(config.arch_config, "video_decoder_variant", "ltx_2"))
-            == "ltx_2_3"
+            str(config.arch_config.video_decoder_variant) == "ltx_2_3"
         )
+        use_ltx23_condition_encoder = (
+            str(config.arch_config.video_encoder_variant) == "ltx_2_3_condition"
+        )
+        self._use_ltx23_condition_encoder = use_ltx23_condition_encoder
         decoder_causal = config.arch_config.decoder_causal
         decoder_spatial_padding_mode = config.arch_config.decoder_spatial_padding_mode
 
-        self.encoder = LTX2VideoEncoder3d(
-            in_channels,
-            latent_channels,
-            block_out_channels,
-            down_block_types,
-            spatio_temporal_scaling,
-            layers_per_block,
-            downsample_type,
-            patch_size,
-            patch_size_t,
-            resnet_norm_eps,
-            encoder_causal,
-            encoder_spatial_padding_mode,
-        )
+        if use_ltx23_condition_encoder:
+            from sglang.multimodal_gen.runtime.models.vaes.ltx_2_3_condition_encoder import (
+                LTX23VideoConditionEncoder,
+            )
+
+            video_encoder_config = dict(
+                config.arch_config.video_encoder_config
+                or config.arch_config.video_decoder_config
+            )
+            if not video_encoder_config:
+                raise ValueError(
+                    "LTX-2.3 condition video encoder requires video_encoder_config "
+                    "or video_decoder_config."
+                )
+            self.encoder = LTX23VideoConditionEncoder(video_encoder_config)
+        else:
+            self.encoder = LTX2VideoEncoder3d(
+                in_channels,
+                latent_channels,
+                block_out_channels,
+                down_block_types,
+                spatio_temporal_scaling,
+                layers_per_block,
+                downsample_type,
+                patch_size,
+                patch_size_t,
+                resnet_norm_eps,
+                encoder_causal,
+                encoder_spatial_padding_mode,
+            )
 
         if use_ltx23_video_decoder:
             video_decoder_config = dict(config.arch_config.video_decoder_config)
@@ -1806,6 +1825,9 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         )
 
     def _encode(self, x: torch.Tensor, causal: Optional[bool] = None) -> torch.Tensor:
+        if self._use_ltx23_condition_encoder:
+            return self.encoder(x)
+
         batch_size, num_channels, num_frames, height, width = x.shape
 
         if self.use_framewise_decoding and num_frames > self.tile_sample_min_num_frames:
@@ -1835,6 +1857,18 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
                 The latent representations of the encoded videos. If `return_dict` is True, a
                 [`~models.autoencoder_kl.AutoencoderKLOutput`] is returned, otherwise a plain `tuple` is returned.
         """
+        if self._use_ltx23_condition_encoder:
+            if self.use_slicing and x.shape[0] > 1:
+                encoded_slices = [
+                    self._encode(x_slice, causal=causal) for x_slice in x.split(1)
+                ]
+                h = torch.cat(encoded_slices)
+            else:
+                h = self._encode(x, causal=causal)
+            if not return_dict:
+                return (h,)
+            return DecoderOutput(sample=h)
+
         if self.use_slicing and x.shape[0] > 1:
             encoded_slices = [
                 self._encode(x_slice, causal=causal) for x_slice in x.split(1)

@@ -54,7 +54,6 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
 
 logger = init_logger(__name__)
 
-# TODO: move to somewhere appropriate
 try:
     # Set the start method to 'spawn' to avoid CUDA errors in forked processes.
     # This must be done at the top level of the module, before any CUDA context
@@ -603,7 +602,7 @@ class DiffGenerator:
         # sends the shutdown command to the server
         if self.local_scheduler_process and self.owns_scheduler_client:
             try:
-                sync_scheduler_client.forward(ShutdownReq())
+                sync_scheduler_client.forward(ShutdownReq(), timeout_ms=5000)
             except Exception:
                 pass
 
@@ -615,11 +614,45 @@ class DiffGenerator:
                         f"Local worker {process.name} did not terminate gracefully, forcing."
                     )
                     process.terminate()
+                    process.join(timeout=1)
+                    if process.is_alive():
+                        process.kill()
+                        process.join(timeout=1)
             self.local_scheduler_process = None
 
         if self.owns_scheduler_client:
             sync_scheduler_client.close()
             self.owns_scheduler_client = False
+
+    def _force_shutdown_local_processes(self) -> None:
+        local_scheduler_process = getattr(self, "local_scheduler_process", None)
+        log = globals().get("logger")
+        if local_scheduler_process:
+            for process in local_scheduler_process:
+                if process.is_alive():
+                    if log is not None:
+                        log.warning(
+                            f"Local worker {process.name} did not terminate gracefully, forcing."
+                        )
+                    process.terminate()
+            for process in local_scheduler_process:
+                process.join(timeout=1)
+                if process.is_alive():
+                    if log is not None:
+                        log.warning(
+                            f"Local worker {process.name} did not terminate after terminate(), killing."
+                        )
+                    process.kill()
+                    process.join(timeout=1)
+            self.local_scheduler_process = None
+
+        if getattr(self, "owns_scheduler_client", False):
+            try:
+                client = globals().get("sync_scheduler_client")
+                if client is not None:
+                    client.close()
+            finally:
+                self.owns_scheduler_client = False
 
     def __enter__(self):
         return self
@@ -630,15 +663,18 @@ class DiffGenerator:
     def __del__(self):
         owns_scheduler_client = bool(getattr(self, "owns_scheduler_client", False))
         local_scheduler_process = getattr(self, "local_scheduler_process", None)
+        log = globals().get("logger")
         if owns_scheduler_client:
-            logger.warning(
-                "Generator was garbage collected without being shut down. "
-                "Attempting to shut down the local server and client."
-            )
-            self.shutdown()
+            if log is not None:
+                log.warning(
+                    "Generator was garbage collected without being shut down. "
+                    "Forcing local server and client cleanup."
+                )
+            self._force_shutdown_local_processes()
         elif local_scheduler_process:
-            logger.warning(
-                "Generator was garbage collected without being shut down. "
-                "Attempting to shut down the local server."
-            )
-            self.shutdown()
+            if log is not None:
+                log.warning(
+                    "Generator was garbage collected without being shut down. "
+                    "Forcing local server cleanup."
+                )
+            self._force_shutdown_local_processes()

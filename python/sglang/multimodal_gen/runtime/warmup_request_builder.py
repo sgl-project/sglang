@@ -65,14 +65,27 @@ def _resolve_default_warmup_resolution(
     *,
     server_based_warmup: bool,
 ) -> tuple[int, int]:
-    """returns a default resolution to warmup"""
-    if server_based_warmup:
-        return _resolve_representative_warmup_resolution(server_args, sampling_defaults)
+    """Return the default warmup resolution.
 
+    Prefer the model's sampling-default resolution — the most likely real
+    request shape — so warmup specializes kernels for it. Server-based image
+    warmup used to shrink this to an area cap (``SERVER_WARMUP_IMAGE_MAX_AREA``,
+    768x768) to bound startup, but that left a residual first-request
+    cold-start when the real request is larger (e.g. 1024x1024 paid ~0.1s of
+    first-shape kernel autotuning, measured on H100).
+    """
     width = sampling_defaults.width
     height = sampling_defaults.height
-    if width is not None and height is not None:
+    is_image_gen = server_args.pipeline_config.task_type.is_image_gen()
+    if (
+        width is not None
+        and height is not None
+        and (not server_based_warmup or is_image_gen)
+    ):
         return width, height
+
+    if server_based_warmup:
+        return _resolve_representative_warmup_resolution(server_args, sampling_defaults)
 
     supported_resolutions = sampling_defaults.supported_resolutions
     if supported_resolutions:

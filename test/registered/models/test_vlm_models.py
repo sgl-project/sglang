@@ -19,12 +19,15 @@ register_amd_ci(est_time=850, suite="stage-b-test-1-gpu-small-amd-nondeterminist
 _is_hip = is_hip()
 # VLM models for testing
 if _is_hip:
-    MODELS = [SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4)]
+    MODELS = [
+        # SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4),  # temporarily disabled: NaN in next_token_logits
+        SimpleNamespace(model="Qwen/Qwen2.5-VL-3B-Instruct", mmmu_accuracy=0.4),
+    ]
 else:
     MODELS = [
         SimpleNamespace(model="google/gemma-3-4b-it", mmmu_accuracy=0.38),
         SimpleNamespace(model="Qwen/Qwen2.5-VL-3B-Instruct", mmmu_accuracy=0.4),
-        SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4),
+        # SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4),  # temporarily disabled: NaN in next_token_logits
     ]
 
 

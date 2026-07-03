@@ -136,6 +136,8 @@ def sync_ltx23_runtime_vae_markers(
     for key in (
         "ltx_variant",
         "condition_encoder_subdir",
+        "video_encoder_variant",
+        "video_encoder_config",
         "video_decoder_variant",
         "video_decoder_config",
     ):
@@ -198,8 +200,9 @@ class LTX2PipelineConfig(PipelineConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            auto_disable_component_offload_min_available_memory_gb=70,
-            auto_disable_component_offload_components=("dit",),
+            keep_resident_min_available_gb=70,
+            keep_resident_components=("dit",),
+            auto_cfg_parallel_degree_by_num_gpus=((4, 1), (8, 1)),
         )
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
@@ -708,6 +711,11 @@ class LTX2PipelineConfig(PipelineConfig):
         )
 
         return latents, audio_latents
+
+
+@dataclasses.dataclass
+class LTX23PipelineConfig(LTX2PipelineConfig):
+    """Configuration overrides for LTX-2.3."""
 
 
 @dataclasses.dataclass

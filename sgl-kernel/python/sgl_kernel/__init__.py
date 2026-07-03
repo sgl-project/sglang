@@ -57,7 +57,6 @@ else:
         awq_dequantize,
         bmm_fp8,
         dsv3_fused_a_gemm,
-        dsv3_router_gemm,
         fp8_blockwise_scaled_mm,
         fp8_scaled_mm,
         gptq_gemm,

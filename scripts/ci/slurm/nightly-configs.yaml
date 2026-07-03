@@ -44,3 +44,279 @@ dsr1-fp4-gb200-dynamo-sglang:
         - conc-list: [512, 2048, 4096, 8192]
           # https://github.com/NVIDIA/srt-slurm/blob/sglang-nightly-regression/recipes/gb200-fp4/1k1k/mid-curve.yaml
           config_file: recipes/gb200-fp4/1k1k/mid-curve.yaml
+
+# AMD MI355X 2-node 1P1D disaggregation. Driven by
+# scripts/ci/slurm/launch_mi355x.sh, which reads each recipe's `runtime`,
+# `bench`, and `bench.accuracy` sections. Every nightly runs ALL four
+# DeepSeek-V4 model x precision combos below (full matrix; GitHub
+# strategy.matrix.config, fail-fast: false). Each runs a GSM8K accuracy
+# hard-gate before the perf sweep.
+#
+# model_path points at the shared NFS HuggingFace cache dir (models--org--name);
+# the launcher resolves the live snapshot via refs/main, so no hash is hardcoded.
+dsv4flash-fp8-mi355x-sglang:
+  model: sgl-project/DeepSeek-V4-Flash-FP8
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4flash/1k1k/1p1d.yaml
+
+dsv4pro-fp8-mi355x-sglang:
+  model: sgl-project/DeepSeek-V4-Pro-FP8
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d.yaml
+
+dsv4flash-fp4-mi355x-sglang:
+  model: deepseek-ai/DeepSeek-V4-Flash
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4flash/1k1k/1p1d.yaml
+
+dsv4pro-fp4-mi355x-sglang:
+  model: deepseek-ai/DeepSeek-V4-Pro
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4pro/1k1k/1p1d.yaml
+
+# AMD MI355X 2-node 1P1D disaggregation over MORI with extra topology / MTP
+# coverage on the SAME four DeepSeek-V4 model x precision combos as the base
+# MORI blocks above (which stay TP8, no MTP). Three variants per model:
+#   * -mtp        : TP8 + EAGLE MTP (recipe `mtp.enabled`)
+#   * -dp8ep8     : DP-attention 8 + narrow within-node EP8
+#   * -dp8ep8-mtp : DP8 + narrow EP8 + EAGLE MTP
+# launch_mi355x.sh reads expert-/data-parallel-size and the `mtp:` section to
+# append --ep-size / --enable-dp-attention --dp-size / --speculative-* flags.
+
+dsv4flash-fp8-mi355x-mtp-sglang:
+  model: sgl-project/DeepSeek-V4-Flash-FP8
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4flash/1k1k/1p1d-mtp.yaml
+
+dsv4flash-fp8-mi355x-dp8ep8-sglang:
+  model: sgl-project/DeepSeek-V4-Flash-FP8
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4flash/1k1k/1p1d-dp8ep8.yaml
+
+dsv4flash-fp8-mi355x-dp8ep8-mtp-sglang:
+  model: sgl-project/DeepSeek-V4-Flash-FP8
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4flash/1k1k/1p1d-dp8ep8-mtp.yaml
+
+dsv4pro-fp8-mi355x-mtp-sglang:
+  model: sgl-project/DeepSeek-V4-Pro-FP8
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        # conc256 excluded: disagg-decode SWA hybrid pool retract->get_cpu_copy
+        # is an upstream NotImplementedError (crashes decode). See recipe.
+        - conc-list: [1, 8, 16, 32, 64, 128]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d-mtp.yaml
+
+dsv4pro-fp8-mi355x-dp8ep8-sglang:
+  model: sgl-project/DeepSeek-V4-Pro-FP8
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d-dp8ep8.yaml
+
+dsv4pro-fp8-mi355x-dp8ep8-mtp-sglang:
+  model: sgl-project/DeepSeek-V4-Pro-FP8
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d-dp8ep8-mtp.yaml
+
+dsv4flash-fp4-mi355x-mtp-sglang:
+  model: deepseek-ai/DeepSeek-V4-Flash
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4flash/1k1k/1p1d-mtp.yaml
+
+dsv4flash-fp4-mi355x-dp8ep8-sglang:
+  model: deepseek-ai/DeepSeek-V4-Flash
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4flash/1k1k/1p1d-dp8ep8.yaml
+
+dsv4flash-fp4-mi355x-dp8ep8-mtp-sglang:
+  model: deepseek-ai/DeepSeek-V4-Flash
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4flash/1k1k/1p1d-dp8ep8-mtp.yaml
+
+dsv4pro-fp4-mi355x-mtp-sglang:
+  model: deepseek-ai/DeepSeek-V4-Pro
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4pro/1k1k/1p1d-mtp.yaml
+
+dsv4pro-fp4-mi355x-dp8ep8-sglang:
+  model: deepseek-ai/DeepSeek-V4-Pro
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4pro/1k1k/1p1d-dp8ep8.yaml
+
+dsv4pro-fp4-mi355x-dp8ep8-mtp-sglang:
+  model: deepseek-ai/DeepSeek-V4-Pro
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4pro/1k1k/1p1d-dp8ep8-mtp.yaml

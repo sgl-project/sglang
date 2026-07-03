@@ -143,7 +143,7 @@ export const Nemotron3UltraDeployment = () => {
         { id: 'enabled',  label: 'Enabled',  default: true  },
         { id: 'disabled', label: 'Disabled', default: false }
       ],
-      commandRule: (value) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4' : null
+      commandRule: (value) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 5 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 6' : null
     },
     kvcache: {
       name: 'kvcache',
@@ -153,6 +153,36 @@ export const Nemotron3UltraDeployment = () => {
         { id: 'fp8_e4m3', label: 'fp8_e4m3', default: false },
         { id: 'bf16',     label: 'bf16',     default: false }
       ]
+    },
+    mambabackend: {
+      name: 'mambabackend',
+      title: 'Mamba Backend',
+      items: [
+        { id: 'triton',     label: 'Triton',     subtitle: 'Default', default: true  },
+        { id: 'flashinfer', label: 'FlashInfer', subtitle: 'Faster',  default: false }
+      ],
+      commandRule: (value) => value === 'flashinfer' ? '--mamba-backend flashinfer' : null
+    },
+    mambassmdtype: {
+      name: 'mambassmdtype',
+      title: 'Mamba SSM DType',
+      items: [
+        { id: 'default', label: 'Default', subtitle: 'Model config', default: true  },
+        { id: 'float16', label: 'float16', subtitle: 'Less memory',   default: false }
+      ],
+      commandRule: (value) => value === 'float16' ? '--mamba-ssm-dtype float16' : null
+    },
+    mambastochasticrounding: {
+      name: 'mambastochasticrounding',
+      title: 'Mamba Stochastic Rounding',
+      items: [
+        { id: 'disabled', label: 'Disabled', default: true  },
+        { id: 'enabled',  label: 'Enabled',  subtitle: 'FP16 SSM' }
+      ],
+      commandRule: (value, state) =>
+        value === 'enabled' && state.mambassmdtype === 'float16'
+          ? '--enable-mamba-cache-stochastic-rounding'
+          : null
     },
     thinking: {
       name: 'thinking',

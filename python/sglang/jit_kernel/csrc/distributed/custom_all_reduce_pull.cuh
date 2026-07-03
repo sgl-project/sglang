@@ -169,6 +169,8 @@ struct CustomAllReducePull : public CustomAllReduceBase {
     const auto stream = LaunchKernel::resolve_device(device);
     auto launch = LaunchKernel{num_blocks, m_cta_size, stream};
     launch.enable_pdl(kUsePDL);
+    const auto input_bytes = static_cast<int64_t>(sizeof(DType) * num_items);
+    RuntimeCheck(input_bytes <= m_pull_buffer_bytes, "Input is too large, num items: ", num_items);
     const auto check_capturing = [&] {
       if (!m_is_graph_capturing) return false;  // override to avoid cudaRT call overhead
       cudaStreamCaptureStatus status;
@@ -177,13 +179,11 @@ struct CustomAllReducePull : public CustomAllReduceBase {
     };
     if (check_capturing()) {
       // no-op if not really capturing, we're in a dummy run
-      const auto data_ptr = allocate_graph_capture_input(input_ptr);
+      const auto data_ptr = allocate_graph_capture_input(input_ptr, input_bytes);
       /// NOTE: we assume when the graph is replayed, the data_ptr should be ready
       launch(kernel, data_ptr, params, ctrl);
     } else {
       // 1.copy the input to the buffer
-      const auto input_bytes = static_cast<int64_t>(sizeof(DType) * num_items);
-      RuntimeCheck(input_bytes <= m_pull_buffer_bytes, "Input is too large, num items: ", num_items);
       RuntimeDeviceCheck(cudaMemcpyAsync(buffer_ptr, input_ptr, input_bytes, cudaMemcpyDeviceToDevice, stream));
       // 2. launch the all reduce kernel
       const auto data_ptr = get_data_ptr();  // use default buffer

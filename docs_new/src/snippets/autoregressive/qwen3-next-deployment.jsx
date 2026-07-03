@@ -5,6 +5,7 @@ export const Qwen3NextDeployment = () => {
       title: 'Hardware Platform',
       items: [
         { id: 'b200', label: 'B200', default: true },
+        { id: 'b300', label: 'B300', default: false },
         { id: 'h200', label: 'H200', default: false },
         { id: 'h100', label: 'H100', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
@@ -75,6 +76,7 @@ export const Qwen3NextDeployment = () => {
       h100: { tp: 4, ep: 0, bf16: true, fp8: true },
       h200: { tp: 2, ep: 0, bf16: true, fp8: true },
       b200: { tp: 2, ep: 0, bf16: true, fp8: true },
+      b300: { tp: 2, ep: 0, bf16: true, fp8: true },
       mi300x: { tp: 2, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 2, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 2, ep: 0, bf16: true, fp8: true },
@@ -135,6 +137,10 @@ export const Qwen3NextDeployment = () => {
     // AMD GPUs require triton attention backend
     if (hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x') {
       cmd += ` \\\n  --attention-backend triton`;
+    }
+    if (hardware === 'b300') {
+      cmd += ` \\\n  --attention-backend flashinfer`;
+      cmd += ` \\\n  --enforce-disable-flashinfer-allreduce-fusion`;
     }
 
     return cmd;

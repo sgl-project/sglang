@@ -6,6 +6,7 @@ via KL divergence.
 """
 
 import os
+import random
 import shutil
 import tempfile
 import unittest
@@ -22,7 +23,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-GLM5_MODEL = "zai-org/GLM-5.1-FP8"
+GLM5_MODEL = "zai-org/GLM-5.2-FP8"
 GLM5_LAUNCH_TIMEOUT = 3600
 
 register_cuda_ci(est_time=900, suite="nightly-8-gpu-h200", nightly=True)
@@ -41,6 +42,12 @@ class AccuracyTwoPassMixin:
     gsm8k_parallel: int = 40
 
     max_accuracy_diff: float = 0.02
+
+    l3_prefetch_page_size: int = 64
+    l3_prefetch_prompt_pages: int = 16
+    # Max tokens that may stay uncached on a full-prompt re-request; the bound
+    # depends on model architecture. Defaults to page_size; subclasses override.
+    l3_prefetch_max_uncached_tokens: int = None
 
     def _run_gsm8k(self):
         from sglang.test.few_shot_gsm8k import run_eval as run_few_shot_gsm8k
@@ -106,9 +113,35 @@ class AccuracyTwoPassMixin:
         """Run GSM8K twice with flush in between, verify accuracy diff <= max_accuracy_diff."""
         self._two_pass("GSM8K", self._run_gsm8k, self.gsm8k_threshold)
 
+    def test_l3_prefetch_full_prefix_hit_after_flush(self):
+        from sglang.test.kl_test_utils import _flush_cache, _generate
+
+        page = int(self.l3_prefetch_page_size)
+        n_tokens = page * int(self.l3_prefetch_prompt_pages)
+        max_uncached = int(
+            self.l3_prefetch_max_uncached_tokens
+            if self.l3_prefetch_max_uncached_tokens is not None
+            else page
+        )
+
+        rng = random.Random(987)
+        input_ids = [rng.randint(1, 30000) for _ in range(n_tokens)]
+
+        _generate(self.base_url, [input_ids], max_new_tokens=4)
+        _flush_cache(self.base_url)
+        results = _generate(self.base_url, [input_ids], max_new_tokens=4)
+        cached = int(results[0]["meta_info"]["cached_tokens"])
+
+        expected_min = n_tokens - max_uncached
+        self.assertGreaterEqual(
+            cached,
+            expected_min,
+            f"cached_tokens={cached} < {expected_min} (= input_len - {max_uncached})",
+        )
+
 
 class TestGLM5HiRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
-    """GLM-5.1-FP8 + HiCache L3 (file backend), with HiRadixTree."""
+    """GLM-5.2-FP8 + HiCache L3 (file backend), with HiRadixTree."""
 
     @classmethod
     def setUpClass(cls):
@@ -126,7 +159,7 @@ class TestGLM5HiRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
                 "--page-size",
                 "64",
                 "--mem-fraction-static",
-                "0.85",
+                "0.8",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
                 "--enable-hierarchical-cache",
@@ -137,9 +170,9 @@ class TestGLM5HiRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
                 "--hicache-storage-prefetch-policy",
                 "wait_complete",
                 "--hicache-io-backend",
-                "direct",
+                "kernel",
                 "--hicache-mem-layout",
-                "page_first_direct",
+                "page_first",
                 "--hicache-storage-backend",
                 "file",
             ],
@@ -156,7 +189,7 @@ class TestGLM5HiRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
 
 
 class TestGLM5UnifiedRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
-    """GLM-5.1-FP8 + HiCache L3 (file backend), with UnifiedRadixTree."""
+    """GLM-5.2-FP8 + HiCache L3 (file backend), with UnifiedRadixTree."""
 
     @classmethod
     def setUpClass(cls):
@@ -174,7 +207,7 @@ class TestGLM5UnifiedRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
                 "--page-size",
                 "64",
                 "--mem-fraction-static",
-                "0.85",
+                "0.8",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
                 "--enable-hierarchical-cache",
@@ -185,9 +218,9 @@ class TestGLM5UnifiedRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
                 "--hicache-storage-prefetch-policy",
                 "wait_complete",
                 "--hicache-io-backend",
-                "direct",
+                "kernel",
                 "--hicache-mem-layout",
-                "page_first_direct",
+                "page_first",
                 "--hicache-storage-backend",
                 "file",
             ],

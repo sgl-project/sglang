@@ -59,6 +59,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image_layered import (
     QwenImageLayeredBeforeDenoisingStage,
+    _resolve_layered_image_path,
     _resolve_text_encoder_dtype,
 )
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
@@ -429,6 +430,20 @@ class TestPipelineSpecificExtraModules(unittest.TestCase):
 
 
 class TestQwenImageLayeredDtype(_GlobalStageArgsMixin, unittest.TestCase):
+    def test_layered_image_path_accepts_string_and_list(self):
+        self.assertEqual(
+            _resolve_layered_image_path("/tmp/input.png"),
+            "/tmp/input.png",
+        )
+        self.assertEqual(
+            _resolve_layered_image_path(["/tmp/input.png"]),
+            "/tmp/input.png",
+        )
+
+    def test_layered_image_path_rejects_empty_list(self):
+        with self.assertRaisesRegex(ValueError, "non-empty image_path"):
+            _resolve_layered_image_path([])
+
     def test_text_encoder_dtype_uses_parameter_dtype_without_dtype_attr(self):
         text_encoder = torch.nn.Linear(1, 1, bias=False).to(dtype=torch.bfloat16)
         self.assertEqual(

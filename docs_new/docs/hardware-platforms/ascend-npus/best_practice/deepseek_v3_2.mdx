@@ -4,7 +4,9 @@ metatags:
   description: "Best Practice for DeepSeek-V3.2 on Ascend NPU"
 ---
 
-This guide describes the best practice data for DeepSeek-V3.2 on the Ascend NPU.
+<Note>
+This page focuses on optimal configuration and benchmark results for DeepSeek-V3.2 on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [DeepSeek-V3.2 Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_v3_2).
+</Note>
 
 ### Low Latency
 
@@ -19,8 +21,9 @@ This guide describes the best practice data for DeepSeek-V3.2 on the Ascend NPU.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | DeepSeek-V3.2 | Atlas 800I A3 | 32 | PD Disaggregation | 128K+1K | 107ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-bs16) |
 
-
 ## Optimal Configuration
+
+<a id="pd-disaggregation" title="Referenced by external docs. Verify before removing."></a>
 
 ### DeepSeek-V3.2 W8A8 1P1D 32P IN128K OUT1K 26ms
 
@@ -121,7 +124,12 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 2
+        --speculative-num-draft-tokens 2 \
+        --reasoning-parser deepseek-v3 \
+        --tool-call-parser deepseekv32 \
+        --trust-remote-code \
+        --attention-backend ascend \
+        --device npu
         NODE_RANK=$i
         break
     fi
@@ -162,7 +170,7 @@ do
         --chunked-prefill-size -1 \
         --max-prefill-tokens 68000 \
         --max-running-requests 32 \
-        --cuda-graph-max-bs 4 \
+        --cuda-graph-max-bs-decode 4 \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency \
         --quantization modelslim \
@@ -170,7 +178,12 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --disaggregation-transfer-backend ascend
+        --disaggregation-transfer-backend ascend \
+        --reasoning-parser deepseek-v3 \
+        --tool-call-parser deepseekv32 \
+        --trust-remote-code \
+        --attention-backend ascend \
+        --device npu
         NODE_RANK=$i
         break
     fi
@@ -310,7 +323,12 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 2
+        --speculative-num-draft-tokens 2 \
+        --reasoning-parser deepseek-v3 \
+        --tool-call-parser deepseekv32 \
+        --trust-remote-code \
+        --attention-backend ascend \
+        --device npu
         NODE_RANK=$i
         break
     fi
@@ -351,7 +369,7 @@ do
         --chunked-prefill-size -1 \
         --max-prefill-tokens 68000 \
         --max-running-requests 32 \
-        --cuda-graph-max-bs 4 \
+        --cuda-graph-max-bs-decode 4 \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency \
         --quantization modelslim \
@@ -359,7 +377,12 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --disaggregation-transfer-backend ascend
+        --disaggregation-transfer-backend ascend \
+        --reasoning-parser deepseek-v3 \
+        --tool-call-parser deepseekv32 \
+        --trust-remote-code \
+        --attention-backend ascend \
+        --device npu
         NODE_RANK=$i
         break
     fi
@@ -499,7 +522,12 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 2
+        --speculative-num-draft-tokens 2 \
+        --reasoning-parser deepseek-v3 \
+        --tool-call-parser deepseekv32 \
+        --trust-remote-code \
+        --attention-backend ascend \
+        --device npu
         NODE_RANK=$i
         break
     fi
@@ -540,7 +568,7 @@ do
         --chunked-prefill-size -1 \
         --max-prefill-tokens 68000 \
         --max-running-requests 32 \
-        --cuda-graph-max-bs 4 \
+        --cuda-graph-max-bs-decode 4 \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency \
         --quantization modelslim \
@@ -548,7 +576,12 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --disaggregation-transfer-backend ascend
+        --disaggregation-transfer-backend ascend \
+        --reasoning-parser deepseek-v3 \
+        --tool-call-parser deepseekv32 \
+        --trust-remote-code \
+        --attention-backend ascend \
+        --device npu
         NODE_RANK=$i
         break
     fi

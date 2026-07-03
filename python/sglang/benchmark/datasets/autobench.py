@@ -173,7 +173,7 @@ def _estimate_prompt_lens(
         prompt_len = len(prompt)
         return prompt_len, prompt_len, 0
 
-    # Multi-turn prompt lists are handled specially by bench_serving and do not
+    # Multi-turn prompt lists are handled specially by the serving benchmark and do not
     # contribute reliable static prompt lengths.
     return 0, 0, 0
 

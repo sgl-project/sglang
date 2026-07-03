@@ -187,7 +187,7 @@ class Ideogram4ProgressiveDenoisingStage(
         self._spectrum_beta = IDEOGRAM_SPECTRUM_BETA
         # Ideogram4DenoisingStage extra transformer
         self.unconditional_transformer = unconditional_transformer
-        self._maybe_enable_torch_compile(self.unconditional_transformer)
+        self._maybe_torch_compile(self.unconditional_transformer)
 
     # ------------------------------------------------------------------
     # Latent scale factor

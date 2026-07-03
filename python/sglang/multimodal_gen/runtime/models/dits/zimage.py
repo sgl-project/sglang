@@ -954,7 +954,6 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         cap_feats = self._as_caption_list(encoder_hidden_states)
         timestep = 1000.0 - timestep
         t = timestep
-        device = x[0].device
         t = self.t_embedder(t)
         adaln_input = t.to(dtype=x[0].dtype)
         (

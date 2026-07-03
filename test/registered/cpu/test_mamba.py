@@ -12,6 +12,12 @@ register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 
 torch.manual_seed(1234)
 
+# [NB]: State-layout convention for this test file:
+# - CPU kernel path in fla.cpp uses VK state layout, same as triton impl.
+# - Torch naive reference follows KV semantics from:
+#   https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/gated_delta_rule/naive.py
+# - Transposes in these tests only bridge VK (kernel-facing) and KV (ref-facing) views.
+
 
 def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6):
     """This function is intended to align with the l2norm implementation in the FLA library."""
@@ -119,12 +125,13 @@ def chunk_gated_delta_rule_update(
     g,  # [B, T, HV]
     beta,  # [B, T, HV]
     cu_seqlens,  # [N+1]
-    initial_state,  # [N, HV, K, V]
+    initial_state,  # [N, HV, V, K]
     use_qk_l2norm_in_kernel,  # True
 ):
     num_heads = query.shape[2]
     num_value_heads = value.shape[2]
     batch_size = initial_state.shape[0]
+    initial_state_kv = initial_state.transpose(-1, -2).contiguous()
     if num_value_heads // num_heads > 1:
         query = query.repeat_interleave(num_value_heads // num_heads, dim=2)
         key = key.repeat_interleave(num_value_heads // num_heads, dim=2)
@@ -139,12 +146,12 @@ def chunk_gated_delta_rule_update(
             value=value[:, start_q:end_q, :, :],
             g=g[:, start_q:end_q, :],
             beta=beta[:, start_q:end_q, :],
-            initial_state=initial_state[i],
+            initial_state=initial_state_kv[i],
             output_final_state=True,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
         output[:, start_q:end_q, :, :] = core_attn_outi
-        final_state[i] = last_recurrent_state
+        final_state[i] = last_recurrent_state.transpose(-1, -2).contiguous()
         start_q = end_q
     return output, final_state
 
@@ -217,16 +224,24 @@ def sigmoid_gating_delta_rule_update(
 ):
     beta = b.sigmoid()
     g = -A_log.float().exp() * softplus(a.float() + dt_bias)
-    return torch_recurrent_gated_delta_rule(
+    initial_state_kv = (
+        initial_state.transpose(-1, -2).contiguous()
+        if initial_state is not None
+        else None
+    )
+    core_attn_out, last_recurrent_state = torch_recurrent_gated_delta_rule(
         query,
         key,
         value,
         g.unsqueeze(1),
         beta.unsqueeze(1),
-        initial_state,
+        initial_state_kv,
         output_final_state,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
+    if last_recurrent_state is not None:
+        last_recurrent_state = last_recurrent_state.transpose(-1, -2).contiguous()
+    return core_attn_out, last_recurrent_state
 
 
 def torch_gdn_gating(A_log, a, b, dt_bias):
@@ -237,19 +252,29 @@ def torch_gdn_gating(A_log, a, b, dt_bias):
 
 class TestMambaAttention(CustomTestCase):
     def test_chunk_gated_delta_rule(self):
-        B, L, HK, HV, EK, EV, N = 1, 100, 3, 6, 64, 64, 4
-        seqlens = torch.randint(1, L, (N + 1,))
-        seqlens[0] = 0
-        cu_seqlens_ = torch.cumsum(seqlens, dim=0).to(torch.int32)
+        B, T_PER_SEQ, HK, HV, K, V, POOL_SIZE = 1, 128, 16, 32, 128, 128, 17
+        seq_lens = torch.tensor(
+            [T_PER_SEQ - 7, T_PER_SEQ + 11, T_PER_SEQ - 13, T_PER_SEQ + 9],
+            dtype=torch.int32,
+        )
+        cu_seqlens_ = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32),
+                seq_lens.cumsum(dim=0, dtype=torch.int32),
+            ]
+        )
         T = cu_seqlens_[-1].item()
-        query_ = torch.rand((B, T, HK, EK), dtype=torch.bfloat16) * 0.05
-        key_ = torch.rand((B, T, HK, EK), dtype=torch.bfloat16) * 0.05
-        value_ = torch.rand((B, T, HV, EV), dtype=torch.bfloat16) * 0.05
-        g_ = torch.rand((B, T, HV), dtype=torch.float32) * 0.05
-        beta_ = torch.rand((B, T, HV), dtype=torch.bfloat16) * 0.05
-        initial_state_ = torch.rand((N, HV, EK, EV), dtype=torch.float32) * 0.05
+        cache_indices = torch.tensor([3, 11, 15, 7], dtype=torch.int32)
+        state_slots = cache_indices
+        query_ = torch.randn((B, T, HK, K), dtype=torch.bfloat16)
+        key_ = torch.randn((B, T, HK, K), dtype=torch.bfloat16)
+        value_ = torch.randn((B, T, HV, V), dtype=torch.bfloat16)
+        g_ = F.logsigmoid(torch.randn((B, T, HV), dtype=torch.float32))
+        beta_ = torch.sigmoid(torch.randn((B, T, HV), dtype=torch.bfloat16))
+        initial_state_ = torch.randn((POOL_SIZE, HV, V, K), dtype=torch.float32) * 0.1
 
-        for use_qk_l2norm_in_kernel in [True, False]:
+        # skip `use_qk_l2norm_in_kernel=False` case since it's not numerically stable in bfloat16
+        for use_qk_l2norm_in_kernel in [True]:
             core_attn_out_ref, last_recurrent_state_ref = chunk_gated_delta_rule_update(
                 query=query_,
                 key=key_,
@@ -257,7 +282,7 @@ class TestMambaAttention(CustomTestCase):
                 g=g_,
                 beta=beta_,
                 cu_seqlens=cu_seqlens_,
-                initial_state=initial_state_,
+                initial_state=initial_state_[state_slots],
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             )
 
@@ -267,9 +292,10 @@ class TestMambaAttention(CustomTestCase):
             g = g_.clone()
             beta = beta_.clone()
             cu_seqlens = cu_seqlens_.clone()
-            initial_state = initial_state_.clone()
+            initial_state = initial_state_.clone().transpose(-1, -2).contiguous()
+            initial_state_before = initial_state.clone()
 
-            core_attn_out, last_recurrent_state = (
+            core_attn_out, returned_state = (
                 torch.ops.sgl_kernel.chunk_gated_delta_rule_cpu(
                     query=query,
                     key=key,
@@ -281,14 +307,24 @@ class TestMambaAttention(CustomTestCase):
                     cu_seqlens=cu_seqlens,
                     head_first=False,
                     use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    initial_state_indices=cache_indices,
                 )
             )
+            last_recurrent_state = (
+                initial_state[state_slots].transpose(-1, -2).contiguous()
+            )
+            untouched_slots = torch.ones(POOL_SIZE, dtype=torch.bool)
+            untouched_slots[state_slots] = False
             atol = rtol = precision[core_attn_out.dtype]
             torch.testing.assert_close(
                 core_attn_out, core_attn_out_ref, atol=atol, rtol=rtol
             )
             torch.testing.assert_close(
                 last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol
+            )
+            torch.testing.assert_close(returned_state, initial_state)
+            torch.testing.assert_close(
+                initial_state[untouched_slots], initial_state_before[untouched_slots]
             )
 
     def test_fused_gdn_gating(self):
@@ -350,7 +386,7 @@ class TestMambaAttention(CustomTestCase):
         a = torch.rand(batch_size, num_value_heads, dtype=torch.bfloat16)
         b = torch.rand(batch_size, num_value_heads, dtype=torch.bfloat16)
         dt_bias = torch.rand(num_value_heads, dtype=torch.bfloat16)
-        ssm_states = torch.rand(
+        ssm_states_kv = torch.rand(
             513, num_value_heads, head_k_dim, head_v_dim, dtype=torch.float32
         )
         cache_indices = torch.randint(0, 513, (batch_size,), dtype=torch.int32)
@@ -372,7 +408,9 @@ class TestMambaAttention(CustomTestCase):
                     a,
                     dt_bias,
                     b,
-                    initial_state=ssm_states[cache_indices],
+                    initial_state=ssm_states_kv[cache_indices]
+                    .transpose(-1, -2)
+                    .contiguous(),
                     output_final_state=True,
                     use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                 )
@@ -386,7 +424,7 @@ class TestMambaAttention(CustomTestCase):
                     v=value,
                     a=a,
                     b=b,
-                    initial_state_source=ssm_states,
+                    initial_state_source=ssm_states_kv,
                     initial_state_indices=cache_indices,
                     cu_seqlens=query_start_loc,
                     use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
@@ -394,7 +432,9 @@ class TestMambaAttention(CustomTestCase):
                     softplus_threshold=20.0,
                 )
             )
-            last_recurrent_state = ssm_states[cache_indices]
+            last_recurrent_state = (
+                ssm_states_kv[cache_indices].transpose(-1, -2).contiguous()
+            )
             atol = rtol = precision[core_attn_out.dtype]
             torch.testing.assert_close(
                 core_attn_out, core_attn_out_ref, atol=atol, rtol=rtol

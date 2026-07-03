@@ -25,9 +25,9 @@ MIMO_V2_OTHER_ARGS = [
     "--hicache-ratio",
     "1.5",
     "--hicache-mem-layout",
-    "page_first",
+    "page_first_direct",
     "--hicache-io-backend",
-    "kernel",
+    "direct",
 ]
 MIMO_V2_MTP_OTHER_ARGS = MIMO_V2_OTHER_ARGS + [
     "--speculative-algorithm",

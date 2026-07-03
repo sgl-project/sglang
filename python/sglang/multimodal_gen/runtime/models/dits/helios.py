@@ -655,7 +655,6 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         latents_history_long=None,
         **kwargs,
     ) -> torch.Tensor:
-        orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
             encoder_hidden_states = encoder_hidden_states[0]
 

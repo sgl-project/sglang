@@ -146,6 +146,7 @@ class TestDummyWithSBO(CustomTestCase):
                 # exception, crash-time coredump) so NaN is sanitized with a
                 # warning instead of killing the scheduler.
                 "SGLANG_ENABLE_ASYNC_ASSERT": "0",
+                "SGLANG_SANITIZE_NAN_LOGITS": "1",
                 "SGLANG_CUDA_COREDUMP": "0",
                 # Already injected into os.environ by the test process when
                 # SGLANG_CUDA_COREDUMP=1, so it must be overridden explicitly.

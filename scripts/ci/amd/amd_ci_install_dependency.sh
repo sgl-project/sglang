@@ -72,6 +72,16 @@ install_with_retry() {
   return 1
 }
 
+# The anthropic SDK passes `socket_options` to httpx.HTTPTransport, which only
+# exists in httpx>=0.25.0. The CI image ships an older httpx, and several deps
+# installed below (lmms-eval, aiter's requirements.txt, etc.) can pull a stale
+# httpx back in, so test_anthropic_server fails with:
+#   TypeError: HTTPTransport.__init__() got an unexpected keyword argument 'socket_options'
+# Call this as the LAST pip operation so nothing can downgrade httpx afterwards.
+ensure_httpx() {
+  install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'httpx>=0.25.0'
+}
+
 # Helper function to git clone with retries
 git_clone_with_retry() {
   local repo_url="$1"
@@ -140,8 +150,6 @@ else
   docker cp human-eval ci_sglang:/
   install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
-  docker exec -w / ci_sglang mkdir -p /dummy-grok
-  # Create dummy grok config inline (bypasses Azure blob storage which may have auth issues)
   mkdir -p dummy-grok
   cat > dummy-grok/config.json << 'EOF'
   {
@@ -166,9 +174,8 @@ else
     "torch_dtype": "bfloat16"
   }
 EOF
-  # docker exec -w / ci_sglang mkdir -p /dummy-grok
-  # mkdir -p dummy-grok && wget https://sharkpublic.blob.core.windows.net/sharkpublic/sglang/dummy_grok.json -O dummy-grok/config.json
-  # docker cp ./dummy-grok ci_sglang:/
+  docker exec -w / ci_sglang mkdir -p /dummy-grok
+  docker cp ./dummy-grok/config.json ci_sglang:/dummy-grok/config.json
 
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache huggingface_hub[hf_xet]
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache pytest
@@ -212,6 +219,7 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
 fi
 
 if [[ -n "${SKIP_AITER_BUILD}" ]]; then
+  ensure_httpx
   exit 0
 fi
 
@@ -331,6 +339,10 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
 fi
 
 echo "[CI-AITER-CHECK] === AITER VERSION CHECK END ==="
+
+# Must be the final pip operation: force httpx>=0.25.0 so the anthropic SDK can
+# construct its httpx transport (see ensure_httpx definition above).
+ensure_httpx
 
 
 # # Clear pre-built AITER kernels from Docker image to avoid segfaults

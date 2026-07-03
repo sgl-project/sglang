@@ -514,6 +514,7 @@ def build_decode_registry(
     enable_mamba_track: bool = False,
     is_encoder_decoder: bool = False,
     encoder_len_fill_value: int = 0,
+    encoder_lens_dtype: torch.dtype = torch.int32,
     enable_num_token_non_padded: bool = False,
     require_gathered_buffer: bool = False,
     enable_prefill_cp: bool = False,
@@ -632,7 +633,7 @@ def build_decode_registry(
             GraphSlot(
                 "encoder_lens",
                 _bs,
-                torch.int32,
+                encoder_lens_dtype,
                 axis="bs",
                 padding_policy=PaddingPolicy.FILL_ONCE,
                 pad_value=encoder_len_fill_value,
@@ -799,7 +800,7 @@ def build_prefill_registry(
     carried from the batch (a read input) rather than written in-graph.
 
     Padding policies match the inline copy/zero in
-    ``PiecewiseCudaGraphRunner.replay_prepare``: ``input_ids`` / ``positions``
+    ``PiecewiseCudaGraphRunner.load_batch``: ``input_ids`` / ``positions``
     / ``out_cache_loc`` / ``mrope_positions`` / ``input_embeds`` reset their
     padded tail ``[raw_num_tokens:padded_num_tokens]`` to ``0`` (the padded
     tokens *are* processed by the graph, so they must be benign), then the head
@@ -887,3 +888,50 @@ def build_prefill_registry(
                 )
         reg.register_slot(slot, bind=bind)
     return reg
+
+
+def build_eager_registry(
+    *,
+    device: torch.device,
+    max_bs: int,
+    max_num_token: int,
+    cache_loc_dtype: torch.dtype,
+    enable_mamba_track: bool = False,
+    is_encoder_decoder: bool = False,
+    encoder_len_fill_value: int = 0,
+    encoder_lens_dtype: torch.dtype = torch.int32,
+    dp_size: int = 1,
+) -> CudaGraphBufferRegistry:
+    """One fixed-max input registry for the ``EagerRunner``, serving BOTH eager
+    decode and eager prefill.
+
+    The decode slot set is a superset of eager prefill's needs (eager prefill
+    carries ``input_embeds`` from the batch and reads the bs-axis fields live),
+    so we reuse it, sized at ``(max_bs, max_num_token)`` where ``max_num_token``
+    is the prefill token ceiling. ``seq_len_fill_value=0`` because eager never
+    pads, so the sentinel tail is never read.
+
+    ``share_pool=True`` so same-named / same-size slots coalesce through the
+    process-wide pool. The ``EagerRunner`` is built before the cuda-graph runners
+    (see ``ModelRunner.init_backends``), so its (largest) allocations are
+    canonical and the cg runners' matching slots (prefill's token-axis at
+    ``max_num_token``, decode's bs-axis at ``max_bs``) adopt them.
+    """
+    return build_decode_registry(
+        device=device,
+        max_bs=max_bs,
+        max_num_token=max_num_token,
+        seq_len_fill_value=0,
+        cache_loc_dtype=cache_loc_dtype,
+        enable_mamba_track=enable_mamba_track,
+        is_encoder_decoder=is_encoder_decoder,
+        encoder_len_fill_value=encoder_len_fill_value,
+        encoder_lens_dtype=encoder_lens_dtype,
+        enable_num_token_non_padded=False,
+        register_global_num_tokens=False,
+        require_gathered_buffer=False,
+        require_mlp_tp_gather=False,
+        dp_size=dp_size,
+        share_pool=True,
+        source=None,
+    )

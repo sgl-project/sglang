@@ -61,8 +61,12 @@ class MoeRunner:
             self.runner_core = None  # FlashInfer TRT-LLM only supports fused path
         elif runner_backend.is_flashinfer_cutedsl():
             self.runner_core = None  # FlashInfer CuteDSL only supports fused path
+        elif runner_backend.is_flashinfer_cutlass():
+            self.runner_core = None  # FlashInfer CUTLASS only supports fused path
         elif runner_backend.is_flashinfer_mxfp4():
             self.runner_core = None  # FlashInfer MXFP4 only supports fused path
+        elif runner_backend.is_cutlass():
+            self.runner_core = None  # CUTLASS uses the direct cutlass_moe_fp4 path
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 

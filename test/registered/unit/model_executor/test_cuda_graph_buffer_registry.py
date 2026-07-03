@@ -904,12 +904,11 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             )
 
     def test_num_token_non_padded_gathered_dp_branch(self):
-        import unittest.mock as mock
 
-        from sglang.srt.model_executor import forward_batch_info as fbi
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
         )
+        from sglang.srt.runtime_context import get_parallel
 
         ntnp = torch.zeros(1, dtype=torch.int32)
         src = SimpleNamespace(
@@ -926,9 +925,7 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         )
         # Gathered (DP) path: post_fill overwrites the FB copy with the local
         # count. Pin attn-TP (size=2, rank=0) so the result is deterministic.
-        with mock.patch.object(
-            fbi, "get_attention_tp_size", return_value=2
-        ), mock.patch.object(fbi, "get_attention_tp_rank", return_value=0):
+        with get_parallel().override(attn_tp_size=2, attn_tp_rank=0):
             reg = build_decode_registry(
                 device=torch.device("cpu"),
                 max_bs=4,

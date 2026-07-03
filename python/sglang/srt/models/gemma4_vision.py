@@ -27,9 +27,9 @@ from sglang.srt.layers.clippable_linear import (
     ClippableQKVParallelLinear,
     ClippableRowParallelLinear,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, get_device_capability, is_cuda, is_hip
 
 # ---------------------------------------------------------------------------
@@ -140,7 +140,7 @@ class Gemma4VisionAttention(nn.Module):
         super().__init__()
         self.head_dim = config.head_dim
 
-        tp_size = get_attention_tp_size()
+        tp_size = get_parallel().attn_tp_size
         self.num_heads_per_partition = config.num_attention_heads // tp_size
         self.num_kv_heads_per_partition = config.num_key_value_heads // tp_size
 
