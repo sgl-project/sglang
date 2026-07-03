@@ -29,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx942-rocm720', 'gfx950-rocm720']
+        gpu_arch: ['gfx950-rocm720']
         build_type: ['all']
     steps:
       - name: Checkout repository
@@ -90,7 +90,7 @@ jobs:
             exit 1
           fi
 
-          tag=v${version}-${rocm_tag}
+          tag=v${version}-${rocm_tag}-pr29986-hotpatch
           echo "IMAGE_TAG=${tag}-${{ env.DATE }}" >> $GITHUB_ENV
 
           # remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori
@@ -141,7 +141,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx942-rocm720', 'gfx950-rocm720']
+        gpu_arch: ['gfx950-rocm720']
     steps:
       - name: Download image tag artifact
         uses: actions/download-artifact@v4
