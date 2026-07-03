@@ -41,8 +41,6 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         host_to_device_ratio: int = 2,
-        layer_shard_rank: Optional[int] = None,
-        layer_shard_size: int = 1,
     ):
         super().__init__(
             size=size,
@@ -58,8 +56,6 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             start_layer=start_layer,
             end_layer=end_layer,
             index_buf_size=size * host_to_device_ratio,
-            layer_shard_rank=layer_shard_rank,
-            layer_shard_size=layer_shard_size,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
 

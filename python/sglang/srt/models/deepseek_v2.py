@@ -70,7 +70,10 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
-from sglang.srt.layers.communicator_dsa_cp import DSACPLayerCommunicator
+from sglang.srt.layers.communicator_dsa_cp import (
+    DSACPLayerCommunicator,
+    maybe_prefetch_next_full_attention_kv,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -2191,6 +2194,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        next_full_attention_layer_id: Optional[int] = None,
     ) -> torch.Tensor:
         hidden_states_orig = hidden_states
         hidden_states, residual = (
@@ -2217,6 +2221,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             topk_indices = None
         get_attn_tp_context().clear_attn_inputs()
+
+        if self.dsa_enable_prefill_cp:
+            maybe_prefetch_next_full_attention_kv(
+                forward_batch, next_full_attention_layer_id
+            )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -2413,6 +2422,11 @@ class DeepseekV2Model(nn.Module):
                 ),
             ),
         )
+        
+        local_layer_ids = list(range(self.start_layer, self.end_layer))
+        self.next_full_attention_layer_id = dict(
+            zip(local_layer_ids, local_layer_ids[1:])
+        )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -2580,6 +2594,9 @@ class DeepseekV2Model(nn.Module):
                     prev_topk_indices=topk_indices,
                     captured_last_layer_outputs=(
                         aux_hidden_states if i in self.layers_to_capture else None
+                    ),
+                    next_full_attention_layer_id=self.next_full_attention_layer_id.get(
+                        i
                     ),
                 )
 

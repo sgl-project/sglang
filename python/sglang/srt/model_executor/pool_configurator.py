@@ -29,10 +29,7 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import (
-    get_attention_cp_size,
-    get_attention_tp_size,
-)
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.common import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -75,27 +72,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _is_glm_dsa_cache_layer_split_enabled(mr: ModelRunner) -> bool:
-    return (
-        not mr.is_draft_worker
-        and mr.server_args.enable_dsa_cache_layer_split
-        and mr.use_mla_backend
-        and is_deepseek_dsa(mr.model_config.hf_config)
+def _get_layer_split_effective_num_layers(mr: ModelRunner, num_layers: int) -> int:
+    from sglang.srt.layers.cp.utils import (
+        get_glm_dsa_layer_split_effective_num_layers,
     )
 
-
-def _get_glm_dsa_layer_split_effective_num_layers(
-    mr: ModelRunner, num_layers: int
-) -> int:
-    if not _is_glm_dsa_cache_layer_split_enabled(mr):
-        return num_layers
-    shard_size = get_attention_cp_size()
-    if shard_size <= 1:
-        return num_layers
-    owned_layers_upper_bound = (num_layers + shard_size - 1) // shard_size
-    # One extra layer accounts for the remote scratch buffer used when reading
-    # a layer owned by another CP rank.
-    return max(1, owned_layers_upper_bound + 1)
+    return get_glm_dsa_layer_split_effective_num_layers(mr, num_layers)
 
 
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
@@ -203,7 +185,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # args to config cell size
         model_config = mr.model_config
         kv_cache_dtype = mr.kv_cache_dtype
-        effective_num_layers = _get_glm_dsa_layer_split_effective_num_layers(
+        effective_num_layers = _get_layer_split_effective_num_layers(
             mr, num_layers
         )
 

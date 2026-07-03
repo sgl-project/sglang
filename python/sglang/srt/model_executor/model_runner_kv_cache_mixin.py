@@ -20,8 +20,6 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
-    get_attention_cp_rank,
-    get_attention_cp_size,
     get_attention_tp_size,
 )
 from sglang.srt.mem_cache.allocator import (
@@ -104,22 +102,12 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
-def _is_glm_dsa_cache_layer_split_enabled(model_runner: ModelRunner) -> bool:
-    return (
-        not model_runner.is_draft_worker
-        and model_runner.server_args.enable_dsa_cache_layer_split
-    )
-
-
 def _get_glm_dsa_cp_layer_shard_info(
     model_runner: ModelRunner,
 ) -> tuple[Optional[int], int]:
-    if not _is_glm_dsa_cache_layer_split_enabled(model_runner):
-        return None, 1
-    shard_size = get_attention_cp_size()
-    if shard_size <= 1:
-        return None, 1
-    return get_attention_cp_rank(), shard_size
+    from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
+
+    return get_glm_dsa_cp_layer_shard_info(model_runner)
 
 
 class ModelRunnerKVCacheMixin:
@@ -868,16 +856,25 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_dsa_model:
-            PoolCls = (
-                HiSparseDSATokenToKVPool if self.enable_hisparse else DSATokenToKVPool
-            )
             pool_kwargs = {}
             if self.enable_hisparse:
+                PoolCls = HiSparseDSATokenToKVPool
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
                 pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                     self.server_args
                 ).host_to_device_ratio
+            elif dsa_cp_layer_shard_rank is not None:
+                # DSA cache layer split: shard KV/indexer layers across CP ranks.
+                from sglang.srt.mem_cache.dsa_cache_layer_split import (
+                    LayerSplitDSATokenToKVPool,
+                )
+
+                PoolCls = LayerSplitDSATokenToKVPool
+                pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
+                pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
+            else:
+                PoolCls = DSATokenToKVPool
             self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -891,8 +888,6 @@ class ModelRunnerKVCacheMixin:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
-                layer_shard_rank=dsa_cp_layer_shard_rank,
-                layer_shard_size=dsa_cp_layer_shard_size,
                 **pool_kwargs,
             )
         elif self.use_mla_backend and not self.mambaish_config:
@@ -1015,8 +1010,6 @@ class ModelRunnerKVCacheMixin:
                     ),
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
-                    layer_shard_rank=dsa_cp_layer_shard_rank,
-                    layer_shard_size=dsa_cp_layer_shard_size,
                     full_kv_pool_class=mha_pool_class,
                     **extra_args,
                 )

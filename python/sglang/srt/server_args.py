@@ -3704,11 +3704,10 @@ class ServerArgs:
         model_arch = hf_config.architectures[0]
 
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
-            logger.warning(
-                "Disabling DSA cache layer split because it is only supported "
-                "for DSA models."
+            raise ValueError(
+                "--enable-dsa-cache-layer-split is only supported for DSA "
+                "(DeepSeek Sparse Attention) models."
             )
-            self.enable_dsa_cache_layer_split = False
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
@@ -3850,29 +3849,26 @@ class ServerArgs:
                     and self.disaggregation_mode != "prefill"
                 ):
                     if self.disaggregation_mode == "decode":
-                        logger.warning(
-                            "Disabling DSA cache layer split on decode workers. "
-                            "This flag is a prefill-CP optimization; decode should "
-                            "receive full cache shards through PD transfer."
+                        raise ValueError(
+                            "--enable-dsa-cache-layer-split is not supported on "
+                            "decode workers. This flag is a prefill-CP "
+                            "optimization; decode receives full cache shards "
+                            "through PD transfer."
                         )
-                    else:
-                        logger.warning(
-                            "Disabling DSA cache layer split because it is only "
-                            "supported on PD prefill workers. Non-PD workers also "
-                            "run decode and require ordinary local decode cache "
-                            "semantics."
-                        )
-                    self.enable_dsa_cache_layer_split = False
+                    raise ValueError(
+                        "--enable-dsa-cache-layer-split is only supported on PD "
+                        "prefill workers. Non-PD workers also run decode and "
+                        "require ordinary local decode cache semantics."
+                    )
                 if self.enable_dsa_cache_layer_split and (
                     not self.enable_prefill_cp or self.cp_strategy != "interleave"
                 ):
-                    logger.warning(
-                        "Disabling DSA cache layer split because it requires "
+                    raise ValueError(
+                        "--enable-dsa-cache-layer-split requires "
                         "--enable-prefill-cp and --cp-strategy interleave "
                         "(or legacy --enable-nsa-prefill-context-parallel with "
                         "--nsa-prefill-cp-mode round-robin-split)."
                     )
-                    self.enable_dsa_cache_layer_split = False
 
             else:
                 # DeepSeek V3/R1/V3.1
