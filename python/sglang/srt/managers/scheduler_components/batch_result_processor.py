@@ -23,6 +23,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
+    page_align_floor,
     release_kv_cache,
 )
 from sglang.srt.server_args import get_global_server_args
@@ -626,6 +627,63 @@ class SchedulerBatchResultProcessor:
             batch.reqs, batch.return_logprob, is_idle_batch=True
         )
 
+    def _maybe_cache_decode_swa_island(self, req: Req) -> None:
+        """Persist a sliding-window 'island' of the decode stream into the radix
+        tree every ``--chunked-prefill-size // 4`` generated tokens, so a later
+        request sharing this (prompt + generation) prefix can also hit the
+        kv-cache inside the decode region, not just the prompt region.
+
+        Mirrors chunked-prefill island creation; SWA-only. Relies on
+        ScheduleBatch._evict_swa having already freed the out-of-window SWA kv,
+        so the insert uses from_decode=True to avoid double-freeing.
+        """
+        if req.finished() or req.is_retracted:
+            return
+        if not envs.SGLANG_SWA_RADIX_CACHE_ISLAND.get():
+            return
+        tree_cache = self.tree_cache
+        if not tree_cache.supports_swa():
+            return
+        # Only SWARadixCache supports the from_decode island insert. SWAChunkCache
+        # (used when radix cache is disabled) also reports supports_swa() but its
+        # cache_unfinished_req has no from_decode path -> skip to avoid a TypeError.
+        if getattr(tree_cache, "is_chunk_cache", lambda: False)():
+            return
+        if getattr(req, "skip_radix_cache_insert", False):
+            return
+        # Island spacing: a quarter of the prefill chunk size (page-multiple).
+        chunked_prefill_size = get_global_server_args().chunked_prefill_size
+        if not chunked_prefill_size or chunked_prefill_size <= 0:
+            return
+        interval = chunked_prefill_size // 4
+        if interval <= 0:
+            return
+        # Fire once every `interval` tokens, at an interval-aligned seqlen.
+        if req.seqlen % interval != 0:
+            return
+        # Only persist COMMITTED, page-aligned KV into the tree. Using
+        # kv_committed_len (not seqlen) drops the in-flight tail token under
+        # overlap scheduling, and page_align_floor drops the last partial/live
+        # page. This matches the boundary cache_finished_req uses (RadixKey
+        # .page_aligned floors too), so the island never registers a live page
+        # the request still owns and writes -- which previously left one page
+        # counted in both available and evictable (pool memory leak at on_idle).
+        insert_len = page_align_floor(req.kv_committed_len, tree_cache.page_size)
+        if insert_len <= req.cache_protected_len:
+            # Nothing new beyond the already-locked prefix; skip to avoid lock churn.
+            return
+        # During decode, get_fill_ids() is limited by extend_range to the last
+        # extend window. Refresh full_untruncated_fill_ids to prompt+generation and
+        # point extend_range at the committed, page-aligned frontier, then restore
+        # it so the rest of decode processing is unaffected.
+        req._refresh_fill_ids()
+        saved_extend_range = req.extend_range
+        req.set_extend_range(0, insert_len)
+        try:
+            tree_cache.cache_unfinished_req(req, from_decode=True)
+        finally:
+            req.extend_range = saved_extend_range
+
     def process_batch_result_decode(
         self,
         batch: ScheduleBatch,
@@ -688,6 +746,11 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state(new_accept_len)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
+
+            # Decode-stage SWA island: periodically persist a (window+page) live SWA
+            # island into the radix tree so the decode region becomes prefix-cache
+            # reusable too, mirroring chunked-prefill island creation.
+            self._maybe_cache_decode_swa_island(req)
 
             if req.return_logprob:
                 self._apply_decode_logprobs(

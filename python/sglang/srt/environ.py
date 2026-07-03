@@ -387,6 +387,11 @@ class Envs:
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
+    # Persist SWA "islands" (the last window+page live SWA kv) into the radix tree,
+    # for both chunked-prefill and decode stages, so prompt AND generated regions
+    # become prefix-cache reusable. Out-of-window SWA kv is freed; full-layer kv is
+    # retained in tombstone nodes. Default on.
+    SGLANG_SWA_RADIX_CACHE_ISLAND = EnvBool(True)
     # For non-streaming requests, the scheduler still flushes intermediate
     # output batches to the tokenizer manager every N decoded tokens so that
     # `first_token_time`/TTFT can be recorded. Lower this (e.g. to 1) to get

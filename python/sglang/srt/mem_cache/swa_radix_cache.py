@@ -422,6 +422,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         value = params.value
         prev_prefix_len = params.prev_prefix_len
         swa_evicted_seqlen = params.swa_evicted_seqlen
+        free_swa_on_tombstone = params.free_swa_on_tombstone
 
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
         key = key.page_aligned(self.page_size)
@@ -431,7 +432,12 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
         prefix_len = self._insert_helper(
-            self.root_node, key, value, prev_prefix_len, swa_evicted_seqlen
+            self.root_node,
+            key,
+            value,
+            prev_prefix_len,
+            swa_evicted_seqlen,
+            free_swa_on_tombstone,
         )
         return InsertResult(prefix_len=prefix_len)
 
@@ -484,7 +490,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         req.swa_prefix_lock_released = False
 
-    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
+    def cache_unfinished_req(
+        self, req: Req, chunked=False, from_decode=False
+    ) -> None:
         """Cache request when it is unfinished."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -506,6 +514,35 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
         old_prefix_len = req.cache_protected_len
 
+        # Decide the SWA tombstone frontier + who frees the SWA kv for this insert.
+        eager_swa_evicted_seqlen = 0
+        eager_free_swa_on_tombstone = False
+        if from_decode:
+            # Decode-stage SWA island insert. ScheduleBatch._evict_swa has already
+            # freed this request's out-of-window SWA kv during decode, so we must
+            # NOT free again here (double-free). Reuse req.swa_evicted_seqlen as the
+            # tombstone frontier: [old_prefix_len, swa_evicted_seqlen) become
+            # tombstone nodes (full kv kept, swa already freed) and the live tail
+            # [swa_evicted_seqlen, L) is retained as a non-tombstone island so the
+            # decode region becomes prefix-cache reusable.
+            eager_swa_evicted_seqlen = req.swa_evicted_seqlen
+        elif envs.SGLANG_SWA_RADIX_CACHE_ISLAND.get():
+            # Chunked-prefill SWA island (gated by SGLANG_SWA_RADIX_CACHE_ISLAND).
+            # As each prefill chunk commits, tombstone + free the SWA kv of the tokens
+            # that have fallen outside the sliding window, keeping only the last
+            # (window + page) tokens the next chunk's attention still needs. The
+            # full-layer KV stays in the tombstone nodes, so prefix-cache hits are
+            # unaffected; here free_swa_on_tombstone=True because these SWA slots were
+            # just allocated and not pre-freed by ScheduleBatch._evict_swa.
+            target = (
+                (len(radix_key) - self.sliding_window_size - self.page_size)
+                // self.page_size
+            ) * self.page_size
+            target = max(target, req.swa_evicted_seqlen)
+            if target > old_prefix_len:
+                eager_swa_evicted_seqlen = target
+                eager_free_swa_on_tombstone = True
+
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
         result = self.insert(
@@ -513,8 +550,14 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 key=radix_key,
                 value=values,
                 prev_prefix_len=old_prefix_len,
+                swa_evicted_seqlen=eager_swa_evicted_seqlen,
+                free_swa_on_tombstone=eager_free_swa_on_tombstone,
             )
         )
+        if eager_free_swa_on_tombstone:
+            req.swa_evicted_seqlen = max(
+                req.swa_evicted_seqlen, eager_swa_evicted_seqlen
+            )
         new_prefix_len = result.prefix_len
 
         # The prefix indices could be updated, reuse it
@@ -1096,6 +1139,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         value,
         update_kv_after_len: int,
         swa_evicted_seqlen: int = 0,
+        free_swa_on_tombstone: bool = False,
     ) -> int:
         # Update the last access time from root to leaf, so that
         # swa will tombstone the node closer to root first
@@ -1222,6 +1266,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 and swa_evicted_seqlen < total_prefix_length + len(key)
             ):
                 swa_tombstone_len = swa_evicted_seqlen - total_prefix_length
+                if free_swa_on_tombstone:
+                    # Eager prefill eviction: these newly-allocated SWA slots were
+                    # not pre-freed by _evict_swa, so free them here. Full-layer KV
+                    # stays in node.value (the tombstone node), preserving reuse.
+                    self.token_to_kv_pool_allocator.free_swa(
+                        value[:swa_tombstone_len]
+                    )
                 node = self._add_new_node(
                     node,
                     key[:swa_tombstone_len],
