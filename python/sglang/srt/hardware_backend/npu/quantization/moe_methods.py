@@ -992,7 +992,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
                 quant_dtype=torch.float8_e4m3fn
             )
         if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "bf16")
+            self._set_dispatcher_output_dtype(layer, "mxfp8_e4m3fn")
 
     # --------------- W4A8 MXFP4 ---------------
     def _apply_online_mxfp4_w4a8(self, layer, weight_prefix, weight_name):
