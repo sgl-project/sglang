@@ -13,6 +13,7 @@ import weakref
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
+from enum import Enum
 from functools import lru_cache
 from typing import Any
 
@@ -177,6 +178,17 @@ class DenoisingStepState:
     current_model: Any
     current_guidance_scale: Any
     attn_metadata: Any | None
+
+
+class DualTransformerExecutionMode(str, Enum):
+    """How a denoising stage uses a second DiT.
+
+    BOUNDARY_EXPERTS means one transformer is selected per timestep.
+    PAIRED_PER_STEP means both transformers participate in each denoising step.
+    """
+
+    BOUNDARY_EXPERTS = "boundary_experts"
+    PAIRED_PER_STEP = "paired_per_step"
 
 
 class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
@@ -426,6 +438,133 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 return True
         return False
 
+    def _cache_dit_dual_model_name(self) -> str:
+        return "wan2.2"
+
+    def _cache_dit_secondary_uses_primary_config(self) -> bool:
+        return False
+
+    def _dual_transformer_execution_mode(self) -> DualTransformerExecutionMode | None:
+        if self.transformer_2 is None:
+            return None
+        return DualTransformerExecutionMode.BOUNDARY_EXPERTS
+
+    def _cache_dit_step_counts(
+        self, num_inference_steps: int | tuple[int, int]
+    ) -> tuple[int, int | None]:
+        if isinstance(num_inference_steps, tuple):
+            primary_steps, secondary_steps = num_inference_steps
+            return int(primary_steps), int(secondary_steps)
+        steps = int(num_inference_steps)
+        mode = self._dual_transformer_execution_mode()
+        if mode is None:
+            return steps, None
+        if mode == DualTransformerExecutionMode.PAIRED_PER_STEP:
+            return steps, steps
+        raise ValueError("Boundary-expert dual transformers require split step counts.")
+
+    @staticmethod
+    def _parse_cache_dit_scm_bins() -> tuple[list[int] | None, list[int] | None, str]:
+        scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
+        compute_bins_str = envs.SGLANG_CACHE_DIT_SCM_COMPUTE_BINS
+        cache_bins_str = envs.SGLANG_CACHE_DIT_SCM_CACHE_BINS
+        compute_bins = None
+        cache_bins = None
+        if compute_bins_str and cache_bins_str:
+            try:
+                compute_bins = [int(x.strip()) for x in compute_bins_str.split(",")]
+                cache_bins = [int(x.strip()) for x in cache_bins_str.split(",")]
+            except ValueError as exc:
+                logger.warning("Failed to parse SCM bins: %s. SCM disabled.", exc)
+                scm_preset = "none"
+        elif compute_bins_str or cache_bins_str:
+            logger.warning(
+                "SCM custom bins require both compute_bins and cache_bins. "
+                "Only one was provided (compute=%s, cache=%s). Falling back to preset '%s'.",
+                compute_bins_str,
+                cache_bins_str,
+                scm_preset,
+            )
+        return compute_bins, cache_bins, scm_preset
+
+    def _cache_dit_scm_masks(
+        self, primary_num_steps: int, secondary_num_steps: int | None = None
+    ) -> tuple[str, str, list[int] | None, list[int] | None]:
+        scm_compute_bins, scm_cache_bins, scm_preset = self._parse_cache_dit_scm_bins()
+        scm_policy = envs.SGLANG_CACHE_DIT_SCM_POLICY
+        steps_computation_mask = get_scm_mask(
+            preset=scm_preset,
+            num_inference_steps=primary_num_steps,
+            compute_bins=scm_compute_bins,
+            cache_bins=scm_cache_bins,
+        )
+
+        steps_computation_mask_2 = None
+        if secondary_num_steps is not None:
+            if (
+                self._cache_dit_secondary_uses_primary_config()
+                and secondary_num_steps == primary_num_steps
+            ):
+                steps_computation_mask_2 = steps_computation_mask
+            else:
+                steps_computation_mask_2 = get_scm_mask(
+                    preset=scm_preset,
+                    num_inference_steps=secondary_num_steps,
+                    compute_bins=scm_compute_bins,
+                    cache_bins=scm_cache_bins,
+                )
+        return scm_preset, scm_policy, steps_computation_mask, steps_computation_mask_2
+
+    @staticmethod
+    def _build_cache_dit_config(
+        num_inference_steps: int,
+        steps_computation_mask: list[int] | None,
+        scm_policy: str,
+        *,
+        secondary: bool = False,
+    ) -> CacheDitConfig:
+        return CacheDitConfig(
+            enabled=True,
+            Fn_compute_blocks=(
+                envs.SGLANG_CACHE_DIT_SECONDARY_FN
+                if secondary
+                else envs.SGLANG_CACHE_DIT_FN
+            ),
+            Bn_compute_blocks=(
+                envs.SGLANG_CACHE_DIT_SECONDARY_BN
+                if secondary
+                else envs.SGLANG_CACHE_DIT_BN
+            ),
+            max_warmup_steps=(
+                envs.SGLANG_CACHE_DIT_SECONDARY_WARMUP
+                if secondary
+                else envs.SGLANG_CACHE_DIT_WARMUP
+            ),
+            residual_diff_threshold=(
+                envs.SGLANG_CACHE_DIT_SECONDARY_RDT
+                if secondary
+                else envs.SGLANG_CACHE_DIT_RDT
+            ),
+            max_continuous_cached_steps=(
+                envs.SGLANG_CACHE_DIT_SECONDARY_MC
+                if secondary
+                else envs.SGLANG_CACHE_DIT_MC
+            ),
+            enable_taylorseer=(
+                envs.SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER
+                if secondary
+                else envs.SGLANG_CACHE_DIT_TAYLORSEER
+            ),
+            taylorseer_order=(
+                envs.SGLANG_CACHE_DIT_SECONDARY_TS_ORDER
+                if secondary
+                else envs.SGLANG_CACHE_DIT_TS_ORDER
+            ),
+            num_inference_steps=num_inference_steps,
+            steps_computation_mask=steps_computation_mask,
+            steps_computation_policy=scm_policy,
+        )
+
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
     ) -> None:
@@ -442,25 +581,30 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             # Cache-DiT wraps transformer.forward with step-skipping control
             # flow that must not be baked into a captured CUDA graph.
             return
-        if isinstance(num_inference_steps, tuple):
-            num_high_noise_steps, num_low_noise_steps = num_inference_steps
-
         # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:
-            scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
-            scm_preset = None if scm_preset == "none" else scm_preset
-            if isinstance(num_inference_steps, tuple):
+            primary_num_steps, secondary_num_steps = self._cache_dit_step_counts(
+                num_inference_steps
+            )
+            scm_preset, scm_policy, steps_computation_mask, steps_computation_mask_2 = (
+                self._cache_dit_scm_masks(primary_num_steps, secondary_num_steps)
+            )
+            if self.transformer_2 is not None:
+                assert secondary_num_steps is not None
                 refresh_context_on_dual_transformer(
                     self.transformer,
                     self.transformer_2,
-                    num_high_noise_steps,
-                    num_low_noise_steps,
-                    scm_preset=scm_preset,
+                    primary_num_steps,
+                    secondary_num_steps,
+                    steps_computation_mask=steps_computation_mask,
+                    steps_computation_mask_2=steps_computation_mask_2,
+                    steps_computation_policy=scm_policy,
                 )
             else:
+                scm_preset = None if scm_preset == "none" else scm_preset
                 refresh_context_on_transformer(
                     self.transformer,
-                    num_inference_steps,
+                    primary_num_steps,
                     scm_preset=scm_preset,
                 )
             return
@@ -474,6 +618,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         ):
             return
 
+        primary_num_steps, secondary_num_steps = self._cache_dit_step_counts(
+            num_inference_steps
+        )
         world_size = get_world_size()
         parallelized = world_size > 1
 
@@ -498,93 +645,29 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 has_sp,
                 has_tp,
             )
-        # === Parse SCM configuration from envs ===
-        # SCM is shared between primary and secondary transformers
-        scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
-        scm_compute_bins_str = envs.SGLANG_CACHE_DIT_SCM_COMPUTE_BINS
-        scm_cache_bins_str = envs.SGLANG_CACHE_DIT_SCM_CACHE_BINS
-        scm_policy = envs.SGLANG_CACHE_DIT_SCM_POLICY
-
-        # parse custom bins if provided (both must be set together)
-        scm_compute_bins = None
-        scm_cache_bins = None
-        if scm_compute_bins_str and scm_cache_bins_str:
-            try:
-                scm_compute_bins = [
-                    int(x.strip()) for x in scm_compute_bins_str.split(",")
-                ]
-                scm_cache_bins = [int(x.strip()) for x in scm_cache_bins_str.split(",")]
-            except ValueError as e:
-                logger.warning("Failed to parse SCM bins: %s. SCM disabled.", e)
-                scm_preset = "none"
-        elif scm_compute_bins_str or scm_cache_bins_str:
-            # Only one of the bins was provided - warn user
-            logger.warning(
-                "SCM custom bins require both compute_bins and cache_bins. "
-                "Only one was provided (compute=%s, cache=%s). Falling back to preset '%s'.",
-                scm_compute_bins_str,
-                scm_cache_bins_str,
-                scm_preset,
-            )
-
-        # generate SCM mask using cache-dit's steps_mask()
-        # cache-dit handles step count validation and scaling internally
-        steps_computation_mask = get_scm_mask(
-            preset=scm_preset,
-            num_inference_steps=(
-                num_inference_steps
-                if isinstance(num_inference_steps, int)
-                else num_high_noise_steps
-            ),
-            compute_bins=scm_compute_bins,
-            cache_bins=scm_cache_bins,
+        _, scm_policy, steps_computation_mask, steps_computation_mask_2 = (
+            self._cache_dit_scm_masks(primary_num_steps, secondary_num_steps)
         )
-
-        if isinstance(num_inference_steps, tuple):
-            steps_computation_mask_2 = get_scm_mask(
-                preset=scm_preset,
-                num_inference_steps=num_low_noise_steps,
-                compute_bins=scm_compute_bins,
-                cache_bins=scm_cache_bins,
-            )
-
-        # build config for primary transformer (high-noise expert)
-        primary_config = CacheDitConfig(
-            enabled=True,
-            Fn_compute_blocks=envs.SGLANG_CACHE_DIT_FN,
-            Bn_compute_blocks=envs.SGLANG_CACHE_DIT_BN,
-            max_warmup_steps=envs.SGLANG_CACHE_DIT_WARMUP,
-            residual_diff_threshold=envs.SGLANG_CACHE_DIT_RDT,
-            max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_MC,
-            enable_taylorseer=envs.SGLANG_CACHE_DIT_TAYLORSEER,
-            taylorseer_order=envs.SGLANG_CACHE_DIT_TS_ORDER,
-            num_inference_steps=(
-                num_inference_steps
-                if isinstance(num_inference_steps, int)
-                else num_high_noise_steps
-            ),
-            # SCM fields
+        primary_config = self._build_cache_dit_config(
+            primary_num_steps,
             steps_computation_mask=steps_computation_mask,
-            steps_computation_policy=scm_policy,
+            scm_policy=scm_policy,
         )
 
         if self.transformer_2 is not None:
             # dual transformer
             # build config for secondary transformer (low-noise expert)
             # uses secondary parameters which inherit from primary if not explicitly set
-            secondary_config = CacheDitConfig(
-                enabled=True,
-                Fn_compute_blocks=envs.SGLANG_CACHE_DIT_SECONDARY_FN,
-                Bn_compute_blocks=envs.SGLANG_CACHE_DIT_SECONDARY_BN,
-                max_warmup_steps=envs.SGLANG_CACHE_DIT_SECONDARY_WARMUP,
-                residual_diff_threshold=envs.SGLANG_CACHE_DIT_SECONDARY_RDT,
-                max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_SECONDARY_MC,
-                enable_taylorseer=envs.SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER,
-                taylorseer_order=envs.SGLANG_CACHE_DIT_SECONDARY_TS_ORDER,
-                num_inference_steps=num_low_noise_steps,
-                # SCM fields - shared with primary
-                steps_computation_mask=steps_computation_mask_2,
-                steps_computation_policy=scm_policy,
+            assert secondary_num_steps is not None
+            secondary_config = (
+                primary_config
+                if self._cache_dit_secondary_uses_primary_config()
+                else self._build_cache_dit_config(
+                    secondary_num_steps,
+                    steps_computation_mask=steps_computation_mask_2,
+                    scm_policy=scm_policy,
+                    secondary=True,
+                )
             )
 
             # for dual transformers, must use BlockAdapter to enable cache on both simultaneously.
@@ -594,14 +677,14 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 self.transformer_2,
                 primary_config,
                 secondary_config,
-                model_name="wan2.2",
+                model_name=self._cache_dit_dual_model_name(),
                 sp_group=sp_group,
                 tp_group=tp_group,
             )
             logger.info(
                 "cache-dit enabled on dual transformers (steps=%d, %d)",
-                num_high_noise_steps,
-                num_low_noise_steps,
+                primary_num_steps,
+                secondary_num_steps,
             )
         else:
             # single transformer
@@ -615,7 +698,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
-                num_inference_steps,
+                primary_num_steps,
                 envs.SGLANG_CACHE_DIT_FN,
                 envs.SGLANG_CACHE_DIT_BN,
                 envs.SGLANG_CACHE_DIT_RDT,
@@ -698,9 +781,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         scheduler = batch.scheduler
         assert scheduler is not None
 
+        dual_transformer_mode = self._dual_transformer_execution_mode()
+        uses_boundary_transformer_2 = (
+            dual_transformer_mode == DualTransformerExecutionMode.BOUNDARY_EXPERTS
+        )
         boundary_timestep = (
             self._handle_boundary_ratio(server_args, batch, scheduler)
-            if self.transformer_2 is not None
+            if uses_boundary_transformer_2
             else None
         )
         # Get timesteps and calculate warmup steps
@@ -708,7 +795,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         num_inference_steps = batch.num_inference_steps
         num_warmup_steps = len(timesteps) - num_inference_steps * scheduler.order
 
-        if self.transformer_2 is not None:
+        if uses_boundary_transformer_2:
             assert boundary_timestep is not None, "boundary_timestep must be provided"
             num_high_noise_steps = (timesteps >= boundary_timestep).sum().item()
             num_low_noise_steps = num_inference_steps - num_high_noise_steps
