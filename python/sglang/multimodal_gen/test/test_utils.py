@@ -102,6 +102,7 @@ OFFICIAL_CONSISTENCY_GT_SKIP_CASES = frozenset(
         # Prefer existing sglang-generated GT instead of relaxing thresholds over
         # large semantic/content mismatches.
         "ltx_2_two_stage_t2v",
+        "qwen_image_edit_2509_ti2i",
     }
 )
 # Case keys whose remote GT has been positively confirmed present. Cached so a
