@@ -38,6 +38,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     FunctionResponse,
     LogProbs,
     MessageProcessingResult,
+    PromptTokensDetails,
     ResponseParserProtocol,
     SglExt,
     ToolCall,
@@ -336,6 +337,15 @@ class OpenAIServingChat(OpenAIServingBase):
         """Post-process reasoning and tool_calls before building response."""
         return reasoning_text, tool_calls
 
+    def _continuous_usage_cached_details(
+        self, content: Dict[str, Any]
+    ) -> Optional[PromptTokensDetails]:
+        if not self.tokenizer_manager.server_args.enable_cache_report:
+            return None
+        return UsageProcessor._details_if_cached(
+            content["meta_info"].get("cached_tokens", 0)
+        )
+
     async def _generate_stream_content(
         self,
         content: Dict[str, Any],
@@ -360,6 +370,11 @@ class OpenAIServingChat(OpenAIServingBase):
             delta = content["text"][offset:]
             stream_offsets[index] = len(content["text"])
 
+        # Attach logprobs to the first chunk emitted this step (reasoning,
+        # tool-call, or content) so they aren't dropped when a parser is active
+        # nor duplicated across chunks; flush any leftover at the end.
+        remaining_logprobs = choice_logprobs
+
         # Handle reasoning content
         if self.reasoning_parser and request.separate_reasoning:
             reasoning_text, delta = self._process_reasoning_stream(
@@ -372,6 +387,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         prompt_tokens=prompt_tokens.get(index, 0),
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
+                        cached_tokens=self._continuous_usage_cached_details(content),
                     ).model_dump()
 
                 yield build_sse_content(
@@ -380,8 +396,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     index=index,
                     reasoning_content=reasoning_text,
+                    logprobs=remaining_logprobs,
                     usage=usage,
                 )
+                remaining_logprobs = None
 
         # Handle tool calls
         if request.tool_choice != "none" and request.tools and self.tool_call_parser:
@@ -415,6 +433,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         prompt_tokens=prompt_tokens.get(index, 0),
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
+                        cached_tokens=self._continuous_usage_cached_details(content),
                     ).model_dump()
 
                 yield build_sse_content(
@@ -423,9 +442,36 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     index=index,
                     content=delta,
-                    logprobs=choice_logprobs,
+                    logprobs=remaining_logprobs,
                     usage=usage,
                 )
+                remaining_logprobs = None
+
+        # Flush logprobs still unattached this step — only when a parser is
+        # active, since _process_tool_call_stream may consume the delta and emit
+        # no content chunk. On the plain path an empty-delta step has no chunk
+        # to attach to either way, and a standalone empty-delta logprobs chunk
+        # is not a shape clients expect.
+        if remaining_logprobs is not None and (
+            self.reasoning_parser or self.tool_call_parser
+        ):
+            usage = None
+            if continuous_usage_stats:
+                usage = UsageProcessor.calculate_token_usage(
+                    prompt_tokens=prompt_tokens.get(index, 0),
+                    reasoning_tokens=reasoning_tokens.get(index, 0),
+                    completion_tokens=completion_tokens.get(index, 0),
+                    cached_tokens=self._continuous_usage_cached_details(content),
+                ).model_dump()
+
+            yield build_sse_content(
+                chunk_id=content["meta_info"]["id"],
+                created=int(time.time()),
+                model=request.model,
+                index=index,
+                logprobs=remaining_logprobs,
+                usage=usage,
+            )
 
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""
@@ -573,12 +619,14 @@ class OpenAIServingChat(OpenAIServingBase):
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,
             rid=request.rid,
+            session_id=request.session_id,
             extra_key=self._compute_extra_key(request),
             require_reasoning=require_reasoning,
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            images_config=getattr(request, "images_config", None),
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
@@ -819,7 +867,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(
                     rendered_prompt, **encode_kwargs
                 )
-            except Exception as e:
+            except Exception:
                 # If the first attempt fails, try with flat function-only format.
                 # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
                 tools = (
@@ -1863,6 +1911,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     reasoning_tokens=reasoning_tokens,
+                    cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
@@ -1915,6 +1964,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     reasoning_tokens=reasoning_tokens,
+                    cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"

@@ -111,6 +111,7 @@ def _topk_ids_logical_to_physical_dynamic(
     topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
 ) -> torch.Tensor:
     topk_ids_original_shape = topk_ids.shape
+    original_dtype = topk_ids.dtype
     device = topk_ids.device
     topk_ids = topk_ids.flatten()
 
@@ -120,7 +121,7 @@ def _topk_ids_logical_to_physical_dynamic(
     )
     topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
     if _is_hip:
-        topk_ids = topk_ids.to(topk_ids.dtype)
+        topk_ids = topk_ids.to(original_dtype)
 
     topk_ids = topk_ids.view(topk_ids_original_shape)
     return topk_ids

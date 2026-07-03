@@ -7,16 +7,40 @@ export const QwenImageDeployment = () => {
         name: 'hardware',
         title: 'Hardware Platform',
         items: [
-          { id: 'mi300x', label: 'MI300X', default: true },
+          { id: 'b200', label: 'B200', default: true },
+          { id: 'b300', label: 'B300', default: false },
+          { id: 'h200', label: 'H200', default: false },
+          { id: 'h100', label: 'H100', default: false },
+          { id: 'mi300x', label: 'MI300X', default: false },
           { id: 'mi325x', label: 'MI325X', default: false },
           { id: 'mi355x', label: 'MI355X', default: false }
+        ]
+      },
+      precision: {
+        name: 'precision',
+        title: 'Precision',
+        items: [
+          { id: 'bf16', label: 'BF16', default: true },
+          {
+            id: 'nvfp4',
+            label: 'NVFP4',
+            default: false,
+            disabledWhen: (values) => !['b200', 'b300'].includes(values.hardware),
+            disabledReason: 'ModelOpt NVFP4 requires Blackwell hardware such as B200 or B300'
+          }
         ]
       }
     },
 
     generateCommand: function(values) {
+      const isBlackwell = ['b200', 'b300'].includes(values.hardware);
+      const isNvfp4 = values.precision === 'nvfp4' && isBlackwell;
+      const modelPath = isNvfp4
+        ? 'lmsys/qwen-image-2512-modelopt-nvfp4-sglang'
+        : 'Qwen/Qwen-Image';
+
       return `sglang serve \\
-  --model-path Qwen/Qwen-Image \\
+  --model-path ${modelPath} \\
   --ulysses-degree=1 \\
   --ring-degree=1`;
     }
@@ -89,7 +113,17 @@ export const QwenImageDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      const next = { ...prev, [optionName]: value };
+      if (
+        optionName === 'hardware' &&
+        !['b200', 'b300'].includes(value) &&
+        next.precision === 'nvfp4'
+      ) {
+        next.precision = 'bf16';
+      }
+      return next;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {
@@ -266,7 +300,9 @@ export const QwenImageDeployment = () => {
               ) : (
                 items.map((item) => {
                   const isChecked = values[option.name] === item.id;
-                  const isDisabled = Boolean(item.disabled);
+                  const isDisabled =
+                    item.disabled ||
+                    (typeof item.disabledWhen === 'function' && item.disabledWhen(values));
 
                   return (
                     <label

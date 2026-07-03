@@ -321,8 +321,8 @@ class TestDSAIndexer(CustomTestCase):
         params.update(kwargs)
 
         torch.set_default_dtype(self.dtype)
-        indexer = Indexer(**params)
-        # Move indexer to CUDA device
+        with torch.device(self.device):
+            indexer = Indexer(**params)
         indexer = indexer.to(device=self.device)
 
         # Convert linear layer weights to bfloat16 (but preserve LayerNorm's float32

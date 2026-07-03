@@ -5,7 +5,6 @@
 import logging
 from enum import Enum
 from functools import cached_property
-from threading import Lock
 from typing import List, Optional, Tuple
 
 import torch
@@ -13,7 +12,10 @@ from torch.nn.parameter import UninitializedParameter
 
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
-from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import (
+    get_tp_group,
+    tensor_model_parallel_all_reduce,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -33,7 +35,9 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
-from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
+from sglang.srt.layers.moe.token_dispatcher.standard import (
+    StandardDispatcher,
+)
 from sglang.srt.layers.moe.topk import (
     BypassedTopKOutput,
     StandardTopKOutput,
@@ -44,6 +48,7 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     get_fused_shared_expert_replicas_per_rank,
+    has_per_rank_fused_shared_slots,
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import (
@@ -54,8 +59,8 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_to_mxfp4
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
-from sglang.srt.layers.quantization.mxfp4_tensor import quantize_fp8_weight_to_mxfp4
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
@@ -69,7 +74,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
-    is_npu,
     print_info_once,
     round_up,
 )
@@ -78,7 +82,6 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
@@ -180,6 +183,7 @@ class FusedMoE(torch.nn.Module):
         with_bias=False,
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
+        gate_up_interleaved: bool = True,
     ):
         super().__init__()
         if params_dtype is None:
@@ -200,10 +204,11 @@ class FusedMoE(torch.nn.Module):
         self.moe_tp_size = get_parallel().moe_tp_size
         self.moe_tp_rank = get_parallel().moe_tp_rank
 
-        # DeepEP/MegaMOE use one physical shared slot per rank. Other backends
-        # keep the shared expert as a global slot.
-        # AMD/Standard: shared experts are global, slots = num_fused_shared_experts.
-        if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
+        # For fused shared experts, DeepEP-class and MegaMOE backends use
+        # per-rank physical shared slots, while other backends keep fused
+        # shared experts as global shared slots. When fusion is disabled,
+        # num_fused_shared_experts is 0 and no shared slots are added here.
+        if has_per_rank_fused_shared_slots(num_fused_shared_experts):
             self.num_fused_shared_expert_replicas_per_rank = (
                 get_fused_shared_expert_replicas_per_rank()
             )
@@ -225,10 +230,8 @@ class FusedMoE(torch.nn.Module):
             self._num_local_routed + self.num_local_fused_shared_experts
         )
         self._has_fused_shared = num_fused_shared_experts > 0
-        self._fp8_shared_to_fp4_lock = Lock()
-        self._fp8_shared_to_fp4_cache: dict[
-            tuple[int, str], dict[str, torch.Tensor]
-        ] = {}
+        self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
+        self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
 
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
@@ -283,6 +286,7 @@ class FusedMoE(torch.nn.Module):
             swiglu_limit=swiglu_limit,
             is_gated=is_gated,
             routing_method_type=routing_method_type,
+            gate_up_interleaved=gate_up_interleaved,
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
@@ -627,43 +631,53 @@ class FusedMoE(torch.nn.Module):
             return False
 
         key = (expert_id, shard_id)
-        with self._fp8_shared_to_fp4_lock:
-            entry = self._fp8_shared_to_fp4_cache.setdefault(key, {})
-            entry["weight" if is_weight else "scale"] = loaded_weight
-            if "weight" not in entry or "scale" not in entry:
+        if is_weight:
+            fp8_weight = loaded_weight
+            fp8_scale = self._pending_fp8_shared_scales.pop(key, None)
+            if fp8_scale is None:
+                self._pending_fp8_shared_weights[key] = loaded_weight
+                return True
+        else:
+            fp8_weight = self._pending_fp8_shared_weights.pop(key, None)
+            fp8_scale = loaded_weight
+            if fp8_weight is None:
+                self._pending_fp8_shared_scales[key] = loaded_weight
                 return True
 
-            fp8_weight = entry.pop("weight")
-            fp8_scale = entry.pop("scale")
-            if not entry:
-                self._fp8_shared_to_fp4_cache.pop(key, None)
+        logging.getLogger(__name__).warning_once(
+            "Loading FP8 shared expert weights into FP4 fused MoE weights. "
+            "The shared expert is quantized at load time and may differ "
+            "slightly from a checkpoint that stores shared experts directly "
+            "in FP4."
+        )
 
-            logging.getLogger(__name__).warning_once(
-                "Loading FP8 shared expert weights into FP4 fused MoE weights. "
-                "The shared expert is quantized at load time and may differ "
-                "slightly from a checkpoint that stores shared experts directly "
-                "in FP4."
+        weight_block_size = getattr(self.quant_config, "weight_block_size", None)
+        if weight_block_size is None:
+            raise ValueError(
+                "Loading FP8 shared expert weights into FP4 fused MoE weights "
+                "requires block-FP8 weight_block_size."
             )
+        fp4_weight, fp4_scale = quantize_block_fp8_weight_to_mxfp4(
+            fp8_weight, fp8_scale, weight_block_size
+        )
 
-            fp4_weight, fp4_scale = quantize_fp8_weight_to_mxfp4(fp8_weight, fp8_scale)
-
-            weight_data = weight_param.data[expert_id]
-            scale_data = scale_param.data[expert_id]
-            self._load_model_weight_or_group_weight_scale(
-                shard_dim=shard_dim,
-                expert_data=weight_data,
-                shard_id=shard_id,
-                loaded_weight=fp4_weight,
-                tp_rank=tp_rank,
-            )
-            self._load_model_weight_or_group_weight_scale(
-                shard_dim=shard_dim,
-                expert_data=scale_data,
-                shard_id=shard_id,
-                loaded_weight=fp4_scale,
-                tp_rank=tp_rank,
-            )
-            return True
+        weight_data = weight_param.data[expert_id]
+        scale_data = scale_param.data[expert_id]
+        self._load_model_weight_or_group_weight_scale(
+            shard_dim=shard_dim,
+            expert_data=weight_data,
+            shard_id=shard_id,
+            loaded_weight=fp4_weight,
+            tp_rank=tp_rank,
+        )
+        self._load_model_weight_or_group_weight_scale(
+            shard_dim=shard_dim,
+            expert_data=scale_data,
+            shard_id=shard_id,
+            loaded_weight=fp4_scale,
+            tp_rank=tp_rank,
+        )
+        return True
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
@@ -730,54 +744,6 @@ class FusedMoE(torch.nn.Module):
 
         global_expert_location_metadata = get_global_expert_location_metadata()
         if global_expert_location_metadata is None:
-            require_global_experts = getattr(
-                param, "_sglang_require_global_experts", False
-            )
-            shared_expert_id = (
-                expert_id - self._num_global_routed
-                if self._has_fused_shared and expert_id is not None
-                else -1
-            )
-            if 0 <= shared_expert_id < self.num_fused_shared_experts:
-                shared_replica_base = (
-                    shared_expert_id * self.num_fused_shared_expert_replicas_per_rank
-                )
-                if require_global_experts and uses_per_rank_fused_shared_slots():
-                    physical_expert_ids = [
-                        rank * self.num_local_experts
-                        + self._num_local_routed
-                        + shared_replica_base
-                        + replica
-                        for rank in range(self.moe_ep_size)
-                        for replica in range(
-                            self.num_fused_shared_expert_replicas_per_rank
-                        )
-                    ]
-                    for physical_expert_id in physical_expert_ids:
-                        self._weight_loader_impl(
-                            param=param,
-                            loaded_weight=loaded_weight,
-                            weight_name=weight_name,
-                            shard_id=shard_id,
-                            expert_id=physical_expert_id,
-                        )
-                else:
-                    physical_expert_ids = [
-                        self._num_global_routed + shared_replica_base + replica
-                        for replica in range(
-                            self.num_fused_shared_expert_replicas_per_rank
-                        )
-                    ]
-                    for physical_expert_id in physical_expert_ids:
-                        self._weight_loader_physical(
-                            param=param,
-                            loaded_weight=loaded_weight,
-                            weight_name=weight_name,
-                            shard_id=shard_id,
-                            expert_id=physical_expert_id,
-                        )
-                return
-
             if not getattr(param, "_sglang_require_global_experts", False):
                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
                 if expert_id == -1:
@@ -801,10 +767,10 @@ class FusedMoE(torch.nn.Module):
         if 0 <= shared_expert_id < self.num_fused_shared_experts:
             # Checkpoint shared experts start after logical routed experts, while
             # local fused MoE weights store them after physical routed experts.
+            shared_replica_base = (
+                shared_expert_id * self.num_fused_shared_expert_replicas_per_rank
+            )
             if require_global_experts and uses_per_rank_fused_shared_slots():
-                shared_replica_base = (
-                    shared_expert_id * self.num_fused_shared_expert_replicas_per_rank
-                )
                 physical_expert_ids = [
                     rank * self.num_local_experts
                     + self._num_local_routed
@@ -814,12 +780,8 @@ class FusedMoE(torch.nn.Module):
                     for replica in range(self.num_fused_shared_expert_replicas_per_rank)
                 ]
             else:
-                shared_replica_base = (
-                    self._num_global_routed
-                    + shared_expert_id * self.num_fused_shared_expert_replicas_per_rank
-                )
                 physical_expert_ids = [
-                    shared_replica_base + replica
+                    self._num_global_routed + shared_replica_base + replica
                     for replica in range(self.num_fused_shared_expert_replicas_per_rank)
                 ]
         else:
@@ -944,18 +906,21 @@ class FusedMoE(torch.nn.Module):
         # expert weights into block layout. During weight update, we must restore
         # canonical load-time shapes before copying checkpoint tensors.
         if isinstance(method, UnquantizedFusedMoEMethod):
-            if _is_npu:
-                if weight_name.endswith(".experts.w2_weight"):
-                    if param.data.shape[1] != loaded_weight.shape[0]:
-                        param.data = param.data.transpose(1, 2).contiguous()
-                if weight_name.endswith(".experts.w13_weight"):
-                    if param.data.shape[2] != loaded_weight.shape[1]:
-                        param.data = param.data.transpose(1, 2).contiguous()
             method.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
                 layer=self,
                 param=param,
                 weight_name=weight_name,
             )
+        elif isinstance(method, Fp8MoEMethod) and (
+            get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            or get_moe_runner_backend().is_flashinfer_trtllm()
+        ):
+            # Drop the GPU mxfp8 shuffle-index cache on every reload for mxfp8 trtllm, trtllm_routed
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                clear_mxfp8_shuffle_index_cache,
+            )
+
+            clear_mxfp8_shuffle_index_cache()
 
         loaded_weight = (
             loaded_weight.t().contiguous()
@@ -1189,6 +1154,16 @@ class FusedMoE(torch.nn.Module):
         method = self.quant_method
         if hasattr(self, "scheme"):
             method = self.scheme
+        if isinstance(method, Fp8MoEMethod) and (
+            get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            or get_moe_runner_backend().is_flashinfer_trtllm()
+        ):
+            # Drop the GPU mxfp8 shuffle-index cache on every reload for mxfp8 trtllm, trtllm_routed
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                clear_mxfp8_shuffle_index_cache,
+            )
+
+            clear_mxfp8_shuffle_index_cache()
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (
@@ -1267,6 +1242,7 @@ class FusedMoE(torch.nn.Module):
                     topk_output.topk_config.correction_bias,
                     topk_output.topk_config.renormalize,
                     self.layer_id,
+                    topk_output.topk_config.allow_routed_experts_capture,
                 )
             else:
                 # Make sure there is torch lib op registration for the whole moe layer
@@ -1517,6 +1493,7 @@ def fused_moe_bypassed_piecewise_cuda_graph_impl(
     correction_bias: Optional[torch.Tensor],
     renormalize: bool,
     layer_id: int,
+    allow_routed_experts_capture: bool,
 ) -> torch.Tensor:
     topk_output = BypassedTopKOutput(
         hidden_states=hidden_states,
@@ -1527,6 +1504,7 @@ def fused_moe_bypassed_piecewise_cuda_graph_impl(
             num_expert_group=num_expert_group,
             correction_bias=correction_bias,
             renormalize=renormalize,
+            allow_routed_experts_capture=allow_routed_experts_capture,
         ),
     )
     forward_context = get_tc_piecewise_forward_context()

@@ -1,13 +1,19 @@
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe import hash_topk as hash_topk_module
-from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.hash_topk import HashTopK
-from sglang.srt.layers.moe.topk import TopKConfig, remap_topk_for_per_rank_shared_slots
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    TopKConfig,
+    remap_topk_for_per_rank_shared_slots,
+)
+from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -21,17 +27,26 @@ def _set_dummy_server_args():
 
 def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
     monkeypatch.setattr(
-        hash_topk_module, "uses_per_rank_fused_shared_slots", lambda *_args: True
+        hash_topk_module, "has_per_rank_fused_shared_slots", lambda *_args: True
     )
-    monkeypatch.setattr(topk_module, "get_moe_expert_parallel_world_size", lambda: 4)
-    monkeypatch.setattr(topk_module, "get_moe_expert_parallel_rank", lambda: 2)
+    recorded = {}
+
+    class FakeRecorder:
+        def on_select_experts(self, *, topk_ids):
+            recorded["topk_ids"] = topk_ids.clone()
+
+    monkeypatch.setattr(
+        hash_topk_module,
+        "get_global_expert_distribution_recorder",
+        lambda: FakeRecorder(),
+    )
 
     topk = HashTopK(
         topk=3,
         num_experts=256,
         num_fused_shared_experts=1,
         vocab_size=2,
-        scoring_func="softmax",
+        scoring_func="sqrtsoftplus",
         routed_scaling_factor=2.5,
     )
     with torch.no_grad():
@@ -51,22 +66,27 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
         num_physical_experts=256,
     )
 
-    output = topk(
-        hidden_states=torch.empty(2, 4),
-        router_logits=torch.ones(2, 256),
-        input_ids=torch.tensor([0, 1], dtype=torch.int64),
-        expert_location_dispatch_info=info,
-    )
+    with (
+        get_parallel().override(moe_ep_size=4, moe_ep_rank=2),
+        hash_topk_module.envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False),
+    ):
+        output = topk(
+            hidden_states=torch.empty(2, 4),
+            router_logits=torch.ones(2, 256),
+            input_ids=torch.tensor([0, 1], dtype=torch.int64),
+            expert_location_dispatch_info=info,
+        )
 
     # Physical layout for EP=4 has 64 routed slots per rank plus one local
     # shared slot: [0..63, shared, 64..127, shared, ...].
     assert output.topk_ids.tolist() == [[0, 66, 194], [63, 128, 194]]
     assert torch.allclose(output.topk_weights[:, -1], torch.full((2,), 0.4))
+    assert recorded["topk_ids"].tolist() == [[0, 65], [63, 127]]
 
 
 def test_hash_topk_empty_output_keeps_per_rank_shared_slot(monkeypatch):
     monkeypatch.setattr(
-        hash_topk_module, "uses_per_rank_fused_shared_slots", lambda *_args: True
+        hash_topk_module, "has_per_rank_fused_shared_slots", lambda *_args: True
     )
 
     topk = HashTopK(
@@ -84,27 +104,64 @@ def test_hash_topk_empty_output_keeps_per_rank_shared_slot(monkeypatch):
     assert output.router_logits.shape == (0, 6)
 
 
-def test_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
-    monkeypatch.setattr(topk_module, "get_moe_expert_parallel_world_size", lambda: 4)
-    monkeypatch.setattr(topk_module, "get_moe_expert_parallel_rank", lambda: 2)
-
+def test_topk_remaps_per_rank_fused_shared_slots():
     topk_ids = torch.tensor([[0, 65, 256], [63, 127, 256]], dtype=torch.int32)
     topk_weights = torch.tensor([[0.8, 0.7, 1.0], [0.6, 0.5, 1.0]])
 
-    topk_ids, topk_weights = remap_topk_for_per_rank_shared_slots(
-        topk_ids,
-        topk_weights,
-        num_fused_shared_experts=1,
-        num_physical_routed_experts=256,
-        topk_config=TopKConfig(
-            top_k=3,
+    with get_parallel().override(moe_ep_size=4, moe_ep_rank=2):
+        topk_ids, topk_weights = remap_topk_for_per_rank_shared_slots(
+            topk_ids,
+            topk_weights,
             num_fused_shared_experts=1,
-            routed_scaling_factor=2.5,
-        ),
-    )
+            num_physical_routed_experts=256,
+            topk_config=TopKConfig(
+                top_k=3,
+                num_fused_shared_experts=1,
+                routed_scaling_factor=2.5,
+            ),
+        )
 
     assert topk_ids.tolist() == [[0, 66, 194], [63, 128, 194]]
     assert torch.allclose(topk_weights[:, -1], torch.full((2,), 0.4))
+
+
+def test_deepep_empty_forward_does_not_append_shared_slot_twice():
+    captured = {}
+
+    class FakeTopK:
+        def empty_topk_output(self, device, *, layer_id=None):
+            return StandardTopKOutput(
+                topk_weights=torch.empty((0, 9), dtype=torch.float32, device=device),
+                topk_ids=torch.empty((0, 9), dtype=torch.int32, device=device),
+                router_logits=torch.empty((0, 8), dtype=torch.float32, device=device),
+            )
+
+    class FakeExperts:
+        should_fuse_routed_scaling_factor_in_topk = True
+
+        def __call__(self, hidden_states, topk_output):
+            captured["topk_ids_shape"] = tuple(topk_output.topk_ids.shape)
+            captured["topk_weights_shape"] = tuple(topk_output.topk_weights.shape)
+            return hidden_states
+
+    moe = SimpleNamespace(
+        _fuse_shared_experts_inside_sbo=False,
+        is_nextn=False,
+        num_fused_shared_experts=1,
+        layer_id=0,
+        topk=FakeTopK(),
+        experts=FakeExperts(),
+        alt_stream=None,
+        routed_scaling_factor=1.0,
+    )
+
+    hidden_states = torch.empty((0, 4), dtype=torch.float32)
+    forward_batch = SimpleNamespace(num_token_non_padded=None)
+
+    DeepseekV2MoE.forward_deepep(moe, hidden_states, forward_batch)
+
+    assert captured["topk_ids_shape"] == (0, 9)
+    assert captured["topk_weights_shape"] == (0, 9)
 
 
 if __name__ == "__main__":

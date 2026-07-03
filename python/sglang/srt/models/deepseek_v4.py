@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-import os
 import time
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import torch
 import torch.nn as nn
@@ -40,13 +48,16 @@ from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
     dsa_cp_reduce_scatter_hidden_states,
 )
-from sglang.srt.layers.deepseek_v4_rope import v4_rope_inplace_npu
+from sglang.srt.layers.deepseek_v4_rope import (
+    v4_rope_inplace_npu,
+)
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
     attn_tp_all_reduce,
     dp_gather_partial,
     dp_gather_replicate,
+    dp_reduce_scatter_tensor,
     dp_scatter,
     get_dp_global_num_tokens,
     get_global_dp_buffer,
@@ -57,7 +68,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.mhc import mhc_fused_post_pre, npu_hc_pre
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
@@ -102,9 +112,12 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     try_fused_hc_post_pre,
 )
 from sglang.srt.models.deepseek_common.utils import _use_aiter_bpreshuffle_gfx95
-from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
-from sglang.srt.models.triton_ops.deepseek_v4 import (
-    rms_normalize_triton as rms_normalize_triton,
+from sglang.srt.models.deepseek_v2 import (
+    ParallelLMHead,
+    _is_cuda,
+    _is_hip,
+    _is_npu,
+    _is_xpu,
 )
 from sglang.srt.runtime_context import get_parallel
 
@@ -113,12 +126,18 @@ if not _is_hip:
         prepare_context_parallel_metadata,
     )
 
+if _is_xpu:
+    from sgl_kernel import hc_split_sinkhorn
+else:
+    from sglang.srt.layers.mhc import hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre
+
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
     is_gfx95_supported,
+    is_gfx942_supported,
     log_info_on_rank0,
     make_layers,
 )
@@ -147,7 +166,12 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
 
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+# PoC: compute the (replicated TP1) shared expert on LOCAL hidden before the dp
+# gather instead of on the gathered global buffer. Requires
+# SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
+_SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx942_supported = is_gfx942_supported()
 
 if _use_aiter:
     if _is_gfx95_supported:
@@ -194,7 +218,9 @@ def _freqs_cis_to_cos_sin(
 
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+    from sglang.srt.layers.attention.deepseek_v4_backend import (
+        DeepseekV4AttnBackend,
+    )
     from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
         DeepseekV4HipRadixBackend,
     )
@@ -672,7 +698,7 @@ class MQALayer(nn.Module):
 
             token_to_kv_pool = get_token_to_kv_pool()
             swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
-            swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
+            swa_cache = token_to_kv_pool.get_swa_raw_buffer(self.layer_id)
             swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
 
             q = fused_qk_norm_rope_swa_store(
@@ -773,7 +799,7 @@ class MQALayer(nn.Module):
                 swa_loc = attn_backend.get_unified_swa_loc(forward_batch)
                 swa_page_size, bf16_store = 1, True
             else:
-                swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
+                swa_cache = token_to_kv_pool.get_swa_raw_buffer(self.layer_id)
                 swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
                 swa_page_size, bf16_store = (
                     token_to_kv_pool.swa_kv_pool.page_size,
@@ -934,7 +960,14 @@ class MQALayer(nn.Module):
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
             # this rank and padded to match.
             padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
-            q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+            # Only [0:n_local_heads] is written below. Uninitialized padded TP
+            # heads inject NaN into attention on gfx942 (fnuz), so zero-init
+            # there; other archs tolerate new_empty and skip the per-forward
+            # memset.
+            if _is_gfx942_supported:
+                q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
+            else:
+                q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
             if self._attn_sink_local is None:
@@ -1149,121 +1182,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.post_attention_layernorm.weight.data.bfloat16().contiguous()
         )
 
-    def prewarm_mhc_token_counts(
-        self, token_counts: Tuple[int, ...], device: torch.device
-    ) -> None:
-        paths = (
-            (
-                "attn",
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                self.input_layernorm,
-            ),
-            (
-                "ffn",
-                self.hc_ffn_fn,
-                self.hc_ffn_scale,
-                self.hc_ffn_base,
-                self.post_attention_layernorm,
-            ),
-        )
-
-        with torch.inference_mode():
-            for num_tokens in token_counts:
-                for path_name, hc_fn, hc_scale, hc_base, norm in paths:
-                    tic = time.perf_counter()
-                    residual = torch.empty(
-                        (num_tokens, self.hc_mult, self.hidden_size),
-                        dtype=torch.bfloat16,
-                        device=device,
-                    )
-                    y, post, comb, _ = self.hc_pre(
-                        residual,
-                        hc_fn,
-                        hc_scale,
-                        hc_base,
-                        norm=norm,
-                    )
-                    del residual, y, post, comb
-                    torch.cuda.synchronize()
-                    logger.info(
-                        "DeepSeek V4 MHC prewarm path=%s num_tokens=%s completed in %.3fs",
-                        path_name,
-                        num_tokens,
-                        time.perf_counter() - tic,
-                    )
-
-            if self.use_fused_mhc_post_pre:
-                for num_tokens in token_counts:
-                    for path_name, hc_fn, hc_scale, hc_base, norm in paths:
-                        tic = time.perf_counter()
-                        # Dummy inputs matching the fused kernel's expected shapes.
-                        x = torch.empty(
-                            (num_tokens, self.hidden_size),
-                            dtype=torch.bfloat16,
-                            device=device,
-                        )
-                        residual = torch.empty(
-                            (num_tokens, self.hc_mult, self.hidden_size),
-                            dtype=torch.bfloat16,
-                            device=device,
-                        )
-                        post_mix = torch.empty(
-                            (num_tokens, self.hc_mult, 1),
-                            dtype=torch.float32,
-                            device=device,
-                        )
-                        comb_mix = torch.empty(
-                            (num_tokens, self.hc_mult, self.hc_mult),
-                            dtype=torch.float32,
-                            device=device,
-                        )
-                        norm_weight = norm.weight.data.bfloat16().contiguous()
-                        mhc_fused_post_pre(
-                            x,
-                            residual,
-                            post_mix,
-                            comb_mix,
-                            hc_fn,
-                            hc_scale,
-                            hc_base,
-                            self.rms_norm_eps,
-                            self.hc_eps,
-                            self.hc_eps,
-                            _MHC_POST_MULT_VALUE,
-                            self.hc_sinkhorn_iters,
-                            norm_weight=norm_weight,
-                            norm_eps=norm.variance_epsilon,
-                        )
-                        del x, residual, post_mix, comb_mix, norm_weight
-                        torch.cuda.synchronize()
-                        logger.info(
-                            "DeepSeek V4 MHC fused prewarm path=%s num_tokens=%s completed in %.3fs",
-                            path_name,
-                            num_tokens,
-                            time.perf_counter() - tic,
-                        )
-
-    def prewarm_mhc_token_count_buckets(
-        self, max_num_tokens: int, device: torch.device
-    ) -> Tuple[int, ...]:
-        from sglang.srt.layers.mhc import get_mhc_pre_token_count_representatives
-
-        token_counts = get_mhc_pre_token_count_representatives(
-            max_num_tokens, self.hc_mult * self.hidden_size
-        )
-        if not token_counts:
-            return token_counts
-
-        logger.info(
-            "DeepSeek V4 MHC prewarm max_num_tokens=%s representative token counts: %s",
-            max_num_tokens,
-            token_counts,
-        )
-        self.prewarm_mhc_token_counts(token_counts, device)
-        return token_counts
-
     def hc_pre(
         self,
         x: torch.Tensor,
@@ -1364,8 +1282,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
         else:
             x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
-
-        from sglang.srt.layers.mhc import hc_split_sinkhorn
 
         pre, post, comb = hc_split_sinkhorn(
             mixes,
@@ -1562,11 +1478,43 @@ class DeepseekV4DecoderLayer(nn.Module):
         # in ONE op, REPLACING the MoE-internal post-experts all_reduce — so we
         # MUST tell the MoE to skip it (use_reduce_scatter=True) or it
         # double-reduces. Env-gated via SGLANG_DP_USE_GATHERV, default OFF.
-        _use_gatherv_pair = (
+        _use_reduce_scatterv = (
             _use_tp_moe_gather
             and is_dp_gatherv_active()
             and forward_batch.dp_padding_mode is not None
             and not forward_batch.dp_padding_mode.is_max_len()
+        )
+        # SGLANG_DP_USE_REDUCE_SCATTER: in the MAX_LEN decode path (equal per-rank
+        # padding, gatherv inactive, no EP), replace the MoE-internal post-experts
+        # all_reduce + dp_scatter with an equal-chunk reduce_scatter. On ROCm this
+        # uses the aiter custom kernel (so BOTH gather and combine are aiter custom),
+        # elsewhere RCCL reduce_scatter; either way it cuts combine traffic ~2x vs
+        # all_reduce. tp_size==attn_dp_size required so the global buffer splits
+        # evenly into per-rank chunks.
+        _use_reduce_scatter = (
+            envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
+            and _use_tp_moe_gather
+            and not _use_reduce_scatterv
+            and not should_use_dp_reduce_scatterv()
+            and forward_batch.dp_padding_mode is not None
+            and forward_batch.dp_padding_mode.is_max_len()
+            and get_parallel().tp_size == get_parallel().attn_dp_size
+        )
+        # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): compute the replicated shared expert
+        # on LOCAL hidden before the gather and add it back after the combine
+        # (reduce_scatterv OR dp_scatter), instead of on the gathered global buffer.
+        # Applies to BOTH prefill and decode: the shared expert is a per-token MLP,
+        # so computing it on this rank's local tokens (M_local rows) is identical to
+        # computing it on the gathered global buffer (M_global rows) and keeping the
+        # local slice -- but costs 1/dp_size the rows. With a replicated (TP1) shared
+        # expert this cancels the TP1 "full-dim" cost in decode (M_local * dim ==
+        # M_global * dim/tp), so decode no longer pays the ~dp_size x penalty.
+        _shared_local = None
+        _do_shared_local = (
+            _SHARED_EXPERT_LOCAL
+            and _use_tp_moe_gather
+            and getattr(self.mlp, "shared_experts", None) is not None
+            and getattr(self.mlp, "_shared_expert_tp1", False)
         )
         if _use_cp:
             if get_moe_a2a_backend().is_none():
@@ -1581,6 +1529,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 get_global_dp_buffer(get_tp_group()),
                 hidden_states,
             )
+            if _do_shared_local and local_hidden_states.shape[0] > 0:
+                _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
@@ -1595,8 +1545,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids=input_ids,
             input_ids_global=input_ids_global,
             # Skip the MoE-internal post-experts all_reduce when we will do the
-            # reduce via reduce_scatterv at the combine below (else double-reduce).
-            use_reduce_scatter=_use_cp or _use_gatherv_pair,
+            # reduce via reduce_scatterv/reduce_scatter at the combine below
+            # (else double-reduce).
+            use_reduce_scatter=_use_cp or _use_reduce_scatterv or _use_reduce_scatter,
+            skip_shared_experts=_do_shared_local,
         )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
@@ -1605,7 +1557,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 get_local_dp_buffer(get_tp_group()),
                 hidden_states,
             )
-            if should_use_dp_reduce_scatterv() or _use_gatherv_pair:
+            if should_use_dp_reduce_scatterv() or _use_reduce_scatterv:
                 # SUM the TP-sharded per-rank partial expert outputs AND scatter
                 # each rank its own token slice, in one op. Correct because the
                 # MoE-internal all_reduce was skipped (use_reduce_scatter above).
@@ -1615,8 +1567,25 @@ class DeepseekV4DecoderLayer(nn.Module):
                     output=hidden_states,
                     sizes=get_dp_global_num_tokens(),
                 )
+            elif _use_reduce_scatter:
+                # Equal-chunk reduce_scatter: SUM the TP-sharded per-rank partial
+                # expert outputs AND scatter each rank its own (MAX_LEN-padded)
+                # token chunk in one op (symmetric inverse of the MAX_LEN
+                # all_gather). Correct because the MoE-internal all_reduce was
+                # skipped (use_reduce_scatter above). dp_reduce_scatter_tensor
+                # routes to the equal-chunk reduce_scatter_tensor here (its
+                # variable-length reduce_scatterv branch is gated by
+                # is_dp_gatherv_active(), which is False under MAX_LEN), which in
+                # turn uses the aiter custom kernel when it fits (else RCCL).
+                dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
             else:
                 dp_scatter(hidden_states, global_hidden_states, forward_batch)
+            # PoC: add the locally-computed shared-expert output to this rank's
+            # reduce-scattered / dp-scattered local slice (skipped inside self.mlp
+            # above). Covers both prefill (gatherv) and decode (dp_scatter).
+            if _shared_local is not None:
+                n = hidden_states.shape[0]
+                hidden_states = hidden_states + _shared_local[:n]
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
             gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
@@ -1829,6 +1798,15 @@ class DeepseekV4ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # DeepseekV4 enables, by default, the CK w8a8-block GEMM (MLA proj) and the
+        # batched/contiguous-load rope kernels (faster on gfx95; .
+        # Module-level toggles default OFF; flipped True here for DSV4
+        if _is_hip:
+            from sglang.srt.layers.deepseek_v4_rope import set_batched_rope
+            from sglang.srt.layers.quantization.fp8_utils import set_force_ck_w8a8
+
+            set_force_ck_w8a8(True)
+            set_batched_rope(True)
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
@@ -1873,6 +1851,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.cp_rank = get_parallel().attn_cp_rank
             self.cp_size = get_parallel().attn_cp_size
 
+        # update_weights_from_disk/_tensor/_distributed re-enter load_weights
+        # mid-serving (RL refit sends many partial batches); the prewarm and
+        # its barrier must only run on the first (startup) load.
+        self._mhc_prewarmed_at_load = False
+
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
@@ -1883,15 +1866,18 @@ class DeepseekV4ForCausalLM(nn.Module):
         if server_args.disable_shared_experts_fusion:
             return
 
+        disable_reason = None
         if not (
             server_args.enforce_shared_experts_fusion
             or getattr(server_args, "enable_deepep_waterfill", False)
         ):
+            disable_reason = "Config does not support fused shared expert(s)."
+
+        if disable_reason is not None:
             server_args.disable_shared_experts_fusion = True
             log_info_on_rank0(
                 logger,
-                "DeepSeek V4 shared-experts fusion is disabled unless explicitly "
-                "enforced or required by DeepEP Waterfill.",
+                f"{disable_reason} Shared experts fusion optimization is disabled.",
             )
             return
 
@@ -2050,21 +2036,76 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".attn_norm.", ".input_layernorm.")
         name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
 
-        if "self_attn" in name:
-            name = name.replace(".scale", ".weight_scale_inv")
+        if "self_attn" in name and name.endswith(".scale"):
+            name = name.removesuffix(".scale") + ".weight_scale_inv"
 
         name = name.replace(".gate.tid2eid", ".topk.tid2eid")
         name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
         name = name.replace(".w1.", ".gate_proj.")
         name = name.replace(".w2.", ".down_proj.")
         name = name.replace(".w3.", ".up_proj.")
-        if "mlp" in name:
-            name = name.replace(".scale", ".weight_scale_inv")
+        if "mlp" in name and name.endswith(".scale"):
+            name = name.removesuffix(".scale") + ".weight_scale_inv"
 
         return name
 
+    def _prewarm_mhc_pre_kernels(self) -> None:
+        """One-shot mhc_pre() JIT prewarm at load time, synced across ranks.
+
+        Runs before any forward so the compile burst stays off the serving
+        path; the barrier keeps ranks from proceeding while a peer is still
+        compiling. The early returns below must stay rank-uniform.
+        """
+        if self._mhc_prewarmed_at_load:
+            return
+        self._mhc_prewarmed_at_load = True
+        if _is_npu or not (
+            envs.SGLANG_DSV4_MHC_PREWARM.get()
+            and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+        ):
+            return
+        layer = next(
+            (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),
+            None,
+        )
+        if layer is None:
+            return
+
+        from sglang.srt.layers.mhc import prewarm_mhc_pre
+
+        tic = time.perf_counter()
+        prewarm_mhc_pre(
+            # Template carrying dtype/device; buckets allocate their own sizes.
+            residual=torch.zeros(
+                (1, layer.hc_mult, layer.hidden_size),
+                dtype=torch.bfloat16,
+                device=layer.hc_attn_fn.device,
+            ),
+            fn=layer.hc_attn_fn,
+            hc_scale=layer.hc_attn_scale,
+            hc_base=layer.hc_attn_base,
+            rms_eps=layer.rms_norm_eps,
+            hc_pre_eps=layer.hc_eps,
+            hc_sinkhorn_eps=layer.hc_eps,
+            hc_post_mult_value=_MHC_POST_MULT_VALUE,
+            sinkhorn_repeat=layer.hc_sinkhorn_iters,
+            n_splits=1,
+            n_splits_pre=32,
+            norm_weight=layer.input_layernorm.weight.data,
+            norm_eps=layer.input_layernorm.variance_epsilon,
+        )
+        torch.cuda.synchronize()
+        compile_secs = time.perf_counter() - tic
+        # Runs before init_memory_pool(); don't let transients skew pool sizing.
+        torch.cuda.empty_cache()
+        get_tp_group().barrier()
+        logger.info(
+            "DeepSeek V4 MHC prenorm prewarm at load: compile %.1fs, rank sync +%.1fs",
+            compile_secs,
+            time.perf_counter() - tic - compile_secs,
+        )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-        load_debug_t0 = time.perf_counter()
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
@@ -2081,22 +2122,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
         if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
-            logger.debug("DSV4_LOAD_WEIGHTS_LIST_BEGIN is_nextn=%s", is_nextn)
             weights = list(weights)
-            logger.debug(
-                "DSV4_LOAD_WEIGHTS_LIST_DONE is_nextn=%s count=%s elapsed=%.3fs",
-                is_nextn,
-                len(weights),
-                time.perf_counter() - load_debug_t0,
-            )
             exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
             if exists_wo_a_scale:
                 logger.info("Execute dequant fp8 wo_a")
                 weights = _dequant_fp8_wo_a(weights)
             else:
                 logger.info("Skip dequant fp8 wo_a")
-        else:
-            logger.debug("DSV4_LOAD_WEIGHTS_LIST_SKIPPED is_nextn=%s", is_nextn)
 
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
@@ -2146,28 +2178,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             weight_names = []
-            num_seen_weights = 0
-            logger.debug(
-                "DSV4_LOAD_WEIGHTS_APPLY_BEGIN is_nextn=%s elapsed=%.3fs",
-                is_nextn,
-                time.perf_counter() - load_debug_t0,
-            )
             for name, loaded_weight in weights:
-                num_seen_weights += 1
-                if num_seen_weights == 1 or num_seen_weights % 100 == 0:
-                    logger.debug(
-                        "DSV4_LOAD_WEIGHTS_APPLY_PROGRESS is_nextn=%s seen=%s "
-                        "name=%s shape=%s elapsed=%.3fs",
-                        is_nextn,
-                        num_seen_weights,
-                        name,
-                        tuple(loaded_weight.shape),
-                        time.perf_counter() - load_debug_t0,
-                    )
                 try:
                     use_async_loading = should_async_load(loaded_weight)
-                    if os.environ.get("SGLANG_DSV4_DISABLE_ASYNC_WEIGHT_LOAD") == "1":
-                        use_async_loading = False
 
                     name = self.remap_weight_name_to_dpsk_hf_format(
                         name,
@@ -2393,32 +2406,18 @@ class DeepseekV4ForCausalLM(nn.Module):
                     e.add_note(f"{name=} {loaded_weight.shape=}")
                     raise
 
-            logger.debug(
-                "DSV4_LOAD_WEIGHTS_FUTURES_BEGIN is_nextn=%s seen=%s "
-                "loaded_params=%s futures=%s elapsed=%.3fs",
-                is_nextn,
-                num_seen_weights,
-                len(loaded_params),
-                len(futures),
-                time.perf_counter() - load_debug_t0,
-            )
             for future in concurrent.futures.as_completed(futures):
                 future.result()
-            logger.debug(
-                "DSV4_LOAD_WEIGHTS_APPLY_DONE is_nextn=%s loaded_params=%s "
-                "seen=%s futures=%s elapsed=%.3fs",
-                is_nextn,
-                len(loaded_params),
-                num_seen_weights,
-                len(futures),
-                time.perf_counter() - load_debug_t0,
-            )
 
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
         unloaded_params = params_dict.keys() - loaded_params
 
-        skipped_checking_patterns = ["attn_mqa.k_scale", "attn_mqa.v_scale"]
+        skipped_checking_patterns = [
+            "attn_mqa.k_scale",
+            "attn_mqa.v_scale",
+            "blockscale_swizzled",
+        ]
         if not self.pp_group.is_first_rank:
             skipped_checking_patterns.append("embed_tokens")
         if not self.pp_group.is_last_rank:
@@ -2439,18 +2438,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                 f"Some weights are not initialized from checkpoints: {unloaded_params}"
             )
 
-        logger.debug(
-            "DSV4_LOAD_WEIGHTS_POST_BEGIN is_nextn=%s weight_names=%s elapsed=%.3fs",
-            is_nextn,
-            len(weight_names),
-            time.perf_counter() - load_debug_t0,
-        )
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
-        logger.debug(
-            "DSV4_LOAD_WEIGHTS_DONE is_nextn=%s elapsed=%.3fs",
-            is_nextn,
-            time.perf_counter() - load_debug_t0,
-        )
+
+        if not is_nextn:
+            self._prewarm_mhc_pre_kernels()
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

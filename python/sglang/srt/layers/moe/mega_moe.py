@@ -544,9 +544,7 @@ def _run_mega_routed(
             and has_no_waterfill_topk
         )
         if fuse_env_explicit:
-            can_fuse_waterfill_predispatch = (
-                fuse_env and can_fuse_waterfill_predispatch
-            )
+            can_fuse_waterfill_predispatch = fuse_env and can_fuse_waterfill_predispatch
         else:
             fuse_env = can_fuse_waterfill_predispatch
         if can_fuse_waterfill_predispatch:

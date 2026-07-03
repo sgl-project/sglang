@@ -105,7 +105,7 @@ def main():
         "1"  # Skip consistency checks in GT gen mode
     )
 
-    logger.info(f"GT generation mode enabled")
+    logger.info("GT generation mode enabled")
     logger.info(f"Output directory: {out_dir}")
 
     # Resolve test files path (same as run_suite.py)

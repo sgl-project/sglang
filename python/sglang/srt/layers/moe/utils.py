@@ -9,7 +9,9 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_npu
 
@@ -383,17 +385,17 @@ def get_fused_shared_expert_replicas_per_rank() -> int:
         return max(env_field.get(), 1)
 
     server_args = get_global_server_args()
-    if (
-        get_moe_a2a_backend().is_megamoe()
-        and getattr(server_args, "enable_deepep_waterfill", False)
+    if get_moe_a2a_backend().is_megamoe() and getattr(
+        server_args, "enable_deepep_waterfill", False
     ):
-        # Mega-MoE Waterfill needs enough physical shared slots for the fused
-        # DeepGEMM schedule to convert rank balance into throughput. Keep the
-        # non-Waterfill Mega-MoE baseline at one slot so A/B comparisons remain
-        # apples-to-apples.
         return 4
 
     return 1
+
+
+def has_per_rank_fused_shared_slots(num_fused_shared_experts: int) -> bool:
+    """Check whether this layer has fused shared experts in per-rank slots."""
+    return num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
 
 
 def is_flashinfer_cutedsl_v1_path() -> bool:
@@ -473,6 +475,12 @@ def should_skip_post_experts_all_reduce(
       - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
         the flashinfer cutlass FP4 kernel performs an all-gather that absorbs
         the post-experts TP all-reduce. Not relevant to the EP all-reduce.
+      - ``get_moe_a2a_backend().is_flashinfer()``: the flashinfer A2A
+        dispatcher's ``MoeAlltoAll.combine`` already alltoall-reduces partial
+        MoE outputs back to the source rank, so any further EP/TP all-reduce
+        would double-count and overflow BF16. Mirrors TRTLLM's
+        ``not enable_alltoall`` gate
+        (``tensorrt_llm/_torch/modules/fused_moe/interface.py:879``).
 
     The first two args are layer-context flags from ``LayerCommunicator`` and
     default to ``False`` for models that don't use it. Pass ``is_tp_path=True``
@@ -483,6 +491,8 @@ def should_skip_post_experts_all_reduce(
     if should_use_dp_reduce_scatterv():
         return True
     if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
+        return True
+    if get_moe_a2a_backend().is_flashinfer():
         return True
     return False
 
