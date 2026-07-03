@@ -136,36 +136,58 @@ def alloc_decode_kernel(
 
 
 @triton.jit
-def mark_swa_free_pages_kernel(
+def free_dual_pool_kernel(
     free_index_ptr,
     n_slots,
+    self_epoch_ptr,
+    self_cur_epoch,
+    self_ring_ptr,
+    self_cap,
+    self_tail_ptr,
     mapping_ptr,
-    page_epoch_ptr,
-    cur_epoch,
-    swa_bitmap_ptr,
+    swa_epoch_ptr,
+    swa_cur_epoch,
+    swa_ring_ptr,
+    swa_cap,
+    swa_tail_ptr,
     page_size: tl.constexpr,
     BLOCK: tl.constexpr,
+    MARK_SELF: tl.constexpr,
+    SCAN_SWA: tl.constexpr,
 ):
-    """Mark the swa pages referenced by the full pages touched by free_index,
-    and zero their full_to_swa mapping entries, entirely device-side.
+    """Single-launch page free. Elects one winner lane per touched page via a
+    monotone epoch atomic_max (page-granular dedup, no assumptions about input
+    structure) and appends freed pages straight to the device ring, so there
+    is no bitmap sweep and no data-dependent shape anywhere.
 
-    One winner lane is elected per touched full page via a monotone epoch
-    atomic_max (this is also the full-page dedup, robust to concatenated or
-    partial inputs). The winner scans all page_size mapping slots of its page
-    (free is page-granular: a partial page in free_index still clears the
-    whole page), marks each live swa page in swa_bitmap, and zeroes the
-    mapping. No data-dependent output shape, so no CPU-GPU sync anywhere.
+    MARK_SELF: append elected pages to the self ring (off for standalone
+    free_swa, which only elects to dedup the mapping scan).
+    SCAN_SWA: winners additionally scan their page's full_to_swa mapping
+    slots, append live swa pages to the swa ring (second epoch claim), and
+    zero the mapping. Free is page-granular: a partial page in free_index
+    still clears the whole page.
+    Ring append order is nondeterministic (atomic), which only affects which
+    physical page a later alloc picks, not any KV content.
     """
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     lane_m = offs < n_slots
     slots = tl.load(free_index_ptr + offs, mask=lane_m, other=0)
     fp = slots // page_size
-    old = tl.atomic_max(page_epoch_ptr + fp, cur_epoch, mask=lane_m)
-    winner = lane_m & (old < cur_epoch)
-    base = fp * page_size
-    for j in range(page_size):
-        v = tl.load(mapping_ptr + base + j, mask=winner, other=0)
-        sp = v // page_size
-        tl.store(swa_bitmap_ptr + sp, 1, mask=winner & (v > 0))
-        tl.store(mapping_ptr + base + j, 0, mask=winner)
+    old = tl.atomic_max(self_epoch_ptr + fp, self_cur_epoch, mask=lane_m)
+    winner = lane_m & (old < self_cur_epoch)
+    if MARK_SELF:
+        # broadcast the scalar tail pointer to a block so per-lane atomics work
+        pos = tl.atomic_add(self_tail_ptr + fp * 0, 1, mask=winner)
+        tl.store(self_ring_ptr + pos % self_cap, fp.to(tl.int64), mask=winner)
+    if SCAN_SWA:
+        base = fp * page_size
+        for j in range(page_size):
+            v = tl.load(mapping_ptr + base + j, mask=winner, other=0)
+            sp = v // page_size
+            live = winner & (v > 0)
+            old2 = tl.atomic_max(swa_epoch_ptr + sp, swa_cur_epoch, mask=live)
+            sw = live & (old2 < swa_cur_epoch)
+            pos2 = tl.atomic_add(swa_tail_ptr + sp * 0, 1, mask=sw)
+            tl.store(swa_ring_ptr + pos2 % swa_cap, sp.to(tl.int64), mask=sw)
+            tl.store(mapping_ptr + base + j, 0, mask=winner)

@@ -9,7 +9,7 @@ from sglang.srt.mem_cache.allocator.paged import (
 )
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.triton_ops.allocator import mark_swa_free_pages_kernel
+from sglang.srt.mem_cache.triton_ops.allocator import free_dual_pool_kernel
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
 
@@ -69,7 +69,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 PagedTokenToKVPoolAllocatorClass = NPUPagedTokenToKVPoolAllocator
             else:
                 PagedTokenToKVPoolAllocatorClass = PagedTokenToKVPoolAllocator
-            self.full_attn_allocator = PagedTokenToKVPoolAllocatorClass(
+            SubAllocatorClass = (
+                DeviceFreeListPagedAllocator
+                if self._device_free
+                else PagedTokenToKVPoolAllocatorClass
+            )
+            self.full_attn_allocator = SubAllocatorClass(
                 size,
                 page_size,
                 dtype,
@@ -77,12 +82,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 full_kv_pool,
                 need_sort,
             )
-            SwaAllocatorClass = (
-                DeviceFreeListPagedAllocator
-                if self._device_free
-                else PagedTokenToKVPoolAllocatorClass
-            )
-            self.swa_attn_allocator = SwaAllocatorClass(
+            self.swa_attn_allocator = SubAllocatorClass(
                 size_swa,
                 page_size,
                 dtype,
@@ -90,16 +90,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 swa_kv_pool,
                 need_sort,
             )
-            if self._device_free:
-                # Winner-election epochs over full pages and the swa mark
-                # bitmap for mark_swa_free_pages_kernel (see free_swa).
-                self._page_epoch = torch.zeros(
-                    size // page_size + 2, dtype=torch.int32, device=device
-                )
-                self._swa_free_bitmap = torch.zeros(
-                    size_swa // page_size + 2, dtype=torch.int32, device=device
-                )
-                self._free_epoch = 0
         # Note: append one more item of value -1 in the end so -1 maps to -1.
         # It is needed for the last_loc in alloc_extend, where the first full_last_loc
         # is -1, and we need to map it to swa_last_loc -1 as well.
@@ -336,8 +326,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # NOTE: the API is not idempotent.
         if self.is_not_in_free_group:
-            self.full_attn_allocator.free(free_index)
-            self.free_swa(free_index)
+            if self._device_free:
+                self._free_device(free_index, mark_full=True)
+            else:
+                self.full_attn_allocator.free(free_index)
+                self.free_swa(free_index)
         else:
             self.free_group.append(free_index)
         if not self._device_free:
@@ -370,7 +363,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self._device_free:
-            self._free_swa_device(free_index)
+            self._free_device(free_index, mark_full=False)
             return
 
         if self.page_size == 1:
@@ -383,28 +376,42 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[mapping_indices] = 0
 
-    def _free_swa_device(self, free_index: torch.Tensor):
-        """Sync-free free_swa: one kernel marks the live swa pages of every
-        touched full page (page-granular, deduped via epoch election) and
-        zeroes the mapping; the sweep compacts them into the swa allocator's
-        device-resident free list. No data-dependent shapes, no CPU-GPU sync.
+    def _free_device(self, free_index: torch.Tensor, mark_full: bool):
+        """Single-kernel free covering both pools: winner election per touched
+        full page dedups the scan, live swa pages append to the swa ring, the
+        mapping is zeroed, and (composite free only) the full pages append to
+        the full ring. No data-dependent shapes, no CPU-GPU sync.
         """
         if free_index.dtype != torch.int64:
             free_index = free_index.to(torch.int64)
+        full_a = self.full_attn_allocator
+        swa_a = self.swa_attn_allocator
+        full_a._cur_epoch += 1
+        swa_a._cur_epoch += 1
         n = free_index.numel()
-        self._free_epoch += 1
         BLOCK = 256
-        mark_swa_free_pages_kernel[(triton.cdiv(n, BLOCK),)](
+        free_dual_pool_kernel[(triton.cdiv(n, BLOCK),)](
             free_index,
             n,
+            full_a._page_epoch,
+            full_a._cur_epoch,
+            full_a._buf,
+            full_a._cap,
+            full_a._tail,
             self.full_to_swa_index_mapping,
-            self._page_epoch,
-            self._free_epoch,
-            self._swa_free_bitmap,
+            swa_a._page_epoch,
+            swa_a._cur_epoch,
+            swa_a._buf,
+            swa_a._cap,
+            swa_a._tail,
             page_size=self.page_size,
             BLOCK=BLOCK,
+            MARK_SELF=mark_full,
+            SCAN_SWA=True,
         )
-        self.swa_attn_allocator.free_from_bitmap(self._swa_free_bitmap)
+        if mark_full:
+            full_a._mark_freed()
+        swa_a._mark_freed()
 
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
         pages = torch.unique(indices // self.page_size)

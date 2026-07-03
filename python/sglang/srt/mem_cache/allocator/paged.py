@@ -23,11 +23,13 @@ Page-aligned memory pool.
 from typing import TYPE_CHECKING
 
 import torch
+import triton
 
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.triton_ops.allocator import (
     alloc_decode_kernel,
     alloc_extend_kernel,
+    free_dual_pool_kernel,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -296,25 +298,29 @@ class DeviceFreeListPagedAllocator(PagedTokenToKVPoolAllocator):
     """Paged allocator whose free list lives on device (ring buffer plus
     device head/tail counters).
 
-    Frees whose live-page count is data-dependent (the SWA mapping side) are
-    compacted into the ring by free_from_bitmap() with a static output shape,
-    so the free path never forces a CPU-GPU sync. The host tracks occupancy
-    as (tail snapshot - allocs): allocs are host-driven and exact, the tail
-    snapshot arrives through an async pinned copy and is re-adopted with one
-    event wait only when queried after frees.
+    Frees append to the ring inside free_dual_pool_kernel (single launch,
+    page-granular dedup via epoch election), so the free path never forces a
+    CPU-GPU sync even when the live-page count is data-dependent (the SWA
+    mapping side). The host tracks occupancy as (tail snapshot - allocs):
+    allocs are host-driven and exact, the tail snapshot arrives through an
+    async pinned copy and is re-adopted with one event wait only when queried
+    after frees.
     """
 
     def __init__(self, size, page_size, dtype, device, kvcache, need_sort):
         num_pages = size // page_size
-        # Ring capacity num_pages + 1; index _cap is the trash slot for
-        # masked-off scatter writes (also absorbs double-free overflow).
+        # Ring capacity num_pages + 1 so legitimate occupancy never wraps.
         self._cap = num_pages + 1
-        self._buf = torch.empty(self._cap + 1, dtype=torch.int64, device=device)
+        self._buf = torch.empty(self._cap, dtype=torch.int64, device=device)
         # Absolute (never wrapping) counters; physical index = abs % _cap.
         self._head = torch.zeros((), dtype=torch.int64, device=device)
         self._tail = torch.zeros((), dtype=torch.int64, device=device)
         self._tail_pinned = torch.zeros((), dtype=torch.int64, pin_memory=True)
         self._free_event = torch.cuda.Event()
+        # Winner-election epochs (page-granular free dedup); monotone, one
+        # counter per array, never cleared.
+        self._page_epoch = torch.zeros(num_pages + 2, dtype=torch.int32, device=device)
+        self._cur_epoch = 0
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
 
     def clear(self):
@@ -335,6 +341,11 @@ class DeviceFreeListPagedAllocator(PagedTokenToKVPoolAllocator):
             self._free_event.synchronize()
             self._tail_snapshot = int(self._tail_pinned)
             self._dirty = False
+            occupancy = self._tail_snapshot - self._head_host
+            assert occupancy <= self.num_pages, (
+                f"free list overflow (double free): occupancy {occupancy} > "
+                f"{self.num_pages} pages"
+            )
 
     def available_size(self):
         self._refresh()
@@ -353,28 +364,45 @@ class DeviceFreeListPagedAllocator(PagedTokenToKVPoolAllocator):
         self._head_host += num_pages
         return pages
 
-    def free_from_bitmap(self, bitmap: torch.Tensor):
-        """Append the set pages of `bitmap` to the ring and clear it.
-
-        Static shapes throughout (cumsum positions, masked-off writes routed
-        to the trash slot), so no sync; the count stays on device.
-        """
-        mask = bitmap != 0
-        pos = torch.cumsum(mask.to(torch.int64), 0) - 1 + self._tail
-        dest = torch.where(mask, pos % self._cap, torch.full_like(pos, self._cap))
-        src = torch.arange(bitmap.numel(), device=self.device, dtype=torch.int64)
-        self._buf.scatter_(0, dest, src)
-        self._tail += mask.sum()
-        bitmap.zero_()
+    def _mark_freed(self):
         self._tail_pinned.copy_(self._tail, non_blocking=True)
         self._free_event.record()
         self._dirty = True
 
     def free(self, free_index: torch.Tensor):
-        raise NotImplementedError(
-            "DeviceFreeListPagedAllocator is fed via free_from_bitmap(); "
-            "direct free() callers should use the composite SWA allocator"
+        # Page-granular dedup free of arbitrary indices, same semantics as the
+        # legacy torch.unique path but one kernel launch and sync-free.
+        if free_index.numel() == 0:
+            return
+        if not self.is_not_in_free_group:
+            self.free_group.append(free_index)
+            return
+        if free_index.dtype != torch.int64:
+            free_index = free_index.to(torch.int64)
+        self._cur_epoch += 1
+        n = free_index.numel()
+        BLOCK = 256
+        free_dual_pool_kernel[(triton.cdiv(n, BLOCK),)](
+            free_index,
+            n,
+            self._page_epoch,
+            self._cur_epoch,
+            self._buf,
+            self._cap,
+            self._tail,
+            # SCAN_SWA off: the swa-side args are unused (dead code)
+            self._buf,
+            self._page_epoch,
+            0,
+            self._buf,
+            1,
+            self._tail,
+            page_size=self.page_size,
+            BLOCK=BLOCK,
+            MARK_SELF=True,
+            SCAN_SWA=False,
         )
+        self._mark_freed()
 
     def alloc(self, need_size: int):
         if self.debug_mode:
