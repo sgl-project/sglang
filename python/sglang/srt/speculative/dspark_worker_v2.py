@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import os
 from copy import deepcopy
@@ -41,13 +42,13 @@ from sglang.srt.speculative.dspark_info import (
     DSparkDraftInputV2,
     DSparkVerifyInput,
 )
-from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.speculative.spec_utils import draft_tp_context, spec_stage_span
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.speculative.triton_ops.dspark import (
     _compute_dspark_accept_bonus_triton_unchecked,
 )
 from sglang.srt.utils import is_cuda, is_hip
-from sglang.srt.utils.common import empty_context, is_npu
+from sglang.srt.utils.common import empty_context
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,16 @@ def _env_int(name: str, default: int) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def _get_plan_stream(
+    device: str,
+) -> Tuple[object, contextlib.AbstractContextManager]:
+    if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
+        plan_stream = torch.get_device_module(device).Stream()
+        plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
+        return plan_stream, plan_stream_ctx
+    return None, contextlib.nullcontext()
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -168,6 +179,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._materialize_draft_compressors_enabled = True
         self.draft_attn_backend = None
         self.draft_extend_attn_backend = None
+        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
         self._accept_anomaly_enabled = _env_flag("SGLANG_DSPARK_DEBUG_ACCEPT", True)
         self._accept_anomaly_threshold = max(
             1, _env_int("SGLANG_DSPARK_DEBUG_ACCEPT_THRESHOLD", 8)
@@ -629,13 +641,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         out_cache_loc: torch.Tensor,
         seq_lens: Optional[torch.Tensor] = None,
         req_pool_indices: Optional[torch.Tensor] = None,
-        prefix_lens: Optional[torch.Tensor] = None,
-        extend_lens: Optional[torch.Tensor] = None,
         num_tokens_per_req: int = 1,
         use_draft_extend_v2: bool = False,
     ) -> None:
         if main_hidden.numel() == 0:
             return
+        if not use_draft_extend_v2:
+            raise RuntimeError(
+                "DSpark bootstrap forward only supports DRAFT_EXTEND_V2."
+            )
 
         bs = int(len(seq_lens if seq_lens is not None else batch.seq_lens))
         num_tokens = int(input_ids.numel())
@@ -646,15 +660,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark draft bootstrap hidden/input size mismatch: "
                 f"hidden={tuple(main_hidden.shape)} input_tokens={num_tokens}"
             )
-        if use_draft_extend_v2:
-            if num_tokens % bs != 0:
-                raise RuntimeError(
-                    "DSpark draft-extend-v2 bootstrap requires fixed tokens per "
-                    f"request: num_tokens={num_tokens} bs={bs}"
-                )
-            inferred_tokens_per_req = num_tokens // bs
-            if int(num_tokens_per_req) != inferred_tokens_per_req:
-                num_tokens_per_req = inferred_tokens_per_req
+        if num_tokens % bs != 0:
+            raise RuntimeError(
+                "DSpark draft-extend-v2 bootstrap requires fixed tokens per "
+                f"request: num_tokens={num_tokens} bs={bs}"
+            )
+        inferred_tokens_per_req = num_tokens // bs
+        if int(num_tokens_per_req) != inferred_tokens_per_req:
+            num_tokens_per_req = inferred_tokens_per_req
 
         old_input_ids = batch.input_ids
         old_out_cache_loc = batch.out_cache_loc
@@ -674,27 +687,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 raise RuntimeError(
                     "DSpark draft_extend_attn_backend is not initialized."
                 )
-            batch.input_ids = input_ids.to(device=self.device, dtype=torch.int64)
             batch.out_cache_loc = out_cache_loc.to(device=self.device)
-            batch.spec_info = DSparkDraftExtendInput(
-                hidden_states=main_hidden.to(self.device, non_blocking=True),
-                num_tokens_per_req=num_tokens_per_req,
-                num_tokens_for_logprob_per_req=num_tokens_per_req,
-            )
-            batch.forward_mode = (
-                ForwardMode.DRAFT_EXTEND_V2
-                if use_draft_extend_v2
-                else (
-                    ForwardMode.IDLE
-                    if old_forward_mode.is_idle()
-                    else (
-                        ForwardMode.EXTEND
-                        if prefix_lens is not None or extend_lens is not None
-                        else ForwardMode.DECODE
-                    )
-                )
-            )
-            batch.capture_hidden_mode = CaptureHiddenMode.NULL
             if seq_lens is not None:
                 batch.seq_lens = seq_lens.to(
                     device=self.device, dtype=old_seq_lens.dtype
@@ -705,53 +698,37 @@ class DSparkWorkerV2(BaseSpecWorker):
                 batch.req_pool_indices = req_pool_indices.to(
                     device=self.device, dtype=old_req_pool_indices.dtype
                 )
-            if use_draft_extend_v2:
-                batch.prefix_lens = batch.seq_lens_cpu.tolist()
-                batch.extend_lens = [int(num_tokens_per_req)] * bs
-                batch.extend_num_tokens = num_tokens
-            elif prefix_lens is not None or extend_lens is not None:
-                if prefix_lens is None or extend_lens is None:
-                    raise RuntimeError(
-                        "DSpark prefill bootstrap requires both prefix_lens and "
-                        "extend_lens."
-                    )
-                prefix_lens = prefix_lens.to(device=self.device, dtype=torch.int32)
-                extend_lens = extend_lens.to(device=self.device, dtype=torch.int32)
-                batch.prefix_lens = prefix_lens.detach().cpu().tolist()
-                batch.extend_lens = extend_lens.detach().cpu().tolist()
-                batch.extend_num_tokens = int(num_tokens)
 
-            forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
-            forward_batch.return_logprob = False
-            forward_batch.lora_ids = [None] * forward_batch.batch_size
-            if use_draft_extend_v2:
-                forward_batch.seq_lens = forward_batch.seq_lens + int(
-                    num_tokens_per_req
-                )
-                forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + int(
-                    num_tokens_per_req
-                )
-                forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
-
+            draft_extend_input = DSparkDraftExtendInput(
+                hidden_states=main_hidden.to(self.device, non_blocking=True),
+                positions=positions.to(device=self.device),
+                num_tokens_per_req=num_tokens_per_req,
+                num_tokens_for_logprob_per_req=num_tokens_per_req,
+            )
+            predict = input_ids.to(device=self.device, dtype=torch.int64)
+            self.draft_model_runner.attn_backend = self.draft_extend_attn_backend
             with (
                 self.draft_tp_context(self.draft_model_runner.tp_group),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft_extend"),
                 torch.inference_mode(),
             ):
-                self.draft_model_runner.attn_backend = self.draft_extend_attn_backend
-                if (
-                    not forward_batch.forward_mode.is_idle()
-                    and (
-                        forward_batch.forward_mode.is_draft_extend_v2()
-                        or forward_batch.forward_mode.is_extend()
+                with self.plan_stream_ctx:
+                    forward_batch = self.prepare_for_draft_extend(
+                        draft_extend_input,
+                        batch,
+                        predict,
+                        int(num_tokens_per_req),
+                        self.draft_model_runner,
+                        None,
                     )
-                ):
-                    self.draft_model_runner.attn_backend.init_forward_metadata(
-                        forward_batch
+                forward_batch.return_logprob = False
+                forward_batch.lora_ids = [None] * forward_batch.batch_size
+                if self.plan_stream:
+                    torch.get_device_module(self.device).current_stream().wait_stream(
+                        self.plan_stream
                     )
-                    if not is_npu():
-                        forward_batch.mark_forward_metadata_ready()
                 self.draft_model_runner.forward(forward_batch)
         finally:
             batch.input_ids = old_input_ids
@@ -1617,43 +1594,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         if bs > 0:
             hidden = hidden.view(bs, block_size, -1)
             hidden_flat = hidden.reshape(-1, hidden.shape[-1])
-            commit_mask = (
-                self._block_pos_offsets.unsqueeze(0)
-                < commit_lens.unsqueeze(1).to(torch.int64)
-            ).reshape(-1)
-            used_bootstrap_forward = False
-            try:
-                self._run_draft_bootstrap_forward(
-                    batch=model_worker_batch,
-                    main_hidden=hidden_flat,
-                    input_ids=candidates.reshape(-1),
-                    positions=positions,
-                    out_cache_loc=verify_out_cache_loc,
-                    seq_lens=prefix_lens,
-                    num_tokens_per_req=block_size,
-                    use_draft_extend_v2=True,
-                )
-                used_bootstrap_forward = True
-            except Exception as e:
-                logger.warning(
-                    "DSpark decode draft-extend bootstrap failed; "
-                    "falling back to materialization: %s",
-                    e,
-                )
-
+            self._run_draft_bootstrap_forward(
+                batch=model_worker_batch,
+                main_hidden=hidden_flat,
+                input_ids=candidates.reshape(-1),
+                positions=positions,
+                out_cache_loc=verify_out_cache_loc,
+                seq_lens=prefix_lens,
+                num_tokens_per_req=block_size,
+                use_draft_extend_v2=True,
+            )
             self._clear_unaccepted_c128_draft_states(
                 batch=model_worker_batch,
                 prefix_lens=prefix_lens,
                 commit_lens=commit_lens,
             )
-            if not used_bootstrap_forward:
-                self._materialize_main_hidden_to_draft_state(
-                    main_hidden=hidden_flat,
-                    cache_loc=verify_out_cache_loc[commit_mask],
-                    positions=positions[commit_mask],
-                    draft_forward_batch=draft_forward_batch,
-                    kv_main_hidden=hidden_flat[commit_mask],
-                )
 
         logits_output.hidden_states = None
 

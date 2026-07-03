@@ -200,6 +200,7 @@ class DSparkVerifyInput(_DSparkBlockInputBase):
 @dataclass
 class DSparkDraftExtendInput(SpecInput):
     hidden_states: torch.Tensor
+    positions: Optional[torch.Tensor] = None
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
 
