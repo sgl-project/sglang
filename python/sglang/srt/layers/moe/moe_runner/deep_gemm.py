@@ -38,8 +38,8 @@ if TYPE_CHECKING:
         DeepEPNormalDispatchOutput,
     )
     from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import (
-        DeepEPV2CombineInput,
-        DeepEPV2DispatchOutput,
+        DeepEPv2CombineInput,
+        DeepEPv2DispatchOutput,
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
@@ -959,7 +959,7 @@ def _apply_swiglu_limit(
 
 @register_pre_permute("deepep_v2", "deep_gemm")
 def pre_permute_deepep_v2_to_deep_gemm(
-    dispatch_output: DeepEPV2DispatchOutput,
+    dispatch_output: DeepEPv2DispatchOutput,
     quant_info: DeepGemmMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
@@ -1140,9 +1140,9 @@ def post_permute_deep_gemm_to_deepep_v2(
     quant_info: DeepGemmMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
-) -> DeepEPV2CombineInput:
+) -> DeepEPv2CombineInput:
     from sglang.srt.layers.moe.ep_moe.kernels import ep_gather
-    from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPV2CombineInput
+    from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2CombineInput
 
     if running_state.get("deepep_v2_expanded", False):
         hidden_states = runner_output.hidden_states
@@ -1159,7 +1159,7 @@ def post_permute_deep_gemm_to_deepep_v2(
                 running_state["deepep_v2_expert_alignment"],
                 topk_weights=topk_weights,
             )
-            return DeepEPV2CombineInput(hidden_states, None, None)
+            return DeepEPv2CombineInput(hidden_states, None, None)
         if topk_weights is not None:
             # Expanded combine does not consume top-k weights, so apply them to
             # each expert slot before combine. Keep this out-of-place until the
@@ -1167,7 +1167,7 @@ def post_permute_deep_gemm_to_deepep_v2(
             hidden_states = hidden_states * topk_weights.to(
                 hidden_states.dtype
             ).unsqueeze(-1)
-        return DeepEPV2CombineInput(hidden_states, None, None)
+        return DeepEPv2CombineInput(hidden_states, None, None)
 
     hidden_states = runner_output.hidden_states
     topk_ids = running_state["topk_ids"]
@@ -1179,7 +1179,7 @@ def post_permute_deep_gemm_to_deepep_v2(
         dtype=torch.bfloat16,
     )
     ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out)
-    return DeepEPV2CombineInput(
+    return DeepEPv2CombineInput(
         hidden_states=gather_out,
         topk_ids=topk_ids,
         topk_weights=topk_weights,

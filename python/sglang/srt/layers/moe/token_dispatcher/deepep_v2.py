@@ -19,8 +19,8 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
-    DeepEPV2OutputDtype,
-    DeepEPV2RunnerCapability,
+    DeepEPv2OutputDtype,
+    DeepEPv2RunnerCapability,
     get_deepep_v2_runner_capability,
 )
 
@@ -48,7 +48,7 @@ if use_deepep_v2:
         _fp8_quant_import_error = exc
 
 
-class DeepEPV2DispatchOutput(NamedTuple):
+class DeepEPv2DispatchOutput(NamedTuple):
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
     topk_ids: Optional[torch.Tensor]
@@ -68,7 +68,7 @@ class DeepEPV2DispatchOutput(NamedTuple):
         return DispatchOutputFormat.DEEPEP_V2
 
 
-class DeepEPV2CombineInput(NamedTuple):
+class DeepEPv2CombineInput(NamedTuple):
     hidden_states: torch.Tensor
     topk_ids: Optional[torch.Tensor]
     topk_weights: Optional[torch.Tensor]
@@ -78,8 +78,8 @@ class DeepEPV2CombineInput(NamedTuple):
         return CombineInputFormat.DEEPEP_V2
 
 
-assert isinstance(DeepEPV2DispatchOutput, DispatchOutput)
-assert isinstance(DeepEPV2CombineInput, CombineInput)
+assert isinstance(DeepEPv2DispatchOutput, DispatchOutput)
+assert isinstance(DeepEPv2CombineInput, CombineInput)
 
 
 def _raise_deepep_v2_import_error() -> None:
@@ -129,7 +129,7 @@ def _get_allow_hybrid_mode() -> bool:
 
 
 def _quantize_for_deepep_v2_dispatch(
-    hidden_states: torch.Tensor, capability: DeepEPV2RunnerCapability
+    hidden_states: torch.Tensor, capability: DeepEPv2RunnerCapability
 ):
     _ensure_fp8_quant_available()
     return sglang_per_token_group_quant_fp8(
@@ -141,7 +141,7 @@ def _quantize_for_deepep_v2_dispatch(
     )
 
 
-class DeepEPV2Buffer:
+class DeepEPv2Buffer:
     _buffer: Optional[ElasticBuffer] = None
     _buffer_key: Optional[Tuple] = None
 
@@ -212,7 +212,7 @@ class DeepEPV2Buffer:
         cls._buffer_key = None
 
 
-class _DeepEPV2Impl:
+class _DeepEPv2Impl:
     def __init__(
         self,
         group: dist.ProcessGroup,
@@ -220,7 +220,7 @@ class _DeepEPV2Impl:
         num_experts: int,
         num_local_experts: int,
         hidden_size: int,
-        capability: DeepEPV2RunnerCapability,
+        capability: DeepEPv2RunnerCapability,
         num_max_dispatch_tokens_per_rank: int,
     ):
         self.group = group
@@ -233,19 +233,19 @@ class _DeepEPV2Impl:
         self.rank = dist.get_rank(group)
         self._handle = None
 
-    def set_runner_capability(self, capability: DeepEPV2RunnerCapability) -> None:
+    def set_runner_capability(self, capability: DeepEPv2RunnerCapability) -> None:
         if self.capability != capability:
             self._destroy_handle()
             self.capability = capability
 
     def _uses_fp8_dispatch_output(self) -> bool:
-        return self.capability.output_dtype == DeepEPV2OutputDtype.FP8
+        return self.capability.output_dtype == DeepEPv2OutputDtype.FP8
 
     def _destroy_handle(self) -> None:
         self._handle = None
 
     def _get_buffer(self) -> ElasticBuffer:
-        return DeepEPV2Buffer.get_buffer(
+        return DeepEPv2Buffer.get_buffer(
             self.group,
             self.hidden_size,
             self.router_topk,
@@ -484,7 +484,7 @@ class _DeepEPV2Impl:
             masked_max_m = self.num_max_dispatch_tokens_per_rank * ep_group_size
             total_expanded = recv_hidden_states.shape[0]
 
-        return DeepEPV2DispatchOutput(
+        return DeepEPv2DispatchOutput(
             recv_hidden_states,
             recv_hidden_states_scale,
             local_topk_ids,
@@ -505,7 +505,7 @@ class _DeepEPV2Impl:
         # pre-split path; non-TBO callers use this).
         return self.dispatch_b(*self.dispatch_a(hidden_states, topk_output))
 
-    def combine_a(self, combine_input: DeepEPV2CombineInput):
+    def combine_a(self, combine_input: DeepEPv2CombineInput):
         if self._handle is None:
             raise RuntimeError(
                 "DeepEP v2 combine called without a valid dispatch handle"
@@ -541,7 +541,7 @@ class _DeepEPV2Impl:
             self._pad_empty_combine = False
             self._destroy_handle()
 
-    def combine(self, combine_input: DeepEPV2CombineInput) -> torch.Tensor:
+    def combine(self, combine_input: DeepEPv2CombineInput) -> torch.Tensor:
         return self.combine_b(*self.combine_a(combine_input))
 
 
@@ -550,7 +550,7 @@ class _Stage(Enum):
     AFTER_DISPATCH = auto()
 
 
-class DeepEPV2Dispatcher(BaseDispatcher):
+class DeepEPv2Dispatcher(BaseDispatcher):
     def __init__(
         self,
         group: dist.ProcessGroup,
@@ -572,7 +572,7 @@ class DeepEPV2Dispatcher(BaseDispatcher):
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
-        self._impl = _DeepEPV2Impl(
+        self._impl = _DeepEPv2Impl(
             group=group,
             router_topk=router_topk,
             num_experts=num_experts,

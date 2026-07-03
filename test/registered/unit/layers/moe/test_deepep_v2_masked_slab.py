@@ -63,7 +63,7 @@ def _real_rows(starts, counts):
     return rows
 
 
-class TestEpv2MaskedSlab(CustomTestCase):
+class TestDeepEPv2MaskedSlab(CustomTestCase):
     ALIGN = 16
     HIDDEN = 8
     MAX_M = 32

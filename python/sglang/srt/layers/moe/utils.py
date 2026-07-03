@@ -148,7 +148,7 @@ class MoeRunnerBackend(Enum):
         return self == MoeRunnerBackend.AITER
 
 
-class DeepEPV2OutputDtype(Enum):
+class DeepEPv2OutputDtype(Enum):
     """
     Describes the dispatch output data type for DeepEP v2.
 
@@ -160,7 +160,7 @@ class DeepEPV2OutputDtype(Enum):
     FP8 = "fp8"
 
 
-class DeepEPV2RunnerCapability(NamedTuple):
+class DeepEPv2RunnerCapability(NamedTuple):
     """
     Describes the DeepEP v2 dispatcher contract required by the active MoE runner.
 
@@ -170,7 +170,7 @@ class DeepEPV2RunnerCapability(NamedTuple):
     does not peek at runner implementation details itself.
     """
 
-    output_dtype: DeepEPV2OutputDtype
+    output_dtype: DeepEPv2OutputDtype
     expert_alignment: int
     fp8_scale_tma_aligned: bool = False
     fp8_scale_ue8m0: bool = False
@@ -278,7 +278,7 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
     return DeepEPOutputDtype.FP8
 
 
-def get_deepep_v2_output_dtype(self) -> DeepEPV2OutputDtype:
+def get_deepep_v2_output_dtype(self) -> DeepEPv2OutputDtype:
     """
     Automatically choose the dispatch output dtype for DeepEP v2.
 
@@ -291,18 +291,18 @@ def get_deepep_v2_output_dtype(self) -> DeepEPV2OutputDtype:
 
     server_args = get_global_server_args()
     if server_args and server_args.deepep_v2_dispatcher_output_dtype != "auto":
-        return DeepEPV2OutputDtype(server_args.deepep_v2_dispatcher_output_dtype)
+        return DeepEPv2OutputDtype(server_args.deepep_v2_dispatcher_output_dtype)
 
     if getattr(self, "quant_config", None) is not None:
         dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
         if dispatcher_output_dtype is not None:
-            return DeepEPV2OutputDtype(dispatcher_output_dtype)
+            return DeepEPv2OutputDtype(dispatcher_output_dtype)
 
     runner_backend = get_moe_runner_backend()
     if runner_backend.is_deep_gemm():
-        return DeepEPV2OutputDtype.FP8
+        return DeepEPv2OutputDtype.FP8
     if runner_backend.is_triton():
-        return DeepEPV2OutputDtype.BF16
+        return DeepEPv2OutputDtype.BF16
 
     raise ValueError(
         "DeepEP v2 auto dispatcher output dtype only supports deep_gemm and triton "
@@ -312,10 +312,10 @@ def get_deepep_v2_output_dtype(self) -> DeepEPV2OutputDtype:
     )
 
 
-def get_deepep_v2_runner_capability(self) -> DeepEPV2RunnerCapability:
+def get_deepep_v2_runner_capability(self) -> DeepEPv2RunnerCapability:
     output_dtype = get_deepep_v2_output_dtype(self)
     runner_backend = get_moe_runner_backend()
-    if output_dtype == DeepEPV2OutputDtype.FP8:
+    if output_dtype == DeepEPv2OutputDtype.FP8:
         if not runner_backend.is_deep_gemm():
             raise ValueError(
                 "DeepEP v2 FP8 dispatch output currently requires "
@@ -328,7 +328,7 @@ def get_deepep_v2_runner_capability(self) -> DeepEPV2RunnerCapability:
         # native expanded layout so the dispatcher copy epilogue writes one
         # row per local expert slot, avoiding an extra SGLang scatter/gather
         # adapter round-trip on the decode path.
-        return DeepEPV2RunnerCapability(
+        return DeepEPv2RunnerCapability(
             output_dtype=output_dtype,
             expert_alignment=128,
             fp8_scale_tma_aligned=(
@@ -343,7 +343,7 @@ def get_deepep_v2_runner_capability(self) -> DeepEPV2RunnerCapability:
             "DeepEP v2 BF16 dispatch output currently requires "
             f"--moe-runner-backend triton. Got {runner_backend.value}."
         )
-    return DeepEPV2RunnerCapability(output_dtype=output_dtype, expert_alignment=1)
+    return DeepEPv2RunnerCapability(output_dtype=output_dtype, expert_alignment=1)
 
 
 MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None

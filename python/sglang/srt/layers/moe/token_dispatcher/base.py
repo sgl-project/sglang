@@ -25,8 +25,8 @@ if TYPE_CHECKING:
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
-        DeepEPV2CombineInput,
-        DeepEPV2DispatchOutput,
+        DeepEPv2CombineInput,
+        DeepEPv2DispatchOutput,
         FlashinferCombineInput,
         FlashinferDispatchOutput,
         StandardCombineInput,
@@ -162,7 +162,7 @@ class DispatchOutputChecker:
     @staticmethod
     def format_is_deepep_v2(
         dispatch_output: DispatchOutput,
-    ) -> TypeGuard[DeepEPV2DispatchOutput]:
+    ) -> TypeGuard[DeepEPv2DispatchOutput]:
         return dispatch_output.format.is_deepep_v2()
 
 
@@ -246,7 +246,7 @@ class CombineInputChecker:
     @staticmethod
     def format_is_deepep_v2(
         combine_input: CombineInput,
-    ) -> TypeGuard[DeepEPV2CombineInput]:
+    ) -> TypeGuard[DeepEPv2CombineInput]:
         return combine_input.format == CombineInputFormat.DEEPEP_V2
 
 

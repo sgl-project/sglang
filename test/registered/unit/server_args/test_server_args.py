@@ -1336,7 +1336,7 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         self.assertEqual(parsed.sampling_backend, "token_oracle")
 
 
-class TestDeepEPV2Args(CustomTestCase):
+class TestDeepEPv2Args(CustomTestCase):
     """DeepEP v2 server-args resolution + validation. The dummy-model path
     short-circuits __post_init__, so _handle_a2a_moe() is invoked directly."""
 
