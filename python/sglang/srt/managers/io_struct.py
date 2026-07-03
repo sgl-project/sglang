@@ -1331,13 +1331,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
     # DP rank of the scheduler that processed each request
-<<<<<<< HEAD
-    dp_ranks: Optional[List[int]] = None
+    dp_ranks: Optional[List[Optional[int]]] = None
     # PD disaggregation: prefill-side radix cache prefix length
     disagg_prefill_prefix_len: Optional[List[int]] = None
-=======
-    dp_ranks: Optional[List[Optional[int]]] = None
->>>>>>> main
 
     # For observability
     # Pickled Optional[List[SchedulerReqTimeStats]]

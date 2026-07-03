@@ -6897,7 +6897,6 @@ class ServerArgs:
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
-<<<<<<< HEAD
             help="Enable fused qk normalization and rope rotary embedding.",
         )
         parser.add_argument(
@@ -7260,10 +7259,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.msprobe_dump_config,
             help="The path of the JSON configuration file for msProbe. If specified, enables msProbe dump.",
-=======
-            help="(Deprecated: use --flashinfer-allreduce-fusion-backend=auto) "
-            "Enable FlashInfer allreduce fusion with Residual RMSNorm.",
->>>>>>> main
         )
 
     @classmethod
