@@ -812,28 +812,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
 
         seq_lens_before = (prefix_lens[valid].to(torch.int64) - 1).clamp_min(0)
-        try:
-            self._run_draft_bootstrap_forward(
-                batch=batch,
-                main_hidden=hidden[valid],
-                input_ids=torch.zeros(
-                    (int(valid.sum().item()),),
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-                positions=positions[valid],
-                out_cache_loc=cache_loc[valid],
-                seq_lens=seq_lens_before,
-                req_pool_indices=batch.req_pool_indices[valid],
-            )
-            return
-        except Exception as e:
-            logger.warning(
-                "DSpark PD draft bootstrap forward failed; "
-                "falling back to materialization: %s",
-                e,
-            )
-
         draft_forward_batch = self._make_draft_decode_forward_batch_for_materialize(
             batch=batch,
             seq_lens_before=seq_lens_before,
@@ -1405,34 +1383,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(extend_lens)),
         )
-        try:
-            self._run_draft_bootstrap_forward(
-                batch=model_worker_batch,
-                main_hidden=logits_output.hidden_states,
-                input_ids=model_worker_batch.input_ids,
-                positions=positions,
-                out_cache_loc=model_worker_batch.out_cache_loc,
-                prefix_lens=draft_seq_lens,
-                extend_lens=ctx_lens,
-            )
-        except Exception as e:
-            logger.warning(
-                "DSpark prefill draft bootstrap forward failed; "
-                "falling back to materialization: %s",
-                e,
-            )
-        else:
-            logits_output.hidden_states = None
-
-            batch_output.next_draft_input = self._make_next_draft_input_prefill(
-                bonus_tokens=next_token_ids,
-                seq_lens=model_worker_batch.seq_lens,
-                cur_allocated_seq_lens_cpu=model_worker_batch.seq_lens_cpu,
-            )
-            verify_done = torch.get_device_module(device).Event()
-            verify_done.record()
-            batch_output.next_draft_input.verify_done = verify_done
-            return batch_output
 
         draft_forward_batch = self._make_draft_prefill_forward_batch_for_materialize(
             model_worker_batch
