@@ -509,7 +509,7 @@ print(response.choices[0].message.content)
 
 ## DSpark Decoding (DeepSeek-V4)
 
-**DSpark** is a block drafter for DeepSeek-V4. The DSpark checkpoints (`deepseek-ai/DeepSeek-V4-Flash-DSpark`, `deepseek-ai/DeepSeek-V4-Pro-DSpark`) ship the speculative module inside the model under the `mtp.*` namespace, so there is no separate draft model to download. Each decode step DSpark proposes a block of `block_size` tokens (default 5) in one draft forward and the target verifies the whole block in one pass. The drafter is a three-stage MTP stack with a Markov head that refines the block autoregressively and a confidence head that scores each position; it runs off the target's fused hidden states rather than its own token KV. At `temperature 0`, verification is greedy and lossless: the accepted output matches the target's greedy decoding for any block size or confidence threshold. At `temperature > 0`, the block is verified with target-only speculative sampling, which preserves the target's sampling distribution without needing the draft's probabilities.
+**DSpark** is a block drafter for DeepSeek-V4. The DSpark checkpoints (`deepseek-ai/DeepSeek-V4-Flash-DSpark`, `deepseek-ai/DeepSeek-V4-Pro-DSpark`) ship the speculative module inside the model under the `mtp.*` namespace, so there is no separate draft model to download. Each decode step DSpark proposes a block of `block_size` tokens (inferred from the checkpoint, 5 by default) in one draft forward and the target verifies the whole block in one pass. The drafter is a three-stage MTP stack with a Markov head that refines the block autoregressively and a confidence head that scores each position; it runs off the target's fused hidden states rather than its own token KV. At `temperature 0`, verification is greedy and lossless: the accepted output matches the target's greedy decoding for any block size or confidence threshold. At `temperature > 0`, the block is verified with target-only speculative sampling, which preserves the target's sampling distribution without needing the draft's probabilities.
 
 `--speculative-algorithm DSPARK` is enough; the draft path defaults to the target checkpoint, and `--speculative-eagle-topk 1` / `--speculative-num-steps 1` are pinned automatically.
 
@@ -532,7 +532,7 @@ Relevant parameters:
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-dspark-block-size</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Draft block length (tokens proposed per step). Alias of <code>--speculative-num-draft-tokens</code> for DSpark.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>5</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code> (inferred from the draft checkpoint config, otherwise <code>5</code>)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-dspark-confidence-threshold</code></td>
