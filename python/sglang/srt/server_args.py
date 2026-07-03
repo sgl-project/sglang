@@ -63,12 +63,10 @@ from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
-    cpu_has_amx_support,
     get_device,
     get_device_memory_capacity,
     get_device_sm,
     get_int_env_var,
-    get_nvidia_driver_version,
     get_quantization_config,
     has_fp8_weights_in_checkpoint,
     human_readable_int,
@@ -87,7 +85,6 @@ from sglang.srt.utils.common import (
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
-    is_triton_kernels_available,
     is_xpu,
     json_list_type,
     nullable_str,
@@ -576,7 +573,11 @@ class ServerArgs:
     ] = "auto"
     quantization: A[
         Optional[str],
-        Arg(help="The quantization method.", choices=QUANTIZATION_CHOICES),
+        Arg(
+            help="The quantization method.",
+            choices=QUANTIZATION_CHOICES,
+            model_overridable=True,
+        ),
     ] = None
     quantization_param_path: A[
         Optional[str],
@@ -1721,6 +1722,7 @@ class ServerArgs:
         Arg(
             help="Choose the runner backend for MoE.",
             choices=MOE_RUNNER_BACKEND_CHOICES,
+            model_overridable=True,
         ),
     ] = "auto"
     flashinfer_mxfp4_moe_precision: A[
@@ -4099,65 +4101,8 @@ class ServerArgs:
             # The mxfp4 dtype override moved to the R0 registry
             # (arg_groups/overrides.py: _gpt_oss_overrides).
 
-            if self.moe_runner_backend == "auto":
-                if is_sm100_supported() and is_mxfp4_quant_format:
-                    self.moe_runner_backend = "flashinfer_mxfp4"
-                    logger.warning(
-                        "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
-                    )
-                elif is_sm120_supported() and is_mxfp4_quant_format:
-                    # trtllm-gen only supports SM100
-                    self.moe_runner_backend = "marlin"
-                    logger.warning(
-                        "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling Marlin MOE kernel."
-                    )
-                elif (
-                    is_hip() and envs.SGLANG_USE_AITER.get()
-                ) and is_mxfp4_quant_format:
-                    self.moe_runner_backend = "auto"
-                    logger.warning(
-                        "Detected ROCm and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
-                    )
-                    ## The AITER MXFP4 fused-MoE path for GPT-OSS expects the
-                    ## SEPARATED gate/up tile layout (matches the
-                    ## `gptoss_fp4_tuned_fmoe.csv` flydsl entries and the
-                    ## Mxfp4MoEMethod weight shuffle). Other AITER MXFP4
-                    ## callers default to INTERLEAVE; opt this path out
-                    ## unless the user explicitly overrode it.
-                    # envs.SGLANG_USE_AITER_MOE_GU_ITLV.set(False)
-                elif is_hip() and envs.SGLANG_USE_AITER.get():
-                    # For GPT-OSS bf16 on ROCm with aiter, use triton backend
-                    # because aiter CK kernel doesn't support all GEMM dimensions
-                    self.moe_runner_backend = "triton"
-                    logger.warning(
-                        "Detected ROCm with SGLANG_USE_AITER for GPT-OSS bf16 model, using triton MOE kernel."
-                    )
-                elif is_musa() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
-                    self.moe_runner_backend = "deep_gemm"
-                    logger.warning(
-                        "Detected MUSA with SGLANG_DEEPEP_BF16_DISPATCH for bf16 model, using deep_gemm kernel."
-                    )
-                elif (
-                    self.ep_size == 1
-                    and is_triton_kernels_available()
-                    and self.quantization is None
-                    and not (is_cpu() and cpu_has_amx_support())
-                ):
-                    # The triton_kernels package segfaults on Blackwell (B200)
-                    # with NVIDIA driver >= 595. Fall back to triton backend.
-                    if is_blackwell_supported() and get_nvidia_driver_version() >= (
-                        595,
-                    ):
-                        self.moe_runner_backend = "triton"
-                        logger.warning(
-                            "Detected GPT-OSS model on Blackwell with driver >= 595, "
-                            "using triton MOE kernel to avoid triton_kernels SIGSEGV."
-                        )
-                    else:
-                        self.moe_runner_backend = "triton_kernel"
-                        logger.warning(
-                            "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
-                        )
+            # The moe_runner_backend selection moved to the R0 registry
+            # (arg_groups/overrides.py: _gpt_oss_overrides).
 
             if self.moe_runner_backend == "triton_kernel":
                 assert (
@@ -4224,12 +4169,8 @@ class ServerArgs:
                 "trtllm_mha",
                 "intel_xpu",
             }, f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
-            if is_sm100_supported() and self.moe_runner_backend == "auto":
-                if self.quantization in {"fp8", "modelopt_fp8"}:
-                    self.moe_runner_backend = "flashinfer_trtllm"
-                    logger.info(
-                        "Use flashinfer_trtllm as MoE runner backend on SM100 for Llama4"
-                    )
+            # The moe_runner_backend selection moved to the R0 registry
+            # (arg_groups/overrides.py: _llama4_overrides).
         # Gemma2/Gemma3 (disable_hybrid_swa_memory) moved to the R0 registry
         # (arg_groups/overrides.py: _gemma2_gemma3_overrides).
         elif model_arch in (
@@ -4249,14 +4190,8 @@ class ServerArgs:
                 f"got prefill={prefill_backend}, decode={decode_backend}"
             )
 
-            if is_sm100_supported() and self.moe_runner_backend == "auto":
-                if self.get_model_config().quantization == "modelopt_fp4":
-                    self.quantization = "modelopt_fp4"
-                    self.moe_runner_backend = "flashinfer_trtllm"
-                    logger.info(
-                        "Use flashinfer_trtllm as MoE runner backend on "
-                        "SM100 for Gemma-4 (modelopt_fp4)"
-                    )
+            # The quantization/moe_runner_backend resolution moved to the R0
+            # registry (arg_groups/overrides.py: _gemma4_overrides).
         elif model_arch == "MossVLForConditionalGeneration":
             if self.is_attention_backend_not_set():
                 self.prefill_attention_backend = "flashinfer"
@@ -4309,27 +4244,8 @@ class ServerArgs:
             "InternS2PreviewForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
         ]:
-            if is_sm100_supported():
-                quant_method = get_quantization_config(hf_config)
-                if (
-                    self.quantization is None
-                    and not self._quantization_explicitly_unset
-                    and quant_method is not None
-                ):
-                    self.quantization = quant_method
-                if (
-                    (
-                        self.quantization in ("fp8", "modelopt_fp4")
-                        or self.quantization is None
-                    )
-                    and self.moe_a2a_backend == "none"
-                    and self.moe_runner_backend == "auto"
-                ):
-                    self.moe_runner_backend = "flashinfer_trtllm"
-                    logger.info(
-                        "Use flashinfer_trtllm as MoE runner backend on sm100 for "
-                        f"{model_arch}"
-                    )
+            # The quantization/moe_runner_backend resolution moved to the R0
+            # registry (arg_groups/overrides.py: _qwen3_moe_family_overrides).
 
             if model_arch in [
                 "Qwen3NextForCausalLM",
@@ -4349,30 +4265,10 @@ class ServerArgs:
             self._handle_mamba_radix_cache(model_arch=model_arch)
 
         elif model_arch in ["Glm4MoeForCausalLM"]:
-            if is_sm100_supported():
-                quantization_config = getattr(hf_config, "quantization_config", None)
-                quant_method = (
-                    quantization_config.get("quant_method")
-                    if quantization_config is not None
-                    else None
-                )
-                if (
-                    self.quantization is None
-                    and not self._quantization_explicitly_unset
-                    and quant_method is not None
-                ):
-                    self.quantization = quant_method
-                if (
-                    self.quantization in {"modelopt_fp4", None}
-                    and self.moe_a2a_backend == "none"
-                    and self.moe_runner_backend == "auto"
-                ):
-                    self.moe_runner_backend = "flashinfer_trtllm"
-                    logger.info(
-                        "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
-                    )
-            # enable_tf32_matmul moved to the R0 registry
-            # (arg_groups/overrides.py: _glm4_moe_overrides).
+            # The quantization/moe_runner_backend/enable_tf32_matmul resolution
+            # moved to the R0 registry (arg_groups/overrides.py:
+            # _glm4_moe_overrides).
+            pass
 
         elif model_arch in [
             "FalconH1ForCausalLM",
@@ -5187,48 +5083,16 @@ class ServerArgs:
             ), "Please enable dp attention when setting enable_dp_lm_head. "
 
     def _handle_moe_kernel_config(self):
-        if self.quantization == "nvfp4_online":
-            if not is_sm100_supported():
-                raise ValueError(
-                    "--quantization nvfp4_online is supported only on "
-                    "NVIDIA Blackwell SM100/SM103 GPUs."
-                )
-            if self.moe_runner_backend == "auto":
-                self.moe_runner_backend = "flashinfer_trtllm"
-            elif self.moe_runner_backend not in [
-                "flashinfer_trtllm",
-                "flashinfer_trtllm_routed",
-            ]:
-                raise ValueError(
-                    "--quantization nvfp4_online supports only "
-                    "--moe-runner-backend flashinfer_trtllm or "
-                    "flashinfer_trtllm_routed."
-                )
-        if self.quantization == "mxfp8":
-            if self.moe_runner_backend == "auto":
-                self.moe_runner_backend = "flashinfer_trtllm"
-            elif self.moe_runner_backend not in [
-                "cutlass",
-                "flashinfer_trtllm",
-                "flashinfer_trtllm_routed",
-            ]:
-                logger.warning(
-                    "mxfp8 quantization supports only cutlass, flashinfer_trtllm, "
-                    "or flashinfer_trtllm_routed backends. "
-                    f"Overriding {self.moe_runner_backend!r}."
-                )
-                self.moe_runner_backend = "flashinfer_trtllm"
+        # The quantization-driven runner resolutions moved to the pipeline
+        # (arg_groups/overrides.py: _moe_runner_backend_quant_constraints);
+        # the compatibility asserts and fusion writes stay below.
+        from sglang.srt.arg_groups.overrides import (
+            _cutlass_moe_env_override,
+            _moe_runner_backend_quant_constraints,
+            run_post_process_pass,
+        )
 
-        if (
-            self.moe_runner_backend == "auto"
-            and self.quantization == "modelopt_fp4"
-            and is_sm120_supported()
-        ):
-            self.moe_runner_backend = "flashinfer_cutlass"
-            logger.info(
-                "Use flashinfer_cutlass as MoE runner backend on SM120 for "
-                "modelopt_fp4 (trtllm-gen MoE kernels are SM100-only)"
-            )
+        run_post_process_pass(self, _moe_runner_backend_quant_constraints)
 
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
@@ -5293,15 +5157,11 @@ class ServerArgs:
                 "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
-        if envs.SGLANG_CUTLASS_MOE.get():
-            logger.warning(
-                "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass and/or --speculative-moe-runner-backend=cutlass instead"
-            )
-            assert self.quantization in [
-                "fp8",
-                "mxfp8",
-            ], "cutlass MoE is only supported with fp8/mxfp8 quantization"
-            self.moe_runner_backend = "cutlass"
+        # The deprecated SGLANG_CUTLASS_MOE override moved to the pipeline
+        # (arg_groups/overrides.py: _cutlass_moe_env_override). It sits after
+        # the fusion blocks above on purpose: they must observe the
+        # pre-override runner value, exactly as they did imperatively.
+        run_post_process_pass(self, _cutlass_moe_env_override)
         if self.moe_runner_backend == "cutlass" and self.quantization in [
             "fp8",
             "mxfp8",
@@ -5751,10 +5611,19 @@ class ServerArgs:
         )
 
     def _handle_load_format(self):
+        # The quantization side of the gguf coupling moved to the pipeline
+        # (arg_groups/overrides.py: _gguf_quantization); load_format itself is
+        # genuine config (runtime user updates write it) and stays imperative.
+        from sglang.srt.arg_groups.overrides import (
+            _gguf_quantization,
+            run_post_process_pass,
+        )
+
+        run_post_process_pass(self, _gguf_quantization)
         if (
             self.load_format == "auto" or self.load_format == "gguf"
         ) and check_gguf_file(self.model_path):
-            self.quantization = self.load_format = "gguf"
+            self.load_format = "gguf"
 
         if self.load_format == "auto" and self._is_mistral_native_format():
             self.load_format = "mistral"

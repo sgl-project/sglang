@@ -70,6 +70,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "sampling_backend",
                     "attention_backend",
                     "page_size",
+                    "moe_runner_backend",
+                    "quantization",
                 }
             ),
         )
@@ -841,6 +843,88 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     _qwen3vl_overrides(SimpleNamespace(page_size=64), None), {}
                 )
 
+    def test_moe_runner_quant_constraint_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _moe_runner_backend_quant_constraints,
+        )
+
+        def _view(**kw):
+            defaults = dict(quantization=None, moe_runner_backend="auto")
+            defaults.update(kw)
+            return ResolvedView(SimpleNamespace(**defaults))
+
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            self.assertEqual(
+                _moe_runner_backend_quant_constraints(
+                    _view(quantization="nvfp4_online")
+                ),
+                {"moe_runner_backend": "flashinfer_trtllm"},
+            )
+            with self.assertRaises(ValueError):  # incompatible explicit backend
+                _moe_runner_backend_quant_constraints(
+                    _view(quantization="nvfp4_online", moe_runner_backend="triton")
+                )
+        self.assertEqual(
+            _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
+            {"moe_runner_backend": "flashinfer_trtllm"},
+        )
+        with patch.object(overrides_module, "is_sm120_supported", return_value=True):
+            self.assertEqual(
+                _moe_runner_backend_quant_constraints(
+                    _view(quantization="modelopt_fp4")
+                ),
+                {"moe_runner_backend": "flashinfer_cutlass"},
+            )
+        self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
+
+    def test_cutlass_moe_env_override_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _cutlass_moe_env_override,
+        )
+
+        with patch("sglang.srt.environ.envs.SGLANG_CUTLASS_MOE") as e:
+            e.get.return_value = True
+            self.assertEqual(
+                _cutlass_moe_env_override(
+                    ResolvedView(SimpleNamespace(quantization="fp8"))
+                ),
+                {"moe_runner_backend": "cutlass"},
+            )
+            with self.assertRaises(AssertionError):
+                _cutlass_moe_env_override(
+                    ResolvedView(SimpleNamespace(quantization=None))
+                )
+            e.get.return_value = False
+            self.assertEqual(
+                _cutlass_moe_env_override(ResolvedView(SimpleNamespace())), {}
+            )
+
+    def test_gguf_quantization_pass(self):
+        from sglang.srt.arg_groups.overrides import ResolvedView, _gguf_quantization
+
+        with patch(
+            "sglang.srt.utils.hf_transformers_utils.check_gguf_file",
+            return_value=True,
+        ):
+            self.assertEqual(
+                _gguf_quantization(
+                    ResolvedView(
+                        SimpleNamespace(load_format="auto", model_path="x.gguf")
+                    )
+                ),
+                {"quantization": "gguf"},
+            )
+            self.assertEqual(
+                _gguf_quantization(
+                    ResolvedView(
+                        SimpleNamespace(load_format="safetensors", model_path="x")
+                    )
+                ),
+                {},
+            )
+
     def test_page_constraint_passes_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
@@ -942,6 +1026,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 device="cuda",
                 attention_backend=None,
                 is_attention_backend_not_set=lambda: True,
+                # keep the (now-absorbed) quant/moe blocks inert so these
+                # assertions stay attention-only
+                moe_runner_backend="triton",
+                quantization=None,
             )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
@@ -989,9 +1077,55 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(
                 _gemma4_overrides(_args(), None), {"attention_backend": "triton"}
             )
-        # Glm4Moe: unconditional tf32 declaration (quant/moe writes stay in
-        # the branch until their field chains migrate)
-        self.assertEqual(_glm4_moe_overrides(None, None), {"enable_tf32_matmul": True})
+        # Glm4Moe: unconditional tf32 declaration + (sm100) quant/moe absorption
+        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+            self.assertEqual(
+                _glm4_moe_overrides(None, None), {"enable_tf32_matmul": True}
+            )
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            self.assertEqual(
+                _glm4_moe_overrides(
+                    SimpleNamespace(
+                        quantization=None,
+                        _quantization_explicitly_unset=False,
+                        moe_a2a_backend="none",
+                        moe_runner_backend="auto",
+                    ),
+                    SimpleNamespace(
+                        quantization_config={"quant_method": "modelopt_fp4"}
+                    ),
+                ),
+                {
+                    "quantization": "modelopt_fp4",
+                    "moe_runner_backend": "flashinfer_trtllm",
+                    "enable_tf32_matmul": True,
+                },
+            )
+
+    def test_qwen3_moe_family_quant_absorption(self):
+        from sglang.srt.arg_groups.overrides import _qwen3_moe_family_overrides
+
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            with patch.object(
+                overrides_module, "get_quantization_config", return_value="fp8"
+            ):
+                self.assertEqual(
+                    _qwen3_moe_family_overrides(
+                        SimpleNamespace(
+                            quantization=None,
+                            _quantization_explicitly_unset=False,
+                            moe_a2a_backend="none",
+                            moe_runner_backend="auto",
+                        ),
+                        SimpleNamespace(architectures=["Qwen3MoeForCausalLM"]),
+                    ),
+                    {
+                        "quantization": "fp8",
+                        "moe_runner_backend": "flashinfer_trtllm",
+                    },
+                )
+        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+            self.assertEqual(_qwen3_moe_family_overrides(None, None), {})
 
     def test_step3p_declarations_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _step3p_overrides
