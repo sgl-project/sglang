@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 
 LINGBOT_REALTIME_DEFAULT_NUM_INFERENCE_STEPS = 4
 LINGBOT_REALTIME_MIN_CONDITION_CHUNKS = 2
+COMPOSITE_INPUT_EVENT_KIND = "composite_input"
 
 
 class LingBotWorldRealtimeState(RealtimeCameraControlState):
@@ -117,16 +118,79 @@ class LingBotWorldRealtimeAdapter(BaseRealtimeModelAdapter):
     ) -> str:
         state = self._state(session)
         if event.kind == "camera_actions":
-            return state.receive_camera_control_event_payload(
-                event.payload,
-                event_id=event.event_id,
-            )
+            return self._ingest_camera_actions(state, event.payload, event.event_id)
         elif event.kind == "prompt":
-            if not isinstance(event.payload, str) or not event.payload:
-                raise ValueError("prompt event payload must be a non-empty string")
-            state.receive_prompt(event.payload, event_id=event.event_id)
-            return f"kind=prompt, prompt_len={len(event.payload)}"
+            return self._ingest_prompt(state, event.payload, event.event_id)
+        elif event.kind == COMPOSITE_INPUT_EVENT_KIND:
+            return self._ingest_composite_input(state, event.payload, event.event_id)
         raise ValueError(f"unsupported event kind: {event.kind}")
+
+    def _ingest_camera_actions(
+        self,
+        state: LingBotWorldRealtimeState,
+        payload: Any,
+        event_id: int | None,
+    ) -> str:
+        return state.receive_camera_control_event_payload(
+            payload,
+            event_id=event_id,
+        )
+
+    def _ingest_prompt(
+        self,
+        state: LingBotWorldRealtimeState,
+        payload: Any,
+        event_id: int | None,
+    ) -> str:
+        if not isinstance(payload, str) or not payload:
+            raise ValueError("prompt event payload must be a non-empty string")
+        state.receive_prompt(payload, event_id=event_id)
+        return f"kind=prompt, prompt_len={len(payload)}"
+
+    def _ingest_composite_input(
+        self,
+        state: LingBotWorldRealtimeState,
+        payload: Any,
+        event_id: int | None,
+    ) -> str:
+        if not isinstance(payload, dict):
+            raise ValueError("composite_input event payload must be a map")
+        input_types = payload.get("input_types")
+        if not isinstance(input_types, list) or not input_types:
+            raise ValueError(
+                "composite_input event payload requires non-empty input_types"
+            )
+
+        input_logs = []
+        for input_type in input_types:
+            if not isinstance(input_type, str) or not input_type:
+                raise ValueError(
+                    "composite_input input_types must contain non-empty strings"
+                )
+            if input_type not in payload:
+                raise ValueError(f"composite_input event payload requires {input_type}")
+            input_logs.append(
+                self._ingest_composite_input_item(
+                    state,
+                    input_type,
+                    payload[input_type],
+                    event_id,
+                )
+            )
+        return f"kind=composite_input, inputs={input_logs}"
+
+    def _ingest_composite_input_item(
+        self,
+        state: LingBotWorldRealtimeState,
+        input_type: str,
+        payload: Any,
+        event_id: int | None,
+    ) -> str:
+        if input_type == "camera_actions":
+            return self._ingest_camera_actions(state, payload, event_id)
+        if input_type == "prompt":
+            return self._ingest_prompt(state, payload, event_id)
+        raise ValueError(f"unsupported composite_input type: {input_type}")
 
     def sample_chunk_inputs(
         self,

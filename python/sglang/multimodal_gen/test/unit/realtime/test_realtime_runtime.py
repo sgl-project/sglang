@@ -296,6 +296,47 @@ def test_lingbot_realtime_adapter_ingests_generic_events():
     assert state.latest_sampled_event_id == 8
 
 
+def test_lingbot_realtime_adapter_ingests_composite_input_event():
+    adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
+    session = GenerateSession()
+    session.set_adapter(adapter)
+    session.set_request(
+        RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="walk forward",
+        )
+    )
+
+    composite_event = RealtimeEvent(
+        type="event",
+        kind="composite_input",
+        payload={
+            "input_types": ["prompt", "camera_actions"],
+            "prompt": "turn left",
+            "camera_actions": [["w"], ["d"]],
+        },
+        event_id=9,
+    )
+
+    event_log = adapter.ingest_event(session, composite_event)
+
+    assert "kind=composite_input" in event_log
+    chunk_inputs = adapter.sample_chunk_inputs(
+        session,
+        server_args=SimpleNamespace(),
+        chunk=SimpleNamespace(index=1),
+        chunk_size=3,
+    )
+    assert chunk_inputs.prompt == "turn left"
+    assert chunk_inputs.condition_inputs[
+        lingbot_realtime.LINGBOT_PROMPT_UPDATED_CONDITION
+    ]
+    assert chunk_inputs.condition_inputs[
+        lingbot_realtime.LINGBOT_CAMERA_ACTIONS_CONDITION
+    ] == [["w"], ["d"], []]
+    assert adapter.get_realtime_event_id(session) == 9
+
+
 def test_lingbot_realtime_prompt_event_marks_crossattn_reset():
     adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
     session = GenerateSession()
