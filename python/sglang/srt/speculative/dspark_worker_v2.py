@@ -432,9 +432,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=next_token_ids,
             seq_lens=model_worker_batch.seq_lens,
         )
-        verify_done = torch.get_device_module(device).Event()
-        verify_done.record()
-        batch_output.next_draft_input.verify_done = verify_done
         return batch_output
 
     def _forward_decode(
@@ -628,9 +625,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
         )
-        verify_done = torch.get_device_module(device).Event()
-        verify_done.record()
-        next_draft_input.verify_done = verify_done
 
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -651,9 +645,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         if on_publish is not None:
             on_publish(next_draft_input.new_seq_lens)
-        verify_done = torch.get_device_module(self.device).Event()
-        verify_done.record()
-        next_draft_input.verify_done = verify_done
         return GenerationBatchResult(
             logits_output=None,
             next_token_ids=empty_ids,

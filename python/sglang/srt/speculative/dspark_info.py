@@ -146,7 +146,6 @@ class DSparkDraftInputV2(SpecInput):
     # sampling-verify helper avoids a GPU->CPU .item() sync (mirrors DFlash).
     max_top_k: int = 1
     uniform_top_k_value: Optional[int] = None
-    verify_done: Optional[torch.cuda.Event] = None
     topk_p: torch.Tensor = field(
         default_factory=lambda: torch.empty((0, 0), dtype=torch.float32)
     )
@@ -173,13 +172,9 @@ class DSparkDraftInputV2(SpecInput):
             topk_p=torch.empty((0, 0), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, 0), device=device, dtype=torch.int64),
             hidden_states=torch.empty((0, 0), device=device, dtype=torch.float16),
-            verify_done=None,
         )
 
     def prepare_for_decode(self, batch: ScheduleBatch):
-        if self.verify_done is not None:
-            self.verify_done.synchronize()
-
         bs = batch.batch_size()
         if bs == 0:
             return
