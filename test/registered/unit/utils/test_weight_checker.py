@@ -812,7 +812,9 @@ class TestIsSkipWeightCheck(CustomTestCase):
     the _skip_weight_check param flag, and skip_tensor_list substrings."""
 
     def test_non_persistent_buffer_name_is_skipped(self):
-        self.assertTrue(_is_skip_weight_check("model.rotary_emb.inv_freq", torch.zeros(4)))
+        self.assertTrue(
+            _is_skip_weight_check("model.rotary_emb.inv_freq", torch.zeros(4))
+        )
 
     def test_skip_weight_check_flag_is_skipped(self):
         param = torch.zeros(4)
@@ -821,7 +823,9 @@ class TestIsSkipWeightCheck(CustomTestCase):
 
     def test_skip_tensor_list_substring_is_skipped(self):
         self.assertTrue(
-            _is_skip_weight_check("model.visual.blocks.0.weight", torch.zeros(4), ["visual."])
+            _is_skip_weight_check(
+                "model.visual.blocks.0.weight", torch.zeros(4), ["visual."]
+            )
         )
 
     def test_plain_weight_is_not_skipped(self):
