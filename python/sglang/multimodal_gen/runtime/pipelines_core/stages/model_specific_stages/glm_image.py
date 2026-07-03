@@ -257,6 +257,7 @@ class GlmImageAR(PipelineStage):
                 "sampling_params": {
                     "temperature": 1.0,
                     "max_new_tokens": max_new_tokens,
+                    "ignore_eos": True,
                 },
             }
             try:
@@ -338,6 +339,16 @@ class GlmImageAR(PipelineStage):
             )
             input_len = inputs["input_ids"].shape[-1]
             generated_ids = outputs[0][input_len:]
+
+        expected_output_len = large_image_offset + token_h * token_w
+        actual_output_len = 0 if generated_ids is None else len(generated_ids)
+        if actual_output_len < expected_output_len:
+            raise RuntimeError(
+                "GLM-Image AR returned too few output_ids: "
+                f"got {actual_output_len}, need at least {expected_output_len} "
+                f"(large_image_offset={large_image_offset}, "
+                f"token_h={token_h}, token_w={token_w})."
+            )
 
         # Extract large image tokens + upsample D32→D16
         prior_token_ids_d32 = torch.tensor(
