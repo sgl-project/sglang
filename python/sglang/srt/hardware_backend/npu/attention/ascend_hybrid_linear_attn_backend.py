@@ -132,6 +132,8 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         seq_lens_cpu: Optional[torch.Tensor],
         num_padding: Optional[int] = None,
         in_capture: bool = False,
+        *args,
+        **kwargs,
     ):
         # out_graph passes seq_lens_cpu=None at capture; mirror the base guard.
         if seq_lens_cpu is None:
