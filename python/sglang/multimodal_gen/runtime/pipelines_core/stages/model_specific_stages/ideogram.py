@@ -268,7 +268,7 @@ class Ideogram4DenoisingStage(DenoisingStage):
             pipeline=pipeline,
         )
         self.unconditional_transformer = unconditional_transformer
-        self._maybe_enable_torch_compile(self.unconditional_transformer)
+        self._maybe_torch_compile(self.unconditional_transformer)
 
     def _component_name_for_stage_module(self, module, default_name: str) -> str:
         if module is self.unconditional_transformer:
@@ -302,7 +302,7 @@ class Ideogram4DenoisingStage(DenoisingStage):
         for transformer in filter(
             None, [self.transformer, self.unconditional_transformer]
         ):
-            self._maybe_enable_torch_compile(transformer)
+            self._maybe_torch_compile(transformer)
 
     def _manage_unconditional_transformer_use_site(self, batch: Req) -> None:
         manager = self._component_residency_manager

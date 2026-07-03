@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -29,9 +29,6 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
-    create_extend_after_decode_spec_info as create_extend_after_decode_spec_info,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
     filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
@@ -46,13 +43,15 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
 from sglang.srt.speculative.triton_ops.eagle import (
     fill_accept_out_cache_loc as fill_accept_out_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu, next_power_of_2
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.nvtx_utils import profile_range
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
@@ -74,9 +73,32 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def fast_sample(probs: torch.Tensor, num_samples: int = 1):
+    sample_index = torch.multinomial(probs, num_samples=num_samples)
+    sample_p = probs.gather(1, sample_index)
+    return sample_p, sample_index
+
+
+def renorm_draft_probs(
+    next_token_logits: torch.Tensor,
+    sampling_info,
+    use_rejection_sampling: bool,
+) -> torch.Tensor:
+    """Draft-side next-token distribution.
+
+    Plain softmax, except under rejection sampling where logits are
+    temperature-scaled so the draft proposal q tracks the target sampling
+    temperature (higher acceptance; correctness holds for any q).
+    """
+    if not use_rejection_sampling or not next_token_logits.size(0):
+        return torch.softmax(next_token_logits, dim=-1)
+    return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
+
+
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
+SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = (
@@ -123,7 +145,7 @@ def record_stream_each(tensors, stream):
 def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
     """Mark pre-prepare SB / verify_input GPU tensors as used on `fwd_stream`.
 
-    Spec V2 mutates SB mid-forward (`prepare_for_v2_verify` rebinds
+    Spec V2 mutates SB mid-forward (`prepare_for_verify` rebinds
     `batch.input_ids` / `out_cache_loc`; `_draft_extend_for_decode` later
     replaces `batch.input_ids` again). Each rebind drops the only SB Python
     ref to the old tensor while the verify forward kernel may still be
@@ -168,7 +190,7 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     return not server_args.enable_multi_layer_eagle
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
 def create_num_accept_tokens_filter(
     num_correct_drafts: torch.Tensor,
     unfinished_index_device: torch.Tensor,
@@ -202,7 +224,7 @@ def _select_top_k_tokens_first(
     return input_ids, hidden_states, topk_p, tree_info
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
 def _select_top_k_tokens_later(
     i: int,
     topk_p: torch.Tensor,
@@ -296,11 +318,16 @@ def generate_simulated_accept_index(
     accept_index,
     predict,
     num_correct_drafts,
+    candidates,
+    target_predict,
     bs,
     spec_steps,
     simulate_acc_len: float = SIMULATE_ACC_LEN,
     simulate_acc_method: str = SIMULATE_ACC_METHOD,
+    simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
 ):
+    use_real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
+
     assert simulate_acc_len > 0.0
     simulate_acc_len = _sample_simulated_acc_len(
         simulate_acc_len, simulate_acc_method, spec_steps + 1
@@ -314,7 +341,21 @@ def generate_simulated_accept_index(
         simulate_acc_len, device=accept_index.device
     )
     num_correct_drafts.fill_(simulate_acc_len - 1)
-    predict.fill_(100)  # some legit token id
+
+    if not use_real_draft_tokens:
+        predict.fill_(100)  # some legit token id
+        return sim_accept_index
+
+    # Use the topk=1 draft chain for forced acceptance, then a target-derived bonus.
+    if simulate_acc_len > 1:
+        draft_node_indices = sim_accept_index[:, : simulate_acc_len - 1].long()
+        predict[draft_node_indices] = candidates[:, 1:simulate_acc_len].to(
+            dtype=predict.dtype
+        )
+    bonus_node_indices = sim_accept_index[:, simulate_acc_len - 1].long()
+    predict[bonus_node_indices] = target_predict[:, simulate_acc_len - 1].to(
+        dtype=predict.dtype
+    )
     return sim_accept_index
 
 
@@ -480,9 +521,7 @@ def spec_stage_span(name: str):
     """Profiler span for a coarse speculative-decoding stage (``draft`` /
     ``draft_extend`` / ``verify``).
     """
-    if torch.autograd._profiler_enabled():
-        return torch.profiler.record_function(name)
-    return nullcontext()
+    return profile_range(name)
 
 
 def move_accept_tokens_to_target_kvcache(
@@ -632,3 +671,15 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             model=model_runner.model,
         )
+
+
+def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
+    """eagle/ngram share a stateless free function; dflash keeps stateful
+    prep on its draft input -- the dispatcher routes.
+    """
+    if batch.spec_algorithm.is_dflash():
+        batch.spec_info.prepare_for_decode(batch)
+    else:
+        from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
+
+        eagle_prepare_for_decode(batch)

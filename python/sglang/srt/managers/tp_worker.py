@@ -71,6 +71,13 @@ class BaseTpWorker(ABC):
         pass
 
     @property
+    def war_fastpath_runner(self):
+        # The runner that runs the step's LAST shared-buffer-reading phase --
+        # it owns the read-done event the scheduler's WAR barrier waits on.
+        # For a plain worker that's its own runner.
+        return self.model_runner
+
+    @property
     def sliding_window_size(self) -> Optional[int]:
         return self.model_runner.sliding_window_size
 
@@ -276,6 +283,7 @@ class TpModelWorker(BaseTpWorker):
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                     tokenizer_backend=server_args.tokenizer_backend,
+                    model_name=server_args.model_path,
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
@@ -292,24 +300,6 @@ class TpModelWorker(BaseTpWorker):
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
-        # Profile number of tokens
-        self.max_total_num_tokens = self.model_runner.max_total_num_tokens
-        self.max_prefill_tokens = server_args.max_prefill_tokens
-        self.max_running_requests = self.model_runner.max_running_requests
-        assert self.max_running_requests > 0, "max_running_request is zero"
-        self.max_queued_requests = server_args.max_queued_requests
-        assert (
-            self.max_queued_requests is None or self.max_queued_requests >= 1
-        ), "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
-        self.max_req_len = min(
-            self.model_config.context_len - 1,
-            self.model_runner.max_token_pool_size - 1,
-        )
-        self.max_req_input_len = self.max_req_len - 5
-        assert (
-            self.max_req_len > 0 and self.max_req_input_len > 0
-        ), "Memory pool size is too small"
-
         # Sync random seed across TP workers
         self.random_seed = broadcast_pyobj(
             [server_args.random_seed],
@@ -322,6 +312,47 @@ class TpModelWorker(BaseTpWorker):
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_spec = server_args.speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
+
+    def alloc_memory_pool(
+        self,
+        memory_pool_config: Optional[MemoryPoolConfig] = None,
+        req_to_token_pool: Optional[ReqToTokenPool] = None,
+        token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+    ):
+        """Allocate KV cache pools only (no backends or cuda graphs)."""
+        if req_to_token_pool is not None:
+            self.req_to_token_pool = req_to_token_pool
+            self.model_runner.req_to_token_pool = req_to_token_pool
+        if token_to_kv_pool_allocator is not None:
+            self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+            self.model_runner.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.model_runner.alloc_memory_pool(memory_pool_config)
+        for mr in self.model_runner_list[1:]:
+            mr.req_to_token_pool = self.req_to_token_pool
+            mr.token_to_kv_pool_allocator = self.token_to_kv_pool_allocator
+            mr.alloc_memory_pool(memory_pool_config)
+
+        # Validation
+        assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
+        max_req_len = min(
+            self.model_config.context_len - 1,
+            self.model_runner.max_token_pool_size - 1,
+        )
+        assert max_req_len > 0, "Memory pool size is too small"
+
+    def init_attention_backends(self):
+        """Initialize attention backends for all model runners."""
+        self.model_runner.init_attention_backends()
+        for mr in self.model_runner_list[1:]:
+            mr.init_attention_backends()
+
+    def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        """Capture cuda graphs for all model runners."""
+        self.model_runner.init_cuda_graphs(
+            capture_decode_cuda_graph=capture_decode_cuda_graph
+        )
+        for mr in self.model_runner_list[1:]:
+            mr.init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
 
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig
@@ -414,13 +445,17 @@ class TpModelWorker(BaseTpWorker):
         self.model_runner.hisparse_coordinator = coordinator
 
     def get_worker_info(self):
+        max_req_len = min(
+            self.model_config.context_len - 1,
+            self.model_runner.max_token_pool_size - 1,
+        )
         return (
-            self.max_total_num_tokens,
-            self.max_prefill_tokens,
-            self.max_running_requests,
-            self.max_queued_requests,
-            self.max_req_len,
-            self.max_req_input_len,
+            self.model_runner.max_total_num_tokens,
+            self.server_args.max_prefill_tokens,
+            self.model_runner.max_running_requests,
+            self.server_args.max_queued_requests,
+            max_req_len,
+            max_req_len - 5,
             self.random_seed,
             self.device,
             self.model_runner.forward_stream,

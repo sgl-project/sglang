@@ -177,6 +177,20 @@ class PromptTokensDetails(BaseModel):
     """Details about prompt tokens."""
 
     cached_tokens: int = 0
+    # Multimodal prompt token counts (only populated when present in the prompt)
+    image_tokens: Optional[int] = None
+    audio_tokens: Optional[int] = None
+    video_tokens: Optional[int] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Drop multimodal fields when absent so text-only/cache-only responses
+        # keep the original {"cached_tokens": N} shape.
+        for key in ("image_tokens", "audio_tokens", "video_tokens"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
 
 class UsageInfo(BaseModel):
@@ -342,10 +356,13 @@ class CompletionRequest(BaseModel):
     ignore_eos: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    session_id: Optional[str] = None
     session_params: Optional[Dict] = None
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     custom_params: Optional[Dict] = None
     custom_logit_processor: Optional[str] = None
+
+    images_config: Optional[Dict] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -712,6 +729,7 @@ class ChatCompletionRequest(BaseModel):
     continue_final_message: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    session_id: Optional[str] = None
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
@@ -721,6 +739,8 @@ class ChatCompletionRequest(BaseModel):
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
     use_audio_in_video: bool = False
+
+    images_config: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
@@ -1284,14 +1304,46 @@ class ResponseReasoningParam(BaseModel):
         default="medium",
         description="Constrains effort on reasoning for reasoning models.",
     )
+    summary: Optional[Literal["auto", "concise", "detailed"]] = Field(
+        default=None,
+        description="Include a summary of the model's reasoning trace on the response.",
+    )
+
+
+# Only ``function`` / ``web_search*`` / ``code_interpreter`` are wired to
+# execution paths; the rest pass validation so clients aren't rejected.
+RESPONSE_TOOL_TYPES = Literal[
+    "function",
+    "web_search",
+    "web_search_preview",
+    "code_interpreter",
+    "file_search",
+    "image_generation",
+    "computer_use_preview",
+    "local_shell",
+    "mcp",
+    "custom",
+    "namespace",
+    "tool_search",
+]
 
 
 class ResponseTool(BaseModel):
     """Tool definition for responses."""
 
-    type: Literal["web_search_preview", "code_interpreter"] = Field(
-        description="Type of tool to enable"
-    )
+    type: RESPONSE_TOOL_TYPES = Field(description="Type of tool to enable")
+    name: Optional[str] = None
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+    strict: bool = False
+    # Inner schemas for ``namespace`` tools.
+    tools: Optional[List[Dict[str, Any]]] = None
+
+    @model_validator(mode="after")
+    def validate_function_tool(self) -> ResponseTool:
+        if self.type == "function" and not self.name:
+            raise ValueError("Function tools must include a name.")
+        return self
 
 
 ResponseInputOutputItem: TypeAlias = Union[
@@ -1318,7 +1370,9 @@ class ResponsesRequest(BaseModel):
             ]
         ]
     ] = None
-    input: Union[str, List[ResponseInputOutputItem]]
+    # Accept dict-shaped items as the loose arm; downstream normalization
+    # handles replayed shapes that don't satisfy every openai TypedDict.
+    input: Union[str, List[ResponseInputOutputItem], List[Dict[str, Any]]]
     instructions: Optional[str] = None
     max_output_tokens: Optional[int] = None
     max_tool_calls: Optional[int] = None
@@ -1343,6 +1397,7 @@ class ResponsesRequest(BaseModel):
         default_factory=lambda: f"resp_{uuid.uuid4().hex}",
         description="The request_id related to this request. If the caller does not set it, a random uuid will be generated.",
     )
+    session_id: Optional[str] = None
     priority: int = Field(default=0, description="Request priority")
     extra_key: Optional[str] = Field(
         default=None,
@@ -1352,13 +1407,13 @@ class ResponsesRequest(BaseModel):
         default=None, description="Cache salt for request caching"
     )
 
-    # SGLang-specific sampling parameters
+    # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
     stop: Optional[Union[str, List[str]]] = None
-    top_k: int = -1
-    min_p: float = 0.0
-    repetition_penalty: float = 1.0
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
+    repetition_penalty: Optional[float] = None
 
     # Default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
@@ -1369,8 +1424,57 @@ class ResponsesRequest(BaseModel):
         "repetition_penalty": 1.0,
     }
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_responses_input(cls, values):
+        if not isinstance(values, dict):
+            return values
+
+        input_value = values.get("input")
+        if not isinstance(input_value, list):
+            return values
+
+        values = values.copy()
+        values["input"] = [
+            cls._normalize_input_item_for_validation(item) for item in input_value
+        ]
+        return values
+
+    @staticmethod
+    def _normalize_input_item_for_validation(item):
+        if not isinstance(item, dict):
+            return item
+
+        content = item.get("content")
+        if not isinstance(content, list):
+            return item
+
+        item = item.copy()
+        item["content"] = [
+            ResponsesRequest._normalize_content_part_for_validation(part)
+            for part in content
+        ]
+        return item
+
+    @staticmethod
+    def _normalize_content_part_for_validation(part):
+        if not isinstance(part, dict):
+            return part
+
+        part_type = part.get("type")
+        if part_type != "input_image" or part.get("detail") is not None:
+            return part
+
+        part = part.copy()
+        part["detail"] = "auto"
+        return part
+
     def to_sampling_params(
-        self, default_max_tokens: int, default_params: Optional[Dict] = None
+        self,
+        default_max_tokens: int,
+        default_params: Optional[Dict] = None,
+        stop: Optional[Union[str, List[str]]] = None,
+        tool_call_constraint: Optional[ToolCallConstraint] = None,
     ) -> Dict[str, Any]:
         """Convert to sampling parameters for generation."""
         if default_params is None:
@@ -1382,10 +1486,9 @@ class ResponsesRequest(BaseModel):
         else:
             max_tokens = default_max_tokens
 
-        # Avoid exceed the context length by minus 2 token
+        # Headroom for BOS/EOS the engine appends on top of prompt+budget.
         max_tokens -= 2
 
-        # Get parameters with defaults
         temperature = self.temperature
         if temperature is None:
             temperature = default_params.get(
@@ -1396,22 +1499,50 @@ class ResponsesRequest(BaseModel):
         if top_p is None:
             top_p = default_params.get("top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"])
 
-        params = {
+        # Omit None entries so they fall through to ``--preferred-sampling-params``
+        # rather than overriding it with a literal default.
+        params: dict[str, Any] = {
             "max_new_tokens": max_tokens,
             "temperature": temperature,
             "top_p": top_p,
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
-            "stop": self.stop,
-            "top_k": self.top_k,
-            "min_p": self.min_p,
-            "repetition_penalty": self.repetition_penalty,
+            "stop": self.stop if stop is None else stop,
         }
+        if self.top_k is not None:
+            params["top_k"] = self.top_k
+        if self.min_p is not None:
+            params["min_p"] = self.min_p
+        if self.repetition_penalty is not None:
+            params["repetition_penalty"] = self.repetition_penalty
 
         # Apply any additional default parameters
         for key, value in default_params.items():
             if key not in params or params[key] is None:
                 params[key] = value
+
+        has_existing_constraints = (
+            params.get("regex")
+            or params.get("ebnf")
+            or params.get("structural_tag")
+            or params.get("json_schema")
+        )
+        if tool_call_constraint and has_existing_constraints:
+            # Refuse rather than silently drop the tool-call grammar.
+            raise ValueError(
+                "Cannot combine tool calls with constrained decoding "
+                "(regex / ebnf / structural_tag / json_schema). Remove one."
+            )
+        if tool_call_constraint:
+            constraint_type, constraint_value = tool_call_constraint
+            if constraint_type in ("structural_tag", "json_schema"):
+                params[constraint_type] = convert_json_schema_to_str(
+                    constraint_value.model_dump(by_alias=True)
+                    if hasattr(constraint_value, "model_dump")
+                    else constraint_value
+                )
+            else:
+                params[constraint_type] = constraint_value
 
         return params
 
@@ -1515,7 +1646,11 @@ class ResponsesResponse(BaseModel):
             output=output,
             status=status,
             usage=usage,
-            parallel_tool_calls=request.parallel_tool_calls or True,
+            parallel_tool_calls=(
+                request.parallel_tool_calls
+                if request.parallel_tool_calls is not None
+                else True
+            ),
             tool_choice=request.tool_choice,
             tools=request.tools,
             # fields for parity with v1/responses

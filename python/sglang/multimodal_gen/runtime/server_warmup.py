@@ -1,29 +1,36 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-import asyncio
 import os
 import tempfile
-from copy import copy
-from typing import Any
+from typing import Any, Awaitable, Callable
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.registry import get_pipeline_config_classes
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-    _parse_size,
-    save_image_to_path,
+from tqdm.auto import tqdm
+
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    OutputBatch,
+    Req,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_path
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.warmup_request_builder import (
+    build_warmup_reqs,
+    should_include_warmup_image,
+)
 
 logger = init_logger(__name__)
 
-MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
+# a 64x64 image because some pipelines reject smaller inputs (e.g. FLUX.2's
+# diffusers image processor requires both dimensions >= 64px)
+MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAS0lEQVR42u3PMQ0AAAwDoEqv9ErYvQQckD4XAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAYHLAB8+AWnmfUycAAAAAElFTkSuQmCC"
 
-DEFAULT_PLACEHOLDER_PROMPT = "warmup"
-DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION = (64, 64)
+
+def _is_ci_log_env() -> bool:
+    return (
+        os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+        or os.environ.get("CI", "").lower() == "true"
+    )
 
 
 def get_first_generation_req(req_or_group: Any) -> Req | None:
@@ -60,26 +67,115 @@ def should_return_warmup_result(req_or_group: Any) -> bool:
     )
 
 
-def get_model_sampling_defaults(server_args: ServerArgs) -> SamplingParams:
-    pipeline_class_name = server_args.pipeline_class_name
+def should_run_server_warmup(server_args: ServerArgs) -> bool:
+    return server_args.warmup and server_args.server_warmup
+
+
+def is_realtime_serving(server_args: ServerArgs) -> bool:
+    """Synthetic warmup has no realtime session state."""
     try:
-        if pipeline_class_name:
-            config_classes = get_pipeline_config_classes(pipeline_class_name)
-            if config_classes is not None:
-                _, sampling_params_cls = config_classes
-                return sampling_params_cls()
-
-        return SamplingParams.from_pretrained(
-            server_args.model_path,
-            backend=server_args.backend,
-            model_id=server_args.model_id,
+        from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
+            get_realtime_model_adapter,
         )
+
+        get_realtime_model_adapter(server_args)
+        return True
     except Exception:
-        logger.debug("Falling back to base SamplingParams for server warmup")
-        return SamplingParams()
+        return False
 
 
-async def prepare_warmup_image_path(server_args: ServerArgs) -> str:
+def should_run_synthetic_server_warmup(server_args: ServerArgs) -> bool:
+    return should_run_server_warmup(server_args) and not is_realtime_serving(
+        server_args
+    )
+
+
+def should_run_explicit_client_warmup(server_args: ServerArgs) -> bool:
+    return server_args.warmup and server_args.warmup_resolutions is not None
+
+
+def format_warmup_req(req_or_group: Any) -> str:
+    req = get_first_generation_req(req_or_group)
+    prefix = (
+        "server warmup req" if is_server_based_warmup(req_or_group) else "warmup req"
+    )
+    if req is None:
+        return prefix
+
+    shape = f"{req.width}x{req.height}"
+    if req.num_frames is not None and req.num_frames > 1:
+        shape += f"x{req.num_frames}f"
+
+    default_steps = req.extra.get("cache_dit_num_inference_steps")
+    if default_steps is not None and default_steps != req.num_inference_steps:
+        steps = f"{req.num_inference_steps}/{default_steps} steps"
+    else:
+        steps = f"{req.num_inference_steps} step"
+        if req.num_inference_steps != 1:
+            steps += "s"
+
+    return f"{prefix} ({shape}, {steps})"
+
+
+def build_client_warmup_reqs(
+    server_args: ServerArgs,
+    *,
+    warmup_input_path: str | None = None,
+) -> list[Req]:
+    warmup_reqs = build_warmup_reqs(
+        server_args,
+        warmup_resolutions=server_args.warmup_resolutions,
+        warmup_input_path=warmup_input_path,
+        return_warmup_result=True,
+        server_based_warmup=True,
+    )
+    warmup_total = len(warmup_reqs)
+    for req in warmup_reqs:
+        req.extra["warmup_total"] = warmup_total
+    return warmup_reqs
+
+
+async def run_async_client_warmup(
+    server_args: ServerArgs,
+    forward: Callable[[Req], Awaitable[OutputBatch]],
+    *,
+    fail_open: bool = False,
+) -> None:
+    try:
+        warmup_input_path = None
+        if should_include_warmup_image(server_args, server_based_warmup=True):
+            warmup_input_path = prepare_warmup_image_path(server_args)
+
+        for req in build_client_warmup_reqs(
+            server_args, warmup_input_path=warmup_input_path
+        ):
+            response = await forward(req)
+            if response.error is not None:
+                raise RuntimeError(response.error)
+    except Exception as e:
+        if fail_open:
+            logger.warning("Synthetic server warmup failed; continuing startup: %s", e)
+            return
+        raise
+
+
+def run_sync_client_warmup(
+    server_args: ServerArgs,
+    forward: Callable[[Req], OutputBatch],
+) -> None:
+    warmup_input_path = None
+    if should_include_warmup_image(server_args, server_based_warmup=True):
+        warmup_input_path = prepare_warmup_image_path(server_args)
+
+    for req in build_client_warmup_reqs(
+        server_args, warmup_input_path=warmup_input_path
+    ):
+        response = forward(req)
+        if response.error is not None:
+            raise RuntimeError(response.error)
+
+
+def prepare_warmup_image_path(server_args: ServerArgs) -> str:
     if server_args.input_save_path is not None:
         uploads_dir = server_args.input_save_path
         os.makedirs(uploads_dir, exist_ok=True)
@@ -87,133 +183,121 @@ async def prepare_warmup_image_path(server_args: ServerArgs) -> str:
         uploads_dir = tempfile.mkdtemp(prefix="sglang_input_")
 
     warmup_image_base = os.path.join(uploads_dir, "warmup_image")
-    return await save_image_to_path(
+    return save_base64_image_to_path(
         MINIMUM_PICTURE_BASE64_FOR_WARMUP, warmup_image_base
     )
 
 
-def prepare_warmup_image_path_sync(server_args: ServerArgs) -> str:
-    return asyncio.run(prepare_warmup_image_path(server_args))
+class SchedulerWarmupMixin:
+    @staticmethod
+    def _format_warmup_req(req_or_group: Any) -> str:
+        return format_warmup_req(req_or_group)
 
+    def _warmup_progress_total(self, req_or_group: Any | None = None) -> int:
+        req = get_first_generation_req(req_or_group)
+        if req is not None:
+            warmup_total = req.extra.get("warmup_total")
+            if warmup_total is not None:
+                return warmup_total
 
-def _resolve_default_warmup_resolution(
-    server_args: ServerArgs,
-    sampling_defaults: SamplingParams,
-) -> tuple[int, int]:
-    supported_resolutions = sampling_defaults.supported_resolutions
-    if supported_resolutions:
-        return min(supported_resolutions, key=lambda size: size[0] * size[1])
+        return max(self._warmup_total, 1)
 
-    width = sampling_defaults.width
-    height = sampling_defaults.height
-    if width is not None and height is not None:
-        return width, height
+    def _ensure_warmup_progress_bar(self, req_or_group: Any) -> None:
+        if not self._show_warmup_progress:
+            return
 
-    if server_args.pipeline_config.task_type.is_image_gen():
-        return DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION
-
-    return (
-        width or DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION[0],
-        height or DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION[1],
-    )
-
-
-def _effective_cfg_scale(sampling_defaults: SamplingParams) -> float | None:
-    if sampling_defaults.true_cfg_scale is not None:
-        return sampling_defaults.true_cfg_scale
-    return sampling_defaults.guidance_scale
-
-
-def should_include_warmup_image(
-    server_args: ServerArgs, server_based_warmup: bool
-) -> bool:
-    task_type = server_args.pipeline_config.task_type
-    if not task_type.accepts_image_input():
-        return False
-    if task_type.requires_image_input():
-        return True
-    if server_based_warmup:
-        return task_type in (ModelTaskType.TI2I, ModelTaskType.TI2V)
-    return True
-
-
-def build_warmup_reqs(
-    server_args: ServerArgs,
-    *,
-    warmup_resolutions: list[str] | None,
-    warmup_input_path: str | None = None,
-    return_warmup_result: bool = False,
-    server_based_warmup: bool = False,
-    use_model_sampling_defaults: bool = False,
-) -> list[Req]:
-    task_type = server_args.pipeline_config.task_type
-    if warmup_resolutions is None or use_model_sampling_defaults:
-        sampling_defaults = get_model_sampling_defaults(server_args)
-    else:
-        sampling_defaults = SamplingParams()
-
-    if warmup_resolutions is None:
-        width, height = _resolve_default_warmup_resolution(
-            server_args, sampling_defaults
-        )
-        resolutions: list[tuple[int, int]] = [(width, height)]
-    else:
-        resolutions = [_parse_size(resolution) for resolution in warmup_resolutions]
-
-    negative_prompt: Any = (
-        sampling_defaults.negative_prompt if use_model_sampling_defaults else None
-    )
-    cfg_scale = (
-        _effective_cfg_scale(sampling_defaults) if use_model_sampling_defaults else None
-    )
-
-    warmup_reqs = []
-    include_warmup_image = should_include_warmup_image(server_args, server_based_warmup)
-    for width, height in resolutions:
-        req_kwargs = dict(
-            data_type=task_type.data_type(),
-            width=width,
-            height=height,
-            prompt=DEFAULT_PLACEHOLDER_PROMPT,
-        )
-        if use_model_sampling_defaults:
-            req_kwargs["sampling_params"] = copy(sampling_defaults)
-            req_kwargs.update(
-                negative_prompt=negative_prompt,
-                guidance_scale=sampling_defaults.guidance_scale,
-                guidance_scale_2=sampling_defaults.guidance_scale_2,
-                true_cfg_scale=sampling_defaults.true_cfg_scale,
-                num_inference_steps=sampling_defaults.num_inference_steps,
+        ci_log_env = _is_ci_log_env()
+        if self._warmup_progress_bar is None:
+            self._warmup_progress_bar = tqdm(
+                total=self._warmup_progress_total(req_or_group),
+                desc="Warmup requests",
+                unit="req",
+                disable=ci_log_env,
             )
-        if include_warmup_image:
-            if warmup_input_path is None:
-                raise RuntimeError(
-                    "Warmup image path is required for image-input model"
+            if ci_log_env:
+                logger.info(
+                    "Warmup requests: 0/%s %s",
+                    self._warmup_progress_bar.total,
+                    self._format_warmup_req(req_or_group),
                 )
-            req_kwargs["prompt"] = DEFAULT_PLACEHOLDER_PROMPT
-            if not use_model_sampling_defaults:
-                req_kwargs["negative_prompt"] = ""
-            req_kwargs["image_path"] = [warmup_input_path]
+        self._warmup_progress_bar.set_postfix_str(
+            self._format_warmup_req(req_or_group), refresh=False
+        )
+
+    def _advance_warmup_progress_bar(
+        self, req_or_group: Any, output_batch: OutputBatch
+    ) -> None:
+        if not self._show_warmup_progress:
+            return
+
+        if self._warmup_progress_bar is None:
+            self._ensure_warmup_progress_bar(req_or_group)
+
+        if output_batch.metrics is not None:
+            last_duration_s = output_batch.metrics.total_duration_s
+            self._warmup_progress_bar.set_postfix_str(
+                f"{self._format_warmup_req(req_or_group)}, last={last_duration_s:.2f}s",
+                refresh=False,
+            )
+        self._warmup_progress_bar.update(1)
+        if _is_ci_log_env():
+            logger.info(
+                "Warmup requests: %s/%s %s",
+                self._warmup_progress_bar.n,
+                self._warmup_progress_bar.total,
+                self._format_warmup_req(req_or_group),
+            )
+
+        if self._warmup_progress_bar.n >= self._warmup_progress_bar.total:
+            self._warmup_progress_bar.close()
+            self._warmup_progress_bar = None
+
+    def _log_warmup_result(
+        self,
+        output_batch: OutputBatch,
+        req_or_group: Any,
+        is_warmup: bool,
+    ) -> None:
+        if not is_warmup:
+            return
+
+        server_based_warmup = is_server_based_warmup(req_or_group)
+        self._warmup_processed += 1
+        self._advance_warmup_progress_bar(req_or_group, output_batch)
+
+        if output_batch.error is None:
+            if (
+                not server_based_warmup
+                and not self._logged_server_ready_after_warmup
+                and (
+                    self._warmup_total <= 0
+                    or self._warmup_processed >= self._warmup_total
+                )
+            ):
+                logger.info("The server is fired up and ready to roll!")
+                self._logged_server_ready_after_warmup = True
+        else:
+            warmup_desc = self._format_warmup_req(req_or_group)
+            logger.info(f"{warmup_desc} processing failed")
+
+    def process_received_reqs_with_req_based_warmup(
+        self, recv_reqs: list[tuple[bytes, Any]]
+    ) -> list[tuple[bytes, Any]]:
         if (
-            server_args.enable_cfg_parallel
-            and req_kwargs.get("negative_prompt") is None
+            self.req_based_warmup_scheduled
+            or not self.server_args.warmup
+            or not recv_reqs
+            or self.server_args.warmup_resolutions is not None
+            or self.server_args.server_warmup
         ):
-            req_kwargs["negative_prompt"] = DEFAULT_PLACEHOLDER_PROMPT
-            req_kwargs["do_classifier_free_guidance"] = True
-        elif (
-            use_model_sampling_defaults
-            and negative_prompt is not None
-            and cfg_scale is not None
-            and cfg_scale > 1.0
-        ):
-            req_kwargs["do_classifier_free_guidance"] = True
+            return recv_reqs
 
-        req = Req(**req_kwargs)
-        req.set_as_warmup(server_args.warmup_steps)
-        if return_warmup_result:
-            req.extra["return_warmup_result"] = True
-        if server_based_warmup:
-            req.extra["server_based_warmup"] = True
-        warmup_reqs.append(req)
-
-    return warmup_reqs
+        identity, req_or_group = recv_reqs[0]
+        req = get_first_generation_req(req_or_group)
+        if req is not None:
+            warmup_req = req.copy_as_warmup(self.server_args.warmup_steps)
+            recv_reqs.insert(0, (identity, warmup_req))
+            self._warmup_total = 1
+            self._warmup_processed = 0
+            self.req_based_warmup_scheduled = True
+        return recv_reqs

@@ -26,12 +26,16 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, List, Optional
 
-logger = logging.getLogger(__name__)
-
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.runner_backend_utils import (
+    PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+
+logger = logging.getLogger(__name__)
 
 _in_tc_piecewise_cuda_graph = False
 
@@ -43,22 +47,19 @@ def is_in_tc_piecewise_cuda_graph() -> bool:
 
 @contextmanager
 def enable_tc_piecewise_cuda_graph():
-    """Mark the enclosed scope as "we are inside a piecewise CUDA graph
-    capture/replay". Sets _in_tc_piecewise_cuda_graph true for the duration.
-
-    Errors during capture surface a hint that lets users disable the
-    feature while filing a bug.
+    """Mark the enclosed scope as inside a tc_piecewise CUDA graph
+    capture/replay. Any exception raised inside is logged with the
+    PCG-specific failure hint, then re-raised for the caller to handle.
     """
     global _in_tc_piecewise_cuda_graph
     _in_tc_piecewise_cuda_graph = True
     try:
         yield
-    except Exception as e:
-        logger.error(
-            "Piecewise CUDA Graph failed with error: %s\n%s",
-            e,
-            TC_PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG,
+    except Exception as exc:
+        msg = PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG.format(
+            backend=Backend.TC_PIECEWISE, suggestions=TCPCG_FAILURE_HINT
         )
+        logger.error(f"{type(exc).__name__}: {exc}\n{msg}")
         raise
     finally:
         _in_tc_piecewise_cuda_graph = False
@@ -111,8 +112,10 @@ def set_tc_piecewise_forward_context(
         _tc_piecewise_forward_context = None
 
 
-TC_PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG = (
-    "Piecewise CUDA Graph is enabled by default as an experimental feature.\n"
-    "To work around this error, add --disable-piecewise-cuda-graph to your launch command.\n"
-    "Please report this issue at https://github.com/sgl-project/sglang/issues/new/choose"
+TCPCG_FAILURE_HINT = (
+    "1. change to breakable by --cuda-graph-backend-prefill=breakable\n"
+    "2. disable the prefill CUDA graph by --cuda-graph-backend-prefill=disabled\n"
+    "3. if it is an OOM problem, set --mem-fraction-static to a smaller value "
+    "(e.g., 0.8 or 0.7) or set --cuda-graph-max-bs-prefill to a smaller value "
+    "(e.g., 2048)\n"
 )
