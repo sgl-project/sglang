@@ -50,6 +50,7 @@ class DraftBackendFactory:
             "flashinfer": self._create_flashinfer_decode_backend,
             "triton": self._create_triton_decode_backend,
             "intel_amx": self._create_intel_amx_decode_backend,
+            "intel_xpu": self._create_intel_xpu_decode_backend,
             "aiter": self._create_aiter_decode_backend,
             "fa3": self._create_fa3_decode_backend,
             "hybrid_linear_attn": self._create_hybrid_linear_attn_decode_backend,
@@ -76,6 +77,7 @@ class DraftBackendFactory:
             "flashinfer": self._create_flashinfer_prefill_backend,
             "triton": self._create_triton_prefill_backend,
             "intel_amx": self._create_intel_amx_prefill_backend,
+            "intel_xpu": self._create_intel_xpu_prefill_backend,
             "aiter": self._create_aiter_prefill_backend,
             "fa3": self._create_fa3_prefill_backend,
             "hybrid_linear_attn": self._create_hybrid_linear_attn_prefill_backend,
@@ -172,6 +174,13 @@ class DraftBackendFactory:
         if is_blackwell():
             return self._create_triton_prefill_backend()
         return self._create_fa3_prefill_backend()
+
+    def _create_intel_xpu_decode_backend(self):
+        from sglang.srt.layers.attention.xpu_backend import XPUMultiStepDraftBackend
+
+        return XPUMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
 
     def _create_aiter_decode_backend(self):
         from sglang.srt.layers.attention.aiter_backend import AiterMultiStepDraftBackend
@@ -310,6 +319,11 @@ class DraftBackendFactory:
         from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
 
         return IntelAMXAttnBackend(self.draft_model_runner)
+
+    def _create_intel_xpu_prefill_backend(self):
+        from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+
+        return XPUAttentionBackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_aiter_prefill_backend(self):
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend

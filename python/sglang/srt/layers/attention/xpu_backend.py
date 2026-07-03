@@ -116,9 +116,6 @@ class XPUAttentionBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             # Draft Decode
             if forward_batch.spec_info is not None:
-                assert (
-                    False
-                ), "XPUAttentionBackend doesn't support speculative decoding yet, please use --attention-backend triton instead."
                 if self.topk <= 1:
                     metadata.cache_seqlens_int32 = (
                         seqlens_in_batch + (self.speculative_step_id + 1)
@@ -332,7 +329,9 @@ class XPUAttentionBackend(AttentionBackend):
                         metadata, metadata_expand
                     )
 
-        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+            include_draft_extend_v2=True
+        ):
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
             metadata.cu_seqlens_k = torch.nn.functional.pad(
@@ -342,7 +341,16 @@ class XPUAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
-            if any(forward_batch.extend_prefix_lens_cpu):
+            # Detect draft extend: either explicit DRAFT_EXTEND_V2 mode or EXTEND
+            # mode with an EagleDraftInput spec_info.
+            is_draft_extend = (
+                forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND_V2
+                or (
+                    forward_batch.spec_info is not None
+                    and forward_batch.spec_info.is_draft_input()
+                )
+            )
+            if any(forward_batch.extend_prefix_lens_cpu) or is_draft_extend:
                 extend_seq_lens = forward_batch.extend_seq_lens
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
@@ -527,6 +535,12 @@ class XPUAttentionBackend(AttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
+        # Piecewise XPU graph for prefill pre-allocates a fixed-address output
+        # buffer (_attn_output) so graph replay writes to the same storage. It is
+        # set by radix_attention only on the graph path; pass it as flash_attn's
+        # `out` solely when present (older builds lack the `out` kwarg entirely).
+        attn_output_buffer = getattr(forward_batch, "_attn_output", None)
+
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
             local_metadata = metadata.local_attn_metadata
@@ -563,7 +577,7 @@ class XPUAttentionBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             )
             value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
             )
             if layer.is_cross_attention:
                 page_table = metadata.encoder_page_table
@@ -587,18 +601,17 @@ class XPUAttentionBackend(AttentionBackend):
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,
-                # Piecewise XPU graph for prefill requires a pre-allocated
-                # output buffer at a stable device address so the graph can
-                # record writes to the same storage on every replay.
-                # _attn_output is that fixed buffer; None falls back to a
-                # freshly allocated tensor (eager / cascade-attn path).
-                out=(
-                    forward_batch._attn_output.view(
-                        -1, layer.tp_q_head_num, layer.v_head_dim
-                    )
-                    if not use_cascade_attn
-                    and getattr(forward_batch, "_attn_output", None) is not None
-                    else None
+                # `out` is injected via out_kwargs only on the graph path (buffer
+                # present, non-cascade); the eager path omits it for flash_attn
+                # builds that lack the kwarg.
+                **(
+                    {
+                        "out": attn_output_buffer.view(
+                            -1, layer.tp_q_head_num, layer.v_head_dim
+                        )
+                    }
+                    if not use_cascade_attn and attn_output_buffer is not None
+                    else {}
                 ),
                 **kwargs,
             )
@@ -853,7 +866,7 @@ class XPUAttentionBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             )
             value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
             )
 
             if layer.is_cross_attention:
@@ -1311,3 +1324,62 @@ class XPUAttentionBackend(AttentionBackend):
             metadata_swa.cu_seqlens_k.copy_(cu_seqlens_k)
 
         metadata.swa_spec_metadata = metadata_swa
+
+
+class XPUMultiStepDraftBackend:
+    """Wrap multiple XPU attention backends for consecutive draft decode steps."""
+
+    needs_cpu_seq_lens: bool = False
+
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        topk: int,
+        speculative_num_steps: int,
+    ):
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.attn_backends = [
+            XPUAttentionBackend(
+                model_runner,
+                skip_prefill=True,
+                speculative_step_id=i,
+                topk=topk,
+                speculative_num_steps=speculative_num_steps,
+            )
+            for i in range(speculative_num_steps - 1)
+        ]
+        self.max_context_len = self.attn_backends[0].max_context_len
+        self.device = model_runner.device
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata(forward_batch)
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        for attn_backend in self.attn_backends:
+            attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
+        assert forward_batch.spec_info is not None
+        assert forward_batch.spec_info.is_draft_input()
+
+        inner_fb = build_inner_fb_view(
+            forward_batch,
+            bs=forward_batch.batch_size,
+            forward_mode=ForwardMode.DECODE,
+            encoder_lens=forward_batch.encoder_lens,
+        )
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata_out_graph(inner_fb, in_capture=in_capture)
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata_in_graph(forward_batch)
