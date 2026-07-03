@@ -21,10 +21,12 @@ wrapper, not a cache. It gives call-sites one import and one naming scheme in
 place of a dozen free functions, plus a test-only ``override()`` hook to force a
 topology without monkeypatching the underlying getters.
 
-``get_server_args()`` returns the process-wide ``ServerArgs`` (the config tier).
-It is a read-through to ``server_args.get_global_server_args()`` — same object,
-same pre-publish error — so new code can adopt the context accessor while the
-legacy getter remains canonical.
+``get_server_args()`` returns the process-wide ``ServerArgs`` (the config
+tier). The context owns the storage: publishing goes through
+``RuntimeContext.set_server_args`` (the legacy
+``set_global_server_args_for_scheduler`` / ``get_global_server_args`` in
+``server_args.py`` are thin shims over this slot), and the object is returned
+by reference — the same live instance everywhere, never a copy.
 """
 
 from __future__ import annotations
@@ -48,12 +50,6 @@ def _dp():
     from sglang.srt.layers import dp_attention
 
     return dp_attention
-
-
-def _sa():
-    from sglang.srt import server_args
-
-    return server_args
 
 
 _PARALLEL_FIELDS = frozenset(
@@ -223,15 +219,29 @@ class RuntimeContext:
     """Container for the structured runtime accessors; exposes ``parallel`` and
     ``server_args``."""
 
-    __slots__ = ("parallel",)
+    __slots__ = ("parallel", "_server_args")
 
     def __init__(self, parallel: ParallelContext):
         self.parallel = parallel
+        self._server_args: ServerArgs | None = None
 
     @property
     def server_args(self) -> ServerArgs:
-        """The process-wide ``ServerArgs``, read through the global getter."""
-        return _sa().get_global_server_args()
+        """The process-wide ``ServerArgs`` (context-owned slot)."""
+        server_args = self._server_args
+        if server_args is None:
+            # Verbatim legacy message: tests and user scripts may match on it.
+            raise ValueError("Global server args is not set yet!")
+        return server_args
+
+    def set_server_args(self, server_args: ServerArgs) -> None:
+        """Publish the process-wide ``ServerArgs`` into the context-owned slot.
+
+        Overwrite-allowed: a re-publish replaces the slot (test kits re-publish
+        per test; production ordering discipline lives at the call-sites, e.g.
+        the draft-worker guard in ``ModelRunner.__init__``).
+        """
+        self._server_args = server_args
 
 
 _PARALLEL = ParallelContext()
@@ -248,3 +258,11 @@ def get_parallel() -> ParallelContext:
 
 def get_server_args() -> ServerArgs:
     return _CONTEXT.server_args
+
+
+def reset_context() -> None:
+    """Clear the context-owned store (unit-test teardown).
+
+    Wrapper subsystems (``parallel``) hold no state and are unaffected.
+    """
+    _CONTEXT._server_args = None
