@@ -712,7 +712,10 @@ class ModelConfig:
             setattr(self.hf_text_config, "head_dim", self.head_dim)
 
         self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", None)
-        if self.v_head_dim is None:
+        # MLA-disabled checkpoints (e.g. deepseek-vl2-tiny) signal "no MLA" by
+        # zeroing the head-dim fields instead of omitting them, so fall back to
+        # head_dim on 0 as well as None to avoid a zero-width V cache.
+        if not self.v_head_dim:
             self.v_head_dim = self.head_dim
             setattr(self.hf_text_config, "v_head_dim", self.v_head_dim)
 
@@ -805,6 +808,10 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+            # MiniCPM3 uses the plain MLA softmax scale with no yarn mscale;
+            # mirror MiniCPM3Attention.scaling in models/minicpm3.py.
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
         elif "DeepseekVL2ForCausalLM" in self.hf_config.architectures and getattr(
             self.hf_text_config, "use_mla", True
         ):
@@ -813,6 +820,20 @@ class ModelConfig:
             self.kv_lora_rank = self.hf_text_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
+            # VL2 (use_mla) runs a DeepseekV2 language model, so derive the MLA
+            # scale the same way, including yarn mscale.
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            rope_scaling = self.hf_text_config.rope_scaling
+            if rope_scaling:
+                rope_type = (
+                    rope_scaling.get("rope_type")
+                    or rope_scaling.get("type")
+                    or "default"
+                )
+                if rope_type != "default":
+                    self.scaling = compute_mla_mscale_scaling(
+                        rope_scaling, self.scaling
+                    )
         elif "KimiVLForConditionalGeneration" in self.hf_config.architectures:
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -820,6 +841,20 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
+            # Kimi-VL runs a DeepseekV2 language model, so derive the MLA scale
+            # the same way, including yarn mscale.
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            rope_scaling = self.hf_text_config.rope_scaling
+            if rope_scaling:
+                rope_type = (
+                    rope_scaling.get("rope_type")
+                    or rope_scaling.get("type")
+                    or "default"
+                )
+                if rope_type != "default":
+                    self.scaling = compute_mla_mscale_scaling(
+                        rope_scaling, self.scaling
+                    )
         elif "KimiLinearForCausalLM" in self.hf_config.architectures:
             self.head_dim = 72
             self.attention_arch = AttentionArch.MLA

@@ -66,6 +66,23 @@ class TestModelConfigShapes(CustomTestCase):
         self.assertEqual(model_config.swa_head_dim, 64)
         self.assertEqual(model_config.swa_v_head_dim, 48)
 
+    def test_zero_v_head_dim_falls_back_to_head_dim(self):
+        # deepseek-vl2-tiny (MLA disabled) zeroes v_head_dim instead of omitting
+        # it; it must fall back to head_dim rather than size a zero-width V cache.
+        text_config = _make_text_config(
+            architectures=["DeepseekVL2ForCausalLM"],
+            model_type="deepseek_vl_v2",
+            head_dim=None,
+            v_head_dim=0,
+            use_mla=False,
+        )
+
+        model_config = self._derive_shapes(text_config)
+
+        self.assertEqual(model_config.head_dim, 128)
+        self.assertEqual(model_config.v_head_dim, 128)
+        self.assertEqual(text_config.v_head_dim, 128)
+
 
 if __name__ == "__main__":
     unittest.main()
