@@ -23,6 +23,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardBatch,
     ForwardMode,
     compute_position,
 )
@@ -517,7 +518,93 @@ class DSparkWorkerV2(BaseSpecWorker):
             finally:
                 attn_backend.forward_metadata = old_metadata
 
-    def _materialize_disagg_prefill_hidden_to_draft_kv(
+    def _materialize_main_hidden_to_draft_state(
+        self,
+        *,
+        main_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        draft_forward_batch: Optional[ForwardBatch],
+        kv_main_hidden: Optional[torch.Tensor] = None,
+    ) -> None:
+        try:
+            self._materialize_main_hidden_to_draft_compressors(
+                main_hidden=main_hidden,
+                draft_forward_batch=draft_forward_batch,
+            )
+        except Exception as e:
+            self._materialize_draft_compressors_enabled = False
+            logger.warning(
+                "DSpark draft compressor materialization failed; "
+                "falling back to SWA-only materialization: %s",
+                e,
+            )
+        if kv_main_hidden is None:
+            kv_main_hidden = main_hidden
+        self._materialize_main_hidden_to_draft_kv(
+            main_hidden=kv_main_hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+        )
+
+    def _make_draft_prefill_forward_batch_for_materialize(
+        self, batch: ScheduleBatch
+    ) -> ForwardBatch:
+        old_capture_hidden_mode = batch.capture_hidden_mode
+        try:
+            batch.capture_hidden_mode = CaptureHiddenMode.NULL
+            draft_forward_batch = ForwardBatch.init_new(
+                batch, self.draft_model_runner
+            )
+            draft_forward_batch.return_logprob = False
+            draft_forward_batch.lora_ids = [None] * draft_forward_batch.batch_size
+            return draft_forward_batch
+        finally:
+            batch.capture_hidden_mode = old_capture_hidden_mode
+
+    def _make_draft_decode_forward_batch_for_materialize(
+        self,
+        *,
+        batch: ScheduleBatch,
+        seq_lens_before: torch.Tensor,
+        cache_loc: torch.Tensor,
+    ) -> ForwardBatch:
+        old_input_ids = batch.input_ids
+        old_out_cache_loc = batch.out_cache_loc
+        old_spec_info = batch.spec_info
+        old_forward_mode = batch.forward_mode
+        old_capture_hidden_mode = batch.capture_hidden_mode
+        old_seq_lens = batch.seq_lens
+        old_seq_lens_cpu = batch.seq_lens_cpu
+        old_seq_lens_sum = batch.seq_lens_sum
+        try:
+            batch.input_ids = torch.zeros(
+                (seq_lens_before.numel(),), dtype=torch.int64, device=self.device
+            )
+            batch.out_cache_loc = cache_loc
+            batch.spec_info = None
+            batch.forward_mode = ForwardMode.DECODE
+            batch.capture_hidden_mode = CaptureHiddenMode.NULL
+            batch.seq_lens = seq_lens_before.to(dtype=old_seq_lens.dtype)
+            batch.seq_lens_cpu = batch.seq_lens.detach().cpu()
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+            draft_forward_batch = ForwardBatch.init_new(
+                batch, self.draft_model_runner
+            )
+            draft_forward_batch.return_logprob = False
+            draft_forward_batch.lora_ids = [None] * draft_forward_batch.batch_size
+            return draft_forward_batch
+        finally:
+            batch.input_ids = old_input_ids
+            batch.out_cache_loc = old_out_cache_loc
+            batch.spec_info = old_spec_info
+            batch.forward_mode = old_forward_mode
+            batch.capture_hidden_mode = old_capture_hidden_mode
+            batch.seq_lens = old_seq_lens
+            batch.seq_lens_cpu = old_seq_lens_cpu
+            batch.seq_lens_sum = old_seq_lens_sum
+
+    def _materialize_disagg_prefill_hidden_to_draft_state(
         self,
         *,
         draft_input: DSparkDraftInputV2,
@@ -536,7 +623,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 bs,
             )
             return
-        expected_hidden_size = getattr(self.model_runner.model_config, "hidden_size", 0)
+        target_layer_ids = getattr(self._draft_inner, "target_layer_ids", None) or []
+        expected_hidden_size = int(
+            getattr(self.model_runner.model_config, "hidden_size", 0)
+        )
+        expected_hidden_size *= max(1, len(target_layer_ids))
         if expected_hidden_size and hidden.shape[-1] != expected_hidden_size:
             logger.warning(
                 "Skip DSpark PD hidden bootstrap due to hidden size mismatch: "
@@ -556,10 +647,17 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not valid.any():
             return
 
-        self._materialize_main_hidden_to_draft_kv(
+        seq_lens_before = (prefix_lens[valid].to(torch.int64) - 1).clamp_min(0)
+        draft_forward_batch = self._make_draft_decode_forward_batch_for_materialize(
+            batch=batch,
+            seq_lens_before=seq_lens_before,
+            cache_loc=cache_loc[valid],
+        )
+        self._materialize_main_hidden_to_draft_state(
             main_hidden=hidden[valid],
             cache_loc=cache_loc[valid],
             positions=positions[valid],
+            draft_forward_batch=draft_forward_batch,
         )
 
     def _write_draft_kv_from_projected_kv(
@@ -1121,10 +1219,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(extend_lens)),
         )
-        self._materialize_main_hidden_to_draft_kv(
+        draft_forward_batch = self._make_draft_prefill_forward_batch_for_materialize(
+            model_worker_batch
+        )
+        self._materialize_main_hidden_to_draft_state(
             main_hidden=logits_output.hidden_states,
             cache_loc=model_worker_batch.out_cache_loc,
             positions=positions,
+            draft_forward_batch=draft_forward_batch,
         )
 
         logits_output.hidden_states = None
@@ -1193,7 +1295,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_token_num=block_size,
             device=device,
         )
-        self._materialize_disagg_prefill_hidden_to_draft_kv(
+        self._materialize_disagg_prefill_hidden_to_draft_state(
             draft_input=draft_input,
             batch=model_worker_batch,
             prefix_lens=prefix_lens,
@@ -1348,18 +1450,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         if bs > 0:
             hidden = hidden.view(bs, block_size, -1)
             hidden_flat = hidden.reshape(-1, hidden.shape[-1])
-            try:
-                self._materialize_main_hidden_to_draft_compressors(
-                    main_hidden=hidden_flat,
-                    draft_forward_batch=draft_forward_batch,
-                )
-            except Exception as e:
-                self._materialize_draft_compressors_enabled = False
-                logger.warning(
-                    "DSpark draft compressor materialization failed; "
-                    "falling back to SWA-only materialization: %s",
-                    e,
-                )
             self._clear_unaccepted_c128_draft_states(
                 batch=model_worker_batch,
                 prefix_lens=prefix_lens,
@@ -1369,10 +1459,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._block_pos_offsets.unsqueeze(0)
                 < commit_lens.unsqueeze(1).to(torch.int64)
             ).reshape(-1)
-            self._materialize_main_hidden_to_draft_kv(
-                main_hidden=hidden_flat[commit_mask],
+            self._materialize_main_hidden_to_draft_state(
+                main_hidden=hidden_flat,
                 cache_loc=verify_out_cache_loc[commit_mask],
                 positions=positions[commit_mask],
+                draft_forward_batch=draft_forward_batch,
+                kv_main_hidden=hidden_flat[commit_mask],
             )
 
         logits_output.hidden_states = None

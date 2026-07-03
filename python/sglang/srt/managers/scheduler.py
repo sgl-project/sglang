@@ -1133,7 +1133,13 @@ class Scheduler(
             # DSpark PD sends target main hidden states so the decode node can
             # materialize draft-side cache locally. This is not the draft
             # recurrent hidden size used by EAGLE-family algorithms.
-            disagg_hidden_size = self.model_config.hidden_size
+            dspark_target_layer_ids = (
+                getattr(self.tp_worker.model_runner, "dspark_target_layer_ids", None)
+                or []
+            )
+            disagg_hidden_size = max(1, len(dspark_target_layer_ids)) * int(
+                self.model_config.hidden_size
+            )
             disagg_hidden_states_dtype = self.model_config.dtype
         elif self.spec_algorithm.carries_draft_hidden_states():
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
