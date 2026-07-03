@@ -31,7 +31,7 @@ def build_dspark_disagg_draft_input(
     future_map: FutureMap,
 ) -> DSparkDraftInputV2:
     del server_args
-    warmup_rounds = max(0, _env_int("SGLANG_DSPARK_TRANSFER_WARMUP_ROUNDS", 4))
+    warmup_rounds = max(0, _env_int("SGLANG_DSPARK_TRANSFER_WARMUP_ROUNDS", 0))
 
     spec_info = DSparkDraftInputV2(
         bonus_tokens=last_tokens_tensor.to(dtype=torch.int64),

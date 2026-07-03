@@ -654,6 +654,44 @@ def append_state_component(
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
 
 
+def append_swa_state_components(
+    kv_args: KVArgs,
+    pool,
+    *,
+    include_swa: bool = True,
+) -> None:
+    """Append SWA-family PD state components for DeepSeek-V4-like pools."""
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    if include_swa:
+        data_ptrs, data_lens, item_lens = pool.get_state_buf_infos()
+        append_state_component(kv_args, StateType.SWA, data_ptrs, data_lens, item_lens)
+
+    if getattr(pool, "_unified_kv", False) and hasattr(
+        pool, "get_unified_swa_ring_buf_infos"
+    ):
+        ring_ptrs, ring_lens, ring_item_lens = pool.get_unified_swa_ring_buf_infos()
+        if ring_ptrs:
+            append_state_component(
+                kv_args,
+                StateType.SWA_RING,
+                ring_ptrs,
+                ring_lens,
+                ring_item_lens,
+            )
+
+    if hasattr(pool, "get_c128_state_buf_infos"):
+        c128_ptrs, c128_lens, c128_item_lens = pool.get_c128_state_buf_infos()
+        if c128_ptrs:
+            append_state_component(
+                kv_args,
+                StateType.C128_STATE,
+                c128_ptrs,
+                c128_lens,
+                c128_item_lens,
+            )
+
+
 def setup_state_kv_args(
     kv_args: KVArgs,
     token_to_kv_pool,
@@ -695,37 +733,13 @@ def setup_state_kv_args(
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
         # state list is described per-entry via get_state_buf_infos.
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
-            append_state_component(
-                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
-            )
-            # unified_kv: the SWA ring lives in the unified buffers (no separate
-            # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.
-            if getattr(token_to_kv_pool, "_unified_kv", False) and hasattr(
-                token_to_kv_pool, "get_unified_swa_ring_buf_infos"
+            append_swa_state_components(kv_args, token_to_kv_pool)
+            if (
+                draft_token_to_kv_pool is not None
+                and draft_token_to_kv_pool is not token_to_kv_pool
+                and isinstance(draft_token_to_kv_pool, BaseSWAKVPool)
             ):
-                ring_ptrs, ring_lens, ring_item_lens = (
-                    token_to_kv_pool.get_unified_swa_ring_buf_infos()
-                )
-                if ring_ptrs:
-                    append_state_component(
-                        kv_args,
-                        StateType.SWA_RING,
-                        ring_ptrs,
-                        ring_lens,
-                        ring_item_lens,
-                    )
-            if hasattr(token_to_kv_pool, "get_c128_state_buf_infos"):
-                c128_ptrs, c128_lens, c128_item_lens = (
-                    token_to_kv_pool.get_c128_state_buf_infos()
-                )
-                if c128_ptrs:
-                    append_state_component(
-                        kv_args,
-                        StateType.C128_STATE,
-                        c128_ptrs,
-                        c128_lens,
-                        c128_item_lens,
-                    )
+                append_swa_state_components(kv_args, draft_token_to_kv_pool)
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (
                 token_to_kv_pool.get_state_dim_per_tensor()
