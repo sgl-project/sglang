@@ -42,6 +42,31 @@ import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
+if not hasattr(torch, "get_device_module"):
+
+    def _get_device_module(device: Any = None):
+        if device is None:
+            if torch.cuda.is_available():
+                return torch.cuda
+            if hasattr(torch, "xpu") and torch.xpu.is_available():
+                return torch.xpu
+            if torch.backends.mps.is_available():
+                return torch.mps
+            return torch.cpu
+
+        device = torch.device(device)
+        if device.type == "cuda":
+            return torch.cuda
+        if device.type == "xpu" and hasattr(torch, "xpu"):
+            return torch.xpu
+        if device.type == "mps":
+            return torch.mps
+        if device.type == "cpu":
+            return torch.cpu
+        raise ValueError(f"Unknown device module: {device.type}")
+
+    torch.get_device_module = _get_device_module
+
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.distributed.utils import set_global_tcp_store
@@ -1924,7 +1949,9 @@ def init_distributed_environment(
             "distributed_init_method must be provided when initializing "
             "distributed environment"
         )
-        if timeout is not None:
+        if timeout is None:
+            timeout = timedelta(seconds=1800)
+        else:
             assert isinstance(timeout, (int)), "timeout must be a number"
             assert timeout > 0, "timeout must be positive"
             timeout = timedelta(seconds=timeout)

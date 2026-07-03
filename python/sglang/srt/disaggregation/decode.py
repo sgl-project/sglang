@@ -74,7 +74,6 @@ from sglang.srt.mem_cache.common import (
     page_align_floor,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     KVCache,
@@ -97,6 +96,10 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
+
+
+def _is_deepseek_v4_token_to_kv_pool(token_to_kv_pool) -> bool:
+    return type(token_to_kv_pool).__name__ == "DeepSeekV4TokenToKVPool"
 
 
 def _bootstrap_addr(req: Req) -> str:
@@ -349,7 +352,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
-            isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
+            (
+                isinstance(self.token_to_kv_pool, SWAKVPool)
+                or _is_deepseek_v4_token_to_kv_pool(self.token_to_kv_pool)
+            )
             and self.token_to_kv_pool_allocator.page_size > 1
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
@@ -410,8 +416,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.scheduler.enable_hisparse
             else ["VRAM"] * len(kv_data_ptrs)
         )
-        if self.scheduler.enable_hisparse and isinstance(
-            self.token_to_kv_pool, DeepSeekV4TokenToKVPool
+        if self.scheduler.enable_hisparse and _is_deepseek_v4_token_to_kv_pool(
+            self.token_to_kv_pool
         ):
             device_kv_data_ptrs, device_kv_data_lens, device_kv_item_lens = (
                 self.token_to_kv_pool.get_contiguous_buf_infos()

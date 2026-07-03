@@ -19,10 +19,17 @@ from sglang.srt.model_executor.runner_utils.capture_mode import (  # noqa: F401
     get_is_capture_mode,
     model_capture_mode,
 )
-from sglang.srt.model_executor.runner_utils.deepep_adapter import (  # noqa: F401
-    DeepEPCudaGraphRunnerAdapter,
-)
 from sglang.srt.model_executor.runner_utils.pool import (  # noqa: F401
     get_global_graph_memory_pool,
     set_global_graph_memory_pool,
 )
+
+
+def __getattr__(name: str):
+    if name == "DeepEPCudaGraphRunnerAdapter":
+        from sglang.srt.model_executor.runner_utils.deepep_adapter import (
+            DeepEPCudaGraphRunnerAdapter,
+        )
+
+        return DeepEPCudaGraphRunnerAdapter
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

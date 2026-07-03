@@ -4,6 +4,7 @@ import os
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
+from packaging import version as pkg_version
 
 from sglang.jit_kernel.utils import cache_once, load_jit, override_jit_cuda_arch
 from sglang.kernel_api_logging import debug_kernel_api
@@ -14,7 +15,22 @@ if TYPE_CHECKING:
 
 
 _FLOAT4_E2M1_MAX = 6.0
-_FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+
+def _get_fp8_e4m3_max() -> float:
+    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+    if fp8_dtype is None:
+        return 448.0
+    if pkg_version.parse(torch.__version__).release < (2, 3):
+        return 448.0
+    try:
+        return torch.finfo(fp8_dtype).max
+    except RuntimeError:
+        # CUDA 12.2-era PyTorch builds may expose the dtype before finfo support.
+        return 448.0
+
+
+_FLOAT8_E4M3_MAX = _get_fp8_e4m3_max()
 
 
 def _nvfp4_cuda_flags() -> list[str]:

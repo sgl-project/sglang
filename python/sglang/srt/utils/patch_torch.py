@@ -132,7 +132,11 @@ def register_fake_if_exists(op_name):
     def decorator(func):
         namespace, bare_op = op_name.split("::")
         ops_namespace = getattr(torch.ops, namespace, None)
-        if ops_namespace and hasattr(ops_namespace, bare_op):
+        if (
+            ops_namespace
+            and hasattr(ops_namespace, bare_op)
+            and hasattr(torch.library, "register_fake")
+        ):
             torch.library.register_fake(op_name, func)
         return func
 

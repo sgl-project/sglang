@@ -22,12 +22,6 @@ from sglang.srt.layers.amx_utils import (
     _amx_process_weight_after_loading,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
-from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-    FlashInferTrtllmFp8MoeQuantInfo,
-)
-from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     get_moe_a2a_backend,
@@ -101,7 +95,13 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe import MoeRunnerConfig
+    from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        FlashInferTrtllmFp8MoeQuantInfo,
+    )
     from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
+    from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
     from sglang.srt.models.utils import WeightsMapper
@@ -1764,6 +1764,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
+
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
@@ -1792,6 +1794,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             pass
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
+        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+
         return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
@@ -1967,6 +1971,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     .unsqueeze(2)
                     .repeat_interleave(w2_scale_k, dim=2)
                 )
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+                DeepGemmMoeQuantInfo,
+            )
+
             quant_info = DeepGemmMoeQuantInfo(
                 w13_weight=w13_weight,
                 w2_weight=w2_weight,
@@ -1989,6 +1997,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             moe_ep_rank = int(getattr(layer, "moe_ep_rank"))
 
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                FlashInferTrtllmFp8MoeQuantInfo,
                 get_activation_type,
             )
 

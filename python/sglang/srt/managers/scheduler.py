@@ -81,8 +81,6 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
-from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
-from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -954,9 +952,11 @@ class Scheduler(
             )
 
     def init_hisparse_coordinator(self) -> None:
-        self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        self.hisparse_coordinator: Optional["HiSparseCoordinator"] = None
         if not self.enable_hisparse:
             return
+
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 
         # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
@@ -1704,6 +1704,8 @@ class Scheduler(
 
     def init_lora_overlap_loader(self) -> None:
         if self.enable_lora_overlap_loading:
+            from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+
             self.lora_overlap_loader = LoRAOverlapLoader(
                 self.tp_worker.model_runner.lora_manager
             )

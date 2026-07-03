@@ -19,6 +19,11 @@ limitations under the License.
 
 #include <torch/library.h>
 
+#include <tuple>
+#include <optional>
+#include <type_traits>
+#include <utility>
+
 /**
  * Unfortunately, the type signatures of the flash_attn ops are not compatible
  * with the PyTorch library bindings. To get around that we use
@@ -53,7 +58,7 @@ template <typename T>
 using pytorch_library_compatible_type_t = typename pytorch_library_compatible_type<T>::type;
 
 template <typename T>
-T convert_from_pytorch_compatible_type(pytorch_library_compatible_type_t<T> arg) {
+decltype(auto) convert_from_pytorch_compatible_type(pytorch_library_compatible_type_t<T> arg) {
   return pytorch_library_compatible_type<T>::convert_from_type(arg);
 }
 
@@ -110,13 +115,96 @@ struct pytorch_library_compatible_type<float> {
   }
 };
 
+template <>
+struct pytorch_library_compatible_type<const bool&> {
+  using type = bool;
+  static bool convert_from_type(bool arg) {
+    return arg;
+  }
+};
+
+// Map `std::optional<T>` -> `c10::optional<pytorch_library_compatible_type_t<T>>`.
+// Older PyTorch dispatcher versions, including the CUDA 12.2 NGC stack, do not
+// box `std::optional` directly for custom ops.
+template <typename T>
+struct pytorch_library_compatible_type<std::optional<T>> {
+  using type = c10::optional<pytorch_library_compatible_type_t<T>>;
+  static std::optional<T> convert_from_type(type arg) {
+    if (!arg.has_value()) {
+      return std::nullopt;
+    }
+    return std::optional<T>(convert_from_pytorch_compatible_type<T>(*arg));
+  }
+};
+
+template <typename T>
+struct pytorch_library_compatible_type<const std::optional<T>&> {
+  using type = const c10::optional<pytorch_library_compatible_type_t<T>>&;
+  static std::optional<T> convert_from_type(type arg) {
+    if (!arg.has_value()) {
+      return std::nullopt;
+    }
+    return std::optional<T>(convert_from_pytorch_compatible_type<T>(*arg));
+  }
+};
+
+template <typename T>
+struct pytorch_library_return_type {
+  using type = T;
+  static T convert_from_type(T arg) {
+    return arg;
+  }
+};
+
+template <typename T>
+using pytorch_library_return_type_t = typename pytorch_library_return_type<T>::type;
+
+template <>
+struct pytorch_library_return_type<void> {
+  using type = void;
+};
+
+template <typename T>
+struct pytorch_library_return_type<std::optional<T>> {
+  using type = c10::optional<pytorch_library_return_type_t<T>>;
+  static type convert_from_type(std::optional<T> arg) {
+    if (!arg.has_value()) {
+      return c10::nullopt;
+    }
+    return pytorch_library_return_type<T>::convert_from_type(std::move(*arg));
+  }
+};
+
+template <typename... Args>
+struct pytorch_library_return_type<std::tuple<Args...>> {
+  using type = std::tuple<pytorch_library_return_type_t<Args>...>;
+
+  template <std::size_t... I>
+  static type convert_from_tuple(std::tuple<Args...> arg, std::index_sequence<I...>) {
+    return type(pytorch_library_return_type<Args>::convert_from_type(std::move(std::get<I>(arg)))...);
+  }
+
+  static type convert_from_type(std::tuple<Args...> arg) {
+    return convert_from_tuple(std::move(arg), std::index_sequence_for<Args...>{});
+  }
+};
+
+template <typename T>
+pytorch_library_return_type_t<T> convert_to_pytorch_compatible_return(T arg) {
+  return pytorch_library_return_type<T>::convert_from_type(std::move(arg));
+}
+
 //
 //  Shim Utils
 //
 
 template <typename Ret, typename... Args>
 auto make_pytorch_shim(Ret (*fun)(Args... args)) {
-  return [fun](pytorch_library_compatible_type_t<Args>... args) {
-    return fun(convert_from_pytorch_compatible_type<Args>(args)...);
+  return [fun](pytorch_library_compatible_type_t<Args>... args) -> pytorch_library_return_type_t<Ret> {
+    if constexpr (std::is_void_v<Ret>) {
+      fun(convert_from_pytorch_compatible_type<Args>(args)...);
+    } else {
+      return convert_to_pytorch_compatible_return<Ret>(fun(convert_from_pytorch_compatible_type<Args>(args)...));
+    }
   };
 }

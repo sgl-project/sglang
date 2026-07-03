@@ -188,6 +188,6 @@ void es_fp8_blockwise_scaled_grouped_mm(
   end_event_1.block(stream);
 #else
   TORCH_CHECK_NOT_IMPLEMENTED(
-      can_implement, "No implemented fp8_blockwise_scaled_grouped_mm for current compute capability: ", sm_version);
+      false, "No implemented fp8_blockwise_scaled_grouped_mm for the current compute capability in this build");
 #endif
 }

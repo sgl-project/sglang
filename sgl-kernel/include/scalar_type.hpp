@@ -1,5 +1,7 @@
 #pragma once
 
+#include <variant>
+
 // For TORCH_CHECK
 #include <torch/library.h>
 
@@ -36,7 +38,7 @@ class ScalarType {
         signed_(signed_),
         bias(bias),
         finite_values_only(finite_values_only),
-        nan_repr(nan_repr) {};
+        nan_repr(nan_repr){};
 
   static constexpr ScalarType int_(uint8_t size_bits, int32_t bias = 0) {
     return ScalarType(0, size_bits - 1, true, bias);

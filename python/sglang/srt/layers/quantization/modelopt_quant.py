@@ -11,15 +11,10 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe import (
-    MoeRunner,
-    MoeRunnerBackend,
-    MoeRunnerConfig,
-    get_moe_runner_backend,
-)
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
-from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
+    MoeRunnerBackend,
+    get_moe_runner_backend,
     is_flashinfer_cutedsl_v1_path,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -70,7 +65,9 @@ from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe import MoeRunnerConfig
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
@@ -1008,6 +1005,8 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        from sglang.srt.layers.moe import MoeRunner
+
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_flashinfer_cutlass():
@@ -1103,6 +1102,8 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 apply_routed_scaling_factor=not layer.should_fuse_routed_scaling_factor_in_topk,
             )
             return self.runner.run(dispatch_output, quant_info)
+
+        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 
         quant_info = TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
@@ -2249,6 +2250,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        from sglang.srt.layers.moe import MoeRunner
+
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 

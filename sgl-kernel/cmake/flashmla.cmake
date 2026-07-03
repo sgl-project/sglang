@@ -1,4 +1,16 @@
 # flash_mla
+set(DEFAULT_SGL_KERNEL_ENABLE_FLASHMLA OFF)
+if("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
+    set(DEFAULT_SGL_KERNEL_ENABLE_FLASHMLA ON)
+endif()
+option(SGL_KERNEL_ENABLE_FLASHMLA "Enable FlashMLA ops" ${DEFAULT_SGL_KERNEL_ENABLE_FLASHMLA})
+
+# The FlashMLA kernels only work on Hopper and require CUDA 12.4 or later.
+if(NOT SGL_KERNEL_ENABLE_FLASHMLA)
+    message(STATUS "Skipping flashmla_ops because FlashMLA requires CUDA >= 12.4")
+    return()
+endif()
+
 # sm90 dense decode HEAD_DIM_K=512 support (sgl-project/FlashMLA#9, merged).
 FetchContent_Declare(
     repo-flashmla
@@ -26,15 +38,12 @@ set(FLASHMLA_CUDA_FLAGS
 
 set(FLASHMLA_ENABLE_SM100 OFF)
 
-# The FlashMLA kernels only work on hopper and require CUDA 12.4 or later.
-# Only build FlashMLA kernels if we are building for something compatible with
-# sm90a
-if(${CUDA_VERSION} VERSION_GREATER 12.4)
+if("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
 endif()
-if(${CUDA_VERSION} VERSION_GREATER 12.8)
+if("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
     )

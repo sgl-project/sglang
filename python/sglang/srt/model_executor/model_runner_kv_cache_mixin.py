@@ -24,17 +24,11 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.allocator.hisparse import (
-    DeepSeekV4HiSparseTokenToKVPoolAllocator,
-    HiSparseTokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -683,6 +677,10 @@ class ModelRunnerKVCacheMixin:
                     max_num_reqs=self.max_running_requests,
                 )
             else:
+                from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                    DeepSeekV4TokenToKVPool,
+                )
+
                 pool_cls = DeepSeekV4TokenToKVPool
                 c4_state_pool_size = self.c4_state_pool_size
                 c128_state_pool_size = self.c128_state_pool_size
@@ -842,16 +840,19 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_dsa_model:
-            PoolCls = (
-                HiSparseDSATokenToKVPool if self.enable_hisparse else DSATokenToKVPool
-            )
             pool_kwargs = {}
             if self.enable_hisparse:
+                from sglang.srt.mem_cache.hisparse_memory_pool import (
+                    HiSparseDSATokenToKVPool,
+                )
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
+                PoolCls = HiSparseDSATokenToKVPool
                 pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                     self.server_args
                 ).host_to_device_ratio
+            else:
+                PoolCls = DSATokenToKVPool
             self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -1113,6 +1114,9 @@ class ModelRunnerKVCacheMixin:
                     )
                 else:
                     if self.enable_hisparse:
+                        from sglang.srt.mem_cache.allocator.hisparse import (
+                            HiSparseTokenToKVPoolAllocator,
+                        )
                         from sglang.srt.mem_cache.sparsity import (
                             parse_hisparse_config,
                         )
@@ -1148,6 +1152,10 @@ class ModelRunnerKVCacheMixin:
                         )
 
             if self.enable_hisparse and is_dsv4_model:
+                from sglang.srt.mem_cache.allocator.hisparse import (
+                    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+                )
+
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
                 self.token_to_kv_pool_allocator = (
                     DeepSeekV4HiSparseTokenToKVPoolAllocator(

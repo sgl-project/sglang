@@ -18,6 +18,8 @@ limitations under the License.
 // https://github.com/NVIDIA/TensorRT-LLM/blob/v0.16.0/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm_kernel_template_sm89.h
 // https://github.com/NVIDIA/TensorRT-LLM/blob/v0.16.0/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm_kernel_template_sm90.h
 
+#include <optional>
+
 #include <ATen/cuda/CUDAContext.h>
 #include <cudaTypedefs.h>
 #include <cutlass/arch/arch.h>
@@ -558,7 +560,7 @@ struct DeviceGemmFp8RowwiseSm100 {
   static ArgumentType prepare_args(
       torch::Tensor const& a_scales,
       torch::Tensor const& b_scales,
-      std::optional<torch::Tensor> const& bias = std::nullopt) {
+      const c10::optional<torch::Tensor>& bias = c10::nullopt) {
     auto a_args = args_from_tensor<ScaleA, float>(a_scales);
     auto b_args = args_from_tensor<ScaleB, float>(b_scales);
 
@@ -933,7 +935,7 @@ struct DeviceGemmFp8RowwiseSm120 {
   static ArgumentType prepare_args(
       torch::Tensor const& a_scales,
       torch::Tensor const& b_scales,
-      std::optional<torch::Tensor> const& bias = std::nullopt) {
+      const c10::optional<torch::Tensor>& bias = c10::nullopt) {
     auto a_args = args_from_tensor<ScaleA, float>(a_scales);
     auto b_args = args_from_tensor<ScaleB, float>(b_scales);
 

@@ -21,43 +21,7 @@ from typing import Any, Dict, Optional, Type, Union
 import torch
 from huggingface_hub import snapshot_download
 
-from sglang.srt.configs import (
-    AfmoeConfig,
-    BailingHybridConfig,
-    ChatGLMConfig,
-    DbrxConfig,
-    DeepseekVL2Config,
-    DotsOCRConfig,
-    DotsVLMConfig,
-    ExaoneConfig,
-    FalconH1Config,
-    GraniteMoeHybridConfig,
-    InternS2PreviewConfig,
-    JetNemotronConfig,
-    JetVLMConfig,
-    KimiK25Config,
-    KimiLinearConfig,
-    KimiVLConfig,
-    LagunaConfig,
-    LocateAnythingConfig,
-    LongcatFlashConfig,
-    MiniCPMV4_6Config,
-    MiniCPMV4_6VisionConfig,
-    MultiModalityConfig,
-    NemotronH_Nano_Omni_Reasoning_V3_Config,
-    NemotronH_Nano_VL_V2_Config,
-    NemotronHConfig,
-    NemotronHPuzzleConfig,
-    Olmo3Config,
-    Qwen3_5Config,
-    Qwen3_5MoeConfig,
-    Qwen3NextConfig,
-    Step3p5Config,
-    Step3p7Config,
-    Step3VLConfig,
-)
-from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
-from sglang.srt.configs.internvl import InternVLChatConfig
+from sglang.srt import configs as sgl_configs
 from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
@@ -77,43 +41,59 @@ from transformers import PretrainedConfig
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     cls.model_type: cls
     for cls in [
-        AfmoeConfig,
-        BailingHybridConfig,
-        ChatGLMConfig,
-        DbrxConfig,
-        ExaoneConfig,
-        DeepseekVL2Config,
-        MultiModalityConfig,
-        KimiVLConfig,
-        LocateAnythingConfig,
-        InternVLChatConfig,
-        LagunaConfig,
-        Step3VLConfig,
-        LongcatFlashConfig,
-        Olmo3Config,
-        KimiLinearConfig,
-        Qwen3NextConfig,
-        FalconH1Config,
-        GraniteMoeHybridConfig,
-        DotsVLMConfig,
-        DotsOCRConfig,
-        NemotronH_Nano_VL_V2_Config,
-        NemotronH_Nano_Omni_Reasoning_V3_Config,
-        NemotronHConfig,
-        NemotronHPuzzleConfig,
-        DeepseekVLV2Config,
-        Qwen3_5Config,
-        Qwen3_5MoeConfig,
-        InternS2PreviewConfig,
-        JetNemotronConfig,
-        JetVLMConfig,
-        KimiK25Config,
-        Step3p5Config,
-        Step3p7Config,
-        MiniCPMV4_6Config,
-        MiniCPMV4_6VisionConfig,
+        getattr(sgl_configs, name, None)
+        for name in (
+            "AfmoeConfig",
+            "BailingHybridConfig",
+            "ChatGLMConfig",
+            "DbrxConfig",
+            "ExaoneConfig",
+            "DeepseekVL2Config",
+            "MultiModalityConfig",
+            "KimiVLConfig",
+            "LocateAnythingConfig",
+            "LagunaConfig",
+            "Step3VLConfig",
+            "LongcatFlashConfig",
+            "Olmo3Config",
+            "KimiLinearConfig",
+            "Qwen3NextConfig",
+            "FalconH1Config",
+            "GraniteMoeHybridConfig",
+            "DotsVLMConfig",
+            "DotsOCRConfig",
+            "NemotronH_Nano_VL_V2_Config",
+            "NemotronH_Nano_Omni_Reasoning_V3_Config",
+            "NemotronHConfig",
+            "NemotronHPuzzleConfig",
+            "Qwen3_5Config",
+            "Qwen3_5MoeConfig",
+            "InternS2PreviewConfig",
+            "JetNemotronConfig",
+            "JetVLMConfig",
+            "KimiK25Config",
+            "Step3p5Config",
+            "Step3p7Config",
+            "MiniCPMV4_6Config",
+            "MiniCPMV4_6VisionConfig",
+        )
     ]
+    if cls is not None
 }
+
+try:
+    from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
+
+    _CONFIG_REGISTRY[DeepseekVLV2Config.model_type] = DeepseekVLV2Config
+except (ImportError, ModuleNotFoundError, AttributeError):
+    pass
+
+try:
+    from sglang.srt.configs.internvl import InternVLChatConfig
+
+    _CONFIG_REGISTRY[InternVLChatConfig.model_type] = InternVLChatConfig
+except (ImportError, ModuleNotFoundError, AttributeError):
+    pass
 
 # DeepSeek V3.2 / V4 reuse the V3 config schema. Subclass the upstream
 # transformers class with each model_type so AutoConfig.register passes its

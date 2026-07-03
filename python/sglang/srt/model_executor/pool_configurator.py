@@ -31,7 +31,6 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.common import get_alloc_len_per_decode
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.utils.common import (
     ceil_align,
@@ -70,6 +69,16 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def get_compress_state_ring_size(
+    compress_ratio: int, is_speculative: bool = False
+) -> int:
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+        get_compress_state_ring_size as _get_compress_state_ring_size,
+    )
+
+    return _get_compress_state_ring_size(compress_ratio, is_speculative)
 
 
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:

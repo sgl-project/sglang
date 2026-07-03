@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -14,6 +15,55 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+@lru_cache(maxsize=1)
+def _sdpa_supports_enable_gqa() -> bool:
+    q = torch.empty((1, 1, 1, 1), device="cpu")
+    try:
+        scaled_dot_product_attention(q, q, q, enable_gqa=False)
+        return True
+    except TypeError as e:
+        if "enable_gqa" in str(e):
+            return False
+        raise
+
+
+def _scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    attn_mask: Optional[torch.Tensor],
+    enable_gqa: bool,
+    scale: Optional[float],
+    is_causal: bool,
+) -> torch.Tensor:
+    if _sdpa_supports_enable_gqa():
+        return scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            enable_gqa=enable_gqa,
+            scale=scale,
+            is_causal=is_causal,
+        )
+
+    if enable_gqa and query.shape[-3] != key.shape[-3]:
+        assert query.shape[-3] % key.shape[-3] == 0
+        repeat_factor = query.shape[-3] // key.shape[-3]
+        key = key.repeat_interleave(repeat_factor, dim=-3)
+        value = value.repeat_interleave(repeat_factor, dim=-3)
+
+    return scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=attn_mask,
+        scale=scale,
+        is_causal=is_causal,
+    )
 
 
 class TorchNativeAttnBackend(AttentionBackend):
@@ -157,7 +207,7 @@ class TorchNativeAttnBackend(AttentionBackend):
                 is_causal = False
 
             per_req_out_redudant = (
-                scaled_dot_product_attention(
+                _scaled_dot_product_attention(
                     per_req_query_redudant.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
@@ -259,7 +309,7 @@ class TorchNativeAttnBackend(AttentionBackend):
                 is_causal = False
 
             per_req_out = (
-                scaled_dot_product_attention(
+                _scaled_dot_product_attention(
                     per_req_query.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),

@@ -72,6 +72,8 @@ from typing import (
     Tuple,
     TypeVar,
     Union,
+    get_args,
+    get_origin,
 )
 from unittest import SkipTest
 from unittest.case import _ShouldStop
@@ -104,6 +106,41 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
+
+
+def _install_triton_jit_launch_metadata_compat() -> None:
+    try:
+        import triton
+    except Exception:
+        return
+
+    if "launch_metadata" in inspect.signature(triton.jit).parameters:
+        return
+    if getattr(triton.jit, "_sglang_launch_metadata_compat", False):
+        return
+
+    original_jit = triton.jit
+
+    def _jit_compat(*args, **kwargs):
+        kwargs.pop("launch_metadata", None)
+        return original_jit(*args, **kwargs)
+
+    _jit_compat._sglang_launch_metadata_compat = True
+    _jit_compat._sglang_original_jit = original_jit
+    triton.jit = _jit_compat
+
+
+_install_triton_jit_launch_metadata_compat()
+
+
+def _get_fp8_e4m3_max() -> float:
+    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+    if fp8_dtype is None or torch_release < (2, 3):
+        return 448.0
+    try:
+        return torch.finfo(fp8_dtype).max
+    except RuntimeError:
+        return 448.0
 
 
 class Range(NamedTuple):
@@ -145,7 +182,7 @@ if is_hip():
     HIP_FP8_E4M3_FNUZ_MAX = 224.0
     FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX
 else:
-    FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+    FP8_E4M3_MAX = _get_fp8_e4m3_max()
 
 FP8_E4M3_MIN = -FP8_E4M3_MAX
 
@@ -810,7 +847,7 @@ def set_random_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    if torch.xpu.is_available():
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
         torch.xpu.manual_seed_all(seed)
 
 
@@ -2229,6 +2266,141 @@ def get_compiler_backend(mode=None) -> str:
 sglang_lib = Library("sglang", "FRAGMENT")  # noqa
 
 
+def _infer_custom_op_schema_compat(
+    op_func: Callable,
+    mutates_args: List[str],
+) -> str:
+    def _annotation_name(annotation: Any) -> str:
+        if annotation is inspect.Signature.empty:
+            return ""
+        if isinstance(annotation, str):
+            return annotation.replace("typing.", "").replace("torch.", "")
+        return getattr(annotation, "__name__", str(annotation)).replace("typing.", "")
+
+    def _is_tensor(annotation: Any) -> bool:
+        return annotation is torch.Tensor or _annotation_name(annotation) in (
+            "Tensor",
+            "torch.Tensor",
+        )
+
+    def _is_optional(annotation: Any) -> bool:
+        origin = get_origin(annotation)
+        args = get_args(annotation)
+        if origin is Union and type(None) in args:
+            return True
+        name = _annotation_name(annotation)
+        return (
+            name.startswith("Optional[")
+            or name.startswith("Union[")
+            or " | None" in name
+            or "None | " in name
+        )
+
+    def _optional_arg(annotation: Any) -> Any:
+        origin = get_origin(annotation)
+        args = get_args(annotation)
+        if origin is Union and type(None) in args:
+            non_none = [arg for arg in args if arg is not type(None)]
+            return non_none[0] if len(non_none) == 1 else annotation
+        name = _annotation_name(annotation)
+        if name.startswith("Optional[") and name.endswith("]"):
+            return name[len("Optional[") : -1]
+        if name.startswith("Union[") and name.endswith("]"):
+            parts = [part.strip() for part in name[len("Union[") : -1].split(",")]
+            non_none = [part for part in parts if part not in ("None", "NoneType")]
+            return non_none[0] if len(non_none) == 1 else annotation
+        for sep in (" | None", "None | "):
+            if sep in name:
+                return name.replace(sep, "")
+        return annotation
+
+    def _is_tensor_list(annotation: Any) -> bool:
+        origin = get_origin(annotation)
+        args = get_args(annotation)
+        if origin in (list, List, Sequence) and args:
+            return _is_tensor(args[0])
+        return _annotation_name(annotation) in (
+            "List[Tensor]",
+            "List[torch.Tensor]",
+            "list[Tensor]",
+            "list[torch.Tensor]",
+            "Sequence[Tensor]",
+            "Sequence[torch.Tensor]",
+        )
+
+    def _schema_type(annotation: Any, name: str) -> str:
+        alias = ""
+        if name in mutates_args:
+            alias = f"({chr(ord('a') + mutates_args.index(name))}!)"
+        optional = _is_optional(annotation)
+        base = _optional_arg(annotation) if optional else annotation
+        base_name = _annotation_name(base)
+
+        if _is_tensor(base):
+            return f"Tensor{'?' if optional else ''}{alias}"
+        if _is_tensor_list(base):
+            return f"Tensor[]{alias}"
+        if base is torch.dtype or base_name in ("dtype", "torch.dtype"):
+            return f"ScalarType{'?' if optional else ''}"
+        if base is torch.device or base_name in ("device", "torch.device"):
+            return f"Device{'?' if optional else ''}"
+        if base is int or base_name == "int":
+            return f"SymInt{'?' if optional else ''}"
+        if base is float or base_name == "float":
+            return f"float{'?' if optional else ''}"
+        if base is bool or base_name == "bool":
+            return f"bool{'?' if optional else ''}"
+        if base is str or base_name == "str":
+            return f"str{'?' if optional else ''}"
+        raise TypeError(
+            f"Cannot infer custom op schema for argument {name!r} "
+            f"with annotation {annotation!r}"
+        )
+
+    def _return_type(annotation: Any) -> str:
+        if annotation in (None, type(None), inspect.Signature.empty) or annotation == "None":
+            return "()"
+        if _is_tensor(annotation):
+            return "Tensor"
+        if _is_tensor_list(annotation):
+            return "Tensor[]"
+        origin = get_origin(annotation)
+        args = get_args(annotation)
+        name = _annotation_name(annotation)
+        if origin in (tuple, Tuple) and args and all(_is_tensor(arg) for arg in args):
+            return f"({', '.join('Tensor' for _ in args)})"
+        if name.startswith(("Tuple[", "tuple[")) and "Tensor" in name:
+            count = name.count("Tensor")
+            return f"({', '.join('Tensor' for _ in range(count))})"
+        return _schema_type(annotation, "")
+
+    def _schema_default(default: Any) -> str:
+        if default is inspect.Parameter.empty:
+            return ""
+        if default is None:
+            return "=None"
+        if isinstance(default, bool):
+            return f"={default}"
+        if isinstance(default, (int, float)):
+            return f"={default}"
+        if isinstance(default, str):
+            return f"={default!r}"
+        return ""
+
+    signature = inspect.signature(op_func)
+    args = []
+    inserted_kw_marker = False
+    for name, param in signature.parameters.items():
+        if param.kind is inspect.Parameter.KEYWORD_ONLY and not inserted_kw_marker:
+            args.append("*")
+            inserted_kw_marker = True
+        args.append(
+            f"{_schema_type(param.annotation, name)} {name}"
+            f"{_schema_default(param.default)}"
+        )
+    return f"({', '.join(args)}) -> {_return_type(signature.return_annotation)}"
+
+
 def direct_register_custom_op(
     op_name: str,
     op_func: Callable,
@@ -2282,7 +2454,16 @@ def direct_register_custom_op(
         # for pytorch 2.4
         import torch._custom_op.impl
 
-        schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
+        if torch_release < (2, 4):
+            schema_str = _infer_custom_op_schema_compat(op_func, mutates_args)
+        else:
+            try:
+                schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
+            except TypeError:
+                try:
+                    schema_str = torch._custom_op.impl.infer_schema(op_func)
+                except ValueError:
+                    schema_str = _infer_custom_op_schema_compat(op_func, mutates_args)
 
     try:
         my_lib.define(op_name + schema_str)
@@ -2295,7 +2476,7 @@ def direct_register_custom_op(
             my_lib.impl(op_name, op_func, "MUSA")
         else:
             my_lib.impl(op_name, op_func, "CUDA")
-        if fake_impl is not None:
+        if fake_impl is not None and hasattr(my_lib, "_register_fake"):
             my_lib._register_fake(op_name, fake_impl)
     except RuntimeError as error:
         if "Tried to register an operator" in str(error) and "multiple times" in str(

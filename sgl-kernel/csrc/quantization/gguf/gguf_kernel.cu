@@ -5,6 +5,8 @@
 #include <cuda_runtime.h>
 #include <torch/all.h>
 
+#include <optional>
+
 // dont use clang-format here, it breaks the include order
 // clang-format off
 #include "utils.h"

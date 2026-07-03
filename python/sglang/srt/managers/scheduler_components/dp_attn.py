@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
-from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -193,6 +192,8 @@ def prepare_mlp_sync_batch_raw(
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
     if local_batch is not None:
         local_batch.is_extend_in_batch = is_extend_in_batch
+
+    from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 
     tbo_preparer = TboDPAttentionPreparer()
     if len(offload_tags) == 0 and (

@@ -326,14 +326,20 @@ if torch_release >= (2, 4):
         return device_torch_lib.device(index)
 
 else:
-    assert (
-        device == "cuda"
-    ), "Only cuda device is supported for PyTorch version < 2.4.0."
-    autocast_custom_fwd = device_torch_lib.amp.custom_fwd
-    autocast_custom_bwd = device_torch_lib.amp.custom_bwd
+    if device == "cuda":
+        autocast_custom_fwd = device_torch_lib.amp.custom_fwd
+        autocast_custom_bwd = device_torch_lib.amp.custom_bwd
+    elif torch.cuda.is_available():
+        autocast_custom_fwd = torch.cuda.amp.custom_fwd
+        autocast_custom_bwd = torch.cuda.amp.custom_bwd
+    else:
+        autocast_custom_fwd = lambda fn=None, **_: fn if fn is not None else lambda f: f
+        autocast_custom_bwd = lambda fn=None, **_: fn if fn is not None else lambda f: f
 
     def custom_device_ctx(index: int):
-        return torch.cuda.device(index)
+        if torch.cuda.is_available():
+            return torch.cuda.device(index)
+        return contextlib.nullcontext()
 
 
 device_platform = get_available_device()

@@ -1,4 +1,4 @@
-from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     MoeA2ABackend,
@@ -14,6 +14,15 @@ from sglang.srt.layers.moe.utils import (
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
+
+
+def __getattr__(name: str):
+    if name == "MoeRunner":
+        from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+
+        return MoeRunner
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "DeepEPMode",
