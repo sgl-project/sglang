@@ -450,6 +450,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
         )
+        logger.info(
+            "PD decode state transfer config: state_types=%s, has_draft_pool=%s, "
+            "independent_draft_pool=%s",
+            [str(st.value) for st in kv_args.state_types],
+            self.draft_token_to_kv_pool is not None,
+            self.draft_token_to_kv_pool is not None
+            and self.draft_token_to_kv_pool is not self.token_to_kv_pool,
+        )
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id

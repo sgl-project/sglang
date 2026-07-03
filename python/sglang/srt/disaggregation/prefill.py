@@ -195,6 +195,14 @@ class PrefillBootstrapQueue:
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
         )
+        logger.info(
+            "PD prefill state transfer config: state_types=%s, has_draft_pool=%s, "
+            "independent_draft_pool=%s",
+            [str(st.value) for st in kv_args.state_types],
+            self.draft_token_to_kv_pool is not None,
+            self.draft_token_to_kv_pool is not None
+            and self.draft_token_to_kv_pool is not self.token_to_kv_pool,
+        )
 
         if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
             # V4's KVCache is organized by compression-ratio
