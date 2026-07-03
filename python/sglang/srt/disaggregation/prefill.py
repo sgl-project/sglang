@@ -1001,6 +1001,21 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             return
 
+        # Cached-prefix early-send ships main KV only (state_indices=None) and
+        # advances start_send_idx, so under layer pipeline the prefix pages
+        # fall outside the LP hook's range and their DSA indexer state is
+        # never sent -> decode reads a zero indexer buffer -> garbled output.
+        # Disable early-send when state ships via LP (DSA); non-DSA models,
+        # which have no LP-shipped state, keep the optimization.
+        bootstrap_queue = getattr(self, "disagg_prefill_bootstrap_queue", None)
+        kv_mgr = getattr(bootstrap_queue, "kv_manager", None)
+        if kv_mgr is not None and getattr(
+            kv_mgr, "layer_pipeline_enabled", False
+        ):
+            kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+            if isinstance(kvcache, DSATokenToKVPool):
+                return
+
         # Device-resident prefix only; page-aligned so start_send_idx stays exact.
         cached_end = len(req.prefix_indices) - req.host_hit_length
         if cached_end <= req.start_send_idx:
