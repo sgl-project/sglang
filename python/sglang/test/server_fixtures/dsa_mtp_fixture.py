@@ -34,7 +34,7 @@ class DsaMtpEvalConfigDefaults:
 
     # GSM8KMixin defaults.
     gsm8k_accuracy_thres = 0.935
-    gsm8k_accept_length_thres = 4.5
+    gsm8k_accept_length_thres = 3.7
     gsm8k_num_questions = 500
     gsm8k_num_threads = 500
     gsm8k_num_shots = 20
