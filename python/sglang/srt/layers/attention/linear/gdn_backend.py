@@ -596,6 +596,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     draft_token_num=forward_batch.spec_info.draft_token_num,
                 )
             else:
+                # The recurrent fallback needs the per-draft snapshots, which
+                # the pool gates OFF under --enable-gdn-replayssm-spec (the
+                # same flag that makes `use_replayssm_spec` true above), so
+                # this branch is unreachable with a None buffer by
+                # construction -- keep it loud rather than silently frozen.
+                assert intermediate_state_cache is not None, (
+                    "recurrent target_verify fallback requires intermediate_ssm, "
+                    "which is not allocated under --enable-gdn-replayssm-spec"
+                )
                 core_attn_out = self.kernel_dispatcher.target_verify(
                     A_log=layer.A_log,
                     dt_bias=layer.dt_bias,

@@ -362,7 +362,10 @@ class MambaPool:
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        intermediate_ssm: torch.Tensor
+        # None under --enable-gdn-replayssm-spec: the spec ring owns rollback
+        # (verify writes ring records, commit moves cursors), so the per-draft
+        # full-state snapshots are never produced or consumed.
+        intermediate_ssm: Optional[torch.Tensor]
         intermediate_conv_window: List[torch.Tensor]
 
     def _allocate_deduplicated_conv_window(
@@ -593,18 +596,30 @@ class MambaPool:
                     )
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
-                intermediate_ssm_state_cache = torch.zeros(
-                    size=(
-                        num_mamba_layers,
-                        spec_state_size + 1,
-                        speculative_num_draft_tokens,
-                        temporal_state_shape[0],
-                        temporal_state_shape[1],
-                        temporal_state_shape[2],
-                    ),
-                    dtype=ssm_dtype,
-                    device="cuda",
-                )
+                #
+                # ReplaySSM spec-verify owns rollback via the ring + cursors (the
+                # verify kernel never writes per-draft snapshots; the commit never
+                # reads them), so this buffer -- the dominant spec scratch, ~46x
+                # the conv state -- is dead weight there and is skipped. The conv
+                # intermediate windows below STAY (conv rollback consumes them).
+                # The recurrent-verify fallback cannot be reached under the flag
+                # (GDN + linear chain + triton enforced in server_args; the
+                # backend asserts loudly if it ever is).
+                if enable_gdn_replayssm_spec:
+                    intermediate_ssm_state_cache = None
+                else:
+                    intermediate_ssm_state_cache = torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            temporal_state_shape[0],
+                            temporal_state_shape[1],
+                            temporal_state_shape[2],
+                        ),
+                        dtype=ssm_dtype,
+                        device="cuda",
+                    )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token
                 # during target verify.
                 #
@@ -673,12 +688,17 @@ class MambaPool:
                     replayssm_rawk=replayssm_rawk,
                     replayssm_beta=replayssm_beta,
                 )
+                intermediate_ssm_gb = (
+                    get_tensor_size_bytes(intermediate_ssm_state_cache) / GB
+                    if intermediate_ssm_state_cache is not None
+                    else 0.0
+                )
                 logger.info(
                     f"Mamba Cache is allocated. "
                     f"max_mamba_cache_size: {size}, "
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
-                    f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
+                    f"intermediate_ssm_state_cache size: {intermediate_ssm_gb:.2f}GB "
                     # Report the deduplicated PHYSICAL conv-window buffers (the view
                     # over-reports its logical, un-deduplicated size).
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "

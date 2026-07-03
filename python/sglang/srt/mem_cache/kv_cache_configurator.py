@@ -672,7 +672,14 @@ class KVCacheConfigurator:
             enable_linear_replayssm=self.server_args.enable_linear_replayssm,
             linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
             mamba_envelope_layout=self.server_args.enable_page_major_kv_layout,
-            enable_gdn_replayssm_spec=self.server_args.enable_gdn_replayssm_spec,
+            # ReplaySSM spec-verify is GDN-only: activate the pool machinery
+            # (rings + cursors + the intermediate_ssm gate) only for GDN-hybrid
+            # models, so any other mamba-ish model (Mamba2/Nemotron, lightning,
+            # ...) run with the flag set stays byte-identical to flag-off.
+            enable_gdn_replayssm_spec=(
+                self.server_args.enable_gdn_replayssm_spec
+                and self.hybrid_gdn_config is not None
+            ),
         )
         return req_to_token_pool
 
