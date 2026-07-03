@@ -182,6 +182,8 @@ class FlashinferDispatcher(BaseDispatcher):
         x_sf = None
         if TopKOutputChecker.format_is_bypassed(topk_output):
             topk_output = topk_output.to_standard()
+        # FlashInfer MoeAlltoAll's expert-ID ABI is int32. This dispatcher is
+        # only selected for moe_a2a_backend="flashinfer".
         topk_ids = topk_output.topk_ids.to(torch.int32)
         topk_weights = topk_output.topk_weights
 
