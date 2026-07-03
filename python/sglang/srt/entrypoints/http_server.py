@@ -1431,7 +1431,9 @@ async def slow_down(obj: Annotated[SlowDownReqInput, Body()], request: Request):
 
 @app.api_route("/pd_role_switch", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def pd_role_switch(obj: PdRoleSwitchReqInput, request: Request):
+async def pd_role_switch(
+    obj: Annotated[PdRoleSwitchReqInput, Body()], request: Request
+):
     """(PoC) Switch this instance's PD disaggregation role at runtime
     ("prefill" <-> "decode"). The instance must be idle. Requires the server to
     be launched with --enable-pd-role-switch."""
@@ -1440,7 +1442,7 @@ async def pd_role_switch(obj: PdRoleSwitchReqInput, request: Request):
     except Exception as e:
         return _create_error_response(e)
     return ORJSONResponse(
-        result,
+        msgspec_to_builtins(result),
         status_code=HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST,
     )
 

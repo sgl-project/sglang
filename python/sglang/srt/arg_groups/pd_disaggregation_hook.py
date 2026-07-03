@@ -74,7 +74,13 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             server_args.disaggregation_transfer_backend != "fake"
         ), "Prefill server does not support 'fake' as the transfer backend"
 
-        server_args.disable_cuda_graph = True
+        # A prefill server normally has no use for (decode) CUDA graphs, so they
+        # are disabled to save capture time/memory. But with runtime P<->D role
+        # switching this instance may later become a decode server; without
+        # captured decode CUDA graphs it would fall back to eager decode and run
+        # ~7x slower. Keep CUDA graphs enabled so a post-flip decode is fast.
+        if not server_args.enable_pd_role_switch:
+            server_args.disable_cuda_graph = True
 
     if server_args.disaggregation_mode in ("prefill", "decode"):
         if (

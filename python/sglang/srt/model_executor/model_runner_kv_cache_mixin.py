@@ -546,8 +546,13 @@ class ModelRunnerKVCacheMixin:
                     HybridMambaDecodeReqToTokenPool,
                 )
 
-                # Extra slots for pre-allocated requests
-                pre_alloc_size = self.server_args.disaggregation_decode_extra_slots
+                # Extra slots for pre-allocated requests. A role-switch prefill
+                # instance pre-allocates this decode-flavored pool too, but the
+                # extra-slots default is only computed for the decode role, so
+                # fall back to 0 here to stay role-agnostic.
+                pre_alloc_size = (
+                    self.server_args.disaggregation_decode_extra_slots or 0
+                )
                 if config := self.mambaish_config:
                     self.req_to_token_pool = HybridMambaDecodeReqToTokenPool(
                         size=max_num_reqs,
