@@ -16,7 +16,7 @@ from typing import Optional
 from unittest.mock import patch
 
 from sglang.srt.arg_groups import overrides as overrides_module
-from sglang.srt.arg_groups.arg_utils import A, Arg, model_overridable_fields
+from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
 from sglang.srt.arg_groups.overrides import (
     OverrideRecord,
     apply_declarations_to_server_args,
@@ -37,18 +37,18 @@ from sglang.test.test_utils import CustomTestCase
 @dataclasses.dataclass
 class _FakeArgs:
     plain: A[int, "help text only"] = 0
-    resolved_by_model: A[str, Arg(help="x", model_overridable=True)] = "auto"
-    also_resolved: A[Optional[int], Arg(help="y", model_overridable=True)] = None
+    resolved_by_model: A[str, Arg(help="x", resolvable=True)] = "auto"
+    also_resolved: A[Optional[int], Arg(help="y", resolvable=True)] = None
     metadata_but_not_overridable: A[bool, Arg(help="z")] = False
 
 
 class TestModelOverridableWhitelist(CustomTestCase):
     def test_arg_defaults_to_not_overridable(self):
-        self.assertFalse(Arg().model_overridable)
+        self.assertFalse(Arg().resolvable)
 
     def test_whitelist_derivation_from_annotated_metadata(self):
         self.assertEqual(
-            model_overridable_fields(_FakeArgs),
+            resolvable_fields(_FakeArgs),
             frozenset({"resolved_by_model", "also_resolved"}),
         )
 
@@ -59,7 +59,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
         from sglang.srt.server_args import ServerArgs
 
         self.assertEqual(
-            model_overridable_fields(ServerArgs),
+            resolvable_fields(ServerArgs),
             frozenset(
                 {
                     "dtype",
@@ -83,7 +83,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
         )
 
     def test_non_dataclass_yields_empty_whitelist(self):
-        self.assertEqual(model_overridable_fields(SimpleNamespace), frozenset())
+        self.assertEqual(resolvable_fields(SimpleNamespace), frozenset())
 
 
 class _IsolatedRegistry(CustomTestCase):

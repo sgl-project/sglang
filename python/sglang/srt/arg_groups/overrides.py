@@ -32,7 +32,7 @@ import dataclasses
 import logging
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from sglang.srt.arg_groups.arg_utils import model_overridable_fields
+from sglang.srt.arg_groups.arg_utils import resolvable_fields
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import resolve_flag_leaf
 from sglang.srt.utils.common import (
@@ -1308,7 +1308,7 @@ def apply_model_overrides(
     Returns the provenance log, one record per declared write.
     """
     if whitelist is None:
-        whitelist = model_overridable_fields(type(server_args))
+        whitelist = resolvable_fields(type(server_args))
     whitelist = frozenset(whitelist)
 
     ordered = list(declarations) + list(terminal)
@@ -1367,9 +1367,9 @@ def apply_declarations_to_server_args(
     mutate ``server_args`` and only be rejected at publish time.
     """
     # Non-dataclass fixtures carry no Arg metadata (mirrors the
-    # model_overridable_fields escape); only real ServerArgs is validated.
+    # resolvable_fields escape); only real ServerArgs is validated.
     if dataclasses.is_dataclass(type(server_args)):
-        whitelist = model_overridable_fields(type(server_args))
+        whitelist = resolvable_fields(type(server_args))
         for source, decl in list(declarations) + list(terminal):
             unknown = set(decl) - whitelist
             if unknown:
