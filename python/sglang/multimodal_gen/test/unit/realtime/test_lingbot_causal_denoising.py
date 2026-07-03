@@ -19,14 +19,17 @@ from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
     CausalLingBotWorldTransformerBlock,
     LingBotWorldCamConditioner,
 )
+from sglang.multimodal_gen.runtime.models.dits.lingbot_world_runtime_keys import (
+    LINGBOT_C2WS_PLUCKER_EMB_CACHE,
+    LINGBOT_CAM_CONDITIONER_CACHE,
+    LINGBOT_PROMPT_UPDATED_CONDITION,
+    LINGBOT_ROPE_CACHE,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CausalDMDCachePolicy,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
     LingBotWorldCausalDMDDenoisingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.conditions import (
-    LINGBOT_PROMPT_UPDATED_CONDITION,
 )
 from sglang.multimodal_gen.runtime.realtime.states import RealtimeCausalDiTState
 
@@ -442,9 +445,9 @@ def test_lingbot_interactive_kv_window_allocates_expected_cache_size():
 def test_lingbot_dynamic_condition_cache_clear_removes_chunk_entries():
     cache_state = SimpleNamespace(
         runtime_cache={
-            "lingbot_c2ws_plucker_emb": object(),
-            "lingbot_cam_conditioner": object(),
-            "lingbot_rope": object(),
+            LINGBOT_C2WS_PLUCKER_EMB_CACHE: object(),
+            LINGBOT_CAM_CONDITIONER_CACHE: object(),
+            LINGBOT_ROPE_CACHE: object(),
         }
     )
 
@@ -452,9 +455,9 @@ def test_lingbot_dynamic_condition_cache_clear_removes_chunk_entries():
         cache_state
     )
 
-    assert "lingbot_c2ws_plucker_emb" not in cache_state.runtime_cache
-    assert "lingbot_cam_conditioner" not in cache_state.runtime_cache
-    assert "lingbot_rope" in cache_state.runtime_cache
+    assert LINGBOT_C2WS_PLUCKER_EMB_CACHE not in cache_state.runtime_cache
+    assert LINGBOT_CAM_CONDITIONER_CACHE not in cache_state.runtime_cache
+    assert LINGBOT_ROPE_CACHE in cache_state.runtime_cache
 
 
 def test_lingbot_crossattn_cache_resets_on_prompt_event():
@@ -552,7 +555,7 @@ def test_lingbot_cam_conditioner_cache_reuses_source_tensor(monkeypatch):
     assert first is second
     assert third is not first
     assert block.cam_conditioner.calls == 2
-    cache = forward_batch.extra["lingbot_cam_conditioner"]
+    cache = forward_batch.extra[LINGBOT_CAM_CONDITIONER_CACHE]
     assert cache["source_key"][0] == next_source.data_ptr()
     assert len(cache["entries"]) == 1
 
@@ -584,7 +587,7 @@ def test_lingbot_cam_conditioner_cache_skips_non_sequence_shard(monkeypatch):
     assert first is not second
     assert first[0] is not second[0]
     assert block.cam_conditioner.calls == 2
-    assert "lingbot_cam_conditioner" not in forward_batch.extra
+    assert LINGBOT_CAM_CONDITIONER_CACHE not in forward_batch.extra
 
 
 def test_lingbot_cam_conditioner_cache_skips_single_ulysses_world(monkeypatch):
@@ -616,7 +619,7 @@ def test_lingbot_cam_conditioner_cache_skips_single_ulysses_world(monkeypatch):
 
     assert first is not second
     assert block.cam_conditioner.calls == 2
-    assert "lingbot_cam_conditioner" not in forward_batch.extra
+    assert LINGBOT_CAM_CONDITIONER_CACHE not in forward_batch.extra
 
 
 def test_lingbot_cam_conditioner_cache_reuses_context_update(monkeypatch):
@@ -648,7 +651,7 @@ def test_lingbot_cam_conditioner_cache_reuses_context_update(monkeypatch):
 
     assert first is second
     assert block.cam_conditioner.calls == 1
-    assert "lingbot_cam_conditioner" in forward_batch.extra
+    assert LINGBOT_CAM_CONDITIONER_CACHE in forward_batch.extra
 
 
 def test_lingbot_model_prepares_cam_conditioner_scale_shifts(monkeypatch):

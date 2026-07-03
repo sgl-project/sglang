@@ -329,6 +329,37 @@ class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
     interactive_kv_still_window: int = 3
     interactive_kv_moving_window: int | None = 12
     interactive_kv_still_chunks: int = 2
+    lazy_vae_encode_black_frames: int = 60
+
+    def preprocess_vae_encode(self, image, vae):
+        image = super().preprocess_vae_encode(image, vae)
+        lazy_black_frames = max(0, int(self.lazy_vae_encode_black_frames or 0))
+        if lazy_black_frames <= 0 or image.ndim != 5:
+            return image
+
+        num_frames = int(image.shape[2])
+        if num_frames <= 1:
+            return image
+
+        temporal_ratio = int(self.vae_config.arch_config.temporal_compression_ratio)
+        encode_frames = min(num_frames, 1 + lazy_black_frames)
+        if (encode_frames - 1) % temporal_ratio != 0:
+            encode_frames = (encode_frames - 1) // temporal_ratio + 1
+            encode_frames = encode_frames * temporal_ratio + 1
+            encode_frames = min(num_frames, encode_frames)
+
+        if encode_frames >= num_frames:
+            return image
+
+        logger.info(
+            "LingBot lazy VAE encode: pixel_frames=%s encode_pixel_frames=%s "
+            "black_frames=%s temporal_ratio=%s",
+            num_frames,
+            encode_frames,
+            lazy_black_frames,
+            temporal_ratio,
+        )
+        return image[:, :, :encode_frames].contiguous()
 
     def postprocess_image_latent(self, latent_condition, batch):
         """Build condition tensor aligned to chunk_size (num_frames_per_block).
@@ -346,9 +377,31 @@ class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
         latent_width = batch.width // spatial_ratio
 
         # Align num_latent_frames to chunk_size
-        num_latent_frames = latent_condition.shape[2]
-        num_latent_frames = num_latent_frames - (num_latent_frames % chunk_size)
-        latent_condition = latent_condition[:, :, :num_latent_frames, :, :]
+        target_latent_frames = (int(batch.num_frames) - 1) // temporal_ratio + 1
+        target_latent_frames = target_latent_frames - (
+            target_latent_frames % chunk_size
+        )
+        encoded_latent_frames = int(latent_condition.shape[2])
+        if encoded_latent_frames < target_latent_frames:
+            tail = latent_condition[:, :, -1:, :, :].repeat(
+                1,
+                1,
+                target_latent_frames - encoded_latent_frames,
+                1,
+                1,
+            )
+            latent_condition = torch.cat([latent_condition, tail], dim=2)
+        elif encoded_latent_frames > target_latent_frames:
+            latent_condition = latent_condition[:, :, :target_latent_frames, :, :]
+
+        num_latent_frames = int(latent_condition.shape[2])
+        if encoded_latent_frames != num_latent_frames:
+            logger.info(
+                "LingBot lazy VAE condition: encoded_latent_frames=%s "
+                "target_latent_frames=%s",
+                encoded_latent_frames,
+                num_latent_frames,
+            )
 
         # Number of initial frames that have actual image content
         # (latent_condition from VAE encode of [image, zeros...])

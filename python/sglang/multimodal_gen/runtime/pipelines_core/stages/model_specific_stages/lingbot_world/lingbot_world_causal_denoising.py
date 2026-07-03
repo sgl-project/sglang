@@ -13,15 +13,19 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.models.dits.lingbot_world_runtime_keys import (
+    LINGBOT_C2WS_PLUCKER_EMB_CACHE,
+    LINGBOT_CAM_CONDITIONER_CACHE,
+    LINGBOT_CAMERA_ACTIONS_CONDITION,
+    LINGBOT_INTERACTIVE_KV_WINDOW_CACHE,
+    LINGBOT_PROMPT_UPDATED_CONDITION,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CausalDMDCachePolicy,
     CausalDMDDenoisingStage,
     CausalDMDForwardContext,
     CausalDMDRealtimeCacheContext,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.conditions import (
-    LINGBOT_PROMPT_UPDATED_CONDITION,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -117,7 +121,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         if not self._interactive_kv_window_enabled(server_args):
             return False
         condition_inputs = getattr(batch, "condition_inputs", None) or {}
-        return "camera_actions" in condition_inputs
+        return LINGBOT_CAMERA_ACTIONS_CONDITION in condition_inputs
 
     @staticmethod
     def _interactive_kv_window_enabled(server_args: ServerArgs) -> bool:
@@ -237,7 +241,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             return self._base_kv_sample_num_frames()
 
         dynamic_state = cache_state.runtime_cache.setdefault(
-            "lingbot_interactive_kv_window",
+            LINGBOT_INTERACTIVE_KV_WINDOW_CACHE,
             {
                 "consecutive_still_chunks": 0,
                 "sample_num_frames": None,
@@ -258,7 +262,9 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             dynamic_state["sample_num_frames"] = moving_window
 
         condition_inputs = getattr(batch, "condition_inputs", None) or {}
-        if self._chunk_has_camera_motion(condition_inputs.get("camera_actions")):
+        if self._chunk_has_camera_motion(
+            condition_inputs.get(LINGBOT_CAMERA_ACTIONS_CONDITION)
+        ):
             dynamic_state["consecutive_still_chunks"] = 0
             dynamic_state["sample_num_frames"] = moving_window
         else:
@@ -283,11 +289,13 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         still_chunks = None
         if self._uses_interactive_kv_window(batch, server_args):
             dynamic_state = cache_state.runtime_cache.get(
-                "lingbot_interactive_kv_window", {}
+                LINGBOT_INTERACTIVE_KV_WINDOW_CACHE, {}
             )
             still_chunks = dynamic_state.get("consecutive_still_chunks")
             condition_inputs = getattr(batch, "condition_inputs", None) or {}
-            if self._chunk_has_camera_motion(condition_inputs.get("camera_actions")):
+            if self._chunk_has_camera_motion(
+                condition_inputs.get(LINGBOT_CAMERA_ACTIONS_CONDITION)
+            ):
                 mode = "moving"
             else:
                 still_window = int(
@@ -377,8 +385,8 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         runtime_cache = getattr(cache_state, "runtime_cache", None)
         if runtime_cache is None:
             return
-        runtime_cache.pop("lingbot_c2ws_plucker_emb", None)
-        runtime_cache.pop("lingbot_cam_conditioner", None)
+        runtime_cache.pop(LINGBOT_C2WS_PLUCKER_EMB_CACHE, None)
+        runtime_cache.pop(LINGBOT_CAM_CONDITIONER_CACHE, None)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()

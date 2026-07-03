@@ -14,7 +14,8 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter 
     build_realtime_sampling_params,
     save_realtime_first_frame,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.conditions import (
+from sglang.multimodal_gen.runtime.models.dits.lingbot_world_runtime_keys import (
+    LINGBOT_CAMERA_ACTIONS_CONDITION,
     LINGBOT_PROMPT_UPDATED_CONDITION,
 )
 from sglang.multimodal_gen.runtime.realtime.control_signals import ControlSignalQueue
@@ -89,7 +90,7 @@ class LingBotWorldRealtimeAdapter(BaseRealtimeModelAdapter):
         request: RealtimeVideoGenerationsRequest,
     ) -> None:
         condition_inputs = request.condition_inputs or {}
-        camera_actions = condition_inputs.get("camera_actions")
+        camera_actions = condition_inputs.get(LINGBOT_CAMERA_ACTIONS_CONDITION)
         if camera_actions is not None:
             state = self._state(session)
             state.receive_camera_action_script(
@@ -155,7 +156,7 @@ class LingBotWorldRealtimeAdapter(BaseRealtimeModelAdapter):
             condition_inputs[LINGBOT_PROMPT_UPDATED_CONDITION] = True
         camera_actions = state.sample_camera_actions(chunk_size)
         if camera_actions is not None:
-            condition_inputs["camera_actions"] = camera_actions
+            condition_inputs[LINGBOT_CAMERA_ACTIONS_CONDITION] = camera_actions
         return RealtimeChunkInputs(prompt=prompt, condition_inputs=condition_inputs)
 
     def build_sampling_params(
