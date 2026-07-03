@@ -464,7 +464,12 @@ def test_lingbot_crossattn_cache_resets_on_prompt_event():
     stage = LingBotWorldCausalDMDDenoisingStage.__new__(
         LingBotWorldCausalDMDDenoisingStage
     )
-    crossattn_cache = [CrossAttentionKVCache()]
+    crossattn_cache = [
+        CrossAttentionKVCache(
+            k=torch.empty(1),
+            v=torch.empty(1),
+        )
+    ]
     crossattn_cache[0].store(torch.ones(1), torch.ones(1))
     cache_ctx = SimpleNamespace(
         cache_state=RealtimeCausalDiTState(),

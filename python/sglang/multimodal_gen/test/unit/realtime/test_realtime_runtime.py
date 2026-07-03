@@ -740,6 +740,7 @@ def test_lingbot_realtime_condition_horizon_repeats_blank_tail_chunk():
     latent_condition = torch.ones(1, latent_channels, latent_frames, 2, 2)
     batch = SimpleNamespace(
         height=2 * spatial_ratio,
+        num_frames=num_frames,
         width=2 * spatial_ratio,
     )
     condition_full = config.postprocess_image_latent(latent_condition, batch)
