@@ -25,6 +25,15 @@ How `file -> models` is resolved (best effort, recall-favoring)
     visible rather than silent. A `--overrides` JSON file supplies models for
     dynamic cases and trims false positives.
 
+How `runner label -> models` is aggregated
+    Registration/prewarm decisions are made per GH runner *label* (a runner's
+    `runs-on` tag), not per suite. Each suite's runner_config maps to a label
+    via scripts/ci/runner_configs.yml (several configs can share one label,
+    e.g. `4-gpu-h100` and `deepep-4-gpu-h100`), so `runner_labels` carries the
+    per-label UNION -- the set a runner registered under that label must have
+    cached before it takes jobs. Suites without a mappable runner_config are
+    listed in `unmapped_suites`.
+
 Usage:
     python3 scripts/ci/list_stage_models.py --backend cuda \
         --commit "$GITHUB_SHA" --output models-per-stage.json --markdown out.md
@@ -244,16 +253,22 @@ def _load_ci_register(repo_root: str):
 
 def collect_suite_files(
     repo_root: str, backend_name: str, include_disabled: bool = False
-) -> Tuple[Dict[str, List[str]], Dict[str, bool], Dict[str, str]]:
+) -> Tuple[
+    Dict[str, List[str]],
+    Dict[str, bool],
+    Dict[str, str],
+    Dict[str, Optional[str]],
+]:
     """Map ``effective_suite -> [relative test file]`` for one backend.
 
     By default only enabled (`disabled is None`) registries are grouped, since a
     disabled suite does not run and thus needs no cache warming. Pass
     ``include_disabled=True`` to also group disabled registries (useful to see
     what a suite *would* download once re-enabled). Returns the mapping,
-    ``{suite: is_nightly}``, and ``{file: parse error}`` for files whose
-    registry could not be parsed (their models are excluded -- surfaced, not
-    silently dropped).
+    ``{suite: is_nightly}``, ``{file: parse error}`` for files whose registry
+    could not be parsed (their models are excluded -- surfaced, not silently
+    dropped), and ``{suite: runner_config}`` (None for legacy single-string
+    ``suite=`` registrations, which carry no runner_config).
     """
     ci_register = _load_ci_register(repo_root)
     backend = getattr(ci_register.HWBackend, backend_name.upper())
@@ -267,6 +282,7 @@ def collect_suite_files(
 
     suite_files: Dict[str, List[str]] = {}
     suite_nightly: Dict[str, bool] = {}
+    suite_runner_config: Dict[str, Optional[str]] = {}
     errors: Dict[str, str] = {}
     for path in files:
         rel = os.path.relpath(path, repo_root)
@@ -295,26 +311,95 @@ def collect_suite_files(
             if rel not in suite_files.setdefault(suite, []):
                 suite_files[suite].append(rel)
             suite_nightly[suite] = suite_nightly.get(suite, False) or bool(r.nightly)
-    return suite_files, suite_nightly, errors
+            # Modern registrations name the suite `{stage}-test-{runner_config}`,
+            # so every registry in a suite shares one runner_config; legacy
+            # `suite=` registrations have none (stays None).
+            if r.runner_config is not None:
+                suite_runner_config[suite] = r.runner_config
+            else:
+                suite_runner_config.setdefault(suite, None)
+    return suite_files, suite_nightly, errors, suite_runner_config
 
 
 def load_overrides(path: Optional[str]) -> Dict[str, object]:
-    """Read the overrides JSON: ``by_file``, ``by_suite``, ``deny`` (all optional).
+    """Read the overrides JSON: ``by_file``, ``by_suite``, ``deny``,
+    ``suite_labels`` (all optional).
 
-    A present-but-null key is treated as its default, so a hand-edit like
-    ``"deny": null`` does not blow up downstream iteration.
+    ``suite_labels`` maps a legacy ``suite=`` registration (which carries no
+    runner_config) to the GH runner label(s) its dispatching workflow
+    hardcodes in ``runs-on`` -- a LIST, since one suite can run on several
+    labels. A present-but-null key is treated as its default, so a hand-edit
+    like ``"deny": null`` does not blow up downstream iteration.
     """
-    overrides: Dict[str, object] = {"by_file": {}, "by_suite": {}, "deny": []}
+    overrides: Dict[str, object] = {
+        "by_file": {},
+        "by_suite": {},
+        "deny": [],
+        "suite_labels": {},
+    }
     if not path:
         return overrides
     if not os.path.exists(path):
         raise FileNotFoundError(f"overrides file not found: {path}")
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
-    for key in ("by_file", "by_suite", "deny"):
+    for key in ("by_file", "by_suite", "deny", "suite_labels"):
         if data.get(key) is not None:
             overrides[key] = data[key]
     return overrides
+
+
+# One runner_config entry in runner_configs.yml: a two-space-indented key with
+# a flow-style (inline `{...}`) mapping. This is the file's documented shape;
+# entries are matched line-by-line so the tool stays stdlib-only (the workflow
+# installs nothing, so PyYAML is not available).
+_RUNNER_CONFIG_LINE_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*\{(.*)\}\s*$")
+_RUNS_ON_RE = re.compile(r"\bruns_on:\s*([^,}\s]+)")
+
+# runner_configs.yml uses this placeholder for the dynamically-selected b200
+# runner label (resolved at workflow-load time by runner_configs.py --map).
+# The inventory keeps it literal unless --b200-runner substitutes it, so the
+# consumer can see the group is dynamic rather than silently guessing a label.
+B200_SENTINEL = "$b200_runner"
+
+
+def load_runner_labels(path: str) -> Dict[str, str]:
+    """Parse ``{runner_config: runs_on label}`` out of runner_configs.yml.
+
+    The mapping is what turns per-suite model sets into per-runner-LABEL sets:
+    a runner is registered under a `runs_on` label (several runner_configs can
+    share one, e.g. `4-gpu-h100` and `deepep-4-gpu-h100` both run on
+    `4-gpu-h100`), so a runner's cache must cover the union of every suite
+    that can land on its label. Raises ValueError on an entry without
+    `runs_on` or a file with no entries at all -- a format drift must fail
+    the workflow loudly, not silently empty the label aggregation.
+    """
+    labels: Dict[str, str] = {}
+    in_section = False
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("runner_configs:"):
+                in_section = True
+                continue
+            if in_section and line.strip() and not line.startswith(" "):
+                break  # next top-level key
+            if not in_section:
+                continue
+            m = _RUNNER_CONFIG_LINE_RE.match(line)
+            if not m:
+                continue
+            name, body = m.group(1), m.group(2)
+            runs_on = _RUNS_ON_RE.search(body)
+            if not runs_on:
+                raise ValueError(f"{path}: runner_config {name!r} has no runs_on field")
+            labels[name] = runs_on.group(1)
+    if not labels:
+        raise ValueError(
+            f"{path}: no runner_configs entries parsed -- format drift? "
+            f"(expected two-space-indented `name: {{...}}` lines under "
+            f"a `runner_configs:` key)"
+        )
+    return labels
 
 
 def build_inventory(
@@ -323,15 +408,28 @@ def build_inventory(
     overrides: Dict[str, object],
     commit: str,
     include_disabled: bool = False,
+    b200_runner: Optional[str] = None,
 ) -> Dict[str, object]:
     deny: Set[str] = set(overrides.get("deny", []))  # type: ignore[arg-type]
     by_file: Dict[str, List[str]] = overrides.get("by_file", {})  # type: ignore[assignment]
     by_suite: Dict[str, List[str]] = overrides.get("by_suite", {})  # type: ignore[assignment]
+    suite_labels_override: Dict[str, List[str]] = overrides.get("suite_labels", {})  # type: ignore[assignment]
 
     global_table, table_errors = build_global_constant_table(repo_root, deny)
-    suite_files, suite_nightly, registry_errors = collect_suite_files(
-        repo_root, backend_name, include_disabled
+    suite_files, suite_nightly, registry_errors, suite_runner_config = (
+        collect_suite_files(repo_root, backend_name, include_disabled)
     )
+
+    runner_labels_map: Dict[str, str] = {}
+    runner_configs_path = os.path.join(repo_root, "scripts", "ci", "runner_configs.yml")
+    if os.path.exists(runner_configs_path):
+        runner_labels_map = load_runner_labels(runner_configs_path)
+    else:
+        print(
+            f"WARNING: {runner_configs_path} not found; every suite will be "
+            f"reported as unmapped_suites (no per-runner-label aggregation).",
+            file=sys.stderr,
+        )
 
     # Resolve models once per file (a file can belong to several suites).
     file_models: Dict[str, Set[str]] = {}
@@ -374,10 +472,45 @@ def build_inventory(
         all_models.update(models)
         suites[suite] = {
             "nightly": suite_nightly.get(suite, False),
+            "runner_config": suite_runner_config.get(suite),
             "models": sorted(models),
             "test_file_count": len(suite_files[suite]),
             "unresolved_files": sorted(unresolved),
         }
+
+    # Per-runner-LABEL aggregation: registration/prewarm decisions are made per
+    # GH runner label (what a runner is registered with), and several suites --
+    # via several runner_configs -- can route to one label. A runner's cache
+    # must cover the UNION of every suite that can land on it. Label
+    # resolution order: an explicit `suite_labels` override (legacy suites
+    # whose runs-on lives hardcoded in their dispatching workflow; may name
+    # several labels), else runner_config -> runner_configs.yml. Suites we
+    # cannot map land in `unmapped_suites` -- visible, never silently
+    # dropped, same contract as unresolved_files.
+    label_models: Dict[str, Set[str]] = {}
+    label_suites: Dict[str, List[str]] = {}
+    unmapped_suites: List[str] = []
+    for suite in sorted(suites):
+        labels = suite_labels_override.get(suite)
+        if labels is None:
+            rc = suite_runner_config.get(suite)
+            label = runner_labels_map.get(rc) if rc is not None else None
+            labels = [label] if label is not None else []
+        if not labels:
+            unmapped_suites.append(suite)
+            continue
+        for label in labels:
+            if label == B200_SENTINEL and b200_runner:
+                label = b200_runner
+            label_models.setdefault(label, set()).update(suites[suite]["models"])
+            label_suites.setdefault(label, []).append(suite)
+    runner_labels: Dict[str, object] = {
+        label: {
+            "models": sorted(label_models[label]),
+            "suites": label_suites[label],
+        }
+        for label in sorted(label_models)
+    }
 
     parse_failures = {}
     parse_failures.update(table_errors)
@@ -389,8 +522,11 @@ def build_inventory(
         "backend": backend_name.lower(),
         "suite_count": len(suites),
         "model_count": len(all_models),
+        "runner_label_count": len(runner_labels),
         "all_models": sorted(all_models),
         "parse_failures": dict(sorted(parse_failures.items())),
+        "runner_labels": runner_labels,
+        "unmapped_suites": unmapped_suites,
         "suites": suites,
     }
 
@@ -398,18 +534,40 @@ def build_inventory(
 def render_markdown(inventory: Dict[str, object]) -> str:
     suites: Dict[str, dict] = inventory["suites"]  # type: ignore[assignment]
     failures = inventory.get("parse_failures") or {}
+    runner_labels: Dict[str, dict] = inventory.get("runner_labels") or {}  # type: ignore[assignment]
+    unmapped = inventory.get("unmapped_suites") or []
     lines = [
         f"## NVIDIA CI model inventory (`{inventory['backend']}`)",
         "",
         f"- Commit: `{inventory['generated_at_commit']}`",
         f"- Suites: **{inventory['suite_count']}**, "
-        f"distinct models: **{inventory['model_count']}**",
+        f"distinct models: **{inventory['model_count']}**, "
+        f"runner labels: **{inventory.get('runner_label_count', 0)}**",
     ]
     if failures:
         lines.append(
             f"- ⚠️ Unparsable files: **{len(failures)}** (see `parse_failures`)"
         )
+    if unmapped:
+        lines.append(
+            f"- ⚠️ Suites with no runner label: **{len(unmapped)}** "
+            f"({', '.join(f'`{s}`' for s in unmapped)})"
+        )
+    if runner_labels:
+        lines += [
+            "",
+            "### Per runner label (prewarm a runner's cache with this union)",
+            "",
+            "| Runner label | Suites | Models |",
+            "| --- | ---: | --- |",
+        ]
+        for label in sorted(runner_labels):
+            info = runner_labels[label]
+            models = ", ".join(info["models"]) if info["models"] else "_(none)_"
+            lines.append(f"| `{label}` | {len(info['suites'])} | {models} |")
     lines += [
+        "",
+        "### Per suite",
         "",
         "| Suite | Nightly | Models | Unresolved files |",
         "| --- | :---: | --- | ---: |",
@@ -465,6 +623,13 @@ def main() -> int:
         help="Also include suites whose tests are currently disabled.",
     )
     parser.add_argument(
+        "--b200-runner",
+        default=None,
+        help="Concrete runner label to substitute for the $b200_runner "
+        "placeholder in runner_configs.yml (default: keep the placeholder "
+        "as the runner_labels key, marking the group as dynamically routed).",
+    )
+    parser.add_argument(
         "--output", default=None, help="Write JSON here (default: stdout)."
     )
     parser.add_argument(
@@ -489,7 +654,12 @@ def main() -> int:
     commit = resolve_commit(args.commit, repo_root)
 
     inventory = build_inventory(
-        repo_root, args.backend, overrides, commit, args.include_disabled
+        repo_root,
+        args.backend,
+        overrides,
+        commit,
+        args.include_disabled,
+        b200_runner=args.b200_runner,
     )
     payload = json.dumps(inventory, indent=2, sort_keys=False) + "\n"
 
@@ -498,8 +668,10 @@ def main() -> int:
             f.write(payload)
         print(
             f"Wrote {args.output}: {inventory['suite_count']} suites, "
+            f"{inventory['runner_label_count']} runner labels, "
             f"{inventory['model_count']} distinct models, "
-            f"{len(inventory['parse_failures'])} parse failures.",
+            f"{len(inventory['parse_failures'])} parse failures, "
+            f"{len(inventory['unmapped_suites'])} unmapped suites.",
             file=sys.stderr,
         )
     else:

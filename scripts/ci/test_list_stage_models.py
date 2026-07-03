@@ -182,7 +182,9 @@ class ExtractModels(unittest.TestCase):
 class Overrides(unittest.TestCase):
     def test_load_defaults_when_missing(self):
         ov = lsm.load_overrides(None)
-        self.assertEqual(ov, {"by_file": {}, "by_suite": {}, "deny": []})
+        self.assertEqual(
+            ov, {"by_file": {}, "by_suite": {}, "deny": [], "suite_labels": {}}
+        )
 
     def test_null_values_fall_back_to_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -190,7 +192,9 @@ class Overrides(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as f:
                 f.write('{"deny": null, "by_file": null}')
             ov = lsm.load_overrides(path)
-            self.assertEqual(ov, {"by_file": {}, "by_suite": {}, "deny": []})
+            self.assertEqual(
+                ov, {"by_file": {}, "by_suite": {}, "deny": [], "suite_labels": {}}
+            )
 
 
 class CollectSuiteFiles(unittest.TestCase):
@@ -235,18 +239,25 @@ class CollectSuiteFiles(unittest.TestCase):
     def test_enabled_only_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._repo(tmp)
-            suites, nightly, errors = lsm.collect_suite_files(tmp, "cuda")
+            suites, nightly, errors, runner_configs = lsm.collect_suite_files(
+                tmp, "cuda"
+            )
             self.assertEqual(set(suites), {"base-x-test-1-gpu", "nightly-y"})
             self.assertEqual(errors, {})
             self.assertTrue(nightly["nightly-y"])
             self.assertFalse(nightly["base-x-test-1-gpu"])
             # AMD suite never appears for the CUDA backend.
             self.assertNotIn("nightly-amd", suites)
+            # Modern registrations carry their runner_config; legacy suite= has none.
+            self.assertEqual(runner_configs["base-x-test-1-gpu"], "1-gpu")
+            self.assertIsNone(runner_configs["nightly-y"])
 
     def test_include_disabled(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._repo(tmp)
-            suites, _, _ = lsm.collect_suite_files(tmp, "cuda", include_disabled=True)
+            suites, _, _, _ = lsm.collect_suite_files(
+                tmp, "cuda", include_disabled=True
+            )
             self.assertIn("base-z-test-1-gpu", suites)
 
     def test_unparsable_registry_is_surfaced(self):
@@ -261,7 +272,7 @@ class CollectSuiteFiles(unittest.TestCase):
                     ),
                 },
             )
-            suites, _, errors = lsm.collect_suite_files(tmp, "cuda")
+            suites, _, errors, _ = lsm.collect_suite_files(tmp, "cuda")
             self.assertEqual(suites, {})
             self.assertIn("test/registered/d/test_bad.py", errors)
 
@@ -370,6 +381,206 @@ class RenderMarkdown(unittest.TestCase):
             "suites": {},
         }
         self.assertIn("Unparsable files", lsm.render_markdown(inv))
+
+    def test_runner_label_table_and_unmapped_note(self):
+        inv = {
+            "backend": "cuda",
+            "generated_at_commit": "sha",
+            "suite_count": 1,
+            "model_count": 1,
+            "runner_label_count": 1,
+            "parse_failures": {},
+            "runner_labels": {
+                "1-gpu-h100": {"models": ["org/m"], "suites": ["s1", "s2"]}
+            },
+            "unmapped_suites": ["nightly-legacy"],
+            "suites": {
+                "s1": {"nightly": False, "models": ["org/m"], "unresolved_files": []}
+            },
+        }
+        md = lsm.render_markdown(inv)
+        self.assertIn("Per runner label", md)
+        self.assertIn("| `1-gpu-h100` | 2 | org/m |", md)
+        self.assertIn("no runner label: **1**", md)
+        self.assertIn("`nightly-legacy`", md)
+
+
+_FAKE_RUNNER_CONFIGS_YML = """\
+# comment
+_anchors:
+  default_install: &default scripts/ci/cuda/ci_install_dependency.sh
+
+runner_configs:
+  1-gpu:        { install: *default, artifact_version: v4, runs_on: 1-gpu-h100 }
+  deepep-1-gpu: { install: *default, artifact_version: v4, runs_on: 1-gpu-h100 }
+  4-gpu-b200:   { install: *default, artifact_version: v6, runs_on: $b200_runner }
+"""
+
+
+class LoadRunnerLabels(unittest.TestCase):
+    def _load(self, content):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "runner_configs.yml")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return lsm.load_runner_labels(path)
+
+    def test_parses_flat_inline_maps(self):
+        labels = self._load(_FAKE_RUNNER_CONFIGS_YML)
+        self.assertEqual(
+            labels,
+            {
+                "1-gpu": "1-gpu-h100",
+                "deepep-1-gpu": "1-gpu-h100",
+                "4-gpu-b200": lsm.B200_SENTINEL,
+            },
+        )
+
+    def test_missing_runs_on_is_loud(self):
+        with self.assertRaises(ValueError):
+            self._load("runner_configs:\n  broken: { install: x }\n")
+
+    def test_empty_or_drifted_format_is_loud(self):
+        with self.assertRaises(ValueError):
+            self._load("something_else:\n  a: 1\n")
+
+    def test_real_repo_file(self):
+        """Anchor the stdlib parser to the actual runner_configs.yml: format
+        drift there must fail these tests (which the workflow runs before
+        generating the inventory), not silently empty the label aggregation."""
+        labels = lsm.load_runner_labels(
+            os.path.join(_REPO_ROOT, "scripts", "ci", "runner_configs.yml")
+        )
+        # Two configs sharing a label is the reason the aggregation exists.
+        self.assertEqual(labels["4-gpu-h100"], "4-gpu-h100")
+        self.assertEqual(labels["deepep-4-gpu-h100"], "4-gpu-h100")
+        self.assertEqual(labels["4-gpu-b200"], lsm.B200_SENTINEL)
+        self.assertGreaterEqual(len(labels), 10)
+
+
+class RunnerLabelAggregation(unittest.TestCase):
+    REG = (
+        "import unittest\n"
+        "from sglang.test.ci.ci_register import register_cuda_ci\n"
+        "{calls}\n"
+        'MODEL = "{model}"\n'
+        'if __name__ == "__main__":\n    unittest.main()\n'
+    )
+
+    def _repo(self, tmp):
+        _make_fake_repo(
+            tmp,
+            registered={
+                # Two suites on runner_configs that share the 1-gpu-h100 label.
+                "a/test_a.py": self.REG.format(
+                    calls=(
+                        'register_cuda_ci(est_time=1, stage="base-x", '
+                        'runner_config="1-gpu")'
+                    ),
+                    model="meta-llama/Llama-3.1-8B-Instruct",
+                ),
+                "b/test_b.py": self.REG.format(
+                    calls=(
+                        'register_cuda_ci(est_time=1, stage="base-y", '
+                        'runner_config="deepep-1-gpu")'
+                    ),
+                    model="Qwen/Qwen3-8B",
+                ),
+                # Sentinel-labeled config.
+                "c/test_c.py": self.REG.format(
+                    calls=(
+                        'register_cuda_ci(est_time=1, stage="base-z", '
+                        'runner_config="4-gpu-b200")'
+                    ),
+                    model="google/gemma-3-4b-it",
+                ),
+                # Legacy suite= with no runner_config -> unmapped.
+                "d/test_d.py": self.REG.format(
+                    calls='register_cuda_ci(est_time=1, suite="nightly-legacy")',
+                    model="openai/gpt-oss-20b",
+                ),
+            },
+        )
+        _write(
+            tmp,
+            os.path.join("scripts", "ci", "runner_configs.yml"),
+            _FAKE_RUNNER_CONFIGS_YML,
+        )
+
+    def test_union_per_label_and_unmapped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._repo(tmp)
+            inv = lsm.build_inventory(tmp, "cuda", lsm.load_overrides(None), "sha")
+            self.assertEqual(inv["runner_label_count"], 2)
+            # Shared label carries the UNION of both suites' models.
+            shared = inv["runner_labels"]["1-gpu-h100"]
+            self.assertEqual(
+                shared["models"],
+                ["Qwen/Qwen3-8B", "meta-llama/Llama-3.1-8B-Instruct"],
+            )
+            self.assertEqual(
+                shared["suites"],
+                ["base-x-test-1-gpu", "base-y-test-deepep-1-gpu"],
+            )
+            # Sentinel stays literal without --b200-runner.
+            self.assertIn(lsm.B200_SENTINEL, inv["runner_labels"])
+            # Legacy suite is visible as unmapped, and still fully present
+            # (with its models) in the per-suite section.
+            self.assertEqual(inv["unmapped_suites"], ["nightly-legacy"])
+            self.assertEqual(
+                inv["suites"]["nightly-legacy"]["models"], ["openai/gpt-oss-20b"]
+            )
+            self.assertEqual(inv["suites"]["nightly-legacy"]["runner_config"], None)
+            self.assertEqual(
+                inv["suites"]["base-x-test-1-gpu"]["runner_config"], "1-gpu"
+            )
+
+    def test_b200_runner_substitution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._repo(tmp)
+            inv = lsm.build_inventory(
+                tmp,
+                "cuda",
+                lsm.load_overrides(None),
+                "sha",
+                b200_runner="4-gpu-b200-dyn",
+            )
+            self.assertNotIn(lsm.B200_SENTINEL, inv["runner_labels"])
+            self.assertEqual(
+                inv["runner_labels"]["4-gpu-b200-dyn"]["models"],
+                ["google/gemma-3-4b-it"],
+            )
+
+    def test_suite_labels_override_maps_legacy_suite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._repo(tmp)
+            overrides = lsm.load_overrides(None)
+            # Legacy suite dispatched by two workflows -> two labels; the
+            # sentinel in an override is substituted like a yml-derived one.
+            overrides["suite_labels"] = {
+                "nightly-legacy": ["1-gpu-h100", "$b200_runner"]
+            }
+            inv = lsm.build_inventory(
+                tmp, "cuda", overrides, "sha", b200_runner="b200-dyn"
+            )
+            self.assertEqual(inv["unmapped_suites"], [])
+            self.assertIn(
+                "openai/gpt-oss-20b", inv["runner_labels"]["1-gpu-h100"]["models"]
+            )
+            self.assertIn(
+                "openai/gpt-oss-20b", inv["runner_labels"]["b200-dyn"]["models"]
+            )
+            self.assertIn(
+                "nightly-legacy", inv["runner_labels"]["1-gpu-h100"]["suites"]
+            )
+
+    def test_missing_yml_leaves_all_suites_unmapped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._repo(tmp)
+            os.remove(os.path.join(tmp, "scripts", "ci", "runner_configs.yml"))
+            inv = lsm.build_inventory(tmp, "cuda", lsm.load_overrides(None), "sha")
+            self.assertEqual(inv["runner_labels"], {})
+            self.assertEqual(len(inv["unmapped_suites"]), 4)
 
 
 class ResolveCommit(unittest.TestCase):

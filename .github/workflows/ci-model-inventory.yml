@@ -19,6 +19,7 @@ on:
       - "python/sglang/test/ci/**"
       - "scripts/ci/list_stage_models.py"
       - "scripts/ci/stage_models_overrides.json"
+      - "scripts/ci/runner_configs.yml"
       - ".github/workflows/ci-model-inventory.yml"
   pull_request:
     # Validate the tool itself end-to-end when it changes. Deliberately NOT
