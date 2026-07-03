@@ -1,11 +1,15 @@
-"""Unit tests for the model-override machinery: whitelist metadata, registry
-(V3a — declarations only, nothing calls this in production yet)."""
+"""Unit tests for the model-override machinery: whitelist metadata, registry,
+gate, publish wiring, and the per-arch golden diffs for migrated families."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 import dataclasses
+import json
+import os
+import shutil
+import tempfile
 import unittest
 from types import SimpleNamespace
 from typing import Optional
@@ -48,12 +52,16 @@ class TestModelOverridableWhitelist(CustomTestCase):
             frozenset({"resolved_by_model", "also_resolved"}),
         )
 
-    def test_server_args_whitelist_empty_at_skeleton(self):
-        # No ServerArgs field is tagged yet: the V3 sweeps whitelist fields
-        # one family at a time. This pin makes accidental tagging visible.
+    def test_server_args_whitelist_is_exactly_the_migrated_fields(self):
+        # Fields are whitelisted one family at a time by the migration
+        # sweeps. This pin makes accidental tagging visible — extend it in
+        # the same commit that tags a new field.
         from sglang.srt.server_args import ServerArgs
 
-        self.assertEqual(model_overridable_fields(ServerArgs), frozenset())
+        self.assertEqual(
+            model_overridable_fields(ServerArgs),
+            frozenset({"dtype", "enable_tf32_matmul", "enable_multi_layer_eagle"}),
+        )
 
     def test_non_dataclass_yields_empty_whitelist(self):
         self.assertEqual(model_overridable_fields(SimpleNamespace), frozenset())
@@ -258,6 +266,116 @@ class TestPublishResolvesFlags(_IsolatedPublish):
             get_context().set_server_args(sa)
         # a failed publish must leave BOTH the slot and the flags untouched
         self.assertIs(get_flags(), flags_before)
+
+
+class TestGoldenModelOverrides(_IsolatedPublish):
+    """Per-arch golden diff for migrated families: the declarative path must
+    reproduce the legacy imperative writes byte-identically on server_args
+    (dual-apply) and materialize the same values on the flags tier at
+    publish."""
+
+    _MINI_CONFIG = {
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_attention_heads": 4,
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 2,
+        "vocab_size": 512,
+        "max_position_embeddings": 128,
+        "rms_norm_eps": 1e-5,
+        "torch_dtype": "bfloat16",
+        # MLA shape fields (required by the MistralLarge3/Pixtral arch
+        # family; inert extras for non-MLA control arches).
+        "kv_lora_rank": 32,
+        "qk_nope_head_dim": 16,
+        "qk_rope_head_dim": 8,
+        "v_head_dim": 16,
+    }
+
+    def _construct(self, arch, model_type, **server_kwargs):
+        from sglang.srt.server_args import ServerArgs
+
+        # Golden resolution must be host-independent: accelerator-less CI
+        # runners resolve only the base platform, where get_device() raises.
+        server_kwargs.setdefault("device", "cuda")
+        config = dict(self._MINI_CONFIG, architectures=[arch], model_type=model_type)
+        config_dir = tempfile.mkdtemp(prefix="golden_override_")
+        self.addCleanup(shutil.rmtree, config_dir, ignore_errors=True)
+        with open(os.path.join(config_dir, "config.json"), "w") as f:
+            json.dump(config, f)
+        return ServerArgs(model_path=config_dir, **server_kwargs)
+
+    def _publish(self, server_args):
+        from sglang.srt.runtime_context import get_flags
+        from sglang.srt.server_args import set_global_server_args_for_scheduler
+
+        set_global_server_args_for_scheduler(server_args)
+        return get_flags()
+
+    def test_mistral_large3_forces_bfloat16(self):
+        sa = self._construct("MistralLarge3ForCausalLM", "mistral")
+        self.assertEqual(sa.dtype, "bfloat16")  # dual-apply == legacy write
+        self.assertEqual(
+            sa._resolved_overrides,
+            [("MODEL_OVERRIDES['MistralLarge3ForCausalLM']", {"dtype": "bfloat16"})],
+        )
+        self.assertEqual(self._publish(sa).dtype, "bfloat16")
+
+    def test_pixtral_forces_bfloat16(self):
+        sa = self._construct("PixtralForConditionalGeneration", "pixtral")
+        self.assertEqual(sa.dtype, "bfloat16")
+        self.assertEqual(self._publish(sa).dtype, "bfloat16")
+
+    def test_user_requested_dtype_is_still_overridden(self):
+        # Legacy fidelity: the arch branch overwrote dtype unconditionally,
+        # so the declaration must too. The pristine request survives only on
+        # provenance (and, post-V3, as the un-overridden server_args field).
+        sa = self._construct("MistralLarge3ForCausalLM", "mistral", dtype="float16")
+        self.assertEqual(sa.dtype, "bfloat16")
+        self.assertEqual(self._publish(sa).dtype, "bfloat16")
+
+    def test_control_arch_keeps_pristine_dtype(self):
+        sa = self._construct("LlamaForCausalLM", "llama")
+        self.assertEqual(sa.dtype, "auto")
+        self.assertEqual(sa._resolved_overrides, [])
+        # publish still materializes the whitelisted leaf with the pristine
+        # value: readers only ever read flags.
+        self.assertEqual(self._publish(sa).dtype, "auto")
+
+    def test_minimax_m2_enables_tf32_matmul(self):
+        sa = self._construct("MiniMaxM2ForCausalLM", "llama")
+        self.assertTrue(sa.enable_tf32_matmul)  # dual-apply == legacy write
+        self.assertEqual(
+            sa._resolved_overrides,
+            [("_minimax_m2_overrides", {"enable_tf32_matmul": True})],
+        )
+        flags = self._publish(sa)
+        self.assertTrue(flags.enable_tf32_matmul)
+        self.assertFalse(flags.enable_multi_layer_eagle)  # pristine materialize
+
+    def test_mimo_v2_declarations(self):
+        # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),
+        # so the declaration is pinned directly for both provider inputs.
+        from sglang.srt.arg_groups.overrides import _mimo_v2_overrides
+
+        self.assertEqual(
+            _mimo_v2_overrides(SimpleNamespace(speculative_algorithm="EAGLE"), None),
+            {"enable_multi_layer_eagle": True},
+        )
+        self.assertEqual(
+            _mimo_v2_overrides(SimpleNamespace(speculative_algorithm=None), None),
+            {},
+        )
+
+    def test_mimo_v2_family_is_registered(self):
+        self.assertEqual(
+            collect_model_override_declarations(
+                "MiMoV2FlashForCausalLM",
+                SimpleNamespace(speculative_algorithm="EAGLE"),
+                None,
+            ),
+            [("_mimo_v2_overrides", {"enable_multi_layer_eagle": True})],
+        )
 
 
 class TestDualApplyParity(CustomTestCase):
