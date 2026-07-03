@@ -171,6 +171,22 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._decode_bootstrap_forward_enabled = _env_flag(
             "SGLANG_DSPARK_DECODE_BOOTSTRAP_FORWARD", False
         )
+        if (
+            server_args.enable_dp_attention
+            and (
+                self._prefill_bootstrap_forward_enabled
+                or self._decode_bootstrap_forward_enabled
+            )
+            and not _env_flag("SGLANG_DSPARK_FORCE_UNSAFE_BOOTSTRAP_FORWARD", False)
+        ):
+            logger.warning(
+                "Disable DSpark draft bootstrap forward under DP attention. "
+                "Nested draft forward can hang DP/EP/MoE collectives; use "
+                "SGLANG_DSPARK_FORCE_UNSAFE_BOOTSTRAP_FORWARD=1 only for "
+                "debugging."
+            )
+            self._prefill_bootstrap_forward_enabled = False
+            self._decode_bootstrap_forward_enabled = False
         self._accept_anomaly_enabled = _env_flag("SGLANG_DSPARK_DEBUG_ACCEPT", True)
         self._accept_anomaly_threshold = max(
             1, _env_int("SGLANG_DSPARK_DEBUG_ACCEPT_THRESHOLD", 8)
