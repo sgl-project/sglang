@@ -885,16 +885,26 @@ class QwenImageGELU(nn.Module):
         inner_dim: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        replicated: bool = False,
     ) -> None:
         super().__init__()
-        self.proj = ColumnParallelLinear(
-            dim,
-            inner_dim,
-            bias=True,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.proj",
-        )
+        if replicated:
+            self.proj = ReplicatedLinear(
+                dim,
+                inner_dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.proj",
+            )
+        else:
+            self.proj = ColumnParallelLinear(
+                dim,
+                inner_dim,
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.proj",
+            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states, _ = self.proj(hidden_states)
@@ -909,9 +919,30 @@ class QwenImageFeedForward(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         mult: int = 4,
+        replicated: bool = False,
     ) -> None:
         super().__init__()
         inner_dim = dim * mult
+        if replicated:
+            # Keep the whole FFN resident on every rank: no per-block
+            # all-reduce. Only worth it when the branch's token count is small
+            # enough that the duplicated GEMM is cheaper than the all-reduce.
+            down = ReplicatedLinear(
+                inner_dim,
+                dim_out,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.net.2",
+            )
+        else:
+            down = RowParallelLinear(
+                inner_dim,
+                dim_out,
+                bias=True,
+                input_is_parallel=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.net.2",
+            )
         self.net = nn.ModuleList(
             [
                 QwenImageGELU(
@@ -919,16 +950,10 @@ class QwenImageFeedForward(nn.Module):
                     inner_dim,
                     quant_config=quant_config,
                     prefix=f"{prefix}.net.0",
+                    replicated=replicated,
                 ),
                 nn.Dropout(0.0),
-                RowParallelLinear(
-                    inner_dim,
-                    dim_out,
-                    bias=True,
-                    input_is_parallel=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.net.2",
-                ),
+                down,
             ]
         )
 
@@ -1043,6 +1068,11 @@ class QwenImageTransformerBlock(nn.Module):
                 dim_out=dim,
                 quant_config=quant_config,
                 prefix=f"{prefix}.txt_mlp",
+                # The text branch is ~1K tokens regardless of image size, so
+                # sharding its FFN saves less GEMM time than the per-block
+                # all-reduce it adds; keeping it replicated is a measured e2e
+                # win (2xH100 tp=2: 5.58s -> 5.12s single-request).
+                replicated=True,
             )
 
         if nunchaku_enabled:
