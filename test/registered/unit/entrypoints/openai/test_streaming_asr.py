@@ -152,11 +152,7 @@ class TestProcessAsrChunk(CustomTestCase):
         self.assertEqual(state.emitted_text, "你好世界")
 
     def test_cumulative_early_revision_does_not_drop_new_words(self):
-        # Regression: on the cumulative (HTTP SSE / pre-gate WS) path, when a
-        # snapshot recases word 0 and shifts the confirmed word count (here the
-        # model drops "nation"), the reconciler must not skip a genuinely-new
-        # word. The old len(old_words) tail-slice dropped "and" between "up"
-        # and "live" -- the "missing words" the reviewer saw.
+        # Recasing/revising early words must not skip genuinely new tail words.
         state = self._state(unfixed_chunk_num=0, unfixed_token_num=5)
         snapshots = [
             "The nation will rise",
@@ -172,7 +168,6 @@ class TestProcessAsrChunk(CustomTestCase):
             is_last=True,
         )
         emitted = state.emitted_text.split()
-        # Every distinct new word from the stream must survive (no drop).
         for word in ("rise", "up", "and", "live", "out", "meaning", "creed", "done"):
             self.assertIn(word, emitted, f"dropped new word: {word!r}")
 
@@ -190,10 +185,7 @@ class TestProcessAsrChunk(CustomTestCase):
         self.assertEqual(out, "fresh tail")
 
     def test_cjk_char_to_word_flip_does_not_duplicate(self):
-        # Regression: a CJK->Latin code-switch flips the spaceless char path to
-        # the whitespace word path; str.split collapses the prior CJK run into
-        # one token, so the word reconciler must not re-emit the already-emitted
-        # CJK prefix ("我今天很...我今天很...").
+        # CJK->Latin code-switches must not re-emit the already emitted CJK run.
         state = StreamingASRState(
             chunk_size_sec=2.0, unfixed_chunk_num=2, unfixed_token_num=5
         )
@@ -211,9 +203,7 @@ class TestProcessAsrChunk(CustomTestCase):
         self.assertEqual(repeat_state.emitted_text, "你好你好")
 
     def test_sliced_path_emits_deduped_window_without_token_holdback(self):
-        # Regression: on the sliced path (cumulative=False) dedupe_overlap is the
-        # only intended dedup. Token-count holdback can drop words when their
-        # audio falls outside the next overlap, so the deduped window is emitted.
+        # Sliced updates emit the deduped window without token-count holdback.
         state = StreamingASRState(
             chunk_size_sec=2.0, unfixed_chunk_num=2, unfixed_token_num=2
         )
@@ -225,11 +215,7 @@ class TestProcessAsrChunk(CustomTestCase):
         self.assertEqual(state.emitted_text, "the dog saw the cat ran up")
 
     def test_dedupe_overlap_only_trims_verbatim_prefix(self):
-        # Regression (reviewer missing-word class): the sliced-overlap dedupe must
-        # trim ONLY a verbatim normalized *prefix* of the candidate that matches
-        # the committed tail; it must never delete unmatched leading words or
-        # rewrite text when nothing overlaps.
-        # (a) a genuine verbatim overlap prefix is trimmed.
+        # Only a verbatim normalized prefix is trimmed.
         self.assertEqual(
             dedupe_overlap(
                 "he hoped there would be stew for dinner turnips",
@@ -237,43 +223,31 @@ class TestProcessAsrChunk(CustomTestCase):
             ),
             "and carrots and bruised",
         )
-        # (b) a phrase that recurs later in the candidate must NOT drag the
-        #     genuine new leading words out with it (the old fuzzy leading-skip
-        #     deleted "x y" here).
         self.assertEqual(
             dedupe_overlap(
                 "one two three four five six", "x y three four five six seven"
             ),
             "x y three four five six seven",
         )
-        # (c) no overlap -> the candidate is returned byte-for-byte, never
-        #     re-tokenized or rewritten (em/en dashes are preserved).
         self.assertEqual(
             dedupe_overlap("alpha beta", "fresh dinner—turnips text"),
             "fresh dinner—turnips text",
         )
 
     def test_sliced_dedupe_safety_verdict(self):
-        # The default sliced dedupe reports whether the overlap trim is provably
-        # safe. A voiced overlap the exact-prefix dedupe cannot match (reworded)
-        # is UNVERIFIED (caller defers); the same non-match over a SILENT overlap
-        # is genuinely new content and is verified (safe to emit). A verbatim
-        # overlap is trimmed and verified.
+        # Voiced unmatched overlap is unsafe; silent unmatched overlap is new text.
         voiced = np.full(16000, 0.1, dtype=np.float32)
         silent = np.zeros(16000, dtype=np.float32)
-        # reworded/unmatched over VOICED overlap -> nothing deleted, NOT verified.
         text, verified = _apply_sliced_dedupe(
             "alpha beta", "gamma delta epsilon", voiced, 16000, 0.5
         )
         self.assertEqual(text, "gamma delta epsilon")
         self.assertFalse(verified)
-        # same unmatched candidate over a SILENT overlap -> new content, verified.
         text, verified = _apply_sliced_dedupe(
             "alpha beta", "gamma delta epsilon", silent, 16000, 0.5
         )
         self.assertEqual(text, "gamma delta epsilon")
         self.assertTrue(verified)
-        # a verbatim overlap prefix is trimmed and verified.
         text, verified = _apply_sliced_dedupe(
             "one two three", "three four five", voiced, 16000, 0.5
         )
@@ -431,11 +405,10 @@ class TestRealtimePCMCompaction(CustomTestCase):
         )
 
     def test_skipped_window_cursor_semantics_and_final_commit(self):
-        # Mid-stream skip advances only scheduling; final commit still infers
-        # pending audio by widening to retained voiced PCM.
+        # Mid-stream skip advances only scheduling; final commit still infers.
         tokenizer_manager = _MockTokenizerManager("unused")
         conn = self._conn(tokenizer_manager)
-        conn.audio.append_pcm(np.zeros(8, dtype=np.int16).tobytes())  # 16 bytes silence
+        conn.audio.append_pcm(np.zeros(8, dtype=np.int16).tobytes())
         conn.audio.last_scheduled_offset_bytes = 8
         conn.audio.last_inferred_offset_bytes = 8
         conn.audio.last_sliced_buffer_end_bytes = 8
@@ -445,38 +418,36 @@ class TestRealtimePCMCompaction(CustomTestCase):
         ok = _run(conn._run_inference(is_last=False))
 
         self.assertTrue(ok)
-        self.assertEqual(len(tokenizer_manager.requests), 0)  # skipped, no model call
-        self.assertEqual(conn.audio.last_scheduled_offset_bytes, 16)  # advanced
-        self.assertEqual(conn.audio.last_inferred_offset_bytes, 8)  # NOT advanced
-        self.assertEqual(conn.audio.last_sliced_buffer_end_bytes, 8)  # anchor frozen
+        self.assertEqual(len(tokenizer_manager.requests), 0)
+        self.assertEqual(conn.audio.last_scheduled_offset_bytes, 16)
+        self.assertEqual(conn.audio.last_inferred_offset_bytes, 8)
+        self.assertEqual(conn.audio.last_sliced_buffer_end_bytes, 8)
 
         tokenizer_manager = _MockTokenizerManager(["alpha beta gamma"])
         conn = self._conn(tokenizer_manager)
-        voiced = np.full(6, 12000, dtype=np.int16).tobytes()  # 12 bytes, loud
-        silent = np.zeros(4, dtype=np.int16).tobytes()  # 8 bytes, silence
-        conn.audio.append_pcm(voiced + silent)  # total = 20
+        voiced = np.full(6, 12000, dtype=np.int16).tobytes()
+        silent = np.zeros(4, dtype=np.int16).tobytes()
+        conn.audio.append_pcm(voiced + silent)
         conn.audio.last_scheduled_offset_bytes = 12
         conn.audio.last_inferred_offset_bytes = 12
-        conn.audio.last_sliced_buffer_end_bytes = 16  # bounded window [14,20]=silent
+        conn.audio.last_sliced_buffer_end_bytes = 16
         conn.audio.state.chunk_index = 2
         conn.audio.state.emitted_text = "alpha"
 
         ok = _run(conn._run_inference(is_last=True))
 
         self.assertTrue(ok)
-        # The model WAS called (final commit did a real inference, not a skip).
         self.assertEqual(len(tokenizer_manager.requests), 1)
         self.assertGreater(len(tokenizer_manager.requests[0].audio_data), 0)
-        self.assertEqual(conn.audio.last_inferred_offset_bytes, 20)  # consumed
+        self.assertEqual(conn.audio.last_inferred_offset_bytes, 20)
 
     def test_unsafe_boundary_defers_but_commit_emits(self):
-        # Voiced unmatched overlap is deferred mid-stream without compacting, but
-        # commit always emits so pending audio is never dropped.
-        tokenizer_manager = _MockTokenizerManager(["zulu beta gamma"])  # no "alpha"
+        # Voiced unmatched overlap defers mid-stream, but commit still emits.
+        tokenizer_manager = _MockTokenizerManager(["zulu beta gamma"])
         conn = self._conn(tokenizer_manager)
         samples = np.zeros(6, dtype=np.int16)
-        samples[3] = 12000  # loud int16 at byte offset 6 == the overlap region
-        conn.audio.append_pcm(samples.tobytes())  # 12 bytes
+        samples[3] = 12000
+        conn.audio.append_pcm(samples.tobytes())
         conn.audio.last_scheduled_offset_bytes = 8
         conn.audio.last_inferred_offset_bytes = 8
         conn.audio.last_sliced_buffer_end_bytes = 8
@@ -486,14 +457,14 @@ class TestRealtimePCMCompaction(CustomTestCase):
         ok = _run(conn._run_inference(is_last=False))
 
         self.assertTrue(ok)
-        self.assertEqual(len(tokenizer_manager.requests), 1)  # model ran...
-        self.assertEqual(conn.item.emitted_deltas, [])  # ...but nothing emitted
-        self.assertEqual(conn.audio.last_scheduled_offset_bytes, 12)  # advanced
-        self.assertEqual(conn.audio.last_inferred_offset_bytes, 8)  # NOT advanced
-        self.assertEqual(conn.audio.last_sliced_buffer_end_bytes, 8)  # anchor frozen
-        self.assertEqual(conn.audio.pcm_buffer_base_offset_bytes, 0)  # NOT compacted
-        self.assertEqual(len(conn.audio.pcm_buffer), 12)  # audio recoverable
-        self.assertEqual(conn.audio.state.chunk_index, 2)  # not ingested into state
+        self.assertEqual(len(tokenizer_manager.requests), 1)
+        self.assertEqual(conn.item.emitted_deltas, [])
+        self.assertEqual(conn.audio.last_scheduled_offset_bytes, 12)
+        self.assertEqual(conn.audio.last_inferred_offset_bytes, 8)
+        self.assertEqual(conn.audio.last_sliced_buffer_end_bytes, 8)
+        self.assertEqual(conn.audio.pcm_buffer_base_offset_bytes, 0)
+        self.assertEqual(len(conn.audio.pcm_buffer), 12)
+        self.assertEqual(conn.audio.state.chunk_index, 2)
 
         tokenizer_manager = _MockTokenizerManager(["zulu beta gamma"])
         conn = self._conn(tokenizer_manager)
@@ -509,9 +480,9 @@ class TestRealtimePCMCompaction(CustomTestCase):
         ok = _run(conn._run_inference(is_last=True))
 
         self.assertTrue(ok)
-        self.assertEqual(len(tokenizer_manager.requests), 1)  # model ran
-        self.assertNotEqual(conn.item.emitted_deltas, [])  # emitted (not deferred)
-        self.assertEqual(conn.audio.last_inferred_offset_bytes, 12)  # consumed
+        self.assertEqual(len(tokenizer_manager.requests), 1)
+        self.assertNotEqual(conn.item.emitted_deltas, [])
+        self.assertEqual(conn.audio.last_inferred_offset_bytes, 12)
 
     def test_failed_sliced_inference_does_not_compact(self):
         tokenizer_manager = _FailingTokenizerManager()

@@ -19,21 +19,14 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 logger = logging.getLogger(__name__)
 
 
-# Overlap region RMS above which we treat the re-sent audio as containing real
-# speech. Used only to decide dedupe *safety*, never to skip/drop audio.
+# Voice floor used only for sliced-overlap dedupe safety.
 _OVERLAP_VOICE_RMS = 0.02
 
 
 def _overlap_has_voice(
     samples: Any, sample_rate: Optional[int], overlap_seconds: float
 ) -> bool:
-    """Whether the leading overlap region of a slice carries voiced speech.
-
-    Used to disambiguate a ``cut == 0`` exact-prefix result: if the overlap audio
-    was silent there was nothing to repeat, so a non-matching candidate is
-    genuinely new (safe to emit); if it was voiced, a non-match means the model
-    reworded the overlap and emitting verbatim would duplicate (unsafe). Biased
-    toward "no voice" (safe/emit) when the audio payload can't be inspected."""
+    """Whether the leading overlap region of a slice carries voiced speech."""
     if (
         not isinstance(samples, np.ndarray)
         or not sample_rate
@@ -57,19 +50,7 @@ def _apply_sliced_dedupe(
     sample_rate: Optional[int],
     overlap_seconds: float,
 ) -> "tuple[str, bool]":
-    """Conservative sliced-overlap dedupe.
-
-    Returns ``(deduped_text, overlap_verified)``. Trims only a verbatim
-    (normalized) copy of the committed tail from the start of the candidate --
-    never guesses, and never deletes an unmatched leading word.
-
-    ``overlap_verified`` reports whether the trim is provably safe:
-      * a verbatim overlap prefix was matched and trimmed -> safe;
-      * no match, but the overlap audio was silent        -> safe (new content);
-      * no match over a *voiced* overlap                  -> UNSAFE: the model
-        reworded the re-sent audio, so the caller defers instead of emitting a
-        duplicate guess.
-    """
+    """Trim exact overlap and report whether emitting the result is safe."""
     if not committed_text or not text:
         return text, True
     deduped, matched = _dedupe_by_word(committed_text, text)
@@ -158,14 +139,7 @@ class StreamingASRState:
         return delta
 
     def _trim_large_cumulative_prompt_echo(self, delta: str) -> str:
-        """Drop obvious full-prefix echoes from cumulative chunked ASR.
-
-        HTTP SSE chunked ASR prompts the next cumulative audio snapshot with
-        already emitted text. On repetitive audio, Qwen3-ASR can copy that
-        prompt text back before the new words. A short chunk should not add
-        dozens of words at once, so this only trims unusually large deltas that
-        start with a long normalized copy of the emitted prefix.
-        """
+        """Drop obvious full-prefix echoes from cumulative chunked ASR."""
         if not delta or not self.emitted_text:
             return delta
 
@@ -418,27 +392,7 @@ def _norm_common_prefix_len(left_words: List[str], right_words: List[str]) -> in
 
 
 def _dedupe_by_word(committed_text: str, candidate_out: str) -> "tuple[str, bool]":
-    """Trim a verbatim overlap prefix repeated by a sliced audio request.
-
-    Returns ``(trimmed_text, matched)`` where ``matched`` is True iff a non-empty
-    normalized overlap prefix was found and trimmed. ``matched == False`` means
-    the candidate did not verifiably start on the committed tail (the model
-    reworded it, or there was no overlap): nothing is deleted, and the caller
-    decides whether emitting verbatim is safe.
-
-    The model re-transcribes the committed tail from the left-overlap audio, so
-    the candidate can begin with a copy of the committed tail. Trim only the
-    longest *normalized prefix* of the candidate that exactly matches a suffix of
-    the committed tail: the candidate must START on the overlap, so genuine new
-    speech -- which always follows the overlap in a sliced request -- is never
-    deleted, and unmatched leading words are never dropped.
-
-    This is deliberately conservative. Re-worded overlap ("ladled" -> "laid") is
-    left as-is rather than guessed at: a reworded copy can't be told from genuinely
-    repeated speech by text alone, so ``matched`` stays False and the caller keeps
-    the audio and defers instead of guessing. When nothing overlaps, the candidate
-    is returned verbatim (never re-tokenized or rewritten).
-    """
+    """Trim only a normalized candidate prefix matching the committed tail."""
     candidate_words = candidate_out.split()
     if not candidate_words:
         return candidate_out, False
@@ -461,23 +415,12 @@ def _dedupe_by_word(committed_text: str, candidate_out: str) -> "tuple[str, bool
             cut = length
             break
     if cut == 0:
-        # No overlap trimmed -- return the model output untouched.
         return candidate_out, False
     return " ".join(candidate_words[cut:]), True
 
 
 def dedupe_overlap(committed_text: str, candidate_out: str) -> str:
-    """Word-level text dedupe for sliced ASR overlap.
-
-    Sliced realtime requests intentionally resend a little old audio for
-    continuity. That overlap can make the model repeat already-emitted words,
-    so trim the repeated prefix before updating streaming state.
-    Trims words at the start of ``candidate_out`` that re-transcribe
-    ``committed_text``'s tail. It matches whitespace-delimited words only and only
-    a verbatim (normalized) prefix; when the overlap can't be matched it is left
-    untouched rather than guessed at.
-
-    CJK has no inter-word spaces, so those streams stay on the cumulative path."""
+    """Word-level exact-prefix dedupe for sliced ASR overlap."""
     if not committed_text or not candidate_out:
         return candidate_out
     return _dedupe_by_word(committed_text, candidate_out)[0]
@@ -503,15 +446,9 @@ async def process_asr_chunk(
 
     ``audio_data`` accepts WAV bytes or pre-decoded float samples.
     ``prompt`` overrides the default ``adapter.prompt_template + state.get_prefix_text()``.
-    ``dedupe_against`` triggers the sliced overlap dedupe on raw model output
-    before ``state`` ingests it. Realtime sliced calls pass both: the bare prompt
-    avoids text-prefix injection, and the dedupe target removes text repeated from
-    the acoustic overlap.
-
-    ``defer_if_unverified``: when the overlap trim can't be proven safe, return ""
-    WITHOUT ingesting into ``state`` so a later slice or the commit re-covers the
-    audio instead of emitting a duplicate guess. ``verified_out``, if given,
-    receives the verdict under key ``"verified"``.
+    ``dedupe_against`` triggers sliced overlap dedupe before ``state`` ingests
+    the text. ``defer_if_unverified`` returns "" without mutating ``state`` when
+    the overlap cannot be proven safe.
     """
     if prompt is None:
         prompt = adapter.prompt_template + state.get_prefix_text()
@@ -550,9 +487,6 @@ async def process_asr_chunk(
         if verified_out is not None:
             verified_out["verified"] = overlap_verified
         if defer_if_unverified and not overlap_verified:
-            # Unsafe boundary: do not ingest into streaming state. The caller
-            # leaves the slice anchor/PCM intact so a later slice or the commit
-            # re-covers this audio instead of emitting a duplicate guess.
             return ""
 
     if is_last:
