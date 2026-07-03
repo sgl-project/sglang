@@ -165,8 +165,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._markov_candidates_buf: Optional[torch.Tensor] = None
         self._markov_embeds_buf: Optional[torch.Tensor] = None
         self._materialize_draft_compressors_enabled = True
-        self._draft_bootstrap_forward_enabled = _env_flag(
-            "SGLANG_DSPARK_DRAFT_BOOTSTRAP_FORWARD", True
+        self._prefill_bootstrap_forward_enabled = _env_flag(
+            "SGLANG_DSPARK_PREFILL_BOOTSTRAP_FORWARD", False
+        )
+        self._decode_bootstrap_forward_enabled = _env_flag(
+            "SGLANG_DSPARK_DECODE_BOOTSTRAP_FORWARD", False
         )
         self._accept_anomaly_enabled = _env_flag("SGLANG_DSPARK_DEBUG_ACCEPT", True)
         self._accept_anomaly_threshold = max(
@@ -794,7 +797,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
 
         seq_lens_before = (prefix_lens[valid].to(torch.int64) - 1).clamp_min(0)
-        if self._draft_bootstrap_forward_enabled:
+        if self._prefill_bootstrap_forward_enabled:
             try:
                 self._run_draft_bootstrap_forward(
                     batch=batch,
@@ -1388,7 +1391,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(extend_lens)),
         )
-        if self._draft_bootstrap_forward_enabled:
+        if self._prefill_bootstrap_forward_enabled:
             try:
                 self._run_draft_bootstrap_forward(
                     batch=model_worker_batch,
@@ -1654,7 +1657,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 < commit_lens.unsqueeze(1).to(torch.int64)
             ).reshape(-1)
             used_bootstrap_forward = False
-            if self._draft_bootstrap_forward_enabled:
+            if self._decode_bootstrap_forward_enabled:
                 try:
                     self._run_draft_bootstrap_forward(
                         batch=model_worker_batch,
