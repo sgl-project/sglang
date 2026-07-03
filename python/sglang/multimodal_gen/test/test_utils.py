@@ -95,6 +95,7 @@ DEFAULT_PSNR_THRESHOLD_VIDEO = 24.0
 DEFAULT_MEAN_ABS_DIFF_THRESHOLD_VIDEO = 10.0
 _clip_model_cache: dict[str, Any] = {}
 _consistency_gt_cache: dict[str, Any] = {}
+_official_consistency_gt_outputs_cache: dict[str, frozenset[str]] | None = None
 OFFICIAL_CONSISTENCY_GT_SKIP_CASES = frozenset(
     {
         # Official references for these cases need regeneration or parity triage.
@@ -1103,6 +1104,62 @@ def _is_ascend_consistency_case(case_id: str) -> bool:
     return "npu" in case_id
 
 
+def _load_official_consistency_gt_outputs() -> dict[str, frozenset[str]]:
+    """Return case_id -> declared official GT outputs from the pinned ci-data map."""
+    global _official_consistency_gt_outputs_cache
+    if _official_consistency_gt_outputs_cache is not None:
+        return _official_consistency_gt_outputs_cache
+
+    url = f"{SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE}/case_map.json"
+    outputs_by_case: dict[str, frozenset[str]] = {}
+    try:
+        resp = requests.get(url, timeout=30)
+        try:
+            if resp.status_code == 200:
+                data = resp.json()
+            else:
+                data = {}
+                logger.warning(
+                    "Failed to load official consistency GT case map from %s: HTTP %s",
+                    url,
+                    resp.status_code,
+                )
+        finally:
+            resp.close()
+    except (ValueError, requests.RequestException) as exc:
+        data = {}
+        logger.warning(
+            "Failed to load official consistency GT case map from %s: %s",
+            url,
+            exc,
+        )
+
+    cases = data.get("cases", {}) if isinstance(data, dict) else {}
+    if isinstance(cases, dict):
+        for case_id, metadata in cases.items():
+            outputs = metadata.get("outputs", []) if isinstance(metadata, dict) else []
+            if isinstance(outputs, list):
+                outputs_by_case[str(case_id)] = frozenset(str(item) for item in outputs)
+
+    _official_consistency_gt_outputs_cache = outputs_by_case
+    return outputs_by_case
+
+
+def _official_consistency_gt_outputs_for_case(case_id: str) -> frozenset[str]:
+    return _load_official_consistency_gt_outputs().get(case_id, frozenset())
+
+
+def _is_official_consistency_gt_base_url(base_url: str) -> bool:
+    return base_url in (
+        SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
+        SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE_ASCEND,
+    )
+
+
+def _official_consistency_gt_candidate_is_declared(case_id: str, filename: str) -> bool:
+    return filename in _official_consistency_gt_outputs_for_case(case_id)
+
+
 def _remote_consistency_gt_base_urls(case_id: str) -> tuple[str, ...]:
     if case_id in OFFICIAL_CONSISTENCY_GT_SKIP_CASES:
         if _is_ascend_consistency_case(case_id) or current_platform.is_npu():
@@ -1111,17 +1168,25 @@ def _remote_consistency_gt_base_urls(case_id: str) -> tuple[str, ...]:
                 SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
             )
         return (SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,)
+    has_declared_official_gt = bool(_official_consistency_gt_outputs_for_case(case_id))
     if _is_ascend_consistency_case(case_id) or current_platform.is_npu():
+        if has_declared_official_gt:
+            return (
+                SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE_ASCEND,
+                SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE_ASCEND,
+                SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
+                SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
+            )
         return (
-            SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE_ASCEND,
             SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE_ASCEND,
+            SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
+        )
+    if has_declared_official_gt:
+        return (
             SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
             SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
         )
-    return (
-        SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
-        SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
-    )
+    return (SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,)
 
 
 def _remote_file_exists(url: str) -> bool | None:
@@ -1199,6 +1264,14 @@ def _find_remote_consistency_gt_files(
             candidates = [
                 (filename, f"{base_url}/{filename}") for filename in filenames
             ]
+            if _is_official_consistency_gt_base_url(base_url):
+                candidates = [
+                    (filename, url)
+                    for filename, url in candidates
+                    if _official_consistency_gt_candidate_is_declared(case_id, filename)
+                ]
+                if not candidates or (is_video and len(candidates) != len(filenames)):
+                    continue
             if is_video:
                 exists = [_remote_file_exists(url) for _, url in candidates]
                 if all(status is not False for status in exists):

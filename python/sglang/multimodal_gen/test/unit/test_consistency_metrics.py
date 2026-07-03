@@ -1,6 +1,7 @@
 import math
 
 import numpy as np
+import pytest
 
 from sglang.multimodal_gen.test import test_utils
 from sglang.multimodal_gen.test.test_utils import (
@@ -16,6 +17,19 @@ from sglang.multimodal_gen.test.test_utils import (
 
 def _solid_image(value: int, size: int = 32) -> np.ndarray:
     return np.full((size, size, 3), value, dtype=np.uint8)
+
+
+def _set_official_gt_outputs(monkeypatch, outputs_by_case):
+    monkeypatch.setattr(
+        test_utils,
+        "_official_consistency_gt_outputs_for_case",
+        lambda case_id: frozenset(outputs_by_case.get(case_id, ())),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _disable_remote_official_gt_case_map(monkeypatch):
+    _set_official_gt_outputs(monkeypatch, {})
 
 
 def test_consistency_gt_urls_are_pinned_to_ci_data_revision():
@@ -58,6 +72,7 @@ def test_remote_image_gt_prefers_official_when_present(monkeypatch):
     monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
     official_prefix = test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE + "/"
     expected_filename = f"unit_image_1gpu.{test_utils.output_format_to_ext(None)}"
+    _set_official_gt_outputs(monkeypatch, {"unit_image": [expected_filename]})
     monkeypatch.setattr(
         test_utils,
         "_remote_file_exists",
@@ -78,6 +93,74 @@ def test_remote_image_gt_prefers_official_when_present(monkeypatch):
                 f"/{expected_filename}"
             ),
         )
+    ]
+
+
+def test_remote_image_gt_ignores_unmapped_official_file(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+    official_prefix = test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE + "/"
+    sglang_prefix = test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE + "/"
+    expected_filename = f"unit_image_1gpu.{test_utils.output_format_to_ext(None)}"
+    _set_official_gt_outputs(monkeypatch, {})
+    monkeypatch.setattr(
+        test_utils,
+        "_remote_file_exists",
+        lambda url: url.startswith(official_prefix) or url.startswith(sglang_prefix),
+    )
+
+    files = test_utils._find_remote_consistency_gt_files(
+        "unit_image",
+        1,
+        is_video=False,
+    )
+
+    assert files == [
+        (
+            expected_filename,
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                f"/{expected_filename}"
+            ),
+        )
+    ]
+
+
+def test_remote_video_gt_ignores_unmapped_official_files(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+    official_prefix = test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE + "/"
+    sglang_prefix = test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE + "/"
+    case_id = "unit_video"
+    _set_official_gt_outputs(monkeypatch, {})
+    monkeypatch.setattr(
+        test_utils,
+        "_remote_file_exists",
+        lambda url: url.startswith(official_prefix) or url.startswith(sglang_prefix),
+    )
+
+    files = test_utils._find_remote_consistency_gt_files(case_id, 2, is_video=True)
+
+    assert files == [
+        (
+            f"{case_id}_2gpu_frame_0.png",
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                f"/{case_id}_2gpu_frame_0.png"
+            ),
+        ),
+        (
+            f"{case_id}_2gpu_frame_mid.png",
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                f"/{case_id}_2gpu_frame_mid.png"
+            ),
+        ),
+        (
+            f"{case_id}_2gpu_frame_last.png",
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                f"/{case_id}_2gpu_frame_last.png"
+            ),
+        ),
     ]
 
 
@@ -233,6 +316,7 @@ def test_remote_npu_image_gt_prefers_official_ascend_when_present(monkeypatch):
         test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE_ASCEND + "/"
     )
     expected_filename = f"unit_npu_image_1gpu.{test_utils.output_format_to_ext(None)}"
+    _set_official_gt_outputs(monkeypatch, {"unit_npu_image": [expected_filename]})
     monkeypatch.setattr(
         test_utils,
         "_remote_file_exists",
