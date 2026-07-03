@@ -867,6 +867,12 @@ class Envs:
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(False)
 
+    # SWA allocator
+    # Free swa KV pages device-side (kernel compaction into a device-resident
+    # free list) so the free path never forces a CPU-GPU sync. See
+    # DeviceFreeListPagedAllocator.
+    SGLANG_OPT_SWA_DEVICE_FREE = EnvBool(False)
+
     # SWA radix cache
     # TODO(DSV4): @ispobock this has bug on main branch when retract
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)

@@ -133,3 +133,39 @@ def alloc_decode_kernel(
     else:
         page = tl.load(free_page_ptr + new_page_start_loc)
         tl.store(out_indices + pid, page * page_size)
+
+
+@triton.jit
+def mark_swa_free_pages_kernel(
+    free_index_ptr,
+    n_slots,
+    mapping_ptr,
+    page_epoch_ptr,
+    cur_epoch,
+    swa_bitmap_ptr,
+    page_size: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Mark the swa pages referenced by the full pages touched by free_index,
+    and zero their full_to_swa mapping entries, entirely device-side.
+
+    One winner lane is elected per touched full page via a monotone epoch
+    atomic_max (this is also the full-page dedup, robust to concatenated or
+    partial inputs). The winner scans all page_size mapping slots of its page
+    (free is page-granular: a partial page in free_index still clears the
+    whole page), marks each live swa page in swa_bitmap, and zeroes the
+    mapping. No data-dependent output shape, so no CPU-GPU sync anywhere.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    lane_m = offs < n_slots
+    slots = tl.load(free_index_ptr + offs, mask=lane_m, other=0)
+    fp = slots // page_size
+    old = tl.atomic_max(page_epoch_ptr + fp, cur_epoch, mask=lane_m)
+    winner = lane_m & (old < cur_epoch)
+    base = fp * page_size
+    for j in range(page_size):
+        v = tl.load(mapping_ptr + base + j, mask=winner, other=0)
+        sp = v // page_size
+        tl.store(swa_bitmap_ptr + sp, 1, mask=winner & (v > 0))
+        tl.store(mapping_ptr + base + j, 0, mask=winner)
