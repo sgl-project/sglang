@@ -52,11 +52,15 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
+from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    maybe_flashinfer_autotune_speculative_draft,
+)
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -368,13 +372,20 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
             self.deepep_adapter.capture(is_extend_in_batch=True)
             shape_key = self._make_graph_key(bs)
+            post_warmup_hook = getattr(
+                self.attn_backend, "on_after_cuda_graph_warmup", None
+            )
+            maybe_flashinfer_autotune_speculative_draft(
+                self,
+                run_once,
+                post_warmup_hook=post_warmup_hook,
+                skip_logits=False,
+            )
             self.backend.capture_one(
                 shape_key,
                 run_once,
                 dummies=None,
-                post_warmup_hook=getattr(
-                    self.attn_backend, "on_after_cuda_graph_warmup", None
-                ),
+                post_warmup_hook=post_warmup_hook,
             )
 
     def replay(self, bs: int, seq_lens_sum: int, spec_info: EagleDraftExtendInput):
@@ -517,11 +528,12 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
 
     def _allocate_buffers(self) -> MultiLayerEagleDraftExtendInputBuffers:
         runner = next(r for r in self.runners if r is not None)
+        model_runner = runner.model_runner
         max_bs = self.max_bs
         num_tokens_per_bs = self.num_tokens_per_bs
         max_num_token = max_bs * num_tokens_per_bs
-        hidden_size = EagleDraftExtendInput.hidden_size_for(self.eagle_worker)
-        dtype = EagleDraftExtendInput.dtype_for(self.eagle_worker)
+        hidden_size = get_draft_input_from_target_hidden_dim(model_runner)
+        dtype = model_runner.model_config.dtype
         vocab_size = self._vocab_size()
 
         seq_lens_cpu = torch.full((max_bs,), self.seq_len_fill_value, dtype=torch.int32)

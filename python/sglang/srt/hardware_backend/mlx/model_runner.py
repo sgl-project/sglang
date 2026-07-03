@@ -1753,10 +1753,6 @@ class MlxModelRunner:
         """
         caches = prev.caches
 
-        # TODO (changminbark): Need to fix
-        # ContiguousAttentionKVCache.write_token to accommodate dynamic growing
-        # like ContiguousAttentionKVCache.update_and_fetch.
-
         # After prev's graph ran, each attention KV cache offset was
         # bumped by one per layer - attention wrapper's `write_token`
         # mutates the Python offset synchronously at graph-build time.
