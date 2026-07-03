@@ -216,6 +216,9 @@ class DSparkDraftInputV2(SpecInput):
     hidden_states: torch.Tensor = field(
         default_factory=lambda: torch.empty((0, 0), dtype=torch.float16)
     )
+    transfer_warmup_rounds: torch.Tensor = field(
+        default_factory=lambda: torch.empty((0,), dtype=torch.int32)
+    )
     direct_carry_valid: bool = True
     future_indices: Optional[torch.Tensor] = None
     _prepare_batch_seq_lens_cpu_buf: Optional[torch.Tensor] = None
@@ -236,6 +239,9 @@ class DSparkDraftInputV2(SpecInput):
         self.topk_p = move_empty_to_device(self.topk_p)
         self.topk_index = move_empty_to_device(self.topk_index)
         self.hidden_states = move_empty_to_device(self.hidden_states)
+        self.transfer_warmup_rounds = move_empty_to_device(
+            self.transfer_warmup_rounds
+        )
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return 1, 1
@@ -291,6 +297,7 @@ class DSparkDraftInputV2(SpecInput):
             topk_p=torch.empty((0, 0), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, 0), device=device, dtype=torch.int64),
             hidden_states=torch.empty((0, 0), device=device, dtype=torch.float16),
+            transfer_warmup_rounds=torch.empty((0,), device=device, dtype=torch.int32),
             verify_done=None,
         )
 
@@ -393,6 +400,8 @@ class DSparkDraftInputV2(SpecInput):
 
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
+            if self.transfer_warmup_rounds.numel() > 0:
+                self.transfer_warmup_rounds = self.transfer_warmup_rounds[new_indices]
             self.direct_carry_valid = False
             return
 
@@ -408,6 +417,8 @@ class DSparkDraftInputV2(SpecInput):
             self.topk_index = self.topk_index[new_indices]
         if self.hidden_states.numel() > 0:
             self.hidden_states = self.hidden_states[new_indices]
+        if self.transfer_warmup_rounds.numel() > 0:
+            self.transfer_warmup_rounds = self.transfer_warmup_rounds[new_indices]
 
     def merge_batch(self, spec_info: DSparkDraftInputV2):
         if (
@@ -437,6 +448,10 @@ class DSparkDraftInputV2(SpecInput):
             self.future_indices = torch.cat(
                 [self.future_indices, spec_info.future_indices]
             )
+            self.transfer_warmup_rounds = torch.cat(
+                [self.transfer_warmup_rounds, spec_info.transfer_warmup_rounds],
+                dim=0,
+            )
             self.direct_carry_valid = False
             return
 
@@ -456,4 +471,7 @@ class DSparkDraftInputV2(SpecInput):
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index], dim=0)
         self.hidden_states = torch.cat(
             [self.hidden_states, spec_info.hidden_states], dim=0
+        )
+        self.transfer_warmup_rounds = torch.cat(
+            [self.transfer_warmup_rounds, spec_info.transfer_warmup_rounds], dim=0
         )

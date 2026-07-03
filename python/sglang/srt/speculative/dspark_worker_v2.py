@@ -790,14 +790,23 @@ class DSparkWorkerV2(BaseSpecWorker):
         verify_out_cache_loc: torch.Tensor,
         prefix_lens: torch.Tensor,
         new_seq_lens: torch.Tensor,
+        ignore_mask: Optional[torch.Tensor] = None,
     ) -> None:
         if not self._accept_anomaly_enabled or commit_lens.numel() == 0:
             return
 
         bs, block_size = candidates.shape
         commit_lens_cpu = commit_lens.detach().cpu().tolist()
+        ignore_cpu = (
+            ignore_mask.detach().cpu().tolist()
+            if ignore_mask is not None and ignore_mask.numel() == bs
+            else [False] * bs
+        )
         if (
-            not any(int(commit_len) <= 1 for commit_len in commit_lens_cpu)
+            not any(
+                int(commit_len) <= 1 and not bool(ignore_cpu[i])
+                for i, commit_len in enumerate(commit_lens_cpu)
+            )
             and not self._accept_anomaly_histories
         ):
             return
@@ -829,6 +838,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             rid = getattr(req, "rid", None)
             key = (int(req_pool_idx), rid)
             active_keys.add(key)
+            if bool(ignore_cpu[i]):
+                self._accept_anomaly_histories.pop(key, None)
+                self._accept_anomaly_streaks.pop(key, None)
+                continue
 
             candidate_row = candidate_cpu[i]
             target_row = target_cpu[i]
@@ -965,17 +978,29 @@ class DSparkWorkerV2(BaseSpecWorker):
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
         )
 
+    def _get_transfer_warmup_rounds(
+        self, draft_input: DSparkDraftInputV2, bs: int, device: torch.device
+    ) -> torch.Tensor:
+        rounds = draft_input.transfer_warmup_rounds
+        if rounds.numel() == bs:
+            return rounds.to(device=device, dtype=torch.int32)
+        return torch.zeros((bs,), dtype=torch.int32, device=device)
+
     def _make_next_draft_input_decode(
         self,
         *,
         bonus_tokens: torch.Tensor,
         new_seq_lens: torch.Tensor,
         cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None,
+        transfer_warmup_rounds: Optional[torch.Tensor] = None,
     ) -> DSparkDraftInputV2:
+        if transfer_warmup_rounds is None:
+            transfer_warmup_rounds = torch.zeros_like(new_seq_lens, dtype=torch.int32)
         return DSparkDraftInputV2(
             bonus_tokens=bonus_tokens.to(dtype=torch.int64),
             new_seq_lens=new_seq_lens.to(dtype=torch.int64),
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
+            transfer_warmup_rounds=transfer_warmup_rounds.to(dtype=torch.int32),
         )
 
     def forward_batch_generation(
@@ -1228,6 +1253,28 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+        transfer_warmup_rounds = self._get_transfer_warmup_rounds(
+            draft_input, bs, device
+        )
+        transfer_warmup_mask = transfer_warmup_rounds > 0
+        next_transfer_warmup_rounds = torch.clamp(
+            transfer_warmup_rounds - 1, min=0
+        )
+        if transfer_warmup_mask.any():
+            target0 = target_predict[:, 0]
+            commit_lens = torch.where(
+                transfer_warmup_mask,
+                torch.ones_like(commit_lens),
+                commit_lens,
+            )
+            bonus_tokens = torch.where(transfer_warmup_mask, target0, bonus_tokens)
+            new_seq_lens = torch.where(
+                transfer_warmup_mask,
+                prefix_lens + 1,
+                new_seq_lens,
+            )
+            out_tokens[transfer_warmup_mask] = 0
+            out_tokens[transfer_warmup_mask, 0] = target0[transfer_warmup_mask]
         self._maybe_log_accept_anomaly(
             model_worker_batch=model_worker_batch,
             draft_input=draft_input,
@@ -1239,6 +1286,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_out_cache_loc=verify_out_cache_loc,
             prefix_lens=prefix_lens,
             new_seq_lens=new_seq_lens,
+            ignore_mask=transfer_warmup_mask,
         )
 
         hidden = logits_output.hidden_states
@@ -1284,6 +1332,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
             cur_allocated_seq_lens_cpu=draft_input.reserved_seq_lens_cpu,
+            transfer_warmup_rounds=next_transfer_warmup_rounds,
         )
         next_draft_input.carry_prepare_buffers_from(draft_input)
         verify_done = torch.get_device_module(device).Event()

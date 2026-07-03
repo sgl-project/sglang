@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -13,6 +14,16 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 def build_dspark_disagg_draft_input(
     batch: ScheduleBatch,
     server_args: ServerArgs,
@@ -20,6 +31,7 @@ def build_dspark_disagg_draft_input(
     future_map: FutureMap,
 ) -> DSparkDraftInputV2:
     del server_args
+    warmup_rounds = max(0, _env_int("SGLANG_DSPARK_TRANSFER_WARMUP_ROUNDS", 4))
 
     spec_info = DSparkDraftInputV2(
         bonus_tokens=last_tokens_tensor.to(dtype=torch.int64),
@@ -28,6 +40,12 @@ def build_dspark_disagg_draft_input(
         topk_p=torch.empty((0, 0), dtype=torch.float32, device=batch.device),
         topk_index=torch.empty((0, 0), dtype=torch.int64, device=batch.device),
         hidden_states=torch.empty((0, 0), dtype=torch.float16, device=batch.device),
+        transfer_warmup_rounds=torch.full(
+            (batch.batch_size(),),
+            warmup_rounds,
+            dtype=torch.int32,
+            device=batch.device,
+        ),
     )
 
     if batch.enable_overlap:
@@ -35,7 +53,10 @@ def build_dspark_disagg_draft_input(
         future_map.publish(spec_info.future_indices, batch.seq_lens)
         future_map.stash(
             spec_info.future_indices,
-            RelayPayload(bonus_tokens=spec_info.bonus_tokens),
+            RelayPayload(
+                bonus_tokens=spec_info.bonus_tokens,
+                transfer_warmup_rounds=spec_info.transfer_warmup_rounds,
+            ),
         )
 
     return spec_info

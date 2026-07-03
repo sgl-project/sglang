@@ -111,6 +111,7 @@ class RelayPayload:
     topk_index: Optional[torch.Tensor] = None
     hidden_states: Optional[torch.Tensor] = None
     draft_probs: Optional[torch.Tensor] = None
+    transfer_warmup_rounds: Optional[torch.Tensor] = None
 
     @classmethod
     def from_draft_input(cls, draft_input: EagleDraftInput) -> RelayPayload:
@@ -120,6 +121,9 @@ class RelayPayload:
             topk_index=draft_input.topk_index,
             hidden_states=draft_input.hidden_states,
             draft_probs=getattr(draft_input, "draft_probs", None),
+            transfer_warmup_rounds=getattr(
+                draft_input, "transfer_warmup_rounds", None
+            ),
         )
 
 
@@ -216,6 +220,19 @@ class FutureMap:
                 device=self.device,
             )
 
+        self.transfer_warmup_rounds_buf = None
+        if self.spec_algo.is_dspark():
+            dtype = (
+                payload.transfer_warmup_rounds.dtype
+                if payload.transfer_warmup_rounds is not None
+                else torch.int32
+            )
+            self.transfer_warmup_rounds_buf = torch.zeros(
+                (self.req_pool_size,),
+                dtype=dtype,
+                device=self.device,
+            )
+
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         if self.spec_algo.is_ngram():
             # FIXME: remove once precomputed draft is supported.
@@ -257,6 +274,13 @@ class FutureMap:
                 draft_input.draft_probs = self.draft_probs_buf[indices]
         else:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
+        if (
+            self.transfer_warmup_rounds_buf is not None
+            and hasattr(draft_input, "transfer_warmup_rounds")
+        ):
+            draft_input.transfer_warmup_rounds = self.transfer_warmup_rounds_buf[
+                indices
+            ]
         if self.need_hidden_states and not self.need_topk:
             draft_input.hidden_states = self.hidden_states_buf[indices]
         if _DEBUG_ASSERT:
@@ -347,3 +371,12 @@ class FutureMap:
             )
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
             self.draft_probs_buf[indices] = payload.draft_probs
+        if (
+            self.transfer_warmup_rounds_buf is not None
+            and payload.transfer_warmup_rounds is not None
+        ):
+            self.transfer_warmup_rounds_buf[indices] = (
+                payload.transfer_warmup_rounds.to(
+                    self.transfer_warmup_rounds_buf.dtype
+                )
+            )
