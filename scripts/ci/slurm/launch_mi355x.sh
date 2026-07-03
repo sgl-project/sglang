@@ -262,6 +262,46 @@ DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \
 --security-opt seccomp=unconfined \
 --device /dev/kfd --device /dev/dri --device /dev/infiniband \
 -v /it-share:/it-share:ro -v $HOME:/host_home"
+CONTAINER_WORKDIR="/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}"
+
+# Runtime hot patch for the transformers 5.12.1 dynamic-module symlink bug.
+# This mirrors upstream transformers PR #46618, but applies inside each fresh
+# server container because the MI355X disagg workflow consumes published images
+# rather than building one in CI.
+cat > "$WORKDIR/hotpatch_transformers_dynamic_module_utils.py" <<'PY'
+import pathlib
+
+import transformers.dynamic_module_utils as m
+
+REPLACEMENTS = (
+    ("Path(resolved_module_file).resolve()", "Path(resolved_module_file)"),
+    ("Path(source_file).resolve()", "Path(source_file)"),
+)
+
+path = pathlib.Path(m.__file__)
+src = path.read_text()
+patched = src
+matched = []
+for old, new in REPLACEMENTS:
+    if old in patched:
+        matched.append(old)
+        patched = patched.replace(old, new)
+
+if not matched:
+    print(f"transformers dynamic_module_utils already fixed; no patch needed ({path})")
+else:
+    if patched == src:
+        raise RuntimeError("transformers symlink hotpatch matched but changed nothing")
+    path.write_text(patched)
+    print(f"patched transformers dynamic_module_utils symlink bug ({path})")
+PY
+
+cat > "$WORKDIR/server_entrypoint.sh" <<EOF
+#!/bin/bash
+set -euo pipefail
+python3 "$CONTAINER_WORKDIR/hotpatch_transformers_dynamic_module_utils.py"
+exec python3 -m sglang.launch_server "\$@"
+EOF
 
 # ---------------------------------------------------------------------------
 # Write per-role scripts that srun dispatches to each compute node.
@@ -277,7 +317,7 @@ source "$WORKDIR/model_flags.sh"
 docker rm -f mi355x_prefill 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_prefill \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV "\${MODEL_ENV_ARGS[@]}" \
-  $IMAGE python3 -m sglang.launch_server \
+  $IMAGE bash $CONTAINER_WORKDIR/server_entrypoint.sh \
   --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
   $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
   --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
@@ -289,7 +329,7 @@ source "$WORKDIR/model_flags.sh"
 docker rm -f mi355x_decode 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_decode \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV "\${MODEL_ENV_ARGS[@]}" \
-  $IMAGE python3 -m sglang.launch_server \
+  $IMAGE bash $CONTAINER_WORKDIR/server_entrypoint.sh \
   --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
   $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
   --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
