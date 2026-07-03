@@ -198,6 +198,23 @@ class DSparkVerifyInput(_DSparkBlockInputBase):
 
 
 @dataclass
+class DSparkDraftExtendInput(SpecInput):
+    hidden_states: torch.Tensor
+    num_tokens_per_req: int = -1
+    num_tokens_for_logprob_per_req: int = -1
+
+    def __post_init__(self):
+        super().__init__(spec_input_type=SpecInputType.DSPARK_DRAFT_EXTEND)
+        if self.num_tokens_per_req == -1:
+            self.num_tokens_per_req = 1
+        if self.num_tokens_for_logprob_per_req == -1:
+            self.num_tokens_for_logprob_per_req = self.num_tokens_per_req
+
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
+        return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
+
+
+@dataclass
 class DSparkDraftInputV2(SpecInput):
     bonus_tokens: torch.Tensor
     new_seq_lens: torch.Tensor

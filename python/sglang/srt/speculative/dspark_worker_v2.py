@@ -36,6 +36,7 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import compute_dflash_correct_drafts_and_bonus
 from sglang.srt.speculative.dspark_info import (
     DSparkDraftBlockInput,
+    DSparkDraftExtendInput,
     DSparkDraftInputV2,
     DSparkVerifyInput,
 )
@@ -604,6 +605,74 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch.seq_lens_cpu = old_seq_lens_cpu
             batch.seq_lens_sum = old_seq_lens_sum
 
+    def _run_draft_bootstrap_forward(
+        self,
+        *,
+        batch: ScheduleBatch,
+        main_hidden: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        forward_mode: ForwardMode,
+        seq_lens: Optional[torch.Tensor] = None,
+        req_pool_indices: Optional[torch.Tensor] = None,
+        num_tokens_per_req: int = 1,
+    ) -> None:
+        if main_hidden.numel() == 0:
+            return
+
+        old_input_ids = batch.input_ids
+        old_out_cache_loc = batch.out_cache_loc
+        old_spec_info = batch.spec_info
+        old_forward_mode = batch.forward_mode
+        old_capture_hidden_mode = batch.capture_hidden_mode
+        old_seq_lens = batch.seq_lens
+        old_seq_lens_cpu = batch.seq_lens_cpu
+        old_seq_lens_sum = batch.seq_lens_sum
+        old_req_pool_indices = batch.req_pool_indices
+        try:
+            batch.input_ids = input_ids.to(device=self.device, dtype=torch.int64)
+            batch.out_cache_loc = out_cache_loc.to(device=self.device)
+            batch.spec_info = DSparkDraftExtendInput(
+                hidden_states=main_hidden.to(self.device, non_blocking=True),
+                num_tokens_per_req=num_tokens_per_req,
+                num_tokens_for_logprob_per_req=num_tokens_per_req,
+            )
+            batch.forward_mode = forward_mode
+            batch.capture_hidden_mode = CaptureHiddenMode.NULL
+            if seq_lens is not None:
+                batch.seq_lens = seq_lens.to(
+                    device=self.device, dtype=old_seq_lens.dtype
+                )
+                batch.seq_lens_cpu = batch.seq_lens.detach().cpu()
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+            if req_pool_indices is not None:
+                batch.req_pool_indices = req_pool_indices.to(
+                    device=self.device, dtype=old_req_pool_indices.dtype
+                )
+
+            forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
+            forward_batch.return_logprob = False
+            forward_batch.lora_ids = [None] * forward_batch.batch_size
+
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                torch.inference_mode(),
+            ):
+                self.draft_model_runner.forward(forward_batch)
+        finally:
+            batch.input_ids = old_input_ids
+            batch.out_cache_loc = old_out_cache_loc
+            batch.spec_info = old_spec_info
+            batch.forward_mode = old_forward_mode
+            batch.capture_hidden_mode = old_capture_hidden_mode
+            batch.seq_lens = old_seq_lens
+            batch.seq_lens_cpu = old_seq_lens_cpu
+            batch.seq_lens_sum = old_seq_lens_sum
+            batch.req_pool_indices = old_req_pool_indices
+
     def _materialize_disagg_prefill_hidden_to_draft_state(
         self,
         *,
@@ -648,17 +717,36 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
 
         seq_lens_before = (prefix_lens[valid].to(torch.int64) - 1).clamp_min(0)
-        draft_forward_batch = self._make_draft_decode_forward_batch_for_materialize(
-            batch=batch,
-            seq_lens_before=seq_lens_before,
-            cache_loc=cache_loc[valid],
-        )
-        self._materialize_main_hidden_to_draft_state(
-            main_hidden=hidden[valid],
-            cache_loc=cache_loc[valid],
-            positions=positions[valid],
-            draft_forward_batch=draft_forward_batch,
-        )
+        try:
+            self._run_draft_bootstrap_forward(
+                batch=batch,
+                main_hidden=hidden[valid],
+                input_ids=torch.zeros(
+                    (int(valid.sum().item()),), dtype=torch.int64, device=self.device
+                ),
+                positions=positions[valid],
+                out_cache_loc=cache_loc[valid],
+                forward_mode=ForwardMode.DECODE,
+                seq_lens=seq_lens_before,
+                req_pool_indices=batch.req_pool_indices[valid],
+            )
+        except Exception as e:
+            logger.warning(
+                "DSpark PD draft bootstrap forward failed; "
+                "falling back to materialization: %s",
+                e,
+            )
+            draft_forward_batch = self._make_draft_decode_forward_batch_for_materialize(
+                batch=batch,
+                seq_lens_before=seq_lens_before,
+                cache_loc=cache_loc[valid],
+            )
+            self._materialize_main_hidden_to_draft_state(
+                main_hidden=hidden[valid],
+                cache_loc=cache_loc[valid],
+                positions=positions[valid],
+                draft_forward_batch=draft_forward_batch,
+            )
 
     def _write_draft_kv_from_projected_kv(
         self,
@@ -1219,15 +1307,30 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(extend_lens)),
         )
-        draft_forward_batch = self._make_draft_prefill_forward_batch_for_materialize(
-            model_worker_batch
-        )
-        self._materialize_main_hidden_to_draft_state(
-            main_hidden=logits_output.hidden_states,
-            cache_loc=model_worker_batch.out_cache_loc,
-            positions=positions,
-            draft_forward_batch=draft_forward_batch,
-        )
+        try:
+            self._run_draft_bootstrap_forward(
+                batch=model_worker_batch,
+                main_hidden=logits_output.hidden_states,
+                input_ids=model_worker_batch.input_ids,
+                positions=positions,
+                out_cache_loc=model_worker_batch.out_cache_loc,
+                forward_mode=model_worker_batch.forward_mode,
+            )
+        except Exception as e:
+            logger.warning(
+                "DSpark prefill draft bootstrap forward failed; "
+                "falling back to materialization: %s",
+                e,
+            )
+            draft_forward_batch = self._make_draft_prefill_forward_batch_for_materialize(
+                model_worker_batch
+            )
+            self._materialize_main_hidden_to_draft_state(
+                main_hidden=logits_output.hidden_states,
+                cache_loc=model_worker_batch.out_cache_loc,
+                positions=positions,
+                draft_forward_batch=draft_forward_batch,
+            )
 
         logits_output.hidden_states = None
 

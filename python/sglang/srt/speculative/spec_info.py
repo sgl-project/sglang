@@ -274,6 +274,7 @@ class SpecInputType(IntEnum):
     DFLASH_VERIFY = auto()
     NGRAM_VERIFY = auto()
     DSPARK_DRAFT = auto()
+    DSPARK_DRAFT_EXTEND = auto()
     DSPARK_DRAFT_BLOCK = auto()
     DSPARK_VERIFY = auto()
 
@@ -293,6 +294,7 @@ class SpecInput(ABC):
             SpecInputType.FROZEN_KV_MTP_DRAFT,
             SpecInputType.DFLASH_DRAFT,
             SpecInputType.DSPARK_DRAFT,
+            SpecInputType.DSPARK_DRAFT_EXTEND,
         }
 
     def is_verify_input(self) -> bool:

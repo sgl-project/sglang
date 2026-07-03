@@ -189,6 +189,36 @@ class DeepseekV4DSparkModel(nn.Module):
             )
         return hidden_states
 
+    def forward_backbone_from_main_hidden(
+        self,
+        main_hidden: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        hidden_states = self.project_main_hidden(main_hidden)
+        hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+
+        prev_residual, prev_post, prev_comb = None, None, None
+        last_layer = None
+        for layer in self.layers:
+            last_layer = layer
+            hidden_states, prev_residual, prev_post, prev_comb = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                input_ids=input_ids,
+                input_ids_global=input_ids,
+                prev_residual=prev_residual,
+                prev_post=prev_post,
+                prev_comb=prev_comb,
+            )
+        if last_layer is not None and prev_residual is not None:
+            hidden_states = last_layer.hc_post(
+                hidden_states, prev_residual, prev_post, prev_comb
+            )
+        return hidden_states
+
     def collapse_block_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.hc_head(
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
@@ -201,7 +231,18 @@ class DeepseekV4DSparkModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        hidden_states = self.forward_backbone(input_ids, positions, forward_batch)
+        spec_info = getattr(forward_batch, "spec_info", None)
+        main_hidden = getattr(spec_info, "hidden_states", None)
+        if (
+            getattr(spec_info, "spec_input_type", None) is not None
+            and getattr(spec_info.spec_input_type, "name", None) == "DSPARK_DRAFT_EXTEND"
+            and main_hidden is not None
+        ):
+            hidden_states = self.forward_backbone_from_main_hidden(
+                main_hidden, input_ids, positions, forward_batch
+            )
+        else:
+            hidden_states = self.forward_backbone(input_ids, positions, forward_batch)
         return self.collapse_block_hidden(hidden_states)
 
 
