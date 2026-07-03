@@ -10,14 +10,14 @@ metatags:
 ```bash Command
 # replace 172.16.4.52:20000 with your own node ip address and port of the first node
 
-python3 -m sglang.launch_server \
+sglang serve \
   --model-path meta-llama/Meta-Llama-3.1-405B-Instruct \
   --tp 16 \
   --dist-init-addr 172.16.4.52:20000 \
   --nnodes 2 \
   --node-rank 0
 
-python3 -m sglang.launch_server \
+sglang serve \
   --model-path meta-llama/Meta-Llama-3.1-405B-Instruct \
   --tp 16 \
   --dist-init-addr 172.16.4.52:20000 \
@@ -28,7 +28,7 @@ python3 -m sglang.launch_server \
 Note that LLama 405B (fp8) can also be launched on a single node.
 
 ```bash Command
-python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct-FP8 --tp 8
+sglang serve --model-path meta-llama/Meta-Llama-3.1-405B-Instruct-FP8 --tp 8
 ```
 
 ## DeepSeek V3/R1
@@ -78,9 +78,8 @@ echo "[INFO] NCCL_INIT_ADDR: $NCCL_INIT_ADDR"
 # Launch the model server on each node using SLURM
 srun --ntasks=2 --nodes=2 --output="SLURM_Logs/%x_%j_node$SLURM_NODEID.out" \
     --error="SLURM_Logs/%x_%j_node$SLURM_NODEID.err" \
-    python3 -m sglang.launch_server \
+    sglang serve \
     --model-path "$model" \
-    --grammar-backend "xgrammar" \
     --tp "$tp_size" \
     --dist-init-addr "$NCCL_INIT_ADDR" \
     --nnodes 2 \
@@ -101,3 +100,246 @@ wait
 Then, you can test the server by sending requests following other [documents](../../basic_usage/openai_api_completions).
 
 Thanks for [aflah02](https://github.com/aflah02) for providing the example, based on his [blog post](https://aflah02.substack.com/p/multi-node-llm-inference-with-sglang).
+
+## Prefill-Decode (PD) Disaggregation on SLURM
+
+PD disaggregation splits inference across two sets of nodes: prefill nodes handle prompt processing while decode nodes handle token generation. This improves throughput for high-volume serving.
+
+The default transfer backend is Mooncake, which requires RDMA InfiniBand. Install the engine before submitting the jobs:
+
+```bash
+pip install mooncake-transfer-engine
+```
+
+Replace `<ib-device>` below with your InfiniBand device name (e.g., `mlx5_0`). See the
+[PD Disaggregation guide](/docs/advanced_features/pd_disaggregation) for details on other backends and NVLink transport.
+
+### Prefill job
+
+```bash Command
+#!/bin/bash -l
+
+#SBATCH -o SLURM_Logs/%x_%j_prefill.out
+#SBATCH -e SLURM_Logs/%x_%j_prefill.err
+#SBATCH -D ./
+#SBATCH -J Llama-405B-Prefill
+
+#SBATCH --nodes=2
+#SBATCH --ntasks=2
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=18
+#SBATCH --mem=224GB
+#SBATCH --partition="<your-partition>"
+#SBATCH --gres=gpu:8
+#SBATCH --time=12:00:00
+
+source ENV_FOLDER/bin/activate
+
+model=meta-llama/Meta-Llama-3.1-405B-Instruct
+tp_size=16
+prefill_port=30000
+bootstrap_port=8998
+
+HEAD_NODE=$(scontrol show hostname "$SLURM_NODELIST" | head -n 1)
+NCCL_INIT_ADDR="${HEAD_NODE}:8000"
+
+srun --ntasks=2 --nodes=2 \
+    --output="SLURM_Logs/%x_%j_prefill_node$SLURM_NODEID.out" \
+    --error="SLURM_Logs/%x_%j_prefill_node$SLURM_NODEID.err" \
+    sglang serve \
+    --model-path "$model" \
+    --disaggregation-mode prefill \
+    --disaggregation-bootstrap-port "$bootstrap_port" \
+    --disaggregation-ib-device <ib-device> \
+    --host 0.0.0.0 \
+    --port "$prefill_port" \
+    --tp "$tp_size" \
+    --dist-init-addr "$NCCL_INIT_ADDR" \
+    --nnodes 2 \
+    --node-rank "$SLURM_NODEID" &
+
+while ! nc -z "$HEAD_NODE" "$prefill_port"; do
+    sleep 1
+    echo "[INFO] Waiting for prefill $HEAD_NODE:$prefill_port"
+done
+
+echo "[INFO] Prefill ready on $HEAD_NODE:$prefill_port"
+
+# Publish the prefill address for the router to discover
+echo "http://${HEAD_NODE}:${prefill_port}" > /shared/pd_prefill_addr.txt
+
+wait
+```
+
+### Decode job
+
+```bash Command
+#!/bin/bash -l
+
+#SBATCH -o SLURM_Logs/%x_%j_decode.out
+#SBATCH -e SLURM_Logs/%x_%j_decode.err
+#SBATCH -D ./
+#SBATCH -J Llama-405B-Decode
+
+#SBATCH --nodes=2
+#SBATCH --ntasks=2
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=18
+#SBATCH --mem=224GB
+#SBATCH --partition="<your-partition>"
+#SBATCH --gres=gpu:8
+#SBATCH --time=12:00:00
+
+source ENV_FOLDER/bin/activate
+
+model=meta-llama/Meta-Llama-3.1-405B-Instruct
+tp_size=16
+decode_port=30001
+
+HEAD_NODE=$(scontrol show hostname "$SLURM_NODELIST" | head -n 1)
+NCCL_INIT_ADDR="${HEAD_NODE}:8000"
+
+srun --ntasks=2 --nodes=2 \
+    --output="SLURM_Logs/%x_%j_decode_node$SLURM_NODEID.out" \
+    --error="SLURM_Logs/%x_%j_decode_node$SLURM_NODEID.err" \
+    sglang serve \
+    --model-path "$model" \
+    --disaggregation-mode decode \
+    --disaggregation-ib-device <ib-device> \
+    --host 0.0.0.0 \
+    --port "$decode_port" \
+    --tp "$tp_size" \
+    --dist-init-addr "$NCCL_INIT_ADDR" \
+    --nnodes 2 \
+    --node-rank "$SLURM_NODEID" &
+
+while ! nc -z "$HEAD_NODE" "$decode_port"; do
+    sleep 1
+    echo "[INFO] Waiting for decode $HEAD_NODE:$decode_port"
+done
+
+echo "[INFO] Decode ready on $HEAD_NODE:$decode_port"
+
+# Publish the decode address for the router to discover
+echo "http://${HEAD_NODE}:${decode_port}" > /shared/pd_decode_addr.txt
+
+wait
+```
+
+### Router
+
+The router only needs a CPU node — allocate it explicitly via SLURM so it runs alongside the prefill/decode jobs. It reads the addresses published by the prefill and decode jobs from the shared filesystem.
+
+```bash Command
+#!/bin/bash -l
+
+#SBATCH -o SLURM_Logs/%x_%j_router.out
+#SBATCH -e SLURM_Logs/%x_%j_router.err
+#SBATCH -D ./
+#SBATCH -J Llama-405B-Router
+
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=8GB
+#SBATCH --partition="<your-cpu-partition>"
+#SBATCH --time=12:00:00
+
+PREFILL_ADDR=$(cat /shared/pd_prefill_addr.txt)
+DECODE_ADDR=$(cat /shared/pd_decode_addr.txt)
+
+srun python3 -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill "$PREFILL_ADDR" \
+  --decode "$DECODE_ADDR" \
+  --host 0.0.0.0 \
+  --port 8000 &
+
+while ! nc -z localhost 8000; do
+    sleep 1
+    echo "[INFO] Waiting for router on port 8000"
+done
+
+echo "[INFO] Router ready on port 8000"
+wait
+```
+
+Send requests to the router on port 8000:
+
+```bash Command
+curl http://<router-node>:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "default", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+## Working with Container via Apptainer (Singularity) on SLURM
+
+Many HPC clusters prefer Apptainer (Singularity) over Docker. Use `apptainer exec` (or `singularity exec`) with `--nv` for GPU access and `--bind` for model mounts.
+
+Build the SIF image once on the shared filesystem so all nodes can use it:
+
+```bash
+apptainer build /path/to/shared/sglang.sif docker://lmsysorg/sglang:latest
+```
+
+Then replace the `source ENV_FOLDER/bin/activate` step in the SLURM job scripts above with `apptainer exec`:
+
+```bash Command
+#!/bin/bash -l
+
+#SBATCH -o SLURM_Logs/%x_%j_master.out
+#SBATCH -e SLURM_Logs/%x_%j_master.err
+#SBATCH -D ./
+#SBATCH -J Llama-405B-TP16-SGL
+
+#SBATCH --nodes=2
+#SBATCH --ntasks=2
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=18
+#SBATCH --mem=224GB
+#SBATCH --partition="<your-partition>"
+#SBATCH --gres=gpu:8
+#SBATCH --time=12:00:00
+
+model=/models/meta-llama/Meta-Llama-3.1-405B-Instruct
+tp_size=16
+port=30000
+
+HEAD_NODE=$(scontrol show hostname "$SLURM_NODELIST" | head -n 1)
+NCCL_INIT_ADDR="${HEAD_NODE}:8000"
+
+srun --ntasks=2 --nodes=2 \
+    --output="SLURM_Logs/%x_%j_node$SLURM_NODEID.out" \
+    --error="SLURM_Logs/%x_%j_node$SLURM_NODEID.err" \
+    apptainer exec --nv --bind /path/to/models:/models:ro \
+    /path/to/shared/sglang.sif \
+    sglang serve \
+    --model-path "$model" \
+    --tp "$tp_size" \
+    --dist-init-addr "$NCCL_INIT_ADDR" \
+    --nnodes 2 \
+    --node-rank "$SLURM_NODEID" &
+
+while ! nc -z "$HEAD_NODE" "$port"; do
+    sleep 1
+    echo "[INFO] Waiting for $HEAD_NODE:$port"
+done
+
+echo "[INFO] $HEAD_NODE:$port is ready"
+wait
+```
+
+If your site supports Docker, you can also replace the activation step with `docker run`:
+
+```bash Command
+srun --ntasks=2 --nodes=2 \
+    docker run --rm --gpus all --ipc host --network host \
+    -v /path/to/models:/models:ro \
+    lmsysorg/sglang:latest \
+    sglang serve \
+    --model-path /models/meta-llama/Meta-Llama-3.1-405B-Instruct \
+    --tp 16 \
+    --dist-init-addr "$NCCL_INIT_ADDR" \
+    --nnodes 2 \
+    --node-rank "$SLURM_NODEID" &
+```
