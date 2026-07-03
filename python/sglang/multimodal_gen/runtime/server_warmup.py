@@ -26,6 +26,13 @@ logger = init_logger(__name__)
 MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAS0lEQVR42u3PMQ0AAAwDoEqv9ErYvQQckD4XAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAYHLAB8+AWnmfUycAAAAAElFTkSuQmCC"
 
 
+def _is_ci_log_env() -> bool:
+    return (
+        os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+        or os.environ.get("CI", "").lower() == "true"
+    )
+
+
 def get_first_generation_req(req_or_group: Any) -> Req | None:
     """Extract the first req"""
     if isinstance(req_or_group, Req):
@@ -200,12 +207,20 @@ class SchedulerWarmupMixin:
         if not self._show_warmup_progress:
             return
 
+        ci_log_env = _is_ci_log_env()
         if self._warmup_progress_bar is None:
             self._warmup_progress_bar = tqdm(
                 total=self._warmup_progress_total(req_or_group),
                 desc="Warmup requests",
                 unit="req",
+                disable=ci_log_env,
             )
+            if ci_log_env:
+                logger.info(
+                    "Warmup requests: 0/%s %s",
+                    self._warmup_progress_bar.total,
+                    self._format_warmup_req(req_or_group),
+                )
         self._warmup_progress_bar.set_postfix_str(
             self._format_warmup_req(req_or_group), refresh=False
         )
@@ -226,6 +241,13 @@ class SchedulerWarmupMixin:
                 refresh=False,
             )
         self._warmup_progress_bar.update(1)
+        if _is_ci_log_env():
+            logger.info(
+                "Warmup requests: %s/%s %s",
+                self._warmup_progress_bar.n,
+                self._warmup_progress_bar.total,
+                self._format_warmup_req(req_or_group),
+            )
 
         if self._warmup_progress_bar.n >= self._warmup_progress_bar.total:
             self._warmup_progress_bar.close()

@@ -375,7 +375,11 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual(req.negative_prompt, "model default negative")
         self.assertIs(req.do_classifier_free_guidance, True)
 
-    def test_server_based_warmup_uses_supported_resolution_within_budget(self):
+    def test_server_based_image_warmup_uses_model_default_over_supported(self):
+        """Server-based image warmup uses the model's default resolution so it
+        warms up at the real inference shape (avoiding a residual
+        cudagraph/compile gap), rather than shrinking to the smallest supported
+        resolution within an area budget."""
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
@@ -402,9 +406,12 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
                 server_based_warmup=True,
             )
 
-        self.assertEqual((reqs[0].width, reqs[0].height), (512, 512))
+        self.assertEqual((reqs[0].width, reqs[0].height), (1024, 1024))
 
-    def test_server_based_warmup_scales_large_image_default(self):
+    def test_server_based_image_warmup_uses_full_model_default(self):
+        """Server-based image warmup keeps the model's full default resolution
+        instead of scaling down to a server-warmup area budget, so warmup hits
+        the real inference shape."""
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
@@ -428,9 +435,11 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
                 server_based_warmup=True,
             )
 
-        self.assertEqual((reqs[0].width, reqs[0].height), (768, 768))
+        self.assertEqual((reqs[0].width, reqs[0].height), (1024, 1024))
 
-    def test_server_based_warmup_uses_diffusers_image_budget(self):
+    def test_server_based_image_warmup_diffusers_uses_model_default(self):
+        """Even on the diffusers backend, server-based image warmup uses the
+        model default resolution rather than the diffusers image area budget."""
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
@@ -454,7 +463,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
                 server_based_warmup=True,
             )
 
-        self.assertEqual((reqs[0].width, reqs[0].height), (512, 512))
+        self.assertEqual((reqs[0].width, reqs[0].height), (1024, 1024))
 
     def test_server_based_warmup_keeps_video_warmup_lightweight(self):
         server_args = MagicMock()

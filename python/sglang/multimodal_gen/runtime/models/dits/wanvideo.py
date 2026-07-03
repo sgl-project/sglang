@@ -939,7 +939,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             config.out_channels * math.prod(config.patch_size),
             bias=True,
             gather_output=True,
-            prefix=f"proj_out",
+            prefix="proj_out",
             quant_config=quant_config,
         )
         self.scale_shift_table = nn.Parameter(
