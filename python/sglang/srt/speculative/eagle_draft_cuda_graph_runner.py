@@ -28,6 +28,9 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
+from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    maybe_flashinfer_autotune_speculative_draft,
+)
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -440,13 +443,20 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.mark_forward_metadata_ready()
             self.deepep_adapter.capture(is_extend_in_batch=False)
             shape_key = self._make_graph_key(num_seqs)
+            post_warmup_hook = getattr(
+                self.draft_attn_backend, "on_after_cuda_graph_warmup", None
+            )
+            maybe_flashinfer_autotune_speculative_draft(
+                self,
+                run_once,
+                post_warmup_hook=post_warmup_hook,
+                skip_logits=False,
+            )
             self.backend.capture_one(
                 shape_key,
                 run_once,
                 dummies=None,
-                post_warmup_hook=getattr(
-                    self.draft_attn_backend, "on_after_cuda_graph_warmup", None
-                ),
+                post_warmup_hook=post_warmup_hook,
             )
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
