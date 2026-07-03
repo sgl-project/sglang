@@ -1128,6 +1128,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
     def model_specific_adjustment(self):
+        if self.is_draft_worker:
+            # Serving-wide ServerArgs adjustments are driven by the target
+            # model; a draft (e.g. an MHA drafter on an MLA target) must not
+            # override them.
+            return
+
         server_args = self.server_args
 
         # HRM-Text needs bidirectional prompt attention (prefill), which only the
