@@ -51,7 +51,11 @@ from sglang.srt.managers.schedule_batch import (
     flatten_nested_list,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
+from sglang.srt.models.gemma4_causal import (
+    Gemma4TextModel,
+    log_unloaded_params,
+    pp_filter_load_weight,
+)
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
 from sglang.srt.utils import add_prefix
 
@@ -337,7 +341,12 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
     # ------------------------------------------------------------------
     # Weight loading
     # ------------------------------------------------------------------
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        *,
+        is_full_load: bool = True,
+    ) -> Set[str]:
         k_eq_v_layers = self._get_k_eq_v_layers()
 
         params_dict = dict(self.named_parameters())
@@ -411,27 +420,14 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
-        unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
-            param_names = set(dict(self.named_parameters()).keys())
-            buckets = {
-                logging.WARNING: (
-                    "Some weights are not initialized from checkpoints",
-                    lambda p: p in param_names,
-                ),
-                logging.INFO: (
-                    "Persistent buffers not in checkpoint (using default init)",
-                    lambda p: p not in param_names and p not in non_persistent_buffers,
-                ),
-                logging.DEBUG: (
-                    "Non-persistent buffers not in checkpoint (expected)",
-                    lambda p: p in non_persistent_buffers,
-                ),
-            }
-            for level, (msg, pred) in buckets.items():
-                names = sorted(p for p in unloaded_params if pred(p))
-                if names:
-                    logger.log(level, "%s: %s", msg, names)
+        if is_full_load:
+            log_unloaded_params(
+                logger,
+                params_dict,
+                loaded_params,
+                set(dict(self.named_parameters()).keys()),
+                non_persistent_buffers,
+            )
         return loaded_params
 
 

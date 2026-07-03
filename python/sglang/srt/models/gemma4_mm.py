@@ -59,7 +59,11 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma4_audio import Gemma4AudioEncoder
-from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
+from sglang.srt.models.gemma4_causal import (
+    Gemma4TextModel,
+    log_unloaded_params,
+    pp_filter_load_weight,
+)
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -826,7 +830,12 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             i for i, lt in enumerate(text_config.layer_types) if lt == "full_attention"
         }
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        *,
+        is_full_load: bool = True,
+    ):
         k_eq_v_layers = self._get_k_eq_v_layers()
 
         num_experts = getattr(self.config.text_config, "num_experts", 0) or 0
@@ -1017,27 +1026,14 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                         )
                         weight_loader(param, loaded_weight)
                         loaded_params.add(name)
-        unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
-            param_names = set(dict(self.named_parameters()).keys())
-            buckets = {
-                logging.WARNING: (
-                    "Some weights are not initialized from checkpoints",
-                    lambda p: p in param_names,
-                ),
-                logging.INFO: (
-                    "Persistent buffers not in checkpoint (using default init)",
-                    lambda p: p not in param_names and p not in non_persistent_buffers,
-                ),
-                logging.DEBUG: (
-                    "Non-persistent buffers not in checkpoint (expected)",
-                    lambda p: p in non_persistent_buffers,
-                ),
-            }
-            for level, (msg, pred) in buckets.items():
-                names = sorted(p for p in unloaded_params if pred(p))
-                if names:
-                    logger.log(level, "%s: %s", msg, names)
+        if is_full_load:
+            log_unloaded_params(
+                logger,
+                params_dict,
+                loaded_params,
+                set(dict(self.named_parameters()).keys()),
+                non_persistent_buffers,
+            )
         return loaded_params
 
     lora_pattern = re.compile(

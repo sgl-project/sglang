@@ -651,7 +651,9 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         return name, loaded_weight
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], *, is_full_load: bool = True
+    ) -> Set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
@@ -714,7 +716,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             loaded_params.add(name)
             self._handle_default_weight(name, loaded_weight, params_dict)
         unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
+        if is_full_load and unloaded_params:
             logger.warning(
                 f"Some weights are not initialized from checkpoints {unloaded_params}"
             )
