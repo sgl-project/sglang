@@ -427,6 +427,69 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(flags.swa_full_tokens_ratio, 1.0)
         self.assertTrue(flags.disable_hybrid_swa_memory)
 
+    def test_gemma2_disables_hybrid_swa_memory(self):
+        sa = self._construct("Gemma2ForCausalLM", "llama")
+        self.assertTrue(sa.disable_hybrid_swa_memory)  # dual-apply == legacy
+        self.assertEqual(
+            sa._resolved_overrides,
+            [("_gemma2_gemma3_overrides", {"disable_hybrid_swa_memory": True})],
+        )
+        self.assertTrue(self._publish(sa).disable_hybrid_swa_memory)
+
+    def test_olmo2_disables_hybrid_swa_memory(self):
+        sa = self._construct("Olmo2ForCausalLM", "llama")
+        self.assertTrue(sa.disable_hybrid_swa_memory)
+        self.assertTrue(self._publish(sa).disable_hybrid_swa_memory)
+
+    def test_exaone_conditional_on_sliding_window_pattern(self):
+        # With the pattern the branch also asserts an explicit backend.
+        sa = self._construct(
+            "Exaone4ForCausalLM",
+            "llama",
+            config_extra={"sliding_window_pattern": "LLLG"},
+            attention_backend="fa3",
+        )
+        self.assertTrue(sa.disable_hybrid_swa_memory)
+        self.assertTrue(self._publish(sa).disable_hybrid_swa_memory)
+
+    def test_exaone_without_pattern_declares_nothing(self):
+        from sglang.srt.arg_groups.overrides import _exaone_overrides
+
+        self.assertEqual(
+            _exaone_overrides(None, SimpleNamespace(sliding_window_pattern=None)),
+            {},
+        )
+
+    def test_gpt_oss_mxfp4_forces_bfloat16(self):
+        from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+
+        if "mxfp4" not in QUANTIZATION_METHODS:
+            # Registration is platform-gated (CUDA / CPU engine / MXFP-HIP);
+            # plain CPU CI runners cannot construct an mxfp4 ModelConfig.
+            self.skipTest("mxfp4 quantization is not registered on this platform")
+        sa = self._construct(
+            "GptOssForCausalLM",
+            "llama",
+            config_extra={"quantization_config": {"quant_method": "mxfp4"}},
+        )
+        self.assertEqual(sa.dtype, "bfloat16")  # dual-apply == legacy
+        self.assertEqual(self._publish(sa).dtype, "bfloat16")
+
+    def test_gpt_oss_without_mxfp4_keeps_pristine_dtype(self):
+        sa = self._construct("GptOssForCausalLM", "llama")
+        self.assertEqual(sa.dtype, "auto")
+        self.assertEqual(self._publish(sa).dtype, "auto")
+
+    def test_gpt_oss_xpu_dtype_validation_reads_pristine(self):
+        from sglang.srt.arg_groups.overrides import _gpt_oss_overrides
+
+        with patch.object(overrides_module, "is_xpu", return_value=True):
+            with self.assertRaises(NotImplementedError):
+                _gpt_oss_overrides(
+                    SimpleNamespace(dtype="float16"),
+                    SimpleNamespace(architectures=["GptOssForCausalLM"]),
+                )
+
     def test_step3p_declarations_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _step3p_overrides
 

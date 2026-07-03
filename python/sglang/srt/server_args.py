@@ -4073,17 +4073,8 @@ class ServerArgs:
                 else:
                     self.attention_backend = "triton"
 
-            if is_xpu():
-                # Check for bf16 dtype on Intel XPU
-                if self.dtype == "auto":
-                    logger.warning(
-                        "GptOssForCausalLM on Intel XPU currently supports bfloat16 dtype only"
-                    )
-                elif self.dtype not in ["bfloat16"]:
-                    raise NotImplementedError(
-                        f"GptOssForCausalLM on Intel XPU only supports bfloat16 dtype, "
-                        f"but got '{self.dtype}'. Please use --dtype bfloat16 or remove --dtype to use auto."
-                    )
+            # XPU dtype validation moved to the R0 registry
+            # (arg_groups/overrides.py: _gpt_oss_overrides).
 
             supported_backends = [
                 "triton",
@@ -4116,9 +4107,8 @@ class ServerArgs:
                 quantization_config is not None
                 and quantization_config.get("quant_method") == "mxfp4"
             )
-            if is_mxfp4_quant_format:
-                # use bf16 for mxfp4 triton kernels
-                self.dtype = "bfloat16"
+            # The mxfp4 dtype override moved to the R0 registry
+            # (arg_groups/overrides.py: _gpt_oss_overrides).
 
             if self.moe_runner_backend == "auto":
                 if is_sm100_supported() and is_mxfp4_quant_format:
@@ -4273,19 +4263,8 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on SM100 for Llama4"
                     )
-        elif model_arch in [
-            "Gemma2ForCausalLM",
-            "Gemma3ForCausalLM",
-            "Gemma3ForConditionalGeneration",
-            "Gemma3nForCausalLM",
-            "Gemma3nForConditionalGeneration",
-        ]:
-            # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
-            # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736
-            logger.warning(
-                f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
-            )
-            self.disable_hybrid_swa_memory = True
+        # Gemma2/Gemma3 (disable_hybrid_swa_memory) moved to the R0 registry
+        # (arg_groups/overrides.py: _gemma2_gemma3_overrides).
         elif model_arch in (
             "Gemma4ForConditionalGeneration",
             "Gemma4ForCausalLM",
@@ -4337,22 +4316,16 @@ class ServerArgs:
             )
         elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
             if hf_config.sliding_window_pattern is not None:
-                logger.warning(
-                    f"Disabling hybrid SWA memory for {model_arch} as it is not yet supported."
-                )
-                self.disable_hybrid_swa_memory = True
+                # disable_hybrid_swa_memory moved to the R0 registry
+                # (arg_groups/overrides.py: _exaone_overrides).
                 # https://docs.sglang.ai/advanced_features/attention_backend.html
                 accepted_backends = ["fa3", "triton", "trtllm_mha"]
                 assert (
                     self.attention_backend in accepted_backends
                 ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {self.attention_backend}"
         elif model_arch in ["Olmo2ForCausalLM"]:
-            # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with Olmo3 model.
-            logger.warning(
-                f"Disabling hybrid SWA memory for {model_arch} as it is not yet supported."
-            )
-            self.disable_hybrid_swa_memory = True
-
+            # disable_hybrid_swa_memory moved to the R0 registry
+            # (arg_groups/overrides.py: _olmo2_overrides).
             if self.attention_backend is None:
                 if is_cuda() and is_sm100_supported():
                     self.attention_backend = "trtllm_mha"
