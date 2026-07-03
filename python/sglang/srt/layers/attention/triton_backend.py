@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.triton_ops.metadata import get_num_kv_splits_tr
 from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
+    dcp_merge_attention,
     get_dcp_lens,
 )
 from sglang.srt.layers.radix_attention import AttentionType
@@ -1748,7 +1749,7 @@ class TritonAttnBackend(AttentionBackend):
                 ],
                 dim=-1,
             )
-            o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
+            o = dcp_merge_attention(o_for_decode, local_lse, group, backend="mha")
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
         self.decode_attention_fwd(

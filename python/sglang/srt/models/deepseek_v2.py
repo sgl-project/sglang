@@ -71,9 +71,10 @@ from sglang.srt.layers.communicator import (
     get_attn_tp_context,
 )
 from sglang.srt.layers.communicator_dsa_cp import DSACPLayerCommunicator
-from sglang.srt.layers.dcp import dcp_enabled, get_attention_dcp_world_size
-from sglang.srt.layers.dcp.planner import (
-    prepare_decode_context_parallel_metadata,
+from sglang.srt.layers.dcp import (
+    dcp_build_decode_metadata,
+    dcp_enabled,
+    get_attention_dcp_world_size,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -2914,7 +2915,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
-        return prepare_decode_context_parallel_metadata(
+        return dcp_build_decode_metadata(
             seq_lens=seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,

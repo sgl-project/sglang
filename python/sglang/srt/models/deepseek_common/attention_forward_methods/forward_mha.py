@@ -13,7 +13,7 @@ from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
     dcp_enabled,
-    filter_dcp_local_kv_indices,
+    dcp_shard_decode_kv_indices,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
@@ -511,7 +511,7 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _is_cuda or _use_aiter_gfx95:
-            kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
+            kv_indices = dcp_shard_decode_kv_indices(kv_indices)
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )

@@ -25,6 +25,12 @@ Package-internal helpers (the @triton.jit kernels, ``CPTritonContext``,
 ``_all_gather_dcp_kv_cache``) stay private to their submodules — import them from
 ``sglang.srt.layers.dcp.{kernels,comm}`` if ever needed internally."""
 
+from sglang.srt.layers.dcp.base import (
+    DecodeContextParallelStrategyKind,
+    get_dcp_strategy,
+    init_dcp_strategy,
+    is_dcp_enabled,
+)
 from sglang.srt.layers.dcp.comm import (
     all_gather_kv_cache_for_dcp,
     all_gather_kv_cache_for_mha_chunk_extend,
@@ -44,17 +50,27 @@ from sglang.srt.layers.dcp.layout import (
     update_local_kv_lens_for_dcp,
 )
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
+from sglang.srt.layers.dcp.utils import (
+    dcp_build_decode_metadata,
+    dcp_gather_decode_query,
+    dcp_merge_attention,
+    dcp_plan_decode_metadata,
+    dcp_shard_decode_kv_indices,
+    dcp_update_local_decode_kv_lens,
+)
 
-# NOTE: planner.py is intentionally NOT imported here. It depends on server_args
-# (get_global_server_args), whereas this package-init executes at module-load time
-# for every eager importer of the DCP primitives — triton_backend,
-# mem_cache.memory_pool, mem_cache.triton_ops.mla_buffer, mem_cache.kv_cache_builder,
-# the FlashInfer-MLA / FlashMLA backends, and the deepseek forward methods. Keeping
-# the init server_args-free avoids a load-time import edge into server_args. Import
-# planner functions from sglang.srt.layers.dcp.planner directly.
+# NOTE: strategy.py and planner.py are intentionally NOT imported here. planner
+# depends on server_args (get_global_server_args), and strategy imports planner;
+# this package-init executes at module-load time for every eager importer of the DCP
+# primitives — triton_backend, mem_cache.memory_pool, mem_cache.triton_ops.mla_buffer,
+# mem_cache.kv_cache_builder, the FlashInfer-MLA / FlashMLA backends, and the deepseek
+# forward methods. Keeping the init server_args-free avoids a load-time import edge.
+# The concrete strategy is reached via get_dcp_strategy() (which lazily imports it);
+# import planner functions from sglang.srt.layers.dcp.planner directly if needed.
 
 __all__ = [
     "DecodeContextParallelMetadata",
+    "DecodeContextParallelStrategyKind",
     "all_gather_kv_cache_for_dcp",
     "all_gather_kv_cache_for_mha_chunk_extend",
     "all_gather_kv_cache_for_mha_extend",
@@ -63,10 +79,19 @@ __all__ = [
     "cp_lse_ag_out_rs_mha",
     "cp_lse_ag_out_rs_mla",
     "create_triton_kv_indices_for_dcp_triton",
+    "dcp_build_decode_metadata",
     "dcp_enabled",
+    "dcp_gather_decode_query",
+    "dcp_merge_attention",
+    "dcp_plan_decode_metadata",
+    "dcp_shard_decode_kv_indices",
+    "dcp_update_local_decode_kv_lens",
     "filter_dcp_local_kv_indices",
     "get_attention_dcp_rank",
     "get_attention_dcp_world_size",
     "get_dcp_lens",
+    "get_dcp_strategy",
+    "init_dcp_strategy",
+    "is_dcp_enabled",
     "update_local_kv_lens_for_dcp",
 ]

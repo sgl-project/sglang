@@ -26,10 +26,10 @@ from sglang.srt.layers.attention.utils import assert_buffer_fits
 from sglang.srt.layers.dcp import (
     DecodeContextParallelMetadata,
     dcp_enabled,
+    dcp_plan_decode_metadata,
+    dcp_update_local_decode_kv_lens,
     get_attention_dcp_world_size,
-    update_local_kv_lens_for_dcp,
 )
-from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -471,7 +471,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             assert seq_lens_cpu is not None
             kv_len_arr_cpu = seq_lens_cpu[:bs].to(torch.int32)
-            update_local_kv_lens_for_dcp(kv_len_arr_cpu)
+            dcp_update_local_decode_kv_lens(kv_len_arr_cpu)
             self.cuda_graph_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
                 kv_len_arr_cpu, dim=0
             )
@@ -735,13 +735,13 @@ class FlashInferMLAIndicesUpdaterDecode:
             )
 
             if dcp_enabled():
-                plan_dcp_decode_metadata(
-                    kv_lens,
-                    kv_indptr,
-                    kv_indices,
-                    init_metadata_replay,
-                    fast_decode_kwargs,
-                    bs,
+                dcp_plan_decode_metadata(
+                    kv_lens=kv_lens,
+                    kv_indptr=kv_indptr,
+                    kv_indices=kv_indices,
+                    init_metadata_replay=init_metadata_replay,
+                    fast_decode_kwargs=fast_decode_kwargs,
+                    bs=bs,
                 )
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
