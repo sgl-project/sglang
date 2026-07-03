@@ -855,12 +855,6 @@ class PipelineConfig:
             default=None,
             help="Override the total frame capacity of realtime causal DiT KV cache for pipelines that support it.",
         )
-        parser.add_argument(
-            f"--{prefix_with_dot}lazy-vae-encode-black-frames",
-            type=int,
-            default=None,
-            help="Use a shorter first-frame-plus-black-frame VAE encode for pipelines that support it.",
-        )
 
         # Add VAE configuration arguments
         from sglang.multimodal_gen.configs.models.vaes.base import VAEConfig

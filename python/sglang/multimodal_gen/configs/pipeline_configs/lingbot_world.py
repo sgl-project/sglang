@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models import DiTConfig
 from sglang.multimodal_gen.configs.models.dits import LingBotWorldVideoConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_I2V_A14B_Config
@@ -329,11 +330,14 @@ class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
     interactive_kv_still_window: int = 3
     interactive_kv_moving_window: int | None = 12
     interactive_kv_still_chunks: int = 2
-    lazy_vae_encode_black_frames: int = 60
+    lazy_vae_encode_black_frames: int = 0
 
     def preprocess_vae_encode(self, image, vae):
         image = super().preprocess_vae_encode(image, vae)
-        lazy_black_frames = max(0, int(self.lazy_vae_encode_black_frames or 0))
+        lazy_black_frames = envs.SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES
+        if lazy_black_frames is None:
+            lazy_black_frames = self.lazy_vae_encode_black_frames
+        lazy_black_frames = max(0, int(lazy_black_frames or 0))
         if lazy_black_frames <= 0 or image.ndim != 5:
             return image
 
