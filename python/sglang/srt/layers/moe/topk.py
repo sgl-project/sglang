@@ -24,6 +24,7 @@ from typing import (
     NamedTuple,
     Optional,
     Protocol,
+    Tuple,
     TypeGuard,
     runtime_checkable,
 )
@@ -178,11 +179,6 @@ if _is_cuda:
     except ImportError:
         fused_topk_deepseek = None
 
-    try:
-        from sgl_kernel import kimi_k2_moe_fused_gate
-    except ImportError as e:
-        pass
-
 if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel import topk_softmax
 
@@ -199,7 +195,7 @@ if _use_aiter:
 if _is_musa:
     try:
         from mate import moe_fused_gate
-    except ImportError as e:
+    except ImportError:
         raise ImportError("mate is required for the biased grouped topk.")
 
     from sglang.srt.hardware_backend.musa.kernels.topk import topk_sigmoid, topk_softmax
@@ -793,6 +789,24 @@ def fused_topk(
                 num_token_non_padded=num_token_non_padded,
             )
         # ===== END TO BE REFACTORED ====
+        elif _is_cuda and envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
+            # Unified Triton router (subsumes the AOT topk_softmax CUDA kernel).
+            from sglang.jit_kernel.moe_fused_gate import (
+                moe_fused_gate as _jit_moe_fused_gate,
+            )
+
+            zero_bias = torch.zeros(
+                gating_output.shape[1],
+                dtype=torch.float32,
+                device=gating_output.device,
+            )
+            topk_weights, topk_ids = _jit_moe_fused_gate(
+                gating_output,
+                zero_bias,
+                topk,
+                scoring_func="softmax",
+                renormalize=renormalize,
+            )
         else:
             topk_softmax(
                 topk_weights,
@@ -810,6 +824,28 @@ def fused_topk(
                 num_expert_group=1,
                 topk_group=1,
                 need_renorm=renormalize,
+            )
+        elif _is_cuda and envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
+            # Unified Triton router (subsumes the AOT topk_sigmoid CUDA kernel).
+            from sglang.jit_kernel.moe_fused_gate import (
+                moe_fused_gate as _jit_moe_fused_gate,
+            )
+
+            bias_fp32 = (
+                correction_bias.to(torch.float32)
+                if correction_bias is not None
+                else torch.zeros(
+                    gating_output.shape[1],
+                    dtype=torch.float32,
+                    device=gating_output.device,
+                )
+            )
+            topk_weights, topk_ids = _jit_moe_fused_gate(
+                gating_output,
+                bias_fp32,
+                topk,
+                scoring_func="sigmoid",
+                renormalize=renormalize,
             )
         else:
             topk_sigmoid(
@@ -1027,7 +1063,7 @@ def biased_topk_jit_kernel_impl(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     if _use_aiter and scoring_func == "sqrtsoftplus" and num_fused_shared_experts == 0:
@@ -1355,8 +1391,7 @@ def biased_grouped_topk_gpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
-):
-
+) -> Tuple[torch.Tensor, torch.Tensor]:
     num_tokens = gating_output.shape[0]
     num_experts = gating_output.shape[1]
     experts_per_group = (
@@ -1365,6 +1400,33 @@ def biased_grouped_topk_gpu(
 
     # topk for routed experts only (shared experts are appended separately below)
     topk_routed = topk - num_fused_shared_experts
+    if (
+        _is_cuda
+        and num_expert_group
+        and num_expert_group > 1
+        and envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
+    ):
+        # Opt-in: unified Triton router for DeepSeek-V3 grouped routing. Bit-exact
+        # with the flashinfer/AOT paths on DeepSeek-V3.2 e2e (validated); handles any
+        # experts-per-group (no <=32 cap). Off by default — see the env-var comment.
+        from sglang.jit_kernel.moe_fused_gate import moe_fused_gate as jit_grouped_gate
+
+        return jit_grouped_gate(
+            gating_output.to(dtype=torch.float32),
+            correction_bias.to(dtype=torch.float32),
+            topk,
+            scoring_func="sigmoid",
+            num_fused_shared_experts=num_fused_shared_experts,
+            renormalize=renormalize,
+            routed_scaling_factor=(
+                routed_scaling_factor if routed_scaling_factor is not None else 1.0
+            ),
+            apply_routed_scaling_factor_on_output=bool(
+                apply_routed_scaling_factor_on_output
+            ),
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+        )
     if (
         _is_cuda
         and fused_topk_deepseek is not None
@@ -1473,8 +1535,8 @@ def biased_grouped_topk_gpu(
             True,
             apply_routed_scaling_factor_on_output,
         )
+        return topk_weights, topk_ids
     else:
-        # Use optimized path for Kimi K2 (384 experts with num_expert_group=1)
         num_experts = gating_output.shape[1]
         if _is_cuda and num_experts == 384 and num_expert_group == 1:
             # ===== TO BE REFACTORED ====
@@ -1501,12 +1563,18 @@ def biased_grouped_topk_gpu(
                     apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 )
             # ===== END TO BE REFACTORED ====
-            return kimi_k2_moe_fused_gate(
+            from sglang.jit_kernel.moe_fused_gate import moe_fused_gate as jit_gate
+
+            return jit_gate(
                 gating_output.to(dtype=torch.float32),
                 correction_bias,
                 topk=topk,
+                scoring_func="sigmoid",
+                num_fused_shared_experts=num_fused_shared_experts,
                 renormalize=renormalize,
-                routed_scaling_factor=routed_scaling_factor,
+                routed_scaling_factor=(
+                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
+                ),
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
         elif (
@@ -1517,21 +1585,20 @@ def biased_grouped_topk_gpu(
             and num_experts <= 512
             and topk <= 8
         ):
-            from sglang.jit_kernel.grouped_topk import grouped_topk as jit_grouped_topk
+            # Ungrouped sigmoid (num_expert_group == 1): use the unified Triton
+            # router, which subsumes the jit grouped_topk.cuh kernel here.
+            from sglang.jit_kernel.moe_fused_gate import moe_fused_gate as jit_gate
 
-            scaling = (
-                routed_scaling_factor if routed_scaling_factor is not None else 1.0
-            )
-            if not apply_routed_scaling_factor_on_output:
-                scaling = 1.0
-            return jit_grouped_topk(
-                gating_output.to(dtype=torch.float32),
-                correction_bias.to(dtype=torch.float32),
-                num_expert_group,
-                topk_group,
+            return jit_gate(
+                gating_output,
+                correction_bias.to(torch.float32),
                 topk,
-                renormalize,
-                scaling,
+                scoring_func="sigmoid",
+                renormalize=renormalize,
+                routed_scaling_factor=(
+                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
+                ),
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
         elif (
             _is_xpu
