@@ -100,7 +100,9 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
-from sglang.srt.layers.moe.utils import is_deepep_class_backend
+from sglang.srt.layers.moe.utils import (
+    has_per_rank_fused_shared_slots,
+)
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
@@ -596,7 +598,7 @@ class TopK(MultiPlatformOp):
         # FIXME: router_logits should be of size (0, num_experts)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
-        if self.topk_config.num_fused_shared_experts > 0 and is_deepep_class_backend():
+        if has_per_rank_fused_shared_slots(self.topk_config.num_fused_shared_experts):
             n = self.topk_config.num_fused_shared_experts
             topk_output = topk_output._replace(
                 topk_ids=topk_output.topk_ids.new_empty(
@@ -1470,7 +1472,8 @@ def biased_grouped_topk_gpu(
         if num_fused_shared_experts > 0:
             # Append shared expert columns: ID = num_experts (first shared slot),
             # weight = sum(routed) / scaling_factor (matching biased_grouped_topk_impl).
-            # DeepEP fusion will overwrite both in _remap_topk_ids_for_deepep_fusion.
+            # For DeepEP/MegaMOE per-rank shared-slot layout, post-process remaps
+            # this placeholder ID and overwrites the shared weight for the active scaling path.
             topk_ids = F.pad(topk_ids, (0, num_fused_shared_experts), value=num_experts)
             topk_weights = F.pad(topk_weights, (0, num_fused_shared_experts))
             if routed_scaling_factor is not None:
@@ -1686,18 +1689,18 @@ else:
     fused_topk_native = fused_topk_torch_native
 
 
-def _remap_topk_for_deepep(
+def remap_topk_for_per_rank_shared_slots(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     num_fused_shared_experts: int,
     num_physical_routed_experts: int,
     topk_config: TopKConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Remap TopK output to DeepEP interleaved expert layout.
+    """Remap TopK IDs to a per-rank shared-slot layout.
 
-    DeepEP dispatch needs each rank's shared expert at a unique ID so tokens
-    route to the correct rank. The layout interleaves shared slots among
-    routed experts: [routed_0..L-1, shared, routed_L..2L-1, shared, ...].
+    DeepEP and MegaMoE dispatch need each rank's shared expert at a unique ID
+    so tokens route to the correct rank. The layout is ordered by rank:
+    [rank0 routed..., rank0 shared, rank1 routed..., rank1 shared, ...].
 
     Routed IDs:  e -> e + e // num_local_routed
     Shared IDs:  ep_rank * num_local_experts + num_local_routed
@@ -1710,7 +1713,7 @@ def _remap_topk_for_deepep(
     ep_rank = get_parallel().moe_ep_rank
     # Static EPLB may add redundant physical experts. At this point routed
     # topk_ids have already been remapped from logical to physical ids, so the
-    # DeepEP interleaved layout must use the physical routed count.
+    # per-rank shared-slot layout must use the physical routed count.
     num_local_routed = num_physical_routed_experts // ep_size
     num_local_experts = num_local_routed + num_fused_shared_experts
 
@@ -1786,6 +1789,9 @@ def _post_process_topk_ids(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_fused_shared_experts = topk_config.num_fused_shared_experts
+    use_per_rank_shared_slots = has_per_rank_fused_shared_slots(
+        num_fused_shared_experts
+    )
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
     )
@@ -1811,7 +1817,7 @@ def _post_process_topk_ids(
                 topk_ids, expert_location_dispatch_info, log2phy_prob
             )
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
-        elif num_fused_shared_experts > 0 and is_deepep_class_backend():
+        elif use_per_rank_shared_slots:
             # Shared experts appended as extra columns in topk_ids: their value
             # would be out-of-bounds for the logical-to-physical dispatch table,
             # so split, dispatch the routed cols, recombine.
@@ -1822,8 +1828,8 @@ def _post_process_topk_ids(
             )
             topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
             # ExpertDistributionRecorder tracks EPLB physical routed experts.
-            # DeepEP dispatch later inserts per-rank shared slots into topk_ids,
-            # so keep the routed physical ids separately for statistics.
+            # Per-rank shared-slot remap later adds shared slots to the topk ID
+            # space, so keep the routed physical ids separately for statistics.
             recorder_topk_ids = routed_cols
         else:
             topk_ids = _biased_grouped_topk_postprocess(
@@ -1854,12 +1860,11 @@ def _post_process_topk_ids(
         recorder_topk_ids = topk_ids
 
     _aiter_append = num_fused_shared_experts > 0 and _use_aiter
-    _deepep_remap = num_fused_shared_experts > 0 and is_deepep_class_backend()
 
-    if _aiter_append and _deepep_remap:
-        # Fused path: append shared experts AND apply the DeepEP interleaved
+    if _aiter_append and use_per_rank_shared_slots:
+        # Fused path: append shared experts AND apply the per-rank shared-slot
         # remap in a single Triton kernel. This replaces the original
-        # fused_append_shared_experts() + eager _remap_topk_for_deepep() pair,
+        # fused_append_shared_experts() + eager per-rank shared-slot remap pair,
         # collapsing ~6 launch-bound elementwise kernels/layer (div_floor / add /
         # arange / fill / copy) into the one append kernel that already runs.
         #
@@ -1867,7 +1872,7 @@ def _post_process_topk_ids(
         # aiter_biased_grouped_topk folds routed_scaling_factor into the routed
         # weights and forward_deepep skips the post-MoE multiply for _use_aiter,
         # so the always-on shared expert must contribute 1.0x. (The eager
-        # _remap_topk_for_deepep instead sets shared weight to
+        # per-rank shared-slot remap instead sets shared weight to
         # 1/routed_scaling_factor to compensate a post-MoE scale that the aiter
         # path does not apply; see PR #28237.)
         num_physical_routed_experts = (
@@ -1914,15 +1919,16 @@ def _post_process_topk_ids(
             scale_factor,
             N,  # base id for shared experts
         )
-    elif _deepep_remap:
-        # DeepEP: remap to interleaved expert layout where each rank's shared
-        # expert has a unique ID for dispatch routing.
+
+    elif use_per_rank_shared_slots:
+        # DeepEP/MegaMOE: remap to per-rank shared-slot layout where each
+        # rank's shared expert has a unique ID for dispatch routing.
         num_physical_routed_experts = (
             expert_location_dispatch_info.num_physical_experts
             if expert_location_dispatch_info is not None
             else router_logits.shape[1]
         )
-        topk_ids, topk_weights = _remap_topk_for_deepep(
+        topk_ids, topk_weights = remap_topk_for_per_rank_shared_slots(
             topk_ids,
             topk_weights,
             num_fused_shared_experts,
