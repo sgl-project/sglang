@@ -128,33 +128,43 @@ if _HAVE_TRITON:
         HV: tl.constexpr,
         Dk: tl.constexpr,
         CS: tl.constexpr,
+        RB: tl.constexpr,
     ):
-        """One program per value-head. Computes A_strict = -(kb @ kn^T)*decay (strictly lower)
-        and STORES it to a global fp32 tensor. Splitting this out (vs inlining the solve) is what
-        makes the replay bit-identical to torch_chunk: torch_chunk feeds the standalone
-        _fwd_sub_kernel an A that was rounded to fp32 in global memory by its `@`, whereas an
-        inline solve consumed A while still register-resident (tl.dot accumulator, unrounded),
-        drifting ~1 fp32 ULP and tipping a bf16 boundary on ~1% of real decode tokens.
+        """One program per (value-head, RB-row block). Computes rows [rb*RB, rb*RB+RB) of
+        A_strict = -(kb @ kn^T)*decay (strictly lower) and STORES them to a global fp32 tensor.
+        Splitting this out (vs inlining the solve) is what makes the replay bit-identical to
+        torch_chunk: torch_chunk feeds the standalone _fwd_sub_kernel an A that was rounded to
+        fp32 in global memory by its `@`, whereas an inline solve consumed A while still
+        register-resident (tl.dot accumulator, unrounded), drifting ~1 fp32 ULP and tipping a
+        bf16 boundary on ~1% of real decode tokens. Row-blocking (grid HV*CS//RB) turns the 48
+        oversized programs into 48*CS//RB small ones, eliminating register spills and giving the
+        148-SM B200 enough programs to fill (~135us monolithic -> ~22us).
         """
-        h = tl.program_id(0)
-        r = tl.arange(0, CS)
+        pid = tl.program_id(0)
+        nrb: tl.constexpr = CS // RB
+        h = pid // nrb
+        rb = pid % nrb
+        ri = rb * RB + tl.arange(0, RB)  # this block's rows
+        rj = tl.arange(0, CS)  # all columns
         dk = tl.arange(0, Dk)
-        valid = r < W
-        kn = tl.load(
-            kn_ptr + (r[:, None] * HV + h) * Dk + dk[None, :], mask=valid[:, None], other=0.0
-        )
+        vi = ri < W
+        vj = rj < W
         kb = tl.load(
-            kb_ptr + (r[:, None] * HV + h) * Dk + dk[None, :], mask=valid[:, None], other=0.0
+            kb_ptr + (ri[:, None] * HV + h) * Dk + dk[None, :], mask=vi[:, None], other=0.0
         )
-        gcum = tl.load(gcum_ptr + r * HV + h, mask=valid, other=0.0)
+        kn = tl.load(
+            kn_ptr + (rj[:, None] * HV + h) * Dk + dk[None, :], mask=vj[:, None], other=0.0
+        )
+        gi = tl.load(gcum_ptr + ri * HV + h, mask=vi, other=0.0)
+        gj = tl.load(gcum_ptr + rj * HV + h, mask=vj, other=0.0)
         # See main kernel for the exponent-masking rationale (guards inf*0=NaN on padded rows /
         # the discarded upper triangle).
-        kept = (r[:, None] >= r[None, :]) & valid[:, None] & valid[None, :]
-        gd = tl.where(kept, gcum[:, None] - gcum[None, :], 0.0)
+        kept = (ri[:, None] >= rj[None, :]) & vi[:, None] & vj[None, :]
+        gd = tl.where(kept, gi[:, None] - gj[None, :], 0.0)
         decay = tl.where(kept, libdevice.exp(gd), 0.0)
         A = -tl.dot(kb, tl.trans(kn), input_precision="ieee") * decay
-        A = tl.where(r[:, None] > r[None, :], A, 0.0)
-        tl.store(A_ptr + (h * CS + r[:, None]) * CS + r[None, :], A)
+        A = tl.where(ri[:, None] > rj[None, :], A, 0.0)
+        tl.store(A_ptr + (h * CS + ri[:, None]) * CS + rj[None, :], A)
 
     @triton.jit
     def _gdn_fused_replay_kernel(
@@ -336,15 +346,20 @@ def _gdn_fused_replay(
     # A is still a tl.dot accumulator) is what makes the replay bit-identical to torch_chunk; an
     # inline solve drifts ~1 fp32 ULP and tips a bf16 boundary on ~1% of real decode tokens.
     T = torch.empty(HV, C, C, device=S.device, dtype=torch.float32)
-    _gdn_replay_A_kernel[(HV,)](
-        kn, kb, gcum, T, w, HV=HV, Dk=Dk, CS=C, num_warps=4,
+    # Row-block A (RB=16) so the 148-SM B200 gets HV*CS//RB programs instead of HV oversized ones
+    # (no register spills, ~135us -> ~22us). Bit-identical to the monolithic kernel.
+    RB = 16
+    _gdn_replay_A_kernel[(HV * (C // RB),)](
+        kn, kb, gcum, T, w, HV=HV, Dk=Dk, CS=C, RB=RB, num_warps=8,
     )
     _fwd_sub_kernel[(HV,)](T, C=C)  # in-place strictly-lower solve, == torch_chunk's _solve_fwd_sub
     out = torch.empty(B, HV, Dv, device=S.device, dtype=torch.float32)
     Snew = torch.empty_like(S) if commit else S
+    # num_warps=32: the [CS,CS]/[CS,Dk]/[CS,Dv] fp32 tiles spill heavily at 4 warps (~4000 spills,
+    # ~1.1ms); 32 warps drops spills ~10x for ~9x speedup, bit-identical across widths 1..64.
     _gdn_fused_replay_kernel[(B * HV,)](
         qn, kn, kb, vb, gcum, T, S, out, Snew,
-        w, B, HV=HV, Dk=Dk, Dv=Dv, CS=C, COMMIT=commit, num_warps=4,
+        w, B, HV=HV, Dk=Dk, Dv=Dv, CS=C, COMMIT=commit, num_warps=32,
     )
     return out, Snew
 
