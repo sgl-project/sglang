@@ -33,8 +33,23 @@ import logging
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from sglang.srt.arg_groups.arg_utils import model_overridable_fields
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import resolve_flag_leaf
-from sglang.srt.utils.common import is_flashinfer_available, is_xpu
+from sglang.srt.utils.common import (
+    cpu_has_amx_support,
+    get_device_sm,
+    is_blackwell_supported,
+    is_cpu,
+    is_cuda,
+    is_flashinfer_available,
+    is_hip,
+    is_npu,
+    is_sm90_supported,
+    is_sm100_supported,
+    is_sm120_supported,
+    is_xpu,
+    xpu_has_xmx_support,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +265,21 @@ def _exaone_overrides(server_args: Any, hf_config: Any) -> dict:
 
 @_register_for("GptOssForCausalLM")
 def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
+    overrides: Dict[str, Any] = {}
+    # Set attention backend for GPT-OSS
+    if server_args.is_attention_backend_not_set():
+        if is_sm100_supported():
+            overrides["attention_backend"] = "trtllm_mha"
+        elif is_sm90_supported():
+            overrides["attention_backend"] = "fa3"
+        elif is_cpu() and cpu_has_amx_support():
+            overrides["attention_backend"] = "intel_amx"
+        elif is_xpu():
+            overrides["attention_backend"] = "intel_xpu"
+        elif is_hip():
+            overrides["attention_backend"] = "aiter"
+        else:
+            overrides["attention_backend"] = "triton"
     if is_xpu():
         # Check for bf16 dtype on Intel XPU. Reads the pristine dtype request,
         # which equals the legacy mid-branch read: dtype had no earlier writer
@@ -269,17 +299,111 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
         and quantization_config.get("quant_method") == "mxfp4"
     ):
         # use bf16 for mxfp4 triton kernels
-        return {"dtype": "bfloat16"}
+        overrides["dtype"] = "bfloat16"
+    return overrides
+
+
+# Keep in sync with LLAMA4_MODEL_ARCHS (server_args.py).
+@_register_for("Llama4ForConditionalGeneration", "Llama4ForCausalLM")
+def _llama4_overrides(server_args: Any, hf_config: Any) -> dict:
+    if server_args.device == "cpu":
+        return {}
+    # Auto-select attention backend for Llama4 if not specified
+    if server_args.attention_backend is None:
+        if is_sm100_supported():
+            backend, platform = "trtllm_mha", "sm100"
+        elif is_sm90_supported():
+            backend, platform = "fa3", "sm90"
+        elif is_hip():
+            backend, platform = "aiter", "hip"
+        elif server_args.device == "xpu":
+            backend, platform = "intel_xpu", "xpu"
+        else:
+            backend, platform = "triton", "other platforms"
+        logger.warning(
+            f"Use {backend} as attention backend on {platform} for Llama4 model"
+        )
+        return {"attention_backend": backend}
     return {}
+
+
+@_register_for(
+    "Gemma4ForConditionalGeneration",
+    "Gemma4ForCausalLM",
+    "Gemma4UnifiedForConditionalGeneration",
+)
+def _gemma4_overrides(server_args: Any, hf_config: Any) -> dict:
+    default_attention_backend = "trtllm_mha" if is_sm100_supported() else "triton"
+    if server_args.is_attention_backend_not_set():
+        logger.info(
+            f"Use {default_attention_backend} as default attention backend for Gemma4"
+        )
+        return {"attention_backend": default_attention_backend}
+    # If only one split backend is set, keep the other side on a
+    # Gemma4-compatible fallback instead of letting generic backend selection
+    # choose an unsupported backend later.
+    if server_args.attention_backend is None:
+        return {"attention_backend": default_attention_backend}
+    return {}
+
+
+@_register_for("MiniCPMV4_6ForConditionalGeneration")
+def _minicpm_v4_6_overrides(server_args: Any, hf_config: Any) -> dict:
+    if is_sm100_supported() and server_args.attention_backend is None:
+        return {"attention_backend": "triton"}
+    return {}
+
+
+@_register_for(
+    "FalconH1ForCausalLM", "JetNemotronForCausalLM", "JetVLMForConditionalGeneration"
+)
+def _falcon_h1_jet_overrides(server_args: Any, hf_config: Any) -> dict:
+    if is_sm100_supported() and server_args.attention_backend is None:
+        return {"attention_backend": "triton"}
+    return {}
+
+
+@_register_for("GraniteMoeHybridForCausalLM")
+def _granite_moe_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
+    has_mamba = any(
+        layer_type == "mamba" for layer_type in getattr(hf_config, "layer_types", [])
+    )
+    if has_mamba and is_sm100_supported() and server_args.attention_backend is None:
+        return {"attention_backend": "flashinfer"}
+    return {}
+
+
+@_register_for("Lfm2ForCausalLM")
+def _lfm2_overrides(server_args: Any, hf_config: Any) -> dict:
+    if is_sm100_supported() and server_args.attention_backend is None:
+        return {"attention_backend": "flashinfer"}
+    return {}
+
+
+@_register_for("Glm4MoeForCausalLM")
+def _glm4_moe_overrides(server_args: Any, hf_config: Any) -> dict:
+    logger.info(
+        "Enable TF32 matmul for Glm4MoeForCausalLM model to improve gate gemm performance."
+    )
+    return {"enable_tf32_matmul": True}
 
 
 @_register_for("Olmo2ForCausalLM")
 def _olmo2_overrides(server_args: Any, hf_config: Any) -> dict:
+    overrides: Dict[str, Any] = {}
     # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with Olmo3 model.
     logger.warning(
         f"Disabling hybrid SWA memory for {hf_config.architectures[0]} as it is not yet supported."
     )
-    return {"disable_hybrid_swa_memory": True}
+    overrides["disable_hybrid_swa_memory"] = True
+    if server_args.attention_backend is None:
+        if is_cuda() and is_sm100_supported():
+            overrides["attention_backend"] = "trtllm_mha"
+        elif is_cuda() and get_device_sm() >= 80:
+            overrides["attention_backend"] = "fa3"
+        else:
+            overrides["attention_backend"] = "triton"
+    return overrides
 
 
 @register_model_override_predicate(
@@ -288,6 +412,13 @@ def _olmo2_overrides(server_args: Any, hf_config: Any) -> dict:
 )
 def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:
     overrides: Dict[str, Any] = {}
+    if server_args.is_attention_backend_not_set():
+        if is_blackwell_supported():
+            logger.info("Auto-select fa4 attention backend for Step3p7 on Blackwell.")
+            overrides["attention_backend"] = "fa4"
+        elif is_sm90_supported():
+            logger.info("Auto-select fa3 attention backend for Step3p7 on Hopper.")
+            overrides["attention_backend"] = "fa3"
     if server_args.speculative_algorithm == "EAGLE":
         logger.info(
             "Enable multi-layer EAGLE speculative decoding for Step3p5ForCausalLM model."
@@ -330,6 +461,155 @@ def _deterministic_sampling_backend(view: Any) -> dict:
             "Sampling backend is set to pytorch for deterministic inference."
         )
         return {"sampling_backend": "pytorch"}
+    return {}
+
+
+def _deterministic_is_deepseek_model(view: Any) -> bool:
+    """Faithful copy of the deterministic handler's arch probe (pure read;
+    the handler keeps its own copy for the later deepseek validation)."""
+    from sglang.srt.connector import ConnectorType
+    from sglang.srt.utils.common import parse_connector_type
+
+    if parse_connector_type(view.model_path) == ConnectorType.INSTANCE:
+        return False
+    try:
+        hf_config = view.get_model_config().hf_config
+        return hf_config.architectures[0] in [
+            "DeepseekV2ForCausalLM",
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+            "MistralLarge3ForCausalLM",
+            "PixtralForConditionalGeneration",
+            "GlmMoeDsaForCausalLM",
+        ]
+    except Exception:
+        return False
+
+
+@register_post_process
+def _deterministic_attention_backend(view: Any) -> dict:
+    if not view.enable_deterministic_inference:
+        return {}
+    from sglang.srt.server_args import DETERMINISTIC_ATTENTION_BACKEND_CHOICES
+
+    if view.attention_backend is None:
+        # User didn't specify attention backend, fallback based on GPU architecture
+        if is_sm100_supported() or is_sm120_supported():
+            # Blackwell and newer architectures
+            if _deterministic_is_deepseek_model(view):
+                # fallback to triton for DeepSeek models because flashinfer
+                # doesn't support deterministic inference for DeepSeek models yet
+                backend = "triton"
+            else:
+                # fallback to flashinfer on Blackwell for non-DeepSeek models
+                backend = "flashinfer"
+        else:
+            # Hopper (SM90) and older architectures
+            backend = "fa3"
+        logger.warning(
+            f"Attention backend not specified. Falling back to '{backend}' for deterministic inference. "
+            f"You can explicitly set --attention-backend to one of {DETERMINISTIC_ATTENTION_BACKEND_CHOICES}."
+        )
+        return {"attention_backend": backend}
+    elif view.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
+        # User explicitly specified an incompatible attention backend
+        raise ValueError(
+            f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference, "
+            f"but you explicitly specified '{view.attention_backend}'."
+        )
+    return {}
+
+
+@register_post_process
+def _attention_backend_default(view: Any) -> dict:
+    if view.prefill_attention_backend is not None and (
+        view.prefill_attention_backend == view.decode_attention_backend
+    ):  # override the default attention backend
+        return {"attention_backend": view.prefill_attention_backend}
+    if view.attention_backend is None:
+        backend = view._get_default_attn_backend(
+            view.use_mla_backend(), view.get_model_config()
+        )
+        logger.info(
+            f"Attention backend not specified. Use {backend} backend by default."
+        )
+        return {"attention_backend": backend}
+    return {}
+
+
+@register_post_process
+def _attention_backend_fa3_fp8_fallback(view: Any) -> dict:
+    if view.attention_backend == "fa3" and view.kv_cache_dtype == "fp8_e5m2":
+        logger.warning(
+            "FlashAttention3 only supports fp8_e4m3 if using FP8; "
+            "Setting attention backend to triton."
+        )
+        return {"attention_backend": "triton"}
+    return {}
+
+
+@register_post_process
+def _attention_backend_platform_fallbacks(view: Any) -> dict:
+    if (
+        view.attention_backend == "intel_amx"
+        and view.device == "cpu"
+        and not cpu_has_amx_support()
+    ):
+        logger.warning(
+            "The current platform does not support Intel AMX, will fallback to torch_native backend."
+        )
+        return {"attention_backend": "torch_native"}
+    if (
+        view.attention_backend == "intel_xpu"
+        and view.device == "xpu"
+        and not xpu_has_xmx_support()
+    ):
+        logger.warning(
+            "The current platform does not support Intel XMX, will fallback to triton backend."
+        )
+        return {"attention_backend": "triton"}
+    return {}
+
+
+@register_post_process
+def _attention_backend_dual_chunk(view: Any) -> dict:
+    if (
+        getattr(view.get_model_config().hf_config, "dual_chunk_attention_config", None)
+        is not None
+    ):
+        if view.attention_backend is None:
+            logger.info("Dual chunk attention is turned on by default.")
+            return {"attention_backend": "dual_chunk_flash_attn"}
+        elif view.attention_backend != "dual_chunk_flash_attn":
+            raise ValueError(
+                "Dual chunk attention is enabled, but attention backend is set to "
+                f"{view.attention_backend}. Please set it to 'dual_chunk_flash_attn'."
+            )
+    return {}
+
+
+@register_post_process
+def _dllm_attention_backend(view: Any) -> dict:
+    if view.dllm_algorithm is None:
+        return {}
+    if is_hip():
+        if view.attention_backend not in ["triton", "aiter"]:
+            logger.warning(
+                "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
+            )
+            return {"attention_backend": "triton"}
+    elif is_npu():
+        if view.attention_backend != "ascend":
+            logger.warning(
+                "Attention backend is overridden to 'ascend' when running on NPU for diffusion LLM inference."
+            )
+            return {"attention_backend": "ascend"}
+    elif view.cuda_graph_config.decode.backend != Backend.DISABLED:
+        if view.attention_backend != "flashinfer":
+            logger.warning(
+                "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
+            )
+            return {"attention_backend": "flashinfer"}
     return {}
 
 
@@ -442,6 +722,27 @@ def apply_declarations_to_server_args(
     for _source, decl in list(declarations) + list(terminal):
         for field, value in decl.items():
             setattr(server_args, field, value)
+
+
+def refresh_declared_fields(server_args: Any, fields: Iterable[str]) -> None:
+    """Transition helper for legacy code that overwrites a resolved field
+    AFTER the override collection in ``__post_init__`` (e.g.
+    ``ModelRunner.model_specific_adjustment`` forcing ``attention_backend``
+    for HRM-Text). Redeclares the live value so publish parity holds and the
+    flags tier materializes the adjusted end state.
+    """
+    _missing = object()
+    declarations = server_args._resolved_overrides
+    for field in fields:
+        effective = _missing
+        for _source, decl in declarations:
+            if field in decl:
+                effective = decl[field]
+        if effective is _missing:
+            continue
+        live = getattr(server_args, field)
+        if effective != live:
+            declarations.append((f"runtime_adjustment[{field}]", {field: live}))
 
 
 def assert_flag_parity(

@@ -68,6 +68,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "swa_full_tokens_ratio",
                     "disable_hybrid_swa_memory",
                     "sampling_backend",
+                    "attention_backend",
                 }
             ),
         )
@@ -535,7 +536,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with patch.object(overrides_module, "is_xpu", return_value=True):
             with self.assertRaises(NotImplementedError):
                 _gpt_oss_overrides(
-                    SimpleNamespace(dtype="float16"),
+                    SimpleNamespace(
+                        dtype="float16",
+                        is_attention_backend_not_set=lambda: False,
+                    ),
                     SimpleNamespace(architectures=["GptOssForCausalLM"]),
                 )
 
@@ -564,7 +568,32 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # two pass writers chain: default fill, then the deterministic force —
         # last writer wins on the flags leaf and parity holds end-to-end.
         self.assertEqual(sa.sampling_backend, "pytorch")
-        self.assertEqual(self._publish(sa).sampling_backend, "pytorch")
+        flags = self._publish(sa)
+        self.assertEqual(flags.sampling_backend, "pytorch")
+        # the deterministic attention fill declared a compatible backend and
+        # the compatibility default-fill then had nothing to do
+        self.assertIn(
+            (
+                "_deterministic_attention_backend",
+                {"attention_backend": sa.attention_backend},
+            ),
+            sa._resolved_overrides,
+        )
+        self.assertEqual(flags.attn.backend, sa.attention_backend)
+
+    def test_deterministic_incompatible_backend_raises(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deterministic_attention_backend,
+        )
+
+        view = ResolvedView(
+            SimpleNamespace(
+                enable_deterministic_inference=True, attention_backend="flashmla"
+            )
+        )
+        with self.assertRaises(ValueError):
+            _deterministic_attention_backend(view)
 
     def test_deterministic_ascend_is_left_alone(self):
         from sglang.srt.arg_groups.overrides import (
@@ -579,36 +608,228 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         self.assertEqual(_deterministic_sampling_backend(view), {})
 
+    def test_dllm_forces_flashinfer_with_cuda_graph(self):
+        # CUDA path: cuda graph enabled by default -> dllm forces flashinfer.
+        sa = self._construct(
+            "LlamaForCausalLM",
+            "llama",
+            dllm_algorithm="LowConfidence",
+            disable_radix_cache=True,
+        )
+        self.assertEqual(sa.attention_backend, "flashinfer")
+        self.assertIn(
+            ("_dllm_attention_backend", {"attention_backend": "flashinfer"}),
+            sa._resolved_overrides,
+        )
+        # first MAPPED leaf: attention_backend routes to flags.attn.backend
+        self.assertEqual(self._publish(sa).attn.backend, "flashinfer")
+
+    def test_attention_backend_leaf_materializes_end_state(self):
+        # The default-fill pass declares the platform-selected backend; the
+        # leaf must equal the final server_args value (publish parity).
+        sa = self._construct("LlamaForCausalLM", "llama")
+        declared = {f for _s, d in sa._resolved_overrides for f in d}
+        self.assertIn("attention_backend", declared)  # default fill declared
+        self.assertEqual(self._publish(sa).attn.backend, sa.attention_backend)
+
+    def test_runner_side_adjustment_can_refresh_declaration(self):
+        from sglang.srt.arg_groups.overrides import refresh_declared_fields
+
+        sa = self._construct("LlamaForCausalLM", "llama")
+        declared = {f for _s, d in sa._resolved_overrides for f in d}
+        self.assertIn("attention_backend", declared)
+        # Simulate a legacy runner-side overwrite between collection and publish
+        # (model_specific_adjustment forces attention_backend for HRM-Text).
+        sa.attention_backend = "fa3" if sa.attention_backend != "fa3" else "triton"
+        with self.assertRaises(AssertionError):
+            self._publish(sa)  # stale declaration breaks parity
+        refresh_declared_fields(sa, ("attention_backend",))
+        self.assertEqual(self._publish(sa).attn.backend, sa.attention_backend)
+
+    def test_attention_backend_user_choice_declares_nothing_extra(self):
+        sa = self._construct("LlamaForCausalLM", "llama", attention_backend="triton")
+        self.assertEqual(sa.attention_backend, "triton")
+        self.assertEqual(self._publish(sa).attn.backend, "triton")
+
+    def test_compatibility_passes_at_callable_level(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _attention_backend_default,
+            _attention_backend_dual_chunk,
+            _attention_backend_fa3_fp8_fallback,
+            _attention_backend_platform_fallbacks,
+        )
+
+        # split-backend override wins over the default fill
+        view = ResolvedView(
+            SimpleNamespace(
+                prefill_attention_backend="fa3",
+                decode_attention_backend="fa3",
+                attention_backend=None,
+            )
+        )
+        self.assertEqual(_attention_backend_default(view), {"attention_backend": "fa3"})
+
+        # fa3 + fp8_e5m2 falls back to triton
+        view = ResolvedView(
+            SimpleNamespace(attention_backend="fa3", kv_cache_dtype="fp8_e5m2")
+        )
+        self.assertEqual(
+            _attention_backend_fa3_fp8_fallback(view),
+            {"attention_backend": "triton"},
+        )
+
+        # amx fallback fires only without hardware support
+        view = ResolvedView(
+            SimpleNamespace(attention_backend="intel_amx", device="cpu")
+        )
+        with patch.object(overrides_module, "cpu_has_amx_support", return_value=False):
+            self.assertEqual(
+                _attention_backend_platform_fallbacks(view),
+                {"attention_backend": "torch_native"},
+            )
+        with patch.object(overrides_module, "cpu_has_amx_support", return_value=True):
+            self.assertEqual(_attention_backend_platform_fallbacks(view), {})
+
+        # dual-chunk config: mismatched explicit backend raises verbatim
+        def _mc(dual):
+            return SimpleNamespace(
+                get_model_config=lambda: SimpleNamespace(
+                    hf_config=SimpleNamespace(dual_chunk_attention_config=dual)
+                ),
+                attention_backend="fa3",
+            )
+
+        with self.assertRaises(ValueError):
+            _attention_backend_dual_chunk(ResolvedView(_mc({"a": 1})))
+        self.assertEqual(_attention_backend_dual_chunk(ResolvedView(_mc(None))), {})
+
+    def test_dllm_platform_paths_at_callable_level(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _dllm_attention_backend,
+        )
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        def _view(**kw):
+            defaults = dict(
+                dllm_algorithm="LowConfidence",
+                attention_backend=None,
+                cuda_graph_config=SimpleNamespace(
+                    decode=SimpleNamespace(backend=Backend.DISABLED)
+                ),
+            )
+            defaults.update(kw)
+            return ResolvedView(SimpleNamespace(**defaults))
+
+        with patch.object(overrides_module, "is_hip", return_value=True):
+            self.assertEqual(
+                _dllm_attention_backend(_view()), {"attention_backend": "triton"}
+            )
+            self.assertEqual(
+                _dllm_attention_backend(_view(attention_backend="aiter")), {}
+            )
+        with patch.object(overrides_module, "is_hip", return_value=False):
+            with patch.object(overrides_module, "is_npu", return_value=True):
+                self.assertEqual(
+                    _dllm_attention_backend(_view()),
+                    {"attention_backend": "ascend"},
+                )
+            with patch.object(overrides_module, "is_npu", return_value=False):
+                # cuda graph disabled -> nothing to force
+                self.assertEqual(_dllm_attention_backend(_view()), {})
+                self.assertEqual(
+                    _dllm_attention_backend(_view(dllm_algorithm=None)), {}
+                )
+
+    def test_monolith_attention_families_at_callable_level(self):
+        from sglang.srt.arg_groups.overrides import (
+            _falcon_h1_jet_overrides,
+            _gemma4_overrides,
+            _glm4_moe_overrides,
+            _granite_moe_hybrid_overrides,
+            _lfm2_overrides,
+            _llama4_overrides,
+            _minicpm_v4_6_overrides,
+        )
+
+        def _args(**kw):
+            defaults = dict(
+                device="cuda",
+                attention_backend=None,
+                is_attention_backend_not_set=lambda: True,
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            self.assertEqual(
+                _llama4_overrides(_args(), None), {"attention_backend": "trtllm_mha"}
+            )
+            self.assertEqual(_llama4_overrides(_args(device="cpu"), None), {})
+            self.assertEqual(
+                _llama4_overrides(_args(attention_backend="fa3"), None), {}
+            )
+            self.assertEqual(
+                _gemma4_overrides(_args(), None), {"attention_backend": "trtllm_mha"}
+            )
+            self.assertEqual(
+                _minicpm_v4_6_overrides(_args(), None),
+                {"attention_backend": "triton"},
+            )
+            self.assertEqual(
+                _falcon_h1_jet_overrides(_args(), None),
+                {"attention_backend": "triton"},
+            )
+            self.assertEqual(
+                _granite_moe_hybrid_overrides(
+                    _args(), SimpleNamespace(layer_types=["mamba", "attention"])
+                ),
+                {"attention_backend": "flashinfer"},
+            )
+            self.assertEqual(
+                _granite_moe_hybrid_overrides(
+                    _args(), SimpleNamespace(layer_types=["attention"])
+                ),
+                {},
+            )
+            self.assertEqual(
+                _lfm2_overrides(_args(), None), {"attention_backend": "flashinfer"}
+            )
+        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+            self.assertEqual(_minicpm_v4_6_overrides(_args(), None), {})
+            with patch.object(overrides_module, "is_sm90_supported", return_value=True):
+                self.assertEqual(
+                    _llama4_overrides(_args(), None), {"attention_backend": "fa3"}
+                )
+            self.assertEqual(
+                _gemma4_overrides(_args(), None), {"attention_backend": "triton"}
+            )
+        # Glm4Moe: unconditional tf32 declaration (quant/moe writes stay in
+        # the branch until their field chains migrate)
+        self.assertEqual(_glm4_moe_overrides(None, None), {"enable_tf32_matmul": True})
+
     def test_step3p_declarations_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _step3p_overrides
 
+        def _args(**kw):
+            defaults = dict(
+                speculative_algorithm=None,
+                enable_hierarchical_cache=False,
+                is_attention_backend_not_set=lambda: False,
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
         self.assertEqual(
-            _step3p_overrides(
-                SimpleNamespace(
-                    speculative_algorithm="EAGLE", enable_hierarchical_cache=False
-                ),
-                None,
-            ),
+            _step3p_overrides(_args(speculative_algorithm="EAGLE"), None),
             {"enable_multi_layer_eagle": True},
         )
         self.assertEqual(
-            _step3p_overrides(
-                SimpleNamespace(
-                    speculative_algorithm=None, enable_hierarchical_cache=True
-                ),
-                None,
-            ),
+            _step3p_overrides(_args(enable_hierarchical_cache=True), None),
             {"swa_full_tokens_ratio": 1.0, "disable_hybrid_swa_memory": True},
         )
-        self.assertEqual(
-            _step3p_overrides(
-                SimpleNamespace(
-                    speculative_algorithm=None, enable_hierarchical_cache=False
-                ),
-                None,
-            ),
-            {},
-        )
+        self.assertEqual(_step3p_overrides(_args(), None), {})
 
 
 class TestDualApplyParity(CustomTestCase):
