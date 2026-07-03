@@ -164,6 +164,25 @@ def test_remote_video_gt_ignores_unmapped_official_files(monkeypatch):
     ]
 
 
+def test_ltx_hq_remote_gt_uses_sglang_generated_when_official_declared(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+    case_id = "ltx_2_3_hq_pipeline"
+    filenames = [
+        f"{case_id}_1gpu_frame_0.png",
+        f"{case_id}_1gpu_frame_mid.png",
+        f"{case_id}_1gpu_frame_last.png",
+    ]
+    _set_official_gt_outputs(monkeypatch, {case_id: filenames})
+    monkeypatch.setattr(test_utils, "_remote_file_exists", lambda url: True)
+
+    files = test_utils._find_remote_consistency_gt_files(case_id, 1, is_video=True)
+
+    assert files == [
+        (filename, f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}/{filename}")
+        for filename in filenames
+    ]
+
+
 def test_remote_image_gt_falls_back_to_sglang_when_official_missing(monkeypatch):
     monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
     sglang_prefix = test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE + "/"
