@@ -621,6 +621,8 @@ class Scheduler(
         )
 
         self.load_snapshot_writer = None
+        self.recv_from_tokenizer = None
+
         if not is_rank_zero:
             return
 
@@ -1769,7 +1771,6 @@ class Scheduler(
             # Always define the attribute: init_output_streamer and the
             # process_input_requests hook read self.rust_server unconditionally.
             self.rust_server = None
-            self.recv_from_tokenizer = None
             return
 
         rust_server = RustServer.maybe_create(self)
