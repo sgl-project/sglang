@@ -577,22 +577,14 @@ def sparse_attention_fwd_kernel_v2(
                         acc_s[h_i, bi_i] = T.if_then_else(
                             is_kv_valid_0[bi_i], 0, -T.infinity(acc_s.dtype)
                         )
-                    T.gemm(
-                        Q_shared_l, KV_shared_0_l, acc_s, transpose_B=True, wg_wait=-1
-                    )
-                    T.gemm(
-                        Q_shared_r, KV_shared_0_r, acc_s, transpose_B=True, wg_wait=-1
-                    )
+                    T.gemm(Q_shared_l, KV_shared_0_l, acc_s, transpose_B=True)
+                    T.gemm(Q_shared_r, KV_shared_0_r, acc_s, transpose_B=True)
                     T.gemm(
                         Q_tail_shared,
                         K_tail_shared_0,
                         acc_s,
                         transpose_B=True,
-                        wg_wait=-1,
                     )
-
-                    T.wait_wgmma(0)
-
                     if i_i != 0:
                         T.barrier_arrive(bar_sScale_and_sS_free)
                         T.barrier_wait(bar_sScale_and_sS_free, ((i_i * 2) & 1) ^ 1)
@@ -629,22 +621,14 @@ def sparse_attention_fwd_kernel_v2(
                         acc_s[h_i, bi_i] = T.if_then_else(
                             is_kv_valid_1[bi_i], 0, -T.infinity(acc_s.dtype)
                         )
-                    T.gemm(
-                        Q_shared_l, KV_shared_1_l, acc_s, transpose_B=True, wg_wait=-1
-                    )
-                    T.gemm(
-                        Q_shared_r, KV_shared_1_r, acc_s, transpose_B=True, wg_wait=-1
-                    )
+                    T.gemm(Q_shared_l, KV_shared_1_l, acc_s, transpose_B=True)
+                    T.gemm(Q_shared_r, KV_shared_1_r, acc_s, transpose_B=True)
                     T.gemm(
                         Q_tail_shared,
                         K_tail_shared_1,
                         acc_s,
                         transpose_B=True,
-                        wg_wait=-1,
                     )
-
-                    T.wait_wgmma(0)
-
                     T.barrier_arrive(bar_sScale_and_sS_free)
                     T.barrier_wait(bar_sScale_and_sS_free, ((i_i * 2 + 1) & 1) ^ 1)
 
