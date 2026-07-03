@@ -2172,6 +2172,74 @@ def _execute_server_warmup(server_args: ServerArgs):
     return success
 
 
+def _execute_rust_server_warmup(server_args: ServerArgs) -> bool:
+    """Warm up the embedded Rust server before advertising readiness.
+
+    ``_launch_subprocesses`` has already called ``wait_for_ready()`` for the Rust
+    branch, so the scheduler is initialized and the Rust HTTP server is listening
+    by the time this runs.
+    """
+    headers = {}
+    url = server_args.url()
+    if server_args.api_key:
+        headers["Authorization"] = f"Bearer {server_args.api_key}"
+    ssl_verify = server_args.ssl_verify()
+
+    if server_args.disaggregation_mode == "null":
+        json_data = {
+            "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+        }
+        if server_args.skip_tokenizer_init:
+            json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
+            # TODO Workaround the bug that embedding errors for list of size 1
+            if server_args.dp_size == 1:
+                json_data["input_ids"] = json_data["input_ids"][0]
+        else:
+            json_data["text"] = ["The capital city of France is"] * server_args.dp_size
+            # TODO Workaround the bug that embedding errors for list of size 1
+            if server_args.dp_size == 1:
+                json_data["text"] = json_data["text"][0]
+    else:
+        logger.info("Start of pd disaggregation warmup ...")
+        json_data = {
+            "sampling_params": {
+                "temperature": 0.0,
+                "max_new_tokens": 8,
+                "ignore_eos": True,
+            },
+            "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
+            # Ensure fake transfer is enabled during prefill warmup, and each dp
+            # rank gets a unique bootstrap_room.
+            "bootstrap_room": [
+                i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
+                for i in range(server_args.dp_size)
+            ],
+            "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
+        }
+
+    warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
+    default_timeout = 1800 if server_args.disaggregation_mode != "null" else 600
+    try:
+        res = requests.post(
+            url + "/generate",
+            json=json_data,
+            headers=headers,
+            timeout=warmup_timeout if warmup_timeout > 0 else default_timeout,
+            verify=ssl_verify,
+        )
+        assert res.status_code == 200, f"{res.status_code=}, {res.text=}"
+    except Exception:
+        logger.error(
+            f"Rust server warmup failed: {get_exception_traceback()}",
+        )
+        kill_process_tree(os.getpid())
+        return False
+
+    if server_args.disaggregation_mode != "null":
+        logger.info("End of disaggregation warmup")
+    return True
+
+
 def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
@@ -2583,6 +2651,15 @@ def launch_server(
     if envs.SGLANG_RUST_SERVER.get():
         # The Rust server serves api-server, tokenizer, and detokenizer, so the
         # main process has no Python HTTP server / tokenizer manager to run.
+        # Run a warmup /generate before advertising readiness: the Rust /health
+        # and /get_model_info endpoints are static (200 as soon as the server
+        # binds, before any forward pass), so without this the first real request
+        # pays the cold-start cost (observed as a >60s first generation).
+        if not server_args.skip_server_warmup:
+            _execute_rust_server_warmup(server_args)
+        logger.info("The server is fired up and ready to roll!")
+        if launch_callback is not None:
+            launch_callback()
         scheduler_init_result.wait_for_completion()
         return
 
