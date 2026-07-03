@@ -43,6 +43,11 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_MC: int = 3
     SGLANG_CACHE_DIT_TAYLORSEER: bool = False
     SGLANG_CACHE_DIT_TS_ORDER: int = 1
+    SGLANG_CACHE_DIT_DMD: bool = False
+    SGLANG_CACHE_DIT_DMD_HISTORY: int = 6
+    SGLANG_CACHE_DIT_DMD_RANK: int = 0
+    SGLANG_CACHE_DIT_DMD_RIDGE: float = 1e-8
+    SGLANG_CACHE_DIT_DMD_SVD_PRECISION: str = "medium"
     SGLANG_CACHE_DIT_SCM_PRESET: str = "none"
     SGLANG_CACHE_DIT_SCM_COMPUTE_BINS: str | None = None
     SGLANG_CACHE_DIT_SCM_CACHE_BINS: str | None = None
@@ -55,6 +60,11 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_MC: int = 3
     SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER: bool = False
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
+    SGLANG_CACHE_DIT_SECONDARY_DMD: bool = False
+    SGLANG_CACHE_DIT_SECONDARY_DMD_HISTORY: int = 6
+    SGLANG_CACHE_DIT_SECONDARY_DMD_RANK: int = 0
+    SGLANG_CACHE_DIT_SECONDARY_DMD_RIDGE: float = 1e-8
+    SGLANG_CACHE_DIT_SECONDARY_DMD_SVD_PRECISION: str = "medium"
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
@@ -283,6 +293,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_CACHE_DIT_TAYLORSEER": _lazy_bool("SGLANG_CACHE_DIT_TAYLORSEER", "false"),
     # TaylorSeer order (1 or 2)
     "SGLANG_CACHE_DIT_TS_ORDER": _lazy_int("SGLANG_CACHE_DIT_TS_ORDER", 1),
+    # Enable DMD (Dynamic Mode Decomposition) calibrator (mutually exclusive
+    # with TaylorSeer). DMD forecasts Bn residuals via an exponential basis.
+    "SGLANG_CACHE_DIT_DMD": _lazy_bool("SGLANG_CACHE_DIT_DMD", "false"),
+    # DMD snapshot window length (>= 4 uniformly spaced snapshots to engage)
+    "SGLANG_CACHE_DIT_DMD_HISTORY": _lazy_int("SGLANG_CACHE_DIT_DMD_HISTORY", 6),
+    # DMD SVD truncation rank (0 = automatic)
+    "SGLANG_CACHE_DIT_DMD_RANK": _lazy_int("SGLANG_CACHE_DIT_DMD_RANK", 0),
+    # DMD Tikhonov regularisation term added to inverted singular values
+    "SGLANG_CACHE_DIT_DMD_RIDGE": _lazy_float("SGLANG_CACHE_DIT_DMD_RIDGE", 1e-8),
+    # DMD SVD precision mode: low, medium, high
+    "SGLANG_CACHE_DIT_DMD_SVD_PRECISION": _lazy_str(
+        "SGLANG_CACHE_DIT_DMD_SVD_PRECISION", "medium"
+    ),
     # SCM preset: none, slow, medium, fast, ultra
     "SGLANG_CACHE_DIT_SCM_PRESET": _lazy_str("SGLANG_CACHE_DIT_SCM_PRESET", "none"),
     # SCM custom compute bins (e.g., "8,3,3,2,2")
@@ -329,6 +352,10 @@ _CACHE_DIT_SECONDARY_CONFIGS = [
     ("RDT", float, "0.24"),
     ("MC", int, "3"),
     ("TS_ORDER", int, "1"),
+    ("DMD_HISTORY", int, "6"),
+    ("DMD_RANK", int, "0"),
+    ("DMD_RIDGE", float, "1e-8"),
+    ("DMD_SVD_PRECISION", str, "medium"),
 ]
 
 
@@ -361,6 +388,17 @@ def _secondary_taylorseer_getter():
 environment_variables["SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER"] = (
     _secondary_taylorseer_getter
 )
+
+
+# Special handling for boolean secondary var (DMD)
+def _secondary_dmd_getter():
+    return get_bool_env_var(
+        "SGLANG_CACHE_DIT_SECONDARY_DMD",
+        default=os.getenv("SGLANG_CACHE_DIT_DMD", "false"),
+    )
+
+
+environment_variables["SGLANG_CACHE_DIT_SECONDARY_DMD"] = _secondary_dmd_getter
 
 
 # end-env-vars-definition
