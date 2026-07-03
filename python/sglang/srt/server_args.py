@@ -2937,6 +2937,9 @@ class ServerArgs:
 
         handle_speculative_decoding(self)
 
+        # Needs the draft-token count derived just above.
+        self._validate_gdn_replayssm_spec_ring()
+
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
 
@@ -5248,20 +5251,8 @@ class ServerArgs:
                     "--linear-replayssm-cache-len must be a power of two for the "
                     f"circular spec-verify ring, got {ring_len}."
                 )
-            if (
-                self.speculative_num_draft_tokens is not None
-                and ring_len < 2 * self.speculative_num_draft_tokens
-            ):
-                # Early-flush margin invariant: write_pos + spec_len <= ring_len
-                # must hold on every verify step (see
-                # _advance_gdn_spec_cursors_kernel), which needs
-                # ring_len >= 2 * max_spec_len.
-                raise ValueError(
-                    "--linear-replayssm-cache-len must be >= 2 * "
-                    "--speculative-num-draft-tokens for the spec-verify ring "
-                    f"(early-flush margin), got {ring_len} < "
-                    f"{2 * self.speculative_num_draft_tokens}."
-                )
+            # ring_len >= 2 * max drafts is checked in
+            # _validate_gdn_replayssm_spec_ring() (draft tokens not derived yet).
             # Closed-loop exact fold: the flush replays raw ring inputs through
             # the recurrent update into the checkpoint, bit-identical to the
             # recurrent baseline -- which keeps its state in fp32. A 16-bit
@@ -5283,6 +5274,27 @@ class ServerArgs:
                     "fp32 checkpoint; a 16-bit checkpoint would re-quantize it "
                     "every flush."
                 )
+
+    def _validate_gdn_replayssm_spec_ring(self):
+        """Enforce ring_len >= 2 * max draft tokens for the spec-verify ring.
+
+        Early-flush margin: write_pos + spec_len <= ring_len must hold on every
+        verify step (see _advance_gdn_spec_cursors_kernel). Runs after
+        handle_speculative_decoding() so the (adaptive-aware) max is final;
+        MambaPool re-checks at ring allocation as a backstop.
+        """
+        if not self.enable_gdn_replayssm_spec:
+            return
+        max_drafts = self.max_speculative_num_draft_tokens
+        if max_drafts is None:
+            return
+        ring_len = self.linear_replayssm_cache_len
+        if ring_len < 2 * max_drafts:
+            raise ValueError(
+                "--linear-replayssm-cache-len must be >= 2 * the maximum "
+                "speculative draft-token count for the spec-verify ring "
+                f"(early-flush margin), got {ring_len} < {2 * max_drafts}."
+            )
 
     def _handle_legacy_cp_arguments(self):
         legacy_mode_to_strategy = {

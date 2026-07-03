@@ -570,6 +570,20 @@ class MambaPool:
                 # (bit-identical to the recurrent baseline) instead of folding
                 # the chunked `d` records open-loop.
                 if enable_gdn_replayssm_spec:
+                    # Backstop for the spec-verify ring invariants; this pool
+                    # is sized with the final adaptive-aware draft maximum.
+                    if L & (L - 1) != 0:
+                        raise ValueError(
+                            f"spec-verify ring length must be a power of two, got {L}"
+                        )
+                    if (
+                        speculative_num_draft_tokens is not None
+                        and L < 2 * speculative_num_draft_tokens
+                    ):
+                        raise ValueError(
+                            f"spec-verify ring too small: {L} < "
+                            f"2 * {speculative_num_draft_tokens} (early-flush margin)"
+                        )
                     replayssm_rawv = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, L, v_dim),
                         dtype=conv_dtype,
