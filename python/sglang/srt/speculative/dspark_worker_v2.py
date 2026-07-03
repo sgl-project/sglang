@@ -608,15 +608,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DSpark verify requires target main_hidden states, but got None."
             )
+        # Materialize draft KV for every block position unconditionally (a fixed
+        # [bs * block] shape each step), not just the committed prefix. Writing
+        # the uncommitted (rejected) positions is safe: the next draft block
+        # attends only to committed context (< prefix + commit_len), so those
+        # slots are never read before the next verify overwrites the exact same
+        # slots. This mirrors the target verify's own unconditional KV write at
+        # verify_out_cache_loc above, and drops the data-dependent torch.nonzero
+        # host syncs that the masked-select path incurred.
         hidden = hidden.view(bs, block_size, -1)
-        commit_mask = (
-            self._block_pos_offsets.unsqueeze(0)
-            < commit_lens.unsqueeze(1).to(torch.int64)
-        ).reshape(-1)
         self._materialize_main_hidden_to_draft_kv(
-            main_hidden=hidden.reshape(-1, hidden.shape[-1])[commit_mask],
-            cache_loc=verify_out_cache_loc[commit_mask],
-            positions=positions[commit_mask],
+            main_hidden=hidden.reshape(-1, hidden.shape[-1]),
+            cache_loc=verify_out_cache_loc,
+            positions=positions,
         )
 
         logits_output.hidden_states = None
