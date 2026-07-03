@@ -46,7 +46,7 @@ dependencies = [
   "msgspec",
   "ninja",
   "numpy",
-  "nvidia-cutlass-dsl[cu13]==4.6.0",
+  "nvidia-cutlass-dsl[cu13]==4.5.2",
   "nvidia-mathdx==25.6.0",
   "nvidia-ml-py",
   "openai==2.6.1",
