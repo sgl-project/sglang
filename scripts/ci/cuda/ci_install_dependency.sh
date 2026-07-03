@@ -196,6 +196,32 @@ setup_pip_toolchain() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+install_flashinfer_cubin_wheel() {
+    # TEMP workaround — delete me once flashinfer-cubin 0.6.14 is on PyPI.
+    # cubin 0.6.14 is stuck behind PyPI's 10 GB per-project limit
+    # (flashinfer-ai/flashinfer#3808), so we pull it straight from the GitHub
+    # release instead of PyPI, which would 404 at install_sglang. The version in
+    # the URL below must match the flashinfer_cubin==<ver> pin in
+    # python/pyproject.toml (we fail loud if it doesn't). Delete this function
+    # and its call in main() once cubin 0.6.14 lands on PyPI.
+    FLASHINFER_CUBIN_WHEEL_URL="https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.14/flashinfer_cubin-0.6.14-py3-none-any.whl"
+
+    FLASHINFER_CUBIN_REQUIRED=$(grep -Po -m1 'flashinfer_cubin(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
+    CUBIN_WHEEL_VER=$(printf '%s\n' "$FLASHINFER_CUBIN_WHEEL_URL" | sed -n 's#.*/flashinfer_cubin-\([^-]*\)-py3.*#\1#p')
+    if [ -z "$CUBIN_WHEEL_VER" ]; then
+        echo "ERROR: could not parse flashinfer-cubin version from wheel URL: ${FLASHINFER_CUBIN_WHEEL_URL}"
+        exit 1
+    fi
+    if [ -n "$FLASHINFER_CUBIN_REQUIRED" ] && [ "$CUBIN_WHEEL_VER" != "$FLASHINFER_CUBIN_REQUIRED" ]; then
+        echo "ERROR: hardcoded wheel URL is flashinfer-cubin ${CUBIN_WHEEL_VER} but python/pyproject.toml pins flashinfer_cubin==${FLASHINFER_CUBIN_REQUIRED}. Update the URL or remove this workaround."
+        exit 1
+    fi
+
+    echo "Installing flashinfer-cubin ${CUBIN_WHEEL_VER} from GitHub release: ${FLASHINFER_CUBIN_WHEEL_URL}"
+    $PIP_CMD install "${FLASHINFER_CUBIN_WHEEL_URL}" --no-deps $PIP_INSTALL_SUFFIX
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 uninstall_stale_flashinfer() {
     # Keep flashinfer packages if version matches to avoid re-downloading:
     # - flashinfer-cubin: 150+ MB
@@ -524,6 +550,7 @@ main() {
     install_apt_packages
     clean_site_packages
     setup_pip_toolchain
+    install_flashinfer_cubin_wheel
     uninstall_stale_flashinfer
     install_sglang
     install_sglang_kernel
