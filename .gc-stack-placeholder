@@ -1,0 +1,3 @@
+Placeholder to keep cheng/gc-stack (the aggregate stack head) distinct from
+the last per-step branch (gc-15). No functional effect; remove when the stack
+lands.
