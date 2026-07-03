@@ -528,12 +528,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Model-specific adjustment
         self.model_specific_adjustment()
 
-        # Set the global server_args in the scheduler process
-        set_global_server_args_for_scheduler(server_args)
-        global_server_args = get_global_server_args()
-
-        # FIXME: hacky set `use_mla_backend`
-        global_server_args.use_mla_backend = self.use_mla_backend
+        # Set the global server_args in the scheduler process (target worker
+        # only, so a draft init cannot clobber target-derived global state).
+        if not self.is_draft_worker:
+            set_global_server_args_for_scheduler(server_args)
+            # FIXME: hacky set `use_mla_backend`
+            get_global_server_args().use_mla_backend = self.use_mla_backend
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
@@ -1128,6 +1128,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
     def model_specific_adjustment(self):
+        if self.is_draft_worker:
+            return
+
         server_args = self.server_args
 
         # HRM-Text needs bidirectional prompt attention (prefill), which only the
