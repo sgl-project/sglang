@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+set -x
 HOSTNAME_VALUE=$(hostname)
 GPU_ARCH="mi30x"   # default
 SKIP_TT_DEPS=""
@@ -42,8 +43,8 @@ fi
 
 # Install the required dependencies in CI.
 # Fix permissions on pip cache, ignore errors from concurrent access or missing temp files
-docker exec ci_sglang chown -R root:root /sgl-data/pip-cache 2>/dev/null || true
-docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
+docker exec akao_fix_install_dependency chown -R root:root /sgl-data/pip-cache 2>/dev/null || true
+docker exec akao_fix_install_dependency pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
 
 # Helper function to install with retries and fallback PyPI mirror
 install_with_retry() {
@@ -79,7 +80,7 @@ install_with_retry() {
 #   TypeError: HTTPTransport.__init__() got an unexpected keyword argument 'socket_options'
 # Call this as the LAST pip operation so nothing can downgrade httpx afterwards.
 ensure_httpx() {
-  install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'httpx>=0.25.0'
+  install_with_retry docker exec akao_fix_install_dependency pip install --cache-dir=/sgl-data/pip-cache --upgrade 'httpx>=0.25.0'
 }
 
 # Helper function to git clone with retries
@@ -119,19 +120,21 @@ git_clone_with_retry() {
 if [ -n "$SKIP_SGLANG_BUILD" ]; then
   echo "Didn't build checkout SGLang"
 else
-  docker exec ci_sglang pip uninstall sgl-kernel -y || true
-  docker exec ci_sglang pip uninstall sglang-kernel -y || true
-  docker exec ci_sglang pip uninstall sglang -y || true
+  docker exec akao_fix_install_dependency pip uninstall sgl-kernel -y || true
+  docker exec akao_fix_install_dependency pip uninstall sglang-kernel -y || true
+  docker exec akao_fix_install_dependency pip uninstall sglang -y || true
   # Clear Python cache to ensure latest code is used
-  docker exec ci_sglang find /opt/venv -name "*.pyc" -delete || true
-  docker exec ci_sglang find /opt/venv -name "__pycache__" -type d -exec rm -rf {} + || true
+  docker exec akao_fix_install_dependency find /opt/venv -name "*.pyc" -delete || true
+  docker exec akao_fix_install_dependency find /opt/venv -name "__pycache__" -type d -exec rm -rf {} + || true
   # Also clear cache in sglang-checkout
-  docker exec ci_sglang find /sglang-checkout -name "*.pyc" -delete || true
-  docker exec ci_sglang find /sglang-checkout -name "__pycache__" -type d -exec rm -rf {} + || true
-  docker exec -w /sglang-checkout/sgl-kernel ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
+  docker exec akao_fix_install_dependency find /sglang-checkout -name "*.pyc" -delete || true
+  docker exec akao_fix_install_dependency find /sglang-checkout -name "__pycache__" -type d -exec rm -rf {} + || true
+  docker exec -w /sglang-checkout/sgl-kernel akao_fix_install_dependency bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
 
-  docker exec ci_sglang bash -c 'rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml'
-  install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
+  docker exec akao_fix_install_dependency bash -c 'cd /sglang-checkout && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml'
+  # docker exec akao_fix_install_dependency bash -c 'python -m pip freeze  | grep -Ev "^[[:space:]]*(-e|--editable)[[:space:]]+" > /tmp/rocm-constraint.txt'
+  # install_with_retry docker exec -w /sglang-checkout akao_fix_install_dependency pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]" -c /tmp/rocm-constraint.txt --no-build-isolation
+  install_with_retry docker exec -w /sglang-checkout akao_fix_install_dependency pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
 fi
 
 if [[ -n "${SKIP_TT_DEPS}" ]]; then
@@ -142,13 +145,13 @@ else
   # owned by the runner (non-root); mark it safe so setuptools_scm /
   # vcs_versioning can run `git` introspection during pip install.
   git_clone_with_retry https://github.com/EvolvingLMMs-Lab/lmms-eval.git lmms-eval "--branch v0.4.1"
-  docker cp lmms-eval ci_sglang:/
-  docker exec ci_sglang git config --global --add safe.directory /lmms-eval
-  install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+  docker cp lmms-eval akao_fix_install_dependency:/
+  docker exec akao_fix_install_dependency git config --global --add safe.directory /lmms-eval
+  install_with_retry docker exec -w /lmms-eval akao_fix_install_dependency pip install --cache-dir=/sgl-data/pip-cache -e .
 
   git_clone_with_retry https://github.com/akao-amd/human-eval.git human-eval
-  docker cp human-eval ci_sglang:/
-  install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+  docker cp human-eval akao_fix_install_dependency:/
+  install_with_retry docker exec -w /human-eval akao_fix_install_dependency pip install --cache-dir=/sgl-data/pip-cache -e .
 
   mkdir -p dummy-grok
   cat > dummy-grok/config.json << 'EOF'
@@ -177,14 +180,14 @@ EOF
   docker exec -w / ci_sglang mkdir -p /dummy-grok
   docker cp ./dummy-grok/config.json ci_sglang:/dummy-grok/config.json
 
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache huggingface_hub[hf_xet]
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache pytest
+  docker exec akao_fix_install_dependency pip install --cache-dir=/sgl-data/pip-cache huggingface_hub[hf_xet]
+  docker exec akao_fix_install_dependency pip install --cache-dir=/sgl-data/pip-cache pytest
 
   # Install cache-dit for qwen_image_t2i_cache_dit_enabled test (added in PR 16204)
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'cache-dit==1.3.0' || echo "cache-dit installation failed"
+  docker exec akao_fix_install_dependency pip install --cache-dir=/sgl-data/pip-cache --upgrade 'cache-dit==1.3.0' || echo "cache-dit installation failed"
 
   # Install accelerate for distributed training and inference support
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache accelerate || echo "accelerate installation failed"
+  docker exec akao_fix_install_dependency pip install --cache-dir=/sgl-data/pip-cache accelerate || echo "accelerate installation failed"
 fi
 
 # -----------------------
@@ -192,10 +195,10 @@ fi
 # The CI image bakes MORI at the docker/rocm.Dockerfile-pinned commit; when a PR
 # bumps MORI_COMMIT the image is not rebuilt, so reinstall MORI here the same way
 # the Dockerfile does. Only ENABLE_MORI=1 images ship /sgl-workspace/mori.
-if docker exec ci_sglang test -d /sgl-workspace/mori; then
-  MORI_REPO=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_REPO=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_REPO="\([^"]*\)".*/\1/')
+if docker exec akao_fix_install_dependency test -d /sgl-workspace/mori; then
+  MORI_REPO=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_REPO=' 2026/nocopy/sglang/scout-therock/docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_REPO="\([^"]*\)".*/\1/')
 
-  ROCM_VERSION=$(docker exec ci_sglang bash -c 'cat $ROCM_HOME/.info/version 2>/dev/null || echo unknown')
+  ROCM_VERSION=$(docker exec akao_fix_install_dependency bash -c 'cat $ROCM_HOME/.info/version 2>/dev/null || echo unknown')
 
   # Check if ROCm version >= 7.14.0
   if [[ "${ROCM_VERSION}" != "unknown" ]] && [[ "$(printf '%s\n' "7.14.0" "${ROCM_VERSION}" | sort -V | head -n1)" == "7.14.0" ]]; then
@@ -205,7 +208,7 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     #   2. The real ROCM_VERSION condition (as above) is too complicated.
     LEGACY_EDITABLE_INSTALL=0
     # Only gfx950-rocm7_14 stage covers ROCm >= 7.14
-    MORI_COMMIT=$(grep -F -A80 'AS gfx950-rocm7_14' docker/rocm.Dockerfile \
+    MORI_COMMIT=$(grep -F -A80 'AS gfx950-rocm7_14' 2026/nocopy/sglang/scout-therock/docker/rocm.Dockerfile \
                   | grep 'MORI_COMMIT_DEFAULT=' \
                   | head -n1 \
                   | sed 's/.*MORI_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
@@ -231,7 +234,7 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
   fi
 
   echo "[MORI] Reinstalling MORI ${MORI_COMMIT} (MORI_GPU_ARCHS=${MORI_GPU_ARCHS})"
-  docker exec ci_sglang bash -c "
+  docker exec akao_fix_install_dependency bash -c "
     set -euo pipefail
     export MORI_GPU_ARCHS='${MORI_GPU_ARCHS}'
     rm -rf /sgl-workspace/mori
@@ -272,7 +275,7 @@ fi
 
 echo "[CI-AITER-CHECK] === AITER VERSION CHECK START ==="
 
-DOCKERFILE="docker/rocm.Dockerfile"
+DOCKERFILE="2026/nocopy/sglang/scout-therock/docker/rocm.Dockerfile"
 
 # GPU_ARCH
 GPU_ARCH="${GPU_ARCH:-mi30x}"
@@ -289,7 +292,7 @@ if [[ "${GPU_ARCH}" == "mi35x" ]]; then
                         | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
 else
     echo "[CI-AITER-CHECK] Using gfx942 block from Dockerfile..."
-    REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_942 AS gfx942' docker/rocm.Dockerfile \
+    REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_942 AS gfx942' $DOCKERFILE \
                         | grep 'AITER_COMMIT_DEFAULT=' \
                         | head -n1 \
                         | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
@@ -306,7 +309,7 @@ echo "[CI-AITER-CHECK] Dockerfile expects AITER_COMMIT=${REPO_AITER_COMMIT}"
 #############################################
 # 2. Check container pre-installed AITER version
 #############################################
-IMAGE_AITER_VERSION=$(docker exec ci_sglang bash -c "pip show amd-aiter 2>/dev/null | grep '^Version:' | awk '{print \$2}'" || echo "none")
+IMAGE_AITER_VERSION=$(docker exec akao_fix_install_dependency bash -c "pip show amd-aiter 2>/dev/null | grep '^Version:' | awk '{print \$2}'" || echo "none")
 IMAGE_AITER_VERSION="v${IMAGE_AITER_VERSION}"
 echo "[CI-AITER-CHECK] AITER version inside CI image: ${IMAGE_AITER_VERSION}"
 
@@ -340,13 +343,13 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     echo "[CI-AITER-CHECK] === AITER REBUILD START ==="
 
     # uninstall existing aiter
-    docker exec ci_sglang pip uninstall -y amd-aiter || true
+    docker exec akao_fix_install_dependency pip uninstall -y amd-aiter || true
 
     # delete old aiter directory
-    docker exec ci_sglang rm -rf /sgl-workspace/aiter
+    docker exec akao_fix_install_dependency rm -rf /sgl-workspace/aiter
 
     # clone a fresh copy to /sgl-workspace/aiter
-    docker exec ci_sglang git clone https://github.com/ROCm/aiter.git /sgl-workspace/aiter
+    docker exec akao_fix_install_dependency git clone https://github.com/ROCm/aiter.git /sgl-workspace/aiter
 
     # checkout correct version and install requirements
     # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
@@ -354,7 +357,7 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     # not block switching to commits that predate that rule. The working tree
     # was just produced by `rm -rf` + fresh `git clone` above, so there are no
     # real user changes to preserve.
-    docker exec ci_sglang bash -c "
+    docker exec akao_fix_install_dependency bash -c "
         cd /sgl-workspace/aiter && \
         git fetch --all && \
         git checkout -f ${REPO_AITER_COMMIT} && \
@@ -370,13 +373,13 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
 
     # Detect ROCm version for build method selection
-    ROCM_VERSION=$(docker exec ci_sglang bash -c 'cat $ROCM_HOME/.info/version 2>/dev/null || cat /opt/rocm/.info/version 2>/dev/null || echo unknown')
+    ROCM_VERSION=$(docker exec akao_fix_install_dependency bash -c 'cat $ROCM_HOME/.info/version 2>/dev/null || cat /opt/rocm/.info/version 2>/dev/null || echo unknown')
     echo "[CI-AITER-CHECK] ROCm version=${ROCM_VERSION}"
 
     # build AITER with ROCm 7.14 awareness
     if [[ "${ROCM_VERSION}" != "unknown" ]] && [[ "$(printf '%s\n' "7.14.0" "${ROCM_VERSION}" | sort -V | head -n1)" == "7.14.0" ]]; then
         echo "[CI-AITER-CHECK] ROCm version ${ROCM_VERSION} >= 7.14.0 detected, using pip install --no-build-isolation"
-        docker exec ci_sglang bash -c "
+        docker exec akao_fix_install_dependency bash -c "
             set -euo pipefail
             cd /sgl-workspace/aiter
             export AITER_USE_SYSTEM_TRITON=1
@@ -384,7 +387,7 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
         "
     else
         echo "[CI-AITER-CHECK] ROCm version ${ROCM_VERSION} < 7.14.0 or unknown, using setup.py develop"
-        docker exec ci_sglang bash -c "
+        docker exec akao_fix_install_dependency bash -c "
             cd /sgl-workspace/aiter && \
             AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
         "
@@ -403,9 +406,9 @@ ensure_httpx
 # # Clear pre-built AITER kernels from Docker image to avoid segfaults
 # # The Docker image may contain pre-compiled kernels incompatible with the current environment
 # echo "Clearing pre-built AITER kernels from Docker image..."
-# docker exec ci_sglang find /sgl-workspace/aiter/aiter/jit -name "*.so" -delete 2>/dev/null || true
-# docker exec ci_sglang ls -la /sgl-workspace/aiter/aiter/jit/ 2>/dev/null || echo "jit dir empty or not found"
+# docker exec akao_fix_install_dependency find /sgl-workspace/aiter/aiter/jit -name "*.so" -delete 2>/dev/null || true
+# docker exec akao_fix_install_dependency ls -la /sgl-workspace/aiter/aiter/jit/ 2>/dev/null || echo "jit dir empty or not found"
 
 # # Pre-build AITER kernels to avoid timeout during tests
 # echo "Warming up AITER JIT kernels..."
-# docker exec -e SGLANG_USE_AITER=1 ci_sglang python3 /sglang-checkout/scripts/ci/amd/amd_ci_warmup_aiter.py || echo "AITER warmup completed (some kernels may not be available)"
+# docker exec -e SGLANG_USE_AITER=1 akao_fix_install_dependency python3 /sglang-checkout/scripts/ci/amd/amd_ci_warmup_aiter.py || echo "AITER warmup completed (some kernels may not be available)"
