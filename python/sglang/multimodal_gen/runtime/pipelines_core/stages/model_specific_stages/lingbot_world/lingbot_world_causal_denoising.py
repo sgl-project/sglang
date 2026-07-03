@@ -13,13 +13,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.models.dits.lingbot_world_runtime_keys import (
-    LINGBOT_C2WS_PLUCKER_EMB_CACHE,
-    LINGBOT_CAM_CONDITIONER_CACHE,
-    LINGBOT_CAMERA_ACTIONS_CONDITION,
-    LINGBOT_INTERACTIVE_KV_WINDOW_CACHE,
-    LINGBOT_PROMPT_UPDATED_CONDITION,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CausalDMDCachePolicy,
@@ -34,6 +27,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.realtime.constants.lingbot_world import (
+    LINGBOT_C2WS_PLUCKER_EMB_CACHE,
+    LINGBOT_CAM_CONDITIONER_CACHE,
+    LINGBOT_CAMERA_ACTIONS_CONDITION,
+    LINGBOT_INTERACTIVE_KV_WINDOW_CACHE,
+    LINGBOT_PROMPT_UPDATED_CONDITION,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -159,11 +159,8 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         if self.local_attn_size != -1:
             return cache_window
 
-        pipeline_config = server_args.pipeline_config
         moving_window = self._moving_kv_sample_num_frames(server_args) or 0
-        still_window = max(
-            0, int(getattr(pipeline_config, "interactive_kv_still_window", 0))
-        )
+        still_window = self._still_kv_sample_num_frames(server_args) or 0
         return max(
             cache_window,
             int(self.sink_size)
@@ -215,18 +212,35 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         )
         return sample_frames if sample_frames > 0 else None
 
+    @staticmethod
+    def _optional_non_negative_int(value: Any) -> int | None:
+        if value is None:
+            return None
+        return max(0, int(value))
+
     def _moving_kv_sample_num_frames(
         self,
         server_args: ServerArgs,
     ) -> int | None:
-        moving_window = getattr(
-            server_args.pipeline_config,
-            "interactive_kv_moving_window",
-            None,
+        return self._optional_non_negative_int(
+            getattr(
+                server_args.pipeline_config,
+                "interactive_kv_moving_window",
+                None,
+            )
         )
-        if moving_window is None:
-            return self._base_kv_sample_num_frames()
-        return max(0, int(moving_window))
+
+    def _still_kv_sample_num_frames(
+        self,
+        server_args: ServerArgs,
+    ) -> int | None:
+        return self._optional_non_negative_int(
+            getattr(
+                server_args.pipeline_config,
+                "interactive_kv_still_window",
+                3,
+            )
+        )
 
     def _get_interactive_kv_sample_num_frames(
         self,
@@ -254,7 +268,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         moving_window = self._moving_kv_sample_num_frames(server_args)
         if moving_window is None:
             return None
-        still_window = int(getattr(pipeline_config, "interactive_kv_still_window", 3))
+        still_window = self._still_kv_sample_num_frames(server_args)
         still_chunks_threshold = max(
             1, int(getattr(pipeline_config, "interactive_kv_still_chunks", 2))
         )
@@ -269,7 +283,10 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             dynamic_state["sample_num_frames"] = moving_window
         else:
             dynamic_state["consecutive_still_chunks"] += 1
-            if dynamic_state["consecutive_still_chunks"] >= still_chunks_threshold:
+            if (
+                still_window is not None
+                and dynamic_state["consecutive_still_chunks"] >= still_chunks_threshold
+            ):
                 dynamic_state["sample_num_frames"] = still_window
 
         return int(dynamic_state["sample_num_frames"])
@@ -298,11 +315,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             ):
                 mode = "moving"
             else:
-                still_window = int(
-                    getattr(
-                        server_args.pipeline_config, "interactive_kv_still_window", 3
-                    )
-                )
+                still_window = self._still_kv_sample_num_frames(server_args)
                 still_chunks_threshold = max(
                     1,
                     int(
@@ -314,7 +327,8 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                     ),
                 )
                 if (
-                    sample_frames == still_window
+                    still_window is not None
+                    and sample_frames == still_window
                     and still_chunks is not None
                     and still_chunks >= still_chunks_threshold
                 ):

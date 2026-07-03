@@ -305,7 +305,7 @@ class CausalSelfAttentionKVCache:
         recent_window_tokens: int | None,
         cache_head_slice: slice | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if recent_window_tokens is None or recent_window_tokens <= 0:
+        if recent_window_tokens is None:
             if cache_head_slice is None:
                 return (
                     self.k[:, attn_start_index:updated_local_end],
@@ -315,6 +315,8 @@ class CausalSelfAttentionKVCache:
                 self.k[:, attn_start_index:updated_local_end, cache_head_slice, :],
                 self.v[:, attn_start_index:updated_local_end, cache_head_slice, :],
             )
+        if recent_window_tokens < 0:
+            raise ValueError("recent_window_tokens must be non-negative or None")
 
         sink_end = min(self.sink_tokens, updated_local_end)
         recent_start = max(sink_end, local_start_index - recent_window_tokens)

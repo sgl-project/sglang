@@ -327,7 +327,7 @@ class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
     realtime_causal_sink_size: int | None = None
     realtime_causal_kv_cache_num_frames: int | None = None
     interactive_kv_window_enable: bool = False
-    interactive_kv_still_window: int = 3
+    interactive_kv_still_window: int | None = 3
     interactive_kv_moving_window: int | None = 12
     interactive_kv_still_chunks: int = 2
     lazy_vae_encode_black_frames: int = 0
