@@ -71,6 +71,10 @@ from sglang.srt.layers.communicator import (
     get_attn_tp_context,
 )
 from sglang.srt.layers.communicator_dsa_cp import DSACPLayerCommunicator
+from sglang.srt.layers.dcp import dcp_enabled, get_attention_dcp_world_size
+from sglang.srt.layers.dcp.planner import (
+    prepare_decode_context_parallel_metadata,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -122,11 +126,6 @@ from sglang.srt.layers.utils.cp_utils import (
     is_prefill_context_parallel_enabled,
     mla_use_prefill_cp,
     prepare_context_parallel_metadata,
-)
-from sglang.srt.layers.utils.dcp_utils import (
-    dcp_enabled,
-    get_attention_dcp_world_size,
-    prepare_decode_context_parallel_metadata,
 )
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -507,7 +506,7 @@ class MoEGate(nn.Module):
 
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
-            elif _is_npu or not _is_cuda:
+            elif not _is_cuda:
                 logits = F.linear(hidden_states, self.weight, None)
             else:
                 # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
