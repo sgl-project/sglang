@@ -21,7 +21,7 @@ class TestGLM52NVFP4TPMTP(
     model = "nvidia/GLM-5.2-NVFP4"
     tp_size = 4
     mem_fraction_static = 0.8
-    bs_1_speed_thres = 150
+    bs_1_speed_thres = 180
     extra_server_args = [
         "--moe-runner-backend",
         "flashinfer_trtllm",
