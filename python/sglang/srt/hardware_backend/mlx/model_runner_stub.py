@@ -208,3 +208,20 @@ class MlxModelRunnerStub(ModelRunner):
     def alloc_memory_pool(self, memory_pool_config=None):
         """No-op: MLX manages its own KV cache."""
         pass
+
+    def init_attention_backends(self):
+        """No-op: MLX performs attention itself; keep ``attn_backend = None``.
+
+        The base implementation constructs the backend named by
+        ``server_args.attention_backend``. Model-specific defaults can force
+        one whose ``__init__`` reads real KV buffers (e.g. gpt-oss forces
+        ``triton``, which crashes on ``_DummyKVCache``), and any backend
+        built here would never be used.
+
+        Consequences accepted deliberately: ``decide_needs_cpu_seq_lens``
+        filters the ``None`` backend and returns False (its seq_lens_cpu
+        mirror only feeds spec-decode paths, unsupported on MLX), and the
+        base method's ``init_aux_hidden_state_capture`` is skipped (a no-op
+        outside eagle3/dflash, also unsupported on MLX).
+        """
+        self.attn_backend = None

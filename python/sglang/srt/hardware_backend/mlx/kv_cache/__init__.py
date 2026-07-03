@@ -1,7 +1,10 @@
 """Cache components for the MLX backend."""
 
 from sglang.srt.hardware_backend.mlx.kv_cache.attention_contract import (
+    get_attention_scale,
+    get_container_window_size,
     get_head_dim,
+    get_layer_window_sizes,
     get_num_heads,
     get_num_kv_heads,
     is_attention_module,
@@ -11,6 +14,7 @@ from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_cache import (
     AttentionOffsetCache,
     ContiguousAttentionKVCache,
     PoolBackedAttentionKVCache,
+    make_attention_mask,
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_pool import (
     MlxAttentionKVPool,
@@ -40,12 +44,16 @@ __all__ = [
     "AttentionOffsetCache",
     "ContiguousAttentionKVCache",
     "find_attention_layers",
+    "get_attention_scale",
+    "get_container_window_size",
     "get_head_dim",
     "get_context",
+    "get_layer_window_sizes",
     "get_num_layers",
     "get_num_heads",
     "get_num_kv_heads",
     "is_attention_module",
+    "make_attention_mask",
     "MLXAttentionWrapper",
     "MlxAttentionKVPool",
     "MlxAuxiliaryStateComponent",

@@ -1,10 +1,16 @@
-"""Guard the MLX stub's ``alloc_memory_pool`` override against drift.
+"""Guard the MLX stub's ``ModelRunner`` overrides against drift.
 
 The base ``ModelRunner.alloc_memory_pool`` runs ``_init_pools`` which
 asserts ``is_draft_worker`` (model_runner_kv_cache_mixin.py:409); the
 MLX stub manages its own KV cache via ``MlxAttentionKVPool`` and must
 short-circuit that GPU-allocation path.  If the override is lost, every
 MLX startup crashes inside ``Scheduler.init_target_memory_pool``.
+
+Similarly, the base ``init_attention_backends`` constructs the torch
+attention backend named by ``server_args.attention_backend``; MLX never
+uses one, and model-specific defaults can force a backend whose
+``__init__`` reads real KV buffers (gpt-oss forces ``triton``, which
+crashes on ``_DummyKVCache``).
 
 The checks are signature/identity-only and MLX-gated because importing
 the stub pulls in ``mlx.core``.
@@ -73,6 +79,32 @@ class TestMlxRunnerPoolContract(unittest.TestCase):
                 "MlxModelRunnerStub.alloc_memory_pool must accept an "
                 f"optional MemoryPoolConfig argument: {exc}"
             )
+
+    def test_stub_overrides_base_init_attention_backends(self):
+        self.assertIn(
+            "init_attention_backends",
+            vars(MlxModelRunnerStub),
+            msg=(
+                "MlxModelRunnerStub lost its init_attention_backends "
+                "override. The base implementation constructs the backend "
+                "named by server_args.attention_backend; model-specific "
+                "defaults can force one whose __init__ reads real KV "
+                "buffers (gpt-oss forces triton, which crashes on "
+                "_DummyKVCache). MLX never uses a torch attention backend "
+                "— re-add the override that keeps attn_backend = None."
+            ),
+        )
+        self.assertIsNot(
+            MlxModelRunnerStub.init_attention_backends,
+            ModelRunner.init_attention_backends,
+            msg="init_attention_backends must be overridden on the MLX "
+            "stub, not inherited from ModelRunner.",
+        )
+
+    def test_stub_init_attention_backends_keeps_attn_backend_none(self):
+        runner = object.__new__(MlxModelRunnerStub)
+        MlxModelRunnerStub.init_attention_backends(runner)
+        self.assertIsNone(runner.attn_backend)
 
 
 if __name__ == "__main__":

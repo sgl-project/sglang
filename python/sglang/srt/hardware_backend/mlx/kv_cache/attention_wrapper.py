@@ -15,6 +15,7 @@ from sglang.srt.hardware_backend.mlx.aot import (
     MlxAOTRoPEContext,
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.attention_contract import (
+    get_attention_scale,
     get_head_dim,
     get_num_heads,
     get_num_kv_heads,
@@ -120,12 +121,29 @@ class MLXAttentionWrapper(nn.Module):
 
     When ``BatchedDecodeContext`` is set, performs per-request RoPE,
     cache writes, and batched SDPA.  Otherwise delegates to inner module.
+
+    ``window_size`` marks a sliding-window layer: the pool keeps the full
+    KV history and the wrapper attends to the trailing window only, which
+    is numerically identical to a rotating cache.
     """
 
-    def __init__(self, inner: nn.Module, layer_idx: int):
+    def __init__(
+        self, inner: nn.Module, layer_idx: int, window_size: int | None = None
+    ):
         super().__init__()
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "_layer_idx", layer_idx)
+        object.__setattr__(self, "_window_size", window_size)
+        # Resolved once at patch time (weights are loaded before patching and
+        # the inner module is never swapped afterwards), keeping the decode
+        # hot path free of attribute scans and failing fast on a bad module.
+        scale = get_attention_scale(inner)
+        if scale is None:
+            raise RuntimeError(
+                f"Cannot determine attention scale for {type(inner).__name__}"
+            )
+        object.__setattr__(self, "_scale", scale)
+        object.__setattr__(self, "_sinks", getattr(inner, "sinks", None))
 
     def __call__(self, x: mx.array, mask: Any = None, cache: Any = None) -> mx.array:
         ctx = get_context()
@@ -200,7 +218,17 @@ class MLXAttentionWrapper(nn.Module):
             keys = inner.rope(keys, offset=offsets)
 
         layer_caches = ctx.attention_layer_caches[attention_pool_idx]
-        pad_sizes = ctx.pad_sizes
+        window = self._window_size
+        if window is None:
+            pad_sizes = ctx.pad_sizes
+        else:
+            # Sliding-window layer: the cache keeps the full history but the
+            # newest token only attends to the trailing ``window`` keys.  The
+            # padding metadata shared on the context is full-length, so it is
+            # rebuilt locally for the windowed lengths.
+            eff_lens = [min(n + 1, window) for n in ctx.seq_lens]
+            max_eff = max(eff_lens)
+            pad_sizes = [max_eff - n for n in eff_lens]
 
         # TODO: replace per-request loop with native batched/ragged
         # attention once mx.fast.scaled_dot_product_attention supports
@@ -212,6 +240,9 @@ class MLXAttentionWrapper(nn.Module):
             layer_caches[i].write_token(keys[i : i + 1], values[i : i + 1])
 
             k_all, v_all = layer_caches[i].get_kv()
+            if window is not None and k_all.shape[2] > window:
+                k_all = k_all[:, :, -window:, :]
+                v_all = v_all[:, :, -window:, :]
 
             pad = pad_sizes[i]
             if pad > 0:
@@ -226,17 +257,34 @@ class MLXAttentionWrapper(nn.Module):
         keys_b = mx.concatenate(all_k, axis=0)
         values_b = mx.concatenate(all_v, axis=0)
 
+        pad_mask = None
+        if window is None:
+            if ctx.needs_padding:
+                pad_mask = ctx.positions[None, :] >= ctx.valid_lens[:, None]
+        elif max(pad_sizes) > 0:
+            eff = mx.array(eff_lens, dtype=mx.int32)
+            pad_mask = mx.arange(max_eff)[None, :] >= eff[:, None]
+
         attn_mask = None
-        if ctx.needs_padding:
-            mask_bool = ctx.positions[None, :] >= ctx.valid_lens[:, None]
+        if pad_mask is not None:
             attn_mask = mx.where(
-                mask_bool[:, None, None, :],
+                pad_mask[:, None, None, :],
                 mx.array(mx.finfo(queries.dtype).min, dtype=queries.dtype),
                 mx.array(0.0, dtype=queries.dtype),
             )
 
+        # Only pass sinks when the module has them: the kwarg requires a
+        # recent mlx and must not constrain models without sinks.
+        sink_kwargs = {}
+        if self._sinks is not None:
+            sink_kwargs["sinks"] = self._sinks
         output = mx.fast.scaled_dot_product_attention(
-            queries, keys_b, values_b, scale=inner.scale, mask=attn_mask
+            queries,
+            keys_b,
+            values_b,
+            scale=self._scale,
+            mask=attn_mask,
+            **sink_kwargs,
         )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, 1, -1)

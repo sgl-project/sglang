@@ -4028,8 +4028,12 @@ class ServerArgs:
                 envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
 
         elif model_arch in ["GptOssForCausalLM"]:
-            # Set attention backend for GPT-OSS
-            if self.is_attention_backend_not_set():
+            # Set attention backend for GPT-OSS. When serving through MLX on
+            # Apple Silicon none of the backends below exist (no triton);
+            # keep the platform default (torch_native), which attention
+            # never runs through — inference goes through the MLX runner.
+            _mlx_serving = is_mps() and use_mlx()
+            if self.is_attention_backend_not_set() and not _mlx_serving:
                 if is_sm100_supported():
                     self.attention_backend = "trtllm_mha"
                 elif is_sm90_supported():
@@ -4055,25 +4059,28 @@ class ServerArgs:
                         f"but got '{self.dtype}'. Please use --dtype bfloat16 or remove --dtype to use auto."
                     )
 
-            supported_backends = [
-                "triton",
-                "trtllm_mha",
-                "fa3",
-                "fa4",
-                "ascend",
-                "intel_amx",
-                "intel_xpu",
-                "aiter",
-            ]
-            prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
-            assert (
-                prefill_attn_backend in supported_backends
-                and decode_attn_backend in supported_backends
-            ), (
-                f"GptOssForCausalLM requires one of {supported_backends} attention backend, but got the following backends\n"
-                f"- Prefill: {prefill_attn_backend}\n"
-                f"- Decode: {decode_attn_backend}\n"
-            )
+            if not _mlx_serving:
+                supported_backends = [
+                    "triton",
+                    "trtllm_mha",
+                    "fa3",
+                    "fa4",
+                    "ascend",
+                    "intel_amx",
+                    "intel_xpu",
+                    "aiter",
+                ]
+                prefill_attn_backend, decode_attn_backend = (
+                    self.get_attention_backends()
+                )
+                assert (
+                    prefill_attn_backend in supported_backends
+                    and decode_attn_backend in supported_backends
+                ), (
+                    f"GptOssForCausalLM requires one of {supported_backends} attention backend, but got the following backends\n"
+                    f"- Prefill: {prefill_attn_backend}\n"
+                    f"- Decode: {decode_attn_backend}\n"
+                )
 
             quant_method = get_quantization_config(hf_config)
             is_mxfp4_quant_format = quant_method == "mxfp4"
