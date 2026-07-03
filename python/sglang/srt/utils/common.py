@@ -621,9 +621,23 @@ def get_available_gpu_memory(
 
         if empty_cache:
             empty_device_cache(torch.xpu)
-        # Use mem_get_info() to reflect true OS-level free memory
-        # including graph pool reservations; avoids KV-cache over-allocation.
-        free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info(gpu_id)
+        # Use mem_get_info() with a sanity cap to avoid KV-cache over-allocation
+        # on drivers that incorrectly return total memory as free memory.
+        # Consistent with the fallback: free = max(0, total - allocated).
+        try:
+            free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info(gpu_id)
+            used_memory = float(torch.xpu.memory_allocated(gpu_id))
+            free_gpu_memory = min(
+                float(free_gpu_memory),
+                max(0.0, float(total_gpu_memory) - used_memory),
+            )
+        except Exception:
+            # Fallback for devices/drivers that do not support querying free memory
+            used_memory = float(torch.xpu.memory_allocated(gpu_id))
+            total_gpu_memory = float(
+                torch.xpu.get_device_properties(gpu_id).total_memory
+            )
+            free_gpu_memory = max(0.0, total_gpu_memory - used_memory)
 
     elif device == "hpu":
         num_gpus = torch.hpu.device_count()
@@ -1857,7 +1871,7 @@ def get_npu_memory_capacity():
             return envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get()  # unit: MB
         else:
             return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
-    except ImportError as e:
+    except ImportError:
         raise ImportError("torch_npu is required when run on npu device.")
 
 
@@ -2210,7 +2224,7 @@ def get_compiler_backend(mode=None) -> str:
             import torchair
             import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
             from torchair.configs.compiler_config import CompilerConfig
-        except ImportError as e:
+        except ImportError:
             raise ImportError(
                 "NPU detected, but torchair package is not installed. "
                 "Please install torchair for torch.compile support on NPU."

@@ -11,6 +11,7 @@ import os
 import time
 import weakref
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from functools import lru_cache
 from typing import Any
@@ -71,6 +72,10 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+    is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -201,8 +206,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         attn_head_size = hidden_size // num_attention_heads
 
         # torch compile
+        # list of offloaded dit modules if torch compile is enabled. cleared after compile and warmup
+        self._offloaded_dit_modules_for_compile: list[torch.nn.Module] = []
+        # layerwise-offload and then compile to avoid OOM
         for transformer in filter(None, [self.transformer, self.transformer_2]):
-            self._maybe_enable_torch_compile(transformer)
+            self._maybe_offload_during_compile(transformer)
+            self._maybe_torch_compile(transformer)
 
         self.scheduler = scheduler
         self.vae = vae
@@ -298,7 +307,49 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 return name
         return default_name
 
-    def _maybe_enable_torch_compile(self, module: object) -> None:
+    def _maybe_offload_during_compile(self, module: object) -> None:
+        """
+        Layerwise-offload the DiT so the compile warmup autotunes each layer
+        with only itself resident; forward() restores it after the warmup.
+        """
+        args = self.server_args
+        if (
+            not args.enable_torch_compile
+            or not args.offload_during_compile
+            or not args.warmup
+            # a subclass with its own forward would never run the restore
+            or type(self).forward is not DenoisingStage.forward
+            or args.use_fsdp_inference
+            or envs.SGLANG_CACHE_DIT_ENABLED
+            or not isinstance(module, LayerwiseOffloadableModuleMixin)
+            or is_layerwise_offloaded_module(module)
+        ):
+            return
+        module.configure_layerwise_offload(args)
+        if is_layerwise_offloaded_module(module):
+            self._offloaded_dit_modules_for_compile.append(module)
+
+    def _move_resident_components_for_warmup(self) -> list[torch.nn.Module]:
+        """Move resident non-DiT components off-device while the warmup
+        denoising (the compile/autotune peak) runs; forward() moves them back."""
+        pipeline = self.pipeline() if self.pipeline is not None else None
+        if pipeline is None:
+            return []
+        dit_ids = {id(self.transformer), id(self.transformer_2)}
+        moved = []
+        for module in pipeline.modules.values():
+            if (
+                isinstance(module, torch.nn.Module)
+                and id(module) not in dit_ids
+                and not is_layerwise_offloaded_module(module)
+            ):
+                param = next(module.parameters(), None)
+                if param is not None and param.device.type != "cpu":
+                    module.to("cpu")
+                    moved.append(module)
+        return moved
+
+    def _maybe_torch_compile(self, module: object) -> None:
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object is not a nn.Module.
@@ -354,7 +405,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         """Apply request-dependent transformer acceleration in trace-safe order."""
         self._maybe_enable_cache_dit(num_inference_steps, batch)
         for transformer in filter(None, [self.transformer, self.transformer_2]):
-            self._maybe_enable_torch_compile(transformer)
+            self._maybe_torch_compile(transformer)
 
     @staticmethod
     def _needs_nvfp4_jit_prewarm(module: nn.Module) -> bool:
@@ -1363,8 +1414,45 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         return latents
 
-    @torch.no_grad()
+    @contextmanager
+    def _offload_for_torch_compile_warmup(self, batch: Req):
+        """wrap a denoise so the torch.compile warmup has spare VRAM.
+
+        No-op unless the DiT was layerwise-offloaded for compile.
+        Warmup: move resident non-DiT components off-device for the autotune window, restore
+        after.
+        """
+        if not self._offloaded_dit_modules_for_compile:
+            yield
+            return
+        # if the dits have been layerwise-offloaded in preparation stage
+        if batch.is_warmup:
+            # if warmup is enabled, for warmup request, offload components to ensure sufficient VRAM headroom for torch compile
+            moved = self._move_resident_components_for_warmup()
+            try:
+                yield
+            finally:
+                device = get_local_torch_device()
+                for module in moved:
+                    module.to(device)
+            return
+        # prepare for first real request: restore the user-configured residency
+        for module in self._offloaded_dit_modules_for_compile:
+            module.disable_offload()
+        # clear the list for avoid overhead during real request
+        self._offloaded_dit_modules_for_compile.clear()
+        yield
+
     def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        with self._offload_for_torch_compile_warmup(batch):
+            return self._denoise(batch, server_args)
+
+    @torch.no_grad()
+    def _denoise(
         self,
         batch: Req,
         server_args: ServerArgs,
