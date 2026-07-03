@@ -9,13 +9,18 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from array import array
 from itertools import chain
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
 
-from sglang.srt.managers.io_struct import msgpack_decode
+from sglang.srt.managers.io_struct import (
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+    msgpack_decode,
+)
 
 if TYPE_CHECKING:
     from sglang_server import Server
@@ -60,6 +65,38 @@ def _flatten_floats(x):
     for e in x:
         out.extend(_flatten_floats(e))
     return out
+
+
+# Tag string -> struct field names, in tagged-array order.
+_TAG_TO_FIELDS = {
+    cls.__struct_config__.tag: cls.__struct_fields__
+    for cls in (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+}
+
+# Leading ``$[<n>]`` in a msgspec ValidationError path, e.g. ``$[12][0]``.
+_ARRAY_INDEX_RE = re.compile(r"\$\[(\d+)\]")
+
+
+def _explain_decode_failure(header: bytes, err: Exception) -> tuple[Optional[str], str]:
+    """Recover the rid and a human-readable message from a header the *typed*
+    decode rejected.
+    """
+    msg = str(err)
+    try:
+        arr = msgspec.msgpack.decode(header)
+    except Exception:
+        return None, msg
+    if not (isinstance(arr, (list, tuple)) and arr):
+        return None, msg
+    rid = str(arr[1]) if len(arr) > 1 and arr[1] is not None else None
+    fields = _TAG_TO_FIELDS.get(arr[0])
+    if fields is not None:
+        m = _ARRAY_INDEX_RE.search(msg)
+        if m is not None:
+            idx = int(m.group(1))
+            if 1 <= idx <= len(fields):
+                msg = f"{msg[:m.start()]}$.{fields[idx - 1]}{msg[m.end():]}"
+    return rid, msg
 
 
 def _flatten_hidden(hs):
@@ -149,9 +186,20 @@ class RustServer:
         out = []
         pos = 0  # byte offset into ids_buf
         for header, n in zip(headers, lengths):
-            obj = msgpack_decode(header)
+            nbytes = n * 8
+            try:
+                obj = msgpack_decode(header)
+            except Exception as e:
+                # Return 400 for malformed request field (e.g. token_ids_logprob=[[0]].
+                rid, reason = _explain_decode_failure(header, e)
+                logger.warning(
+                    "rust ingress: dropping undecodable request %s: %s", rid, reason
+                )
+                if rid is not None:
+                    self.server.push_error(rid, f"invalid request: {reason}")
+                pos += nbytes
+                continue
             if n:  # generate request: attach its int64 ids slice as array("q")
-                nbytes = n * 8
                 ids = array("q")
                 ids.frombytes(ids_view[pos : pos + nbytes])
                 obj.input_ids = ids
