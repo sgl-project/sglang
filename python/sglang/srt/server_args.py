@@ -567,7 +567,7 @@ class ServerArgs:
                 '* "float32" for FP32 precision.'
             ),
             choices=["auto", "half", "float16", "bfloat16", "float", "float32"],
-            model_overridable=True,
+            resolvable=True,
         ),
     ] = "auto"
     quantization: A[
@@ -575,7 +575,7 @@ class ServerArgs:
         Arg(
             help="The quantization method.",
             choices=QUANTIZATION_CHOICES,
-            model_overridable=True,
+            resolvable=True,
         ),
     ] = None
     quantization_param_path: A[
@@ -655,7 +655,7 @@ class ServerArgs:
         bool,
         Arg(
             help="Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only.",
-            model_overridable=True,
+            resolvable=True,
         ),
     ] = False
 
@@ -752,7 +752,7 @@ class ServerArgs:
     ] = 1.0
     page_size: A[
         Optional[int],
-        Arg(help="The number of tokens in a page.", model_overridable=True),
+        Arg(help="The number of tokens in a page.", resolvable=True),
     ] = None
     swa_full_tokens_ratio: A[
         float,
@@ -763,12 +763,12 @@ class ServerArgs:
                 "E.g. 0.5 means if each swa layer has 50 tokens, then each full "
                 "layer has 100 tokens."
             ),
-            model_overridable=True,
+            resolvable=True,
         ),
     ] = 0.8
     disable_hybrid_swa_memory: A[
         bool,
-        Arg(help="Disable the hybrid SWA memory pool.", model_overridable=True),
+        Arg(help="Disable the hybrid SWA memory pool.", resolvable=True),
     ] = False
     radix_eviction_policy: A[
         str,
@@ -931,7 +931,7 @@ class ServerArgs:
         Arg(
             help="The attention context parallelism size.",
             aliases=["--attention-context-parallel-size"],
-            model_overridable=True,
+            resolvable=True,
         ),
     ] = 1
     moe_dp_size: A[
@@ -968,7 +968,7 @@ class ServerArgs:
         bool,
         Arg(
             help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported.",
-            model_overridable=True,
+            resolvable=True,
         ),
     ] = False
     enable_dp_attention_local_control_broadcast: A[
@@ -979,7 +979,7 @@ class ServerArgs:
         bool,
         Arg(
             help="Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention.",
-            model_overridable=True,
+            resolvable=True,
         ),
     ] = False
     enable_attn_tp_input_scattered: A[
@@ -1418,7 +1418,7 @@ class ServerArgs:
         Arg(
             help="Choose the kernels for attention layers.",
             choices=ATTENTION_BACKEND_CHOICES,
-            model_overridable=True,
+            resolvable=True,
         ),
     ] = None
     decode_attention_backend: A[
@@ -1440,7 +1440,7 @@ class ServerArgs:
         Arg(
             help="Choose the kernels for sampling layers.",
             choices=SAMPLING_BACKEND_CHOICES,
-            model_overridable=True,
+            resolvable=True,
         ),
     ] = None
     grammar_backend: A[
@@ -1618,7 +1618,7 @@ class ServerArgs:
         bool,
         Arg(
             help="Enable multi-layer Eagle speculative decoding.",
-            model_overridable=True,
+            resolvable=True,
         ),
     ] = False
     speculative_adaptive: A[
@@ -1705,7 +1705,7 @@ class ServerArgs:
         Arg(
             help="The expert parallelism size.",
             aliases=["--expert-parallel-size", "--ep"],
-            model_overridable=True,
+            resolvable=True,
         ),
     ] = 1
     moe_a2a_backend: A[
@@ -1722,7 +1722,7 @@ class ServerArgs:
         Arg(
             help="Choose the backend for MoE A2A.",
             choices=MOE_A2A_BACKEND_CHOICES,
-            model_overridable=True,
+            resolvable=True,
         ),
     ] = "none"
     moe_runner_backend: A[
@@ -1730,7 +1730,7 @@ class ServerArgs:
         Arg(
             help="Choose the runner backend for MoE.",
             choices=MOE_RUNNER_BACKEND_CHOICES,
-            model_overridable=True,
+            resolvable=True,
         ),
     ] = "auto"
     flashinfer_mxfp4_moe_precision: A[
@@ -1788,7 +1788,7 @@ class ServerArgs:
         Optional[int],
         Arg(
             help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
-            model_overridable=True,
+            resolvable=True,
         ),
     ] = None
     elastic_ep_backend: A[
