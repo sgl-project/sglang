@@ -196,5 +196,16 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         # that forward directly, so no change to this wrapper's forward is needed.
         self.language_model.set_eagle3_layers_to_capture(layer_ids)
 
+    # --- DFlash support ---
+    def get_input_embeddings(self):
+        return self.language_model.get_input_embeddings()
+
+    def set_dflash_layers_to_capture(self, layer_ids):
+        self.language_model.set_dflash_layers_to_capture(layer_ids)
+
+    @property
+    def lm_head(self):
+        return self.language_model.lm_head
+
 
 EntryClass = Qwen2AudioForConditionalGeneration
