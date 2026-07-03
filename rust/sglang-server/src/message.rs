@@ -380,6 +380,10 @@ pub const EGRESS_TAG_RESULT: u8 = 1;
 /// per-request [`ChunkEvent`]s and routes each by rid — no per-request FFI /
 /// msgpack from Python.
 pub const EGRESS_TAG_BATCH: u8 = 2;
+/// A per-request failure `[rid, message]`: the Python drain couldn't decode a
+/// request's header (e.g. a malformed field), so instead of letting the error
+/// escape the scheduler loop it routes a 400 back to the owning request.
+pub const EGRESS_TAG_ERROR: u8 = 3;
 
 /// Read `n` little-endian f32s from `data` at `*off`, advancing `*off`.
 fn take_f32(data: &[u8], off: &mut usize, n: usize) -> Vec<f32> {
@@ -659,6 +663,17 @@ pub fn frame_egress_result(rid: &str, payload: &[u8]) -> Bytes {
     let arr = Value::Array(vec![Value::from(rid), Value::Binary(payload.to_vec())]);
     let mut buf = Vec::with_capacity(1 + payload.len() + rid.len() + 8);
     buf.push(EGRESS_TAG_RESULT);
+    let _ = rmpv::encode::write_value(&mut buf, &arr);
+    Bytes::from(buf)
+}
+
+/// Frame a per-request failure `[rid, message]` for the egress ring — routes a
+/// terminal error back to the owning request (→ HTTP 400) instead of crashing.
+pub fn frame_egress_error(rid: &str, message: &str) -> Bytes {
+    use rmpv::Value;
+    let arr = Value::Array(vec![Value::from(rid), Value::from(message)]);
+    let mut buf = Vec::with_capacity(1 + rid.len() + message.len() + 8);
+    buf.push(EGRESS_TAG_ERROR);
     let _ = rmpv::encode::write_value(&mut buf, &arr);
     Bytes::from(buf)
 }
