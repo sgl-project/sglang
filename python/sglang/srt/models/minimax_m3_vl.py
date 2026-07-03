@@ -138,6 +138,9 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
 
         self.logits_processor = LogitsProcessor(text_config)
 
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
     def _determine_num_fused_shared_experts(self) -> None:
         text_config = self.config.text_config
         server_args = get_global_server_args()
@@ -201,6 +204,37 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    def get_embed_and_head(self):
+        # EAGLE3 target interface: share the text embed + lm_head with the draft.
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
+        # EAGLE3 target interface: select which decoder layers' hidden states the
+        # draft consumes. Mirrors MiniMaxM3SparseForCausalLM; operates on the inner
+        # MiniMaxM3Model (self.model), whose forward returns (hidden, aux) once set.
+        if not self.pp_group.is_last_rank:
+            return
+
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.text_config.num_hidden_layers
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]  # Specific layers for EAGLE3 support
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+        # MiniMaxM3Model.forward checks each layer's ``_is_layer_to_capture``
+        # attribute (not ``i in layers_to_capture``); set it explicitly so the
+        # (hidden, aux) tuple is actually returned during capture-enabled forwards.
+        for layer_id in self.model.layers_to_capture:
+            if 0 <= layer_id < len(self.model.layers):
+                setattr(
+                    self.model.layers[layer_id], "_is_layer_to_capture", True
+                )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -221,12 +255,20 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        # EAGLE3: when layers_to_capture is set, MiniMaxM3Model.forward returns
+        # (hidden_states, aux_hidden_states) once aux is non-empty; on idle/warmup
+        # forwards with no captured tokens it returns a bare hidden tensor.
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states and isinstance(hidden_states, tuple):
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank and not get_embedding:
             return self.logits_processor(
                 input_ids,
                 hidden_states,
                 self.lm_head,
                 forward_batch,
+                aux_hidden_states,
             )
         return hidden_states
 

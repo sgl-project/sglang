@@ -284,6 +284,10 @@ class Envs:
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
+    # Per-cycle wall-clock split (draft / target_verify / overhead) of the EAGLE3
+    # verify cycle. Diagnostic only: uses torch.<device>.synchronize() barriers,
+    # so absolute TPOT is perturbed; the relative phase split stays valid.
+    SGLANG_DEBUG_SPEC_CYCLE = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)

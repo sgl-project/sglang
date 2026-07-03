@@ -121,6 +121,88 @@ def _prepare_low_latency_dispatch_inputs(
     return hidden_states, topk_ids, topk_weights
 
 
+def _is_currently_capturing() -> bool:
+    """True if we are inside a cuda/npu graph capture region.
+
+    Used by the verify-capture diagnostic to skip host-syncing value checks
+    (``.item()`` / ``.min()`` / ``.unique()``) that would themselves break
+    capture.
+    """
+    try:
+        if _is_npu:
+            return torch.npu.is_current_stream_capturing()
+        return torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return False
+
+
+def _log_low_latency_dispatch_inputs(
+    tag: str,
+    *,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: Optional[torch.Tensor] = None,
+    num_max_dispatch_tokens_per_rank: Optional[int] = None,
+    num_experts: Optional[int] = None,
+    expected_m: Optional[int] = None,
+    resolved_mode: Optional[str] = None,
+) -> None:
+    """Env-gated diagnostic for the DeepEP low_latency verify-capture crash.
+
+    Enable with ``SGLANG_DEEPEP_DEBUG_VERIFY_CAPTURE=1``. Emits tensor metadata
+    (shapes / dtypes / data_ptrs -- CPU-side, safe inside capture), the DeepEP
+    mode, and the inputs to the ``num_tokens <= num_max_dispatch_tokens_per_rank``
+    guard. Value stats (min / max / unique / NaN) require a host sync and are
+    therefore only emitted when NOT capturing -- run an eager (graph-disabled)
+    verify batch to inspect them.
+    """
+    if not get_bool_env_var("SGLANG_DEEPEP_DEBUG_VERIFY_CAPTURE", "False"):
+        return
+    capturing = _is_currently_capturing()
+    parts = [
+        f"[DeepEP verify-capture debug] {tag}",
+        f"  capturing={capturing} is_npu={_is_npu}",
+        f"  hidden_states: shape={tuple(hidden_states.shape)} dtype={hidden_states.dtype}"
+        f" ptr={hex(hidden_states.data_ptr())} contig={hidden_states.is_contiguous()}",
+        f"  topk_ids:      shape={tuple(topk_ids.shape)} dtype={topk_ids.dtype}"
+        f" ptr={hex(topk_ids.data_ptr())}",
+    ]
+    if topk_weights is not None:
+        parts.append(
+            f"  topk_weights:  shape={tuple(topk_weights.shape)} dtype={topk_weights.dtype}"
+        )
+    if num_max_dispatch_tokens_per_rank is not None:
+        parts.append(f"  num_max_dispatch_tokens_per_rank={num_max_dispatch_tokens_per_rank}")
+    if num_experts is not None:
+        parts.append(f"  num_experts={num_experts}")
+    if expected_m is not None:
+        parts.append(f"  expected_m={expected_m}")
+    try:
+        parts.append(f"  is_extend_in_batch={get_is_extend_in_batch()}")
+    except Exception as e:  # diagnostic only -- never break the forward
+        parts.append(f"  is_extend_in_batch=<lookup failed: {e}>")
+    if resolved_mode is not None:
+        parts.append(f"  resolved_deepep_mode={resolved_mode}")
+    if num_max_dispatch_tokens_per_rank is not None:
+        parts.append(
+            f"  guard(num_tokens<=buf)={hidden_states.shape[0] <= num_max_dispatch_tokens_per_rank}"
+            f" (num_tokens={hidden_states.shape[0]})"
+        )
+    # Value checks D2H-sync and would break capture -- only when not capturing.
+    if not capturing:
+        parts.append(
+            f"  topk_ids min={topk_ids.min().item()} max={topk_ids.max().item()}"
+            f" unique={topk_ids.unique().numel()}"
+        )
+        if topk_weights is not None:
+            parts.append(
+                f"  topk_weights min={topk_weights.min().item()}"
+                f" max={topk_weights.max().item()}"
+                f" has_nan_or_inf={bool((torch.isnan(topk_weights) | torch.isinf(topk_weights)).any())}"
+            )
+    logger.warning("\n".join(parts))
+
+
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
     def __call__(self, dispatcher: BaseDispatcher):
         for hook_fun in self.hook_dict.values():
@@ -697,6 +779,16 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
+        _log_low_latency_dispatch_inputs(
+            "low_latency dispatch_a (pre _dispatch_core)",
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+            num_experts=self.num_experts,
+            expected_m=expected_m,
+            resolved_mode=str(self.deepep_mode.resolve(get_is_extend_in_batch())),
+        )
         hidden_states, masked_m, event, hook, topk_ids = self._dispatch_core(
             hidden_states,
             topk_ids,
@@ -765,6 +857,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
+        _log_low_latency_dispatch_inputs(
+            "_dispatch_core -> buffer.low_latency_dispatch (crash site)",
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+            num_experts=self.num_experts,
+        )
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
