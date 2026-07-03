@@ -806,7 +806,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     return_indexer_topk: bool = False
 
     # Session info for continual prompting
-    session_id: Optional[str] = field(default=None, kw_only=True)
+    session_id: Optional[str] = None
     session_params: Optional[SessionParams] = None
 
     # LoRA related
