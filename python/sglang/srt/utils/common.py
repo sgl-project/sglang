@@ -179,6 +179,17 @@ def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
+def register_xpu_device_properties_for_dynamo() -> None:
+    if not is_xpu():
+        return
+
+    import torch._dynamo.utils as dynamo_utils
+
+    xpu_props_type = getattr(torch.xpu, "_XpuDeviceProperties", None)
+    if xpu_props_type is not None:
+        dynamo_utils.common_constant_types.add(xpu_props_type)
+
+
 @lru_cache(maxsize=1)
 def is_npu() -> bool:
     if not hasattr(torch, "npu"):
@@ -610,15 +621,23 @@ def get_available_gpu_memory(
 
         if empty_cache:
             empty_device_cache(torch.xpu)
-        # memory_allocated() only counts active tensors; it misses the XPU caching
-        # allocator's pre-claimed Level Zero pool.  memory_reserved() covers both
-        # active tensors and the allocator pool, giving a conservative (correct)
-        # estimate that prevents KV-cache over-allocation on Intel XPU devices.
-        # Note: torch.xpu.mem_get_info() is unreliable on Intel XPU — it always
-        # returns the full hardware capacity as free regardless of allocations.
-        used_memory = torch.xpu.memory_reserved(gpu_id)
-        total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
-        free_gpu_memory = total_gpu_memory - used_memory
+        # Use mem_get_info() with a sanity cap to avoid KV-cache over-allocation
+        # on drivers that incorrectly return total memory as free memory.
+        # Consistent with the fallback: free = max(0, total - allocated).
+        try:
+            free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info(gpu_id)
+            used_memory = float(torch.xpu.memory_allocated(gpu_id))
+            free_gpu_memory = min(
+                float(free_gpu_memory),
+                max(0.0, float(total_gpu_memory) - used_memory),
+            )
+        except Exception:
+            # Fallback for devices/drivers that do not support querying free memory
+            used_memory = float(torch.xpu.memory_allocated(gpu_id))
+            total_gpu_memory = float(
+                torch.xpu.get_device_properties(gpu_id).total_memory
+            )
+            free_gpu_memory = max(0.0, total_gpu_memory - used_memory)
 
     elif device == "hpu":
         num_gpus = torch.hpu.device_count()
@@ -1852,7 +1871,7 @@ def get_npu_memory_capacity():
             return envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get()  # unit: MB
         else:
             return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
-    except ImportError as e:
+    except ImportError:
         raise ImportError("torch_npu is required when run on npu device.")
 
 
@@ -2205,7 +2224,7 @@ def get_compiler_backend(mode=None) -> str:
             import torchair
             import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
             from torchair.configs.compiler_config import CompilerConfig
-        except ImportError as e:
+        except ImportError:
             raise ImportError(
                 "NPU detected, but torchair package is not installed. "
                 "Please install torchair for torch.compile support on NPU."

@@ -315,7 +315,7 @@ MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 
-LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer"]
+LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer", "flashkda"]
 
 
 # Allow external code to add more choices
@@ -775,6 +775,22 @@ class ServerArgs:
         "Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
     ] = False
     disable_radix_cache: A[bool, "Disable RadixAttention for prefix caching."] = False
+    enable_page_major_kv_layout: A[
+        bool,
+        "Enable the page-major KV layout: lay out the Mamba state and full/SWA "
+        "KV caches in a page-granularity envelope (page is the outermost axis, "
+        "layer-major within a page) instead of the default per-layer "
+        "(layer-major) layout. Requires the Triton attention / linear-attn / "
+        "Mamba backends.",
+    ] = False
+    enable_unified_memory: A[
+        bool,
+        "Replace the statically-partitioned hybrid-model pools (full-attn KV + "
+        "SWA/Mamba state) with one byte buffer split dynamically between "
+        "sub-pools. Requires the Triton attention / linear-attn / Mamba "
+        "backends; not yet compatible with PD disaggregation or speculative "
+        "decoding.",
+    ] = False
     disable_chunked_prefix_cache: A[
         bool,
         "Disable chunked prefix cache feature for deepseek, which should save overhead for short sequences.",
@@ -1793,6 +1809,14 @@ class ServerArgs:
             choices=["float32", "bfloat16", "float16"],
         ),
     ] = None
+    enable_mamba_cache_stochastic_rounding: A[
+        bool,
+        "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",
+    ] = False
+    mamba_cache_philox_rounds: A[
+        int,
+        "Number of Philox rounds to use for stochastic rounding of FP16 Mamba SSM cache writes. Triton uses the Triton default when set to 0; FlashInfer uses 10 rounds when set to 0.",
+    ] = 0
     mamba_full_memory_ratio: A[
         float,
         "The ratio of mamba state memory to full kv cache memory.",
@@ -1907,6 +1931,7 @@ class ServerArgs:
                 "dynamic",
                 "eic",
                 "simm",
+                "mori",
             ],
         ),
     ] = None
@@ -2629,6 +2654,9 @@ class ServerArgs:
         # deterministic backend is set before auto-detection fills it in.
         self._handle_deterministic_inference()
         self._handle_attention_backend_compatibility()
+        # Must run after the attention backend is resolved so the trtllm_mla
+        # default (auto-selected for DeepseekV3ForCausalLM on sm100) is visible.
+        self._disable_prefill_cuda_graph_for_deepseek_trtllm_mla()
         self._handle_mamba_backend()
         self._handle_int8_mamba_checkpoint()
         self._handle_linear_attn_backend()
@@ -2694,6 +2722,10 @@ class ServerArgs:
 
         # Validate cache settings.
         self._handle_cache_compatibility()
+
+        self._handle_page_major_kv_layout()
+
+        self._handle_unified_memory_pool()
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
@@ -3022,12 +3054,31 @@ class ServerArgs:
 
     def _handle_xpu_backends(self):
         if self.device == "xpu":
-            if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+            # Decode graph is opt-in on XPU: unless the user explicitly set
+            # --cuda-graph-backend-decode (or --cuda-graph-config), keep it
+            # disabled so the default startup doesn't require graph capture.
+            if (Phase.DECODE, "backend") not in self._cuda_graph_config_locked:
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+            elif self.cuda_graph_config.decode.backend not in (
+                Backend.DISABLED,
+                Backend.FULL,
+            ):
                 logger.warning(
-                    "XPU platform does not support piecewise CUDA graph, "
-                    "disabling prefill cuda graph."
+                    "XPU platform only supports decode backend 'full'; "
+                    "disabling unsupported decode backend '%s'.",
+                    self.cuda_graph_config.decode.backend,
                 )
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+
+            if self.cuda_graph_config.prefill.backend not in (
+                Backend.DISABLED,
+                Backend.TC_PIECEWISE,
+            ):
+                logger.warning(
+                    "XPU platform currently only supports prefill tc_piecewise CUDA graph; "
+                    "disabling unsupported prefill backend."
+                )
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
@@ -3183,11 +3234,27 @@ class ServerArgs:
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
         """
+        from sglang.srt.configs.model_config import is_deepseek_v4
+
         rules = [
-            # MLA prefill takes a different attn-forward path under BCG (no
-            # tc_piecewise gate), causing q.view shape mismatches. Disable
-            # until the MLA prefill path is BCG-aware.
+            # MLA prefill takes a different attn-forward path under BCG.
             ("MLA attention", lambda: self.use_mla_backend()),
+            # DSV4 is BCG-compatible but introduces heavy memory pressure: the
+            # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
+            (
+                "DeepSeek-V4 (heavy capture-pool memory pressure)",
+                lambda: is_deepseek_v4(self.get_model_config().hf_config),
+            ),
+            # CP all_gather replay size mismatch under BCG.
+            ("context parallel (attn_cp_size > 1)", lambda: self.attn_cp_size > 1),
+            # BCG capture + LoRA adapter weights exceed host RAM headroom.
+            ("LoRA", lambda: bool(self.lora_paths) or bool(self.enable_lora)),
+            # BCG bucket sizes exceed FlashInfer MoE A2A's dispatch cap.
+            ("MoE A2A backend", lambda: self.moe_a2a_backend != "none"),
+            # DP-attn × BCG capture/replay not yet validated.
+            ("DP attention", lambda: self.enable_dp_attention),
+            # Multimodal prefill replay faults under BCG.
+            ("multimodal model", lambda: self.get_model_config().is_multimodal),
         ]
         for name, predicate in rules:
             if predicate():
@@ -3198,6 +3265,34 @@ class ServerArgs:
                 )
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
                 return
+
+    def _disable_prefill_cuda_graph_for_deepseek_trtllm_mla(self):
+        """Disable prefill CUDA graph for dsr1 by default when using the trtllm_mla
+        attention backend. Under any captured prefill CUDA graph (tc_piecewise or
+        breakable) trtllm_mla falls back to FlashAttention for prefill and regresses
+        performance, so disable whichever prefill graph backend is in effect.
+        """
+
+        if (Phase.PREFILL, "backend") in self._cuda_graph_config_locked:
+            return
+        if self.cuda_graph_config.prefill.backend == Backend.DISABLED:
+            return
+        if (
+            "DeepseekV3ForCausalLM"
+            not in self.get_model_config().hf_config.architectures
+        ):
+            return
+        prefill_attention_backend, _ = self.get_attention_backends()
+        if prefill_attention_backend != "trtllm_mla":
+            return
+        logger.warning(
+            "Disabling prefill CUDA graph (%s) by default for the DeepSeek-V3 arch on "
+            "the trtllm_mla attention backend (a captured prefill graph forces a "
+            "FlashAttention fallback that regresses prefill). Set the prefill cuda graph "
+            "backend explicitly (e.g. --cuda-graph-backend-prefill tc_piecewise) to override.",
+            self.cuda_graph_config.prefill.backend,
+        )
+        self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _validate_cuda_graph_config(self):
         if self.cuda_graph_config is None:
@@ -4984,20 +5079,52 @@ class ServerArgs:
             self.grammar_backend = "xgrammar"
 
     def _handle_mamba_backend(self):
+        if self.mamba_cache_philox_rounds < 0:
+            raise ValueError("--mamba-cache-philox-rounds must be non-negative.")
+
+        if self.enable_mamba_cache_stochastic_rounding:
+            if self.mamba_ssm_dtype != "float16":
+                raise ValueError(
+                    "Stochastic rounding for the Mamba SSM cache requires "
+                    f"--mamba-ssm-dtype float16, got {self.mamba_ssm_dtype!r}. "
+                    "Run with --mamba-ssm-dtype float16 or disable "
+                    "--enable-mamba-cache-stochastic-rounding."
+                )
+            if not is_cuda():
+                raise ValueError(
+                    "Stochastic rounding for the Mamba SSM cache is only "
+                    "supported on NVIDIA CUDA platforms. Disable "
+                    "--enable-mamba-cache-stochastic-rounding on this platform."
+                )
+            if self.mamba_backend == "triton" and not is_sm100_supported():
+                raise ValueError(
+                    "Stochastic rounding for the Mamba SSM cache with "
+                    "--mamba-backend triton requires SM100 with CUDA >= 12.8 "
+                    "because it uses the cvt.rs.f16x2.f32 PTX instruction. On "
+                    "H100/SM90, run with --mamba-backend flashinfer "
+                    "--mamba-ssm-dtype float16, or disable "
+                    "--enable-mamba-cache-stochastic-rounding."
+                )
+
         if self.mamba_backend == "flashinfer":
+            flashinfer_error = (
+                "FlashInfer mamba module not available, please check the "
+                "FlashInfer installation."
+            )
+            if self.enable_mamba_cache_stochastic_rounding:
+                flashinfer_error += (
+                    " Stochastic rounding with --mamba-backend flashinfer "
+                    "requires FlashInfer Mamba and --mamba-ssm-dtype float16."
+                )
             if is_flashinfer_available():
                 try:
                     import flashinfer.mamba  # noqa: F401
 
                     logger.info("Successfully imported FlashInfer mamba module")
                 except (ImportError, AttributeError):
-                    raise ValueError(
-                        "FlashInfer mamba module not available, please check flashinfer installation."
-                    )
+                    raise ValueError(flashinfer_error)
             else:
-                raise ValueError(
-                    "FlashInfer mamba module not available, please check flashinfer installation."
-                )
+                raise ValueError(flashinfer_error)
 
     def _handle_int8_mamba_checkpoint(self):
         # The int8 mamba checkpoint pool is only wired into the built-in
@@ -5041,6 +5168,26 @@ class ServerArgs:
 
         # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
         decode = self.linear_attn_decode_backend or self.linear_attn_backend
+
+        # FlashKDA is a prefill-only KDA kernel (no decode kernel) but shares the
+        # backend choice list, so guard it from being selected for decode: error
+        # on an explicit --linear-attn-decode-backend flashkda, and fall back to
+        # triton decode when it was only inherited from base=flashkda (prefill
+        # keeps FlashKDA).
+        if decode == "flashkda":
+            if self.linear_attn_decode_backend == "flashkda":
+                raise ValueError(
+                    "--linear-attn-decode-backend flashkda is not supported: "
+                    "FlashKDA is prefill-only. Use "
+                    "--linear-attn-prefill-backend flashkda (decode stays on triton)."
+                )
+            self.linear_attn_decode_backend = "triton"
+            decode = "triton"
+            logger.info(
+                "FlashKDA is prefill-only; using triton for KDA decode "
+                "(FlashKDA stays on prefill)."
+            )
+
         if (
             decode == "flashinfer"
             and self.mamba_ssm_dtype != "bfloat16"
@@ -5301,9 +5448,10 @@ class ServerArgs:
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if self.moe_runner_backend == "flashinfer_cutedsl":
-            assert self.quantization in [
-                "modelopt_fp4"
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4'."
+            assert (
+                self.quantization in ["modelopt_fp4"]
+                or self.get_model_config().nvfp4_moe_meta is not None
+            ), f"Invalid quantization '{self.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4' or hybrid NVFP4 models."
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -5524,7 +5672,10 @@ class ServerArgs:
             )
             if self.deepep_mode != "auto":
                 logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
-            if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set():
+            if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
+                self.quantization == "modelopt_fp4"
+                or self.get_model_config().nvfp4_moe_meta is not None
+            ):
                 envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
                 logger.warning(
                     "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
@@ -5532,7 +5683,8 @@ class ServerArgs:
             assert self.moe_runner_backend in [
                 "flashinfer_cutlass",
                 "flashinfer_cutedsl",
-            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass or flashinfer_cutedsl moe runner backend"
+                "flashinfer_trtllm_routed",
+            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass, flashinfer_cutedsl or flashinfer_trtllm_routed moe runner backend"
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size
@@ -6248,6 +6400,80 @@ class ServerArgs:
                     logger.warning(
                         "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
                     )
+
+    def _handle_unified_memory_pool(self):
+        if not self.enable_unified_memory:
+            return
+        assert self.disaggregation_mode == "null", (
+            "--enable-unified-memory is not yet compatible with PD " "disaggregation."
+        )
+        assert self.speculative_algorithm is None, (
+            "--enable-unified-memory is not yet compatible with speculative "
+            "decoding."
+        )
+        assert not (self.enable_hierarchical_cache or self.enable_lmcache), (
+            "--enable-unified-memory is not yet compatible with hierarchical / "
+            "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
+            "the unified-memory-pool init wires up no host pools, and its device mamba / "
+            "full-attention slots are VIRTUAL — the host-offload path does not "
+            "translate them to physical."
+        )
+        assert self.dcp_size == 1, (
+            "--enable-unified-memory is not yet compatible with decode context "
+            "parallelism (--dcp-size > 1): the pool has no DCP-aware masked write "
+            "path (UnifiedMHATokenToKVPool.set_kv_buffer asserts dcp_kv_mask is None), "
+            "so a DCP run would boot and then fail on the first KV write."
+        )
+        # Only monolithic decode cuda-graph capture is wired; piecewise prefill
+        # capture is not. Guard when the user opts into it.
+        _cg_cfg = self.cuda_graph_config
+        if _cg_cfg is not None and _cg_cfg.prefill.backend == Backend.TC_PIECEWISE:
+            raise ValueError(
+                "--enable-unified-memory supports monolithic (decode) "
+                "cuda-graph capture only; disable piecewise prefill capture "
+                "(e.g. --cuda-graph-backend-prefill=disabled)."
+            )
+        # The strided-layout Triton requirement is enforced via
+        # --enable-page-major-kv-layout (implied by the unified pool in
+        # _handle_page_major_kv_layout); the model-family gate is enforced at pool
+        # construction in model_runner_kv_cache_mixin._init_pools.
+
+    def _handle_page_major_kv_layout(self):
+        # The unified pool stores state in the page-major envelope-strided layout, so
+        # enabling it implies --enable-page-major-kv-layout — routing it through the
+        # single page-major path + stride-aware Triton asserts (set before the guard).
+        if self.enable_unified_memory:
+            self.enable_page_major_kv_layout = True
+        if not self.enable_page_major_kv_layout:
+            return
+        # Only the Triton attention kernels read the strided 4-D envelope K/V
+        # views; FA3 / FlashInfer do not.
+        backends = {
+            self.attention_backend,
+            self.prefill_attention_backend,
+            self.decode_attention_backend,
+        }
+        backends.discard(None)
+        assert backends <= {"triton"}, (
+            "--enable-page-major-kv-layout requires the Triton attention backend "
+            f"for the full-attention layers; got {sorted(backends)}. Pass "
+            "--attention-backend triton."
+        )
+        # The Mamba state is stored in envelope-strided views; only the
+        # stride-aware Triton causal-conv / SSM kernels read them correctly.
+        linear_backends = {
+            self.linear_attn_backend,
+            self.linear_attn_decode_backend,
+            self.linear_attn_prefill_backend,
+            self.mamba_backend,
+        }
+        linear_backends.discard(None)
+        assert linear_backends <= {"triton"}, (
+            "--enable-page-major-kv-layout requires the Triton linear-attention / "
+            f"Mamba kernels for the strided conv/SSM state; got "
+            f"{sorted(linear_backends)}. Pass --linear-attn-backend triton and "
+            "--mamba-backend triton."
+        )
 
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:

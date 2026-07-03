@@ -1065,7 +1065,7 @@ class TestIdeogram4(unittest.TestCase):
         self.assertTrue(layer.mlp.down_proj.input_is_parallel)
         self.assertTrue(layer.mlp.down_proj.reduce_results)
 
-    def test_denoise_and_decode_shape_smoke(self):
+    def test_denoise_and_decode_shape_check(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
 
         cfg = Ideogram4PipelineConfig()
