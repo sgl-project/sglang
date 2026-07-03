@@ -11,6 +11,9 @@ active scheduler, so consumers see a plain scheduler either way.
 
 from __future__ import annotations
 
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    get_or_create_request_scheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     TimestepPreparationStage,
 )
@@ -26,18 +29,22 @@ class RolloutTimestepPreparationStage(TimestepPreparationStage):
     """Resolve the per-request scheduler before preparing timesteps."""
 
     def forward(self, batch, server_args):
-        self.scheduler.prepare_for_batch(batch)
+        scheduler = get_or_create_request_scheduler(batch, self.scheduler)
+        scheduler.prepare_for_batch(batch)
         return super().forward(batch, server_args)
 
 
 class RolloutSchedulerSwitch(SchedulerRLMixin):
     """Dispatch between a serving and a rollout scheduler per request."""
 
+    # Class-level so the info log prints once per process even if the
+    # scheduler is cloned per request (isolate=True paths).
+    _logged_rollout_check = False
+
     def __init__(self, serving_scheduler, rollout_scheduler):
         self.serving_scheduler = serving_scheduler
         self.rollout_scheduler = rollout_scheduler
         self._active_scheduler = serving_scheduler
-        self._logged_rollout_check = False
 
     def prepare_for_batch(self, batch):
         self._active_scheduler = (
@@ -128,7 +135,7 @@ class RolloutSchedulerSwitch(SchedulerRLMixin):
             raise ValueError(
                 f"rollout timestep/sigma mismatch: max_abs_diff={max_abs_diff:.6g}"
             )
-        if not self._logged_rollout_check:
+        if not RolloutSchedulerSwitch._logged_rollout_check:
             logger.info(
                 "RL rollout using %s (timesteps dtype=%s, sigmas dtype=%s, "
                 "max_abs_diff=%.6g)",
@@ -137,7 +144,7 @@ class RolloutSchedulerSwitch(SchedulerRLMixin):
                 sigmas.dtype,
                 max_abs_diff,
             )
-            self._logged_rollout_check = True
+            RolloutSchedulerSwitch._logged_rollout_check = True
 
     def scale_model_input(self, sample, timestep=None):
         return self._active_scheduler.scale_model_input(sample, timestep)
