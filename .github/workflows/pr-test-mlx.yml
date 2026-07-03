@@ -1,0 +1,97 @@
+name: PR Test (MLX)
+
+on:
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened, labeled]
+
+concurrency:
+  group: pr-test-mlx-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  mlx-unit-test:
+    # Label-gated on 'mlx', reusing the repo's run-ci label-gate mechanism
+    # (pr-test-rust.yml). The gate keys on the PR's current label set, so any
+    # event on a labeled PR re-runs the tests and a later unrelated label can't
+    # mask a prior result. The non-pull_request clause covers push / dispatch.
+    if: |
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'mlx')
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      SGLANG_IS_IN_CI: true
+      # use_mlx() needs this var (and mlx importable); without it the profiler
+      # takes the MPS branch and the MLX capture path goes untested.
+      SGLANG_USE_MLX: 1
+      # Forbid HF downloads so the model-free guarantee is enforced, not assumed.
+      HF_HUB_OFFLINE: 1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: 'python/pyproject_other.toml'
+
+      - name: Verify Apple Silicon runner
+        run: |
+          echo "uname -m: $(uname -m)"
+          python3 -c "import platform; assert platform.machine()=='arm64', platform.machine(); print('machine:', platform.machine(), 'system:', platform.system())"
+
+      - name: Install dependencies (MLX / srt_mps extra)
+        timeout-minutes: 30
+        run: |
+          test -f python/pyproject_other.toml || { echo "alt pyproject_other.toml missing"; exit 1; }
+          # Swap in the Apple Silicon project metadata, then install the srt_mps
+          # extra (mlx, mlx-lm, runtime_common, torch) into an isolated uv venv.
+          # The all_mps diffusion chain is not needed here.
+          rm -f python/pyproject.toml
+          mv python/pyproject_other.toml python/pyproject.toml
+          uv venv
+          uv pip install -e "python[srt_mps]"
+          uv pip install pytest
+
+      - name: Report MLX / torch versions
+        run: |
+          uv run python -c "import mlx.core as mx; print('mlx', mx.__version__)"
+          uv run python -c "import torch; print('torch', torch.__version__)"
+
+      - name: Run model-free MLX unit tests
+        timeout-minutes: 15
+        run: |
+          # Model-free MLX unit tests via pytest, like MUSA's unit-test jobs
+          # (its model and server suites use run_suite.py). None load a model:
+          # signature contracts, mocked Metal capture, dummy ServerArgs patching,
+          # and quant-config dicts.
+          uv run python -m pytest -v \
+            test/registered/unit/hardware_backend/mlx/test_runner_init_contract.py \
+            test/registered/unit/hardware_backend/mlx/test_metal_profiler.py \
+            test/registered/unit/hardware_backend/mlx/test_attention_patching.py \
+            "test/registered/unit/hardware_backend/mlx/test_quantization.py::TestMlxQuantizationOverride"
+
+  pr-test-mlx-finish:
+    needs: [mlx-unit-test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check dependent job status
+        run: |
+          result="${{ needs.mlx-unit-test.result }}"
+          echo "mlx-unit-test: $result"
+          if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+            echo "The MLX unit-test job failed."
+            exit 1
+          fi
+          echo "All jobs completed successfully"
