@@ -23,13 +23,12 @@ Page-aligned memory pool.
 from typing import TYPE_CHECKING
 
 import torch
-import triton
 
+from sglang.jit_kernel.free_page_pool import free_dual_pool
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.triton_ops.allocator import (
     alloc_decode_kernel,
     alloc_extend_kernel,
-    free_dual_pool_kernel,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -380,27 +379,23 @@ class DeviceFreeListPagedAllocator(PagedTokenToKVPoolAllocator):
         if free_index.dtype != torch.int64:
             free_index = free_index.to(torch.int64)
         self._cur_epoch += 1
-        n = free_index.numel()
-        BLOCK = 256
-        free_dual_pool_kernel[(triton.cdiv(n, BLOCK),)](
+        free_dual_pool(
             free_index,
-            n,
             self._page_epoch,
             self._cur_epoch,
             self._buf,
             self._cap,
             self._tail,
-            # SCAN_SWA off: the swa-side args are unused (dead code)
+            True,
+            # scan_swa off: the mapping/swa args are unused
             self._buf,
             self._page_epoch,
             0,
             self._buf,
             1,
             self._tail,
-            page_size=self.page_size,
-            BLOCK=BLOCK,
-            MARK_SELF=True,
-            SCAN_SWA=False,
+            False,
+            self.page_size,
         )
         self._mark_freed()
 

@@ -1,6 +1,6 @@
 import torch
-import triton
 
+from sglang.jit_kernel.free_page_pool import free_dual_pool
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import (
@@ -9,7 +9,6 @@ from sglang.srt.mem_cache.allocator.paged import (
 )
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.triton_ops.allocator import free_dual_pool_kernel
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
 
@@ -388,26 +387,22 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         swa_a = self.swa_attn_allocator
         full_a._cur_epoch += 1
         swa_a._cur_epoch += 1
-        n = free_index.numel()
-        BLOCK = 256
-        free_dual_pool_kernel[(triton.cdiv(n, BLOCK),)](
+        free_dual_pool(
             free_index,
-            n,
             full_a._page_epoch,
             full_a._cur_epoch,
             full_a._buf,
             full_a._cap,
             full_a._tail,
+            mark_full,
             self.full_to_swa_index_mapping,
             swa_a._page_epoch,
             swa_a._cur_epoch,
             swa_a._buf,
             swa_a._cap,
             swa_a._tail,
-            page_size=self.page_size,
-            BLOCK=BLOCK,
-            MARK_SELF=mark_full,
-            SCAN_SWA=True,
+            True,
+            self.page_size,
         )
         if mark_full:
             full_a._mark_freed()
