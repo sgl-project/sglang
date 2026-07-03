@@ -157,45 +157,7 @@ class CommonKVManager(BaseKVManager):
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
         )
-        # Per-CP-rank shard mode: "page" splits pages across CP ranks;
-        # "layer" makes each rank own a subset of layer groups (only when
-        # LP is active and CP ranks hold identical KV). The CLI flag
-        # `--disaggregation-cp-transfer-shard-mode` (default "page") is
-        # canonical; the deprecated env var
-        # `SGLANG_DISAGGREGATION_CP_TRANSFER_SHARD_MODE` overrides it with
-        # a warning.
-        cli_mode = self._normalize_cp_transfer_shard_mode(
-            getattr(server_args, "disaggregation_cp_transfer_shard_mode", "page")
-        )
-        if envs.SGLANG_DISAGGREGATION_CP_TRANSFER_SHARD_MODE.is_set():
-            raw_mode = envs.SGLANG_DISAGGREGATION_CP_TRANSFER_SHARD_MODE.get()
-            env_mode = self._normalize_cp_transfer_shard_mode(raw_mode)
-            self.cp_transfer_shard_mode = env_mode
-            logger.warning(
-                "SGLANG_DISAGGREGATION_CP_TRANSFER_SHARD_MODE=%r is "
-                "deprecated and overrides "
-                "--disaggregation-cp-transfer-shard-mode=%r. Prefer "
-                "the CLI flag; the env var will be removed in a "
-                "future release.",
-                raw_mode,
-                cli_mode,
-            )
-        else:
-            raw_mode = cli_mode
-            self.cp_transfer_shard_mode = cli_mode
-        # Warn only on a non-empty unknown value; silent fallback for
-        # an unset / empty env var is expected.
-        if (
-            isinstance(raw_mode, str)
-            and raw_mode.strip()
-            and raw_mode.strip().lower() != self.cp_transfer_shard_mode
-        ):
-            logger.warning(
-                "Unknown SGLANG_DISAGGREGATION_CP_TRANSFER_SHARD_MODE=%r, "
-                "falling back to 'page'.",
-                raw_mode,
-            )
-
+        self.cp_transfer_shard_mode = self._resolve_cp_transfer_shard_mode()
         self._validate_cp_transfer_shard_mode()
 
         # bind zmq socket
@@ -561,14 +523,7 @@ class CommonKVManager(BaseKVManager):
         src_logical_layers: int,
         num_main_local: Optional[int],
     ) -> Tuple[int, int]:
-        """Compute ``(local_main_count, local_draft_count)`` for src.
-
-        Shared by the three PP helpers so the draft-tail fail-loud check
-        runs before any equal-length fast path; otherwise src-with-draft
-        against a coincidentally equal-length dst silently bypasses it.
-        ``num_main_local`` of None or >= src_logical_layers means "no
-        draft in src" (contiguous main-only); negatives raise loudly.
-        """
+        """Compute ``(main_count, draft_count)`` for a local source list."""
         if num_main_local is None or num_main_local >= src_logical_layers:
             return src_logical_layers, 0
         if num_main_local < 0:
@@ -578,6 +533,76 @@ class CommonKVManager(BaseKVManager):
             )
         return num_main_local, src_logical_layers - num_main_local
 
+    @staticmethod
+    def _equal_layout_safe(
+        local_main_count: int,
+        local_draft_count: int,
+        dst_num_main: Optional[int],
+    ) -> bool:
+        if local_draft_count == 0:
+            return dst_num_main is None or dst_num_main >= local_main_count
+        return dst_num_main == local_main_count
+
+    @staticmethod
+    def _resolve_dst_main_count(
+        helper_name: str,
+        dst_total_count: int,
+        local_draft_count: int,
+        dst_num_main: Optional[int],
+    ) -> int:
+        if local_draft_count > 0:
+            if dst_num_main is None:
+                raise ValueError(
+                    f"{helper_name}: src has a draft tail but decode did "
+                    "not advertise num_main_kv_layers."
+                )
+            if dst_num_main < 0:
+                raise ValueError(
+                    f"{helper_name}: dst_num_main must be >= 0, got {dst_num_main}"
+                )
+            dst_draft_count = dst_total_count - dst_num_main
+            if dst_draft_count < local_draft_count:
+                raise ValueError(
+                    f"{helper_name}: src has {local_draft_count} draft ptr(s) "
+                    f"but dst exposes only {dst_draft_count}."
+                )
+            return dst_num_main
+
+        if dst_num_main is not None:
+            if dst_num_main < 0:
+                raise ValueError(
+                    f"{helper_name}: dst_num_main must be >= 0, got {dst_num_main}"
+                )
+            return dst_num_main
+        return dst_total_count
+
+    @staticmethod
+    def _check_dst_main_slice(
+        helper_name: str,
+        dst_main_count: int,
+        start_layer: int,
+        local_main_count: int,
+    ) -> None:
+        if dst_main_count < start_layer + local_main_count:
+            raise ValueError(
+                f"{helper_name}: dst has {dst_main_count} main ptrs, "
+                f"but prefill PP rank covers "
+                f"[{start_layer}, {start_layer + local_main_count})."
+            )
+
+    @staticmethod
+    def _slice_main_then_draft(
+        ptrs: List[int],
+        main_start: int,
+        local_main_count: int,
+        draft_start: int,
+        local_draft_count: int,
+    ) -> List[int]:
+        sliced = list(ptrs[main_start : main_start + local_main_count])
+        if local_draft_count > 0:
+            sliced.extend(ptrs[draft_start : draft_start + local_draft_count])
+        return sliced
+
     def get_mha_kv_ptrs_with_pp(
         self,
         src_kv_ptrs: List[int],
@@ -586,19 +611,7 @@ class CommonKVManager(BaseKVManager):
         num_main_local: Optional[int] = None,
         dst_num_main: Optional[int] = None,
     ) -> Tuple[List[int], List[int], List[int], List[int], int]:
-        """Align src/dst MHA KV pointers across PP and draft layouts.
-
-        ``merge_main_and_draft_kv_layout`` packs MHA pools as
-        ``[K_main, K_draft, V_main, V_draft]`` on both sides so the
-        ``//2`` split groups all K then all V; ``[0, n_main)`` is main,
-        ``[n_main, ...)`` is draft. With a draft tail, ``num_main_local``
-        and ``dst_num_main`` MUST both be set so main/draft regions of
-        dst can be sliced independently — otherwise the draft layer
-        silently lands in the next PP stage's main slot (KV corruption).
-
-        Backend note: only Mooncake threads these kwargs today; NIXL /
-        Ascend call with defaults (``None``) and keep legacy behavior.
-        """
+        """Align MHA KV ptrs across PP and optional draft-tail layouts."""
         # Probe path: caller wants src ptrs + layer count only.
         if not dst_kv_ptrs:
             num_kv_layers_probe = len(src_kv_ptrs) // 2
@@ -620,34 +633,11 @@ class CommonKVManager(BaseKVManager):
         local_main_count, local_draft_count = CommonKVManager._split_local_main_draft(
             "get_mha_kv_ptrs_with_pp", num_kv_layers, num_main_local
         )
-        # Fail-loud BEFORE the fast path: src with a draft tail REQUIRES
-        # dst_num_main, else an equal-length dst could be [main_local,
-        # draft] (correct) or [main, ..., main] (silent KV corruption —
-        # draft bytes overwrite a main slot).
-        if local_draft_count > 0 and dst_num_main is None:
-            raise ValueError(
-                "get_mha_kv_ptrs_with_pp: src has draft tail "
-                f"(local_draft_count={local_draft_count}) but dst did "
-                "not advertise num_main_kv_layers. Cannot disambiguate "
-                "dst's draft slots from main; refusing to silently "
-                "reinterpret a main layer as a draft slot. Upgrade the "
-                "decode side to ship num_main_kv_layers via "
-                "registration."
-            )
 
         if num_kv_layers == dst_num_total_layers:
-            # Fast path: identical length is safe iff (a) no draft tail
-            # and dst advertises enough main slots, or (b) symmetric
-            # main count (symmetric PP + draft). Any other equal-length
-            # case is a coincidence and must fall through to validation
-            # so the cross-side draft check fires.
-            fast_path_safe = (
-                local_draft_count == 0
-                and (dst_num_main is None or dst_num_main >= local_main_count)
-            ) or (
-                local_draft_count > 0 and dst_num_main == local_main_count
-            )
-            if fast_path_safe:
+            if CommonKVManager._equal_layout_safe(
+                local_main_count, local_draft_count, dst_num_main
+            ):
                 dst_k_ptrs = dst_kv_ptrs[:dst_num_total_layers]
                 dst_v_ptrs = dst_kv_ptrs[dst_num_total_layers:]
                 return (
@@ -658,84 +648,34 @@ class CommonKVManager(BaseKVManager):
                     layers_current_pp_stage,
                 )
 
-        # Diverging dst layouts handled below:
-        #   1. PP size differs (decode typically PP=1, prefill PP>1):
-        #      src is a per-stage slice; dst holds the full model.
-        #   2. Decode has a draft tail, prefill main-only: dst's draft
-        #      slot is dropped harmlessly.
-        #   3. Both sides have draft AND prefill PP>1: slice main and
-        #      draft independently, else the draft layer slips into the
-        #      next PP stage's main slot (silent KV corruption).
-
-        if local_draft_count > 0:
-            # dst_num_main presence already validated above.
-            if dst_num_main < 0:
-                raise ValueError(
-                    f"get_mha_kv_ptrs_with_pp: dst_num_main must be "
-                    f">= 0, got {dst_num_main}"
-                )
-            inferred_draft_count = dst_num_total_layers - dst_num_main
-            if inferred_draft_count < local_draft_count:
-                raise ValueError(
-                    f"get_mha_kv_ptrs_with_pp: cross-side draft tail "
-                    f"mismatch — src has {local_draft_count} draft "
-                    f"ptr(s) but dst exposes only {inferred_draft_count} "
-                    f"(dst_num_main={dst_num_main}, "
-                    f"dst_num_total_layers={dst_num_total_layers})."
-                )
-            dst_main_count = dst_num_main
-        else:
-            if dst_num_main is not None:
-                if dst_num_main < 0:
-                    raise ValueError(
-                        f"get_mha_kv_ptrs_with_pp: dst_num_main must "
-                        f"be >= 0, got {dst_num_main}"
-                    )
-                dst_main_count = dst_num_main
-            else:
-                # Case 2: prefill main-only, decode may have draft tail
-                # that we harmlessly drop. Bound the main slice by full
-                # dst length so the validation accepts case-2 dst.
-                dst_main_count = dst_num_total_layers
-        if dst_main_count < start_layer + local_main_count:
-            raise ValueError(
-                f"get_mha_kv_ptrs_with_pp: dst has only {dst_main_count} "
-                f"main ptrs but prefill PP rank covers main layers "
-                f"[{start_layer}, {start_layer + local_main_count})."
-            )
-
-        # K-half is at [0, dst_num_total_layers); V-half at
-        # [dst_num_total_layers, 2*dst_num_total_layers).
-        dst_k_main = list(
-            dst_kv_ptrs[start_layer : start_layer + local_main_count]
+        dst_main_count = CommonKVManager._resolve_dst_main_count(
+            "get_mha_kv_ptrs_with_pp",
+            dst_num_total_layers,
+            local_draft_count,
+            dst_num_main,
         )
-        dst_v_main = list(
-            dst_kv_ptrs[
-                dst_num_total_layers
-                + start_layer : dst_num_total_layers
-                + start_layer
-                + local_main_count
-            ]
+        CommonKVManager._check_dst_main_slice(
+            "get_mha_kv_ptrs_with_pp",
+            dst_main_count,
+            start_layer,
+            local_main_count,
         )
-        if local_draft_count > 0:
-            dst_k_draft = list(
-                dst_kv_ptrs[
-                    dst_main_count : dst_main_count + local_draft_count
-                ]
-            )
-            dst_v_draft = list(
-                dst_kv_ptrs[
-                    dst_num_total_layers
-                    + dst_main_count : dst_num_total_layers
-                    + dst_main_count
-                    + local_draft_count
-                ]
-            )
-            dst_k_ptrs = dst_k_main + dst_k_draft
-            dst_v_ptrs = dst_v_main + dst_v_draft
-        else:
-            dst_k_ptrs = dst_k_main
-            dst_v_ptrs = dst_v_main
+
+        dst_k_ptrs = CommonKVManager._slice_main_then_draft(
+            dst_kv_ptrs,
+            start_layer,
+            local_main_count,
+            dst_main_count,
+            local_draft_count,
+        )
+        dst_v_all = dst_kv_ptrs[dst_num_total_layers:]
+        dst_v_ptrs = CommonKVManager._slice_main_then_draft(
+            dst_v_all,
+            start_layer,
+            local_main_count,
+            dst_main_count,
+            local_draft_count,
+        )
         return (
             src_k_ptrs,
             src_v_ptrs,
@@ -753,38 +693,20 @@ class CommonKVManager(BaseKVManager):
         num_main_local: Optional[int] = None,
         dst_num_main: Optional[int] = None,
     ) -> Tuple[List[int], List[int], int]:
-        """Align src/dst MLA KV pointers when prefill is a PP sub-stage
-        and decode holds the full model.
-
-        MLA: one pointer per layer; with a draft pool the merged layout
-        is ``[main_0..main_{M-1}, draft_0..draft_{D-1}]`` on both sides.
-        ``num_main_local`` / ``dst_num_main`` let main/draft portions of
-        dst be sliced independently so the draft tail doesn't silently
-        land in another PP stage's main slot. See
-        ``get_state_ptrs_with_pp`` for the state-pointer equivalent.
-
-        Backend note: only Mooncake passes these kwargs; NIXL uses
-        defaults (legacy behavior). Ascend overrides this method on
-        ``AscendKVManager``.
-        """
+        """Align MLA KV ptrs across PP and optional draft-tail layouts."""
         # Probe path (hash logging): empty dst ⇒ return src as-is.
         if not dst_kv_ptrs:
             return src_kv_ptrs, [], len(src_kv_ptrs)
 
         mla_ratios = getattr(self.kv_args, "mla_compression_ratios", None)
         if mla_ratios:
-            # Compressed-MLA (e.g. DeepSeek V4): the flat list is organized
-            # by buffer type (compression-ratio bucket) rather than by
-            # layer, so we locate this PP stage's sub-range in each section.
-            # Draft tail unsupported here — fail loud to avoid silently
-            # mis-slicing the compressed buckets.
+            # Compressed-MLA groups ptrs by buffer type; draft tail is not
+            # supported because it would need bucket-aware draft slicing.
             if num_main_local is not None and num_main_local < len(src_kv_ptrs):
                 raise ValueError(
                     "get_mla_kv_ptrs_with_pp: compressed-MLA "
                     "(mla_compression_ratios set) does not yet support a "
-                    "draft tail in src; num_main_local "
-                    f"({num_main_local}) < len(src) ({len(src_kv_ptrs)}) "
-                    "would slice the wrong compression bucket."
+                    "draft tail in src."
                 )
             sliced_src_kv_ptrs, sliced_dst_kv_ptrs = self._mla_slice_ptrs_for_pp(
                 src_kv_ptrs, dst_kv_ptrs, mla_ratios, state_type
@@ -802,73 +724,33 @@ class CommonKVManager(BaseKVManager):
         local_main_count, local_draft_count = CommonKVManager._split_local_main_draft(
             "get_mla_kv_ptrs_with_pp", src_len, num_main_local
         )
-        # Fail-loud BEFORE the equal-length fast path: see
-        # get_mha_kv_ptrs_with_pp for the rationale.
-        if local_draft_count > 0 and dst_num_main is None:
-            raise ValueError(
-                "get_mla_kv_ptrs_with_pp: src has draft tail "
-                f"(local_draft_count={local_draft_count}) but dst did "
-                "not advertise num_main_kv_layers. Cannot disambiguate "
-                "dst's draft slots from main; refusing to silently "
-                "reinterpret a main layer as a draft slot. Upgrade the "
-                "decode side to ship num_main_kv_layers via "
-                "registration."
-            )
 
-        # Fast path: identical length is safe iff (a) no draft tail and
-        # dst advertises enough main slots, or (b) symmetric main count.
-        # A coincidental equal length with a different main/draft split
-        # falls through to validation so the cross-side draft check fires.
         if len(src_kv_ptrs) == len(dst_kv_ptrs):
-            fast_path_safe = (
-                local_draft_count == 0
-                and (dst_num_main is None or dst_num_main >= local_main_count)
-            ) or (
-                local_draft_count > 0 and dst_num_main == local_main_count
-            )
-            if fast_path_safe:
+            if CommonKVManager._equal_layout_safe(
+                local_main_count, local_draft_count, dst_num_main
+            ):
                 return src_kv_ptrs, dst_kv_ptrs, len(src_kv_ptrs)
 
-        if local_draft_count > 0:
-            if dst_num_main < 0:
-                raise ValueError(
-                    f"get_mla_kv_ptrs_with_pp: dst_num_main must be "
-                    f">= 0, got {dst_num_main}"
-                )
-            inferred_draft_count = len(dst_kv_ptrs) - dst_num_main
-            if inferred_draft_count < local_draft_count:
-                raise ValueError(
-                    f"get_mla_kv_ptrs_with_pp: cross-side draft tail "
-                    f"mismatch — src has {local_draft_count} draft "
-                    f"ptr(s) but dst exposes only {inferred_draft_count} "
-                    f"(dst_num_main={dst_num_main}, "
-                    f"len(dst)={len(dst_kv_ptrs)})."
-                )
-            dst_main_count = dst_num_main
-        else:
-            if dst_num_main is not None:
-                if dst_num_main < 0:
-                    raise ValueError(
-                        f"get_mla_kv_ptrs_with_pp: dst_num_main must be "
-                        f">= 0, got {dst_num_main}"
-                    )
-                dst_main_count = dst_num_main
-            else:
-                dst_main_count = len(dst_kv_ptrs)
-        if dst_main_count < start_layer + local_main_count:
-            raise ValueError(
-                f"get_mla_kv_ptrs_with_pp: dst has only {dst_main_count} "
-                f"main ptrs but prefill PP rank covers main layers "
-                f"[{start_layer}, {start_layer + local_main_count})."
-            )
-
-        sliced_dst_kv_ptrs = list(
-            dst_kv_ptrs[start_layer : start_layer + local_main_count]
+        dst_main_count = CommonKVManager._resolve_dst_main_count(
+            "get_mla_kv_ptrs_with_pp",
+            len(dst_kv_ptrs),
+            local_draft_count,
+            dst_num_main,
         )
-        if local_draft_count > 0:
-            sliced_dst_kv_ptrs += list(
-                dst_kv_ptrs[dst_main_count : dst_main_count + local_draft_count]
-            )
+        CommonKVManager._check_dst_main_slice(
+            "get_mla_kv_ptrs_with_pp",
+            dst_main_count,
+            start_layer,
+            local_main_count,
+        )
+
+        sliced_dst_kv_ptrs = CommonKVManager._slice_main_then_draft(
+            dst_kv_ptrs,
+            start_layer,
+            local_main_count,
+            dst_main_count,
+            local_draft_count,
+        )
         return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
 
     def get_state_ptrs_with_pp(
@@ -880,118 +762,40 @@ class CommonKVManager(BaseKVManager):
         num_main_local: Optional[int] = None,
         dst_num_main: Optional[int] = None,
     ) -> Tuple[List[int], List[int], List[int]]:
-        """Align src/dst per-layer state pointers when prefill is a PP
-        sub-stage and decode holds the full model.
-
-        State (SWA / DSA / SWA_RING) carries one pointer per layer in
-        the producer's local PP slice; decode (PP=1) registers the full
-        model. With a draft pool, ``setup_state_kv_args`` appends draft
-        ptrs to main on both sides::
-
-            src = [main_local_0.., draft_local_0..]
-            dst = [main_full_0.., draft_full_0..]
-
-        A naive ``dst[start_layer : start_layer + len(src)]`` on a
-        non-last PP rank walks past the local main slice into the next
-        stage's main layers instead of the draft tail. ``num_main_local``
-        (= ``kv_args.prefill_num_main_kv_layers``) lets main/draft be
-        sliced independently; None / >= len(src) means "no draft in src".
-
-        ``dst_num_main`` (decode main count) is REQUIRED when src has a
-        draft tail — inferring it would reinterpret a real main layer as
-        a draft slot when the sides disagree (silent corruption); it is
-        optional otherwise. Raises ValueError on registration-side shape
-        mismatches instead of silently clamping.
-
-        Mirrors ``get_mla_kv_ptrs_with_pp`` (see ``fast_path_safe`` below).
-        Returns ``(src_ptrs, aligned_dst_ptrs, src_item_lens)``. Backend
-        note: only Mooncake threads these kwargs today.
-        """
+        """Align per-layer state ptrs across PP and optional draft tails."""
         start_layer = getattr(self.kv_args, "prefill_start_layer", 0) or 0
         src_len = len(src_state_ptrs)
 
         local_main_count, local_draft_count = CommonKVManager._split_local_main_draft(
             "get_state_ptrs_with_pp", src_len, num_main_local
         )
-        # Fail-loud BEFORE the fast path: src with a draft tail REQUIRES
-        # dst_num_main, else an equal-length dst could be [main_local,
-        # draft] (correct) or [main, ..., main] (silent state corruption).
-        if local_draft_count > 0 and dst_num_main is None:
-            raise ValueError(
-                "get_state_ptrs_with_pp: src has draft tail "
-                f"(local_draft_count={local_draft_count}) but dst did "
-                "not advertise num_main_kv_layers. Cannot disambiguate "
-                "dst's draft slots from main; refusing to silently "
-                "reinterpret a main layer as a draft slot. Upgrade "
-                "the decode side to ship num_main_kv_layers via "
-                "registration."
-            )
 
-        # Fast path: identical length is safe iff (a) no draft tail and
-        # dst advertises enough main slots, or (b) symmetric main count.
-        # Otherwise treat the length match as coincidental and fall
-        # through to cross-side draft validation.
         if len(src_state_ptrs) == len(dst_state_ptrs):
-            fast_path_safe = (
-                local_draft_count == 0
-                and (dst_num_main is None or dst_num_main >= local_main_count)
-            ) or (
-                local_draft_count > 0 and dst_num_main == local_main_count
-            )
-            if fast_path_safe:
+            if CommonKVManager._equal_layout_safe(
+                local_main_count, local_draft_count, dst_num_main
+            ):
                 return src_state_ptrs, dst_state_ptrs, src_state_item_lens
 
-        # Compute dst main count. The fail-loud above already rejected
-        # src-with-draft without dst_num_main; the fallback below is
-        # for src main-only (decode's draft tail, if any, is dropped
-        # harmlessly).
-        if local_draft_count > 0:
-            if dst_num_main < 0:
-                raise ValueError(
-                    f"get_state_ptrs_with_pp: dst_num_main must be "
-                    f">= 0, got {dst_num_main}"
-                )
-            inferred_draft_count = len(dst_state_ptrs) - dst_num_main
-            if inferred_draft_count < local_draft_count:
-                raise ValueError(
-                    f"get_state_ptrs_with_pp: cross-side draft tail "
-                    f"mismatch — src has {local_draft_count} draft "
-                    f"ptr(s) but dst exposes only {inferred_draft_count} "
-                    f"(dst_num_main={dst_num_main}, "
-                    f"len(dst)={len(dst_state_ptrs)})."
-                )
-            dst_main_count = dst_num_main
-        else:
-            # No draft in src: tolerate decode's draft tail (use the
-            # advertised value when present, else treat all of dst as
-            # main; only ``dst[start:start+local_main_count]`` is read).
-            if dst_num_main is not None:
-                if dst_num_main < 0:
-                    raise ValueError(
-                        f"get_state_ptrs_with_pp: dst_num_main must be "
-                        f">= 0, got {dst_num_main}"
-                    )
-                dst_main_count = dst_num_main
-            else:
-                dst_main_count = len(dst_state_ptrs)
-        if dst_main_count < start_layer + local_main_count:
-            raise ValueError(
-                f"get_state_ptrs_with_pp: dst has only {dst_main_count} "
-                f"main ptrs but prefill PP rank covers main layers "
-                f"[{start_layer}, {start_layer + local_main_count}). "
-                f"Registration mismatch — dst is shorter than the "
-                f"prefill PP slice claims to occupy."
-            )
-
-        aligned_dst = list(
-            dst_state_ptrs[start_layer : start_layer + local_main_count]
+        dst_main_count = CommonKVManager._resolve_dst_main_count(
+            "get_state_ptrs_with_pp",
+            len(dst_state_ptrs),
+            local_draft_count,
+            dst_num_main,
         )
-        if local_draft_count > 0:
-            aligned_dst += list(
-                dst_state_ptrs[
-                    dst_main_count : dst_main_count + local_draft_count
-                ]
-            )
+        CommonKVManager._check_dst_main_slice(
+            "get_state_ptrs_with_pp",
+            dst_main_count,
+            start_layer,
+            local_main_count,
+        )
+
+        aligned_dst = CommonKVManager._slice_main_then_draft(
+            dst_state_ptrs,
+            start_layer,
+            local_main_count,
+            dst_main_count,
+            local_draft_count,
+        )
         return src_state_ptrs, aligned_dst, src_state_item_lens
 
     def _mla_slice_ptrs_for_pp(
@@ -1001,36 +805,12 @@ class CommonKVManager(BaseKVManager):
         mla_ratios: List[int],
         state_type: Optional[StateType] = None,
     ) -> Tuple[List[int], List[int]]:
-        """Produce aligned (src, dst) pointer lists for compressed-MLA
-        pools (e.g. DeepSeek V4) under PP.
+        """Slice compressed-MLA dst ptrs for this PP stage.
 
-        The pool produces two possible flat-list layouts (selected via dst
-        length):
-
-        - kv_data layout, length = 2 * c4_L + c128_L:
-            [c4_layer_{0..c4_L-1},
-             c4_indexer_layer_{0..c4_L-1},
-             c128_layer_{0..c128_L-1}]
-          Each section is indexed by compressed-layer id within that
-          compression bucket.
-
-        - SWA state_data layout, length = swa_L + 2 * c4_L:
-            [swa_layer_{0..swa_L-1},
-             c4_compress_state_{0..c4_L-1},
-             c4_indexer_compress_state_{0..c4_L-1}]
-          ``swa_L`` is the SWA pool's actual buffer count
-          (``num_effective_layers``), which can be smaller than
-          ``len(mla_ratios)`` when the HF config's ``compress_ratios``
-          list contains entries for layers not materialized into the SWA
-          pool (e.g. an MTP/nextn slot at the tail).
-
-        - C128_STATE layout, length = c128_L:
-            [c128_compress_state_{0..c128_L-1}]
-
-        src is already PP-filtered on the prefill side. dst is the
-        decode-side full-model list (when decode is PP=1). We slice dst to
-        match src's PP stage. If src itself is also full-model, it is
-        returned unchanged.
+        dst can be either KV layout (c4, c4-indexer, c128) or state layout
+        (SWA, compressed state, indexer compressed state, or C128 state).
+        Offsets are derived from compression ratios and the prefill stage's
+        start/end layer.
         """
         start_layer = self.kv_args.prefill_start_layer
         end_layer = getattr(self.kv_args, "prefill_end_layer", None)
@@ -1204,23 +984,12 @@ class CommonKVManager(BaseKVManager):
         )
 
     def local_num_kv_layers(self) -> int:
-        # Layer count owned by THIS PP stage. MHA stores K+V as separate
-        # pointers per layer (len // 2); MLA packs KV into one pointer per layer.
         if self.is_mla_backend:
             return len(self.kv_args.kv_data_ptrs)
         return len(self.kv_args.kv_data_ptrs) // 2
 
     def use_layer_cp_shard_for_transfer(self) -> bool:
-        """Whether transfer partitions LAYER GROUPS across CP ranks
-        (disjoint subset each) instead of pages. Requires LP enabled,
-        CP > 1, and all CP ranks participating.
-
-        Layer-shard only makes sense under LP (it partitions the LP
-        hook's layer-group dispatch). When LP is off it MUST degrade to
-        page-shard, else non-CP0 ranks silently skip pages with nothing
-        covering them. The ``layer_pipeline_enabled`` gate below is
-        defense-in-depth against an LP-off caller.
-        """
+        """Whether CP ranks shard LP layer groups instead of pages."""
         return (
             self.layer_pipeline_enabled
             and self.enable_all_cp_ranks_for_transfer
@@ -1229,7 +998,6 @@ class CommonKVManager(BaseKVManager):
         )
 
     def rank_owns_no_main_groups_for_transfer(self) -> bool:
-        """Whether this CP rank owns zero main layer groups under layer-shard."""
         if not self.use_layer_cp_shard_for_transfer():
             return False
         group_size = self.layer_group_size
@@ -1282,15 +1050,35 @@ class CommonKVManager(BaseKVManager):
             )
         )
 
+    def _resolve_cp_transfer_shard_mode(self) -> str:
+        cli_mode = self._normalize_cp_transfer_shard_mode(
+            getattr(self.server_args, "disaggregation_cp_transfer_shard_mode", "page")
+        )
+        if not envs.SGLANG_DISAGGREGATION_CP_TRANSFER_SHARD_MODE.is_set():
+            return cli_mode
+
+        raw_mode = envs.SGLANG_DISAGGREGATION_CP_TRANSFER_SHARD_MODE.get()
+        env_mode = self._normalize_cp_transfer_shard_mode(raw_mode)
+        logger.warning(
+            "SGLANG_DISAGGREGATION_CP_TRANSFER_SHARD_MODE=%r is deprecated "
+            "and overrides --disaggregation-cp-transfer-shard-mode=%r.",
+            raw_mode,
+            cli_mode,
+        )
+        if (
+            isinstance(raw_mode, str)
+            and raw_mode.strip()
+            and raw_mode.strip().lower() != env_mode
+        ):
+            logger.warning(
+                "Unknown SGLANG_DISAGGREGATION_CP_TRANSFER_SHARD_MODE=%r, "
+                "falling back to 'page'.",
+                raw_mode,
+            )
+        return env_mode
+
     @staticmethod
     def _normalize_cp_transfer_shard_mode(raw_value: object) -> str:
-        """Resolve the shard-mode env value to "page" or "layer".
-
-        Strips/lower-cases and falls back to "page" for empty / unknown
-        / non-string values; callers log the fallback. Staticmethod so
-        unit tests can validate parsing without instantiating
-        CommonKVManager (needs zmq / bootstrap state).
-        """
         if not isinstance(raw_value, str):
             return "page"
         canonical = raw_value.strip().lower()
@@ -1392,27 +1180,24 @@ class CommonKVSender(BaseKVSender):
     ):
         self._transfer_num_kv_indices += len(kv_indices)
         if state_indices:
-            for component_indices in state_indices:
-                if component_indices is not None:
-                    if hasattr(component_indices, "numel"):
-                        self._transfer_num_state_indices += int(
-                            component_indices.numel()
-                        )
-                    elif hasattr(component_indices, "size") and isinstance(
-                        component_indices.size, (int, np.integer)
-                    ):
-                        self._transfer_num_state_indices += int(
-                            component_indices.size
-                        )
-                    elif hasattr(component_indices, "__len__"):
-                        try:
-                            self._transfer_num_state_indices += len(
-                                component_indices
-                            )
-                        except TypeError:
-                            self._transfer_num_state_indices += 1
-                    else:
-                        self._transfer_num_state_indices += 1
+            self._transfer_num_state_indices += sum(
+                self._index_count(component_indices)
+                for component_indices in state_indices
+            )
+
+    @staticmethod
+    def _index_count(indices) -> int:
+        if indices is None:
+            return 0
+        if hasattr(indices, "numel"):
+            return int(indices.numel())
+        size = getattr(indices, "size", None)
+        if isinstance(size, (int, np.integer)):
+            return int(size)
+        try:
+            return len(indices)
+        except TypeError:
+            return 1
 
     def _prepare_send_indices(
         self,
