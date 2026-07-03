@@ -20,6 +20,29 @@ this module without pulling in ``sglang.srt``.
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+_warned_unknown_working_set = False
+
+
+def _warn_unknown_working_set() -> None:
+    """Warn once when the Metal working-set size cannot be determined.
+
+    The callers then fall back to plain system-memory reporting, which is
+    the overcommit-prone behavior #21443 fixed; the regression should be
+    visible in logs rather than silent.
+    """
+    global _warned_unknown_working_set
+    if _warned_unknown_working_set:
+        return
+    _warned_unknown_working_set = True
+    logger.warning(
+        "Metal working-set size is unavailable; falling back to system-memory "
+        "reporting, which may overcommit the GPU working set."
+    )
+
 
 def _mlx_runtime_active() -> bool:
     """Return True when SGLang runs the native MLX backend."""
@@ -98,6 +121,7 @@ def apple_gpu_total_memory() -> int:
     working_set = apple_gpu_working_set_size()
     if working_set > 0:
         return working_set
+    _warn_unknown_working_set()
 
     import psutil
 
@@ -123,4 +147,6 @@ def apple_gpu_available_memory(empty_cache: bool = False) -> int:
     if working_set > 0:
         headroom = working_set - apple_gpu_allocated_memory()
         available = min(available, max(headroom, 0))
+    else:
+        _warn_unknown_working_set()
     return available

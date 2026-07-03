@@ -159,6 +159,23 @@ class TestAppleGpuMemoryTorchPath(CustomTestCase):
             _patch_torch_runtime(stack, recommended=0, total=24 * GiB)
             self.assertEqual(apple_mem.apple_gpu_total_memory(), 24 * GiB)
 
+    def test_unknown_working_set_warns_once(self):
+        # Falling back to system-memory reporting reverts to the
+        # overcommit-prone pre-#21443 behavior; that must show up in logs,
+        # but only once per process.
+        apple_mem._warned_unknown_working_set = False
+        try:
+            with ExitStack() as stack:
+                _patch_torch_runtime(
+                    stack, available=8 * GiB, total=24 * GiB, recommended=0
+                )
+                with self.assertLogs(apple_mem.logger, level="WARNING") as logs:
+                    apple_mem.apple_gpu_total_memory()
+                    apple_mem.apple_gpu_available_memory()
+            self.assertEqual(len(logs.output), 1)
+        finally:
+            apple_mem._warned_unknown_working_set = False
+
 
 class TestAppleGpuMemoryMlxDispatch(CustomTestCase):
     """Under ``use_mlx()`` queries are answered by MLX plus the device-level
