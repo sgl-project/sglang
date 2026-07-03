@@ -478,18 +478,43 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_moe_a2a_backend_context(),
             torch.inference_mode(),
         ):
-            main_x = self.draft_model.project_main_hidden(main_hidden)
-            for layer in self._draft_inner.layers:
-                attn = layer.self_attn
-                compressor = getattr(attn, "compressor", None)
-                if compressor is None:
-                    continue
-                attn_backend.forward_core_compressor(
-                    main_x,
-                    draft_forward_batch,
-                    attn.layer_id,
-                    compressor,
+            old_metadata = getattr(attn_backend, "forward_metadata", None)
+            try:
+                # The backend stores compressor metadata globally. Rebuild it for
+                # this draft verify batch before replaying compressor writes with
+                # target hidden; PD overlap can otherwise observe stale metadata.
+                attn_backend.init_forward_metadata(draft_forward_batch)
+                metadata = getattr(attn_backend, "forward_metadata", None)
+                c128_out_loc = getattr(
+                    getattr(metadata, "core_metadata", None), "c128_out_loc", None
                 )
+                if (
+                    c128_out_loc is not None
+                    and c128_out_loc.shape[0] != main_hidden.shape[0]
+                ):
+                    self._materialize_draft_compressors_enabled = False
+                    logger.warning(
+                        "Skip DSpark draft compressor materialization due to "
+                        "metadata shape mismatch: out_loc=%s hidden=%s",
+                        c128_out_loc.shape[0],
+                        main_hidden.shape[0],
+                    )
+                    return
+
+                main_x = self.draft_model.project_main_hidden(main_hidden)
+                for layer in self._draft_inner.layers:
+                    attn = layer.self_attn
+                    compressor = getattr(attn, "compressor", None)
+                    if compressor is None:
+                        continue
+                    attn_backend.forward_core_compressor(
+                        main_x,
+                        draft_forward_batch,
+                        attn.layer_id,
+                        compressor,
+                    )
+            finally:
+                attn_backend.forward_metadata = old_metadata
 
     def _write_draft_kv_from_projected_kv(
         self,
@@ -1222,24 +1247,20 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark verify requires target main_hidden states, but got None."
             )
         if bs > 0:
-            is_pd_decode = self.server_args.disaggregation_mode == "decode"
             hidden = hidden.view(bs, block_size, -1)
             hidden_flat = hidden.reshape(-1, hidden.shape[-1])
-            # PD decode uses overlap/future-map scheduling; rebuilding draft C128
-            # from target hidden can observe stale draft batch indices there.
-            if not is_pd_decode:
-                try:
-                    self._materialize_main_hidden_to_draft_compressors(
-                        main_hidden=hidden_flat,
-                        draft_forward_batch=draft_forward_batch,
-                    )
-                except Exception as e:
-                    self._materialize_draft_compressors_enabled = False
-                    logger.warning(
-                        "DSpark draft compressor materialization failed; "
-                        "falling back to SWA-only materialization: %s",
-                        e,
-                    )
+            try:
+                self._materialize_main_hidden_to_draft_compressors(
+                    main_hidden=hidden_flat,
+                    draft_forward_batch=draft_forward_batch,
+                )
+            except Exception as e:
+                self._materialize_draft_compressors_enabled = False
+                logger.warning(
+                    "DSpark draft compressor materialization failed; "
+                    "falling back to SWA-only materialization: %s",
+                    e,
+                )
             self._clear_unaccepted_c128_draft_states(
                 batch=model_worker_batch,
                 prefix_lens=prefix_lens,
