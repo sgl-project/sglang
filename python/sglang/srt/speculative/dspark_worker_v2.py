@@ -123,6 +123,17 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         self._sampling_verify_logged = False
 
+        # Two-slot ping-pong device buffers for the per-step commit tensors. The
+        # previous step's tensors may still be read / copied D2H by the scheduler,
+        # so the current step writes the other slot instead of overwriting them.
+        # Grown on demand with doubling.
+        self._decode_buffer_cap = 0
+        self._decode_buffer_slot = 0
+        self._block_ids_bufs = []
+        self._out_tokens_bufs = []
+        self._commit_lens_bufs = []
+        self._new_seq_lens_bufs = []
+
         if self.tp_rank == 0:
             logger.info(
                 "Initialized DSpark draft runner. model=%s, block_size=%s, "
@@ -334,6 +345,47 @@ class DSparkWorkerV2(BaseSpecWorker):
         keep = torch.sigmoid(confidence) >= self.confidence_threshold
         return keep.to(torch.int32).cumprod(dim=1).sum(dim=1)
 
+    def _ensure_decode_buffers(self, bs: int) -> None:
+        if self._decode_buffer_cap >= int(bs):
+            return
+        new_cap = max(
+            int(bs),
+            self._decode_buffer_cap * 2 if self._decode_buffer_cap > 0 else int(bs),
+        )
+        device = self.device
+        block_size = int(self.block_size)
+        self._block_ids_bufs = [
+            torch.empty((new_cap, block_size), dtype=torch.int64, device=device)
+            for _ in range(2)
+        ]
+        self._out_tokens_bufs = [
+            torch.empty((new_cap, block_size), dtype=torch.int64, device=device)
+            for _ in range(2)
+        ]
+        self._commit_lens_bufs = [
+            torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
+        ]
+        self._new_seq_lens_bufs = [
+            torch.empty((new_cap,), dtype=torch.int64, device=device) for _ in range(2)
+        ]
+        self._decode_buffer_cap = new_cap
+
+    def _next_decode_buffers(self, bs: int) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        self._ensure_decode_buffers(bs)
+        slot = self._decode_buffer_slot
+        self._decode_buffer_slot = (slot + 1) % 2
+        return (
+            self._block_ids_bufs[slot][:bs],
+            self._out_tokens_bufs[slot][:bs],
+            self._commit_lens_bufs[slot][:bs],
+            self._new_seq_lens_bufs[slot][:bs],
+        )
+
     def _make_next_draft_input_prefill(
         self,
         *,
@@ -468,9 +520,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         prefix_lens = model_worker_batch.seq_lens
         req_pool_indices = model_worker_batch.req_pool_indices
 
-        block_ids = torch.full(
-            (bs, block_size), self.noise_token_id, dtype=torch.int64, device=device
-        )
+        block_ids, out_tokens, commit_lens, new_seq_lens = self._next_decode_buffers(bs)
+        block_ids.fill_(self.noise_token_id)
         block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
 
         positions_2d = prefix_lens.unsqueeze(1) + self._block_pos_offsets
@@ -608,9 +659,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             bonus_tokens = target_predict.gather(1, correct_len.unsqueeze(1)).squeeze(1)
 
-        commit_lens = correct_len.to(torch.int32) + 1
+        commit_lens.copy_(correct_len)
+        commit_lens.add_(1)
 
-        out_tokens = torch.empty((bs, block_size), dtype=torch.int64, device=device)
         if block_size > 1:
             out_tokens[:, : block_size - 1].copy_(candidates[:, 1:])
         out_tokens[:, block_size - 1].fill_(0)
@@ -618,7 +669,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             1, correct_len.unsqueeze(1), bonus_tokens.unsqueeze(1).to(torch.int64)
         )
 
-        new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+        new_seq_lens.copy_(prefix_lens)
+        new_seq_lens.add_(commit_lens)
         if on_publish is not None:
             on_publish(new_seq_lens)
 
