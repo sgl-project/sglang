@@ -160,6 +160,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
 
         _sa = getattr(runner, "server_args", None)
+        self.speculative_num_draft_tokens = getattr(
+            _sa, "speculative_num_draft_tokens", None
+        )
         _decode_cuda_graph = not check_cuda_graph_backend(
             Phase.DECODE, Backend.DISABLED
         )
@@ -212,7 +215,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._max_seqlen_q = int(max(extend_lens))
         else:
             self._max_seqlen_q = 1
-        if in_capture and forward_batch.forward_mode.is_decode_or_idle():
+        if in_capture and (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            # Under cuda-graph capture the dummy batch's seq_lens are tiny, so
+            # seq_lens_cpu.max() would under-bound max_blocks and truncate the
+            # captured block_table — at replay, real (longer) sequences would
+            # miss KV blocks and produce garbage. Decode already used the full
+            # context bound for this reason; TARGET_VERIFY (captured into the
+            # same decode graph) needs it too.
             self._max_seqlen_k = self.max_context_len
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
@@ -984,6 +996,34 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
+        if forward_batch.extend_seq_lens is None:
+            # TARGET_VERIFY: ForwardBatch leaves extend_seq_lens(_cpu) None (it
+            # only populates seq_lens = prefix + draft); each sequence verifies
+            # `speculative_num_draft_tokens` draft tokens (see ascend_backend
+            # forward_metadata). Reconstruct per-seq extend lengths so the sparse
+            # prefill kernel receives correct cu_seqlens instead of crashing on
+            # the None .device access.
+            _bs = forward_batch.seq_lens.shape[0]
+            _ndt = self.speculative_num_draft_tokens or (
+                q.shape[0] // max(_bs, 1)
+            )
+            forward_batch.extend_seq_lens = torch.full(
+                (_bs,),
+                int(_ndt),
+                dtype=torch.int32,
+                device=forward_batch.seq_lens.device,
+            )
+            forward_batch.extend_seq_lens_cpu = [int(_ndt)] * _bs
+            # For TARGET_VERIFY, seq_lens = prefix + ndt (draft tokens are added to
+            # KV during verify); the cached prefix per seq is seq_lens - ndt. The
+            # default ``prefix_lens = 0`` branch below is wrong for verify and makes
+            # the sparse block selection / positions read garbage, so materialize
+            # extend_prefix_lens here.
+            if forward_batch.extend_prefix_lens is None:
+                forward_batch.extend_prefix_lens = (
+                    forward_batch.seq_lens.to(torch.int32) - int(_ndt)
+                ).clamp(min=0)
+
         cu_seqlens = torch.cat(
             [
                 torch.zeros(
@@ -1018,18 +1058,95 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_q = idx_q[:actual_num_tokens]
 
         if self.is_npu:
-            idx_o, o = self._forward_npu_sparse_prefill(
-                q,
-                k_cache,
-                v_cache,
-                idx_q,
-                idx_k_cache,
-                idx_v_cache,
-                forward_batch,
-                cu_seqlens,
-                seq_lens,
-                prefix_lens,
-            )
+            if (
+                _npu_use_triton_sparse()
+                and forward_batch.forward_mode.is_target_verify()
+            ):
+                # TARGET_VERIFY must run under cuda-graph capture, but
+                # _forward_npu_sparse_prefill is a per-batch .item() loop that
+                # CANN refuses to capture (107027). Route to the capture-safe
+                # triton verify path (reuses the decode kernels with per-query
+                # causal seq_lens). Prefill (non-verify extend) still uses the
+                # PyTorch prefill kernel.
+                idx_o_t, o_t = self._forward_npu_triton_verify(
+                    q,
+                    k_cache,
+                    v_cache,
+                    idx_q,
+                    idx_k_cache,
+                    idx_v_cache,
+                    forward_batch,
+                    prefix_lens,
+                )
+                import os as _os_vdiff
+
+                if _os_vdiff.environ.get("MINIMAX_NPU_TRITON_VERIFY_DEBUG_DIFF"):
+                    # Eager-only diagnostic: compare capture-safe triton verify
+                    # against the validated PyTorch prefill on identical inputs,
+                    # then RETURN the validated PyTorch result so the eager server
+                    # stays correct while we read the divergence. The .item() calls
+                    # are fine because this only runs when the env is set (eager
+                    # debugging), never under graph capture.
+                    if not hasattr(self, "_vdiff_count"):
+                        self._vdiff_count = 0
+                    if self._vdiff_count < 8:
+                        self._vdiff_count += 1
+                        try:
+                            idx_o, o = self._forward_npu_sparse_prefill(
+                                q,
+                                k_cache,
+                                v_cache,
+                                idx_q,
+                                idx_k_cache,
+                                idx_v_cache,
+                                forward_batch,
+                                cu_seqlens,
+                                seq_lens,
+                                prefix_lens,
+                            )
+                            _d = (o_t.float() - o.float()).abs().max().item()
+                            _r = _d / max(o.float().abs().max().item(), 1e-6)
+                            _id = (
+                                0.0
+                                if idx_o_t is None or idx_o is None
+                                else (
+                                    idx_o_t.float() - idx_o.float()
+                                ).abs().max().item()
+                            )
+                            logger.warning(
+                                "[MiniMax/NPU triton-verify-vs-pytorch] call #%d: "
+                                "o max_abs_diff=%.6f rel=%.5f | idx_o max_abs=%.6f "
+                                "(q=%s prefix=%s)",
+                                self._vdiff_count,
+                                _d,
+                                _r,
+                                _id,
+                                tuple(q.shape),
+                                prefix_lens.flatten().tolist()[:8],
+                            )
+                        except Exception as _e:  # noqa: BLE001
+                            idx_o, o = idx_o_t, o_t
+                            logger.warning(
+                                "[MiniMax/NPU triton-verify reference failed: %s",
+                                _e,
+                            )
+                    else:
+                        idx_o, o = idx_o_t, o_t
+                else:
+                    idx_o, o = idx_o_t, o_t
+            else:
+                idx_o, o = self._forward_npu_sparse_prefill(
+                    q,
+                    k_cache,
+                    v_cache,
+                    idx_q,
+                    idx_k_cache,
+                    idx_v_cache,
+                    forward_batch,
+                    cu_seqlens,
+                    seq_lens,
+                    prefix_lens,
+                )
         else:
             idx_o, o = minimax_sparse_prefill(
                 q,
@@ -1263,6 +1380,17 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.sparse.get_cuda_graph_seq_len_fill_value()
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        # EAGLE3 verify buffer interface: the dense (ascend) backend owns the
+        # tree-mask/position buffers consumed by the verify forward. The base
+        # AttentionBackend raises NotImplementedError, so delegate to dense.
+        return self.dense.get_verify_buffers_to_fill_after_draft()
+
+    def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs=None):
+        return self.dense.update_verify_buffers_to_fill_after_draft(
+            spec_info, cuda_graph_bs
+        )
 
     def forward(
         self,

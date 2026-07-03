@@ -1768,6 +1768,16 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+        # MiniMaxM3Model.forward checks each layer's ``_is_layer_to_capture``
+        # attribute (not ``i in layers_to_capture``), so the per-layer flag must
+        # be set explicitly -- mirroring qwen3_next/qwen2_moe. Without this the
+        # aux list stays empty and the (hidden, aux) tuple is never returned.
+        for layer_id in self.model.layers_to_capture:
+            if 0 <= layer_id < len(self.model.layers):
+                setattr(
+                    self.model.layers[layer_id], "_is_layer_to_capture", True
+                )
+
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
