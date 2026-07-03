@@ -175,6 +175,44 @@ def _refine_block_markov_sharded(
     return candidates, confidence
 
 
+class _DSparkDraftSampler:
+    """Runs the collective-free Markov refine inside the draft decode cuda
+    graph, mirroring _DflashDraftSampler. The per-iteration int64 MAX
+    all-reduce is captured with the graph exactly like the model's own TP
+    collectives, so unlike DFLASH this sampler supports tp > 1. Candidates
+    (and confidence) land in persistent buffers the worker reads after
+    replay; they are consumed into the verify input before the next draft
+    replay, so the single buffer cannot be overwritten while still in use.
+    """
+
+    def __init__(self, *, refs: _DSparkRefineRefs, max_bs: int, device):
+        self.refs = refs
+        self.candidates_buf = torch.empty(
+            (int(max_bs), refs.block_size), dtype=torch.int64, device=device
+        )
+        self.confidence_buf = (
+            torch.empty(
+                (int(max_bs), refs.block_size), dtype=torch.float32, device=device
+            )
+            if refs.use_confidence
+            else None
+        )
+
+    def __call__(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> None:
+        block_size = self.refs.block_size
+        bs = hidden_states.shape[0] // block_size
+        block_hidden = hidden_states.view(bs, block_size, -1)
+        # The graph's static input buffer holds the block ids; column 0 is the
+        # seeded bonus token the worker wrote before replay.
+        seeds = input_ids.view(bs, block_size)[:, 0]
+        candidates, confidence = _refine_block_markov_sharded(
+            block_hidden, seeds, self.refs
+        )
+        self.candidates_buf[:bs].copy_(candidates)
+        if self.confidence_buf is not None:
+            self.confidence_buf[:bs].copy_(confidence)
+
+
 class DSparkWorkerV2(BaseSpecWorker):
     def __init__(
         self,
@@ -271,6 +309,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._new_seq_lens_bufs = []
 
         self._refine_refs = self._build_refine_refs()
+        self._draft_sampler = None
 
         if self.tp_rank == 0:
             logger.info(
@@ -328,8 +367,26 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
+        if capture_decode_cuda_graph:
+            # Must run before capture so the draft graph folds the refine in.
+            self._draft_sampler = self._maybe_build_draft_sampler()
+            self.draft_model_runner.dspark_draft_sampler = self._draft_sampler
         self._draft_worker.init_cuda_graphs(
             capture_decode_cuda_graph=capture_decode_cuda_graph
+        )
+
+    def _maybe_build_draft_sampler(self):
+        if not torch.is_floating_point(self.draft_model.lm_head.weight):
+            # Quantized lm_head would break the static F.linear in the refine.
+            if self.tp_rank == 0:
+                logger.info("DSpark Markov refine kept eager (quantized lm_head).")
+            return None
+        if self.tp_rank == 0:
+            logger.info("DSpark Markov refine folded into the draft cuda graph.")
+        return _DSparkDraftSampler(
+            refs=self._refine_refs,
+            max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+            device=self.device,
         )
 
     def clear_cache_pool(self):
@@ -390,7 +447,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         req_pool_indices: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor] = None,
         seq_lens_sum: Optional[int] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, bool]:
         device = self.device
         # Host seq lengths must be committed (mirror the committed device
         # seq_lens=prefix_lens), not the reserved over-allocation:
@@ -432,7 +489,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         block_hidden = raw if isinstance(raw, torch.Tensor) else raw.hidden_states
         if block_hidden is None:
             raise RuntimeError("DSpark draft model returned no block hidden states.")
-        return block_hidden.view(bs, int(self.block_size), -1)
+        return (
+            block_hidden.view(bs, int(self.block_size), -1),
+            bool(draft_runner_out.can_run_graph),
+        )
 
     def _build_refine_refs(self) -> _DSparkRefineRefs:
         lm_head = self.draft_model.lm_head
@@ -687,7 +747,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             device=device,
         )
 
-        block_hidden = self._run_draft_block(
+        block_hidden, draft_ran_captured = self._run_draft_block(
             bs=bs,
             block_ids=block_ids,
             positions=positions,
@@ -698,10 +758,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             seq_lens_sum=model_worker_batch.seq_lens_sum,
         )
 
-        with torch.inference_mode():
-            candidates, confidence = _refine_block_markov_sharded(
-                block_hidden, draft_input.bonus_tokens, self._refine_refs
+        if self._draft_sampler is not None and draft_ran_captured:
+            # The captured refine already ran inside the draft graph replay.
+            candidates = self._draft_sampler.candidates_buf[:bs]
+            confidence = (
+                self._draft_sampler.confidence_buf[:bs]
+                if self._draft_sampler.confidence_buf is not None
+                else None
             )
+        else:
+            with torch.inference_mode():
+                candidates, confidence = _refine_block_markov_sharded(
+                    block_hidden, draft_input.bonus_tokens, self._refine_refs
+                )
 
         verify_input = DSparkVerifyInput(
             draft_token=candidates.reshape(-1),

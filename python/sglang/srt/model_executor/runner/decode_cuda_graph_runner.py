@@ -841,6 +841,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                             "hidden_states to capture into the graph."
                         )
                     dflash_sampler(out.hidden_states)
+                dspark_sampler = getattr(
+                    self.model_runner, "dspark_draft_sampler", None
+                )
+                if dspark_sampler is not None:
+                    # Same discipline as the DFLASH sampler above: capture the
+                    # refine here or fail loudly, else replay would leave stale
+                    # candidate buffers the worker reads as valid tokens.
+                    if (
+                        not isinstance(out, LogitsProcessorOutput)
+                        or out.hidden_states is None
+                    ):
+                        raise RuntimeError(
+                            "DSpark draft sampler set but the draft forward has "
+                            "no hidden_states to capture into the graph."
+                        )
+                    dspark_sampler(out.hidden_states, forward_batch.input_ids)
                 return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
