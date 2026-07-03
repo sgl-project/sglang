@@ -3,11 +3,14 @@
 SGLang has two runtimes on Apple Silicon: native MLX (``SGLANG_USE_MLX=1``)
 and torch-MPS.  Both share unified memory, of which Metal can only keep
 ``recommendedMaxWorkingSetSize`` (~65-75% of system RAM) resident on the GPU,
-but each runtime has its own allocator and cannot see the other's
-allocations.  Questions like "how much GPU memory is used / still available"
-must therefore be answered with the APIs of the runtime that actually
-allocates: MLX when the MLX backend is active, ``torch.mps`` otherwise.
-These helpers are that dispatch point (#21443).
+but their accounting differs: MLX's counters see only MLX buffers, while
+``torch.mps.driver_allocated_memory()`` is device-level and covers every
+Metal allocation the process made (torch caches and MLX buffers alike).
+Questions like "how much GPU memory is used / still available" are therefore
+answered by the active backend's APIs, and the MLX path additionally folds
+in the torch-side view because MLX serving still bridges tensors through
+torch-MPS (``tensor_bridge``).  These helpers are that dispatch point
+(#21443).
 
 All sizes are in bytes; callers convert units.  Only stdlib is imported at
 module level so that ``sglang._mps_stub`` (installed from
@@ -48,28 +51,39 @@ def apple_gpu_working_set_size() -> int:
 
 
 def apple_gpu_allocated_memory() -> int:
-    """Bytes of the working set held by the active runtime's allocator."""
+    """Bytes of the working set held resident by this process's allocators."""
+    import torch
+
     if _mlx_runtime_active():
         import mlx.core as mx
 
-        # Active buffers plus the allocator cache: both stay resident, which
-        # matches what torch.mps.driver_allocated_memory() reports.
-        return int(mx.get_active_memory()) + int(mx.get_cache_memory())
-
-    import torch
+        # Active buffers plus the allocator cache: both stay resident.  MLX
+        # counters cannot see torch-MPS allocations, but tensors bridged
+        # through torch (tensor_bridge) keep torch-side blocks resident too.
+        # torch's driver counter is device-level and already includes the
+        # MLX buffers, so take the larger view rather than summing.
+        mlx_allocated = int(mx.get_active_memory()) + int(mx.get_cache_memory())
+        if torch.backends.mps.is_available():
+            return max(mlx_allocated, int(torch.mps.driver_allocated_memory()))
+        return mlx_allocated
 
     return int(torch.mps.driver_allocated_memory())
 
 
 def apple_gpu_empty_cache() -> None:
-    """Release cached blocks held by the active runtime's allocator."""
+    """Release cached blocks held by this process's GPU allocators."""
+    import torch
+
     if _mlx_runtime_active():
         import mlx.core as mx
 
         mx.clear_cache()
+        # Tensors bridged through torch-MPS leave cached blocks in torch's
+        # allocator as well; dropping them frees real working-set memory
+        # before availability is measured.
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
         return
-
-    import torch
 
     torch.mps.empty_cache()
 

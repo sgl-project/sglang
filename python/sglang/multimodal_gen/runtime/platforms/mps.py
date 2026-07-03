@@ -60,6 +60,8 @@ class MpsPlatform(Platform):
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         # Metal cannot use all of system RAM: cap at the recommended max
         # working set so callers do not overcommit the GPU budget (#21443).
+        # lru_cache pins the first dispatch decision, which is safe: both
+        # runtimes report the identical Metal working-set value.
         return apple_gpu_total_memory()
 
     @classmethod
