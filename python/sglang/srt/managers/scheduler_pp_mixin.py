@@ -82,9 +82,9 @@ class SchedulerPPMixin:
         run ith batch
         recv prev (i+1)% mb_size th outputs
         recv/forward prev (i+1)% mb_size th grammar final consensus
-        process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
         send ith req to next stage
         send ith grammar first-round consensus to next stage
+        process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
         send ith proxy to next stage
         send current stage's outputs to next stage(can be stashed and delayed to send later)
 
@@ -164,14 +164,6 @@ class SchedulerPPMixin:
                     gmbs[next_mb_id] = None
                 self._pp_commit_comm_work(send_consensus_grammar_work)
 
-                if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
-                    with torch.profiler.record_function("process_batch_result"):
-                        self._pp_process_batch_result(
-                            self.mbs[next_mb_id],
-                            next_batch_result,
-                        )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
@@ -182,6 +174,16 @@ class SchedulerPPMixin:
                         send_grammar_work = self._pp_send_pyobj_to_next_stage(
                             grammar_rids, async_send=True
                         )
+
+                if self.mbs[next_mb_id] is not None:
+                    d2h_event.synchronize()
+                    with torch.profiler.record_function("process_batch_result"):
+                        self._pp_process_batch_result(
+                            self.mbs[next_mb_id],
+                            next_batch_result,
+                        )
+                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                if not self.pp_group.is_last_rank:
                     if self.cur_batch:
                         self.device_module.current_stream().wait_event(
                             self.launch_event
