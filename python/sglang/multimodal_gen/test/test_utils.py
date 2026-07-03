@@ -78,6 +78,12 @@ SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES = frozenset(
         "ltx_2_3_two_stage_ti2v_2gpus",
     }
 )
+# cases listed here must compare against native SGLang-generated GT
+SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_CASES = frozenset(
+    {
+        "ltx_2_3_hq_pipeline",
+    }
+)
 
 CONSISTENCY_PLATFORM_ENV = "SGLANG_DIFFUSION_CONSISTENCY_PLATFORM"
 CONSISTENCY_THRESHOLD_DIR = (
@@ -1196,6 +1202,8 @@ def _find_remote_consistency_gt_files(
             SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE_ASCEND,
             SGL_TEST_FILES_CONSISTENCY_GT_BASE,
         )
+    elif case_id in SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_CASES:
+        bases = (SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,)
     elif case_id in SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES:
         bases = SGL_TEST_FILES_CONSISTENCY_GT_BASES
     else:
