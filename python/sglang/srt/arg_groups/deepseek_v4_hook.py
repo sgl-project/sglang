@@ -14,6 +14,19 @@ logger = logging.getLogger(__name__)
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
     """Apply DeepSeek V4 model-specific server arg defaults and constraints."""
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.utils import is_hip
+
+    # FlashMLA sparse prefill (SGLANG_OPT_FLASHMLA_SPARSE_PREFILL, default on)
+    # currently returns incorrect output for DeepSeek-V4-Flash on ROCm/HIP
+    # (MI355X), which breaks the disaggregation nightly. Keep the previous
+    # (dense prefill) behavior on ROCm until the sparse kernel is validated
+    # there; an explicit env var still overrides this.
+    if is_hip() and not envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.is_set():
+        logger.warning(
+            "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL by default on ROCm/HIP "
+            f"for {model_arch}; set it explicitly to override."
+        )
+        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
 
     server_args.attention_backend = "dsv4"
     server_args.page_size = 256

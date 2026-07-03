@@ -116,17 +116,30 @@ export const config = {
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --num-threads 128`,
+      // sgl-eval's --thinking sets the generic 'thinking' key, which Laguna's template
+      // ignores (it gates on enable_thinking — see Configuration Tips: Thinking). To run
+      // AIME25 with thinking, serve with a copy of the model's chat template whose
+      // enable_thinking default is flipped to true, passed via --chat-template.
+      aime25_pct:
+`# pip install git+https://github.com/sgl-project/sgl-eval
+# Serve with an enable_thinking=true chat template (see Configuration Tips: Thinking).
+sgl-eval run aime25 \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
+  --n-repeats 16 --max-tokens 64000 \\
+  --temperature 1.0 --top-p 0.95 --thinking \\
+  --num-threads 128`,
     },
     numPromptsByConc: { 1: 8, 16: 32, 64: 128, 128: 256, 256: 512, 1024: 2048, 4096: 4096 },
   },
 
   // No variant-wide accuracy default; real numbers are per-cell in laguna-xs21-benchmarks.jsx.
   defaultAccuracy: {
-    default: { gsm8k_pct: null },
+    default: { gsm8k_pct: null, aime25_pct: null },
   },
 
   accuracyLabels: [
     ["gsm8k_pct", "GSM8K", "%"],
+    ["aime25_pct", "AIME25", "%"],
   ],
 
   // Dedicated image built for this cookbook page (PR #29446 + #29761 preinstalled on cu13).
