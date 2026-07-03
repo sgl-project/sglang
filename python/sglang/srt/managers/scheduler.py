@@ -3466,15 +3466,14 @@ class Scheduler(
         self.metrics_reporter.update_device_timer()
 
     def maybe_send_health_check_signal(self):
-        if self.return_health_check_ipcs:
-            # Return some signal for the health check.
-            # This is used to prevent the health check signal being blocked by long context prefill.
-            # However, one minor issue is that this code path does not check the status of detokenizer manager.
-            self.ipc_channels.send_to_tokenizer.send_output(
-                HealthCheckOutput(
-                    http_worker_ipc=self.return_health_check_ipcs.popleft()
-                )
-            )
+        if not self.return_health_check_ipcs:
+            return
+        # Health checks are best-effort liveness signals; do not let a backed-up receiver block the scheduler loop.
+        http_worker_ipc = self.return_health_check_ipcs[0]
+        if self.ipc_channels.send_to_tokenizer.try_send_output(
+            HealthCheckOutput(http_worker_ipc=http_worker_ipc)
+        ):
+            self.return_health_check_ipcs.popleft()
 
     def add_external_corpus(
         self, recv_req: AddExternalCorpusReqInput
