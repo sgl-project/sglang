@@ -17,8 +17,8 @@ from sglang.srt.layers.attention.triton_ops.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.attention.triton_ops.metadata import get_num_kv_splits_triton
-from sglang.srt.layers.attention.utils import (
-    cp_lse_ag_out_rs,
+from sglang.srt.layers.dcp import (
+    cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
     get_dcp_lens,
 )
@@ -1489,7 +1489,7 @@ class TritonAttnBackend(AttentionBackend):
             skip_extend=True,
         )
 
-        prefix_out, prefix_lse = cp_lse_ag_out_rs(
+        prefix_out, prefix_lse = cp_lse_ag_out_rs_mha(
             prefix_out, prefix_lse, group, return_lse=True
         )
         final_lse = torch.logaddexp(prefix_lse, current_lse)
@@ -1748,7 +1748,7 @@ class TritonAttnBackend(AttentionBackend):
                 ],
                 dim=-1,
             )
-            o = cp_lse_ag_out_rs(o_for_decode, local_lse, group)
+            o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
         self.decode_attention_fwd(
