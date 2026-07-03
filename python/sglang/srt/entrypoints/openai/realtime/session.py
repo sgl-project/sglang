@@ -359,11 +359,8 @@ class RealtimeConnection:
                     "Internal server error",
                     error_type="server_error",
                 )
-            except (WebSocketDisconnect, RuntimeError) as e:
-                logger.debug(
-                    "[realtime] failed to notify client of unexpected error: %s",
-                    e,
-                )
+            except (WebSocketDisconnect, RuntimeError):
+                pass
 
     async def _run_loop(self) -> None:
         """Receive-and-dispatch loop. Validation errors emit an error event
@@ -777,16 +774,6 @@ class RealtimeConnection:
             )
             if (too_short or near_silent) and not is_last:
                 # Keep the slice anchor/PCM intact so the next slice re-covers it.
-                logger.debug(
-                    "[realtime] skip %s sliced window: session=%s item=%s "
-                    "range=[%d,%d) bytes=%d",
-                    "short" if too_short else "near-silent",
-                    self.session_id,
-                    self.item.current_item_id,
-                    slice_start_global,
-                    slice_end_global,
-                    len(pcm_slice),
-                )
                 delta = ""
                 skipped = True
             elif (too_short or near_silent) and is_last:
@@ -833,14 +820,6 @@ class RealtimeConnection:
                     and not verified_out.get("verified", True)
                 ):
                     # Do not ingest an unsafe overlap hypothesis; keep audio recoverable.
-                    logger.debug(
-                        "[realtime] defer unverified sliced overlap: session=%s "
-                        "item=%s range=[%d,%d)",
-                        self.session_id,
-                        self.item.current_item_id,
-                        slice_start_global,
-                        slice_end_global,
-                    )
                     delta = ""
                     skipped = True
         except Exception:
@@ -1015,9 +994,9 @@ class RealtimeConnection:
         # the wire send doesn't reach the peer.
         try:
             await self._send_error(code, message, error_type=error_type)
-        except (WebSocketDisconnect, RuntimeError) as e:
-            logger.debug("[realtime] send error %s before close failed: %s", code, e)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
         try:
             await self.websocket.close(code=close_code)
-        except (WebSocketDisconnect, RuntimeError) as e:
-            logger.debug("[realtime] close %d after %s failed: %s", close_code, code, e)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
