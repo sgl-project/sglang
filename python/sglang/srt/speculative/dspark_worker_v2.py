@@ -536,6 +536,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 bs,
             )
             return
+        expected_hidden_size = getattr(self.model_runner.model_config, "hidden_size", 0)
+        if expected_hidden_size and hidden.shape[-1] != expected_hidden_size:
+            logger.warning(
+                "Skip DSpark PD hidden bootstrap due to hidden size mismatch: "
+                "hidden_size=%s expected=%s",
+                hidden.shape[-1],
+                expected_hidden_size,
+            )
+            return
 
         cache_loc = get_last_loc(
             self.model_runner.req_to_token_pool.req_to_token,

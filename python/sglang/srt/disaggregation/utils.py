@@ -736,12 +736,6 @@ def setup_state_kv_args(
         # state list is described per-entry via get_state_buf_infos.
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
             append_swa_state_components(kv_args, token_to_kv_pool)
-            if (
-                draft_token_to_kv_pool is not None
-                and draft_token_to_kv_pool is not token_to_kv_pool
-                and isinstance(draft_token_to_kv_pool, BaseSWAKVPool)
-            ):
-                append_swa_state_components(kv_args, draft_token_to_kv_pool)
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (
                 token_to_kv_pool.get_state_dim_per_tensor()

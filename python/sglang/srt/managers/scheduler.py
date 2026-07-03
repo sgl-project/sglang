@@ -1129,7 +1129,13 @@ class Scheduler(
             server_args=self.server_args,
         )
 
-        if self.spec_algorithm.carries_draft_hidden_states():
+        if self.spec_algorithm.is_dspark():
+            # DSpark PD sends target main hidden states so the decode node can
+            # materialize draft-side cache locally. This is not the draft
+            # recurrent hidden size used by EAGLE-family algorithms.
+            disagg_hidden_size = self.model_config.hidden_size
+            disagg_hidden_states_dtype = self.model_config.dtype
+        elif self.spec_algorithm.carries_draft_hidden_states():
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
             # worker, so a single accessor covers both shapes.
             draft_runner = self.draft_worker.draft_worker.draft_runner
