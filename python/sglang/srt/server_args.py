@@ -315,7 +315,7 @@ MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 
-LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer"]
+LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer", "flashkda"]
 
 
 # Allow external code to add more choices
@@ -782,6 +782,14 @@ class ServerArgs:
         "layer-major within a page) instead of the default per-layer "
         "(layer-major) layout. Requires the Triton attention / linear-attn / "
         "Mamba backends.",
+    ] = False
+    enable_unified_memory: A[
+        bool,
+        "Replace the statically-partitioned hybrid-model pools (full-attn KV + "
+        "SWA/Mamba state) with one byte buffer split dynamically between "
+        "sub-pools. Requires the Triton attention / linear-attn / Mamba "
+        "backends; not yet compatible with PD disaggregation or speculative "
+        "decoding.",
     ] = False
     disable_chunked_prefix_cache: A[
         bool,
@@ -2717,6 +2725,8 @@ class ServerArgs:
 
         self._handle_page_major_kv_layout()
 
+        self._handle_unified_memory_pool()
+
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
 
@@ -3044,12 +3054,15 @@ class ServerArgs:
 
     def _handle_xpu_backends(self):
         if self.device == "xpu":
-            if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+            if self.cuda_graph_config.prefill.backend not in (
+                Backend.DISABLED,
+                Backend.TC_PIECEWISE,
+            ):
                 logger.warning(
-                    "XPU platform does not support piecewise CUDA graph, "
-                    "disabling prefill cuda graph."
+                    "XPU platform currently only supports prefill tc_piecewise CUDA graph; "
+                    "disabling unsupported prefill backend."
                 )
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
@@ -3205,11 +3218,27 @@ class ServerArgs:
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
         """
+        from sglang.srt.configs.model_config import is_deepseek_v4
+
         rules = [
-            # MLA prefill takes a different attn-forward path under BCG (no
-            # tc_piecewise gate), causing q.view shape mismatches. Disable
-            # until the MLA prefill path is BCG-aware.
+            # MLA prefill takes a different attn-forward path under BCG.
             ("MLA attention", lambda: self.use_mla_backend()),
+            # DSV4 is BCG-compatible but introduces heavy memory pressure: the
+            # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
+            (
+                "DeepSeek-V4 (heavy capture-pool memory pressure)",
+                lambda: is_deepseek_v4(self.get_model_config().hf_config),
+            ),
+            # CP all_gather replay size mismatch under BCG.
+            ("context parallel (attn_cp_size > 1)", lambda: self.attn_cp_size > 1),
+            # BCG capture + LoRA adapter weights exceed host RAM headroom.
+            ("LoRA", lambda: bool(self.lora_paths) or bool(self.enable_lora)),
+            # BCG bucket sizes exceed FlashInfer MoE A2A's dispatch cap.
+            ("MoE A2A backend", lambda: self.moe_a2a_backend != "none"),
+            # DP-attn × BCG capture/replay not yet validated.
+            ("DP attention", lambda: self.enable_dp_attention),
+            # Multimodal prefill replay faults under BCG.
+            ("multimodal model", lambda: self.get_model_config().is_multimodal),
         ]
         for name, predicate in rules:
             if predicate():
@@ -5123,6 +5152,26 @@ class ServerArgs:
 
         # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
         decode = self.linear_attn_decode_backend or self.linear_attn_backend
+
+        # FlashKDA is a prefill-only KDA kernel (no decode kernel) but shares the
+        # backend choice list, so guard it from being selected for decode: error
+        # on an explicit --linear-attn-decode-backend flashkda, and fall back to
+        # triton decode when it was only inherited from base=flashkda (prefill
+        # keeps FlashKDA).
+        if decode == "flashkda":
+            if self.linear_attn_decode_backend == "flashkda":
+                raise ValueError(
+                    "--linear-attn-decode-backend flashkda is not supported: "
+                    "FlashKDA is prefill-only. Use "
+                    "--linear-attn-prefill-backend flashkda (decode stays on triton)."
+                )
+            self.linear_attn_decode_backend = "triton"
+            decode = "triton"
+            logger.info(
+                "FlashKDA is prefill-only; using triton for KDA decode "
+                "(FlashKDA stays on prefill)."
+            )
+
         if (
             decode == "flashinfer"
             and self.mamba_ssm_dtype != "bfloat16"
@@ -6336,7 +6385,49 @@ class ServerArgs:
                         "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
                     )
 
+    def _handle_unified_memory_pool(self):
+        if not self.enable_unified_memory:
+            return
+        assert self.disaggregation_mode == "null", (
+            "--enable-unified-memory is not yet compatible with PD " "disaggregation."
+        )
+        assert self.speculative_algorithm is None, (
+            "--enable-unified-memory is not yet compatible with speculative "
+            "decoding."
+        )
+        assert not (self.enable_hierarchical_cache or self.enable_lmcache), (
+            "--enable-unified-memory is not yet compatible with hierarchical / "
+            "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
+            "the unified-memory-pool init wires up no host pools, and its device mamba / "
+            "full-attention slots are VIRTUAL — the host-offload path does not "
+            "translate them to physical."
+        )
+        assert self.dcp_size == 1, (
+            "--enable-unified-memory is not yet compatible with decode context "
+            "parallelism (--dcp-size > 1): the pool has no DCP-aware masked write "
+            "path (UnifiedMHATokenToKVPool.set_kv_buffer asserts dcp_kv_mask is None), "
+            "so a DCP run would boot and then fail on the first KV write."
+        )
+        # Only monolithic decode cuda-graph capture is wired; piecewise prefill
+        # capture is not. Guard when the user opts into it.
+        _cg_cfg = self.cuda_graph_config
+        if _cg_cfg is not None and _cg_cfg.prefill.backend == Backend.TC_PIECEWISE:
+            raise ValueError(
+                "--enable-unified-memory supports monolithic (decode) "
+                "cuda-graph capture only; disable piecewise prefill capture "
+                "(e.g. --cuda-graph-backend-prefill=disabled)."
+            )
+        # The strided-layout Triton requirement is enforced via
+        # --enable-page-major-kv-layout (implied by the unified pool in
+        # _handle_page_major_kv_layout); the model-family gate is enforced at pool
+        # construction in model_runner_kv_cache_mixin._init_pools.
+
     def _handle_page_major_kv_layout(self):
+        # The unified pool stores state in the page-major envelope-strided layout, so
+        # enabling it implies --enable-page-major-kv-layout — routing it through the
+        # single page-major path + stride-aware Triton asserts (set before the guard).
+        if self.enable_unified_memory:
+            self.enable_page_major_kv_layout = True
         if not self.enable_page_major_kv_layout:
             return
         # Only the Triton attention kernels read the strided 4-D envelope K/V
