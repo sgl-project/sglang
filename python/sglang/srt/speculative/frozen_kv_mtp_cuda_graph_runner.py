@@ -25,6 +25,9 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
+from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    maybe_flashinfer_autotune_speculative_draft,
+)
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -192,7 +195,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
     def _replay_graph(self, shape_key, forward_batch):
         return self.backend.replay(shape_key, forward_batch)
 
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = max(forward_batch.global_num_tokens_cpu) // (
                 self.topk * self.topk
@@ -321,13 +324,20 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
                 )
                 self.deepep_adapter.capture(is_extend_in_batch=False)
                 shape_key = self._make_graph_key(request_bs)
+                post_warmup_hook = getattr(
+                    self.draft_attn_backend, "on_after_cuda_graph_warmup", None
+                )
+                maybe_flashinfer_autotune_speculative_draft(
+                    self,
+                    run_once,
+                    post_warmup_hook=post_warmup_hook,
+                    skip_logits=False,
+                )
                 self.backend.capture_one(
                     shape_key,
                     run_once,
                     dummies=None,
-                    post_warmup_hook=getattr(
-                        self.draft_attn_backend, "on_after_cuda_graph_warmup", None
-                    ),
+                    post_warmup_hook=post_warmup_hook,
                 )
         finally:
             self.draft_attn_backend.token_to_kv_pool = saved_backend_pool
@@ -336,7 +346,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         parent_list, top_scores_index, draft_tokens = (t[:raw_bs] for t in out)
         return parent_list, top_scores_index, draft_tokens
 
-    def replay(self, forward_batch: ForwardBatch):
+    def execute(self, forward_batch: ForwardBatch):
         self.deepep_adapter.replay()
         buffers = self.buffers
 

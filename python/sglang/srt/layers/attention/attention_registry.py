@@ -6,9 +6,11 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
-from sglang.srt.utils import get_device_capability, is_musa
+from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
 
 _is_musa = is_musa()
+_is_npu = is_npu()
+_is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -126,9 +128,13 @@ def _create_nsa_compat(runner):
 
 @register_attention_backend("dsv4")
 def create_dsv4_backend(runner):
-    from sglang.srt.utils import is_hip
+    if _is_npu:
+        from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+            DeepseekV4AscendAttnBackend,
+        )
 
-    if is_hip():
+        return DeepseekV4AscendAttnBackend(runner)
+    elif _is_hip:
         from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
             DeepseekV4HipRadixBackend,
         )
@@ -282,6 +288,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
 
         check_environments()
         initialize_linear_attn_config(runner.server_args)
+        hybrid_backend_cls = HybridLinearAttnBackend
         if runner.hybrid_gdn_config is not None:
             if is_blackwell():
                 assert (
@@ -297,7 +304,46 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
             linear_attn_backend = GDNAttnBackend(runner)
         elif runner.mamba2_config is not None:
-            linear_attn_backend = Mamba2AttnBackend(runner)
+            from sglang.srt.configs.lfm2 import Lfm2Config
+            from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
+            from sglang.srt.configs.lfm2_vl import Lfm2VlConfig
+            from sglang.srt.configs.zaya import ZayaConfig
+
+            # Short-conv hybrids (ZAYA1 CCA, LFM2 short conv) share a conv-state
+            # sidecar that owns the per-request state plumbing and is invoked by
+            # the model via conv_state_metadata (never as a full-vs-linear
+            # alternative). Other mamba2 models keep the full Mamba2 SSM backend.
+            short_conv_cfgs = (
+                ZayaConfig,
+                Lfm2Config,
+                Lfm2MoeConfig,
+                Lfm2VlConfig,
+            )
+            if isinstance(runner.mamba2_config, short_conv_cfgs):
+                if is_npu():
+                    # The model conv layers call
+                    # get_attn_backend().conv_state_metadata() unconditionally,
+                    # but the Ascend hybrid/mamba backend has no such method.
+                    # Fail here (before model execution) with a clear message
+                    # rather than an AttributeError deep in the first conv layer.
+                    raise NotImplementedError(
+                        "Short-conv hybrid models (ZAYA1 CCA, LFM2 / LFM2-MoE) "
+                        "are not yet supported on NPU: the conv-state sidecar "
+                        "(ShortConvAttnBackend.conv_state_metadata) has no Ascend "
+                        "implementation. Add an Ascend conv-state backend before "
+                        "serving these models on NPU."
+                    )
+                from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+                    ShortConvHybridAttnBackend,
+                )
+                from sglang.srt.layers.attention.linear.short_conv_backend import (
+                    ShortConvAttnBackend,
+                )
+
+                linear_attn_backend = ShortConvAttnBackend(runner)
+                hybrid_backend_cls = ShortConvHybridAttnBackend
+            else:
+                linear_attn_backend = Mamba2AttnBackend(runner)
         elif runner.kimi_linear_config is not None:
             linear_attn_backend = KDAAttnBackend(runner)
         elif runner.hybrid_lightning_config is not None:
@@ -319,7 +365,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             full_attn_layers = [0]
         else:
             full_attn_layers = cfg.full_attention_layer_ids
-        return HybridLinearAttnBackend(
+        return hybrid_backend_cls(
             full_attn_backend, linear_attn_backend, full_attn_layers
         )
 
