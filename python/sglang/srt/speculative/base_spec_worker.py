@@ -152,6 +152,10 @@ class EagleDraftWorkerBase(ABC):
         if not gpu_only:
             forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + num_draft_tokens
             forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
+        else:
+            # Supply CPU mirror (extend_seq_lens are all num_draft_tokens) so
+            # backend max() reads from list without a per-iter D2H sync.
+            forward_batch.extend_seq_lens_cpu = [num_draft_tokens] * bs
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
             forward_batch
         )
