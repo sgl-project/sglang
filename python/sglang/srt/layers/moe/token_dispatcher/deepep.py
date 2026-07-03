@@ -419,10 +419,10 @@ class _DeepEPDispatcherImplBase:
         dtype = self.deepep_output_dtype
         self.fp8_configs = dict()
 
-        if dtype == DeepEPOutputDtype.BF16:
+        if dtype == DispatcherOutputDtype.BF16:
             self.use_fp8 = False
             self.use_nvfp4 = False
-        elif dtype == DeepEPOutputDtype.FP8:
+        elif dtype == DispatcherOutputDtype.FP8:
             self.use_fp8 = True
             self.use_nvfp4 = False
             self.fp8_configs = dict(
@@ -431,21 +431,21 @@ class _DeepEPDispatcherImplBase:
                 use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
             )
-        elif dtype == DeepEPOutputDtype.INT8:
+        elif dtype == DispatcherOutputDtype.INT8:
             self.use_fp8 = True
             self.use_nvfp4 = False
             self.fp8_configs = dict(round_scale=False, use_ue8m0=False)
-        elif dtype == DeepEPOutputDtype.NVFP4:
+        elif dtype == DispatcherOutputDtype.NVFP4:
             self.use_fp8 = False
             self.use_nvfp4 = True
         elif dtype in (
-            DeepEPOutputDtype.MXFP8_e4m3fn,
-            DeepEPOutputDtype.MXFP8_e5m2,
+            DispatcherOutputDtype.MXFP8_e4m3fn,
+            DispatcherOutputDtype.MXFP8_e5m2,
         ):
             self.use_fp8 = True
             self.use_nvfp4 = False
             self.fp8_configs = dict(round_scale=True, use_ue8m0=True)
-        elif dtype == DeepEPOutputDtype.MXFP4_e2m1fn_x2:
+        elif dtype == DispatcherOutputDtype.MXFP4_e2m1fn_x2:
             # Ascend NPU supports MXFP4 only in normal dispatch mode
             if isinstance(self, _DeepEPDispatcherImplLowLatency):
                 raise ValueError(
@@ -462,15 +462,15 @@ class _DeepEPDispatcherImplBase:
         Returns None if no quantisation is required (e.g., bf16).
         """
         dtype = self.deepep_output_dtype
-        if dtype == DeepEPOutputDtype.BF16:
+        if dtype == DispatcherOutputDtype.BF16:
             return None
-        elif dtype == DeepEPOutputDtype.INT8:
+        elif dtype == DispatcherOutputDtype.INT8:
             return torch.tensor([], dtype=torch.int8, device="npu")
-        elif dtype == DeepEPOutputDtype.MXFP8_e4m3fn:
+        elif dtype == DispatcherOutputDtype.MXFP8_e4m3fn:
             return torch.tensor([], dtype=torch.float8_e4m3fn, device="npu")
-        elif dtype == DeepEPOutputDtype.MXFP8_e5m2:
+        elif dtype == DispatcherOutputDtype.MXFP8_e5m2:
             return torch.tensor([], dtype=torch.float8_e5m2, device="npu")
-        elif dtype == DeepEPOutputDtype.MXFP4_e2m1fn_x2:
+        elif dtype == DispatcherOutputDtype.MXFP4_e2m1fn_x2:
             return torch.tensor([], dtype=torch.float4_e2m1fn_x2, device="npu")
         else:
             raise RuntimeError(f"Unexpected output dtype for NPU quant tensor: {dtype}")
@@ -478,23 +478,23 @@ class _DeepEPDispatcherImplBase:
     def _validate_and_adjust_dtype(self) -> None:
         """Validate dtype against hardware and adjust if necessary."""
         if _is_npu:
-            if self.deepep_output_dtype == DeepEPOutputDtype.FP8:
+            if self.deepep_output_dtype == DispatcherOutputDtype.FP8:
                 logger.warning_once(
                     "Ascend A2/A3 NPU does not support fp8 "
                     "deepep_dispatcher_output_dtype, switching to int8..."
                 )
-                self.deepep_output_dtype = DeepEPOutputDtype.INT8
-            elif self.deepep_output_dtype == DeepEPOutputDtype.NVFP4:
+                self.deepep_output_dtype = DispatcherOutputDtype.INT8
+            elif self.deepep_output_dtype == DispatcherOutputDtype.NVFP4:
                 raise RuntimeError(
                     "Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype."
                 )
         else:
-            if self.deepep_output_dtype == DeepEPOutputDtype.INT8:
+            if self.deepep_output_dtype == DispatcherOutputDtype.INT8:
                 logger.warning_once(
                     "GPU does not support int8 "
                     "deepep_dispatcher_output_dtype, switching to fp8..."
                 )
-                self.deepep_output_dtype = DeepEPOutputDtype.FP8
+                self.deepep_output_dtype = DispatcherOutputDtype.FP8
             # NVFP4 is supported on GPU, no adjustment needed
 
     def set_overlap_args(
