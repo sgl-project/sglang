@@ -1070,9 +1070,11 @@ class QwenImageTransformerBlock(nn.Module):
                 prefix=f"{prefix}.txt_mlp",
                 # The text branch is ~1K tokens regardless of image size, so
                 # sharding its FFN saves less GEMM time than the per-block
-                # all-reduce it adds; keeping it replicated is a measured e2e
-                # win (2xH100 tp=2: 5.58s -> 5.12s single-request).
-                replicated=True,
+                # all-reduce it adds. Measured e2e crossover (H100, 1024x1024):
+                # tp=2 replication wins (5.58s -> 5.12s, -8%) but at tp=4 the
+                # duplicated GEMM outgrows the all-reduce saved (~1% loss), so
+                # gate on the TP degree.
+                replicated=get_tp_world_size() <= 2,
             )
 
         if nunchaku_enabled:
