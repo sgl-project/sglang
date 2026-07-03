@@ -621,14 +621,15 @@ def get_available_gpu_memory(
 
         if empty_cache:
             empty_device_cache(torch.xpu)
-        # Use mem_get_info() to reflect true OS-level free memory
-        # including graph pool reservations; avoids KV-cache over-allocation.
+        # Use mem_get_info() with a sanity cap to avoid KV-cache over-allocation
+        # on drivers that incorrectly return total memory as free memory.
+        # Consistent with the fallback: free = max(0, total - allocated).
         try:
             free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info(gpu_id)
-            reserved = float(torch.xpu.memory_reserved(gpu_id))
+            used_memory = float(torch.xpu.memory_allocated(gpu_id))
             free_gpu_memory = min(
                 float(free_gpu_memory),
-                max(0.0, float(total_gpu_memory) - reserved),
+                max(0.0, float(total_gpu_memory) - used_memory),
             )
         except Exception:
             # Fallback for devices/drivers that do not support querying free memory
