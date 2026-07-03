@@ -48,6 +48,11 @@ MODEL_OVERRIDES: Dict[str, Dict[str, Any]] = {
 # Derived per-architecture override providers, in registration order.
 _MODEL_OVERRIDE_FNS: Dict[str, List[Callable[..., dict]]] = {}
 
+# Predicate-keyed providers, in registration order — for legacy branches
+# matched by substring/predicate on the architecture string rather than an
+# exact name (e.g. '"Step3p5ForCausalLM" in model_arch').
+_PREDICATE_OVERRIDE_FNS: List[Tuple[Callable[[str], bool], Callable[..., dict]]] = []
+
 
 def register_model_override(architecture: str):
     """Register a derived-override provider for ``architecture``.
@@ -66,28 +71,52 @@ def register_model_override(architecture: str):
     return decorator
 
 
+def register_model_override_predicate(predicate: Callable[[str], bool]):
+    """Register a derived-override provider keyed by an architecture
+    predicate. Same callable contract as ``register_model_override``."""
+
+    def decorator(fn: Callable[..., dict]) -> Callable[..., dict]:
+        _PREDICATE_OVERRIDE_FNS.append((predicate, fn))
+        return fn
+
+    return decorator
+
+
+def _invoke_provider(
+    fn: Callable[..., dict], server_args: Any, hf_config: Any
+) -> Dict[str, Any]:
+    declared = fn(server_args, hf_config)
+    if not isinstance(declared, dict):
+        raise TypeError(
+            f"model override provider {fn.__qualname__} must return a dict, "
+            f"got {type(declared).__name__}"
+        )
+    return declared
+
+
 def collect_model_override_declarations(
     architecture: str, server_args: Any, hf_config: Any
 ) -> List[Tuple[str, Dict[str, Any]]]:
     """Collect ``(source, declaration)`` pairs for one architecture.
 
     Application order (last writer wins downstream in the gate): the constant
-    ``MODEL_OVERRIDES`` entry first, then registered callables in registration
-    order. Empty declarations are dropped.
+    ``MODEL_OVERRIDES`` entry first, then exact-keyed callables in
+    registration order, then matching predicate-keyed callables in
+    registration order. Empty declarations are dropped.
     """
     declarations: List[Tuple[str, Dict[str, Any]]] = []
     const = MODEL_OVERRIDES.get(architecture)
     if const:
         declarations.append((f"MODEL_OVERRIDES[{architecture!r}]", dict(const)))
     for fn in _MODEL_OVERRIDE_FNS.get(architecture, ()):
-        declared = fn(server_args, hf_config)
-        if not isinstance(declared, dict):
-            raise TypeError(
-                f"model override provider {fn.__qualname__} must return a dict, "
-                f"got {type(declared).__name__}"
-            )
+        declared = _invoke_provider(fn, server_args, hf_config)
         if declared:
             declarations.append((fn.__qualname__, dict(declared)))
+    for predicate, fn in _PREDICATE_OVERRIDE_FNS:
+        if predicate(architecture):
+            declared = _invoke_provider(fn, server_args, hf_config)
+            if declared:
+                declarations.append((fn.__qualname__, dict(declared)))
     return declarations
 
 
@@ -124,6 +153,29 @@ def _minimax_m2_overrides(server_args: Any, hf_config: Any) -> dict:
         "Enable TF32 matmul for MiniMaxM2ForCausalLM model to improve gate gemm performance."
     )
     return {"enable_tf32_matmul": True}
+
+
+@register_model_override_predicate(
+    lambda arch: "Step3p5ForCausalLM" in arch
+    or "Step3p7ForConditionalGeneration" in arch
+)
+def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:
+    overrides: Dict[str, Any] = {}
+    if server_args.speculative_algorithm == "EAGLE":
+        logger.info(
+            "Enable multi-layer EAGLE speculative decoding for Step3p5ForCausalLM model."
+        )
+        overrides["enable_multi_layer_eagle"] = True
+    if server_args.enable_hierarchical_cache:
+        logger.warning(
+            "Reset swa_full_tokens_ratio to 1.0 for Step3p5ForCausalLM model with hierarchical cache"
+        )
+        overrides["swa_full_tokens_ratio"] = 1.0
+        logger.warning(
+            "Disable hybrid SWA memory for Step3p5ForCausalLM model with hierarchical cache"
+        )
+        overrides["disable_hybrid_swa_memory"] = True
+    return overrides
 
 
 @dataclasses.dataclass(frozen=True)

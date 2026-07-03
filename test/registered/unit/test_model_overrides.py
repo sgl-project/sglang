@@ -60,7 +60,15 @@ class TestModelOverridableWhitelist(CustomTestCase):
 
         self.assertEqual(
             model_overridable_fields(ServerArgs),
-            frozenset({"dtype", "enable_tf32_matmul", "enable_multi_layer_eagle"}),
+            frozenset(
+                {
+                    "dtype",
+                    "enable_tf32_matmul",
+                    "enable_multi_layer_eagle",
+                    "swa_full_tokens_ratio",
+                    "disable_hybrid_swa_memory",
+                }
+            ),
         )
 
     def test_non_dataclass_yields_empty_whitelist(self):
@@ -75,6 +83,7 @@ class _IsolatedRegistry(CustomTestCase):
         self._patches = [
             patch.dict(overrides_module.MODEL_OVERRIDES, clear=True),
             patch.dict(overrides_module._MODEL_OVERRIDE_FNS, clear=True),
+            patch.object(overrides_module, "_PREDICATE_OVERRIDE_FNS", []),
         ]
         for p in self._patches:
             p.start()
@@ -130,6 +139,27 @@ class TestModelOverrideRegistry(_IsolatedRegistry):
 
         with self.assertRaises(TypeError):
             collect_model_override_declarations("FakeForCausalLM", None, None)
+
+    def test_predicate_keyed_provider(self):
+        from sglang.srt.arg_groups.overrides import register_model_override_predicate
+
+        @register_model_override("FakeStep9ForCausalLM")
+        def _exact(server_args, hf_config):
+            return {"a": 1}
+
+        @register_model_override_predicate(lambda arch: "Step9" in arch)
+        def _by_predicate(server_args, hf_config):
+            return {"b": 2}
+
+        # matching arch: exact-keyed first, then predicate-keyed
+        self.assertEqual(
+            collect_model_override_declarations("FakeStep9ForCausalLM", None, None),
+            [(_exact.__qualname__, {"a": 1}), (_by_predicate.__qualname__, {"b": 2})],
+        )
+        # non-matching arch: predicate does not fire
+        self.assertEqual(
+            collect_model_override_declarations("OtherForCausalLM", None, None), []
+        )
 
 
 @dataclasses.dataclass
@@ -292,13 +322,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         "v_head_dim": 16,
     }
 
-    def _construct(self, arch, model_type, **server_kwargs):
+    def _construct(self, arch, model_type, config_extra=None, **server_kwargs):
         from sglang.srt.server_args import ServerArgs
 
         # Golden resolution must be host-independent: accelerator-less CI
         # runners resolve only the base platform, where get_device() raises.
         server_kwargs.setdefault("device", "cuda")
         config = dict(self._MINI_CONFIG, architectures=[arch], model_type=model_type)
+        config.update(config_extra or {})
         config_dir = tempfile.mkdtemp(prefix="golden_override_")
         self.addCleanup(shutil.rmtree, config_dir, ignore_errors=True)
         with open(os.path.join(config_dir, "config.json"), "w") as f:
@@ -375,6 +406,56 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 None,
             ),
             [("_mimo_v2_overrides", {"enable_multi_layer_eagle": True})],
+        )
+
+    def test_step3p_hierarchical_cache_golden(self):
+        # SWA-hybrid arch: the mini config needs layer_types/sliding_window.
+        config_extra = {
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 64,
+        }
+        sa = self._construct(
+            "Step3p5ForCausalLM",
+            "llama",
+            config_extra=config_extra,
+            enable_hierarchical_cache=True,
+        )
+        # dual-apply == legacy writes
+        self.assertEqual(sa.swa_full_tokens_ratio, 1.0)
+        self.assertTrue(sa.disable_hybrid_swa_memory)
+        flags = self._publish(sa)
+        self.assertEqual(flags.swa_full_tokens_ratio, 1.0)
+        self.assertTrue(flags.disable_hybrid_swa_memory)
+
+    def test_step3p_declarations_at_callable_level(self):
+        from sglang.srt.arg_groups.overrides import _step3p_overrides
+
+        self.assertEqual(
+            _step3p_overrides(
+                SimpleNamespace(
+                    speculative_algorithm="EAGLE", enable_hierarchical_cache=False
+                ),
+                None,
+            ),
+            {"enable_multi_layer_eagle": True},
+        )
+        self.assertEqual(
+            _step3p_overrides(
+                SimpleNamespace(
+                    speculative_algorithm=None, enable_hierarchical_cache=True
+                ),
+                None,
+            ),
+            {"swa_full_tokens_ratio": 1.0, "disable_hybrid_swa_memory": True},
+        )
+        self.assertEqual(
+            _step3p_overrides(
+                SimpleNamespace(
+                    speculative_algorithm=None, enable_hierarchical_cache=False
+                ),
+                None,
+            ),
+            {},
         )
 
 
