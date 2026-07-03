@@ -61,12 +61,13 @@ import random
 import signal
 import threading
 import time
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from sglang.srt.utils import get_int_env_var
 
 if TYPE_CHECKING:
     import zmq as _zmq_type
+
     from sglang.srt.observability.trace import (
         TraceSliceContext,
         TraceThreadInfo,
@@ -92,6 +93,8 @@ _zmq_endpoint: Optional[str] = None
 _zmq_context = None
 _init_pid: Optional[int] = None
 _thread_local = threading.local()
+_socket_lock = threading.Lock()
+_exporter_lock = threading.Lock()
 
 
 def _get_zmq_socket() -> Optional[_zmq_type.Socket]:
@@ -103,17 +106,21 @@ def _get_zmq_socket() -> Optional[_zmq_type.Socket]:
 
     cur_pid = os.getpid()
     if _init_pid != cur_pid:
-        _zmq_context = zmq.Context()
-        _init_pid = cur_pid
-        if hasattr(_thread_local, "socket"):
-            _thread_local.socket = None
+        with _socket_lock:
+            if _init_pid != cur_pid:
+                _zmq_context = zmq.Context()
+                _init_pid = cur_pid
+                if hasattr(_thread_local, "socket"):
+                    _thread_local.socket = None
 
     if not hasattr(_thread_local, "socket") or _thread_local.socket is None:
         from sglang.srt.utils.network import get_zmq_socket
+
         _thread_local.socket = get_zmq_socket(
             _zmq_context, zmq.PUSH, _zmq_endpoint, bind=False
         )
         _thread_local.socket.setsockopt(zmq.LINGER, 5000)
+        _thread_local.socket.setsockopt(zmq.SNDHWM, 10000)
 
     return _thread_local.socket
 
@@ -135,22 +142,24 @@ def start_trace_exporter(
         logger.warning("pyzmq not installed — cannot start async trace exporter")
         return False
 
-    if _exporter_process is not None and _exporter_process.is_alive():
-        return True
+    with _exporter_lock:
+        if _exporter_process is not None and _exporter_process.is_alive():
+            return True
 
-    zmq_endpoint = f"ipc:///tmp/sglang_trace_{os.getpid()}.sock"
+        zmq_endpoint = f"ipc:///tmp/sglang_trace_{os.getpid()}.sock"
 
-    _zmq_endpoint = zmq_endpoint
-    _zmq_context = zmq.Context()
-    _init_pid = os.getpid()
+        _zmq_endpoint = zmq_endpoint
+        _zmq_context = zmq.Context()
+        _init_pid = os.getpid()
 
-    _exporter_process = _TraceExporterProcess(
-        otlp_endpoint=otlp_endpoint,
-        server_name=server_name,
-        zmq_endpoint=zmq_endpoint,
-        trace_modules=trace_modules,
-    )
-    _exporter_process.start()
+        _exporter_process = _TraceExporterProcess(
+            otlp_endpoint=otlp_endpoint,
+            server_name=server_name,
+            zmq_endpoint=zmq_endpoint,
+            trace_modules=trace_modules,
+        )
+        _exporter_process.start()
+
     logger.info(
         "Async trace exporter started on %s (pid %d)",
         zmq_endpoint,
@@ -177,6 +186,9 @@ def stop_trace_exporter():
             if sock:
                 sock.send_pyobj({"action": "shutdown"}, zmq.NOBLOCK)
             _exporter_process.join(timeout=5)
+            if _exporter_process.is_alive():
+                _exporter_process.terminate()
+                _exporter_process.join(timeout=2)
         except Exception:
             _exporter_process.terminate()
     _exporter_process = None
@@ -263,9 +275,9 @@ class _TraceExporterProcess(multiprocessing.Process):
 
         from sglang.srt.observability.trace import (
             TraceCustomIdGenerator,
+            TraceEvent,
             TraceReqContext,
             TraceSliceContext,
-            TraceEvent,
             TraceThreadInfo,
             process_tracing_init,
             threads_info,
@@ -277,72 +289,80 @@ class _TraceExporterProcess(multiprocessing.Process):
 
         ctx = zmq.Context()
         socket = get_zmq_socket(ctx, zmq.PULL, self.zmq_endpoint, bind=True)
+        socket.setsockopt(zmq.RCVHWM, 10000)
 
         contexts: Dict[str, tuple] = {}
         last_cleanup = time.perf_counter()
 
         logger.info("Trace exporter process running")
 
-        while True:
-            try:
-                if socket.poll(timeout=1000):
-                    msg = socket.recv_pyobj()
-                else:
-                    now = time.perf_counter()
-                    if now - last_cleanup > self._CLEANUP_INTERVAL:
-                        self._cleanup_stale(contexts, now)
-                        last_cleanup = now
-                    continue
-            except Exception as e:
-                logger.error("Trace exporter recv error: %s", e)
-                continue
-
-            action = msg.get("action")
-            if action == "shutdown":
-                break
-            elif action == "register_thread_info":
-                pid = msg["pid"]
-                if pid not in threads_info:
-                    threads_info[pid] = TraceThreadInfo(
-                        host_id=msg["host_id"],
-                        pid=pid,
-                        thread_label=msg["thread_label"],
-                        tp_rank=msg.get("tp_rank"),
-                        dp_rank=msg.get("dp_rank"),
-                        pp_rank=msg.get("pp_rank"),
-                    )
-            elif action == "batch":
+        try:
+            while True:
                 try:
-                    self._replay_batch(
-                        msg,
-                        contexts,
-                        threads_info,
-                        TraceCustomIdGenerator,
-                        TraceReqContext,
-                        TraceSliceContext,
-                        TraceEvent,
-                    )
+                    if socket.poll(timeout=1000):
+                        msg = socket.recv_pyobj()
+                    else:
+                        now = time.perf_counter()
+                        if now - last_cleanup > self._CLEANUP_INTERVAL:
+                            self._cleanup_stale(contexts, now)
+                            last_cleanup = now
+                        continue
                 except Exception as e:
-                    logger.error(
-                        "Trace exporter replay error for rid=%s: %s",
-                        msg.get("rid"),
-                        e,
+                    logger.error("Trace exporter recv error: %s", e)
+                    continue
+
+                if not isinstance(msg, dict):
+                    logger.warning(
+                        "Trace exporter received invalid message type: %s", type(msg)
                     )
+                    continue
 
-            now = time.perf_counter()
-            if now - last_cleanup > self._CLEANUP_INTERVAL:
-                self._cleanup_stale(contexts, now)
-                last_cleanup = now
+                action = msg.get("action")
+                if action == "shutdown":
+                    break
+                elif action == "register_thread_info":
+                    pid = msg["pid"]
+                    if pid not in threads_info:
+                        threads_info[pid] = TraceThreadInfo(
+                            host_id=msg["host_id"],
+                            pid=pid,
+                            thread_label=msg["thread_label"],
+                            tp_rank=msg.get("tp_rank"),
+                            dp_rank=msg.get("dp_rank"),
+                            pp_rank=msg.get("pp_rank"),
+                        )
+                elif action == "batch":
+                    try:
+                        self._replay_batch(
+                            msg,
+                            contexts,
+                            threads_info,
+                            TraceCustomIdGenerator,
+                            TraceReqContext,
+                            TraceSliceContext,
+                            TraceEvent,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Trace exporter replay error for rid=%s: %s",
+                            msg.get("rid"),
+                            e,
+                        )
 
-        for rid, (trace_ctx, _) in contexts.items():
-            try:
-                trace_ctx.abort()
-            except Exception:
-                pass
-        contexts.clear()
-        socket.close()
-        ctx.term()
-        logger.info("Trace exporter process stopped")
+                now = time.perf_counter()
+                if now - last_cleanup > self._CLEANUP_INTERVAL:
+                    self._cleanup_stale(contexts, now)
+                    last_cleanup = now
+        finally:
+            for rid, (trace_ctx, _) in contexts.items():
+                try:
+                    trace_ctx.abort()
+                except Exception:
+                    pass
+            contexts.clear()
+            socket.close()
+            ctx.term()
+            logger.info("Trace exporter process stopped")
 
     def _replay_batch(
         self,
@@ -411,9 +431,7 @@ class _TraceExporterProcess(multiprocessing.Process):
                     preset_id = op.get("preset_span_id")
                     if preset_id is not None:
                         TraceCustomIdGenerator.preset_next_span_id(preset_id)
-                    trace_ctx.trace_slice_start(
-                        op["name"], op["level"], op.get("ts")
-                    )
+                    trace_ctx.trace_slice_start(op["name"], op["level"], op.get("ts"))
 
                 elif op_type == "slice_end":
                     trace_ctx.trace_slice_end(
@@ -468,11 +486,13 @@ class _TraceExporterProcess(multiprocessing.Process):
                     carrier = op.get("root_span_carrier")
                     if carrier:
                         from opentelemetry import propagate as otel_propagate
+
                         trace_ctx.root_span_context = otel_propagate.extract(carrier)
                         trace_ctx.is_copy = True
                     lsc = op.get("init_last_span_context")
                     if lsc:
                         from opentelemetry import trace
+
                         trace_ctx.last_span_context = trace.span.SpanContext(
                             trace_id=lsc["trace_id"],
                             span_id=lsc["span_id"],
@@ -491,9 +511,7 @@ class _TraceExporterProcess(multiprocessing.Process):
 
     def _cleanup_stale(self, contexts: Dict[str, tuple], now: float) -> None:
         expired = [
-            cid
-            for cid, (_, ts) in contexts.items()
-            if now - ts > self._CONTEXT_TTL
+            cid for cid, (_, ts) in contexts.items() if now - ts > self._CONTEXT_TTL
         ]
         for cid in expired:
             trace_ctx, _ = contexts.pop(cid)
@@ -586,17 +604,19 @@ class TraceReqContextAsync:
         # Unique ID for this context instance — the exporter uses this (not rid)
         # as its dispatch key, so ops from different threads (copy_for_thread)
         # sharing the same rid are routed to separate TraceReqContext instances.
-        # id(self) is unique among all live objects in the same process.
-        self._context_id: int = id(self)
+        # Use a random 64-bit integer to avoid memory address reuse collisions of id(self).
+        self._context_id: int = random.getrandbits(64)
 
         # For deserialized copies: one-shot data to pass to exporter on first rebuild
         self._init_last_span_context: Optional[Dict[str, int]] = None
 
         # Send init info to exporter once — subsequent flushes only carry ops.
-        self._append_op({
-            "type": "init",
-            "init_args": self._init_args,
-        })
+        self._append_op(
+            {
+                "type": "init",
+                "init_args": self._init_args,
+            }
+        )
 
     # -- helpers --------------------------------------------------------
 
@@ -697,14 +717,18 @@ class TraceReqContextAsync:
         propagate.inject(carrier, self.root_span_context)
         self._root_span_carrier = carrier
 
-        self._append_op({
-            "type": "req_start",
-            "ts": ts,
-            "root_span_carrier": carrier,
-            "caller_pid": self._caller_pid,
-        })
+        self._append_op(
+            {
+                "type": "req_start",
+                "ts": ts,
+                "root_span_carrier": carrier,
+                "caller_pid": self._caller_pid,
+            }
+        )
 
-    def trace_req_finish(self, ts: Optional[int] = None, attrs: Optional[Dict[str, Any]] = None) -> None:
+    def trace_req_finish(
+        self, ts: Optional[int] = None, attrs: Optional[Dict[str, Any]] = None
+    ) -> None:
         if not self.tracing_enable:
             return
         ts = ts or _trace_mod.get_cur_time_ns()
@@ -718,7 +742,9 @@ class TraceReqContextAsync:
             self.root_span.end(end_time=ts)
             self.root_span = None
 
-    def trace_slice_start(self, name: str, level: int, ts: Optional[int] = None) -> None:
+    def trace_slice_start(
+        self, name: str, level: int, ts: Optional[int] = None
+    ) -> None:
         if self._check_fast_return(level):
             return
         ts = ts or _trace_mod.get_cur_time_ns()
@@ -727,13 +753,15 @@ class TraceReqContextAsync:
         span_id = self._gen_span_id()
         self._span_id_stack.append(span_id)
 
-        self._append_op({
-            "type": "slice_start",
-            "name": name,
-            "level": level,
-            "ts": ts,
-            "preset_span_id": span_id,
-        })
+        self._append_op(
+            {
+                "type": "slice_start",
+                "name": name,
+                "level": level,
+                "ts": ts,
+                "preset_span_id": span_id,
+            }
+        )
 
     def trace_slice_end(
         self,
@@ -754,16 +782,20 @@ class TraceReqContextAsync:
             if not self._span_id_stack:
                 self._last_span_id = completed_id
 
-        self._append_op({
-            "type": "slice_end",
-            "name": name,
-            "level": level,
-            "ts": ts,
-            "attrs": attrs,
-            "thread_finish_flag": thread_finish_flag,
-        })
+        self._append_op(
+            {
+                "type": "slice_end",
+                "name": name,
+                "level": level,
+                "ts": ts,
+                "attrs": attrs,
+                "thread_finish_flag": thread_finish_flag,
+            }
+        )
 
-    def trace_slice(self, slice_ctx: TraceSliceContext, thread_finish_flag: bool = False) -> None:
+    def trace_slice(
+        self, slice_ctx: TraceSliceContext, thread_finish_flag: bool = False
+    ) -> None:
         if self._check_fast_return(slice_ctx.level):
             return
 
@@ -790,17 +822,25 @@ class TraceReqContextAsync:
             ]
         self._append_op(op)
 
-    def trace_event(self, name: str, level: int, ts: Optional[int] = None, attrs: Optional[Dict[str, Any]] = None) -> None:
+    def trace_event(
+        self,
+        name: str,
+        level: int,
+        ts: Optional[int] = None,
+        attrs: Optional[Dict[str, Any]] = None,
+    ) -> None:
         if self._check_fast_return(level):
             return
         ts = ts or _trace_mod.get_cur_time_ns()
-        self._append_op({
-            "type": "event",
-            "name": name,
-            "level": level,
-            "ts": ts,
-            "attrs": attrs,
-        })
+        self._append_op(
+            {
+                "type": "event",
+                "name": name,
+                "level": level,
+                "ts": ts,
+                "attrs": attrs,
+            }
+        )
 
     def trace_set_root_attrs(self, attrs: Dict[str, Any]):
         if not self.tracing_enable:
@@ -833,7 +873,9 @@ class TraceReqContextAsync:
             self._init_last_span_context = None
         self._append_op(op)
 
-    def abort(self, ts: Optional[int] = None, abort_info: Optional[Dict] = None) -> None:
+    def abort(
+        self, ts: Optional[int] = None, abort_info: Optional[Dict] = None
+    ) -> None:
         if not self.tracing_enable:
             return
         ts = ts or _trace_mod.get_cur_time_ns()
@@ -882,7 +924,7 @@ class TraceReqContextAsync:
         copied._span_id_stack = []
         copied._last_span_id = self._last_span_id
         copied._caller_pid = 0
-        copied._context_id = id(copied)
+        copied._context_id = random.getrandbits(64)
         copied._init_last_span_context = None
         return copied
 
@@ -914,10 +956,13 @@ class TraceReqContextAsync:
         if self._root_span_carrier and last_id:
             tp_parts = self._root_span_carrier.get("traceparent", "").split("-")
             if len(tp_parts) >= 2:
-                state["last_span_context"] = {
-                    "trace_id": int(tp_parts[1], 16),
-                    "span_id": last_id,
-                }
+                try:
+                    state["last_span_context"] = {
+                        "trace_id": int(tp_parts[1], 16),
+                        "span_id": last_id,
+                    }
+                except ValueError:
+                    pass
 
         return state
 
@@ -944,7 +989,7 @@ class TraceReqContextAsync:
         self._id_rng = random.Random(time.time_ns() ^ os.getpid() ^ id(self))
         self._span_id_stack = []
         self._caller_pid = 0
-        self._context_id = id(self)
+        self._context_id = random.getrandbits(64)
 
         # Restore last_span_id for continued span ID tracking.
         lsc = state.get("last_span_context")
@@ -955,10 +1000,12 @@ class TraceReqContextAsync:
         self._init_last_span_context = lsc
 
         # Send init info to exporter for this deserialized context.
-        self._append_op({
-            "type": "init",
-            "init_args": self._init_args,
-        })
+        self._append_op(
+            {
+                "type": "init",
+                "init_args": self._init_args,
+            }
+        )
 
         # Restore root_span_context for local use.
         if self._root_span_carrier:
@@ -973,16 +1020,19 @@ class TraceReqContextAsync:
         if not getattr(self, "tracing_enable", False):
             return
         try:
-            self._operations.append({
-                "type": "abort",
-                "ts": _trace_mod.get_cur_time_ns(),
-                "abort_info": {"reason": "have unclosed span, auto closed"},
-            })
-            self._flush()
-        except Exception:
+            if hasattr(self, "_operations") and self._operations is not None:
+                self._operations.append(
+                    {
+                        "type": "abort",
+                        "ts": _trace_mod.get_cur_time_ns(),
+                        "abort_info": {"reason": "have unclosed span, auto closed"},
+                    }
+                )
+                self._flush()
+        except BaseException:
             pass
-        if self.root_span and not getattr(self, "is_copy", False):
+        if getattr(self, "root_span", None) and not getattr(self, "is_copy", False):
             try:
                 self.root_span.end()
-            except Exception:
+            except BaseException:
                 pass
