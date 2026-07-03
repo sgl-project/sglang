@@ -12,6 +12,13 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.lingbot_world.constants import (
+    LINGBOT_C2WS_PLUCKER_EMB_CACHE,
+    LINGBOT_CAM_CONDITIONER_CACHE,
+    LINGBOT_CAMERA_ACTIONS_CONDITION,
+    LINGBOT_INTERACTIVE_KV_WINDOW_CACHE,
+    LINGBOT_PROMPT_UPDATED_CONDITION,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
@@ -27,13 +34,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.realtime.constants.lingbot_world import (
-    LINGBOT_C2WS_PLUCKER_EMB_CACHE,
-    LINGBOT_CAM_CONDITIONER_CACHE,
-    LINGBOT_CAMERA_ACTIONS_CONDITION,
-    LINGBOT_INTERACTIVE_KV_WINDOW_CACHE,
-    LINGBOT_PROMPT_UPDATED_CONDITION,
-)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -139,8 +139,20 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> None:
+        self._reset_causal_cache_config_defaults()
         super()._apply_causal_cache_overrides(batch, server_args)
         self._sync_interactive_kv_cache_window(server_args)
+
+    def _reset_causal_cache_config_defaults(self) -> None:
+        arch_config = getattr(
+            getattr(self.transformer, "config", None), "arch_config", None
+        )
+        if arch_config is None:
+            return
+        if hasattr(arch_config, "sink_size"):
+            self.sink_size = int(arch_config.sink_size)
+        if hasattr(arch_config, "sliding_window_num_frames"):
+            self.sliding_window_num_frames = int(arch_config.sliding_window_num_frames)
 
     def _sync_interactive_kv_cache_window(self, server_args: ServerArgs) -> None:
         if not self._interactive_kv_window_enabled(server_args):

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import msgspec.msgpack
 import numpy as np
+import pytest
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
@@ -335,6 +336,36 @@ def test_lingbot_realtime_adapter_ingests_composite_input_event():
         lingbot_realtime.LINGBOT_CAMERA_ACTIONS_CONDITION
     ] == [["w"], ["d"], []]
     assert adapter.get_realtime_event_id(session) == 9
+
+
+def test_lingbot_realtime_adapter_rejects_composite_input_atomically():
+    adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
+    session = GenerateSession()
+    session.set_adapter(adapter)
+    session.set_request(
+        RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="walk forward",
+        )
+    )
+
+    composite_event = RealtimeEvent(
+        type="event",
+        kind="composite_input",
+        payload={
+            "input_types": ["prompt", "camera_actions"],
+            "prompt": "turn left",
+            "camera_actions": ["w"],
+        },
+        event_id=10,
+    )
+
+    with pytest.raises(ValueError, match="camera_actions"):
+        adapter.ingest_event(session, composite_event)
+
+    state = adapter._state(session)
+    assert not state.has_prompt()
+    assert state.sample_camera_actions(3) is None
 
 
 def test_lingbot_realtime_prompt_event_marks_crossattn_reset():

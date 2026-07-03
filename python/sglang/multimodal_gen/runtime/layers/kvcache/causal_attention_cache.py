@@ -119,6 +119,11 @@ class CausalSelfAttentionKVCache:
             current_chunk_start: the global position of the start of the chunk
             cache_head_start: first cache head for key/value when they only
                 carry a local slice of the cache heads; other heads are left untouched
+            recent_window_tokens: dynamic attention sampling window. ``None``
+                returns the full visible attention window. ``0`` keeps only sink
+                tokens plus the current chunk. A positive value keeps sink tokens,
+                up to that many tokens before the current chunk, and the current
+                chunk. Negative values are invalid.
 
         """
         num_new_tokens = key.shape[1]
@@ -305,6 +310,8 @@ class CausalSelfAttentionKVCache:
         recent_window_tokens: int | None,
         cache_head_slice: slice | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # None disables dynamic sampling. Zero is a valid setting and means
+        # sink tokens plus the current chunk only.
         if recent_window_tokens is None:
             if cache_head_slice is None:
                 return (
