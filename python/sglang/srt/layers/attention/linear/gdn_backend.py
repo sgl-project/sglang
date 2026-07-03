@@ -119,12 +119,51 @@ if _HAVE_TRITON:
         tl.store(base + r[:, None] * C + r[None, :], M)
 
     @triton.jit
+    def _gdn_replay_A_kernel(
+        kn_ptr,
+        kb_ptr,
+        gcum_ptr,  # kn,kb [w,HV,Dk]; gcum [w,HV]
+        A_ptr,  # out: [HV, CS, CS] strictly-lower A_strict
+        W,
+        HV: tl.constexpr,
+        Dk: tl.constexpr,
+        CS: tl.constexpr,
+    ):
+        """One program per value-head. Computes A_strict = -(kb @ kn^T)*decay (strictly lower)
+        and STORES it to a global fp32 tensor. Splitting this out (vs inlining the solve) is what
+        makes the replay bit-identical to torch_chunk: torch_chunk feeds the standalone
+        _fwd_sub_kernel an A that was rounded to fp32 in global memory by its `@`, whereas an
+        inline solve consumed A while still register-resident (tl.dot accumulator, unrounded),
+        drifting ~1 fp32 ULP and tipping a bf16 boundary on ~1% of real decode tokens.
+        """
+        h = tl.program_id(0)
+        r = tl.arange(0, CS)
+        dk = tl.arange(0, Dk)
+        valid = r < W
+        kn = tl.load(
+            kn_ptr + (r[:, None] * HV + h) * Dk + dk[None, :], mask=valid[:, None], other=0.0
+        )
+        kb = tl.load(
+            kb_ptr + (r[:, None] * HV + h) * Dk + dk[None, :], mask=valid[:, None], other=0.0
+        )
+        gcum = tl.load(gcum_ptr + r * HV + h, mask=valid, other=0.0)
+        # See main kernel for the exponent-masking rationale (guards inf*0=NaN on padded rows /
+        # the discarded upper triangle).
+        kept = (r[:, None] >= r[None, :]) & valid[:, None] & valid[None, :]
+        gd = tl.where(kept, gcum[:, None] - gcum[None, :], 0.0)
+        decay = tl.where(kept, libdevice.exp(gd), 0.0)
+        A = -tl.dot(kb, tl.trans(kn), input_precision="ieee") * decay
+        A = tl.where(r[:, None] > r[None, :], A, 0.0)
+        tl.store(A_ptr + (h * CS + r[:, None]) * CS + r[None, :], A)
+
+    @triton.jit
     def _gdn_fused_replay_kernel(
         qn_ptr,
         kn_ptr,
         kb_ptr,
         vb_ptr,
         gcum_ptr,  # qn,kn,kb [w,HV,Dk]; vb [w,HV,Dv]; gcum [w,HV]
+        T_ptr,  # [HV, CS, CS] strictly-lower solve output (from _fwd_sub_kernel); eye added here
         S_ptr,
         out_ptr,
         Snew_ptr,
@@ -142,8 +181,10 @@ if _HAVE_TRITON:
 
         The elementwise reductions torch.cumsum / l2norm-sum are NOT done here (tl.cumsum and
         tl.sum diverge from torch's reduction order); they are precomputed in _gdn_replay_prep
-        and passed in as qn/kn/kb/vb/gcum. The kernel does only tl.dot matmuls, libdevice.exp,
-        and the shared forward-sub solve, all proven bit-exact vs torch under batch_invariant.
+        and passed in as qn/kn/kb/vb/gcum. The forward-substitution solve is ALSO not done here:
+        T is precomputed via the shared _fwd_sub_kernel on a globally-rounded A (an inline solve
+        drifts ~1 fp32 ULP, see _gdn_replay_A_kernel). This kernel does only tl.dot matmuls and
+        libdevice.exp, all proven bit-exact vs torch_chunk under batch_invariant.
         """
         pid = tl.program_id(0)
         bt = pid // HV
@@ -177,21 +218,11 @@ if _HAVE_TRITON:
         gd = tl.where(kept, gcum[:, None] - gcum[None, :], 0.0)
         decay = tl.where(kept, libdevice.exp(gd), 0.0)
 
-        # input_precision="ieee": every tl.dot uses true fp32 (no tf32), matching torch_chunk's
-        # bmm (which routes through the batch_invariant persistent kernel, also ieee) and Megatron
-        # bit-for-bit. Default tl.dot would use tf32 and diverge ~1.5e-2.
-        A = -tl.dot(kb, tl.trans(kn), input_precision="ieee") * decay
-        A = tl.where(r[:, None] > r[None, :], A, 0.0)
-        # forward substitution (mirrors _fwd_sub_kernel exactly)
-        T = A
-        for i in range(1, CS):
-            a_im = tl.where(
-                (r < i), tl.sum(tl.where(r[:, None] == i, T, 0.0), 0), 0.0
-            )
-            acc = tl.sum(a_im[:, None] * T, 0)
-            row_i = tl.sum(tl.where(r[:, None] == i, T, 0.0), 0)
-            new_row = tl.where(r < i, row_i + acc, row_i)
-            T = tl.where(r[:, None] == i, new_row[None, :], T)
+        # Load the precomputed strictly-lower solve and add the unit diagonal (torch_chunk does
+        # `attn = _solve_fwd_sub(attn) + eye`). input_precision="ieee" on every tl.dot below uses
+        # true fp32 (no tf32), matching torch_chunk's bmm (batch_invariant persistent kernel, also
+        # ieee) and Megatron bit-for-bit; default tl.dot would use tf32 and diverge ~1.5e-2.
+        T = tl.load(T_ptr + (h * CS + r[:, None]) * CS + r[None, :])
         T = T + tl.where(r[:, None] == r[None, :], 1.0, 0.0)
 
         val = tl.dot(T, vb, input_precision="ieee")
@@ -299,11 +330,21 @@ def _gdn_fused_replay(
     Dk = qh.shape[2]
     Dv = vh.shape[2]
     B = S.shape[0]
+    C = FLA_CHUNK_SIZE
+    # Compute A_strict, round it to fp32 global memory, then solve with the SAME _fwd_sub_kernel
+    # torch_chunk uses. Splitting the solve out of the main kernel (rather than inlining it while
+    # A is still a tl.dot accumulator) is what makes the replay bit-identical to torch_chunk; an
+    # inline solve drifts ~1 fp32 ULP and tips a bf16 boundary on ~1% of real decode tokens.
+    T = torch.empty(HV, C, C, device=S.device, dtype=torch.float32)
+    _gdn_replay_A_kernel[(HV,)](
+        kn, kb, gcum, T, w, HV=HV, Dk=Dk, CS=C, num_warps=4,
+    )
+    _fwd_sub_kernel[(HV,)](T, C=C)  # in-place strictly-lower solve, == torch_chunk's _solve_fwd_sub
     out = torch.empty(B, HV, Dv, device=S.device, dtype=torch.float32)
     Snew = torch.empty_like(S) if commit else S
     _gdn_fused_replay_kernel[(B * HV,)](
-        qn, kn, kb, vb, gcum, S, out, Snew,
-        w, B, HV=HV, Dk=Dk, Dv=Dv, CS=FLA_CHUNK_SIZE, COMMIT=commit, num_warps=4,
+        qn, kn, kb, vb, gcum, T, S, out, Snew,
+        w, B, HV=HV, Dk=Dk, Dv=Dv, CS=C, COMMIT=commit, num_warps=4,
     )
     return out, Snew
 
@@ -729,17 +770,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         cache_indices: torch.Tensor,
     ) -> torch.Tensor:
-        """Incremental chunk-replay decode (batch-invariant path), single fused Triton launch.
+        """Incremental chunk-replay decode (batch-invariant path).
 
         Reproduces Megatron's full-sequence torch_chunk_gated_delta_rule output for each decode
         token bit-for-bit. For every active slot we keep, since the last completed 64-boundary:
         the recurrent boundary state and the raw post-conv q/k/v + pre-gating a/b of each token
         in the partial chunk. Each step appends the new token and replays the partial chunk
-        (width = tokens-since-boundary) seeded by the boundary state via _gdn_fused_replay, which
-        is bit-identical to torch_chunk's row w-1 (elementwise prep in torch, matmuls + solve in
-        one Triton kernel). When the partial chunk reaches 64 tokens we fold a fresh boundary
-        (the kernel's commit path) and clear the buffer. Decode is inference-only, so the fused
-        kernel carries no autograd (unlike the eager torch_chunk path it replaced).
+        (width = tokens-since-boundary) with the SAME torch_chunk_gated_delta_rule Megatron uses,
+        seeded by the boundary state, taking row w-1. When the partial chunk reaches 64 tokens we
+        fold a fresh boundary (torch_chunk's returned last_recurrent_state) and clear the buffer.
+        The fused single-launch kernel (_gdn_fused_replay) was ~1e-6..1e-3 off torch_chunk in fp32
+        on real activations and crossed a bf16 boundary on ~1% of tokens, so torch_chunk is used
+        directly. Decode is inference-only, so no autograd is needed.
 
         mixed_qkv: [B, q_dim+k_dim+v_dim] post-conv, one decode token per row.
         a, b: [B, HV] pre-gating inputs. Returns [1, B, HV, head_v_dim].
@@ -753,7 +795,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         v_tok = v_flat.view(B, layer.num_v_heads, layer.head_v_dim)
         cidx_cpu = cache_indices.tolist()
         outputs = mixed_qkv.new_empty(B, layer.num_v_heads, layer.head_v_dim)
-        zero_cidx = torch.zeros(1, dtype=torch.long, device=mixed_qkv.device)
 
         for j in range(B):
             slot = cidx_cpu[j]
@@ -784,11 +825,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             a_seq = torch.stack(entry["a"], dim=0)  # [w, HV]
             b_seq = torch.stack(entry["b"], dim=0)
             commit = w == FLA_CHUNK_SIZE
-            core, last = _gdn_fused_replay(
-                q_seq, k_seq, v_seq, a_seq, b_seq,
-                layer.A_log, layer.dt_bias, entry["boundary"], commit,
+            # Replay the partial chunk with the fused single-launch kernel, which is now
+            # fp32-bit-identical to the torch_chunk_gated_delta_rule Megatron uses (row w-1 and,
+            # on the 64th token, the folded boundary state). The earlier fused kernel drifted
+            # ~1 fp32 ULP because it solved the forward-substitution inline off an unrounded
+            # tl.dot accumulator; _gdn_fused_replay now rounds A to global memory and runs the
+            # SAME _fwd_sub_kernel torch_chunk does, so decode reproduces the full-sequence
+            # per-token output bit-for-bit. Decode is inference-only so no autograd is needed.
+            out_j, last = _gdn_fused_replay(
+                q_seq, k_seq, v_seq, a_seq, b_seq, layer.A_log, layer.dt_bias,
+                entry["boundary"], commit,
             )
-            outputs[j] = core[0]
+            outputs[j] = out_j[0].to(outputs.dtype)
             if commit:
                 # Completed a 64-chunk: fold it into a fresh boundary and reset the token buffer.
                 entry["boundary"] = last

@@ -112,37 +112,100 @@ class TestGDNChunkReplayDecode(unittest.TestCase):
 
     def test_fused_replay_matches_torch_chunk_seeded(self):
         """Direct fused-kernel vs torch_chunk replay over a single partial chunk seeded by a
-        nonzero boundary state S (the misaligned-prompt path decode continues from)."""
-        with set_batch_invariant_mode(True):
-            HV, HK, K, V = 12, 4, 128, 128
-            torch.manual_seed(0)
-            A_log = torch.randn(HV, device="cuda")
-            dt_bias = torch.randn(HV, device="cuda")
-            for w in [1, 5, 32, 63]:
-                torch.manual_seed(w + 100)
-                qh = torch.randn(w, HK, K, device="cuda", dtype=torch.bfloat16)
-                kh = torch.randn(w, HK, K, device="cuda", dtype=torch.bfloat16)
-                vh = torch.randn(w, HV, V, device="cuda", dtype=torch.bfloat16)
-                a = torch.randn(w, HV, device="cuda", dtype=torch.bfloat16)
-                b = torch.randn(w, HV, device="cuda", dtype=torch.bfloat16)
-                S = torch.randn(1, HV, K, V, device="cuda", dtype=torch.float32) * 0.2
+        nonzero boundary state S (the misaligned-prompt path decode continues from).
 
-                out, _ = _gdn_fused_replay(qh, kh, vh, a, b, A_log, dt_bias, S, w == C)
-                g, beta = torch_gdn_gating(A_log, a, b, dt_bias)
-                ref, _, _ = torch_chunk_gated_delta_rule(
-                    qh.view(1, w, HK, K),
-                    kh.view(1, w, HK, K),
-                    vh.view(1, w, HV, V),
-                    g=g,
-                    beta=beta,
-                    ssm_states=S,
-                    cache_indices=torch.zeros(1, dtype=torch.long, device="cuda"),
-                    query_start_loc=torch.tensor([0, w], dtype=torch.int32, device="cuda"),
-                )
-                self.assertTrue(
-                    torch.equal(out[0].to(torch.bfloat16), ref[0, -1]),
-                    msg=f"w={w} fused replay not bit-identical to torch_chunk",
-                )
+        Asserts FP32 bit-identity (not just bf16). torch_chunk casts its output to bf16, so an
+        fp32 compare needs torch_chunk's pre-cast fp32 value; we recompute it via the same
+        _gdn_replay_prep + _solve_fwd_sub the kernel uses (both proven == torch_chunk internals).
+        An fp32 gap here is what previously tipped a bf16 boundary on ~1% of real decode tokens
+        while bf16-random tests stayed green, so the fp32 assertion is the real regression guard.
+        Runs real Qwen3.6 GDN dims (HV=48, HK=16) plus the small GQA shape.
+        """
+        with set_batch_invariant_mode(True):
+            for HV, HK, K, V in [(48, 16, 128, 128), (12, 4, 128, 128)]:
+                torch.manual_seed(HV)
+                A_log = torch.randn(HV, device="cuda")
+                dt_bias = torch.randn(HV, device="cuda")
+                for w in [1, 5, 30, 32, 63, 64]:
+                    torch.manual_seed(w + 100)
+                    qh = torch.randn(w, HK, K, device="cuda", dtype=torch.bfloat16)
+                    kh = torch.randn(w, HK, K, device="cuda", dtype=torch.bfloat16)
+                    vh = torch.randn(w, HV, V, device="cuda", dtype=torch.bfloat16)
+                    a = torch.randn(w, HV, device="cuda", dtype=torch.bfloat16)
+                    b = torch.randn(w, HV, device="cuda", dtype=torch.bfloat16)
+                    S = torch.randn(1, HV, K, V, device="cuda", dtype=torch.float32) * 0.2
+                    commit = w == C
+
+                    out, Snew = _gdn_fused_replay(qh, kh, vh, a, b, A_log, dt_bias, S, commit)
+
+                    # bf16 vs torch_chunk public output
+                    g, beta = torch_gdn_gating(A_log, a, b, dt_bias)
+                    ref, last, _ = torch_chunk_gated_delta_rule(
+                        qh.view(1, w, HK, K),
+                        kh.view(1, w, HK, K),
+                        vh.view(1, w, HV, V),
+                        g=g,
+                        beta=beta,
+                        ssm_states=S,
+                        cache_indices=torch.zeros(1, dtype=torch.long, device="cuda"),
+                        query_start_loc=torch.tensor([0, w], dtype=torch.int32, device="cuda"),
+                    )
+                    self.assertTrue(
+                        torch.equal(out[0].to(torch.bfloat16), ref[0, -1]),
+                        msg=f"HV={HV} w={w} fused replay not bf16-identical to torch_chunk",
+                    )
+
+                    # fp32 vs torch_chunk's pre-bf16-cast core (the tight guard)
+                    core_fp32, snew_fp32 = self._torch_chunk_fp32(
+                        qh, kh, vh, a, b, A_log, dt_bias, S
+                    )
+                    self.assertTrue(
+                        torch.equal(out[0], core_fp32[:, w - 1]),
+                        msg=f"HV={HV} w={w} fused replay not FP32-identical to torch_chunk core",
+                    )
+                    if commit:
+                        self.assertTrue(
+                            torch.equal(Snew[0], snew_fp32),
+                            msg=f"HV={HV} w={w} fused replay boundary Snew not FP32-identical",
+                        )
+
+    def _torch_chunk_fp32(self, qh, kh, vh, a, b, A_log, dt_bias, S):
+        """torch_chunk single-chunk math in fp32 WITHOUT the final bf16 cast, returning
+        (core [HV,64,V], Snew [HV,K,V]). Uses the same _gdn_replay_prep + _solve_fwd_sub the
+        kernel does; both are proven == torch_chunk's internal q/k/kb/vb/gcum and solve."""
+        import torch.nn.functional as F
+
+        from sglang.srt.layers.attention.linear.gdn_backend import (
+            _gdn_replay_prep,
+            _solve_fwd_sub,
+        )
+
+        qn, kn, kb, vb, gcum = _gdn_replay_prep(qh, kh, vh, a, b, A_log, dt_bias)
+        w, HV, Dk = qn.shape
+        dev = qn.device
+
+        def pad(x):  # [w,HV,D] -> [HV,64,D]
+            return F.pad(x.transpose(0, 1).contiguous(), (0, 0, 0, C - w)).contiguous()
+
+        qn, kn, kb, vb = pad(qn), pad(kn), pad(kb), pad(vb)
+        gc = gcum.transpose(0, 1).contiguous()  # [HV,w]
+        # torch_chunk pads g pre-cumsum, so padded positions flatten at the boundary value.
+        gc = torch.cat([gc, gc[:, -1:].expand(-1, C - w)], dim=1) if w < C else gc
+        decay = ((gc.unsqueeze(-1) - gc.unsqueeze(-2)).tril().exp().float()).tril()
+        tri0 = torch.triu(torch.ones(C, C, dtype=torch.bool, device=dev), 0)
+        A = -((kb @ kn.transpose(-1, -2)) * decay).masked_fill(tri0, 0)
+        T = _solve_fwd_sub(A) + torch.eye(C, device=dev)
+        value = T @ vb
+        kcd = T @ (kb * gc.exp().unsqueeze(-1))
+        Sh = S[0]
+        vnew = value - kcd @ Sh
+        tri1 = torch.triu(torch.ones(C, C, dtype=torch.bool, device=dev), 1)
+        attn2 = ((qn @ kn.transpose(-1, -2)) * decay).masked_fill(tri1, 0)
+        core = (qn * gc.exp().unsqueeze(-1)) @ Sh + attn2 @ vnew
+        glast = gc[:, -1]
+        kdec = kn * (glast[:, None] - gc).exp().unsqueeze(-1)
+        snew = Sh * glast[:, None, None].exp() + kdec.transpose(-1, -2) @ vnew
+        return core, snew
 
     def test_pad_slot_returns_zeros(self):
         with set_batch_invariant_mode(True):
