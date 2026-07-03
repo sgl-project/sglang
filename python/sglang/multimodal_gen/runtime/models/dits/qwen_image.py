@@ -173,6 +173,65 @@ def _pad_shard_text_for_sp_varlen(
     return encoder_hidden_states, freqs_cis, joint_mask, gap_meta
 
 
+def _mask_shard_text_for_sp(
+    encoder_hidden_states: torch.Tensor,
+    freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    text_key_mask: torch.Tensor,
+    image_seq_len: int,
+) -> Tuple[
+    torch.Tensor,
+    Optional[Tuple[torch.Tensor, torch.Tensor]],
+    torch.Tensor,
+    Dict[str, torch.Tensor],
+]:
+    """Shard a *padded, variable-length* text stream across SP ranks.
+
+    Masked counterpart of ``_pad_shard_text_for_sp_varlen``: used when the
+    request carries a per-row text validity mask (batched prompts of different
+    tokenized lengths). The text is right-padded to an SP multiple and evenly
+    sharded so the joint ``[text, image]`` sequence is fully sequence-parallel
+    (``num_replicated_prefix=0``) instead of the text being replicated on every
+    rank and recomputed there.
+
+    Validity is per row (not a single contiguous pad block), so the returned
+    metadata is a full varlen ``cu_seqlens`` mask (via ``build_varlen_mask_meta``)
+    rather than a single ``gap_start``/``gap_end``. Single-request (batch 1)
+    never reaches this path — the pipeline sends no mask when every row is full
+    length — so the single-request path is unchanged.
+    """
+    sp_size = get_sp_world_size()
+    t_real = text_key_mask.shape[1]
+    num_pad = (-t_real) % sp_size
+
+    if num_pad:
+        encoder_hidden_states = F.pad(encoder_hidden_states, (0, 0, 0, num_pad))
+        text_key_mask = F.pad(text_key_mask, (0, num_pad), value=False)
+        if freqs_cis is not None:
+            img_cache, txt_cache = freqs_cis
+            txt_cache = F.pad(txt_cache, (0, 0, 0, num_pad))
+            freqs_cis = (img_cache, txt_cache)
+
+    encoder_hidden_states, freqs_cis = _shard_text_for_sp(
+        encoder_hidden_states, freqs_cis
+    )
+    sp_rank = get_sp_parallel_rank()
+    text_mask_local = torch.chunk(text_key_mask, sp_size, dim=1)[sp_rank]
+
+    image_mask = torch.ones(
+        encoder_hidden_states.shape[0],
+        image_seq_len,
+        dtype=torch.bool,
+        device=encoder_hidden_states.device,
+    )
+    joint_mask = torch.cat([text_mask_local, image_mask], dim=1)
+    return (
+        encoder_hidden_states,
+        freqs_cis,
+        joint_mask,
+        build_varlen_mask_meta(joint_mask),
+    )
+
+
 def _get_qkv_projections(
     attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
 ):
@@ -1508,18 +1567,43 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 device=hidden_states.device, dtype=torch.bool
             )
             batch_size, image_seq_len = hidden_states.shape[:2]
-            image_mask = torch.ones(
-                (batch_size, image_seq_len),
-                dtype=torch.bool,
-                device=hidden_states.device,
-            )
-            joint_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
-            block_attention_kwargs["attn_mask"] = joint_mask
-            # Precompute varlen metadata once per request so every block reuses
-            # the same cu_seqlens / indices instead of rebuilding.
-            block_attention_kwargs["attn_mask_meta"] = build_varlen_mask_meta(
-                joint_mask
-            )
+            if sp_size > 1 and get_ring_parallel_world_size() == 1:
+                # Batched variable-length text under SP: shard the (masked) text
+                # across ranks instead of replicating it, so the joint sequence
+                # is fully sequence-parallel. The per-row validity is carried in
+                # the sharded joint varlen mask. Same machinery as the uneven
+                # no-mask branch below, just with the request's own text mask.
+                # (batch 1 sends no mask, so the single-request path is untouched;
+                # ring>1 keeps replicating — varlen masked path lacks ring support.)
+                (
+                    encoder_hidden_states,
+                    freqs_cis,
+                    joint_mask,
+                    joint_meta,
+                ) = _mask_shard_text_for_sp(
+                    encoder_hidden_states,
+                    freqs_cis,
+                    encoder_hidden_states_mask,
+                    image_seq_len,
+                )
+                sp_text_sharded = True
+                block_attention_kwargs["attn_mask"] = joint_mask
+                block_attention_kwargs["attn_mask_meta"] = joint_meta
+            else:
+                image_mask = torch.ones(
+                    (batch_size, image_seq_len),
+                    dtype=torch.bool,
+                    device=hidden_states.device,
+                )
+                joint_mask = torch.cat(
+                    [encoder_hidden_states_mask, image_mask], dim=1
+                )
+                block_attention_kwargs["attn_mask"] = joint_mask
+                # Precompute varlen metadata once per request so every block
+                # reuses the same cu_seqlens / indices instead of rebuilding.
+                block_attention_kwargs["attn_mask_meta"] = build_varlen_mask_meta(
+                    joint_mask
+                )
         elif sp_size > 1 and encoder_hidden_states.shape[1] % sp_size == 0:
             # Text divides evenly across SP ranks: plain even shard, no mask.
             encoder_hidden_states, freqs_cis = _shard_text_for_sp(
