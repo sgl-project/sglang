@@ -2364,6 +2364,61 @@ class UnifiedRadixCacheSuite:
         )
         cache.sanity_check()
 
+    def test_hicache_l3_write_storage_split_publishes_all_fragments(self):
+        """A split while the L3 backup is in flight must still publish every page."""
+        if self._skip_unsupported_hicache_test():
+            return
+        if self.cfg.has_mamba:
+            self.skipTest("mamba L3 offload is out of scope for this unit fixture")
+
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+
+        tree, allocator, req_to_token_pool = build_fixture(
+            self.cfg, enable_kv_cache_events=True
+        )
+        self._init_hicache(
+            tree,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+        )
+
+        seq = self._make_seq(1, 4)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        leaf = m.last_device_node
+
+        self._backup_node(tree, leaf)
+        self.assertTrue(leaf.hash_value)
+        tree.take_events()
+        self.assertTrue(tree.ongoing_backup)
+
+        # Fork off the first two pages while the L3 backup is still in flight.
+        fork = seq[: 2 * self.cfg.page_size] + self._make_seq(9000, 2)
+        self._insert(tree, allocator, req_to_token_pool, fork)
+        tree.take_events()
+
+        self._flush_l3_backups(tree)
+
+        # Both split fragments must be published, with intact parentage.
+        stored_external = [
+            e
+            for e in tree.take_events()
+            if isinstance(e, BlockStored) and e.medium == StorageMedium.EXTERNAL
+        ]
+        self.assertEqual(
+            [list(e.token_ids) for e in stored_external],
+            [
+                list(seq[i : i + self.cfg.page_size])
+                for i in range(0, len(seq), self.cfg.page_size)
+            ],
+        )
+        self.assertIsNone(stored_external[0].parent_block_hash)
+        for prev, cur in zip(stored_external, stored_external[1:]):
+            self.assertEqual(cur.parent_block_hash, prev.block_hashes[0])
+        tree.sanity_check()
+
     def test_hicache_l3_write_storage_mooncake_mock_publishes_external_events(self):
         """D->H->L3 offload publishes EXTERNAL events with a mocked Mooncake store."""
         if self._skip_unsupported_hicache_test():

@@ -101,6 +101,7 @@ class UnifiedTreeNode:
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
         self.write_through_pending_id: Optional[int] = None
+        self.backup_pending_id: Optional[int] = None
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -280,6 +281,14 @@ class _OngoingWriteThrough(NamedTuple):
 
     node: UnifiedTreeNode
     lock_params: Optional[DecLockRefParams]
+    publish_nodes: list[UnifiedTreeNode]
+
+
+class _OngoingBackup(NamedTuple):
+    """Tracks an in-flight H→L3 storage backup operation."""
+
+    node: UnifiedTreeNode
+    lock_params: DecLockRefParams
     publish_nodes: list[UnifiedTreeNode]
 
 
@@ -468,7 +477,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
-        self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
+        self.ongoing_backup: dict[int, _OngoingBackup] = {}
 
         if self.cache_controller is not None:
             self.cache_controller.reset()
@@ -1036,6 +1045,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if child.backuped:
             self._replace_pending_write_through_node(child, [new_node, child])
+            self._replace_pending_backup_node(child, [new_node, child])
 
         self._for_each_component_lru(
             new_node, UnifiedLRUList.insert_mru, skip_existing=True
@@ -1635,6 +1645,41 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             updated_nodes,
         )
 
+    def _replace_pending_backup_node(
+        self, old_node: UnifiedTreeNode, new_nodes: list[UnifiedTreeNode]
+    ) -> None:
+        # Mirror of _replace_pending_write_through_node for the H->L3 path:
+        # the EXTERNAL store event is published on ack, so publish_nodes must
+        # track splits that happen while the backup is in flight.
+        ack_id = old_node.backup_pending_id
+        if ack_id is None:
+            return
+
+        pending = self.ongoing_backup.get(ack_id)
+        if pending is None:
+            return
+
+        lock_node, lock_params, publish_nodes = pending
+        updated_nodes = []
+        replaced = False
+        for node in publish_nodes:
+            if node is old_node:
+                updated_nodes.extend(new_nodes)
+                replaced = True
+            else:
+                updated_nodes.append(node)
+
+        if not replaced:
+            return
+
+        for node in new_nodes:
+            node.backup_pending_id = ack_id
+        self.ongoing_backup[ack_id] = _OngoingBackup(
+            lock_node,
+            lock_params,
+            updated_nodes,
+        )
+
     def _finish_write_through_ack(self, ack_id: int) -> None:
         lock_node, lock_params, publish_nodes = self.ongoing_write_through.pop(ack_id)
         for node in publish_nodes:
@@ -1857,10 +1902,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prefix_keys,
             extra_pools=aux_xfers or None,
         )
-        self.ongoing_backup[operation_id] = (
+        self.ongoing_backup[operation_id] = _OngoingBackup(
             node,
             self.inc_host_lock_ref(node).to_dec_params(),
+            [node],
         )
+        node.backup_pending_id = operation_id
 
     def prefetch_from_storage(
         self,
@@ -2163,12 +2210,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 drained += 1
                 entry = self.ongoing_backup.pop(operation.id, None)
                 if entry is not None:
-                    node, lock_params = entry
+                    node, lock_params, publish_nodes = entry
                     # Non-owner ranks can receive a zero-token ack when L3
                     # backup is skipped. Partial writes must not publish the
                     # whole node as externally stored.
-                    if operation.completed_tokens >= len(operation.token_ids):
-                        self._record_store_event(node, medium=StorageMedium.EXTERNAL)
+                    publish = operation.completed_tokens >= len(operation.token_ids)
+                    for publish_node in publish_nodes:
+                        if publish_node.backup_pending_id == operation.id:
+                            publish_node.backup_pending_id = None
+                        if publish:
+                            self._record_store_event(
+                                publish_node, medium=StorageMedium.EXTERNAL
+                            )
                     self.dec_host_lock_ref(node, lock_params)
                 if (
                     log_metrics

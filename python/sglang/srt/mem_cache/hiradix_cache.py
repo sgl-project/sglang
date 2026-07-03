@@ -552,7 +552,10 @@ class HiRadixCache(RadixCache):
         # Force release leftover backup ops: drop host protection on nodes.
         try:
             for ack_id, entry in list(self.ongoing_backup.items()):
-                node, _publish_nodes = entry
+                node, publish_nodes = entry
+                for publish_node in publish_nodes:
+                    if publish_node.backup_pending_id == ack_id:
+                        publish_node.backup_pending_id = None
                 try:
                     node.release_host()
                 except Exception:
@@ -614,8 +617,11 @@ class HiRadixCache(RadixCache):
                     # Non-owner ranks can receive a zero-token ack when L3
                     # backup is skipped. Partial writes must not publish the
                     # whole node as externally stored.
-                    if operation.completed_tokens >= len(operation.token_ids):
-                        for publish_node in publish_nodes:
+                    publish = operation.completed_tokens >= len(operation.token_ids)
+                    for publish_node in publish_nodes:
+                        if publish_node.backup_pending_id == ack_id:
+                            publish_node.backup_pending_id = None
+                        if publish:
                             self._record_store_event(
                                 publish_node, medium=StorageMedium.EXTERNAL
                             )
@@ -891,7 +897,40 @@ class HiRadixCache(RadixCache):
             host_value, key, hash_value, prefix_keys, **self._get_extra_pools()
         )
         self.ongoing_backup[operation_id] = (node, publish_nodes)
+        for publish_node in publish_nodes:
+            publish_node.backup_pending_id = operation_id
         node.protect_host()
+
+    def _replace_pending_backup_node(
+        self, old_node: TreeNode, new_nodes: List[TreeNode]
+    ) -> None:
+        # Mirror of _replace_pending_write_through_node for the H->L3 path:
+        # the EXTERNAL store event is published on ack, so publish_nodes must
+        # track splits that happen while the backup is in flight.
+        ack_id = old_node.backup_pending_id
+        if ack_id is None:
+            return
+
+        pending = self.ongoing_backup.get(ack_id)
+        if pending is None:
+            return
+
+        lock_node, publish_nodes = pending
+        updated_nodes = []
+        replaced = False
+        for node in publish_nodes:
+            if node is old_node:
+                updated_nodes.extend(new_nodes)
+                replaced = True
+            else:
+                updated_nodes.append(node)
+
+        if not replaced:
+            return
+
+        for node in new_nodes:
+            node.backup_pending_id = ack_id
+        self.ongoing_backup[ack_id] = (lock_node, updated_nodes)
 
     def _concat_split_chain(self, node: TreeNode, backup_len: int):
         """Recover enqueue-time key/hash/host by walking the split chain."""
@@ -1747,6 +1786,7 @@ class HiRadixCache(RadixCache):
 
         if child.backuped:
             self._replace_pending_write_through_node(child, [new_node, child])
+            self._replace_pending_backup_node(child, [new_node, child])
 
         return new_node
 
