@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CI_DATA_REVISION = "66ddcdda1deededcaa68cb970d1fac72bb56c987"
+SGL_TEST_FILES_CI_DATA_REVISION = "c28c11c24125b009f9e602fd5ae0d0ddcdc11d36"
 
 if current_platform.is_npu():
     SGL_TEST_FILES_CI_DATA_REVISION = "670d66a8a290b62c0c3c077b3e9b0f4a4d9a44e7"
@@ -101,9 +101,7 @@ OFFICIAL_CONSISTENCY_GT_SKIP_CASES = frozenset(
         # Official references for these cases need regeneration or parity triage.
         # Prefer existing sglang-generated GT instead of relaxing thresholds over
         # large semantic/content mismatches.
-        "ltx_2_3_hq_pipeline",
         "ltx_2_two_stage_t2v",
-        "qwen_image_edit_2509_ti2i",
     }
 )
 # Case keys whose remote GT has been positively confirmed present. Cached so a
