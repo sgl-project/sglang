@@ -528,9 +528,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Model-specific adjustment
         self.model_specific_adjustment()
 
-        # Set the global server_args in the scheduler process. Draft workers
-        # share the scheduler's ServerArgs object, so skip re-publishing to
-        # keep target-derived global state (e.g. use_mla_backend) intact.
+        # Set the global server_args in the scheduler process (target worker
+        # only, so a draft init cannot clobber target-derived global state).
         if not self.is_draft_worker:
             set_global_server_args_for_scheduler(server_args)
             # FIXME: hacky set `use_mla_backend`

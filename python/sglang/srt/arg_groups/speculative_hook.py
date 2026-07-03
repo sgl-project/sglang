@@ -247,9 +247,8 @@ def _handle_dflash(server_args: ServerArgs) -> None:
 def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     """Resolve `speculative_draft_attention_backend` to a final, supported value.
 
-    The DFLASH draft worker consumes it through ModelRunner's `is_draft_worker`
-    override (one backend for all draft modes), so the draft TpModelWorker can
-    be constructed from the shared ServerArgs without any per-worker copy.
+    Consumed by ModelRunner's `is_draft_worker` override (one backend for all
+    draft modes).
     """
     from sglang.srt.utils import is_hip
 

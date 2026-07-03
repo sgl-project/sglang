@@ -128,12 +128,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
 
-        # Draft runner (separate KV cache + attention backend). The draft
-        # attention backend was resolved into speculative_draft_attention_backend
-        # by arg_groups.speculative_hook._handle_dflash and is applied through
-        # ModelRunner's is_draft_worker override; the target's effective context
-        # length is forwarded so the draft ModelConfig covers the target's
-        # position range.
+        # Draft runner (separate KV cache + attention backend).
         self._draft_worker = TpModelWorker(
             server_args=server_args,
             gpu_id=gpu_id,

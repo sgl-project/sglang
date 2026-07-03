@@ -262,9 +262,8 @@ class TpModelWorker(BaseTpWorker):
         self.moe_dp_rank = moe_dp_rank
         # Draft worker: target's resolved MemoryPoolConfig (forwarded to ModelRunner).
         self.memory_pool_config = memory_pool_config
-        # Draft worker: target's effective context length, so the draft
-        # ModelConfig covers the target's position range even when the draft
-        # checkpoint declares a shorter one. None keeps server_args.context_length.
+        # Draft worker: target's effective context length; the draft runs at
+        # absolute target positions. None keeps server_args.context_length.
         self.context_length = context_length
 
         # MTP model runners
@@ -279,9 +278,8 @@ class TpModelWorker(BaseTpWorker):
         self._init_dllm_algorithm()
 
         if server_args.skip_tokenizer_init or self.is_draft_worker:
-            # A draft worker's tokenizer would only duplicate the target's
-            # (tokenizer_path always points at the target model); spec workers
-            # that need a tokenizer use the target worker's.
+            # A draft worker's tokenizer would only duplicate the target's:
+            # tokenizer_path always points at the target model.
             self.tokenizer = self.processor = None
         else:
             if self.model_config.is_multimodal:
