@@ -9,6 +9,22 @@ from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 
 @dataclass
+class MoELoRABatchInfo:
+    # Per-request segment indptrs used by MoE LoRA routing, shape (bs + 1,).
+    seg_indptr: torch.Tensor
+
+    # Per-request adapter index used by MoE LoRA routing, shape (bs,).
+    req_to_lora: torch.Tensor
+
+    # A mask indicating if lora adapter is enabled. Shape (num_loras,)
+    adapter_enabled: torch.Tensor
+
+    # A mapping of which lora adapter is used for each token. Shape (num_tokens,)
+    # If a token has no lora adapter, the value is -1.
+    token_lora_mapping: torch.Tensor
+
+
+@dataclass
 class LoRABatchInfo:
     # The forward mode is using CUDA Graph.
     use_cuda_graph: bool
@@ -58,10 +74,33 @@ class LoRABatchInfo:
     # Per-request adapter index, shape (bs,).
     req_weight_indices: Optional[torch.Tensor] = None
 
+    # MoE LoRA batch info
+    moe_lora_info: Optional[MoELoRABatchInfo] = None
+
 
 class LoRAType(Enum):
     LORA_A = 0
     LORA_B = 1
+
+
+def copy_weight_into_buffer(
+    buffer_view: torch.Tensor,
+    weight: torch.Tensor,
+) -> None:
+    """
+    Copy a LoRA weight tensor into a destination buffer.
+
+    When a pinned CPU source has a dtype mismatch with a device destination,
+    cast on the destination device instead of doing the conversion on CPU.
+    """
+    if weight.dtype == buffer_view.dtype:
+        buffer_view.copy_(weight, non_blocking=True)
+        return
+
+    if weight.device.type == "cpu" and buffer_view.device.type != "cpu":
+        weight = weight.to(device=buffer_view.device, non_blocking=True)
+
+    buffer_view.copy_(weight.to(dtype=buffer_view.dtype), non_blocking=True)
 
 
 def get_hidden_dim(
@@ -146,6 +185,21 @@ def get_hidden_dim(
                 config.num_attention_heads
                 * (config.qk_nope_head_dim + config.v_head_dim),
             )
+        elif module_name in DSA_INDEXER_LORA_NAMES:
+            from sglang.srt.configs.model_config import (
+                get_dsa_index_head_dim,
+                get_dsa_index_n_heads,
+            )
+
+            if module_name == "indexer.wq_b":
+                return (
+                    config.q_lora_rank,
+                    get_dsa_index_n_heads(config) * get_dsa_index_head_dim(config),
+                )
+            elif module_name == "indexer.wk":
+                return config.hidden_size, get_dsa_index_head_dim(config)
+            else:  # indexer.weights_proj
+                return config.hidden_size, get_dsa_index_n_heads(config)
         elif module_name == "gate_up_proj_moe":
             moe_inter = (
                 getattr(config, "moe_intermediate_size", None)
@@ -209,6 +263,12 @@ def get_normalized_target_modules(
         "unembed_tokens": "lm_head",
         "q_a_proj": "fused_qkv_a_proj_with_mqa",
         "kv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
+        # DSA indexer projections are qualified with their parent module name
+        # because the bare leaf names collide with unrelated modules in other
+        # models (e.g. DeepSeek-V4 attention `wq_b`, Pixtral vision `wk`).
+        "wq_b": "indexer.wq_b",
+        "wk": "indexer.wk",
+        "weights_proj": "indexer.weights_proj",
     }
 
     result = set()
@@ -263,10 +323,14 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
 ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "out_proj", "down_proj", "down_proj_moe"]
+DSA_INDEXER_LORA_NAMES = frozenset(
+    {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
+)
 REPLICATED_LINEAR_LORA_NAMES = [
     "fused_qkv_a_proj_with_mqa",
     "fc1_latent_proj",
     "fc2_latent_proj",
+    *DSA_INDEXER_LORA_NAMES,
 ]
 
 # Normalized module names that the LoRA system fully supports
@@ -289,6 +353,7 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "q_b_proj",
         "kv_b_proj",
     }
+    | DSA_INDEXER_LORA_NAMES
 )
 
 
@@ -308,6 +373,9 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
     )
 
     raw_names: set = set()
+    dsa_indexer_leaf_names = {
+        target_name.split(".")[-1] for target_name in DSA_INDEXER_LORA_NAMES
+    }
     for name, module in model.named_modules():
         if isinstance(module, FusedMoE):
             raw_names.add("gate_up_proj")
@@ -317,7 +385,18 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
         elif isinstance(module, VocabParallelEmbedding):
             raw_names.add("embed_tokens")
         elif isinstance(module, LinearBase):
-            raw_names.add(name.split(".")[-1])
+            parts = name.split(".")
+            leaf_name = parts[-1]
+            parent_qualified_name = ".".join(parts[-2:])
+            if parent_qualified_name in DSA_INDEXER_LORA_NAMES:
+                raw_names.add(parent_qualified_name)
+            elif leaf_name in dsa_indexer_leaf_names:
+                # Bare DSA indexer leaf names are ambiguous across model
+                # families. Only auto-detect them when the actual module path
+                # proves they are under an `indexer` parent.
+                continue
+            else:
+                raw_names.add(leaf_name)
 
     normalized = get_normalized_target_modules(raw_names)
     result = normalized & _KNOWN_LORA_TARGET_MODULES

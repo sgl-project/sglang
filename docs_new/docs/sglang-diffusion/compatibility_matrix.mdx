@@ -1,20 +1,182 @@
 ---
-title: "Supported Models"
-description: "Check model compatibility across diffusion optimizations and backends."
+title: "Supported Models and Optimization Compatibility"
+description: "Check supported SGLang Diffusion models and their optimization compatibility."
 ---
-The table below shows every supported model and the optimizations supported for them.
+This page tracks supported SGLang Diffusion model families and their optimization compatibility. It also covers long-tail models that do not yet have dedicated cookbook recipes.
 
-The symbols used have the following meanings:
+For model-specific usage recipes, start from the [Diffusion Cookbook](/cookbook/diffusion/intro). Cookbook pages cover the primary models with examples; this page keeps the compact support and compatibility inventory.
+
+## Supported model inventory
+
+Pass the `Hugging Face Model ID` to `--model-path` for `sglang generate` or `sglang serve`. Python API users can pass the same ID to SGLang Diffusion model-loading helpers.
+
+Missing checkpoint aliases do not imply that a model family is unsupported. The runtime registry may also accept detector-based aliases or local model directories that match the same family.
+
+Rows are grouped when a family shares the same runtime path or optimization support. Use the detailed matrix below when you need per-optimization compatibility.
+
+<Tabs>
+  <Tab title="Image">
+    <div className="sgd-model-table-wrap">
+      <table className="sgd-model-table">
+        <thead>
+          <tr>
+            <th>Model family</th>
+            <th>Model IDs</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>FLUX</td>
+            <td><div className="sgd-id-list"><code>black-forest-labs/FLUX.1-dev</code><code>black-forest-labs/FLUX.2-dev</code><code>black-forest-labs/FLUX.2-dev-NVFP4</code><code>black-forest-labs/FLUX.2-klein-4B</code><code>black-forest-labs/FLUX.2-klein-9B</code><code>black-forest-labs/FLUX.2-klein-base-4B</code><code>black-forest-labs/FLUX.2-klein-base-9B</code></div></td>
+          </tr>
+          <tr>
+            <td>Z-Image</td>
+            <td><div className="sgd-id-list"><code>Tongyi-MAI/Z-Image</code><code>Tongyi-MAI/Z-Image-Turbo</code></div></td>
+          </tr>
+          <tr>
+            <td>Qwen-Image</td>
+            <td><div className="sgd-id-list"><code>Qwen/Qwen-Image</code><code>Qwen/Qwen-Image-2512</code><code>Qwen/Qwen-Image-Edit</code><code>Qwen/Qwen-Image-Edit-2509</code><code>Qwen/Qwen-Image-Edit-2511</code><code>Qwen/Qwen-Image-Layered</code></div></td>
+          </tr>
+          <tr>
+            <td>SD3 / SD3.5</td>
+            <td><div className="sgd-id-list"><code>stabilityai/stable-diffusion-3-medium</code><code>stabilityai/stable-diffusion-3-medium-diffusers</code><code>stabilityai/stable-diffusion-3.5-medium</code><code>stabilityai/stable-diffusion-3.5-medium-diffusers</code><code>stabilityai/stable-diffusion-3.5-large</code><code>stabilityai/stable-diffusion-3.5-large-diffusers</code></div></td>
+          </tr>
+          <tr>
+            <td>SANA</td>
+            <td><div className="sgd-id-list"><code>Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers</code><code>Efficient-Large-Model/SANA1.5_4.8B_1024px_diffusers</code><code>Efficient-Large-Model/Sana_1600M_1024px_diffusers</code><code>Efficient-Large-Model/Sana_600M_1024px_diffusers</code><code>Efficient-Large-Model/Sana_1600M_512px_diffusers</code><code>Efficient-Large-Model/Sana_600M_512px_diffusers</code></div></td>
+          </tr>
+          <tr>
+            <td>FireRed-Image</td>
+            <td><div className="sgd-id-list"><code>FireRedTeam/FireRed-Image-Edit-1.0</code><code>FireRedTeam/FireRed-Image-Edit-1.1</code></div></td>
+          </tr>
+          <tr>
+            <td>JoyAI-Image</td>
+            <td><div className="sgd-id-list"><code>jdopensource/JoyAI-Image-Edit-Diffusers</code></div></td>
+          </tr>
+          <tr>
+            <td>Other image pipelines</td>
+            <td><div className="sgd-id-list"><code>zai-org/GLM-Image</code><code>tencent/Hunyuan3D-2</code><code>baidu/ERNIE-Image</code><code>baidu/ERNIE-Image-Turbo</code><code>ideogram-ai/ideogram-4-fp8</code><code>ideogram-ai/ideogram-4-nf4</code><code>Comfy-Org/Ideogram-4</code></div></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </Tab>
+  <Tab title="Video">
+    <div className="sgd-model-table-wrap">
+      <table className="sgd-model-table">
+        <thead>
+          <tr>
+            <th>Model family</th>
+            <th>Model IDs</th>
+            <th>Resolution / mode</th>
+            <th>Optimization support</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>FastWan</td>
+            <td><div className="sgd-id-list"><code>FastVideo/FastWan2.1-T2V-1.3B-Diffusers</code><code>FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers</code><code>FastVideo/FastWan2.2-TI2V-5B-Diffusers</code></div></td>
+            <td>480p / 720p</td>
+            <td><span className="sgd-chip">VSA</span></td>
+          </tr>
+          <tr>
+            <td>Wan2.2</td>
+            <td><div className="sgd-id-list"><code>Wan-AI/Wan2.2-TI2V-5B-Diffusers</code><code>Wan-AI/Wan2.2-T2V-A14B-Diffusers</code><code>nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4</code><code>Wan-AI/Wan2.2-I2V-A14B-Diffusers</code></div></td>
+            <td>TI2V / T2V / I2V, 480p / 720p</td>
+            <td><span className="sgd-chip">Sage</span><span className="sgd-chip">Laser</span><span className="sgd-chip">BSA</span><span className="sgd-chip">Rain Fusion</span></td>
+          </tr>
+          <tr>
+            <td>HunyuanVideo</td>
+            <td><div className="sgd-id-list"><code>hunyuanvideo-community/HunyuanVideo</code><code>FastVideo/FastHunyuan-diffusers</code></div></td>
+            <td>720×1280 / 544×960</td>
+            <td><span className="sgd-chip">Tile</span><span className="sgd-chip">Sage</span><span className="sgd-chip">SVG2</span></td>
+          </tr>
+          <tr>
+            <td>Wan2.1</td>
+            <td><div className="sgd-id-list"><code>Wan-AI/Wan2.1-T2V-1.3B-Diffusers</code><code>Wan-AI/Wan2.1-T2V-14B-Diffusers</code><code>Wan-AI/Wan2.1-I2V-14B-480P-Diffusers</code><code>Wan-AI/Wan2.1-I2V-14B-720P-Diffusers</code></div></td>
+            <td>T2V / I2V, 480p / 720p</td>
+            <td><span className="sgd-chip">TeaCache</span><span className="sgd-chip">Tile</span><span className="sgd-chip">Sage</span><span className="sgd-chip">SVG2</span><span className="sgd-chip">Laser</span><span className="sgd-chip">BSA</span><span className="sgd-chip">Rain Fusion</span></td>
+          </tr>
+          <tr>
+            <td>TurboWan</td>
+            <td><div className="sgd-id-list"><code>IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers</code><code>IPostYellow/TurboWan2.1-T2V-14B-Diffusers</code><code>IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers</code><code>IPostYellow/TurboWan2.2-I2V-A14B-Diffusers</code></div></td>
+            <td>480p / 720p</td>
+            <td><span className="sgd-chip">TeaCache</span><span className="sgd-chip">SLA</span><span className="sgd-chip">SageSLA</span></td>
+          </tr>
+          <tr>
+            <td>MOVA</td>
+            <td><div className="sgd-id-list"><code>OpenMOSS-Team/MOVA-360p</code><code>OpenMOSS-Team/MOVA-720p</code></div></td>
+            <td>Video-audio, 360p / 720p; local MOVA detector aliases are also supported.</td>
+            <td><span className="sgd-muted">No dedicated optimization listed</span></td>
+          </tr>
+          <tr>
+            <td>Wan2.1 Fun</td>
+            <td><div className="sgd-id-list"><code>weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers</code></div></td>
+            <td>480p inpainting</td>
+            <td><span className="sgd-chip">TeaCache</span><span className="sgd-chip">Tile</span><span className="sgd-chip">Sage</span><span className="sgd-chip">SVG2</span></td>
+          </tr>
+          <tr>
+            <td>Helios</td>
+            <td><div className="sgd-id-list"><code>BestWishYsh/Helios-Base</code><code>BestWishYsh/Helios-Mid</code><code>BestWishYsh/Helios-Distilled</code></div></td>
+            <td>720p</td>
+            <td><span className="sgd-muted">No dedicated optimization listed</span></td>
+          </tr>
+          <tr>
+            <td>LTX-2</td>
+            <td><div className="sgd-id-list"><code>Lightricks/LTX-2</code><code>Lightricks/LTX-2.3</code></div></td>
+            <td>One-stage, two-stage, TI2V, HQ</td>
+            <td><span className="sgd-muted">No dedicated optimization listed</span></td>
+          </tr>
+          <tr>
+            <td>Cosmos3</td>
+            <td><div className="sgd-id-list"><code>nvidia/Cosmos3-Nano</code><code>nvidia/Cosmos3-Super</code><code>nvidia/Cosmos3-Super-Text2Image</code><code>nvidia/Cosmos3-Super-Image2Video</code></div></td>
+            <td>T2V / I2V / T2I</td>
+            <td><span className="sgd-muted">No dedicated optimization listed</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </Tab>
+  <Tab title="Realtime / World">
+    <div className="sgd-model-table-wrap">
+      <table className="sgd-model-table">
+        <thead>
+          <tr>
+            <th>Model family</th>
+            <th>Model IDs / detector</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>LingBotWorld</td>
+            <td><div className="sgd-id-list"><code>robbyant/lingbot-world-fast-diffusers</code></div></td>
+            <td>Realtime world model with causal state and control tokens.</td>
+          </tr>
+          <tr>
+            <td>SANA-WM</td>
+            <td><div className="sgd-id-list"><code>Efficient-Large-Model/SANA-WM_bidirectional</code><code>Efficient-Large-Model/SANA-WM_streaming</code></div></td>
+            <td>World-model pipeline with bidirectional and streaming checkpoints.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </Tab>
+</Tabs>
+
+<Note>
+Wan2.2 TI2V 5B currently has known quality issues when used for I2V generation.
+</Note>
+
+## Optimization compatibility
+
+The detailed video matrix uses these symbols:
 
 - ✅ = Full compatibility
 - ❌ = No compatibility
 - ⭕ = Does not apply to this model
 
-## Models x Optimization
-
-The `HuggingFace Model ID` can be passed directly to `from_pretrained()` methods, and sglang-diffusion will use the
-optimal
-default parameters when initializing and generating videos.
+<Accordion title="Detailed video optimization matrix">
 
 ### Video Generation Models
 
@@ -81,8 +243,8 @@ Optimization columns are abbreviated to keep the matrix readable:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FastWan2.2 TI2V 5B Full Attn</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers`</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FastWan2.2 TI2V 5B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers</code><br /><code>FastVideo/FastWan2.2-TI2V-5B-Diffusers</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>720p</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>⭕</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>⭕</td>
@@ -112,7 +274,7 @@ Optimization columns are abbreviated to keep the matrix readable:
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Wan2.2 T2V A14B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Wan-AI/Wan2.2-T2V-A14B-Diffusers`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Wan-AI/Wan2.2-T2V-A14B-Diffusers</code><br /><code>nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4</code></td>
       <td style={{padding: "9px 8px", backgroundColor: "rgba(255,255,255,0.02)"}}>480p<br />720p</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
@@ -380,6 +542,36 @@ Optimization columns are abbreviated to keep the matrix readable:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Cosmos3-Nano (T2V / I2V / T2I)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>nvidia/Cosmos3-Nano</code></td>
+      <td style={{padding: "9px 8px", backgroundColor: "rgba(255,255,255,0.02)"}}>720p · 480p<br />1024×1024 (T2I)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Cosmos3-Super (T2V / I2V / T2I)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>nvidia/Cosmos3-Super</code><br /><code>nvidia/Cosmos3-Super-Text2Image</code><br /><code>nvidia/Cosmos3-Super-Image2Video</code></td>
+      <td style={{padding: "9px 8px", backgroundColor: "rgba(255,255,255,0.02)"}}>720p · 480p<br />1024×1024 (T2I)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+    </tr>
 </tbody>
 </table>
 
@@ -394,141 +586,18 @@ Optimization columns are abbreviated to keep the matrix readable:
    - LTX-2 and LTX-2.3 support both T2V and TI2V (`--image-path`) on one-stage and two-stage pipelines (including HQ).
    - The spatial upsampler and distilled LoRA are auto-resolved from the model snapshot by default, and can still be overridden with `--spatial-upsampler-path` and `--distilled-lora-path`.
    - For LTX models, the `Resolutions` column uses output video `width×height` semantics, matching `sglang generate --width ... --height ...`.
-4. LTX-2 / LTX-2.3 two-stage also supports `--ltx2-two-stage-device-mode {original,snapshot,resident}`:
-   - `snapshot` is the default and recommended mode.
-   - `resident` usually provides the best latency/throughput but uses much more VRAM.
+4. LTX-2 / LTX-2.3 two-stage also supports `--ltx2-two-stage-device-mode {original,resident}`:
    - `original` keeps official two-stage semantics without the premerged stage-2 transformer path.
-   - Example (one prior run): `original` `154.67s`, `snapshot` `114.05s`, `resident` `75.71s`; peak VRAM trend is `original < snapshot < resident`.
+   - `resident` usually provides the best latency/throughput but uses much more VRAM.
+   - Default is auto: `resident` on H200/high-memory CUDA GPUs, otherwise `original`.
+   - Deprecated compatibility: `snapshot` is accepted as an alias for `original` and may be removed after two release cycles.
+5. Cosmos3 ships in two sizes — `nvidia/Cosmos3-Nano` (8B) and
+   `nvidia/Cosmos3-Super` (32B). Both share the same pipeline; the only
+   difference is transformer depth and width, picked up from
+   `transformer/config.json` at load time. A single checkpoint serves T2V,
+   I2V (`--image-path`), and T2I (`--num-frames 1`).
 
-### Image Generation Models
-
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <colgroup>
-    <col style={{width: "22%"}} />
-    <col style={{width: "46%"}} />
-    <col style={{width: "32%"}} />
-  </colgroup>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model Name</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>HuggingFace Model ID</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FLUX.1-dev</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`black-forest-labs/FLUX.1-dev`</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FLUX.2-dev</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`black-forest-labs/FLUX.2-dev`</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FLUX.2-dev-NVFP4</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>black-forest-labs/FLUX.2-dev-NVFP4</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FLUX.2-Klein-4B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>black-forest-labs/FLUX.2-klein-4B</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FLUX.2-Klein-9B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>black-forest-labs/FLUX.2-klein-9B</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Z-Image</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Tongyi-MAI/Z-Image</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Z-Image-Turbo</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Tongyi-MAI/Z-Image-Turbo</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-Image</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>zai-org/GLM-Image</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen Image</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Qwen/Qwen-Image</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen Image 2512</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Qwen/Qwen-Image-2512</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen Image Edit</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Qwen/Qwen-Image-Edit`</td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen Image Edit 2509</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Qwen/Qwen-Image-Edit-2509</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen Image Edit 2511</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Qwen/Qwen-Image-Edit-2511</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen Image Layered</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Qwen/Qwen-Image-Layered</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SD3 Medium</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>stabilityai/stable-diffusion-3-medium-diffusers</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SD3.5 Medium</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>stabilityai/stable-diffusion-3.5-medium-diffusers</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SD3.5 Large</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>stabilityai/stable-diffusion-3.5-large-diffusers</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Hunyuan3D-2</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>tencent/Hunyuan3D-2</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SANA 1.5 1.6B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SANA 1.5 4.8B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Efficient-Large-Model/SANA1.5_4.8B_1024px_diffusers</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SANA 1600M 1024px</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Efficient-Large-Model/Sana_1600M_1024px_diffusers</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SANA 600M 1024px</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Efficient-Large-Model/Sana_600M_1024px_diffusers</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SANA 1600M 512px</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Efficient-Large-Model/Sana_1600M_512px_diffusers</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SANA 600M 512px</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Efficient-Large-Model/Sana_600M_512px_diffusers</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FireRed-Image-Edit 1.0</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>FireRedTeam/FireRed-Image-Edit-1.0</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FireRed-Image-Edit 1.1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>FireRedTeam/FireRed-Image-Edit-1.1</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>ERNIE-Image</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>baidu/ERNIE-Image</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>ERNIE-Image-Turbo</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>baidu/ERNIE-Image-Turbo</code></td>
-    </tr>
-</tbody>
-</table>
+</Accordion>
 
 ## Supported Components
 
@@ -564,7 +633,8 @@ Use the component name from the pipeline's `model_index.json` or the native pipe
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "20%"}} />
-    <col style={{width: "80%"}} />
+    <col style={{width: "42%"}} />
+    <col style={{width: "38%"}} />
   </colgroup>
   <thead>
     <tr style={{borderBottom: "2px solid #d55816"}}>

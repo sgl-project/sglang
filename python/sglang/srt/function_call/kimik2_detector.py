@@ -1,17 +1,20 @@
 import json
 import logging
 import re
-from typing import List
+from typing import List, Literal, Optional, Union
 
-from sglang.srt.entrypoints.openai.protocol import Tool
-from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.function_call.base_format_detector import (
+    BaseFormatDetector,
+    StructuralTag,
+    get_model_structural_tag,
+)
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +25,8 @@ _KIMI_K2_SPECIAL_TOKENS = [
     "<|tool_call_end|>",
     "<|tool_call_argument_begin|>",
 ]
+
+_KIMI_NON_STRICT_ARGUMENTS_SCHEMA = {"type": "object"}
 
 
 def _strip_special_tokens(text: str) -> str:
@@ -171,9 +176,15 @@ class KimiK2Detector(BaseFormatDetector):
             logger.debug("function_call_tuples: %s", function_call_tuples)
 
             tool_calls = []
+            # ``tool_index`` is the per-response 0-based position of the call
+            # (OpenAI spec); enumerate parsed calls locally and ignore the
+            # model's ``:N`` suffix, which is a conversation-level counter.
+            # ``serving_chat._process_tool_call_id()`` later offsets these by
+            # ``history_tool_calls_cnt`` for multi-turn responses.
+            local_tool_index = 0
             for match in function_call_tuples:
                 function_id, function_args = match
-                function_name, function_idx = self._parse_tool_call_id(
+                function_name, _ = self._parse_tool_call_id(
                     function_id, tools, function_args
                 )
                 if function_name is None:
@@ -183,11 +194,12 @@ class KimiK2Detector(BaseFormatDetector):
 
                 tool_calls.append(
                     ToolCallItem(
-                        tool_index=function_idx,
+                        tool_index=local_tool_index,
                         name=function_name,
                         parameters=function_args,
                     )
                 )
+                local_tool_index += 1
 
             content = text[: text.find(self.bot_token)]
             return StreamingParseResult(normal_text=content, calls=tool_calls)
@@ -199,127 +211,207 @@ class KimiK2Detector(BaseFormatDetector):
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
-        """
-        Streaming incremental parsing tool calls for KimiK2 format.
-        """
+        """Streaming incremental parsing tool calls for KimiK2 format."""
         self._buffer += new_text
-        current_text = self._buffer
 
-        # Check if we have a tool call (either the start token or individual tool call)
-        has_tool_call = (
-            self.bot_token in current_text or self.tool_call_start_token in current_text
-        )
-
-        if not has_tool_call:
-            self._buffer = ""
-            normal_text = _strip_special_tokens(new_text)
-            return StreamingParseResult(normal_text=normal_text)
+        # Fast path: no tool call in flight and no markers yet -- emit as
+        # normal text, holding back any trailing partial start token.
+        if (
+            self._current_stream_function_name is None
+            and self.bot_token not in self._buffer
+            and self.tool_call_start_token not in self._buffer
+        ):
+            emit, hold = self._split_pending_start(self._buffer)
+            self._buffer = hold
+            return StreamingParseResult(normal_text=_strip_special_tokens(emit))
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
+        normal_text_parts: list[str] = []
         calls: list[ToolCallItem] = []
+
         try:
-            match = self.stream_tool_call_portion_regex.search(current_text)
-            if match:
-                function_id = match.group("tool_call_id")
-                function_args = match.group("function_arguments")
+            while True:
+                buffer = self._buffer
 
-                # Reuse cached name for current tool call to avoid repeated
-                # json.loads on partial JSON in _infer_tool_name.
-                if self._current_stream_function_name is not None:
-                    function_name = self._current_stream_function_name
-                else:
-                    function_name, _ = self._parse_tool_call_id(
-                        function_id, tools, function_args
+                # Locate next <|tool_call_begin|>, draining any prefix as text.
+                begin_idx = self._locate_tool_call_start(buffer, normal_text_parts)
+                if begin_idx is None:
+                    break
+                buffer = self._buffer
+
+                # If another <|tool_call_begin|> appears before the header
+                # closes with <|tool_call_argument_begin|>, the section is
+                # malformed -- discard and restart at the orphan.
+                arg_begin_idx = buffer.find(self.tool_call_argument_begin_token)
+                next_begin = buffer.find(
+                    self.tool_call_start_token, len(self.tool_call_start_token)
+                )
+                if next_begin != -1 and (
+                    arg_begin_idx == -1 or next_begin < arg_begin_idx
+                ):
+                    logger.warning(
+                        "Kimi-K2 tool_call_begin without preceding tool_call_end; "
+                        "discarding incomplete section."
                     )
-                if function_name is None:
-                    return StreamingParseResult(normal_text="", calls=calls)
+                    self._buffer = buffer[next_begin:]
+                    self._reset_inflight_call_state()
+                    continue
 
-                # Initialize state if this is the first tool call
-                if self.current_tool_id == -1:
-                    self.current_tool_id = 0
-                    self.prev_tool_call_arr = []
-                    self.streamed_args_for_tool = [""]
+                if arg_begin_idx == -1:
+                    # Header not fully arrived yet.
+                    break
 
-                # Ensure we have enough entries in our tracking arrays
-                while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                    self.prev_tool_call_arr.append({})
-                while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                    self.streamed_args_for_tool.append("")
+                id_start = len(self.tool_call_start_token)
+                function_id = buffer[id_start:arg_begin_idx].strip()
+                args_start = arg_begin_idx + len(self.tool_call_argument_begin_token)
+                end_idx = buffer.find(self.tool_call_end_token)
 
-                if not self.current_tool_name_sent:
+                # Resolve function name (cached across chunks within a section).
+                name_just_resolved = False
+                if self._current_stream_function_name is None:
+                    args_for_inference = (
+                        buffer[args_start:end_idx]
+                        if end_idx != -1
+                        else buffer[args_start:]
+                    )
+                    resolved = self._resolve_function_name(
+                        function_id, tools, args_for_inference
+                    )
+                    if resolved is None:
+                        if end_idx == -1:
+                            # Wait for the end marker before deciding.
+                            break
+                        logger.warning(
+                            "Kimi-K2 unrecognized tool_call_id %r; skipping section.",
+                            function_id,
+                        )
+                        self._buffer = buffer[end_idx + len(self.tool_call_end_token) :]
+                        self._reset_inflight_call_state()
+                        continue
+                    name = resolved
+                    self._current_stream_function_name = name
+                    name_just_resolved = True
+
+                    # ``tool_index`` is the per-response 0-based position
+                    # (OpenAI streaming spec); ignore the model's ``:N`` suffix
+                    # which is a conversation-level counter.
+                    if self.current_tool_id == -1:
+                        self.current_tool_id = 0
+                        self.prev_tool_call_arr = []
+                        self.streamed_args_for_tool = [""]
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+                    self.prev_tool_call_arr[self.current_tool_id] = {
+                        "name": name,
+                        "arguments": {},
+                    }
+                    self.current_tool_name_sent = True
+
+                # Stream newly-arrived args, combining the first event with
+                # the freshly-resolved name.
+                if end_idx != -1:
+                    args_full = buffer[args_start:end_idx]
+                else:
+                    args_full = buffer[args_start:]
+                argument_diff = args_full[len(self._last_arguments) :]
+                if argument_diff or name_just_resolved:
                     calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
-                            name=function_name,
-                            parameters="",
+                            name=(
+                                self._current_stream_function_name
+                                if name_just_resolved
+                                else None
+                            ),
+                            parameters=argument_diff,
                         )
                     )
-                    self.current_tool_name_sent = True
-                    self._current_stream_function_name = function_name
-                    self.prev_tool_call_arr[self.current_tool_id] = {
-                        "name": function_name,
-                        "arguments": {},
-                    }
-                else:
-                    argument_diff = (
-                        function_args[len(self._last_arguments) :]
-                        if function_args.startswith(self._last_arguments)
-                        else function_args
-                    )
-
-                    parsed_args_diff = argument_diff.split(self.tool_call_end_token, 1)[
-                        0
-                    ]
-
-                    if parsed_args_diff:
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=None,
-                                parameters=parsed_args_diff,
-                            )
-                        )
-                        self._last_arguments += parsed_args_diff
+                    if argument_diff:
+                        self._last_arguments += argument_diff
                         self.streamed_args_for_tool[
                             self.current_tool_id
-                        ] += parsed_args_diff
+                        ] += argument_diff
 
-                    parsed_args = function_args.split(self.tool_call_end_token, 1)[0]
-                    if _is_complete_json(parsed_args):
-                        try:
-                            parsed_args = json.loads(parsed_args)
-                            self.prev_tool_call_arr[self.current_tool_id][
-                                "arguments"
-                            ] = parsed_args
-                        except json.JSONDecodeError:
-                            pass
+                if end_idx == -1:
+                    # Args still streaming.
+                    break
 
-                        # Find the end of the current tool call and remove only that part from buffer
-                        tool_call_end_pattern = (
-                            r"<\|tool_call_begin\|>.*?<\|tool_call_end\|>"
-                        )
-                        end_match = re.search(
-                            tool_call_end_pattern, current_text, re.DOTALL
-                        )
-                        if end_match:
-                            self._buffer = current_text[end_match.end() :]
-                        else:
-                            self._buffer = ""
+                # Section finalized -- advance buffer and prepare next call.
+                self._buffer = buffer[end_idx + len(self.tool_call_end_token) :]
+                self.current_tool_id += 1
+                self._reset_inflight_call_state()
 
-                        result = StreamingParseResult(normal_text="", calls=calls)
-                        self.current_tool_id += 1
-                        self._last_arguments = ""
-                        self.current_tool_name_sent = False
-                        self._current_stream_function_name = None
-                        return result
-
-            return StreamingParseResult(normal_text="", calls=calls)
+            return StreamingParseResult(
+                normal_text="".join(normal_text_parts), calls=calls
+            )
 
         except Exception as e:
             logger.error("Error in parse_streaming_increment: %s", e, exc_info=True)
-            return StreamingParseResult(normal_text=_strip_special_tokens(current_text))
+            # Drop the buffer to avoid leaking raw special tokens.
+            self._buffer = ""
+            self._reset_inflight_call_state()
+            return StreamingParseResult(
+                normal_text="".join(normal_text_parts), calls=calls
+            )
+
+    def _reset_inflight_call_state(self) -> None:
+        """Reset per-section streaming state after finalize/discard."""
+        self._last_arguments = ""
+        self.current_tool_name_sent = False
+        self._current_stream_function_name = None
+
+    def _locate_tool_call_start(
+        self, buffer: str, normal_text_parts: list
+    ) -> int | None:
+        """Find the next <|tool_call_begin|>; drain any prefix as normal text.
+
+        Returns 0 on success, or ``None`` when no start token is present yet.
+        """
+        begin_idx = buffer.find(self.tool_call_start_token)
+        if begin_idx == -1:
+            emit, hold = self._split_pending_start(buffer)
+            if emit:
+                normal_text_parts.append(_strip_special_tokens(emit))
+            self._buffer = hold
+            return None
+
+        if begin_idx > 0:
+            normal_text_parts.append(_strip_special_tokens(buffer[:begin_idx]))
+            self._buffer = buffer[begin_idx:]
+        return 0
+
+    def _split_pending_start(self, text: str) -> tuple[str, str]:
+        """Hold back a trailing fragment that could be the start of
+        <|tool_calls_section_begin|> or <|tool_call_begin|>. Everything
+        before it is safe to emit as normal text.
+        """
+        candidates = (self.bot_token, self.tool_call_start_token)
+        max_tail = max(len(t) for t in candidates) - 1
+        for n in range(min(len(text), max_tail), 1, -1):
+            tail = text[-n:]
+            if any(t.startswith(tail) for t in candidates):
+                return text[:-n], tail
+        return text, ""
+
+    def _resolve_function_name(
+        self, function_id: str, tools: List[Tool], function_args: str
+    ) -> Optional[str]:
+        """Map a Kimi-K2 tool_call_id to a tool name, or ``None`` if unknown."""
+        if not function_id:
+            return self._infer_tool_name(tools, function_args)
+
+        m = self.tool_call_id_regex.match(function_id)
+        if m:
+            return m.group("name")
+
+        if self.tool_call_id_counter_regex.match(function_id):
+            return self._infer_tool_name(tools, function_args)
+
+        return None
 
     def structure_info(self) -> _GetInfoFunc:
         """Return function that creates StructureInfo for guided generation."""
@@ -333,12 +425,45 @@ class KimiK2Detector(BaseFormatDetector):
 
         return get_info
 
-    # Kimi stays on the SGLang legacy structural tag path. xgrammar 0.2.0's
-    # get_kimi_structural_tag(tool_choice="auto") emits a bare
-    # <|tool_call_begin|>...<|tool_call_end|> grammar without the
-    # <|tool_calls_section_begin|>/<|tool_calls_section_end|> wrapper Kimi's
-    # chat template uses, and KimiK2Detector.has_tool_call() keys off the
-    # section marker — bare tool calls would be silently dropped. Inheriting
-    # the base get_structural_tag_name (returns None) keeps FunctionCallParser
-    # on the legacy path, whose structure_info bakes the section markers in.
-    # TODO: re-enable the builtin once https://github.com/mlc-ai/xgrammar/issues/622 is fixed.
+    def get_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        thinking_mode: bool = False,
+    ) -> Optional[StructuralTag]:
+        if not (
+            tools and (tool_choice == "required" or isinstance(tool_choice, ToolChoice))
+        ):
+            return super().get_structural_tag(
+                tools=tools, tool_choice=tool_choice, thinking_mode=thinking_mode
+            )
+        if get_model_structural_tag is None:
+            return None
+
+        converted_tools = []
+        for tool in tools:
+            converted_tool = tool.model_dump()
+            function = converted_tool["function"]
+            if not function.get("strict", False):
+                # Kimi's parser accepts only object-shaped tool arguments. XGrammar
+                # treats strict=False arguments as unconstrained JSON, which can
+                # generate strings/arrays/numbers that Kimi cannot parse. Keep
+                # non-strict semantics loose by constraining only the outer type.
+                function["strict"] = True
+                function["parameters"] = _KIMI_NON_STRICT_ARGUMENTS_SCHEMA
+            converted_tools.append(converted_tool)
+
+        converted_tool_choice = (
+            tool_choice.model_dump()
+            if isinstance(tool_choice, ToolChoice)
+            else tool_choice
+        )
+        return get_model_structural_tag(
+            model="kimi",
+            tools=converted_tools,
+            tool_choice=converted_tool_choice,
+            reasoning=thinking_mode,
+        )
+
+    def get_structural_tag_name(self) -> str:
+        return "kimi"

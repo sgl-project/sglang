@@ -696,6 +696,9 @@ void topkGatingSoftmaxKernelLauncher(
     case 256:
       LAUNCH_SOFTMAX(T, 256, WARPS_PER_TB);
       break;
+    case 512:
+      LAUNCH_SOFTMAX(T, 512, WARPS_PER_TB);
+      break;
     default: {
       TORCH_CHECK(
           softmax_workspace != nullptr,
@@ -750,8 +753,16 @@ void topk_softmax(
   const int num_tokens = static_cast<int>(gating_output.size(0));
   const int topk = static_cast<int>(topk_weights.size(-1));
 
+  // No tokens on this DP rank, no need to do anything
+  if (num_tokens == 0) {
+    return;
+  }
+
+  TORCH_CHECK(num_experts > 0, "num_experts must be greater than 0");
+  TORCH_CHECK(topk > 0, "topk must be greater than 0");
+
   const bool is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
-  const bool needs_workspace = !is_pow_2 || num_experts > 256;
+  const bool needs_workspace = !is_pow_2 || num_experts > 512;
   const int64_t workspace_size = needs_workspace ? num_tokens * num_experts : 0;
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(gating_output));
@@ -819,4 +830,7 @@ void topk_softmax(
   } else {
     TORCH_CHECK(false, "Unsupported gating_output dtype: ", dtype);
   }
+
+  auto launch_error = cudaGetLastError();
+  TORCH_CHECK(launch_error == cudaSuccess, "topk_softmax launch error: ", cudaGetErrorString(launch_error));
 }

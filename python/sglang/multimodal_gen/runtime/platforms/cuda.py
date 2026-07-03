@@ -27,6 +27,10 @@ from sglang.multimodal_gen.utils import import_pynvml
 
 logger = init_logger(__name__)
 
+_SDPA_BACKEND_CLS_STR = (
+    "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+)
+
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
@@ -66,6 +70,218 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
             pynvml.nvmlShutdown()
 
     return wrapper
+
+
+class _CudaAttentionBackendResolver:
+    backend: AttentionBackendEnum
+
+    @classmethod
+    def resolve(cls, platform) -> str | AttentionBackendEnum:
+        raise NotImplementedError
+
+
+class _DirectCudaAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend_cls_str: str
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        return cls.backend_cls_str
+
+
+class _AITerAttentionBackendResolver(_DirectCudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.AITER
+    backend_cls_str = (
+        "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
+    )
+
+
+class _TorchSDPAAttentionBackendResolver(_DirectCudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.TORCH_SDPA
+    backend_cls_str = _SDPA_BACKEND_CLS_STR
+
+
+class _SparseLinearAttentionBackendResolver(_DirectCudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SLA_ATTN
+    backend_cls_str = "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SparseLinearAttentionBackend"
+
+
+class _SageSparseLinearAttentionBackendResolver(_DirectCudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SAGE_SLA_ATTN
+    backend_cls_str = "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SageSparseLinearAttentionBackend"
+
+
+class _SlidingTileAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SLIDING_TILE_ATTN
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        try:
+            from st_attn import sliding_tile_attention  # noqa: F401
+
+            from sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn import (  # noqa: F401
+                SlidingTileAttentionBackend,
+            )
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn.SlidingTileAttentionBackend"
+        except ImportError as e:
+            logger.error("Failed to import Sliding Tile Attention backend: %s", str(e))
+            raise ImportError(
+                "Sliding Tile Attention backend is not installed. "
+            ) from e
+
+
+class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SAGE_ATTN
+
+    @classmethod
+    def resolve(cls, platform) -> str | AttentionBackendEnum:
+        try:
+            from sageattention import sageattn  # noqa: F401
+
+            from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn import (  # noqa: F401
+                SageAttentionBackend,
+            )
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
+        except ImportError as e:
+            logger.info(e)
+            logger.info(
+                "Sage Attention backend is not installed (To install it, run `pip install sageattention==2.2.0 --no-build-isolation`). Falling back to Flash Attention."
+            )
+            return AttentionBackendEnum.FA
+
+
+class _SageAttention3BackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SAGE_ATTN_3
+
+    @classmethod
+    def resolve(cls, platform) -> str | AttentionBackendEnum:
+        try:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3 import (  # noqa: F401
+                SageAttention3Backend,
+            )
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend"
+        except ImportError as e:
+            logger.info(e)
+            logger.info(
+                "Sage Attention 3 backend is not installed (To install it, see https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell#installation). Falling back to Torch SDPA."
+            )
+            return AttentionBackendEnum.TORCH_SDPA
+
+
+class _VideoSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.VIDEO_SPARSE_ATTN
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        try:
+            from vsa import block_sparse_attn  # noqa: F401
+
+            from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn import (  # noqa: F401
+                VideoSparseAttentionBackend,
+            )
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn.VideoSparseAttentionBackend"
+        except ImportError as e:
+            logger.error("Failed to import Video Sparse Attention backend: %s", str(e))
+            raise ImportError("Video Sparse Attention backend is not installed.") from e
+
+
+class _SparseVideoGen2AttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        try:
+            from svg.kernels.triton.permute import (  # noqa: F401
+                apply_inverse_permutation_triton,
+                permute_tensor_by_labels_triton,
+            )
+            from svg.kmeans_utils import (  # noqa: F401
+                batch_kmeans_Euclid,
+                density_calculation,
+                dynamic_block_sparse_fwd_flashinfer,
+                identify_dynamic_map,
+            )
+
+            from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn import (  # noqa: F401
+                SparseVideoGen2AttentionBackend,
+            )
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn.SparseVideoGen2AttentionBackend"
+        except ImportError as e:
+            logger.error(
+                "Failed to import Sparse Video Gen 2 (SAP) Attention backend: %s",
+                str(e),
+            )
+            raise ImportError(
+                "Sparse Video Gen 2 (SAP) Attention backend is not installed. "
+                "Please install it by following the instructions at "
+                "https://github.com/svg-project/Sparse-VideoGen"
+            ) from e
+
+
+class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.VMOBA_ATTN
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        try:
+            from kernel.attn.vmoba_attn.vmoba import moba_attn_varlen  # noqa: F401
+
+            from sglang.multimodal_gen.runtime.layers.attention.backends.vmoba import (  # noqa: F401
+                VMOBAAttentionBackend,
+            )
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.vmoba.VMOBAAttentionBackend"
+        except ImportError as e:
+            logger.error("Failed to import Video MoBA Attention backend: %s", str(e))
+            raise ImportError("Video MoBA Attention backend is not installed. ") from e
+
+
+class _FlashAttention2BackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.FA2
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2 import (  # noqa: F401
+            FlashAttention2Backend,
+        )
+
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2.FlashAttention2Backend"
+
+
+class _FlashAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.FA
+
+    @classmethod
+    def resolve(cls, platform) -> AttentionBackendEnum:
+        if platform.is_sm120():
+            logger.info(
+                "FlashAttention is not supported on SM12.x in this build; falling back to Torch SDPA."
+            )
+            return AttentionBackendEnum.TORCH_SDPA
+        return AttentionBackendEnum.FA
+
+
+_CUDA_ATTENTION_BACKEND_RESOLVERS = {
+    resolver.backend: resolver
+    for resolver in (
+        _AITerAttentionBackendResolver,
+        _TorchSDPAAttentionBackendResolver,
+        _SparseLinearAttentionBackendResolver,
+        _SageSparseLinearAttentionBackendResolver,
+        _SlidingTileAttentionBackendResolver,
+        _SageAttentionBackendResolver,
+        _SageAttention3BackendResolver,
+        _VideoSparseAttentionBackendResolver,
+        _SparseVideoGen2AttentionBackendResolver,
+        _VMOBAAttentionBackendResolver,
+        _FlashAttention2BackendResolver,
+        _FlashAttentionBackendResolver,
+    )
+}
 
 
 class CudaPlatformBase(Platform):
@@ -124,7 +340,7 @@ class CudaPlatformBase(Platform):
     @lru_cache(maxsize=1)
     def get_modelopt_flashinfer_fp4_backend(cls) -> str:
         backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
-        default_backend = "cudnn" if cls.is_blackwell() else "auto"
+        default_backend = "trtllm"
         if backend is None:
             return default_backend
 
@@ -151,35 +367,23 @@ class CudaPlatformBase(Platform):
     @lru_cache(maxsize=1)
     def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
         requested_backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
-        prefer_flashinfer = requested_backend is not None
-
-        # TODO: Remove this explicit FlashInfer preference once the sm100 CUTLASS
-        # LargeM dispatch grows a validated fallback for Blackwell NVFP4 shapes
-        # such as Wan2.2's large-M attention projections.
-        if prefer_flashinfer:
-            try:
-                from flashinfer import mm_fp4 as flashinfer_mm_fp4
-
-                return flashinfer_mm_fp4, cls.get_modelopt_flashinfer_fp4_backend()
-            except ImportError:
-                logger.warning(
-                    "Requested SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=%r "
-                    "but flashinfer.mm_fp4 is unavailable. Falling back to "
-                    "cutlass.",
-                    requested_backend,
-                )
-
-        try:
-            from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
-
-            return cutlass_fp4_gemm, None
-        except ImportError:
-            pass
 
         try:
             from flashinfer import mm_fp4 as flashinfer_mm_fp4
 
             return flashinfer_mm_fp4, cls.get_modelopt_flashinfer_fp4_backend()
+        except ImportError:
+            logger.warning(
+                "Requested SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=%r "
+                "but flashinfer.mm_fp4 is unavailable. Falling back to "
+                "cutlass.",
+                requested_backend or "flashinfer_trtllm (default)",
+            )
+
+        try:
+            from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
+
+            return cutlass_fp4_gemm, None
         except ImportError:
             return None, None
 
@@ -201,7 +405,7 @@ class CudaPlatformBase(Platform):
     @classmethod
     def get_available_gpu_memory(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
         distributed: bool = False,
         empty_cache: bool = True,
         cpu_group: Any = None,
@@ -209,8 +413,8 @@ class CudaPlatformBase(Platform):
         if empty_cache:
             torch.cuda.empty_cache()
 
-        if torch.distributed.is_initialized():
-            device_id = torch.distributed.get_rank()
+        if device_id is None:
+            device_id = torch.cuda.current_device()
 
         device_props = torch.cuda.get_device_properties(device_id)
         if device_props.is_integrated:
@@ -228,194 +432,39 @@ class CudaPlatformBase(Platform):
         return free_gpu_memory / (1 << 30)
 
     @classmethod
-    def get_attn_backend_cls_str(
-        cls,
-        selected_backend: AttentionBackendEnum | None,
-        head_size: int,
-        dtype: torch.dtype,
-    ) -> str:
-        target_backend: AttentionBackendEnum | None = None
-        # TODO(will): maybe come up with a more general interface for local attention
-        # if distributed is False, we always try to use Flash attn
-        if selected_backend == AttentionBackendEnum.SLIDING_TILE_ATTN:
-            try:
-                from st_attn import sliding_tile_attention  # noqa: F401
+    def _resolve_default_attn_backend(cls) -> AttentionBackendEnum:
+        if cls.is_sm120():
+            # On SM12.x, the sgl-kernel FlashAttention wheels may not include
+            # support yet. Default to Torch SDPA for correctness.
+            logger.info("Defaulting to Torch SDPA backend on SM12.x")
+            return AttentionBackendEnum.TORCH_SDPA
+        return AttentionBackendEnum.FA
 
-                from sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn import (  # noqa: F401
-                    SlidingTileAttentionBackend,
-                )
+    @classmethod
+    def _prepare_flash_attention_for_blackwell(cls) -> bool:
+        if not cls.is_blackwell():
+            return True
 
-                logger.info("Using Sliding Tile Attention backend")
-
-                return "sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn.SlidingTileAttentionBackend"
-            except ImportError as e:
-                logger.error(
-                    "Failed to import Sliding Tile Attention backend: %s", str(e)
-                )
-                raise ImportError(
-                    "Sliding Tile Attention backend is not installed. "
-                ) from e
-        elif selected_backend == AttentionBackendEnum.SAGE_ATTN:
-            try:
-                from sageattention import sageattn  # noqa: F401
-
-                from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn import (  # noqa: F401
-                    SageAttentionBackend,
-                )
-
-                logger.info("Using Sage Attention backend")
-
-                return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
-            except ImportError as e:
-                logger.info(e)
-                logger.info(
-                    "Sage Attention backend is not installed (To install it, run `pip install sageattention==2.2.0 --no-build-isolation`). Falling back to Flash Attention."
-                )
-                target_backend = AttentionBackendEnum.FA
-        elif selected_backend == AttentionBackendEnum.SAGE_ATTN_3:
-            try:
-                from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3 import (  # noqa: F401
-                    SageAttention3Backend,
-                )
-
-                logger.info("Using Sage Attention 3 backend")
-                return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend"
-            except ImportError as e:
-                logger.info(e)
-                logger.info(
-                    "Sage Attention 3 backend is not installed (To install it, see https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell#installation). Falling back to Torch SDPA."
-                )
-                target_backend = AttentionBackendEnum.TORCH_SDPA
-        elif selected_backend == AttentionBackendEnum.VIDEO_SPARSE_ATTN:
-            try:
-                from vsa import block_sparse_attn  # noqa: F401
-
-                from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn import (  # noqa: F401
-                    VideoSparseAttentionBackend,
-                )
-
-                logger.info("Using Video Sparse Attention backend")
-
-                return "sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn.VideoSparseAttentionBackend"
-            except ImportError as e:
-                logger.error(
-                    "Failed to import Video Sparse Attention backend: %s", str(e)
-                )
-                raise ImportError(
-                    "Video Sparse Attention backend is not installed."
-                ) from e
-        elif selected_backend == AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN:
-            try:
-                from svg.kernels.triton.permute import (  # noqa: F401
-                    apply_inverse_permutation_triton,
-                    permute_tensor_by_labels_triton,
-                )
-                from svg.kmeans_utils import (  # noqa: F401
-                    batch_kmeans_Euclid,
-                    density_calculation,
-                    dynamic_block_sparse_fwd_flashinfer,
-                    identify_dynamic_map,
-                )
-
-                from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn import (  # noqa: F401
-                    SparseVideoGen2AttentionBackend,
-                )
-
-                logger.info("Using Sparse Video Gen 2 (SAP) Attention backend")
-                return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn.SparseVideoGen2AttentionBackend"
-            except ImportError as e:
-                logger.error(
-                    "Failed to import Sparse Video Gen 2 (SAP) Attention backend: %s",
-                    str(e),
-                )
-                raise ImportError(
-                    "Sparse Video Gen 2 (SAP) Attention backend is not installed. "
-                    "Please install it by following the instructions at "
-                    "https://github.com/svg-project/Sparse-VideoGen"
-                ) from e
-        elif selected_backend == AttentionBackendEnum.VMOBA_ATTN:
-            try:
-                from kernel.attn.vmoba_attn.vmoba import moba_attn_varlen  # noqa: F401
-
-                from sglang.multimodal_gen.runtime.layers.attention.backends.vmoba import (  # noqa: F401
-                    VMOBAAttentionBackend,
-                )
-
-                logger.info("Using Video MOBA Attention backend")
-
-                return "sglang.multimodal_gen.runtime.layers.attention.backends.vmoba.VMOBAAttentionBackend"
-            except ImportError as e:
-                logger.error(
-                    "Failed to import Video MoBA Attention backend: %s", str(e)
-                )
-                raise ImportError(
-                    "Video MoBA Attention backend is not installed. "
-                ) from e
-        elif selected_backend == AttentionBackendEnum.AITER:
-            logger.info("Using AITer backend")
-            return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
-        elif selected_backend == AttentionBackendEnum.TORCH_SDPA:
-            logger.info("Using Torch SDPA backend")
-            return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
-        elif selected_backend == AttentionBackendEnum.SLA_ATTN:
-            logger.info("Using Sparse Linear Attention backend")
-            return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SparseLinearAttentionBackend"
-        elif selected_backend == AttentionBackendEnum.SAGE_SLA_ATTN:
-            logger.info("Using Sage Sparse Linear Attention backend")
-            return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SageSparseLinearAttentionBackend"
-        elif selected_backend == AttentionBackendEnum.FA2:
-            from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2 import (  # noqa: F401
-                FlashAttention2Backend,
-            )
-
-            logger.info("Using FlashAttention2 backend")
-            return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2.FlashAttention2Backend"
-        elif selected_backend in [
-            AttentionBackendEnum.FA,
-        ]:
-            if cls.is_sm120():
-                logger.info(
-                    "FlashAttention is not supported on SM12.x in this build; falling back to Torch SDPA."
-                )
-                target_backend = AttentionBackendEnum.TORCH_SDPA
-            elif cls.is_blackwell():
-                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-                    set_fa_ver,
-                )
-
-                set_fa_ver(4)
-                target_backend = AttentionBackendEnum.FA
-            else:
-                target_backend = AttentionBackendEnum.FA
-        elif selected_backend:
-            raise ValueError(f"Invalid attention backend for {cls.device_name}")
-        else:
-            if cls.is_sm120():
-                # On SM12.x, the sgl-kernel FlashAttention wheels may not include
-                # support yet. Default to Torch SDPA for correctness.
-                logger.info("Defaulting to Torch SDPA backend on SM12.x")
-                target_backend = AttentionBackendEnum.TORCH_SDPA
-            elif cls.is_blackwell():
-                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-                    set_fa_ver,
-                )
-
-                set_fa_ver(4)
-                target_backend = AttentionBackendEnum.FA
-            else:
-                target_backend = AttentionBackendEnum.FA
-
-        # Ensure we have a target backend selected before validation/fallback.
-        if target_backend is None:
-            target_backend = AttentionBackendEnum.FA
-
-        if target_backend == AttentionBackendEnum.FA and cls.is_blackwell():
+        try:
             from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
                 set_fa_ver,
             )
+        except ImportError:
+            logger.info(
+                "Cannot use FlashAttention backend because the "
+                "flash_attn package is not found. "
+                "Make sure that flash_attn was built and installed "
+                "(on by default)."
+            )
+            return False
 
-            set_fa_ver(4)
+        set_fa_ver(4)
+        return True
 
+    @classmethod
+    def _resolve_flash_attention_backend_cls_str(
+        cls, target_backend: AttentionBackendEnum, head_size: int, dtype: torch.dtype
+    ) -> str:
         if not cls.has_device_capability(80):
             logger.info("Cannot use FlashAttention backend for Volta and Turing GPUs.")
             target_backend = AttentionBackendEnum.TORCH_SDPA
@@ -425,8 +474,13 @@ class CudaPlatformBase(Platform):
                 "torch.float16 or torch.bfloat16."
             )
             target_backend = AttentionBackendEnum.TORCH_SDPA
-        # FlashAttn is valid for the model, checking if the package is
-        # installed.
+
+        if (
+            target_backend == AttentionBackendEnum.FA
+            and not cls._prepare_flash_attention_for_blackwell()
+        ):
+            target_backend = AttentionBackendEnum.TORCH_SDPA
+
         if target_backend == AttentionBackendEnum.FA:
             try:
                 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
@@ -450,13 +504,32 @@ class CudaPlatformBase(Platform):
                 target_backend = AttentionBackendEnum.TORCH_SDPA
 
         if target_backend == AttentionBackendEnum.TORCH_SDPA:
-            logger.info("Using Torch SDPA backend")
-
-            return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
-
-        logger.info("Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend")
+            return _SDPA_BACKEND_CLS_STR
 
         return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
+
+    @classmethod
+    def get_attn_backend_cls_str(
+        cls,
+        selected_backend: AttentionBackendEnum | None,
+        head_size: int,
+        dtype: torch.dtype,
+    ) -> str:
+        if selected_backend is None:
+            target_backend = cls._resolve_default_attn_backend()
+        else:
+            resolver = _CUDA_ATTENTION_BACKEND_RESOLVERS.get(selected_backend)
+            if resolver is None:
+                raise ValueError(f"Invalid attention backend for {cls.device_name}")
+
+            resolved_backend = resolver.resolve(cls)
+            if isinstance(resolved_backend, str):
+                return resolved_backend
+            target_backend = resolved_backend
+
+        return cls._resolve_flash_attention_backend_cls_str(
+            target_backend, head_size, dtype
+        )
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -22,13 +23,18 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
@@ -38,6 +44,18 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+
+
+def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
+    """Check if output send/recv can be skipped for this batch."""
+    return (
+        envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get()
+        and batch is not None
+        and batch.forward_mode == ForwardMode.EXTEND
+        and len(batch.reqs) == 1
+        and not batch.contains_last_prefill_chunk
+        and not batch.return_logprob
+    )
 
 
 @dataclass
@@ -556,7 +574,7 @@ class SchedulerPPMixin:
         if self.pp_group.is_first_rank:
             model_runner = self.tp_worker.model_runner
             model_config = model_runner.model_config
-            input_ids_list = []
+            input_ids_list: List[array[int]] = []
             for i in range(128):
                 chunk_size = int(
                     self.chunked_prefill_size * 1.25
@@ -564,9 +582,12 @@ class SchedulerPPMixin:
                 )
                 if chunk_size <= 0:
                     break
-                input_ids = np.random.randint(
-                    0, 10000, size=chunk_size, dtype=np.int64
-                ).tolist()
+                input_ids = array(
+                    "q",
+                    np.random.randint(
+                        0, 10000, size=chunk_size, dtype=np.int64
+                    ).tobytes(),
+                )
                 input_ids_list.append(input_ids)
 
             sampling_params = SamplingParams(
@@ -586,9 +607,11 @@ class SchedulerPPMixin:
                     origin_input_ids=input_ids,
                     sampling_params=sampling_params,
                 )
-                req.fill_ids = req.origin_input_ids
+                req.full_untruncated_fill_ids = req.origin_input_ids
                 req.logprob_start_len = -1
-                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+                req.set_extend_range(
+                    len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+                )
 
                 # Prepare batch
                 batch = ScheduleBatch.init_new(
@@ -601,7 +624,7 @@ class SchedulerPPMixin:
                     self.spec_algorithm,
                 )
 
-                current_seq_len = len(req.fill_ids)
+                current_seq_len = req.extend_range.end
 
                 if is_dp_attention_enabled():
                     # For profiling, we only have one request on PP0
@@ -629,6 +652,13 @@ class SchedulerPPMixin:
                         device=self.device,
                     ),
                 }
+                pp_proxy_topk_size = model_runner.get_pp_proxy_topk_size()
+                if pp_proxy_topk_size is not None:
+                    proxy_tensors["topk_indices"] = torch.zeros(
+                        (current_seq_len, pp_proxy_topk_size),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
 
                 pp_proxy = PPProxyTensors(proxy_tensors)
 
@@ -639,6 +669,13 @@ class SchedulerPPMixin:
 
                 start = time.perf_counter()
                 batch.prepare_for_extend()
+
+                # Resolve deferred H2D: prepare_for_extend now leaves input_ids=None
+                if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
+                    batch.input_ids = batch.prefill_input_ids_cpu.to(
+                        self.device, non_blocking=True
+                    )
+                    batch.prefill_input_ids_cpu = None
 
                 forward_batch = ForwardBatch.init_new(batch, model_runner)
                 set_is_extend_in_batch(batch.forward_mode.is_extend())
@@ -658,7 +695,7 @@ class SchedulerPPMixin:
                 # Release KV cache
                 if req.req_pool_idx is not None:
                     kv_indices = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, : len(req.fill_ids)
+                        req.req_pool_idx, : req.extend_range.end
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
                     self.req_to_token_pool.free(req)
@@ -890,7 +927,9 @@ class SchedulerPPMixin:
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-            dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
+            dp_offset = (
+                self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+            )
             p2p_work = point_to_point_pyobj(
                 data,
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
@@ -903,7 +942,9 @@ class SchedulerPPMixin:
 
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-            dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
+            dp_offset = (
+                self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+            )
             data = point_to_point_pyobj(
                 [],
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
@@ -1028,6 +1069,30 @@ class SchedulerPPMixin:
             ),
         )
 
+    def _pp_make_skip_output_result(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        mb_metadata: Optional[PPBatchMetadata],
+    ):
+        bs = len(batch.reqs)
+        placeholder = torch.zeros(bs, dtype=torch.int64, device=self.device)
+        # next_pp_outputs = None so non-last ranks skip forwarding
+        # (pp_outputs is None gate). Placeholder carried in
+        # batch_result.next_token_ids for process_batch_result_prefill.
+        batch.output_ids = placeholder
+        batch_result = GenerationBatchResult(
+            logits_output=None,
+            pp_hidden_states_proxy_tensors=None,
+            next_token_ids=placeholder,
+            can_run_cuda_graph=(
+                mb_metadata.can_run_cuda_graph if mb_metadata else False
+            ),
+            skipped_output_comm=True,
+        )
+        d2h_event = self.device_module.Event()
+        d2h_event.record(self.device_module.current_stream())
+        return None, batch_result, d2h_event
+
     def _pp_prep_batch_result(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -1047,6 +1112,12 @@ class SchedulerPPMixin:
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
         batch.input_ids = pp_outputs["next_token_ids"].to(torch.int64)
+        # PP rank 0 also relays into output_tokens_buf so the next iter's
+        # resolve_forward_inputs finds these tokens for the decode portion
+        # of mixed-chunk batches (which gather via mix_running_indices).
+        self.future_map.stash(
+            batch.req_pool_indices, RelayPayload(bonus_tokens=batch.input_ids)
+        )
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
@@ -1072,9 +1143,13 @@ class SchedulerPPMixin:
         send_output_work = []
         if self.pp_group.is_last_rank:
             # send ready PP output to rank 0
-            if mbs[next_first_rank_mb_id] is not None:
+            target = mbs[next_first_rank_mb_id]
+            if target is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
-                if not mbs[next_first_rank_mb_id].forward_mode.is_prebuilt():
+                if (
+                    not target.forward_mode.is_prebuilt()
+                    and not _pp_can_skip_output_comm(target)
+                ):
                     self.device_module.current_stream().wait_event(q_event)
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
@@ -1135,14 +1210,20 @@ class SchedulerPPMixin:
 
         def _do_recv():
             nonlocal next_pp_outputs, batch_result, d2h_event
-            if mbs[next_mb_id] is None or mbs[next_mb_id].forward_mode.is_prebuilt():
+            target = mbs[next_mb_id]
+            if target is None or target.forward_mode.is_prebuilt():
+                return
+            if _pp_can_skip_output_comm(target):
+                next_pp_outputs, batch_result, d2h_event = (
+                    self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
+                )
                 return
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
                 next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
             with self.copy_stream_ctx:
                 self.copy_stream.wait_stream(self.schedule_stream)
                 batch_result = self._pp_prep_batch_result(
-                    mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
+                    target, mb_metadata[next_mb_id], next_pp_outputs
                 )
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
@@ -1327,6 +1408,9 @@ class SchedulerPPMixin:
             released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
                 release_rids
             )
+            if self.enable_hisparse:
+                for req in released_reqs:
+                    self.hisparse_coordinator.admit_request_direct(req)
             self.waiting_queue.extend(released_reqs)
             return [req.rid for req in released_reqs]
         return None

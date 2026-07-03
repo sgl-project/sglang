@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
@@ -16,9 +16,6 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     dp_gather_partial,
-    get_attention_cp_rank,
-    get_attention_cp_size,
-    get_attention_dp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -26,8 +23,10 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
+    cp_round_robin_input_ids,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
     prepare_context_parallel_metadata,
@@ -37,7 +36,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer, DeepseekV4ForCausalLM
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
@@ -91,22 +92,24 @@ class DeepseekV4ModelNextN(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("h_proj", prefix),
         )
-
-        layer_name = "decoder"
+        if isinstance(quant_config, ModelSlimConfig):
+            prefix = "mtp.0"
+        else:
+            prefix = add_prefix("decoder", prefix)
 
         self.decoder = DeepseekV4DecoderLayer(
             config,
             layer_id=0,
             quant_config=quant_config,
             is_nextn=True,
-            prefix=add_prefix(layer_name, prefix),
+            prefix=prefix,
             alt_streams=None,
             compress_ratio_override=COMPRESS_RATIO_NEXTN_LAYER,
         )
 
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
-            self.cp_size = get_attention_cp_size()
+            self.cp_size = get_parallel().attn_cp_size
         else:
             self.cp_size = None
 
@@ -127,11 +130,6 @@ class DeepseekV4ModelNextN(nn.Module):
         pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
         return y.to(dtype)
-
-    def prewarm_mhc_token_count_buckets(
-        self, max_num_tokens: int, device: torch.device
-    ) -> Tuple[int, ...]:
-        return self.decoder.prewarm_mhc_token_count_buckets(max_num_tokens, device)
 
     def forward(
         self,
@@ -159,7 +157,7 @@ class DeepseekV4ModelNextN(nn.Module):
         else:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
-        if get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none():
+        if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
                 (_DpGatheredBufferWrapper._global_dp_buffer_len, 1),
                 dtype=input_ids.dtype,
@@ -173,14 +171,20 @@ class DeepseekV4ModelNextN(nn.Module):
         if dsa_use_prefill_cp(forward_batch):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+            input_ids = cp_round_robin_input_ids(input_ids)
+            input_ids_global = input_ids
 
-        hidden_states = self.decoder(
+        hidden_states, residual, post, comb = self.decoder(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
+        if residual is not None:
+            # NextN has a single decoder layer, so no later layer can consume a
+            # deferred fused hc_post state.
+            hidden_states = self.decoder.hc_post(hidden_states, residual, post, comb)
 
         if dsa_use_prefill_cp(forward_batch):
             hidden_states = cp_all_gather_rerange_output(
@@ -210,14 +214,14 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.pp_group = get_pp_group()
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
-            self.cp_rank = get_attention_cp_rank()
-            self.cp_size = get_attention_cp_size()
+            self.cp_rank = get_parallel().attn_cp_rank
+            self.cp_size = get_parallel().attn_cp_size
         else:
             self.cp_rank = None
             self.cp_size = None
@@ -248,17 +252,17 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
+                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
                 if is_dsa_prefill_cp_round_robin_split():
-                    metadata = forward_batch.attn_backend.forward_metadata
+                    attn_backend = get_attn_backend()
+                    metadata = attn_backend.forward_metadata
                     core_meta = metadata.core_attn_metadata
                     core_meta.apply_cp_reindex()
-                    core_meta.init_flashmla_related()
+                    core_meta.init_flashmla_related(is_prefill=True)
                     if metadata.indexer_metadata is not None:
                         metadata.indexer_metadata = (
-                            forward_batch.attn_backend.init_forward_metadata_indexer(
-                                core_meta
-                            )
+                            attn_backend.init_forward_metadata_indexer(core_meta)
                         )
 
         hidden_states, pre_hc_head = self.model(input_ids, positions, forward_batch)

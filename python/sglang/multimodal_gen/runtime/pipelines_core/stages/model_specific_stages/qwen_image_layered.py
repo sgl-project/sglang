@@ -17,8 +17,34 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import align_tensor_to_module_dtype
 
 logger = init_logger(__name__)
+
+
+def _resolve_text_encoder_dtype(
+    text_encoder: object, fallback: torch.dtype = torch.bfloat16
+) -> torch.dtype:
+    module_dtype = getattr(text_encoder, "dtype", None)
+    if isinstance(module_dtype, torch.dtype):
+        return module_dtype
+
+    for tensor_source in ("parameters", "buffers"):
+        tensors = getattr(text_encoder, tensor_source, None)
+        if not callable(tensors):
+            continue
+        try:
+            for tensor in tensors():
+                if isinstance(tensor, torch.Tensor) and torch.is_floating_point(tensor):
+                    return tensor.dtype
+        except TypeError as exc:
+            logger.warning(
+                "Failed to inspect text encoder %s() for dtype: %s",
+                tensor_source,
+                exc,
+            )
+
+    return fallback
 
 
 def _seq_lens_from_optional_mask(
@@ -28,6 +54,14 @@ def _seq_lens_from_optional_mask(
     if prompt_embeds_mask is None:
         return [int(prompt_embeds.shape[1])] * int(prompt_embeds.shape[0])
     return [int(x) for x in prompt_embeds_mask.sum(dim=1).tolist()]
+
+
+def _resolve_layered_image_path(image_path: str | list[str]) -> str:
+    if isinstance(image_path, str):
+        return image_path
+    if isinstance(image_path, list) and image_path:
+        return image_path[0]
+    raise ValueError("Qwen-Image-Layered requires a non-empty image_path.")
 
 
 # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus.calculate_dimensions
@@ -125,6 +159,7 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
     def __init__(
         self,
         vae,
+        text_encoder,
         tokenizer,
         processor,
         transformer,
@@ -137,14 +172,14 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
         self.vae = vae.to(dtype=vae_dtype)
         self.vae_dtype = vae_dtype
         self.text_encoder_dtype = text_encoder_dtype
-        from transformers import Qwen2_5_VLForConditionalGeneration
+        if text_encoder is None:
+            from transformers import Qwen2_5_VLForConditionalGeneration
 
-        self.text_encoder = (
-            Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 model_path, subfolder="text_encoder"
             )
-            .to(get_local_torch_device())
-            .to(dtype=self.text_encoder_dtype)
+        self.text_encoder = text_encoder.to(
+            device=get_local_torch_device(), dtype=self.text_encoder_dtype
         )
         self.tokenizer = tokenizer
         self.processor = processor
@@ -186,9 +221,15 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         stage_name = self._component_stage_name(stage_name)
         return [
             ComponentUse(
-                stage_name, "qwen_layered_text_encoder", target_dtype=torch.bfloat16
+                stage_name,
+                "text_encoder",
+                target_dtype=self.text_encoder_dtype,
             ),
-            ComponentUse(stage_name, "vae", target_dtype=torch.bfloat16),
+            ComponentUse(
+                stage_name,
+                "vae",
+                target_dtype=self.vae_dtype,
+            ),
         ]
 
     # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.QwenImagePipeline._extract_masked_hidden
@@ -232,7 +273,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
-        dtype = dtype or self.text_encoder.dtype
+        dtype = dtype or _resolve_text_encoder_dtype(self.text_encoder)
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
 
@@ -336,6 +377,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         with self.use_declared_component(component_name="vae", module=self.vae) as vae:
             assert vae is not None
             self.vae = vae
+            image = align_tensor_to_module_dtype(image, self.vae)
             if isinstance(generator, list):
                 image_latents = [
                     retrieve_latents(
@@ -390,7 +432,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
 
         image_latents = None
         if image is not None:
-            image = image.to(device=device, dtype=dtype)
+            image = align_tensor_to_module_dtype(image, self.vae, device=device)
             if image.shape[1] != self.latent_channels:
                 image_latents = self._encode_vae_image(image=image, generator=generator)
             else:
@@ -456,7 +498,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         generator = batch.generator
 
         assert batch.image_path is not None
-        image = load_image(batch.image_path[0])
+        image = load_image(_resolve_layered_image_path(batch.image_path))
         image = image.convert("RGBA")
         image_size = image.size
         resolution = server_args.pipeline_config.resolution
@@ -470,6 +512,8 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         multiple_of = self.vae_scale_factor * 2
         width = width // multiple_of * multiple_of
         height = height // multiple_of * multiple_of
+        batch.width = width
+        batch.height = height
 
         # if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
         image = self.image_processor.resize(image, calculated_height, calculated_width)
@@ -478,11 +522,11 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             image, calculated_height, calculated_width
         )
         image = image.unsqueeze(2)
-        image = image.to(dtype=self.vae_dtype)
+        image = align_tensor_to_module_dtype(image, self.vae, device=device)
 
         prompt = batch.prompt
         with self.use_declared_component(
-            component_name="qwen_layered_text_encoder",
+            component_name="text_encoder",
             module=self.text_encoder,
         ) as text_encoder:
             assert text_encoder is not None
@@ -535,7 +579,6 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         # 5. Prepare timesteps
         scheduler = self.scheduler
         sigmas = np.linspace(1.0, 0, num_inference_steps + 1)[:-1]
-        image_seq_len = latents.shape[1]
         base_seqlen = 256 * 256 / 16 / 16
         mu = (image_latents.shape[1] / base_seqlen) ** 0.5
         timesteps, num_inference_steps = retrieve_timesteps(
@@ -550,8 +593,6 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         negative_txt_seq_lens = _seq_lens_from_optional_mask(
             negative_prompt_embeds, negative_prompt_embeds_mask
         )
-        is_rgb = torch.tensor([0]).to(device=device, dtype=torch.long)
-
         batch.prompt_embeds = [prompt_embeds]
         batch.prompt_embeds_mask = [prompt_embeds_mask]
         batch.prompt_seq_lens = [txt_seq_lens]

@@ -11,6 +11,7 @@ from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -42,6 +43,8 @@ class SamplingBatchInfo:
     # Masking tensors for grammar-guided structured outputs
     vocab_size: int
     grammars: Optional[List] = None
+    rids_int: Optional[torch.Tensor] = None
+    bootstrap_room_ids_int: Optional[torch.Tensor] = None
     vocab_mask: Optional[torch.Tensor] = None
     apply_mask_func: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
 
@@ -77,20 +80,31 @@ class SamplingBatchInfo:
 
         reqs = batch.reqs
         device = batch.device
-        temperatures = torch.tensor(
-            [r.sampling_params.temperature for r in reqs],
-            dtype=torch.float,
-            device=device,
-        ).view(-1, 1)
+        _pin = is_pin_memory_available(device)
+        temperatures = (
+            torch.tensor(
+                [r.sampling_params.temperature for r in reqs],
+                dtype=torch.float,
+                pin_memory=_pin,
+            )
+            .to(device, non_blocking=True)
+            .view(-1, 1)
+        )
         top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
-        )
+            [r.sampling_params.top_p for r in reqs],
+            dtype=torch.float,
+            pin_memory=_pin,
+        ).to(device, non_blocking=True)
         top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int32, device=device
-        )
+            [r.sampling_params.top_k for r in reqs],
+            dtype=torch.int32,
+            pin_memory=_pin,
+        ).to(device, non_blocking=True)
         min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
-        )
+            [r.sampling_params.min_p for r in reqs],
+            dtype=torch.float,
+            pin_memory=_pin,
+        ).to(device, non_blocking=True)
         sampling_seed = (
             torch.tensor(
                 [
@@ -102,8 +116,8 @@ class SamplingBatchInfo:
                     for r in reqs
                 ],
                 dtype=torch.int64,
-                device=device,
-            )
+                pin_memory=_pin,
+            ).to(device, non_blocking=True)
             if enable_deterministic
             else None
         )
@@ -193,7 +207,7 @@ class SamplingBatchInfo:
         pass
 
     # placeholder for override
-    def adjusted_merge_batch(self, other: "SamplingBatchInfo"):
+    def adjusted_merge_batch(self, other: SamplingBatchInfo):
         pass
 
     # placeholder for override
@@ -350,7 +364,7 @@ class SamplingBatchInfo:
 
         return merged_dict
 
-    def merge_batch(self, other: "SamplingBatchInfo"):
+    def merge_batch(self, other: SamplingBatchInfo):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
         # Merge the custom logit processors and custom params lists

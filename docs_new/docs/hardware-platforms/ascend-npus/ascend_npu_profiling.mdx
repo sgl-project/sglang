@@ -44,12 +44,6 @@ sglang serve \
   --max-running-requests 128
 ```
 
-<Note>
-On Ascend NPU, SGLang uses `torch_npu._apply_patches()` to automatically
-redirect PyTorch Profiler's CUDA activity to NPU, so
-`activities: ["CPU", "GPU"]` actually captures NPU operator events.
-</Note>
-
 **Profiling-related environment variables:**
 
 <table>
@@ -78,6 +72,10 @@ redirect PyTorch Profiler's CUDA activity to NPU, so
     </tr>
   </tbody>
 </table>
+
+<Note>
+Priority order: **API parameter > Environment variable > Default value**.
+</Note>
 
 ### 2. Collection Methods
 
@@ -154,7 +152,7 @@ curl -X POST http://127.0.0.1:30000/stop_profile
 server needs time to flush trace data to disk and parse it. Wait for the
 response to complete.
 This method takes a significant amount of time to parse
-profiling data;consider using **Method B** instead to avoid lengthy waits.
+profiling data; consider using **Method B** instead to avoid lengthy waits.
 </Note>
 
 #### Method B: API Auto-Stop
@@ -227,6 +225,12 @@ sending `/stop_profile`.
 shown in the server log as `Profiling done. Traces are saved to: <path>`.
 </Note>
 
+<Note>
+On Ascend NPU, SGLang uses `torch_npu._apply_patches()` to automatically
+redirect PyTorch Profiler's CUDA activity to NPU, so
+`activities: ["CPU", "GPU"]` actually captures NPU operator events.
+</Note>
+
 **`bench_serving --profile` parameters:**
 
 <table>
@@ -255,8 +259,11 @@ python3 -m sglang.profiler \
   --num-steps 3 \
   --cpu --gpu &
 ```
+
 ```bash Command
-# Terminal 2: Immediately send inference requests to provide steps for profiling
+# Terminal 2: Wait for "Waiting for N steps" output from Terminal 1, then send requests.
+# The profiler starts recording once /start_profile is received by the server.
+# Requests sent before the server receives /start_profile will not be captured.
 curl http://127.0.0.1:30000/generate \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello", "sampling_params": {"max_new_tokens": 32}}'
@@ -352,7 +359,8 @@ set of supported parameters:
     <tr>
       <td><code>activities</code></td>
       <td>
-        Activity types: CPU, GPU, MEM, RPD. On Ascend NPU, primarily CPU and GPU
+        Activity types: CPU, GPU, MEM, RPD. On Ascend NPU, only CPU and GPU are supported.
+        MEM depends on CUDA memory APIs and will be silently ignored. RPD requires ROCm and will cause an error.
       </td>
       <td><code>["CPU", "GPU"]</code></td>
     </tr>
@@ -400,15 +408,18 @@ them via:
 
 - **When profiling starts**: server log outputs
   `Profiling starts. Traces will be saved to: <path> (with profile id: <id>)`
-```
+
+```text
 [2026-05-19 13:23:15] Profiling starts. Traces will be saved to: /tmp/1779196995.6948605 (with profile id: 1779196995.6979997)
 [2026-05-19 13:23:15] [WARNING] [350443] profiler.py: Invalid parameter export_type: None, reset it to text.
 [2026-05-19 13:23:15] [WARNING] [350443] profiler.py: Invalid parameter export_type: None, reset it to text.
 [2026-05-19 13:23:15] INFO:     127.0.0.1:40714 - "POST /start_profile HTTP/1.1" 200 OK
 ```
+
 - **When profiling stops**: server log outputs
   `Profiling done. Traces are saved to: <path>`
-```
+
+```text
 [2026-05-19 13:23:17] Stop profiling...
 [2026-05-19 13:23:17] [WARNING] [350443] profiler.py: Incorrect schedule: Stop profiler while current state is RECORD which may result in incomplete parsed data.
 [rank0]:[W519 13:23:17.084812760 compiler_depend.ts:3136] Warning: The indexFromRank 0is not equal indexFromCurDevice 4 , which might be normal if the number of devices on your collective communication server is inconsistent.Otherwise, you need to check if the current device is correct when calling the interface.If it's incorrect, it might have introduced an error. (function operator())
@@ -417,8 +428,10 @@ them via:
 [2026-05-19 13:23:32] [INFO] [352725] profiler.py: All profiling data parsed in a total time of 0:00:14.305669
 [2026-05-19 13:23:32] Profiling done. Traces are saved to: /tmp/1779196995.6948605
 ```
+
 - **CLI output**: `sglang.profiler` outputs `Dump profiling traces to <path>`
-```
+
+```text
 Dump profiling traces to /tmp/1779243331.3219
 Waiting for 10 steps and the trace to be flushed.... (profile_by_stage=False)
 ```
@@ -426,7 +439,7 @@ Waiting for 10 steps and the trace to be flushed.... (profile_by_stage=False)
 The directory structure is
 `<output_dir>/<hostname>_<pid>_<timestamp>_ascend_pt/`. When using Method C
 (`bench_serving --profile`), a timestamp subdirectory is added:
-`<output_dir>/<timestamp>/`. Always check the server log for the exact path:
+`<output_dir>/<timestamp>/<hostname>_<pid>_<timestamp>_ascend_pt/`. Always check the server log for the exact path:
 `Profiling done. Traces are saved to: <path>`.
 
 ### 5. Viewing Results
@@ -465,12 +478,11 @@ files — **no need to manually call `analyse()`**:
 </Note>
 
 <Note>
-If you need to merge distributed trace files in a multi-node deployment, set
-`"merge_profiles": true` in the `/start_profile` request. Note: on Ascend NPU,
-the merger has limited support for the `*_ascend_pt` format — check
-`trace_view.json` on each node individually. See
-[Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling#profiler-trace-merger-for-distributed-traces)
-for details.
+In a multi-node deployment, each node generates its own trace files.
+To merge them into a single unified trace, set `"merge_profiles": true` in the `/start_profile` request.
+However, on Ascend NPU, the merge feature does **not** fully support the `*_ascend_pt` format — merged results may be incomplete or incorrect.
+It is recommended to view `trace_view.json` on each node individually instead.
+For more details, see [Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling#profiler-trace-merger-for-distributed-traces).
 </Note>
 
 ### 6. Re-parsing Raw Data (Optional)
@@ -487,6 +499,8 @@ analyse("./sglang_profile/<hostname>_*_ascend_pt/")
 <Note>
 Normally **no need** to manually run `analyse()` — the server already parses
 data automatically. Only use this for re-parsing or handling interrupted data.
+Running `analyse()` when ASCEND_PROFILER_OUTPUT already exists will overwrite the original directory.
+If the original data is still needed, back it up before running `analyse()`.
 </Note>
 
 ## Best Practices

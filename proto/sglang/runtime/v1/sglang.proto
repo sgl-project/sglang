@@ -68,6 +68,7 @@ message TextGenerateRequest {
   optional string routing_key = 10;
   optional int32 routed_dp_rank = 11;
   map<string, string> trace_headers = 12;
+  optional string session_id = 13;
 }
 
 message TextGenerateResponse {
@@ -90,6 +91,7 @@ message GenerateRequest {
   optional string routing_key = 9;
   optional int32 routed_dp_rank = 10;
   map<string, string> trace_headers = 11;
+  optional string session_id = 12;
 }
 
 message GenerateResponse {
