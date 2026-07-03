@@ -3223,11 +3223,13 @@ class ServerArgs:
         rules = [
             # MLA prefill takes a different attn-forward path under BCG.
             ("MLA attention", lambda: self.use_mla_backend()),
-            # DSV4 is BCG-compatible but introduces heavy memory pressure: the
-            # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
+            # DSV4 target-prefill BCG replay corrupts the hidden states fed
+            # to the spec draft (garbled outputs; reproduces on main with
+            # BCG forced). Plain DSV4 prefill under BCG is bit-correct.
             (
-                "DeepSeek-V4 (heavy capture-pool memory pressure)",
-                lambda: is_deepseek_v4(self.get_model_config().hf_config),
+                "DeepSeek-V4 with speculative decoding",
+                lambda: self.speculative_algorithm is not None
+                and is_deepseek_v4(self.get_model_config().hf_config),
             ),
             # CP all_gather replay size mismatch under BCG.
             ("context parallel (attn_cp_size > 1)", lambda: self.attn_cp_size > 1),
@@ -3505,6 +3507,26 @@ class ServerArgs:
                 else:
                     # For MLA backend the memory overhead is much higher than expected with fa3
                     reserved_mem += 1.5 * 1024
+
+                from sglang.srt.configs.model_config import is_deepseek_v4
+
+                if prefill_cuda_graph_config.backend == Backend.BREAKABLE and (
+                    is_deepseek_v4(self.get_model_config().hf_config)
+                ):
+                    # DSV4 BCG-specific capture overhead. The graph pool
+                    # itself (dominated by the in-graph c4-indexer logits
+                    # scratch) is the captured form of the prefill
+                    # activations already funded by the chunked-prefill
+                    # activation term above, and per-bucket captured
+                    # metadata is deduplicated into max-bucket-size
+                    # backings by the attention backend, and the c4-indexer
+                    # logits scratch is bounded by row-chunking in the
+                    # indexer — none of those need extra reserve. What
+                    # remains: segment-bridge buffers (~30 MB per capture
+                    # bucket) and one-time DeepGEMM JIT workspaces.
+                    # Measured on 4x B200 tp=4; leaves ~4 GB post-capture
+                    # for the per-replay static-metadata rebuild + NCCL.
+                    reserved_mem += len(prefill_cuda_graph_config.bs) * 30 + 1024
 
             if gpu_mem is not None and gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)

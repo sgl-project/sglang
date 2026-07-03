@@ -40,6 +40,12 @@ else:
     FP8_DTYPE = torch.float8_e4m3fn
     FP8_MAX = torch.finfo(FP8_DTYPE).max
 
+# Upper bound for the c4-indexer logits scratch (query_rows × max_c4_seq_len
+# × fp32) per kernel call; larger workloads are computed in row slices. Keeps
+# the worst-case-sized scratch out of the BCG prefill graph pool (~4 GiB at
+# 4096 tokens × 1M context) and bounds long-context eager transients.
+_C4_LOGITS_SCRATCH_BUDGET_BYTES = 512 << 20
+
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
 
@@ -550,19 +556,47 @@ class C4IndexerBackendMixin:
         _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
         if _c4sl.dim() == 1 and not _use_tilelang and not _use_aiter:
             _c4sl = _c4sl.unsqueeze(-1)
-        logits = fn(
-            q,
-            c4_indexer_kv_cache,
-            weights,
-            _c4sl,
-            page_table,
-            indexer_metadata.deep_gemm_metadata,
-            indexer_metadata.max_c4_seq_len,
-            False,
+
+        # The logits scratch is query_rows × max_c4_seq_len × fp32. When
+        # max_c4_seq_len is the full context (BCG prefill capture sizes it
+        # worst-case, and genuinely long-context eager prefills approach it),
+        # a 4096-token chunk costs ~4 GiB — recorded into the graph pool
+        # forever under capture. Rows are independent through topk, so
+        # compute in row slices that bound the scratch instead. deep_gemm
+        # paths only; alternate backends keep the single-shot call.
+        chunk_rows = 0
+        _use_deep_gemm = not (
+            is_hip()
+            or _use_tilelang
+            or _use_aiter
+            or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
         )
+        if _use_deep_gemm:
+            logits_bytes = 4 * query_rows * indexer_metadata.max_c4_seq_len
+            if logits_bytes > _C4_LOGITS_SCRATCH_BUDGET_BYTES:
+                chunk_rows = max(
+                    64,
+                    _C4_LOGITS_SCRATCH_BUDGET_BYTES
+                    // (4 * indexer_metadata.max_c4_seq_len),
+                )
+
+        def _slice_q(start: int, end: int):
+            if use_fp4_indexer:
+                return tuple(part[start:end] for part in q)
+            return q[start:end]
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
+            fn(
+                q,
+                c4_indexer_kv_cache,
+                weights,
+                _c4sl,
+                page_table,
+                indexer_metadata.deep_gemm_metadata,
+                indexer_metadata.max_c4_seq_len,
+                False,
+            )
             return
 
         indexer_capturer = get_global_indexer_capturer()
@@ -583,33 +617,64 @@ class C4IndexerBackendMixin:
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
-        if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
-            topk_transform_512_pytorch_vectorized(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
+        def _logits_then_topk(start: int, end: int, schedule_metadata) -> None:
+            logits = fn(
+                _slice_q(start, end),
+                c4_indexer_kv_cache,
+                weights[start:end],
+                _c4sl[start:end],
+                page_table[start:end],
+                schedule_metadata,
+                indexer_metadata.max_c4_seq_len,
+                False,
             )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
-            topk_transform_512_v2(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                indexer_metadata.topk_metadata,
-            )
+            raw = raw_indices[start:end] if raw_indices is not None else None
+            if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
+                topk_transform_512_pytorch_vectorized(
+                    logits,
+                    c4_seq_lens[start:end],
+                    page_table[start:end],
+                    c4_sparse_page_indices[start:end],
+                    indexer_metadata.c4_page_size,
+                    raw,
+                )
+            elif chunk_rows == 0 and envs.SGLANG_OPT_USE_TOPK_V2.get() and raw is None:
+                # topk v2's plan has a global header row over the full batch
+                # and cannot be row-sliced; chunked slices use v1 below.
+                topk_transform_512_v2(
+                    logits,
+                    c4_seq_lens,
+                    page_table,
+                    c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    indexer_metadata.topk_metadata,
+                )
+            else:
+                topk_transform_512(
+                    logits,
+                    c4_seq_lens[start:end],
+                    page_table[start:end],
+                    c4_sparse_page_indices[start:end],
+                    indexer_metadata.c4_page_size,
+                    raw,
+                )
+
+        if chunk_rows:
+            import deep_gemm
+
+            # Same builder PagedIndexerMetadata picks below the large-query
+            # threshold; per-slice schedules are rebuilt from the sliced
+            # seq lens (device op, records fine inside graph capture).
+            for start in range(0, query_rows, chunk_rows):
+                end = min(start + chunk_rows, query_rows)
+                schedule = deep_gemm.get_paged_mqa_logits_metadata(
+                    _c4sl[start:end].to(torch.int32),
+                    indexer_metadata.c4_page_size,
+                    deep_gemm.get_num_sms(),
+                )
+                _logits_then_topk(start, end, schedule)
         else:
-            topk_transform_512(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
+            _logits_then_topk(0, query_rows, indexer_metadata.deep_gemm_metadata)
         if hisparse_coordinator is not None:
             if hisparse_decode:
                 compress_layer_id = token_to_kv_pool.layer_mapping[

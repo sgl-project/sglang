@@ -709,6 +709,40 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.gpu_id,
             empty_cache=False,
         )
+        # BCG: warm up every shape before capturing any. Warmup transients
+        # (e.g. DSV4's ~4 GB c4-indexer scratch per prefill forward) then
+        # share one cached block in the regular allocator across shapes.
+        # Interleaving warmup with capture instead makes each warmup's
+        # transient coexist with the graph mempool — which retains captured
+        # transients for replay and cannot lend them to eager warmups — so
+        # peak memory becomes pool + warmup rather than max(pool, warmup).
+        two_pass = isinstance(self.backend, BreakableCudaGraphBackend)
+        if two_pass:
+            warmup_range = (
+                tqdm.tqdm(list(reversed(self.capture_num_tokens)))
+                if get_tensor_model_parallel_rank() == 0
+                else reversed(self.capture_num_tokens)
+            )
+            for num_tokens in warmup_range:
+                if get_tensor_model_parallel_rank() == 0:
+                    avail_mem = get_available_gpu_memory(
+                        self.model_runner.device,
+                        self.model_runner.gpu_id,
+                        empty_cache=False,
+                    )
+                    warmup_range.set_description(
+                        f"Warming up num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
+                    )
+                self.capture_one_shape(num_tokens, warmup_only=True)
+                # Release this bucket's transients (freed but cached) before
+                # the next bucket's small long-lived allocations (attn
+                # metadata) land inside the same segments — a segment with
+                # any live tensor can never be returned to the driver, and
+                # the multi-GB warmup segments would stay pinned through
+                # capture.
+                self.device_module.synchronize()
+                self.device_module.empty_cache()
+
         capture_range = (
             tqdm.tqdm(list(reversed(self.capture_num_tokens)))
             if get_tensor_model_parallel_rank() == 0
@@ -724,9 +758,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 capture_range.set_description(
                     f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
                 )
-            self.capture_one_shape(num_tokens)
+            self.capture_one_shape(num_tokens, skip_warmup=two_pass)
 
-    def capture_one_shape(self, size: int) -> None:
+    def capture_one_shape(
+        self, size: int, warmup_only: bool = False, skip_warmup: bool = False
+    ) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
@@ -751,6 +787,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             post_warmup_hook = None
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
+        if warmup_only:
+            assert isinstance(self.backend, BreakableCudaGraphBackend)
+            self.backend.warmup_one(run_once, post_warmup_hook)
+            return
+        if skip_warmup:
+            assert isinstance(self.backend, BreakableCudaGraphBackend)
+            self.backend.capture_one(
+                ShapeKey(size=num_tokens),
+                run_once,
+                dummies=None,
+                post_warmup_hook=post_warmup_hook,
+                skip_warmup=True,
+            )
+            return
         self.backend.capture_one(
             ShapeKey(size=num_tokens),
             run_once,
