@@ -583,6 +583,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
 
+        # Wrap x for NPU quantisation if a quant reference tensor exists
+        x = (x, self.npu_quant_tensor) if self.npu_quant_tensor is not None else x
+
         _deepep_precompile_tp_barrier()
         (
             recv_x,
@@ -685,16 +688,15 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
-        buffer = self._get_buffer()
+        
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
         expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
+            hidden_states.shape[0] * self._get_buffer().group_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
-            hidden_states,
-            topk_ids,
+            hidden_states, topk_ids, topk_weights
         )
         return (
             hidden_states,
@@ -741,41 +743,36 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
+        topk_weights: Optional[torch.Tensor] = None,
     ):
         input_global_scale = self.quant_config.get("input_global_scale", None)
 
-        # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
-        # to return int32-packed UE8M0 scales that don't feed the flashinfer
-        # cutedsl kernel.
-        fp8_deepgemm_scale_opts = (
-            dict(
-                round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-            )
-            if self.use_fp8
-            else dict()
-        )
-
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
+
+        # Build dispatch kwargs common to GPU and NPU
+        dispatch_kwargs = dict(
+            use_fp8=self.use_fp8,
+            async_finish=not self.return_recv_hook,
+            return_recv_hook=self.return_recv_hook,
+            **self.fp8_configs,
+        )
+        if self.use_nvfp4:
+            dispatch_kwargs["use_nvfp4"] = True
+        if input_global_scale is not None:
+            dispatch_kwargs["x_global_scale"] = input_global_scale
+
+        # NPU requires topk_weights during dispatch
+        if _is_npu and topk_weights is not None:
+            dispatch_kwargs["topk_weights"] = topk_weights
+        
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
                 topk_ids,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
-                use_fp8=self.use_fp8,
-                **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
-                **(
-                    dict(x_global_scale=input_global_scale)
-                    if input_global_scale is not None
-                    else dict()
-                ),
-                async_finish=not self.return_recv_hook,
-                return_recv_hook=self.return_recv_hook,
-                **fp8_deepgemm_scale_opts,
+                **dispatch_kwargs,
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook
