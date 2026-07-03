@@ -34,6 +34,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 from sglang.srt.arg_groups.arg_utils import model_overridable_fields
 from sglang.srt.runtime_context import resolve_flag_leaf
+from sglang.srt.utils.common import is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,66 @@ def _minimax_m2_overrides(server_args: Any, hf_config: Any) -> dict:
         "Enable TF32 matmul for MiniMaxM2ForCausalLM model to improve gate gemm performance."
     )
     return {"enable_tf32_matmul": True}
+
+
+@_register_for(
+    "Gemma2ForCausalLM",
+    "Gemma3ForCausalLM",
+    "Gemma3ForConditionalGeneration",
+    "Gemma3nForCausalLM",
+    "Gemma3nForConditionalGeneration",
+)
+def _gemma2_gemma3_overrides(server_args: Any, hf_config: Any) -> dict:
+    # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
+    # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736
+    logger.warning(
+        f"Disable hybrid SWA memory for {hf_config.architectures[0]} as it is not yet supported."
+    )
+    return {"disable_hybrid_swa_memory": True}
+
+
+@_register_for("Exaone4ForCausalLM", "ExaoneMoEForCausalLM")
+def _exaone_overrides(server_args: Any, hf_config: Any) -> dict:
+    if hf_config.sliding_window_pattern is not None:
+        logger.warning(
+            f"Disabling hybrid SWA memory for {hf_config.architectures[0]} as it is not yet supported."
+        )
+        return {"disable_hybrid_swa_memory": True}
+    return {}
+
+
+@_register_for("GptOssForCausalLM")
+def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
+    if is_xpu():
+        # Check for bf16 dtype on Intel XPU. Reads the pristine dtype request,
+        # which equals the legacy mid-branch read: dtype had no earlier writer
+        # for this arch.
+        if server_args.dtype == "auto":
+            logger.warning(
+                "GptOssForCausalLM on Intel XPU currently supports bfloat16 dtype only"
+            )
+        elif server_args.dtype not in ["bfloat16"]:
+            raise NotImplementedError(
+                f"GptOssForCausalLM on Intel XPU only supports bfloat16 dtype, "
+                f"but got '{server_args.dtype}'. Please use --dtype bfloat16 or remove --dtype to use auto."
+            )
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    if (
+        quantization_config is not None
+        and quantization_config.get("quant_method") == "mxfp4"
+    ):
+        # use bf16 for mxfp4 triton kernels
+        return {"dtype": "bfloat16"}
+    return {}
+
+
+@_register_for("Olmo2ForCausalLM")
+def _olmo2_overrides(server_args: Any, hf_config: Any) -> dict:
+    # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with Olmo3 model.
+    logger.warning(
+        f"Disabling hybrid SWA memory for {hf_config.architectures[0]} as it is not yet supported."
+    )
+    return {"disable_hybrid_swa_memory": True}
 
 
 @register_model_override_predicate(
