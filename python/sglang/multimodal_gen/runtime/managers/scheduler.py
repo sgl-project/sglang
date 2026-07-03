@@ -1048,13 +1048,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     is_warmup = is_warmup_req(processed_req)
                     self._log_warmup_result(output_batch, processed_req, is_warmup)
 
-                    if processed_req.extra.get("server_internal_prewarm"):
-                        output_batch.drop_payload_for_warmup()
-                        self.return_result(
-                            output_batch, identity, should_not_return=False
-                        )
-                    elif is_warmup and should_return_warmup_result(processed_req):
-                        # only keep the necessary lightweight payloads
+                    should_return_lightweight_warmup_result = processed_req.extra.get(
+                        "server_internal_prewarm"
+                    ) or (is_warmup and should_return_warmup_result(processed_req))
+                    if should_return_lightweight_warmup_result:
+                        # internal prewarm is a real-path request; reply but drop payloads
                         output_batch.drop_payload_for_warmup()
                         self.return_result(
                             output_batch, identity, should_not_return=False
