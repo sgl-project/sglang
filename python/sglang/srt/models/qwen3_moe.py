@@ -955,13 +955,17 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.model = Qwen3MoeModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-        )
+        # Support tied input/output embeddings for Qwen3-MoE.
+        if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
 
@@ -1150,6 +1154,17 @@ class Qwen3MoeForCausalLM(nn.Module):
 
             if "rotary_emb.inv_freq" in name:
                 continue
+
+            # Tied embeddings: copy the input embedding into a separate lm_head if present.
+            if name == "model.embed_tokens.weight":
+                if self.pp_group.is_last_rank and self.config.tie_word_embeddings:
+                    if "lm_head.weight" in params_dict:
+                        lm_param = params_dict["lm_head.weight"]
+                        weight_loader = getattr(
+                            lm_param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(lm_param, loaded_weight)
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
