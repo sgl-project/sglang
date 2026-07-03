@@ -42,6 +42,13 @@ pub enum DetokMsg {
         id: RequestId,
         payload: bytes::Bytes,
     },
+    /// Terminal per-request failure (e.g. the scheduler ingress couldn't decode a
+    /// malformed request header): deliver an `Error` to the sink and drop the
+    /// request, so the client gets a 400 instead of the scheduler crashing.
+    Fail {
+        id: RequestId,
+        message: String,
+    },
 }
 
 /// Producer-side handles, cloned into every stage that needs to emit.

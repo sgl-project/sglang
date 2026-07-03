@@ -180,6 +180,15 @@ impl Server {
         py.detach(|| self.rt.egress.try_push(bytes))
     }
 
+    /// Route a terminal failure back to request `rid` (→ HTTP 400) instead of
+    /// letting a decode error escape the scheduler loop. The scheduler's ingress
+    /// drain calls this when a request's header can't be decoded (e.g. a
+    /// malformed field). Returns `False` on backpressure.
+    fn push_error(&self, py: Python<'_>, rid: &str, message: &str) -> bool {
+        let bytes = crate::message::frame_egress_error(rid, message);
+        py.detach(|| self.rt.egress.try_push(bytes))
+    }
+
     /// Signal all threads to stop (best effort).
     fn shutdown(&self) {
         self.rt.request_shutdown();

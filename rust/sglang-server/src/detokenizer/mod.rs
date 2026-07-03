@@ -161,6 +161,7 @@ impl Runnable for DetokenizerWorker {
                 }
                 DetokMsg::Chunk(ev) => handle_chunk(&mut table, ev, &self.backend),
                 DetokMsg::Result { id, payload } => handle_result(&mut table, id, payload),
+                DetokMsg::Fail { id, message } => handle_fail(&mut table, id, message),
             }
         }
     }
@@ -173,6 +174,17 @@ fn handle_result(table: &mut HashMap<RequestId, DetokState>, id: RequestId, payl
         let _ = st.sink.try_send(EgressItem::Control(payload));
         // Egress FSM: a control request goes straight to Completed (no Streaming
         // / Finalizing states — single response, never streamed).
+        st.fsm = RequestState::Completed;
+    }
+}
+
+/// Terminal per-request failure (bad request header): send an `Error` to the sink
+/// (the api-server turns it into an HTTP 400) and drop the request.
+fn handle_fail(table: &mut HashMap<RequestId, DetokState>, id: RequestId, message: String) {
+    if let Some(mut st) = table.remove(&id) {
+        let _ = st
+            .sink
+            .try_send(EgressItem::Error(Error::Validation(message)));
         st.fsm = RequestState::Completed;
     }
 }
