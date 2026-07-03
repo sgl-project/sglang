@@ -225,7 +225,12 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 weight=layer.conv_weights.transpose(0, 1).contiguous(),
                 bias=layer.bias,
                 activation=layer.activation,
-                conv_state_indices=cache_indices,
+                # Padded cuda-graph rows carry mamba index 0 (the reserved dead
+                # slot), but this conv kernel only skips rows whose index equals
+                # pad_slot_id. Relabel pad rows so their stale garbage input is
+                # skipped instead of processed (index 0 == pad by pool design;
+                # real requests use slots >= 1).
+                conv_state_indices=cache_indices.masked_fill(cache_indices == 0, -1),
                 num_accepted_tokens=num_accepted_tokens,
                 pad_slot_id=-1,
                 validate_data=False,
