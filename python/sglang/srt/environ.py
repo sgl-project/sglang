@@ -232,6 +232,12 @@ class Envs:
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
+    # HTTP server
+    # Decompress request bodies tagged with `x-body-compressed`.
+    SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
+    # Override parsed request fields from headers.
+    SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
+
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
@@ -288,12 +294,22 @@ class Envs:
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
+    SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
+    # Disable lazy compaction in the unified memory pool allocator and
+    # fall back to the per-free eager compaction. Used for production
+    # A/B and quick rollback. Default False (lazy compaction on).
+    SGLANG_DISABLE_LAZY_COMPACTION = EnvBool(False)
+    # Sort the multi-ended allocator's free list after a merge (perf A/B knob).
+    SGLANG_SORT_FREE_LIST_AFTER_MERGE = EnvBool(False)
+    # Periodically log lazy-compaction stats per sub-pool (observability only).
+    SGLANG_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
+    SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC = EnvInt(30)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
 
@@ -582,6 +598,8 @@ class Envs:
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
     SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
+    # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
+    SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
@@ -648,6 +666,7 @@ class Envs:
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
+    SGLANG_DSA_USE_FUSED_METADATA_GENERATION = EnvBool(True)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
 
@@ -740,8 +759,10 @@ class Envs:
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
 
-    # Breakable CUDA Graph
+    # CUDA Graph
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
+    # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
+    SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
@@ -849,10 +870,11 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+    # Deprecated: DSV4 compressor V2 is always used.
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
-    SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(False)
+    SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
     # SWA radix cache
     # TODO(DSV4): @ispobock this has bug on main branch when retract

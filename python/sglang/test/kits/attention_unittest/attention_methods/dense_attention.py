@@ -276,6 +276,7 @@ class TinyModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = sliding_window_size is not None
         self.is_local_attention_model = sliding_window_size is not None
         self.attention_chunk_size = None

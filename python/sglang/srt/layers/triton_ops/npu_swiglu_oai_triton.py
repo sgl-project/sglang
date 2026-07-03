@@ -18,14 +18,12 @@ Only elementwise triton primitives are used (``tl.minimum``/``tl.maximum``/
 ``tl.exp2``/``tl.where``), all confirmed to run on the Ascend TBE backend (same
 primitives as ``minimax_sparse_ops/npu_triton/flash_block_score_decode.py``).
 """
+
 from __future__ import annotations
 
 import torch
 import triton
 import triton.language as tl
-
-# log2(e); used to express exp() through the TBE-verified tl.exp2().
-_LOG2E = 1.4426950408889634
 
 
 @triton.jit
@@ -54,15 +52,13 @@ def _swiglu_oai_kernel(
     # gate = x[row, col]            up = x[row, n_cols + col]
     gate_ptrs = x_ptr + offs_n[:, None] * stride_xr + offs_d[None, :] * stride_xc
     up_ptrs = (
-        x_ptr
-        + offs_n[:, None] * stride_xr
-        + (offs_d[None, :] + n_cols) * stride_xc
+        x_ptr + offs_n[:, None] * stride_xr + (offs_d[None, :] + n_cols) * stride_xc
     )
     gate = tl.load(gate_ptrs, mask=mask, other=0.0).to(tl.float32)
     up = tl.load(up_ptrs, mask=mask, other=0.0).to(tl.float32)
 
-    gate_c = tl.minimum(gate, limit)                       # clamp(-inf, limit]
-    up_c = tl.minimum(tl.maximum(up, -limit), limit)       # clamp[-limit, limit]
+    gate_c = tl.minimum(gate, limit)  # clamp(-inf, limit]
+    up_c = tl.minimum(tl.maximum(up, -limit), limit)  # clamp[-limit, limit]
     # sigmoid(gate_c * alpha) = 1 / (1 + exp(-(gate_c*alpha)))
     #                       = 1 / (1 + exp2(-(gate_c*alpha) * log2(e)))
     sig = 1.0 / (1.0 + tl.exp2(-(gate_c * alpha) * 1.4426950408889634))
@@ -72,9 +68,7 @@ def _swiglu_oai_kernel(
     tl.store(out_ptrs, result.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-def npu_swiglu_oai_fused(
-    x: torch.Tensor, alpha: float, limit: float
-) -> torch.Tensor:
+def npu_swiglu_oai_fused(x: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
     """Fused SwigluOAI. ``x: [..., 2d] -> out[..., d]`` (bf16/fp16 in & out)."""
     assert x.dim() >= 1 and x.shape[-1] % 2 == 0, f"bad shape {x.shape}"
     d = x.shape[-1] // 2

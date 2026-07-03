@@ -113,9 +113,7 @@ class ModelSlimW8A8Int8MoE(ModelSlimMoEScheme):
     ):
         self.moe_runner_config = moe_runner_config
         layer.swiglu_alpha = getattr(moe_runner_config, "gemm1_alpha", None)
-        layer.swiglu_clamp_limit = getattr(
-            moe_runner_config, "gemm1_clamp_limit", None
-        )
+        layer.swiglu_clamp_limit = getattr(moe_runner_config, "gemm1_clamp_limit", None)
 
     def apply_weights(
         self,

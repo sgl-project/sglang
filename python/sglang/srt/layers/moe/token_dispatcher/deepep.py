@@ -111,7 +111,7 @@ def _prepare_low_latency_dispatch_inputs(
         )
 
     if _is_npu:
-        os.environ["MOE_ENABLE_TOPK_NEG_ONE"] = "1"
+        os.environ.setdefault("MOE_ENABLE_TOPK_NEG_ONE", "1")
 
     hidden_states = hidden_states.contiguous()
     topk_weights = topk_weights.contiguous()

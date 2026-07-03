@@ -470,9 +470,7 @@ class BaseMultimodalProcessor(ABC):
                     npu_apply_minimax_m3_video_preprocess_patch,
                 )
 
-                npu_apply_minimax_m3_image_preprocess_patch(
-                    processor.image_processor
-                )
+                npu_apply_minimax_m3_image_preprocess_patch(processor.image_processor)
                 if (
                     hasattr(processor, "video_processor")
                     and processor.video_processor is not None

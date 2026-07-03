@@ -88,28 +88,6 @@ def get_hw_multiple_of(
     return new_w, new_h
 
 
-def vllm_resize(
-    height: int,
-    width: int,
-    factor: int,
-    max_size: Tuple[int, int],
-) -> Tuple[int, int]:
-    """
-    Wrapper around get_hw_multiple_of.
-
-    Args:
-        height: Image height
-        width: Image width
-        factor: Alignment factor (patch_size * merge_size)
-        max_size: (max_width, max_height) constraint
-
-    Returns:
-        Tuple[int, int]: (new_height, new_width)
-    """
-    new_w, new_h = get_hw_multiple_of((width, height), factor, max_size)
-    return new_h, new_w
-
-
 def _compute_sampled_frame_indices(
     total_frames: int,
     video_fps: float,

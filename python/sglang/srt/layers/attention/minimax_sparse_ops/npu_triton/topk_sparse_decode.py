@@ -3,10 +3,8 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-
 import triton
 import triton.language as tl
-
 
 # =============================================================================
 # Utilities
@@ -54,9 +52,6 @@ def _get_vectorcore_num_safe() -> int:
     return max(1, n) if n > 0 else 32
 
 
-
-
-
 def _choose_num_topk_chunks(
     batch_size: int,
     num_kv_heads: int,
@@ -96,11 +91,9 @@ def _normalize_topk_idx_for_gqa(
     if topk_idx.shape[0] == num_q_heads:
         batch_size = topk_idx.shape[1]
         max_topk = topk_idx.shape[2]
-        return (
-            topk_idx.view(num_kv_heads, gqa_group_size, batch_size, max_topk)
-            [:, 0, :, :]
-            .contiguous()
-        )
+        return topk_idx.view(num_kv_heads, gqa_group_size, batch_size, max_topk)[
+            :, 0, :, :
+        ].contiguous()
 
     raise AssertionError(
         "topk_idx first dimension must be either num_kv_heads or num_q_heads, "
@@ -125,15 +118,15 @@ def _normalize_topk_idx_for_gqa(
 )
 @triton.jit
 def _gqa_share_sparse_decode_bnsd_kernel(
-    q_ptr,              # [B, QH, D]
-    sink_ptr,           # optional [QH, D]
-    k_cache_ptr,        # [NBLOCKS, BLOCK, KVH, D]
-    v_cache_ptr,        # [NBLOCKS, BLOCK, KVH, D]
-    block_table_ptr,    # [B, max_num_blocks]
-    idx_ptr,            # [KVH, B, max_topk]
-    o_ptr,              # [C, B, QH, D]
-    lse_ptr,            # [C, B, QH]
-    seq_lens,           # [B]
+    q_ptr,  # [B, QH, D]
+    sink_ptr,  # optional [QH, D]
+    k_cache_ptr,  # [NBLOCKS, BLOCK, KVH, D]
+    v_cache_ptr,  # [NBLOCKS, BLOCK, KVH, D]
+    block_table_ptr,  # [B, max_num_blocks]
+    idx_ptr,  # [KVH, B, max_topk]
+    o_ptr,  # [C, B, QH, D]
+    lse_ptr,  # [C, B, QH]
+    seq_lens,  # [B]
     # shape
     batch_size,
     gqa_group_size,
@@ -219,10 +212,9 @@ def _gqa_share_sparse_decode_bnsd_kernel(
 
     # Sink belongs only to chunk 0 so it is counted once across split-topk chunks.
     if HAS_SINK and pid_c == 0:
-        sink_offsets = (
-            (pid_h + off_h[:, None]) * stride_sink_h
-            + off_d[None, :] * stride_sink_d
-        )
+        sink_offsets = (pid_h + off_h[:, None]) * stride_sink_h + off_d[
+            None, :
+        ] * stride_sink_d
         sink = tl.load(
             sink_ptr + sink_offsets,
             mask=(off_h[:, None] < gqa_group_size) & (off_d[None, :] < head_dim),
@@ -251,9 +243,7 @@ def _gqa_share_sparse_decode_bnsd_kernel(
         valid_block = logical_block >= 0
 
         physical_block = tl.load(
-            block_table_ptr
-            + pid_b * stride_bt_b
-            + logical_block * stride_bt_n,
+            block_table_ptr + pid_b * stride_bt_b + logical_block * stride_bt_n,
             mask=valid_block,
             other=0,
         ).to(tl.int64)
@@ -292,10 +282,18 @@ def _gqa_share_sparse_decode_bnsd_kernel(
         qk = tl.where(pos_mask[None, :], qk, float("-inf"))
 
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.where(valid_block, tl.exp(qk - m_ij[:, None]), tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32))
+        p = tl.where(
+            valid_block,
+            tl.exp(qk - m_ij[:, None]),
+            tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32),
+        )
         l_ij = tl.sum(p, axis=1)
 
-        acc_o_scale = tl.where(valid_block, tl.exp(m_i - m_ij), tl.full((BLOCK_SIZE_H,), 1.0, dtype=tl.float32))
+        acc_o_scale = tl.where(
+            valid_block,
+            tl.exp(m_i - m_ij),
+            tl.full((BLOCK_SIZE_H,), 1.0, dtype=tl.float32),
+        )
         acc_o_new = acc_o * acc_o_scale[:, None] + tl.dot(p.to(v.dtype), v)
         lse_i_new = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
 
@@ -325,11 +323,7 @@ def _gqa_share_sparse_decode_bnsd_kernel(
         mask=(off_h[:, None] < gqa_group_size) & (off_d[None, :] < head_dim),
     )
 
-    l_offsets = (
-        pid_c * stride_l_c
-        + pid_b * stride_l_b
-        + (pid_h + off_h) * stride_l_h
-    )
+    l_offsets = pid_c * stride_l_c + pid_b * stride_l_b + (pid_h + off_h) * stride_l_h
     tl.store(
         lse_ptr + l_offsets,
         lse_i.to(lse_ptr.dtype.element_ty),
@@ -349,9 +343,9 @@ def _gqa_share_sparse_decode_bnsd_kernel(
 )
 @triton.jit
 def _merge_topk_attn_out_bnsd_kernel(
-    o_ptr,              # [C, B, QH, D]
-    lse_ptr,            # [C, B, QH]
-    out_ptr,            # [B, QH, D]
+    o_ptr,  # [C, B, QH, D]
+    lse_ptr,  # [C, B, QH]
+    out_ptr,  # [B, QH, D]
     head_dim,
     # strides
     stride_o_c,
@@ -427,14 +421,14 @@ def _merge_topk_attn_out_bnsd_kernel(
 
 @torch.no_grad()
 def flash_decode_bnsd_with_gqa_share_sparse(
-    q: torch.Tensor,                    # [batch_size, num_q_heads, head_dim]
-    sink: Optional[torch.Tensor],        # optional [num_q_heads, head_dim]
-    k_cache_bnsd: torch.Tensor,          # [num_blocks, block_size, num_kv_heads, head_dim]
-    v_cache_bnsd: torch.Tensor,          # same shape
-    block_table: torch.Tensor,           # [batch_size, max_num_blocks]
-    seq_lens: torch.Tensor,              # [batch_size]
+    q: torch.Tensor,  # [batch_size, num_q_heads, head_dim]
+    sink: Optional[torch.Tensor],  # optional [num_q_heads, head_dim]
+    k_cache_bnsd: torch.Tensor,  # [num_blocks, block_size, num_kv_heads, head_dim]
+    v_cache_bnsd: torch.Tensor,  # same shape
+    block_table: torch.Tensor,  # [batch_size, max_num_blocks]
+    seq_lens: torch.Tensor,  # [batch_size]
     block_size: int,
-    topk_idx: torch.Tensor,              # [num_kv_heads or num_q_heads, batch_size, topk]
+    topk_idx: torch.Tensor,  # [num_kv_heads or num_q_heads, batch_size, topk]
     sm_scale: Optional[float] = None,
     num_topk_chunks: Optional[int] = None,
     max_num_topk_chunks: int = 8,
@@ -495,7 +489,7 @@ def flash_decode_bnsd_with_gqa_share_sparse(
     max_kv_len = block_table.shape[1] * block_size
 
     if sm_scale is None:
-        sm_scale = head_dim ** -0.5
+        sm_scale = head_dim**-0.5
 
     if num_topk_chunks is None:
         num_topk_chunks = _choose_num_topk_chunks(
