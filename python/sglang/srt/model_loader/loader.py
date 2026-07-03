@@ -119,6 +119,7 @@ from sglang.srt.utils import (
     rank0_log,
     set_weight_attrs,
 )
+from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
@@ -2298,7 +2299,9 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
         load_config = self.load_config
-        instance_ip = socket.gethostbyname(socket.gethostname())
+        # Use IPv6-aware resolution so the group name matches model_runner.py which
+        # also uses NetworkAddress.resolve_host (not gethostbyname).
+        instance_ip = NetworkAddress.resolve_host(socket.gethostname())
         start_build_group_tic = time.time()
         client.build_group(
             gpu_id=device_config.gpu_id,
