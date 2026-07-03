@@ -112,6 +112,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_track_indices=mamba_track_indices,
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
@@ -121,6 +122,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_cache_indices_gdn=self.state_indices_list_gdn[bs - 1],
+                mamba_track_indices=mamba_track_indices,
             )
 
     def _replay_metadata(
@@ -132,6 +134,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         seq_lens_cpu: Optional[torch.Tensor],
         num_padding: Optional[int] = None,
         in_capture: bool = False,
+        mamba_track_indices: Optional[torch.Tensor] = None,
         *args,
         **kwargs,
     ):
