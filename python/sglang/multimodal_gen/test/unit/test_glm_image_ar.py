@@ -7,6 +7,7 @@ import torch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
     GlmImageAR,
 )
+from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 
 
 class _ProcessorInputs(dict):
@@ -55,6 +56,7 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
     def test_srt_ar_uses_ignore_eos_for_fixed_length_tokens(
         self, mock_post, _mock_device
     ):
+        set_global_server_args(self._server_args())
         mock_post.return_value = _FakeResponse(list(range(1025)))
         stage = GlmImageAR(processor=_FakeProcessor(), vision_language_encoder=None)
 
@@ -80,6 +82,7 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
         "model_specific_stages.glm_image.requests.post"
     )
     def test_srt_ar_rejects_short_output_ids(self, mock_post, _mock_device):
+        set_global_server_args(self._server_args())
         mock_post.return_value = _FakeResponse(list(range(993)))
         stage = GlmImageAR(processor=_FakeProcessor(), vision_language_encoder=None)
 
