@@ -476,19 +476,37 @@ class DSparkWorkerV2(BaseSpecWorker):
             main_x = main_x.unsqueeze(1).repeat(1, self.draft_model.model.hc_mult, 1)
             if self._stacked_wqkv_fp8_proj is None:
                 for layer in self._draft_inner.layers:
+                    attn_x, _, _, norm_fused = layer.hc_pre(
+                        main_x,
+                        layer.hc_attn_fn,
+                        layer.hc_attn_scale,
+                        layer.hc_attn_base,
+                        norm=layer.input_layernorm,
+                    )
+                    if not norm_fused:
+                        attn_x = layer.input_layernorm(attn_x)
                     layer.self_attn.kv_from_hidden(
-                        main_x, positions, cache_loc, attn_backend
+                        attn_x, positions, cache_loc, attn_backend
                     )
             else:
-                stacked_out = self._stacked_wqkv_fp8_proj.quant_method.apply(
-                    self._stacked_wqkv_fp8_proj,
-                    main_x,
-                    self._stacked_wqkv_fp8_proj.bias,
-                )
-                layer_outputs = torch.split(
-                    stacked_out, self._stacked_wqkv_out_sizes, dim=-1
-                )
                 for layer_idx, layer in enumerate(self._draft_inner.layers):
+                    attn_x, _, _, norm_fused = layer.hc_pre(
+                        main_x,
+                        layer.hc_attn_fn,
+                        layer.hc_attn_scale,
+                        layer.hc_attn_base,
+                        norm=layer.input_layernorm,
+                    )
+                    if not norm_fused:
+                        attn_x = layer.input_layernorm(attn_x)
+                    stacked_out = self._stacked_wqkv_fp8_proj.quant_method.apply(
+                        self._stacked_wqkv_fp8_proj,
+                        attn_x,
+                        self._stacked_wqkv_fp8_proj.bias,
+                    )
+                    layer_outputs = torch.split(
+                        stacked_out, self._stacked_wqkv_out_sizes, dim=-1
+                    )
                     kv_start, kv_end = self._stacked_wqkv_kv_offsets[layer_idx]
                     self._write_draft_kv_from_projected_kv(
                         attn=layer.self_attn,
