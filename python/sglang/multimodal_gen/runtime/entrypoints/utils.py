@@ -8,6 +8,7 @@ This module provides a consolidated interface for generating videos using
 diffusion models.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -661,6 +662,21 @@ def save_outputs(
     output_paths: list[str] = []
     for idx, sample in enumerate(outputs):
         save_file_path = build_output_path(idx)
+        if data_type == DataType.ACTION:
+            if samples_out is not None:
+                samples_out.append(sample)
+            if audios_out is not None:
+                audios_out.append(None)
+            if frames_out is not None:
+                frames_out.append([])
+            if save_output and save_file_path:
+                os.makedirs(os.path.dirname(save_file_path) or ".", exist_ok=True)
+                with open(save_file_path, "w", encoding="utf-8") as f:
+                    json.dump(sample, f, ensure_ascii=False)
+                logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
+            output_paths.append(save_file_path)
+            continue
+
         if data_type == DataType.VIDEO:
             sample = attach_audio_to_video_sample(sample, audio, idx)
 
@@ -711,6 +727,9 @@ def post_process_sample(
     upscaling_scale: int = 4,
 ) -> list[Any]:
     """materialize frames and save outputs (optional)"""
+    if data_type == DataType.ACTION:
+        return []
+
     materialized = materialize_output_sample(
         sample,
         data_type,

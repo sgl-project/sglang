@@ -451,6 +451,7 @@ class ServerArgs(DisaggServerArgsMixin):
             auto_tuner.maybe_adjust_auto_fsdp_with_offload_enabled()
             auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
         self._adjust_path()
+        self._adjust_pipeline_class_alias()
         self._adjust_quant_config()
         self._adjust_breakable_cuda_graph_support()
         self._adjust_warmup()
@@ -463,6 +464,16 @@ class ServerArgs(DisaggServerArgsMixin):
         self._adjust_autocast()
         auto_tuner.finalize_auto_flags()
         self.adjust_pipeline_config()
+
+    def _adjust_pipeline_class_alias(self):
+        if self.pipeline_class_name is None:
+            return
+        alias = self.pipeline_class_name.strip()
+        alias_map = {
+            "pi05": "Pi05Pipeline",
+            "pi0.5": "Pi05Pipeline",
+        }
+        self.pipeline_class_name = alias_map.get(alias.lower(), alias)
 
     def _adjust_disagg_parallelism_aliases(self):
         if self.decoder_tp is None:
@@ -613,6 +624,17 @@ class ServerArgs(DisaggServerArgsMixin):
     def _adjust_offload(self):
         if current_platform.is_cpu():
             # CPU platform does not need offload
+            return
+
+        if self.pipeline_config.task_type.name == "VLA_ACTION":
+            if self.dit_cpu_offload is None:
+                self.dit_cpu_offload = False
+            if self.text_encoder_cpu_offload is None:
+                self.text_encoder_cpu_offload = False
+            if self.image_encoder_cpu_offload is None:
+                self.image_encoder_cpu_offload = False
+            if self.vae_cpu_offload is None:
+                self.vae_cpu_offload = False
             return
 
         # TODO: to be handled by each platform
@@ -1106,6 +1128,20 @@ class ServerArgs(DisaggServerArgsMixin):
             self.use_fsdp_inference = False
             self.dit_layerwise_offload = False
             self.layerwise_offload_components = None
+            if (
+                self.dit_cpu_offload
+                or self.text_encoder_cpu_offload
+                or self.image_encoder_cpu_offload
+                or self.vae_cpu_offload
+            ):
+                logger.warning(
+                    "Disabling component CPU offload on MPS because CPU-to-MPS "
+                    "module relocation can produce invalid diffusion outputs."
+                )
+            self.dit_cpu_offload = False
+            self.text_encoder_cpu_offload = False
+            self.image_encoder_cpu_offload = False
+            self.vae_cpu_offload = False
 
     def is_arg_explicitly_set(self, arg_name: str) -> bool:
         return arg_name in self._explicit_arg_names
@@ -1283,7 +1319,9 @@ class ServerArgs(DisaggServerArgsMixin):
             ),
         )
         parser.add_argument(
+            "--pipeline",
             "--pipeline-class-name",
+            dest="pipeline_class_name",
             type=str,
             default=ServerArgs.pipeline_class_name,
             help=(
@@ -2173,7 +2211,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
         # Create a set of argument names that were present on the command line.
         # This handles both styles: '--arg=value' and '--arg value'.
-        provided_arg_names = set()
+        provided_arg_names = set(getattr(args, "_sglang_explicit_arg_names", ()))
         for arg in raw_argv:
             if arg.startswith("--"):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
@@ -2192,6 +2230,8 @@ class ServerArgs(DisaggServerArgsMixin):
 
         # Populate provided_args if the argument from the namespace was on the command line.
         for k, v in vars(args).items():
+            if k.startswith("_sglang_"):
+                continue
             if k in provided_arg_names:
                 provided_args[k] = v
 

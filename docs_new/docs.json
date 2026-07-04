@@ -1266,6 +1266,19 @@
                 ]
               },
               {
+                "group": "Vision-Language-Action Policies",
+                "pages": [
+                  "cookbook/vla/intro",
+                  {
+                    "group": "OpenPI",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/vla/OpenPI/Pi0.5"
+                    ]
+                  }
+                ]
+              },
+              {
                 "group": "SpecBundle",
                 "pages": [
                   "cookbook/specbundle/supported_models",

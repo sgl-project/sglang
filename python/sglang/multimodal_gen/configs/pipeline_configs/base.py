@@ -59,6 +59,7 @@ class ModelTaskType(Enum):
     I2I = auto()  # Image to Image
     TI2I = auto()  # Image to Image or Text-Image to Image
     I2M = auto()  # Image to Mesh
+    VLA_ACTION = auto()  # Vision-language-action policy output
 
     def is_image_gen(self) -> bool:
         return (
@@ -81,9 +82,12 @@ class ModelTaskType(Enum):
             or self == ModelTaskType.TI2I
             or self == ModelTaskType.TI2V
             or self == ModelTaskType.I2M
+            or self == ModelTaskType.VLA_ACTION
         )
 
     def data_type(self) -> DataType:
+        if self == ModelTaskType.VLA_ACTION:
+            return DataType.ACTION
         if self == ModelTaskType.I2M:
             return DataType.MESH
         if self.is_image_gen():
@@ -888,6 +892,8 @@ class PipelineConfig:
         pipeline_config_or_path: str | PipelineConfig | dict[str, Any] | None = (
             kwargs.get(prefix_with_dot + "pipeline_config", None)
             or kwargs.get("pipeline_config")
+            or kwargs.get(prefix_with_dot + "pipeline_config_path", None)
+            or kwargs.get("pipeline_config_path")
         )
         if model_path is None:
             raise ValueError("model_path is required in kwargs")
@@ -896,6 +902,16 @@ class PipelineConfig:
         pipeline_class_name = kwargs.get(
             prefix_with_dot + "pipeline_class_name"
         ) or kwargs.get("pipeline_class_name")
+        if isinstance(pipeline_class_name, str):
+            pipeline_class_aliases = {
+                "pi05": "Pi05Pipeline",
+                "pi0.5": "Pi05Pipeline",
+            }
+            pipeline_class_name = pipeline_class_aliases.get(
+                pipeline_class_name.lower(),
+                pipeline_class_name,
+            )
+            kwargs["pipeline_class_name"] = pipeline_class_name
         is_safetensors_file = os.path.isfile(model_path) and model_path.endswith(
             ".safetensors"
         )
@@ -943,36 +959,52 @@ class PipelineConfig:
                 model_id=kwargs.get("model_id"),
             )
             if model_info is None:
-                raise ValueError(
-                    f"Could not get model info for '{model_path}'. "
-                    f"If using a safetensors file, please specify pipeline_class_name"
-                )
-            # 1.5. Adjust pipeline config for fine-tuned VAE if needed
-            pipeline_config_cls = model_info.pipeline_config_cls
-            # If an explicit pipeline_class_name refines the model-default config
-            # (e.g. SanaWMRealtimePipeline -> SanaWMRealtimeConfig, a subclass of
-            # the model-resolved SanaWMPipelineConfig), prefer the pipeline's own
-            # config so realtime-only wiring (the /v1/realtime_video adapter) is
-            # selected. Only applies when the explicit config strictly subclasses
-            # the model default, so non-realtime pipelines are unaffected.
-            if pipeline_class_name:
-                explicit_config_classes = get_pipeline_config_classes(
-                    pipeline_class_name
-                )
-                if explicit_config_classes is not None:
-                    explicit_config_cls = explicit_config_classes[0]
-                    if (
-                        isinstance(explicit_config_cls, type)
-                        and isinstance(pipeline_config_cls, type)
-                        and explicit_config_cls is not pipeline_config_cls
-                        and issubclass(explicit_config_cls, pipeline_config_cls)
-                    ):
+                if pipeline_class_name:
+                    config_classes = get_pipeline_config_classes(pipeline_class_name)
+                    if config_classes is not None:
+                        pipeline_config_cls = config_classes[0]
                         logger.info(
-                            f"Refining pipeline config {pipeline_config_cls.__name__} "
-                            f"-> {explicit_config_cls.__name__} for explicit "
-                            f"pipeline_class_name={pipeline_class_name}"
+                            "Using %s from explicit pipeline_class_name=%s",
+                            pipeline_config_cls.__name__,
+                            pipeline_class_name,
                         )
-                        pipeline_config_cls = explicit_config_cls
+                    else:
+                        raise ValueError(
+                            f"Could not get model info for '{model_path}'. "
+                            "Please specify a valid model_id or pipeline_class_name."
+                        )
+                else:
+                    raise ValueError(
+                        f"Could not get model info for '{model_path}'. "
+                        f"If using a safetensors file, please specify pipeline_class_name"
+                    )
+            else:
+                # 1.5. Adjust pipeline config for fine-tuned VAE if needed
+                pipeline_config_cls = model_info.pipeline_config_cls
+                # If an explicit pipeline_class_name refines the model-default config
+                # (e.g. SanaWMRealtimePipeline -> SanaWMRealtimeConfig, a subclass of
+                # the model-resolved SanaWMPipelineConfig), prefer the pipeline's own
+                # config so realtime-only wiring (the /v1/realtime_video adapter) is
+                # selected. Only applies when the explicit config strictly subclasses
+                # the model default, so non-realtime pipelines are unaffected.
+                if pipeline_class_name:
+                    explicit_config_classes = get_pipeline_config_classes(
+                        pipeline_class_name
+                    )
+                    if explicit_config_classes is not None:
+                        explicit_config_cls = explicit_config_classes[0]
+                        if (
+                            isinstance(explicit_config_cls, type)
+                            and isinstance(pipeline_config_cls, type)
+                            and explicit_config_cls is not pipeline_config_cls
+                            and issubclass(explicit_config_cls, pipeline_config_cls)
+                        ):
+                            logger.info(
+                                f"Refining pipeline config {pipeline_config_cls.__name__} "
+                                f"-> {explicit_config_cls.__name__} for explicit "
+                                f"pipeline_class_name={pipeline_class_name}"
+                            )
+                            pipeline_config_cls = explicit_config_cls
         vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
         if vae_path is None:
             component_paths = kwargs.get(

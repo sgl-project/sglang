@@ -76,12 +76,15 @@ class DataType(Enum):
     IMAGE = auto()
     VIDEO = auto()
     MESH = auto()
+    ACTION = auto()
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
             return "png"
         if self == DataType.VIDEO:
             return "mp4"
+        if self == DataType.ACTION:
+            return "json"
         return "glb"
 
 
@@ -246,10 +249,8 @@ class SamplingParams:
 
     def _set_output_file_ext(self):
         # add extension if needed
-        if not any(
-            self.output_file_name.endswith(ext)
-            for ext in [".mp4", ".jpg", ".png", ".webp", ".obj", ".glb"]
-        ):
+        output_extensions = (".mp4", ".jpg", ".png", ".webp", ".obj", ".glb", ".json")
+        if not any(self.output_file_name.endswith(ext) for ext in output_extensions):
             self.output_file_name = (
                 f"{self.output_file_name}.{self.data_type.get_default_extension()}"
             )
@@ -329,6 +330,8 @@ class SamplingParams:
 
     def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
         """Convert output_quality string to compression level."""
+        if data_type == DataType.ACTION:
+            return 0
         output_quality_mapper = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
         if output_quality == "default":
             return 50 if data_type == DataType.VIDEO else 75
@@ -519,6 +522,9 @@ class SamplingParams:
             else:
                 self.save_output = False
 
+        if self.data_type == DataType.ACTION:
+            self.return_file_paths_only = False
+
         # Process negative prompt
         if self.negative_prompt is not None and not self.negative_prompt.isspace():
             # avoid stripping default negative prompt: ' ' for qwen-image
@@ -571,7 +577,10 @@ class SamplingParams:
                 "Sequence dimension shard is enabled, disabling frame adjustment for better performance"
             )
 
-        if pipeline_config.task_type.is_image_gen():
+        if self.data_type == DataType.ACTION:
+            self.num_frames = 1
+            self.adjust_frames = False
+        elif pipeline_config.task_type.is_image_gen():
             # settle num_frames
             if not server_args.pipeline_config.allow_set_num_frames():
                 logger.debug("Setting `num_frames` to 1 for image generation model")

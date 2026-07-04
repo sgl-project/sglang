@@ -1,0 +1,389 @@
+---
+title: Pi0.5
+metatags:
+    description: "Deploy OpenPI / LeRobot Pi0.5 diffusion Vision-Language-Action policies with SGLang's native multimodal_gen runtime."
+tag: dVLA
+---
+
+<div className="not-prose" style={{display: "flex", flexWrap: "wrap", gap: "6px", margin: "8px 0 30px"}}>
+  <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#eef2ff", color: "#3730a3", fontSize: "12px", fontWeight: 750}}>dVLA</span>
+  <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#eef2ff", color: "#3730a3", fontSize: "12px", fontWeight: 750}}>OpenPI / LeRobot</span>
+  <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#eef2ff", color: "#3730a3", fontSize: "12px", fontWeight: 750}}>flow matching action</span>
+  <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#eef2ff", color: "#3730a3", fontSize: "12px", fontWeight: 750}}>robot edge</span>
+</div>
+
+## 1. Model Introduction
+
+Pi0.5 is an OpenPI / LeRobot diffusion Vision-Language-Action (dVLA) policy. It consumes camera images, a language instruction, and robot state, then returns a continuous action chunk for robot control.
+
+SGLang serves Pi0.5 through the native `multimodal_gen` runtime. The implementation uses a SigLIP/PaliGemma prefix encoder and a Gemma action expert: the prefix is encoded once, then the action expert runs the flow-matching denoising loop. This is not a token decode workload, so the Pi0.5 path does not use the LLM sampler, logits processor, token streaming, paged decode KV cache, or a separate SRT serving engine.
+
+Supported public checkpoints:
+
+| Checkpoint | Cameras | State Dim | Output Action Dim | Action Horizon | Denoise Steps |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `lerobot/pi05_base` | `base_0_rgb`, `left_wrist_0_rgb`, `right_wrist_0_rgb` | 32 | 32 | 50 | 10 |
+| `lerobot/pi05_libero_base` | `image`, `image2`, one empty camera | 8 | 7 | 50 | 10 |
+
+References:
+
+- [OpenPI](https://github.com/Physical-Intelligence/openpi)
+- [lerobot/pi05_base](https://huggingface.co/lerobot/pi05_base)
+- [LeRobot Pi0.5 docs](https://huggingface.co/docs/lerobot/en/pi05)
+
+## 2. Installation
+
+Install SGLang with the diffusion extra. Pi0.5 lives in `multimodal_gen`, and the extra includes the runtime dependencies used by the policy server.
+
+```bash Command
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+pip install -e "python[diffusion]"
+```
+
+For general environment setup, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+
+## 3. Model Deployment
+
+Serve the base Pi0.5 policy:
+
+```bash Command
+sglang serve lerobot/pi05_base \
+  --model-type diffusion \
+  --pipeline pi05 \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+Serve the LIBERO checkpoint:
+
+```bash Command
+sglang serve lerobot/pi05_libero_base \
+  --model-type diffusion \
+  --pipeline pi05 \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+The command dispatches to the native `multimodal_gen` Pi0.5 pipeline. It does not start a second SRT LLM serving engine.
+
+### 3.1 Action Request Schema
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `model` | string, optional | Served model name. When omitted, the server uses the currently loaded policy. |
+| `input.task` or `input.prompt` | string | Language instruction for the policy. |
+| `input.observation.images` | object | Map from camera name to RGB image. Images can be nested here or sent as OpenPI observation keys such as `observation.images.base_0_rgb` through the websocket adapter. |
+| `input.observation.state` | array or tensor object | Robot state vector. Use the same normalization convention as the OpenPI / LeRobot checkpoint. |
+| `input.observation.noise` | array or tensor object, optional | Initial action noise with shape `[action_horizon, action_dim]`. Use this for deterministic debugging. |
+| `parameters.num_inference_steps` | integer, optional | Flow-matching denoise steps. Defaults to `10`. |
+| `parameters.action_horizon` | integer, optional | Output action horizon. Defaults to the checkpoint config. |
+| `parameters.action_dim` | integer, optional | Internal padded action dimension. Defaults to the checkpoint config. |
+| `runtime.return_timing` | boolean, optional | Return stage timing fields. Defaults to `true`. |
+| `runtime.prefix_cache` | boolean or `"auto"`, optional | Enable exact full-prefix cache lookup for this request. Defaults to `"auto"`. |
+| `runtime.cuda_graph` | boolean or `"auto"`, optional | Enable the action denoise CUDA graph path for this request when a matching shape bucket is available. Defaults to `"auto"`. |
+
+## 4. API Usage
+
+### 4.1 Generic Action HTTP API
+
+Use `/v1/actions/generations` for direct policy calls and debugging. Use `/v1/actions/metadata` to discover the camera keys, state size, action shape, defaults, and websocket capabilities of the currently served policy.
+
+```python Example
+import numpy as np
+import requests
+
+image = np.zeros((224, 224, 3), dtype=np.uint8)
+payload = {
+    "model": "lerobot/pi05_base",
+    "input": {
+        "task": "pick up the block",
+        "observation": {
+            "images": {
+                "base_0_rgb": image.tolist(),
+                "left_wrist_0_rgb": image.tolist(),
+                "right_wrist_0_rgb": image.tolist(),
+            },
+            "state": np.zeros(32, dtype=np.float32).tolist(),
+        },
+    },
+    "runtime": {
+        "return_timing": True,
+        "prefix_cache": "auto",
+        "cuda_graph": "auto",
+    },
+}
+
+response = requests.post(
+    "http://127.0.0.1:30000/v1/actions/generations",
+    json=payload,
+    timeout=60,
+)
+response.raise_for_status()
+data = response.json()
+
+actions = data["data"][0]["action"]["values"]
+print(len(actions), len(actions[0]))
+print(data.get("timings"))
+```
+
+For `lerobot/pi05_libero_base`, use the LIBERO camera names and an 8-dimensional state vector:
+
+```python Example
+payload = {
+    "input": {
+        "task": "pick up the object",
+        "observation": {
+            "images": {
+                "image": image.tolist(),
+                "image2": image.tolist(),
+            },
+            "state": np.zeros(8, dtype=np.float32).tolist(),
+        },
+    },
+}
+```
+
+### 4.2 Generic Realtime WebSocket
+
+`/v1/actions/realtime` is the generic msgpack websocket path. It sends `action.metadata` on connect and returns the same `action.generation` envelope as the HTTP API for each request.
+
+### 4.3 OpenPI-Compatible WebSocket
+
+Robot clients can use the OpenPI-compatible msgpack websocket endpoint at `/openpi/policy`. The server sends metadata immediately after connection, then each client message should contain one observation.
+
+```python Example
+import asyncio
+
+import msgpack
+import numpy as np
+import websockets
+
+
+def pack_array(obj):
+    if isinstance(obj, np.ndarray):
+        return {
+            b"__ndarray__": True,
+            b"data": obj.tobytes(),
+            b"dtype": obj.dtype.str,
+            b"shape": obj.shape,
+        }
+    if isinstance(obj, np.generic):
+        return {
+            b"__npgeneric__": True,
+            b"data": obj.item(),
+            b"dtype": obj.dtype.str,
+        }
+    return obj
+
+
+def unpack_array(obj):
+    ndarray_marker = obj.get("__ndarray__") or obj.get(b"__ndarray__")
+    npgeneric_marker = obj.get("__npgeneric__") or obj.get(b"__npgeneric__")
+    data = obj.get("data", obj.get(b"data"))
+    dtype = obj.get("dtype", obj.get(b"dtype"))
+    shape = obj.get("shape", obj.get(b"shape"))
+    if ndarray_marker:
+        return np.ndarray(
+            buffer=data,
+            dtype=np.dtype(dtype),
+            shape=shape,
+        )
+    if npgeneric_marker:
+        return np.dtype(dtype).type(data)
+    return obj
+
+
+def packb(payload):
+    return msgpack.packb(payload, default=pack_array, use_bin_type=True)
+
+
+def unpackb(payload):
+    return msgpack.unpackb(payload, object_hook=unpack_array, raw=False)
+
+
+async def main():
+    image = np.zeros((224, 224, 3), dtype=np.uint8)
+    observation = {
+        "task": "pick up the block",
+        "observation.images.base_0_rgb": image,
+        "observation.images.left_wrist_0_rgb": image,
+        "observation.images.right_wrist_0_rgb": image,
+        "observation.state": np.zeros(32, dtype=np.float32),
+    }
+
+    async with websockets.connect(
+        "ws://127.0.0.1:30000/openpi/policy",
+        max_size=None,
+    ) as websocket:
+        metadata = unpackb(await websocket.recv())
+        print(metadata)
+
+        await websocket.send(packb(observation))
+        result = unpackb(await websocket.recv())
+        actions = result["actions"]
+        print(len(actions), len(actions[0]))
+        print(result.get("server_timing"))
+
+
+asyncio.run(main())
+```
+
+## 5. Configuration Tips
+
+- Request-local `PrefixContext` is always reused across all denoise steps in one request. The prefix K/V is not cloned per step.
+- Global prefix cache only accepts exact full-prefix hits. Partial-prefix reuse is intentionally disabled because Pi0.5 prefix blocks combine image, language, and state under full attention rather than causal text-prefix semantics.
+- The prefix cache key includes model revision, tokenizer, camera order, image content, task/state content, masks/positions, dtype, adapter, and parallel layout version. Real robot frames usually change every control cycle, so treat global prefix cache as an optimization rather than the main latency path. The default server-side prefix cache keeps only one exact prefix entry.
+- CUDA graph capture targets one action-denoise step by shape bucket, then replays it across the flow-matching loop. Shape buckets include batch size, prefix length, action horizon, action dim, dtype, and parallel layout.
+- Do not use CFG parallelism to split the 10 Euler steps. Use it only for independent branches such as multiple candidate actions or future conditional/unconditional branches.
+- The validated v1 path includes single-GPU serving and single-node prefix/action split groups. The split path runs the prefix encoder and action expert on separate ranks and transfers `PrefixContext` once per request; it does not yet shard the action expert computation itself.
+- `lerobot/pi05_libero_base` returns 7 action dimensions even though the internal padded action tensor uses 32 dimensions.
+
+## 6. VRAM Tuning
+
+For current public Pi0.5 checkpoints, a stable 16GB discrete GPU target is a reasonable v1 deployment bar for robot workstations. In practice, leave headroom for the driver, camera middleware, robot process, and allocator fragmentation; a good target is to keep steady `nvidia-smi` usage around `14-15 GiB` after the first real request. Jetson/Orin unified-memory devices need extra caution because system RAM and GPU memory share the same pool.
+
+The normal performance path is still above that line on the prefix side:
+
+| Mode | Command Shape | Steady VRAM Snapshot | Notes |
+| --- | --- | --- | --- |
+| Single GPU | `--num-gpus 1` | about `19.7 GiB` total, worker about `19.2 GiB` | Best simple setup, but still above a 16GB target. |
+| Split prefix/action | `--num-gpus 2 --sp-degree 2 --ulysses-degree 2` | prefix GPU about `19.3 GiB`, action GPU about `9.5 GiB` | Action side fits 16GB; prefix side still does not. |
+| Split, CUDA graph disabled | request `runtime.cuda_graph=false` | action GPU about `9.4 GiB` | Saves about `130 MiB` on the action rank, but cache-hit denoise latency increased from about `51 ms` to `98 ms`. |
+| Split, prefix cache disabled | request `runtime.prefix_cache=false` | effectively unchanged | Prevents cache growth across changing frames; one PrefixContext is not the main steady-memory cost. |
+| Single GPU, 16GB phase offload | config in 6.1 | worker about `12.5-13.0 GiB` after request | Recommended 16GB-class edge path. Keeps GPU compute, but swaps selected weights between CPU and GPU by stage. |
+| Full layerwise CPU offload | config in 6.2 | prefix worker about `7.1 GiB`, action worker about `8.9 GiB` | Fits a 16GB-class target, but prefix latency increases to about `5-6 s`; use only as a compatibility fallback. |
+
+Use these knobs first because they do not change action numerics for a fixed input/noise:
+
+### 6.1 16GB Edge Phase-Offload Config
+
+Use this single-GPU config first for 16GB-class robot workstations and Jetson-style edge targets. It keeps the heavy compute on GPU, but keeps the token embedding on CPU, moves the vision encoder to GPU only for image embedding, keeps a small number of PaliGemma language layers on CPU between prefix passes, and moves the action expert to GPU only for the denoise loop.
+
+```json File
+{
+  "enable_global_prefix_cache": false,
+  "prefix_cache_max_entries": 0,
+  "enable_action_cuda_graph": false,
+  "offload_prefix_image_encoder_after_embed": true,
+  "offload_prefix_token_embedding": true,
+  "offload_prefix_language_layer_count_after_prefix": 2,
+  "offload_action_expert_after_denoise": true,
+  "empty_cache_after_prefix": true
+}
+```
+
+Start a single-GPU server with the override:
+
+```bash Command
+sglang serve lerobot/pi05_base \
+  --model-type diffusion \
+  --pipeline pi05 \
+  --pipeline-config-path pi05_edge_16gb.json \
+  --num-gpus 1 \
+  --warmup-mode off \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+The `offload_prefix_language_layer_count_after_prefix` value is a memory/latency knob. In the 16GB validation, `2` was the best tested value: `1` also fit but was slightly slower, while full language phase-offload was much slower. If your device has less effective headroom, increase it gradually before falling back to full layerwise offload.
+
+This mode is numerically lossless for a fixed input/noise. In the H100 artificial 16GB-pressure validation, HTTP and OpenPI websocket both returned action shape `[50, 32]`. HTTP timings were about `29-32 ms` preprocess, `995 ms` prefix, `503 ms` action denoise, and websocket timings were about `3 ms` preprocess, `1202 ms` prefix, `390 ms` action denoise. The worker snapshot after request was about `12.8 GiB` under the artificial cap.
+
+`enable_action_cuda_graph=false` is recommended with `offload_action_expert_after_denoise=true`, because the action expert weights do not stay resident on GPU between requests. If memory fits without action offload, CUDA graph can be re-enabled, but the 16GB validation with action expert resident OOMed while moving the vision encoder to GPU.
+
+Treat the H100 pressure result as a memory-budget validation, not a Jetson latency guarantee. Jetson/Orin devices use shared system memory and have much lower effective memory bandwidth than H100, so measure closed-loop control latency on the target device before deciding the action chunk cadence.
+
+### 6.2 Full Layerwise Fallback
+
+Use this only when the phase-offload config still does not fit. It moves every PaliGemma language layer to GPU one layer at a time during prefix compute, so it has the lowest VRAM footprint but much higher latency.
+
+```json File
+{
+  "enable_global_prefix_cache": false,
+  "prefix_cache_max_entries": 0,
+  "enable_action_cuda_graph": false,
+  "offload_prefix_image_encoder": true,
+  "offload_prefix_token_embedding": true,
+  "offload_prefix_language_layers": true,
+  "offload_prefix_language_layers_empty_cache": true,
+  "empty_cache_after_prefix": true
+}
+```
+
+This fallback keeps the prefix image encoder, token embedding, and all PaliGemma language layers on CPU, moving only one prefix language layer at a time to GPU for compute. It is numerically lossless, but it is not latency-optimal: in validation, prefix time was about `5-6 s`.
+
+The 16GB validations used an H100 with artificial VRAM pressure. GPU0 had about `15.5 GiB` available before server start. HTTP and OpenPI websocket both returned action shape `[50, 32]`.
+
+### 6.3 Per-Request Controls
+
+For HTTP calls, disable cache or CUDA graph without restarting the server:
+
+```python Example
+payload = {
+    "input": {
+        "task": "pick up the block",
+        "observation": {
+            "images": images,
+            "state": state,
+        },
+    },
+    "runtime": {
+        "prefix_cache": False,
+        "cuda_graph": False,
+    },
+}
+```
+
+For OpenPI websocket clients, include equivalent `enable_pi_prefix_cache` and `enable_pi_cuda_graph` fields in each raw msgpack observation if you need per-request compatibility controls.
+
+### 6.4 Deployment Choices
+
+- Keep batch size to one control stream unless grouped robot streams are explicitly validated. More concurrent observations increase activation and PrefixContext residency.
+- Keep `materialize_dtype` at the default `bf16`. `fp32` is useful only for debugging numerical issues and will increase memory.
+- Use split prefix/action only when you have two GPUs. It lowers the action-side footprint, but the prefix rank still owns the PaliGemma/SigLIP working set; for one 16GB GPU, use the phase-offload config above.
+- Reducing `num_inference_steps` lowers latency but is not a pure memory fix and can change policy behavior. Validate closed-loop task success before using fewer than the checkpoint default.
+- Phase offload is the preferred 16GB lossless path. Full layerwise CPU offload is validated as a compatibility fallback. Quantization and true action/prefix sharding are the next steps for sub-16GB devices or for keeping 16GB latency closer to the normal path.
+
+### 6.5 Loader And Run:ai Model Streamer
+
+Run:ai Model Streamer can improve cold-start and checkpoint loading by reading safetensors concurrently and streaming tensors toward GPU memory. It is useful for local SSD, object storage, and cloud deployments where startup time is dominated by model file IO.
+
+The `python[diffusion]` extra includes `runai_model_streamer`. If the package is installed, SGLang enables it by default through `SGLANG_USE_RUNAI_MODEL_STREAMER=true`. Set it to `false` to force the plain safetensors loader:
+
+```bash Command
+SGLANG_USE_RUNAI_MODEL_STREAMER=false \
+sglang serve lerobot/pi05_base \
+  --model-type diffusion \
+  --pipeline pi05 \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+Pi0.5 uses the direct SSD-to-GPU Run:ai path only when all load targets for the current process are GPU-resident and the distributed world size is one. The single-GPU validation streamed `13.5 GiB` of safetensors directly to `cuda:0` in `1.86 s`, then returned `[50, 32]` actions over both HTTP and OpenPI websocket.
+
+For split prefix/action serving, mixed CPU offload, and low-VRAM 16GB-class mode, Pi0.5 deliberately stays on the header-filtered safe loader. Those paths either load only a subset of checkpoint tensors per rank or keep selected prefix tensors on CPU. Direct GPU streaming there can increase the exact VRAM pressure the low-memory path is trying to avoid, and a split run with one rank streaming directly while another rank loaded a different subset was observed to stall during startup. Use the guarded default unless a distributed Run:ai loading protocol has been validated for your topology.
+
+Run:ai Model Streamer does not reduce steady inference VRAM after parameters, caches, activations, CUDA contexts, and graph buffers are resident. For Pi0.5 low-VRAM work, prioritize component placement, prefix cache size, CUDA graph residency, and CPU/offload first. Model Streamer is a cold-start optimization after the steady-memory budget is correct.
+
+## 7. Validation Notes
+
+The following checks were run on H100 GPUs with the native SGLang Pi0.5 path:
+
+| Check | Result |
+| --- | --- |
+| `lerobot/pi05_base` direct end-to-end | Prefix length `968`, output shape `[1, 50, 32]`, peak allocated memory `12.817 GiB`. |
+| LeRobot reference parity | One-step velocity max absolute difference `1.17e-6`; final 10-step action max absolute difference `1.17e-7`. |
+| Action denoise CUDA graph | Eager 10-step denoise `125.4 ms`; steady graph replay `50.8 ms`; max output difference `0`. |
+| Exact full-prefix cache | First prefix pass about `203 ms`; exact cache hit prefix stage about `0.2 ms`. |
+| `lerobot/pi05_libero_base` direct end-to-end | Image keys `image`, `image2`, `empty_camera_0`; state dim `8`; output action dim `7`; output tensor shape `[1, 50, 32]`. |
+| `sglang serve` HTTP | `/v1/actions/generations` returned action shape `[50, 32]`; single-GPU HTTP timings were about `28 ms` preprocess, `239 ms` prefix, `207 ms` action denoise. |
+| OpenPI websocket | `/openpi/policy` returned action shape `[50, 32]`; exact cache hit request ran action denoise in about `51 ms`. |
+| 2-GPU prefix/action split | `--num-gpus 2 --sp-degree 2 --ulysses-degree 2` returned action shape `[50, 32]`; output matched single-GPU HTTP with max absolute difference `0`. |
+| Steady VRAM snapshot | Single-GPU server worker used about `19.2 GiB` (`19.7 GiB` total); split prefix/action workers used about `18.7 GiB` and `9.0 GiB` (`19.3 GiB` / `9.5 GiB` total), respectively. |
+| Low-VRAM switches | Disabling request CUDA graph kept deterministic actions identical and saved about `130 MiB` on the action rank, with cache-hit denoise increasing from about `51 ms` to `98 ms`. Disabling prefix cache kept deterministic actions identical but did not materially change one-request steady VRAM. |
+| 16GB-class phase-offload path | Single-GPU server with token embedding CPU, vision after-embed offload, two prefix language layers phase-offloaded, action expert after-denoise offload, prefix cache disabled, and CUDA graph disabled returned `[50, 32]` actions over both HTTP and OpenPI websocket under artificial VRAM pressure. Worker snapshot after request was about `12.8 GiB`; HTTP timings were about `32 ms` preprocess, `995 ms` prefix, `503 ms` action denoise. |
+| Full layerwise fallback | Split server with prefix CPU layerwise offload returned `[50, 32]` actions over both HTTP and OpenPI websocket under artificial VRAM pressure. Snapshot after request: prefix worker `7090 MiB`, action worker `8864 MiB`; HTTP timings were about `29 ms` preprocess, `5642 ms` prefix, `281 ms` action denoise. |
+| Run:ai direct loader | Single-GPU serve streamed `13.5 GiB` safetensors to `cuda:0` in `1.86 s` and returned `[50, 32]` actions. Split/offload paths were validated with the guarded non-direct loader to avoid distributed startup stalls and low-VRAM pressure. |
+
+Run a full HTTP or websocket smoke test in your robot deployment environment before using the policy in a closed-loop controller.
