@@ -534,7 +534,7 @@ class HunyuanDetector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
-            begin=f"{self.bot_token}\n{name}{self.tool_sep_token}",
+            begin=f"{self.bot_token}\n{self.tool_call_start_token}{name}{self.tool_sep_token}",
             end=f"{self.tool_call_end_token}\n{self.eot_token}",
             trigger=self.bot_token,
         )
