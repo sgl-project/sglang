@@ -2236,12 +2236,15 @@ class AiterAttnBackend(AttentionBackend):
                     v_unified = v_cache.view(
                         -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                     )
-                    if layer.tp_k_head_num == 1 and layer.tp_q_head_num > 1:
-                        # Qwen3.5 can replicate one KV head across multiple TP ranks.
-                        # Present the local KV head as per-Q-head stride-0 views so
-                        # target_verify uses the same local head mapping as the model.
-                        k_unified = k_unified.expand(-1, -1, layer.tp_q_head_num, -1)
-                        v_unified = v_unified.expand(-1, -1, layer.tp_q_head_num, -1)
+                    # GQA-packing fix: do NOT expand the single KV head to
+                    # tp_q_head_num. Passing K/V with the true kv-head count (exactly
+                    # like forward_decode) lets unified_attention derive
+                    # num_queries_per_kv = tp_q_head_num (the GQA group) and pack all Q
+                    # heads against one KV load. The old stride-0 .expand() made the
+                    # wrapper see num_kv_heads=tp_q_head_num -> num_queries_per_kv=1 ->
+                    # full MHA tiling (~7x more KV traffic at long context; trace
+                    # signature num_query_heads_16/num_queries_per_kv_1). GQA head
+                    # mapping here is identical to the proven decode path.
 
                     # The seq_lens + draft_num add has to run INSIDE the graph
                     # region; a host-side pre-add would allocate a new tensor
