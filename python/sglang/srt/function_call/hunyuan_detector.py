@@ -48,7 +48,7 @@ def resolve_hunyuan_tokens(tokenizer) -> Dict[str, str]:
         except Exception as e:
             logger.warning("Failed to read Hunyuan tokenizer vocab: %s", e)
             vocab = None
-    if vocab:
+    if isinstance(vocab, dict):
         for tok in vocab:
             if not isinstance(tok, str):
                 continue
