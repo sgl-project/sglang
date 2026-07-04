@@ -791,10 +791,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Start the engine info bootstrap server if per-rank info is needed.
         engine_info_bootstrap_server = None
-        if (
-            server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
-            and server_args.node_rank == 0
-        ):
+        if server_args.needs_engine_info_bootstrap() and server_args.node_rank == 0:
             bootstrap_port = server_args.engine_info_bootstrap_port
             if not is_port_available(bootstrap_port):
                 raise RuntimeError(
