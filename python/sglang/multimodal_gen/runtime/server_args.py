@@ -436,7 +436,7 @@ class ServerArgs(DisaggServerArgsMixin):
             self.transformer_weights_path = resolution.transformer_weights_path
         self.nunchaku_config = resolution.nunchaku_config
 
-    # Attribute spellings used across encoder arch configs for the two dims a
+    # For Parallel Folding: attribute names used across encoder arch configs for the two dims a
     # TP shard splits: attention heads and MLP intermediate. Read through
     # ModelConfig.__getattr__ (which delegates to arch_config).
     _ENCODER_HEAD_ATTRS = ("num_attention_heads", "num_heads", "n_heads")
@@ -465,17 +465,12 @@ class ServerArgs(DisaggServerArgsMixin):
         )
 
     def adjust_pipeline_config(self):
-        # Every encoder runs in the encoding stage while the whole DiT replica is
-        # idle, so fold (TP-shard) each one across all replica GPUs — not just tp
-        # — when cfg/sp make the replica larger than tp. Pure TP already uses all.
+        # 1. adjust for encoder parallel folding
         tp_size = self.tp_size or 1
         dp_size = self.dp_size or 1
         sp_degree = self.sp_degree or 1
-        # One replica = all its GPUs; derive from num_gpus so any axis combo
-        # (tp x cfg x ulysses x ring x pp) is covered without enumeration.
+        # one replica = all its GPUs
         replica_size = (self.num_gpus or tp_size) // dp_size
-        # dp==1 monolithic: world group == the single replica. dp>1 /
-        # disaggregated keep the existing per-SP folding.
         fold_world = dp_size == 1 and not self.disagg_mode and replica_size > tp_size
 
         if fold_world:
@@ -486,20 +481,17 @@ class ServerArgs(DisaggServerArgsMixin):
         else:
             return
 
-        # Text encoders always run; image encoders too when a pipeline declares
-        # them (config fields live on the shared base so both are foldable).
         encoder_configs = list(self.pipeline_config.text_encoder_configs) + list(
             getattr(self.pipeline_config, "image_encoder_configs", ()) or ()
         )
         enabled = []
         for encoder_config in encoder_configs:
-            # Only fold when both the attention heads and the MLP intermediate
-            # divide the group; otherwise the parallel Linears cannot shard.
-            # Encoders whose dims we cannot introspect are left unfolded (safe).
+            # only fold when both the attention heads and the MLP intermediate divide the group
             heads, inter = ServerArgs._encoder_shard_dims(encoder_config)
             if heads is None or inter is None:
                 continue
             if heads % group_size != 0 or inter % group_size != 0:
+                # encoders whose dims we cannot introspect are left unfolded (safe)
                 continue
             encoder_config.parallel_folding = True
             encoder_config.parallel_folding_mode = mode

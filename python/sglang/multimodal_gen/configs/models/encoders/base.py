@@ -78,9 +78,7 @@ class EncoderConfig(ModelConfig):
 
     # Parallel folding: during the encoding stage the whole DiT replica is idle,
     # so TP-shard the encoder across those otherwise-unused GPUs instead of
-    # running it on a single rank. Lives on the base so every text/image encoder
-    # inherits it (a bare EncoderConfig would otherwise AttributeError when the
-    # server enables folding). Enabled by ServerArgs.adjust_pipeline_config().
+    # running it on a single rank
     parallel_folding: bool = False
     # Which group to fold over: "sp" | "ulysses" | "ring" | "world"
     # ("world" = the full single-replica DiT, used for any parallelism combo).

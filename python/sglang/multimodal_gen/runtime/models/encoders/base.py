@@ -40,7 +40,7 @@ def get_folding_tp_group(config: EncoderConfig):
         elif config.parallel_folding_mode == "ring":
             return get_sp_group().ring_group
         elif config.parallel_folding_mode == "world":
-            # The whole single-replica DiT (all GPUs), regardless of tp/sp/cfg.
+            # default: the whole single-replica DiT (all GPUs), regardless of tp/sp/cfg.
             return get_world_group()
     return get_tp_group()
 
