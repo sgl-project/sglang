@@ -30,7 +30,11 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput, T5Config
-from sglang.multimodal_gen.runtime.distributed import get_sp_group, get_tp_group
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_group,
+    get_tp_group,
+    get_world_group,
+)
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -58,6 +62,11 @@ def _get_folding_tp_group(
             return get_sp_group().ulysses_group
         elif config.parallel_folding_mode == "ring":
             return get_sp_group().ring_group
+        elif config.parallel_folding_mode == "world":
+            # Fold across the whole single-replica DiT (all GPUs), so the
+            # encoder uses every otherwise-idle GPU during the encoding stage
+            # regardless of the DiT's tp/sp/cfg split.
+            return get_world_group()
     return get_tp_group()
 
 

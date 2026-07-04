@@ -438,23 +438,57 @@ class ServerArgs(DisaggServerArgsMixin):
         self.nunchaku_config = resolution.nunchaku_config
 
     def adjust_pipeline_config(self):
-        # enable parallel folding when SP is enabled
-        if self.tp_size != 1 or self.sp_degree <= 1:
-            return
+        # The text encoder runs in the encoding stage, before denoising, when
+        # every GPU in the DiT replica is idle. Parallel-fold (TP-shard) the T5
+        # encoder across all of them so cfg-parallel and mixed-parallel runs do
+        # not leave it on a single GPU while the rest sit idle.
+        #
+        # Fold over the whole single replica (world group) whenever the DiT
+        # parallelism spans more GPUs than TP alone (cfg/sp beyond tp). Pure TP
+        # (replica == tp) already uses every replica GPU, so it is left
+        # untouched (no folding, no extra gather). dp>1 / disaggregated runs
+        # keep the existing SP folding — a per-replica sub-group is a follow-up.
+        tp_size = self.tp_size or 1
+        sp_degree = self.sp_degree or 1
+        cfg_degree = self.cfg_parallel_degree or 1
+        replica_size = tp_size * sp_degree * cfg_degree
+        fold_world = (
+            self.dp_size == 1
+            and not self.disagg_mode
+            # world group must be exactly the DiT replica (no separate VAE/other
+            # ranks), else folding over it would pull in non-DiT GPUs.
+            and self.num_gpus == replica_size
+            and replica_size > tp_size
+        )
 
-        enabled = False
+        enabled_mode = None
         for text_encoder_config in self.pipeline_config.text_encoder_configs:
-            if isinstance(text_encoder_config, T5Config):
+            if not isinstance(text_encoder_config, T5Config):
+                continue
+            if (
+                fold_world
+                and text_encoder_config.num_heads % replica_size == 0
+                and text_encoder_config.d_ff % replica_size == 0
+            ):
                 text_encoder_config.parallel_folding = True
-                enabled = True
+                text_encoder_config.parallel_folding_mode = "world"
+                enabled_mode = "world"
+            elif tp_size == 1 and sp_degree > 1:
+                # Preserve prior behavior for dp>1 / disaggregated SP runs.
+                text_encoder_config.parallel_folding = True
                 text_encoder_config.parallel_folding_mode = "sp"
+                enabled_mode = enabled_mode or "sp"
 
-        if enabled:
+        if enabled_mode:
             logger.info(
-                "Enabled T5 text encoder parallel folding (mode=sp) for %s (tp_size=%s, sp_degree=%s).",
+                "Enabled T5 text encoder parallel folding (mode=%s) for %s "
+                "(tp=%s sp=%s cfg=%s replica=%s).",
+                enabled_mode,
                 self.__class__.__name__,
-                self.tp_size,
-                self.sp_degree,
+                tp_size,
+                sp_degree,
+                cfg_degree,
+                replica_size,
             )
 
     def _adjust_offload(self):
