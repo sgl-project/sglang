@@ -170,6 +170,10 @@ class TransformerLoader(ComponentLoader):
             reduce_dtype=torch.float32,
             output_dtype=None,
             strict=False,
+            defer_cpu_offload_until_after_weight_processing=(
+                component_server_args.dit_cpu_offload
+                and quant_spec.requires_device_weight_processing
+            ),
         )
 
         # post-hooks (e.g., patch scales (nunchaku))

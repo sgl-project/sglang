@@ -122,6 +122,7 @@ class TransformerQuantLoadSpec:
     quant_config: Optional[QuantizationConfig]
     nunchaku_config: Optional[NunchakuConfig]
     param_dtype: Optional[torch.dtype]
+    requires_device_weight_processing: bool = False
     post_load_hooks: list[PostLoadHook] = field(default_factory=list)
 
     @property
@@ -234,11 +235,7 @@ class _Flux2Nvfp4FallbackAdapter(_TransformerQuantAdapter):
 
 
 class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
-    """Keeps the DiT resident when offload would break FP8-family quant.
-
-    modelopt_fp8 needs it for tensor strides; online quant needs it because
-    the load-time quant kernels are GPU/NPU-only.
-    """
+    """Adapter for diffusion ModelOpt FP8 checkpoints."""
 
     def __init__(
         self,
@@ -260,29 +257,16 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
         quant_name_getter = getattr(type(quant_config), "get_name", None)
         quant_name = quant_name_getter() if callable(quant_name_getter) else None
 
-        # Online quant runs its weight-quant kernel during load, and that kernel
-        # is GPU/NPU-only. If the DiT sits on the host under dit_cpu_offload the
-        # kernel dies there and the loader quietly falls back to an unquantized
-        # native model.
-        is_online_quant = server_args.quantization is not None
-        if quant_name != "modelopt_fp8" and not is_online_quant:
+        if quant_name != "modelopt_fp8":
             return
 
         if server_args.dit_cpu_offload:
             server_args.dit_cpu_offload = False
-            if is_online_quant:
-                logger.warning(
-                    "Disabling dit_cpu_offload: online '%s' quantization needs the "
-                    "DiT on device at load time. Use --dit-layerwise-offload to save "
-                    "DiT memory.",
-                    server_args.quantization,
-                )
-            else:
-                logger.warning(
-                    "ModelOpt FP8 diffusion checkpoints currently keep dit_cpu_offload "
-                    "disabled. Layerwise DiT offload stays enabled because the runtime "
-                    "now preserves the restored FP8 tensor strides.",
-                )
+            logger.warning(
+                "ModelOpt FP8 diffusion checkpoints currently keep dit_cpu_offload "
+                "disabled. Layerwise DiT offload stays enabled because the runtime "
+                "now preserves the restored FP8 tensor strides.",
+            )
 
     def prepare(self) -> None:
         _ModelOptFp8OffloadAdapter._maybe_disable_incompatible_dit_offload_modes(
@@ -498,8 +482,23 @@ def resolve_transformer_quant_load_spec(
         quant_config=quant_config,
         nunchaku_config=nunchaku_config,
         param_dtype=param_dtype,
+        requires_device_weight_processing=_requires_device_weight_processing(
+            quant_config
+        ),
         post_load_hooks=post_load_hooks,
     )
+
+
+def _requires_device_weight_processing(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Return whether post-load weight processing needs CUDA/NPU tensors."""
+    quant_name = _get_quant_config_name(quant_config)
+    if quant_name == "fp8":
+        return not getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+    if quant_name == "mxfp4":
+        return not getattr(quant_config, "is_checkpoint_mxfp4_serialized", False)
+    return False
 
 
 def _build_transformer_quant_adapters(
