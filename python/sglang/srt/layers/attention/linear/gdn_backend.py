@@ -128,22 +128,25 @@ if _HAVE_TRITON:
         #
         # Forward substitution:
         #   for i in 1..C-1: M[i, :i] += sum_{m<i} M[i, m] * M[m, :i]
-        # The reduction over m is a fixed tree order (tl.sum), deterministic and
-        # independent of the number of chunks. It is NOT bit-identical to the Python
-        # loop's `(row.unsqueeze(-1) * sub).sum(-2)` (that path is ~1 fp32 ULP different),
-        # which is fine: Megatron prefill and SGLang both call this same kernel, so they
-        # stay identical to each other, and gradients still flow (see _SolveFwdSub).
+        # The reduction over m is done as a tl.dot (matmul) so its fp32 accumulation order is
+        # FIXED regardless of the launch's num_warps (tl.sum's tree is num_warps-sensitive). This
+        # lets the decode append reproduce this row inside a fused kernel launched at num_warps=8
+        # while prefill runs at the default; the tl.dot path is exactly num_warps-invariant (0 ULP
+        # across nw=4/8) and ~9e-8 off the old tl.sum path (fp32 noise). Megatron prefill and SGLang
+        # both call this same kernel so they stay identical to each other; gradients still flow via
+        # _SolveFwdSub (backward depends only on the output T). Deterministic, length-invariant.
         pid = tl.program_id(0)
         base = A + pid * C * C
         r = tl.arange(0, C)
         M = tl.load(base + r[:, None] * C + r[None, :])  # [C, C] fp32 in registers
         for i in range(1, C):
-            # a_im[m] = M[i, m] for m < i else 0 ; broadcast over columns j
-            a_im = tl.where((r < i), tl.sum(tl.where(r[:, None] == i, M, 0.0), 0), 0.0)  # [C], row i
-            # prod[m, j] = a_im[m] * M[m, j]
-            prod = a_im[:, None] * M  # [C(m), C(j)]
-            acc = tl.sum(prod, 0)  # [C(j)], reduce over m
             row_i = tl.sum(tl.where(r[:, None] == i, M, 0.0), 0)  # current M[i, :]
+            a_im = tl.where(r < i, row_i, 0.0)  # [C] = M[i, m] for m<i, else 0
+            # acc[j] = sum_m a_im[m] * M[m, j], as a [C,C]@[C,C] matmul with only row i of the lhs
+            # nonzero; extract row i. tl.dot's reduction order is num_warps-invariant.
+            lhs = tl.where(r[:, None] == i, a_im[None, :], 0.0)  # [C,C], row i = a_im
+            accfull = tl.dot(lhs, M, input_precision="ieee")  # [C,C], row i = acc
+            acc = tl.sum(tl.where(r[:, None] == i, accfull, 0.0), 0)  # [C(j)]
             new_row = tl.where(r < i, row_i + acc, row_i)  # update only cols < i
             M = tl.where(r[:, None] == i, new_row[None, :], M)
         tl.store(base + r[:, None] * C + r[None, :], M)
@@ -156,32 +159,34 @@ if _HAVE_TRITON:
     #   T [B,HV,CS,CS], vnew [B,HV,CS,Dv], S/Snew [B,HV,Dk,Dv], out [B,HV,Dv].
 
     @triton.jit
-    def _gdn_prep_a_row_append_kernel(
+    def _gdn_step_kernel(
         q_ptr, k_ptr, v_ptr, a_ptr, b_ptr, Alog_ptr, dtb_ptr,  # new token: q/k [B,HK,Dk], v [B,HV,Dv], a/b [B,HV]
-        qn_ptr, kn_ptr, kb_ptr, vb_ptr, g_ptr, gcum_ptr, A_ptr, T_ptr, i_ptr,
+        qn_ptr, kn_ptr, kb_ptr, vb_ptr, g_ptr, gcum_ptr, A_ptr, T_ptr,
+        vnew_ptr, S_ptr, out_ptr, Snew_ptr, i_ptr,
         scale, HV: tl.constexpr, HK: tl.constexpr, Dk: tl.constexpr, Dv: tl.constexpr,
         CS: tl.constexpr, QR: tl.constexpr,
     ):
-        """Fused prep + A-row + T-row-append for the new decode token (one launch instead of three).
+        """Whole GDN decode step for the new token in ONE launch (was 5 kernels): prep + gcum append
+        + A row + T-row append + core/v_new + boundary fold. One program per (slot, value-head).
 
-        Prep: shared triton l2norm (bit-identical to torch_chunk's), GQA repeat, scale, gating; writes
-        row i of the partial-chunk buffers. A row i = -(kb[i] @ kn^T) * exp(gcum[i]-gcum[j]) for j<i
-        (strictly-lower); append forward-sub row T[i,j<i] = A[i,j] + sum_{m<i} A[i,m]*T[m,j].
+        Reproduces row i of torch_chunk_gated_delta_rule bit-for-bit. Row i's kn/kb/vb/gcum/qn and the
+        appended T row are all computed HERE in registers; they are stored to the global buffers (for
+        the NEXT step, which reads them as frozen rows r<i) and simultaneously OVERLAID from those same
+        registers wherever this step needs row i. Rows r<i are read from global (written by prior steps,
+        so behind a launch barrier). Overlaying row i from registers avoids an intra-program store->load
+        hazard (unordered without a fence) while being byte-identical to reloading a just-stored fp32.
 
         Bit-identity notes:
-        (1) Row i's kn/kb/gcum/qn/vb are computed in registers and stored to the global buffers (so the
-            later incr kernel reads them), then row i is OVERLAID from those SAME registers into the A-row
-            tiles. This avoids an intra-program store->load hazard AND is byte-identical to the old prep
-            kernel (fp32 store then fp32 reload is identity); rows r<i come from global (frozen prior steps).
-        (2) gcum[i]=gcum[i-1]+g[i] reloads g_r from the buffer (rounded fp32) before the add: g is the
+        (1) gcum[i]=gcum[i-1]+g[i] reloads g_r from the buffer (rounded fp32) before the add: g is the
             register product -exp(A_log)*sp, so `prev + g` would contract into one FMA (one rounding) and
             diverge from the shared serial _chunk_cumsum_kernel (two stored fp32 operands, two roundings).
             The reload inserts the rounding barrier (FMA contraction otherwise drifts ~1.9e-6).
-        (3) A is computed and consumed entirely in fp32, so feeding the append from the in-register Arow
-            is bit-identical to a global round-trip; Arow is still stored to A_ptr to keep the buffer valid.
-        (4) MUST launch at Triton's DEFAULT num_warps (like the kernels it replaces) so the append's
-            [CS,CS] tl.sum tree reduces in the same order as _fwd_sub_kernel's row i; the incr kernel's
-            nw=8 would drift ~1e-9. QR-tile broadcasts kb[i] so tl.dot has M>=16."""
+        (2) The A dot and the T-append are fp32; the append uses the SAME tl.dot formulation as
+            _fwd_sub_kernel's per-i step, so it is bit-identical to prefill AND num_warps-invariant.
+        (3) This kernel launches at num_warps=8 (for the incr matmuls). Every reduction that must match
+            another engine is num_warps-invariant: the l2norm tl.sum (verified 0-ULP across nw), the
+            tl.dot solve/A/attn matmuls (fixed accumulation order), and the qr/row-selecting tl.sum
+            collapses (a single nonzero lane). So nw=8 is safe. QR-tile broadcasts row i so tl.dot M>=16."""
         pid = tl.program_id(0)
         bt = pid // HV
         h = pid % HV
@@ -195,10 +200,11 @@ if _HAVE_TRITON:
         qr = tl.arange(0, QR)
         valid = r < W
         base = (bt * HV + h) * CS
+        row_i = r[:, None] == i  # [CS,1] mask selecting row i
         # --- prep row i (shared l2norm reduction, GQA repeat, scale, gating) ---
         q = tl.load(q_ptr + (bt * HK + hk) * Dk + dk).to(tl.float32)
         k = tl.load(k_ptr + (bt * HK + hk) * Dk + dk).to(tl.float32)
-        qn = (q * libdevice.rsqrt(tl.sum(q * q, 0) + 1e-6)).to(tl.bfloat16).to(tl.float32) * scale
+        qn_i = (q * libdevice.rsqrt(tl.sum(q * q, 0) + 1e-6)).to(tl.bfloat16).to(tl.float32) * scale  # [Dk]
         kn_i = (k * libdevice.rsqrt(tl.sum(k * k, 0) + 1e-6)).to(tl.bfloat16).to(tl.float32)  # [Dk]
         av = tl.load(a_ptr + bt * HV + h).to(tl.float32)
         bx = tl.load(b_ptr + bt * HV + h).to(tl.float32)
@@ -208,73 +214,59 @@ if _HAVE_TRITON:
         beta = (1.0 / (1.0 + libdevice.exp(-bx))).to(tl.bfloat16).to(tl.float32)
         v = tl.load(v_ptr + (bt * HV + h) * Dv + dv).to(tl.float32)
         kb_i = kn_i * beta  # [Dk]
-        tl.store(qn_ptr + ((bt * CS + i) * HV + h) * Dk + dk, qn)
+        vb_i = v * beta  # [Dv]
+        tl.store(qn_ptr + ((bt * CS + i) * HV + h) * Dk + dk, qn_i)
         tl.store(kn_ptr + ((bt * CS + i) * HV + h) * Dk + dk, kn_i)
         tl.store(kb_ptr + ((bt * CS + i) * HV + h) * Dk + dk, kb_i)
-        tl.store(vb_ptr + ((bt * CS + i) * HV + h) * Dv + dv, v * beta)
+        tl.store(vb_ptr + ((bt * CS + i) * HV + h) * Dv + dv, vb_i)
         tl.store(g_ptr + base + i, g)
-        # gcum[i]=gcum[i-1]+g[i]; reload g_r (rounded fp32) to insert the rounding barrier (see note 2).
+        # gcum[i]=gcum[i-1]+g[i]; reload g_r (rounded fp32) to insert the rounding barrier (see note 1).
         g_r = tl.load(g_ptr + base + i)
         prev = tl.where(i > 0, tl.load(gcum_ptr + base + i - 1, mask=(i > 0), other=0.0), 0.0)
         gi = prev + g_r
         tl.store(gcum_ptr + base + i, gi)
-        # --- A row i (rows r<i from frozen global buffers; row i overlaid from registers) ---
-        kb = kb_i[None, :] + qr[:, None] * 0.0  # [QR,Dk] all rows kb[i]
-        kn = tl.load(kn_ptr + ((bt * CS + r[:, None]) * HV + h) * Dk + dk[None, :], mask=valid[:, None], other=0.0)
-        gj = tl.load(gcum_ptr + base + r, mask=valid, other=0.0)
-        kept = (i > r) & valid
-        decay = tl.where(kept[None, :], libdevice.exp(gi - gj[None, :]), 0.0)  # [QR,CS]
-        A = -tl.dot(kb, tl.trans(kn), input_precision="ieee") * decay
-        A = tl.where(kept[None, :], A, 0.0)
-        Arow = tl.sum(tl.where(qr[:, None] == 0, A, 0.0), 0)  # [CS] tile row 0
-        tl.store(A_ptr + base + r, Arow)
-        # --- append the forward-substitution row using the cached final rows m<i ---
-        M = tl.load(T_ptr + (base + r[:, None]) * CS + r[None, :])
-        a_im = tl.where(r < i, Arow, 0.0)
-        acc = tl.sum(a_im[:, None] * M, 0)
-        new_row = tl.where(r < i, Arow + acc, Arow)
-        tl.store(T_ptr + (base + i) * CS + r, new_row)
-
-    @triton.jit
-    def _gdn_incr_kernel(
-        qn_ptr, kn_ptr, kb_ptr, vb_ptr, gcum_ptr, T_ptr, vnew_ptr, S_ptr, out_ptr, Snew_ptr, i_ptr,
-        HV: tl.constexpr, Dk: tl.constexpr, Dv: tl.constexpr, CS: tl.constexpr, QR: tl.constexpr,
-    ):
-        """Compute row i of core = attn_inter[i] + attn2[i,:] @ v_new, using the just-appended T row
-        (single-row QR tiles) and the full cached v_new (rows 0..i-1 frozen + the new row i). Caches
-        v_new[i] and, when the chunk fills (W==CS), folds the new boundary state Snew. gcum head-major."""
-        pid = tl.program_id(0)
-        bt = pid // HV
-        h = pid % HV
-        i = tl.load(i_ptr + bt)
-        W = i + 1
-        r = tl.arange(0, CS)
-        dk = tl.arange(0, Dk)
-        dv = tl.arange(0, Dv)
-        qr = tl.arange(0, QR)
-        valid = r < W
-        gbase = (bt * HV + h) * CS
+        # Barrier so the row-i stores above are visible to the reloads below (intra-program store->load
+        # to the same addresses is otherwise unordered). Reloading the full [0..i] tiles from global --
+        # rather than overlaying row i from registers -- makes every downstream tl.dot consume the exact
+        # same fp32 tile the separate a_row/incr kernels did, keeping the fused step bit-identical to the
+        # prior 2-launch path (register overlay drifted ~3e-3 through the attn/v_new matmuls).
+        tl.debug_barrier()
         kn = tl.load(kn_ptr + ((bt * CS + r[:, None]) * HV + h) * Dk + dk[None, :], mask=valid[:, None], other=0.0)
         kb = tl.load(kb_ptr + ((bt * CS + r[:, None]) * HV + h) * Dk + dk[None, :], mask=valid[:, None], other=0.0)
         vb = tl.load(vb_ptr + ((bt * CS + r[:, None]) * HV + h) * Dv + dv[None, :], mask=valid[:, None], other=0.0)
-        gcum = tl.load(gcum_ptr + gbase + r, mask=valid, other=0.0)
-        gi = tl.load(gcum_ptr + gbase + i)
+        gcum = tl.load(gcum_ptr + base + r, mask=valid, other=0.0)
+        # --- A row i = -(kb[i] @ kn^T) * exp(gcum[i]-gcum[j]) for j<i (strictly-lower) ---
+        kbr = kb_i[None, :] + qr[:, None] * 0.0  # [QR,Dk] all rows kb[i]
+        kept = (i > r) & valid
+        decay = tl.where(kept[None, :], libdevice.exp(gi - gcum[None, :]), 0.0)  # [QR,CS]
+        A = -tl.dot(kbr, tl.trans(kn), input_precision="ieee") * decay
+        A = tl.where(kept[None, :], A, 0.0)
+        Arow = tl.sum(tl.where(qr[:, None] == 0, A, 0.0), 0)  # [CS] tile row 0
+        tl.store(A_ptr + base + r, Arow)
+        # --- append forward-substitution row: T[i,j<i] = A[i,j] + sum_{m<i} A[i,m]*T[m,j] ---
+        # Same tl.dot formulation as _fwd_sub_kernel (bit-identical to prefill, num_warps-invariant).
+        M = tl.load(T_ptr + (base + r[:, None]) * CS + r[None, :])  # cached final rows m<i
+        a_im = tl.where(r < i, Arow, 0.0)  # [C], zero for m>=i
+        lhs = tl.where(row_i, a_im[None, :], 0.0)  # [C,C], row i = a_im
+        accfull = tl.dot(lhs, M, input_precision="ieee")  # [C,C], row i = sum_m a_im[m]*M[m,j]
+        acc = tl.sum(tl.where(row_i, accfull, 0.0), 0)  # [C(j)]
+        Tnew = tl.where(r < i, Arow + acc, Arow)  # T[i,:] (strictly-lower part filled)
+        tl.store(T_ptr + (base + i) * CS + r, Tnew)
+        # --- core row i = attn_inter[i] + attn2[i,:] @ v_new, caching v_new[i] and optional Snew ---
+        # Reload the just-stored T row i and qn row i from global (after the barrier above) so the core
+        # matmuls consume the same fp32 tiles the separate incr kernel did (bit-identical to prior path).
         S = tl.load(S_ptr + (bt * HV + h) * Dk * Dv + dk[:, None] * Dv + dv[None, :])
-
-        Trow = tl.load(T_ptr + (gbase + i) * CS + r)
-        Trow = Trow + tl.where(r == i, 1.0, 0.0)
+        Trow = tl.load(T_ptr + (base + i) * CS + r)
+        Trow = Trow + tl.where(r == i, 1.0, 0.0)  # + eye row i
         Ttile = tl.where(qr[:, None] == 0, Trow[None, :], 0.0)  # [QR,CS]
-
         val = tl.dot(Ttile, vb, input_precision="ieee")  # [QR,Dv]
         kg = kb * libdevice.exp(gcum)[:, None]
         kcd = tl.dot(Ttile, kg, input_precision="ieee")  # [QR,Dk]
         vprime = tl.where(qr[:, None] >= 0, tl.dot(kcd, S, input_precision="ieee"), 0.0)
         vnew_tile = val - vprime
         vnew_row = tl.sum(tl.where(qr[:, None] == 0, vnew_tile, 0.0), 0)  # [Dv]
-
-        vn_cached = tl.load(vnew_ptr + (gbase + r[:, None]) * Dv + dv[None, :])
-        vnew_full = tl.where(r[:, None] == i, vnew_row[None, :], vn_cached)  # [CS,Dv]
-
+        vn_cached = tl.load(vnew_ptr + (base + r[:, None]) * Dv + dv[None, :], mask=(r < i)[:, None], other=0.0)
+        vnew_full = tl.where(row_i, vnew_row[None, :], vn_cached)  # [CS,Dv]
         qn = tl.load(qn_ptr + ((bt * CS + i) * HV + h) * Dk + dk[None, :] + qr[:, None] * 0, mask=(qr[:, None] == 0), other=0.0)
         ge = tl.where(qr == 0, gi, 0.0)
         dlast = tl.where((i >= r) & valid, libdevice.exp(gi - gcum), 0.0)  # decay[i,:] incl diag
@@ -285,8 +277,7 @@ if _HAVE_TRITON:
         core = attn_inter + intra
         core_row = tl.sum(tl.where(qr[:, None] == 0, core, 0.0), 0)
         tl.store(out_ptr + (bt * HV + h) * Dv + dv, core_row)
-        tl.store(vnew_ptr + (gbase + i) * Dv + dv, vnew_row)
-
+        tl.store(vnew_ptr + (base + i) * Dv + dv, vnew_row)
         if W == CS:
             glast = tl.sum(tl.where(r == (CS - 1), gcum, 0.0), 0)
             kdec = kn * libdevice.exp(glast - gcum)[:, None]
@@ -805,20 +796,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         entry["i_buf"].fill_(i)
         it = entry["i_buf"]
         scale = 1.0 / (Dk ** 0.5)
-        # Fused prep + gcum append + A row + T-row append (one launch). gcum[i]=gcum[i-1]+g[i] is
-        # in-kernel (bit-identical to the shared serial scan), so no torch cumsum launch here.
-        _gdn_prep_a_row_append_kernel[(HV,)](
+        # Whole decode step in one launch: prep + gcum append + A row + T-row append + core/v_new +
+        # boundary fold. gcum[i]=gcum[i-1]+g[i] is in-kernel (bit-identical to the shared serial scan).
+        _gdn_step_kernel[(HV,)](
             q_tok, k_tok, v_tok, a_tok, b_tok, layer.A_log, layer.dt_bias,
             entry["qn"], entry["kn"], entry["kb"], entry["vb"], entry["g"], entry["gcum"],
-            entry["A_row"], entry["T"], it,
-            scale, HV=HV, HK=HK, Dk=Dk, Dv=Dv, CS=C, QR=16,
+            entry["A_row"], entry["T"], entry["vnew"], entry["boundary"], entry["out"], entry["Snew"], it,
+            scale, HV=HV, HK=HK, Dk=Dk, Dv=Dv, CS=C, QR=16, num_warps=8,
         )
         w = i + 1
-        _gdn_incr_kernel[(HV,)](
-            entry["qn"], entry["kn"], entry["kb"], entry["vb"], entry["gcum"], entry["T"],
-            entry["vnew"], entry["boundary"], entry["out"], entry["Snew"], it,
-            HV=HV, Dk=Dk, Dv=Dv, CS=C, QR=16, num_warps=8,
-        )
         core = entry["out"][0]
         if w == C:
             # Completed a 64-chunk: fold the fresh boundary and reset the partial-chunk state.
