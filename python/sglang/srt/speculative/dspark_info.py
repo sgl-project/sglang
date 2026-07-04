@@ -114,6 +114,11 @@ class _DSparkBlockInputBase(SpecInput):
 
 @dataclass
 class DSparkDraftBlockInput(_DSparkBlockInputBase):
+    hidden_states: torch.Tensor = field(
+        default_factory=lambda: torch.empty((0, 0), dtype=torch.float16)
+    )
+    hidden_valid_mask: Optional[torch.Tensor] = None
+
     def __post_init__(self):
         self._init_spec_input(SpecInputType.DSPARK_DRAFT_BLOCK)
 
@@ -234,6 +239,7 @@ class DSparkDraftInputV2(SpecInput):
     hidden_states: torch.Tensor = field(
         default_factory=lambda: torch.empty((0, 0), dtype=torch.float16)
     )
+    hidden_valid_mask: Optional[torch.Tensor] = None
     transfer_warmup_rounds: torch.Tensor = field(
         default_factory=lambda: torch.empty((0,), dtype=torch.int32)
     )
@@ -257,6 +263,7 @@ class DSparkDraftInputV2(SpecInput):
         self.topk_p = move_empty_to_device(self.topk_p)
         self.topk_index = move_empty_to_device(self.topk_index)
         self.hidden_states = move_empty_to_device(self.hidden_states)
+        self.hidden_valid_mask = move_empty_to_device(self.hidden_valid_mask)
         self.transfer_warmup_rounds = move_empty_to_device(
             self.transfer_warmup_rounds
         )
@@ -315,6 +322,7 @@ class DSparkDraftInputV2(SpecInput):
             topk_p=torch.empty((0, 0), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, 0), device=device, dtype=torch.int64),
             hidden_states=torch.empty((0, 0), device=device, dtype=torch.float16),
+            hidden_valid_mask=torch.empty((0, 0), device=device, dtype=torch.bool),
             transfer_warmup_rounds=torch.empty((0,), device=device, dtype=torch.int32),
             verify_done=None,
         )
@@ -420,6 +428,8 @@ class DSparkDraftInputV2(SpecInput):
             self.future_indices = self.future_indices[new_indices]
             if self.hidden_states.numel() > 0:
                 self.hidden_states = self.hidden_states[new_indices]
+            if self.hidden_valid_mask is not None and self.hidden_valid_mask.numel() > 0:
+                self.hidden_valid_mask = self.hidden_valid_mask[new_indices]
             if self.transfer_warmup_rounds.numel() > 0:
                 self.transfer_warmup_rounds = self.transfer_warmup_rounds[new_indices]
             self.direct_carry_valid = False
@@ -437,6 +447,8 @@ class DSparkDraftInputV2(SpecInput):
             self.topk_index = self.topk_index[new_indices]
         if self.hidden_states.numel() > 0:
             self.hidden_states = self.hidden_states[new_indices]
+        if self.hidden_valid_mask is not None and self.hidden_valid_mask.numel() > 0:
+            self.hidden_valid_mask = self.hidden_valid_mask[new_indices]
         if self.transfer_warmup_rounds.numel() > 0:
             self.transfer_warmup_rounds = self.transfer_warmup_rounds[new_indices]
 
@@ -474,6 +486,15 @@ class DSparkDraftInputV2(SpecInput):
                 self.hidden_states = torch.cat(
                     [self.hidden_states, spec_info.hidden_states], dim=0
                 )
+            if self.hidden_valid_mask is None or self.hidden_valid_mask.numel() == 0:
+                self.hidden_valid_mask = spec_info.hidden_valid_mask
+            elif (
+                spec_info.hidden_valid_mask is not None
+                and spec_info.hidden_valid_mask.numel() > 0
+            ):
+                self.hidden_valid_mask = torch.cat(
+                    [self.hidden_valid_mask, spec_info.hidden_valid_mask], dim=0
+                )
             self.transfer_warmup_rounds = torch.cat(
                 [self.transfer_warmup_rounds, spec_info.transfer_warmup_rounds],
                 dim=0,
@@ -502,6 +523,15 @@ class DSparkDraftInputV2(SpecInput):
         else:
             self.hidden_states = torch.cat(
                 [self.hidden_states, spec_info.hidden_states], dim=0
+            )
+        if self.hidden_valid_mask is None or self.hidden_valid_mask.numel() == 0:
+            self.hidden_valid_mask = spec_info.hidden_valid_mask
+        elif (
+            spec_info.hidden_valid_mask is not None
+            and spec_info.hidden_valid_mask.numel() > 0
+        ):
+            self.hidden_valid_mask = torch.cat(
+                [self.hidden_valid_mask, spec_info.hidden_valid_mask], dim=0
             )
         self.transfer_warmup_rounds = torch.cat(
             [self.transfer_warmup_rounds, spec_info.transfer_warmup_rounds], dim=0

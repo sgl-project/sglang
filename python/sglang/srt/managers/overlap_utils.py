@@ -110,6 +110,7 @@ class RelayPayload:
     topk_p: Optional[torch.Tensor] = None
     topk_index: Optional[torch.Tensor] = None
     hidden_states: Optional[torch.Tensor] = None
+    hidden_valid_mask: Optional[torch.Tensor] = None
     draft_probs: Optional[torch.Tensor] = None
     transfer_warmup_rounds: Optional[torch.Tensor] = None
 
@@ -120,6 +121,7 @@ class RelayPayload:
             topk_p=draft_input.topk_p,
             topk_index=draft_input.topk_index,
             hidden_states=draft_input.hidden_states,
+            hidden_valid_mask=getattr(draft_input, "hidden_valid_mask", None),
             draft_probs=getattr(draft_input, "draft_probs", None),
             transfer_warmup_rounds=getattr(
                 draft_input, "transfer_warmup_rounds", None
@@ -188,6 +190,7 @@ class FutureMap:
             self.spec_algo.is_some()
             and spec_need_hidden_states()
             and payload.hidden_states is not None
+            and payload.hidden_states.numel() > 0
         )
 
         if self.need_topk:
@@ -210,6 +213,14 @@ class FutureMap:
                 dtype=hidden_states0.dtype,
                 device=self.device,
             )
+            self.hidden_valid_mask_buf = None
+            if payload.hidden_valid_mask is not None:
+                hidden_valid_mask0 = payload.hidden_valid_mask[0]
+                self.hidden_valid_mask_buf = torch.empty(
+                    (self.req_pool_size, *hidden_valid_mask0.shape),
+                    dtype=hidden_valid_mask0.dtype,
+                    device=self.device,
+                )
 
         self.draft_probs_buf = None
         if payload.draft_probs is not None:
@@ -270,6 +281,12 @@ class FutureMap:
             draft_input.bonus_tokens = bonus_tokens
             if hidden_states is not None:
                 draft_input.hidden_states = hidden_states
+            if (
+                self.need_hidden_states
+                and getattr(self, "hidden_valid_mask_buf", None) is not None
+                and hasattr(draft_input, "hidden_valid_mask")
+            ):
+                draft_input.hidden_valid_mask = self.hidden_valid_mask_buf[indices]
             if self.draft_probs_buf is not None and draft_input.draft_probs is not None:
                 draft_input.draft_probs = self.draft_probs_buf[indices]
         else:
@@ -283,6 +300,11 @@ class FutureMap:
             ]
         if self.need_hidden_states and not self.need_topk:
             draft_input.hidden_states = self.hidden_states_buf[indices]
+            if (
+                getattr(self, "hidden_valid_mask_buf", None) is not None
+                and hasattr(draft_input, "hidden_valid_mask")
+            ):
+                draft_input.hidden_valid_mask = self.hidden_valid_mask_buf[indices]
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
@@ -369,6 +391,13 @@ class FutureMap:
             self.hidden_states_buf[indices] = payload.hidden_states.to(
                 self.hidden_states_buf.dtype
             )
+            if (
+                getattr(self, "hidden_valid_mask_buf", None) is not None
+                and payload.hidden_valid_mask is not None
+            ):
+                self.hidden_valid_mask_buf[indices] = payload.hidden_valid_mask.to(
+                    self.hidden_valid_mask_buf.dtype
+                )
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
             self.draft_probs_buf[indices] = payload.draft_probs
         if (
