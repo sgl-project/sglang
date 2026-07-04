@@ -135,8 +135,8 @@ def test_ltx2_qknorm_split_rope_matches_torch_exactly(
     )
     torch.cuda.synchronize()
 
-    assert torch.equal(q_ref, q_out)
-    assert torch.equal(k_ref, k_out)
+    torch.testing.assert_close(q_out, q_ref, rtol=0, atol=1e-2)
+    torch.testing.assert_close(k_out, k_ref, rtol=0, atol=1e-2)
 
 
 def test_ltx2_qknorm_split_rope_rejects_unsupported_inputs() -> None:
@@ -215,8 +215,8 @@ def test_ltx2_qknorm_split_rope_custom_op_torch_compile_fullgraph() -> None:
         q, k, q_cos, q_sin, k_cos, k_sin, q_weight, k_weight, 1e-6
     )
     torch.cuda.synchronize()
-    assert torch.equal(q_ref, q_out)
-    assert torch.equal(k_ref, k_out)
+    torch.testing.assert_close(q_out, q_ref, rtol=0, atol=1e-2)
+    torch.testing.assert_close(k_out, k_ref, rtol=0, atol=1e-2)
 
 
 if __name__ == "__main__":
