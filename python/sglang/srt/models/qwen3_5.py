@@ -1178,7 +1178,12 @@ class Qwen3_5ForCausalLM(nn.Module):
             and not server_args.disable_shared_experts_fusion
             and not can_fuse_shared_expert(config, quant_config)
         ):
-            server_args.disable_shared_experts_fusion = True
+            from sglang.srt.arg_groups.overrides import declare_load_time_override
+
+            declare_load_time_override(
+                "Qwen3_5ForCausalLM._maybe_autodisable_shared_experts_fusion",
+                {"disable_shared_experts_fusion": True},
+            )
             logger.info(
                 "Qwen3.5: shared-expert fusion not supported for this checkpoint; "
                 "auto-disabling (multi-streaming #25885 still applies)."

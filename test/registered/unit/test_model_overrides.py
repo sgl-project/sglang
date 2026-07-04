@@ -83,6 +83,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "mamba_radix_cache_strategy",
                     "speculative_moe_runner_backend",
                     "speculative_moe_a2a_backend",
+                    "disable_shared_experts_fusion",
                 }
             ),
         )

@@ -1824,7 +1824,10 @@ class ServerArgs:
     ] = False
     disable_shared_experts_fusion: A[
         bool,
-        "Disable the built-in shared experts fusion optimization for DeepSeek V3/R1. Note: DeepEP Waterfill (--enable-deepep-waterfill) still routes shared expert through DeepEP as an extra MoE slot, so shared expert is not separated from the MoE path when Waterfill is enabled.",
+        Arg(
+            help="Disable the built-in shared experts fusion optimization for DeepSeek V3/R1. Note: DeepEP Waterfill (--enable-deepep-waterfill) still routes shared expert through DeepEP as an extra MoE slot, so shared expert is not separated from the MoE path when Waterfill is enabled.",
+            resolvable=True,
+        ),
     ] = False
     enforce_shared_experts_fusion: A[
         bool,

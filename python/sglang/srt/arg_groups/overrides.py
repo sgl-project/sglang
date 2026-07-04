@@ -189,6 +189,19 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
         apply_declarations_to_server_args(server_args, [entry])
 
 
+def declare_load_time_override(source: str, declared: Dict[str, Any]) -> None:
+    """Transition helper for load-time resolved fields (model-file config
+    overrides, weight-resolved dtypes): dual-apply the declaration onto the
+    published ``server_args`` — byte-identical to the imperative write this
+    replaces — and record it into the flags tier through the runtime gate."""
+    from sglang.srt.runtime_context import get_context
+
+    ctx = get_context()
+    entry = (source, dict(declared))
+    apply_declarations_to_server_args(ctx.server_args, [entry])
+    ctx.record_runtime_overrides([entry])
+
+
 def collect_model_override_declarations(
     architecture: str, server_args: Any, hf_config: Any
 ) -> List[Tuple[str, Dict[str, Any]]]:
