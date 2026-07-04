@@ -552,31 +552,31 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 f"mode: {forward_mode}"
             )
 
-        if metadata is not None:
-            # Static upper-bound page-table width (see docstring); the kernel
-            # bounds real KV reads by cache_seqlens, so this is a fixed loop
-            # bound only — never a host max / seq_lens_cpu D2H sync.
-            max_seq_pages = self.max_num_pages
-            update_trtllm_mha_graph_metadata(
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                req_to_token=self.req_to_token,
-                cache_seqlens=metadata.cache_seqlens_int32,
-                cu_seqlens_k=metadata.cu_seqlens_k,
-                page_table=metadata.page_table,
-                bs=bs,
-                seqlen_offset=seqlen_offset,
-                max_seq_pages=max_seq_pages,
-                page_size=self.page_size,
-                swa_mapping=self._swa_full_to_swa_mapping,
-                swa_page_table=metadata.swa_page_table,
-                out_cache_loc=out_cache_loc,
-                swa_out_cache_loc=metadata.swa_out_cache_loc,
-                cu_seqlens_q=cu_seqlens_q,
-                qlens=qlens,
-                q_stride=q_stride,
-                q_mode=q_mode,
-            )
+        assert metadata is not None
+        # Static upper-bound page-table width (see docstring); the kernel
+        # bounds real KV reads by cache_seqlens, so this is a fixed loop
+        # bound only — never a host max / seq_lens_cpu D2H sync.
+        max_seq_pages = self.max_num_pages
+        update_trtllm_mha_graph_metadata(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            req_to_token=self.req_to_token,
+            cache_seqlens=metadata.cache_seqlens_int32,
+            cu_seqlens_k=metadata.cu_seqlens_k,
+            page_table=metadata.page_table,
+            bs=bs,
+            seqlen_offset=seqlen_offset,
+            max_seq_pages=max_seq_pages,
+            page_size=self.page_size,
+            swa_mapping=self._swa_full_to_swa_mapping,
+            swa_page_table=metadata.swa_page_table,
+            out_cache_loc=out_cache_loc,
+            swa_out_cache_loc=metadata.swa_out_cache_loc,
+            cu_seqlens_q=cu_seqlens_q,
+            qlens=qlens,
+            q_stride=q_stride,
+            q_mode=q_mode,
+        )
 
         self.forward_metadata = metadata
 
