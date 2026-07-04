@@ -572,6 +572,7 @@ class ServerArgs:
                 '* "float32" for FP32 precision.'
             ),
             choices=["auto", "half", "float16", "bfloat16", "float", "float32"],
+            model_overridable=True,
         ),
     ] = "auto"
     quantization: A[
@@ -653,7 +654,10 @@ class ServerArgs:
     ] = None  # For flash_rl load format
     enable_tf32_matmul: A[
         bool,
-        "Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only.",
+        Arg(
+            help="Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only.",
+            model_overridable=True,
+        ),
     ] = False
 
     # -------------------------------------------------------------------------
@@ -1595,7 +1599,10 @@ class ServerArgs:
     ] = False
     enable_multi_layer_eagle: A[
         bool,
-        "Enable multi-layer Eagle speculative decoding.",
+        Arg(
+            help="Enable multi-layer Eagle speculative decoding.",
+            model_overridable=True,
+        ),
     ] = False
     speculative_adaptive: A[
         bool,
@@ -3742,12 +3749,6 @@ class ServerArgs:
         apply_declarations_to_server_args(self, self._resolved_overrides)
 
         if model_arch in [
-            "MistralLarge3ForCausalLM",
-            "PixtralForConditionalGeneration",
-        ]:
-            self.dtype = "bfloat16"
-
-        if model_arch in [
             "DeepseekV4ForCausalLM",
         ]:
             from sglang.srt.arg_groups.deepseek_v4_hook import (
@@ -4205,11 +4206,8 @@ class ServerArgs:
                         f"attention TP size is {expected_attn_tp_size}."
                     )
 
-            if self.speculative_algorithm == "EAGLE":
-                self.enable_multi_layer_eagle = True
-                logger.info(
-                    "Enable multi-layer EAGLE speculative decoding for MiMoV2 model."
-                )
+            # enable_multi_layer_eagle for EAGLE moved to the override registry
+            # (arg_groups/overrides.py: _mimo_v2_overrides).
 
             if self.enable_hierarchical_cache:
                 if not envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
@@ -4518,11 +4516,8 @@ class ServerArgs:
         elif model_arch in ["ZayaForCausalLM"]:
             self._handle_mamba_radix_cache(model_arch=model_arch)
 
-        elif model_arch in ["MiniMaxM2ForCausalLM"]:
-            self.enable_tf32_matmul = True
-            logger.info(
-                "Enable TF32 matmul for MiniMaxM2ForCausalLM model to improve gate gemm performance."
-            )
+        # MiniMaxM2ForCausalLM (enable_tf32_matmul) moved to the override registry
+        # (arg_groups/overrides.py: _minimax_m2_overrides).
 
         if (
             model_arch in ["Qwen3VLForConditionalGeneration"]
