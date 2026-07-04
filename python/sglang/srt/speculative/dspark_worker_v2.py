@@ -472,40 +472,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             torch.inference_mode(),
         ):
             # DeepSpec DSpark keeps target_hidden_states fixed for every draft
-            # layer and concatenates its projected KV with block/noise KV inside
-            # attention. SGLang realizes the same layout through KV cache: write
-            # the context KV here, then let draft_block write/read block KV with
-            # full-block metadata.
-            main_x = self.draft_model.project_main_hidden(main_hidden)
-            main_x = main_x.unsqueeze(1).repeat(1, self.draft_model.model.hc_mult, 1)
+            # layer and computes ctx KV directly from hidden_norm(fc(target)).
+            # The noise/block branch owns hc_pre/input_layernorm; applying it to
+            # ctx hidden would change k_ctx/v_ctx. SGLang realizes cat(ctx, block)
+            # through KV cache: write ctx KV here, then let draft_block write/read
+            # block KV with full-block metadata.
+            ctx_x = self.draft_model.project_main_hidden(main_hidden)
             if self._stacked_wqkv_fp8_proj is None:
                 for layer in self._draft_inner.layers:
-                    attn_x, _, _, norm_fused = layer.hc_pre(
-                        main_x,
-                        layer.hc_attn_fn,
-                        layer.hc_attn_scale,
-                        layer.hc_attn_base,
-                        norm=layer.input_layernorm,
-                    )
-                    if not norm_fused:
-                        attn_x = layer.input_layernorm(attn_x)
                     layer.self_attn.kv_from_hidden(
-                        attn_x, positions, cache_loc, attn_backend
+                        ctx_x, positions, cache_loc, attn_backend
                     )
             else:
                 for layer_idx, layer in enumerate(self._draft_inner.layers):
-                    attn_x, _, _, norm_fused = layer.hc_pre(
-                        main_x,
-                        layer.hc_attn_fn,
-                        layer.hc_attn_scale,
-                        layer.hc_attn_base,
-                        norm=layer.input_layernorm,
-                    )
-                    if not norm_fused:
-                        attn_x = layer.input_layernorm(attn_x)
                     stacked_out = self._stacked_wqkv_fp8_proj.quant_method.apply(
                         self._stacked_wqkv_fp8_proj,
-                        attn_x,
+                        ctx_x,
                         self._stacked_wqkv_fp8_proj.bias,
                     )
                     layer_outputs = torch.split(
