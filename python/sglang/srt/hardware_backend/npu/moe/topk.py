@@ -60,8 +60,11 @@ def fused_topk_npu(
         topk_weights = scores.gather(1, topk_ids)
         if renormalize:
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        else:
-            topk_weights = topk_weights * topk_config.routed_scaling_factor
+            if (
+                topk_config.apply_routed_scaling_factor_on_output
+                and topk_config.routed_scaling_factor is not None
+            ):
+                topk_weights *= topk_config.routed_scaling_factor
         topk_weights = topk_weights.to(torch.float32)
 
     # Support grouped top-k or correction bias or sigmoid or routed_scaling_factor
