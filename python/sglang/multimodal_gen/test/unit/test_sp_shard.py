@@ -22,26 +22,26 @@ def _fake_sp(monkeypatch, sp_size, sp_rank=0, ring=1):
 
 def test_plan_shard_divisible(monkeypatch):
     _fake_sp(monkeypatch, 2, 1)
-    s = sps.plan_shard(16)
+    s = sps.build_shard_plan(16)
     assert (s.local_len, s.num_pad, s.local_pad) == (8, 0, 0)
 
 
 def test_plan_shard_padded_last_rank(monkeypatch):
     _fake_sp(monkeypatch, 4, 3)
-    s = sps.plan_shard(14)
+    s = sps.build_shard_plan(14)
     assert (s.local_len, s.num_pad) == (4, 2)
     assert s.local_pad == 2 and s.local_real_len == 2
 
 
 def test_plan_shard_pad_only_on_last_rank(monkeypatch):
     _fake_sp(monkeypatch, 4, 0)
-    s = sps.plan_shard(14)
+    s = sps.build_shard_plan(14)
     assert s.local_pad == 0 and s.local_real_len == 4
 
 
 def test_plan_shard_sp1_noop(monkeypatch):
     _fake_sp(monkeypatch, 1)
-    s = sps.plan_shard(15)
+    s = sps.build_shard_plan(15)
     assert (s.local_len, s.num_pad, s.sp_size) == (15, 0, 1)
 
 

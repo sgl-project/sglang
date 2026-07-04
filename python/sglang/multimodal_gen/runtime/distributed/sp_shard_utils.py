@@ -50,7 +50,7 @@ class SpShard:
         return self.local_len - self.local_pad
 
 
-def plan_shard(seq_len: int) -> SpShard:
+def _build_shard_plan(seq_len: int) -> SpShard:
     """Shard math only; tensors are sliced separately via `shard_like`."""
     sp_size = get_sp_world_size()
     if sp_size <= 1:
@@ -65,7 +65,7 @@ def plan_shard(seq_len: int) -> SpShard:
     )
 
 
-def shard_like(
+def _shard_like(
     x: torch.Tensor, shard: SpShard, dim: int = 1, pad_mode: str = "zeros"
 ) -> torch.Tensor:
     """Apply a planned shard to one tensor (RoPE caches use the same plan as
@@ -89,12 +89,17 @@ def shard_like(
 def shard_seq(
     x: torch.Tensor, dim: int = 1, pad_mode: str = "zeros"
 ) -> tuple[torch.Tensor, SpShard]:
-    shard = plan_shard(x.shape[dim])
-    return shard_like(x, shard, dim=dim, pad_mode=pad_mode), shard
+    """
+        mode:
+            zeroes: pad with zeroes at tail
+            repeat_last: repeat the last token, only for rotary embedding
+    """
+    shard = build_shard_plan(x.shape[dim])
+    return _shard_like(x, shard, dim=dim, pad_mode=pad_mode), shard
 
 
 def gather_seq(local: torch.Tensor, orig_len: int, dim: int = 1) -> torch.Tensor:
-    """All-gather an SP-sharded stream and trim the tail padding."""
+    """All-gather an SP-sharded sequence and trim the tail padding"""
     if get_sp_world_size() <= 1:
         return local
     full = sequence_model_parallel_all_gather(local.contiguous(), dim=dim)
@@ -132,9 +137,10 @@ def tail_attn_meta(
 
 def plan_text_strategy(txt_len: int) -> str:
     """Choose "shard" or "replicate" for the joint-attention text stream.
-    Padded sharding needs the varlen masked path (unsupported under ring) ->
-    replicate there. Measured default is always-shard; the length threshold
-    (SGLANG_SP_TEXT_SHARD_MIN) is only an env escape hatch."""
+
+       Prefer "shard" by default. for small sequence (shorter than SGLANG_SP_TEXT_SHARD_MIN), choose "replicate" for better performance
+
+        """
     sp_size = get_sp_world_size()
     if sp_size <= 1:
         return "replicate"
