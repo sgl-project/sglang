@@ -109,12 +109,10 @@ def tail_attn_meta(
     device: torch.device,
     image_seq_len: int = 0,
 ) -> dict | None:
-    """Per-request attention meta for a tail-padded shard.
-
-    `cu_seqlens_tail` marks each batch row as [valid | pad] varlen segments over
-    the gathered layout, so USPAttention runs varlen FA directly on the padded
-    q/k/v with zero repacking. Built once per request, reused by every block.
-    """
+    """Per-request attention meta for a tail-padded shard: `cu_seqlens_tail`
+    splits each batch row into [valid | pad] varlen segments over the gathered
+    layout, so USPAttention runs varlen FA on the padded q/k/v with zero
+    repacking. Built once per request, reused by every block."""
     if shard.sp_size <= 1 or shard.num_pad == 0:
         return None
     seq = shard.sp_size * (shard.local_len + image_seq_len)
@@ -134,11 +132,9 @@ def tail_attn_meta(
 
 def plan_text_strategy(txt_len: int) -> str:
     """Choose "shard" or "replicate" for the joint-attention text stream.
-
-    Padded sharding needs the varlen masked path, which ring attention does not
-    support - fall back to replicate there. The length threshold is an env
-    escape hatch (SGLANG_SP_TEXT_SHARD_MIN); measured default is always-shard.
-    """
+    Padded sharding needs the varlen masked path (unsupported under ring) ->
+    replicate there. Measured default is always-shard; the length threshold
+    (SGLANG_SP_TEXT_SHARD_MIN) is only an env escape hatch."""
     sp_size = get_sp_world_size()
     if sp_size <= 1:
         return "replicate"

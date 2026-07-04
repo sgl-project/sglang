@@ -134,10 +134,9 @@ class ErnieImageSelfAttention(nn.Module):
             self.norm_q = RMSNorm(head_dim, eps=eps)
             self.norm_k = RMSNorm(head_dim, eps=eps)
 
-        # The joint [image, text] stream is fully replicated (the pipeline does
-        # not sequence-shard these latents), so the ulysses all-to-all would
-        # wrongly treat it as sharded and duplicate the sequence. Skip SP until
-        # the stream is actually sharded (sp_shard + num_replicated_suffix).
+        # The joint [image, text] stream is fully replicated, so the ulysses
+        # all-to-all would wrongly treat it as sharded and duplicate it. Skip
+        # SP until the stream is sharded (sp_shard + num_replicated_suffix).
         self.attn = USPAttention(
             num_heads=self.num_local_heads,
             head_size=head_dim,

@@ -521,10 +521,9 @@ class PipelineConfig:
             return latents, False
         time_dim = latents.shape[2]
 
-        # A non-divisible time dim would need zero-padding, and the pad frames
-        # would enter self-attention unmasked (video models pass no attn_mask),
-        # corrupting real tokens. Keep such shapes unsharded until models
-        # consume the sp_shard tail meta.
+        # Zero-padding a non-divisible time dim would enter self-attention
+        # unmasked (video models pass no attn_mask) and corrupt real tokens;
+        # keep such shapes unsharded until models consume the sp_shard meta.
         if time_dim > 0 and time_dim % sp_world_size != 0:
             logger.warning_once(
                 f"Latent time dim {time_dim} is not divisible by SP degree "
