@@ -193,6 +193,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._accept_anomaly_streaks: dict[tuple[int, object], int] = {}
         self._accept_anomaly_dumped: set[tuple[int, object]] = set()
         self._accept_anomaly_dump_count = 0
+        self._last_draft_block_metadata_debug: Optional[dict] = None
         self._stacked_wqkv_fp8_proj = None
         self._stacked_wqkv_kv_offsets: list[tuple[int, int]] = []
         self._stacked_wqkv_out_sizes: list[int] = []
@@ -927,6 +928,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         try:
             with torch.inference_mode():
                 draft_runner_out = self.draft_model_runner.forward(draft_forward_batch)
+                self._last_draft_block_metadata_debug = (
+                    self._snapshot_draft_block_metadata(
+                        draft_forward_batch=draft_forward_batch,
+                        can_run_graph=bool(
+                            getattr(draft_runner_out, "can_run_graph", False)
+                        ),
+                    )
+                )
         finally:
             _dsv4_be._DSPARK_BLOCK_FULL_ATTN = 0
 
@@ -950,6 +959,51 @@ class DSparkWorkerV2(BaseSpecWorker):
             ),
             draft_forward_batch,
         )
+
+    def _snapshot_draft_block_metadata(
+        self,
+        *,
+        draft_forward_batch,
+        can_run_graph: bool,
+    ) -> Optional[dict]:
+        if not self._accept_anomaly_enabled:
+            return None
+        metadata = getattr(self.draft_model_runner.attn_backend, "forward_metadata", None)
+        core = getattr(metadata, "core_attn_metadata", None)
+        if core is None:
+            return {"draft_can_run_graph": can_run_graph, "draft_metadata": None}
+
+        def first_last_rows(tensor):
+            if (
+                tensor is None
+                or not isinstance(tensor, torch.Tensor)
+                or tensor.numel() == 0
+            ):
+                return None
+            rows = tensor.detach().cpu()
+            if rows.ndim == 1:
+                return [int(rows[0]), int(rows[-1])]
+            return [
+                [int(x) for x in rows[0].reshape(-1)[:8].tolist()],
+                [int(x) for x in rows[-1].reshape(-1)[:8].tolist()],
+            ]
+
+        return {
+            "draft_can_run_graph": can_run_graph,
+            "draft_forward_mode": str(getattr(draft_forward_batch, "forward_mode", None)),
+            "draft_seq_lens_casual_first_last": first_last_rows(
+                getattr(core, "seq_lens_casual", None)
+            ),
+            "draft_positions_casual_first_last": first_last_rows(
+                getattr(core, "positions_casual", None)
+            ),
+            "draft_swa_topk_first_last": first_last_rows(
+                getattr(core, "swa_topk_lengths", None)
+            ),
+            "draft_swa_indices_first_last": first_last_rows(
+                getattr(core, "swa_page_indices", None)
+            ),
+        }
 
     def _ensure_markov_refine_buffers(self, bs: int, device: torch.device) -> None:
         cap = self._markov_refine_buffer_cap
@@ -1320,6 +1374,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                         if verify_swa is not None and block_size > 0
                         else None
                     ),
+                    "draft_block_metadata": self._last_draft_block_metadata_debug,
                 }
             )
             if len(history) > self._accept_anomaly_history_size:
