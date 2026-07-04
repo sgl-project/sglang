@@ -33,8 +33,8 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
 )
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
-    join_seqs,
     build_shard_plan,
+    join_seqs,
     shard_like,
     shard_seq_prefix,
     should_shard_text,

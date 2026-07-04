@@ -23,8 +23,8 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
-    join_seqs,
     build_shard_plan,
+    join_seqs,
     shard_like,
     should_shard_text,
     split_seqs,
