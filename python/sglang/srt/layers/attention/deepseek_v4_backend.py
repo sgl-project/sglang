@@ -1153,6 +1153,7 @@ class DeepseekV4AttnBackend(
                 and extend_seq_lens is not None
                 and extend_seq_lens_cpu is not None
             )
+            num_tokens = sum(extend_seq_lens_cpu)
             is_draft = forward_batch.forward_mode.is_draft_extend_v2()
             metadata = self.init_forward_metadata_prefill(
                 max_seq_len=max_seq_len,
@@ -1160,11 +1161,11 @@ class DeepseekV4AttnBackend(
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu.tolist(),
                 out_cache_loc=forward_batch.out_cache_loc,
-                num_tokens=sum(extend_seq_lens_cpu),
+                num_tokens=num_tokens,
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 extend_start_loc=forward_batch.extend_start_loc,
-                need_compress=not is_draft,
+                need_compress=not is_draft and num_tokens > 0,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
             )
         else:
