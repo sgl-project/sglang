@@ -75,7 +75,7 @@ __device__ float convert_to_float(T x) {
 template <typename T, int TPB>
 __launch_bounds__(TPB) __global__ void moeSigmoid(
     const T* input, const bool* finished, float* output, const int num_cols, const float* correction_bias) {
-  const int thread_row_offset = blockIdx.x * num_cols;
+  const int64_t thread_row_offset = static_cast<int64_t>(blockIdx.x) * num_cols;
 
   // Don't touch finished rows.
   if ((finished != nullptr) && finished[blockIdx.x]) {
@@ -84,7 +84,7 @@ __launch_bounds__(TPB) __global__ void moeSigmoid(
 
   // First pass: Apply transformation, find max, and write transformed values to output
   for (int ii = threadIdx.x; ii < num_cols; ii += TPB) {
-    const int idx = thread_row_offset + ii;
+    const int64_t idx = thread_row_offset + ii;
     float val = convert_to_float<T>(input[idx]);
 
     val = 1.0f / (1.0f + expf(-val));
@@ -120,7 +120,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
   const int block_row = blockIdx.x;
 
   const bool row_is_active = finished ? !finished[block_row] : true;
-  const int thread_read_offset = blockIdx.x * num_experts;
+  const int64_t thread_read_offset = static_cast<int64_t>(blockIdx.x) * num_experts;
   float row_sum_for_renormalize = 0;
   for (int k_idx = 0; k_idx < k; ++k_idx) {
     thread_kvp.key = 0;
@@ -128,7 +128,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
 
     cub_kvp inp_kvp;
     for (int expert = threadIdx.x; expert < num_experts; expert += TPB) {
-      const int idx = thread_read_offset + expert;
+      const int64_t idx = thread_read_offset + expert;
       inp_kvp.key = expert;
       inp_kvp.value = inputs_after_sigmoid[idx];
 
@@ -528,7 +528,7 @@ void topk_sigmoid(
 
   const bool is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
   const bool needs_workspace = !is_pow_2 || num_experts > 256;
-  const int64_t workspace_size = needs_workspace ? num_tokens * num_experts : 0;
+  const int64_t workspace_size = needs_workspace ? static_cast<int64_t>(num_tokens) * num_experts : 0;
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(gating_output));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();

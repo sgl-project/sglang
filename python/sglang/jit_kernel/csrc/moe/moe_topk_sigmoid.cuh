@@ -68,14 +68,14 @@ __device__ float convert_to_float(T x) {
 template <typename T, int TPB>
 __launch_bounds__(TPB) __global__
     void moeSigmoid(const T* input, const bool* finished, float* output, const int num_cols) {
-  const int thread_row_offset = blockIdx.x * num_cols;
+  const int64_t thread_row_offset = static_cast<int64_t>(blockIdx.x) * num_cols;
 
   if ((finished != nullptr) && finished[blockIdx.x]) {
     return;
   }
 
   for (int ii = threadIdx.x; ii < num_cols; ii += TPB) {
-    const int idx = thread_row_offset + ii;
+    const int64_t idx = thread_row_offset + ii;
     float val = convert_to_float<T>(input[idx]);
     val = 1.0f / (1.0f + expf(-val));
     output[idx] = val;
@@ -110,7 +110,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
   const int topk = k + num_fused_shared_experts;
 
   const bool row_is_active = finished ? !finished[block_row] : true;
-  const int thread_read_offset = blockIdx.x * num_experts;
+  const int64_t thread_read_offset = static_cast<int64_t>(blockIdx.x) * num_experts;
   float row_sum_for_renormalize = 0;
 
   for (int k_idx = 0; k_idx < k; ++k_idx) {
@@ -119,7 +119,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
 
     cub_kvp inp_kvp;
     for (int expert = threadIdx.x; expert < num_experts; expert += TPB) {
-      const int idx = thread_read_offset + expert;
+      const int64_t idx = thread_read_offset + expert;
       inp_kvp.key = expert;
       inp_kvp.value = inputs_after_sigmoid[idx];
       if (correction_bias != nullptr) {
