@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.kv_canary.hicache.bridge import CanaryHiCacheBridge
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
@@ -246,6 +247,7 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
+        self.kv_canary_hicache_bridge: Optional[CanaryHiCacheBridge] = None
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
         self.has_draft = False
@@ -304,6 +306,15 @@ class HiCacheController:
                 torch.distributed.get_world_size(group=self.attn_cp_group),
             )
         return 0, 1
+
+    def register_canary_hicache_bridge(self, bridge: CanaryHiCacheBridge) -> None:
+        if self.enable_storage:
+            raise NotImplementedError(
+                "kv-canary: HiCache L3 storage does not yet preserve canary sidecars"
+            )
+        if getattr(self, "kv_canary_hicache_bridge", None) is not None:
+            raise RuntimeError("kv-canary: HiCache canary bridge already registered")
+        self.kv_canary_hicache_bridge = bridge
 
     def _create_prefetch_sync_groups(self) -> None:
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
@@ -423,6 +434,11 @@ class HiCacheController:
         Requirement: no in-flight requests. This call is expected to run on the scheduler
         thread (control path), not concurrently with prefetch/backup.
         """
+        if getattr(self, "kv_canary_hicache_bridge", None) is not None:
+            raise NotImplementedError(
+                "kv-canary: cannot attach HiCache L3 storage while L2 canary "
+                "sidecars are active"
+            )
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
 
@@ -704,6 +720,12 @@ class HiCacheController:
                     device_indices,
                     self.io_backend,
                 )
+            if (bridge := getattr(self, "kv_canary_hicache_bridge", None)) is not None:
+                bridge.backup(
+                    host_indices=host_indices,
+                    device_indices=device_indices,
+                    io_backend=self.io_backend,
+                )
             finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
@@ -769,6 +791,12 @@ class HiCacheController:
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            if (bridge := getattr(self, "kv_canary_hicache_bridge", None)) is not None:
+                bridge.restore(
+                    host_indices=host_indices,
+                    device_indices=device_indices,
+                    io_backend=self.io_backend,
+                )
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,

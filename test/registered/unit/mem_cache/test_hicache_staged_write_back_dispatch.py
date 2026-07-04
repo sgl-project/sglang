@@ -925,6 +925,135 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         controller.move_indices.assert_called_once()
         self.assertEqual(captured["host_indices"].device.type, "cpu")
 
+    def test_cache_controller_copies_canary_with_kv_indices(self):
+        op = ManagerCacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        bridge = mock.Mock()
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.write_queue = [op]
+        controller.io_backend = "direct"
+        controller.mem_pool_host = SimpleNamespace(
+            layout="layer_first",
+            can_use_write_back_jit=False,
+            backup_from_device_all_layer=mock.Mock(),
+        )
+        controller.mem_pool_device = None
+        controller.has_draft = False
+        controller.write_stream = object()
+        controller.ack_write_queue = []
+        controller.move_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices)
+        )
+        controller.kv_canary_hicache_bridge = bridge
+
+        with mock.patch.object(
+            manager_cache_controller, "device_module", _FakeDeviceModule
+        ):
+            controller.start_writing()
+
+        bridge.backup.assert_called_once_with(
+            host_indices=op.host_indices,
+            device_indices=op.device_indices,
+            io_backend="direct",
+        )
+
+    def test_cache_controller_restores_canary_before_layer_completion(self):
+        call_order = []
+        op = ManagerCacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        producer_event = SimpleNamespace(
+            start_event=_FakeEvent(),
+            finish_event=_FakeEvent(),
+            complete=lambda layer_id: call_order.append(("complete", layer_id)),
+        )
+        bridge = mock.Mock()
+        bridge.restore.side_effect = lambda **_: call_order.append(("canary", None))
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.load_queue = [op]
+        controller.io_backend = "direct"
+        controller.mem_pool_host = SimpleNamespace(
+            layout="layer_first",
+            load_to_device_per_layer=lambda *args: call_order.append(("kv", args[3])),
+        )
+        controller.mem_pool_device = None
+        controller.mem_pool_device_allocator = None
+        controller.has_draft = False
+        controller.layer_num = 2
+        controller.load_stream = object()
+        controller.ack_load_queue = []
+        controller.layer_done_counter = SimpleNamespace(
+            update_producer=lambda: 0,
+            events=[producer_event],
+        )
+        controller.move_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices)
+        )
+        controller.kv_canary_hicache_bridge = bridge
+
+        with mock.patch.object(
+            manager_cache_controller, "device_module", _FakeDeviceModule
+        ):
+            controller.start_loading()
+
+        bridge.restore.assert_called_once_with(
+            host_indices=op.host_indices,
+            device_indices=op.device_indices,
+            io_backend="direct",
+        )
+        self.assertEqual(call_order[0], ("canary", None))
+        self.assertEqual(
+            call_order[1:], [("kv", 0), ("complete", 0), ("kv", 1), ("complete", 1)]
+        )
+
+    def test_hybrid_controller_passes_swa_transfer_to_canary(self):
+        swa_transfer = PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=_indices(1, 3),
+            device_indices=_indices(5, 7),
+        )
+        op = CacheOperation(
+            host_indices=_indices(0, 2),
+            device_indices=_indices(4, 6),
+            node_id=1,
+            pool_transfers=[swa_transfer],
+        )
+        bridge = mock.Mock()
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.write_queue = [op]
+        controller.io_backend = "direct"
+        controller.mem_pool_host = SimpleNamespace(
+            layout="layer_first",
+            can_use_write_back_jit=False,
+            backup_from_device_all_layer=mock.Mock(),
+        )
+        controller.mem_pool_device = None
+        controller.has_draft = False
+        controller.write_stream = object()
+        controller.ack_write_queue = []
+        controller._record_transfer_indices_on_stream = mock.Mock()
+        controller.move_hybrid_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices, [swa_transfer])
+        )
+        controller.kv_canary_hicache_bridge = bridge
+
+        with mock.patch.object(
+            hybrid_cache_controller, "device_module", _FakeDeviceModule
+        ):
+            controller.start_writing()
+
+        bridge.backup.assert_called_once_with(
+            host_indices=op.host_indices,
+            device_indices=op.device_indices,
+            pool_transfers=[swa_transfer],
+            io_backend="direct",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

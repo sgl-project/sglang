@@ -427,6 +427,13 @@ class HybridCacheController(BaseHiCacheController):
                     device_indices,
                     self.io_backend,
                 )
+            if (bridge := getattr(self, "kv_canary_hicache_bridge", None)) is not None:
+                bridge.backup(
+                    host_indices=host_indices,
+                    device_indices=device_indices,
+                    pool_transfers=resolved_pool_transfers,
+                    io_backend=self.io_backend,
+                )
             finish_event.record()
             self._record_transfer_indices_on_stream(
                 self.write_stream,
@@ -492,6 +499,13 @@ class HybridCacheController(BaseHiCacheController):
         producer_event.start_event.record()
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            if (bridge := getattr(self, "kv_canary_hicache_bridge", None)) is not None:
+                bridge.restore(
+                    host_indices=host_indices,
+                    device_indices=device_indices,
+                    pool_transfers=resolved_pool_transfers,
+                    io_backend=self.io_backend,
+                )
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,

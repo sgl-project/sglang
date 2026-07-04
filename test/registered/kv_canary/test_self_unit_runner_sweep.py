@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -31,6 +32,27 @@ def _run_one_cycle(manager, forward_batch) -> None:
 
 
 class TestSelfUnitManagerSweep(CanaryManagerTestCase):
+    def test_attach_radix_cache_registers_hicache_bridge(self) -> None:
+        manager = make_manager(device=self.device)
+        cache = make_radix_cache([[], [10, 11]], device=self.device)
+        cache.req_to_token_pool = make_req_to_token_pool(self.device)
+        controller = SimpleNamespace(register_canary_hicache_bridge=Mock())
+        cache.cache_controller = controller
+        bridge = object()
+
+        with patch(
+            "sglang.srt.kv_canary.hicache.bridge."
+            "CanaryHiCacheBridge.from_cache_controller",
+            return_value=bridge,
+        ) as factory:
+            manager.attach_radix_cache(cache)
+
+        factory.assert_called_once_with(
+            buffer_groups=manager._buffer_groups,
+            cache_controller=controller,
+        )
+        controller.register_canary_hicache_bridge.assert_called_once_with(bridge)
+
     def test_sweep_every_n_cadence(self) -> None:
         """Verify sweep execution follows the configured step cadence."""
         config = make_config(sweep_interval=4)
