@@ -246,7 +246,7 @@ class VisionSdpaAttention(nn.Module):
     def generate_patch_attention_mask(
         self,
         s: int,
-        cu_seqlens: Optional[torch.Tensor],
+        cu_seqlens: torch.Tensor | SingletonCache | None,
         flatten_batch: bool = False,
     ) -> Optional[torch.Tensor]:
         r"""
@@ -258,7 +258,7 @@ class VisionSdpaAttention(nn.Module):
         Returns:
             attention mask tensor or None
         """
-        if cu_seqlens is None:
+        if cu_seqlens is None or isinstance(cu_seqlens, SingletonCache):
             return None
 
         cu_seqlens_tuple = tuple(cu_seqlens.cpu().tolist())
@@ -905,7 +905,10 @@ class VisionDynamicCudnnSdpaAttention(nn.Module):
     ) -> bool:
         if self.platform_backend != "fa3":
             return False
-        if cu_seqlens is not None or attention_mask is not None:
+        has_varlen_seqlens = cu_seqlens is not None and not isinstance(
+            cu_seqlens, SingletonCache
+        )
+        if has_varlen_seqlens or attention_mask is not None:
             return False
         if q.dtype not in (torch.float16, torch.bfloat16):
             return False
@@ -913,7 +916,7 @@ class VisionDynamicCudnnSdpaAttention(nn.Module):
             return False
         if window_size != (-1, -1) or s_aux is not None:
             return False
-        return q.shape[-1] in (64, 80, 128) and seq_len <= 1024
+        return q.shape[-1] in (64, 80, 128) and seq_len <= 1025
 
     def forward(
         self,
@@ -940,7 +943,7 @@ class VisionDynamicCudnnSdpaAttention(nn.Module):
                 k,
                 v,
                 bsz=bsz,
-                cu_seqlens=cu_seqlens,
+                cu_seqlens=None,
                 softmax_scale=softmax_scale,
                 **kwargs,
             )
