@@ -750,6 +750,100 @@ def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:
 # ---------------------------------------------------------------------------
 
 
+# Architectures whose monolith branch routes through the mamba radix cache
+# handling (hybrid linear-attention models). Keep in sync with the branch
+# guards in _handle_model_specific_adjustments.
+_MAMBA_RADIX_CACHE_ARCHS = frozenset(
+    {
+        "KimiLinearForCausalLM",
+        "BailingMoeV2_5ForCausalLM",
+        "Qwen3NextForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+        "InternS2PreviewForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "MiniCPMV4_6ForConditionalGeneration",
+        "NemotronHForCausalLM",
+        "NemotronHPuzzleForCausalLM",
+        "FalconH1ForCausalLM",
+        "JetNemotronForCausalLM",
+        "JetVLMForConditionalGeneration",
+        "Lfm2ForCausalLM",
+        "ZayaForCausalLM",
+    }
+)
+
+# Architectures that support the extra_buffer mamba radix cache strategy.
+# Single source of truth: ServerArgs._support_mamba_cache_extra_buffer
+# delegates here.
+_MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
+    {
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3NextForCausalLM",
+        "InternS2PreviewForConditionalGeneration",
+        "MiniCPMV4_6ForConditionalGeneration",
+        "BailingMoeV2_5ForCausalLM",
+        "FalconH1ForCausalLM",
+        "GraniteMoeHybridForCausalLM",
+        "NemotronHForCausalLM",
+        "NemotronHPuzzleForCausalLM",
+    }
+)
+
+
+def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
+    """Whether ``model_arch`` supports the extra_buffer strategy on the
+    configured linear-attention backend (pure read)."""
+    if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
+        return view.linear_attn_backend == "triton"
+    return False
+
+
+@register_post_process
+def _mamba_radix_cache_resolution(view: Any) -> dict:
+    """Resolve the hybrid-mamba radix cache fields (pure).
+
+    Slot pass: invoked at each legacy ``_handle_mamba_radix_cache`` slot —
+    the hybrid-spec call at the head of the monolith and the per-arch branch
+    calls — where it reads the mid-resolution ``page_size`` /
+    ``disable_overlap_schedule`` exactly as the legacy helper did. The arch
+    guard replicates the union of the legacy call-site guards so the pass is
+    self-sufficient in the end-state pass list.
+    """
+    from sglang.srt.configs.linear_attn_model_registry import (
+        get_linear_attn_spec_by_arch,
+    )
+
+    hf_config = view.get_model_config().hf_config
+    model_arch = hf_config.architectures[0]
+
+    in_branch = model_arch in _MAMBA_RADIX_CACHE_ARCHS
+    if model_arch == "GraniteMoeHybridForCausalLM":
+        in_branch = any(
+            layer_type == "mamba"
+            for layer_type in getattr(hf_config, "layer_types", [])
+        )
+    spec = get_linear_attn_spec_by_arch(model_arch)
+    if not ((spec is not None and spec.uses_mamba_radix_cache) or in_branch):
+        return {}
+
+    if view.disable_radix_cache:
+        return {}
+
+    declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
+    if view.mamba_radix_cache_strategy == "auto":
+        wants_overlap = not view.disable_overlap_schedule
+        wants_paging = view.page_size is not None and view.page_size > 1
+        if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(
+            view, model_arch
+        ):
+            declared["mamba_radix_cache_strategy"] = "extra_buffer"
+        else:
+            declared["mamba_radix_cache_strategy"] = "no_buffer"
+            declared["disable_overlap_schedule"] = True
+    return declared
+
+
 # Keep in sync with the DeepSeek family list on _deepseek_family_overrides.
 _DEEPSEEK_FAMILY_ARCHS = frozenset(
     {
@@ -833,6 +927,18 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
                     "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
                 )
     return overrides
+
+
+@register_post_process
+def _sparse_head_overlap_disable(view: Any) -> dict:
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
+        logger.warning(
+            "Overlap scheduler is disabled when using sparse head for embedding model."
+        )
+        return {"disable_overlap_schedule": True}
+    return {}
 
 
 @register_post_process
@@ -1222,6 +1328,14 @@ def _a2a_ep_size(view: Any) -> dict:
 
 
 @register_post_process
+def _pipeline_parallel_overlap_disable(view: Any) -> dict:
+    if view.pp_size > 1:
+        logger.warning("Pipeline parallelism is incompatible with overlap schedule.")
+        return {"disable_overlap_schedule": True}
+    return {}
+
+
+@register_post_process
 def _gguf_quantization(view: Any) -> dict:
     from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 
@@ -1255,6 +1369,18 @@ def _dllm_attention_backend(view: Any) -> dict:
             )
             return {"attention_backend": "flashinfer"}
     return {}
+
+
+@register_post_process
+def _dllm_overlap_disable(view: Any) -> dict:
+    if view.dllm_algorithm is None:
+        return {}
+    if view.disable_overlap_schedule:
+        return {}
+    logger.warning(
+        "Overlap schedule is disabled because of using diffusion LLM inference"
+    )
+    return {"disable_overlap_schedule": True}
 
 
 @register_post_process

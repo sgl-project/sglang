@@ -325,6 +325,9 @@ class Flags(_StaticFlags):
     sampling_backend: str | None = None
     page_size: int | None = None
     quantization: str | None = None
+    disable_overlap_schedule: bool = False
+    uses_mamba_radix_cache: bool = False
+    mamba_radix_cache_strategy: str = "auto"
     # Parallel-request fields: flat transitional home, to be re-homed by the
     # Parallel Parameters Clarification module.
     enable_dp_attention: bool = False

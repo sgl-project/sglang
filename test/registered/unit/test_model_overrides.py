@@ -78,6 +78,9 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "ep_size",
                     "moe_dense_tp_size",
                     "attn_cp_size",
+                    "disable_overlap_schedule",
+                    "uses_mamba_radix_cache",
+                    "mamba_radix_cache_strategy",
                 }
             ),
         )
@@ -789,6 +792,164 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(_dllm_page_size(_view(page_size=64)), {})  # aligned
         self.assertEqual(_dllm_page_size(_view(dllm_algorithm=None)), {})
         self.assertEqual(_dllm_page_size(_view(disable_radix_cache=True)), {})
+
+    def test_overlap_disable_passes(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _dllm_overlap_disable,
+            _pipeline_parallel_overlap_disable,
+            _sparse_head_overlap_disable,
+        )
+
+        # pipeline parallelism: declares only when pp_size > 1
+        self.assertEqual(
+            _pipeline_parallel_overlap_disable(
+                ResolvedView(SimpleNamespace(pp_size=1))
+            ),
+            {},
+        )
+        self.assertEqual(
+            _pipeline_parallel_overlap_disable(
+                ResolvedView(SimpleNamespace(pp_size=2))
+            ),
+            {"disable_overlap_schedule": True},
+        )
+
+        # dllm: guarded on the algorithm and the current value
+        def _view(**kw):
+            defaults = dict(
+                dllm_algorithm="LowConfidence", disable_overlap_schedule=False
+            )
+            defaults.update(kw)
+            return ResolvedView(SimpleNamespace(**defaults))
+
+        self.assertEqual(_dllm_overlap_disable(_view(dllm_algorithm=None)), {})
+        self.assertEqual(
+            _dllm_overlap_disable(_view(disable_overlap_schedule=True)), {}
+        )
+        self.assertEqual(
+            _dllm_overlap_disable(_view()), {"disable_overlap_schedule": True}
+        )
+
+        # embeddings sparse head: keyed on the env var being set
+        from sglang.srt.environ import envs
+
+        view = ResolvedView(SimpleNamespace())
+        with patch.object(
+            envs.SGLANG_EMBEDDINGS_SPARSE_HEAD, "is_set", return_value=False
+        ):
+            self.assertEqual(_sparse_head_overlap_disable(view), {})
+        with patch.object(
+            envs.SGLANG_EMBEDDINGS_SPARSE_HEAD, "is_set", return_value=True
+        ):
+            self.assertEqual(
+                _sparse_head_overlap_disable(view), {"disable_overlap_schedule": True}
+            )
+
+    def test_mamba_radix_cache_resolution_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _mamba_radix_cache_resolution,
+            supports_mamba_cache_extra_buffer,
+        )
+
+        def _view(arch, layer_types=None, **kw):
+            hf = SimpleNamespace(architectures=[arch])
+            if layer_types is not None:
+                hf.layer_types = layer_types
+            defaults = dict(
+                disable_radix_cache=False,
+                mamba_radix_cache_strategy="auto",
+                disable_overlap_schedule=False,
+                page_size=None,
+                linear_attn_backend="triton",
+            )
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(
+                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+                )
+            )
+
+        # arch guard: non-mamba arch declares nothing
+        self.assertEqual(_mamba_radix_cache_resolution(_view("LlamaForCausalLM")), {})
+        # radix cache disabled: nothing to resolve
+        self.assertEqual(
+            _mamba_radix_cache_resolution(
+                _view("Qwen3NextForCausalLM", disable_radix_cache=True)
+            ),
+            {},
+        )
+        # auto + overlap wanted + extra-buffer support -> extra_buffer
+        self.assertEqual(
+            _mamba_radix_cache_resolution(_view("Qwen3NextForCausalLM")),
+            {
+                "uses_mamba_radix_cache": True,
+                "mamba_radix_cache_strategy": "extra_buffer",
+            },
+        )
+        # auto + no extra-buffer support (Lfm2) -> no_buffer + overlap disable
+        self.assertEqual(
+            _mamba_radix_cache_resolution(_view("Lfm2ForCausalLM")),
+            {
+                "uses_mamba_radix_cache": True,
+                "mamba_radix_cache_strategy": "no_buffer",
+                "disable_overlap_schedule": True,
+            },
+        )
+        # neither overlap nor paging wanted -> no_buffer even when supported
+        declared = _mamba_radix_cache_resolution(
+            _view("Qwen3NextForCausalLM", disable_overlap_schedule=True, page_size=1)
+        )
+        self.assertEqual(declared["mamba_radix_cache_strategy"], "no_buffer")
+        self.assertIs(declared["disable_overlap_schedule"], True)
+        # paging alone wants the extra buffer
+        self.assertEqual(
+            _mamba_radix_cache_resolution(
+                _view(
+                    "Qwen3NextForCausalLM", disable_overlap_schedule=True, page_size=64
+                )
+            )["mamba_radix_cache_strategy"],
+            "extra_buffer",
+        )
+        # user-set strategy: only the routing marker is declared
+        self.assertEqual(
+            _mamba_radix_cache_resolution(
+                _view(
+                    "Qwen3NextForCausalLM",
+                    mamba_radix_cache_strategy="extra_buffer_lazy",
+                )
+            ),
+            {"uses_mamba_radix_cache": True},
+        )
+        # NemotronH routes through the pass (covered by the guard union,
+        # not the branch chain — its hook invokes the handler)
+        self.assertEqual(
+            _mamba_radix_cache_resolution(_view("NemotronHForCausalLM")),
+            {
+                "uses_mamba_radix_cache": True,
+                "mamba_radix_cache_strategy": "extra_buffer",
+            },
+        )
+        # GraniteMoeHybrid is guarded on mamba layer types
+        self.assertEqual(
+            _mamba_radix_cache_resolution(
+                _view("GraniteMoeHybridForCausalLM", layer_types=["attention"])
+            ),
+            {},
+        )
+        self.assertEqual(
+            _mamba_radix_cache_resolution(
+                _view("GraniteMoeHybridForCausalLM", layer_types=["mamba", "attention"])
+            )["mamba_radix_cache_strategy"],
+            "extra_buffer",
+        )
+        # extra-buffer support requires the triton linear-attn backend
+        self.assertFalse(
+            supports_mamba_cache_extra_buffer(
+                SimpleNamespace(linear_attn_backend="fla"), "Qwen3NextForCausalLM"
+            )
+        )
 
     def test_page_size_leaf_materializes_end_state(self):
         sa = self._construct("LlamaForCausalLM", "llama")

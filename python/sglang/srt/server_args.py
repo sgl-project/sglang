@@ -809,7 +809,10 @@ class ServerArgs:
     ] = False
     disable_overlap_schedule: A[
         bool,
-        "Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
+        Arg(
+            help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
+            resolvable=True,
+        ),
     ] = False
     num_continuous_decode_steps: A[
         int,
@@ -1856,8 +1859,19 @@ class ServerArgs:
         Arg(
             help="The strategy to use for mamba radix cache.",
             choices=MAMBA_RADIX_CACHE_STRATEGY_CHOICES,
+            resolvable=True,
         ),
     ] = "auto"
+    uses_mamba_radix_cache: A[
+        bool,
+        Arg(
+            help="(Derived) whether the model routes through the hybrid-mamba "
+            "radix cache handling; resolved from the model architecture, no "
+            "CLI surface.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
     mamba_track_interval: A[
         int,
         "The interval to track the mamba state during decode.",
@@ -4109,10 +4123,6 @@ class ServerArgs:
             logger.info(
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
             )
-        elif model_arch in ["KimiLinearForCausalLM"]:
-            self._handle_mamba_radix_cache(model_arch=model_arch)
-        elif model_arch in ["BailingMoeV2_5ForCausalLM"]:
-            self._handle_mamba_radix_cache(model_arch=model_arch)
         elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
             from sglang.srt.arg_groups.nemotron_h_hook import (
                 apply_nemotron_h_defaults,
@@ -4127,25 +4137,11 @@ class ServerArgs:
             "InternS2PreviewForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
         ]:
-            # The quantization/moe_runner_backend resolution moved to the override
-            # registry (arg_groups/overrides.py: _qwen3_moe_family_overrides).
-
-            if model_arch in [
-                "Qwen3NextForCausalLM",
-                "Qwen3_5MoeForConditionalGeneration",
-                "InternS2PreviewForConditionalGeneration",
-                "Qwen3_5ForConditionalGeneration",
-            ]:
-                # Attention backend + page size defaults moved to the override
-                # registry (arg_groups/overrides.py: _qwen3_5_hybrid_overrides).
-                self._handle_mamba_radix_cache(model_arch=model_arch)
-
-        elif model_arch == "MiniCPMV4_6ForConditionalGeneration":
-            # 4.6 wraps a Qwen3.5 hybrid GDN backbone, so it needs the same
-            # mamba radix cache handling as Qwen3_5ForConditionalGeneration.
-            # (attention backend selection moved to the override registry:
-            # arg_groups/overrides.py _minicpm_v4_6_overrides)
-            self._handle_mamba_radix_cache(model_arch=model_arch)
+            # The quantization/moe_runner_backend resolution moved to the
+            # override registry (arg_groups/overrides.py:
+            # _qwen3_moe_family_overrides); the hybrid sub-family's attention
+            # backend + page size defaults to _qwen3_5_hybrid_overrides.
+            pass
 
         elif model_arch in ["Glm4MoeForCausalLM"]:
             # The quantization/moe_runner_backend/enable_tf32_matmul resolution
@@ -4153,37 +4149,13 @@ class ServerArgs:
             # _glm4_moe_overrides).
             pass
 
-        elif model_arch in [
-            "FalconH1ForCausalLM",
-            "JetNemotronForCausalLM",
-            "JetVLMForConditionalGeneration",
-        ]:
-            # Attention backend selection moved to the override registry
-            # (arg_groups/overrides.py: _falcon_h1_jet_overrides).
-            self._handle_mamba_radix_cache(model_arch=model_arch)
-
-        elif model_arch == "GraniteMoeHybridForCausalLM":
-            hf_config = self.get_model_config().hf_config
-            has_mamba = any(
-                layer_type == "mamba"
-                for layer_type in getattr(hf_config, "layer_types", [])
-            )
-            if has_mamba:
-                # Attention backend selection moved to the override registry
-                # (arg_groups/overrides.py: _granite_moe_hybrid_overrides).
-                self._handle_mamba_radix_cache(model_arch=model_arch)
-
         elif model_arch in ["Lfm2ForCausalLM"]:
             # Attention backend selection moved to the override registry
             # (arg_groups/overrides.py: _lfm2_overrides).
-            self._handle_mamba_radix_cache(model_arch=model_arch)
             assert self.attention_backend != "triton", (
                 f"{model_arch} does not support triton attention backend, "
                 "as the first layer might not be an attention layer"
             )
-
-        elif model_arch in ["ZayaForCausalLM"]:
-            self._handle_mamba_radix_cache(model_arch=model_arch)
 
         # MiniMaxM2ForCausalLM (enable_tf32_matmul) moved to the override registry
         # (arg_groups/overrides.py: _minimax_m2_overrides).
@@ -4191,11 +4163,21 @@ class ServerArgs:
         # Qwen3VL aiter unified-attention page_size moved to the override registry
         # (arg_groups/overrides.py: _qwen3vl_overrides).
 
-        if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled when using sparse head for embedding model."
-            )
+        # Hybrid-mamba radix cache handling for the per-arch branch call sites
+        # dissolved above: the resolution pass self-guards on the arch union
+        # (and the Granite layer_types probe), so one call covers them all.
+        # Hybrid-spec archs already resolved at the pre-dispatch call above;
+        # for them this re-invocation is an idempotent no-op plus validation.
+        # Kept ahead of the sparse-head pass: the legacy per-branch calls
+        # resolved before that tail write of disable_overlap_schedule.
+        self._handle_mamba_radix_cache(model_arch=model_arch)
+
+        from sglang.srt.arg_groups.overrides import (
+            _sparse_head_overlap_disable,
+            run_post_process_pass,
+        )
+
+        run_post_process_pass(self, _sparse_head_overlap_disable)
 
         # Auto-enable FlashInfer AllReduce Fusion on SM90/SM100, for models with
         # explicit support (DeepseekV3, GptOss, Glm4Moe, MistralLarge3,
@@ -4242,21 +4224,9 @@ class ServerArgs:
             )
 
     def _support_mamba_cache_extra_buffer(self, model_arch: str):
-        if model_arch in [
-            "Qwen3_5ForConditionalGeneration",
-            "Qwen3_5MoeForConditionalGeneration",
-            "Qwen3NextForCausalLM",
-            "InternS2PreviewForConditionalGeneration",
-            "MiniCPMV4_6ForConditionalGeneration",
-            "BailingMoeV2_5ForCausalLM",
-            "FalconH1ForCausalLM",
-            "GraniteMoeHybridForCausalLM",
-            "NemotronHForCausalLM",
-            "NemotronHPuzzleForCausalLM",
-        ]:
-            return self.linear_attn_backend == "triton"
+        from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
 
-        return False
+        return supports_mamba_cache_extra_buffer(self, model_arch)
 
     def _validate_mamba_no_buffer(self, model_arch: str):
         assert self.page_size in (1, None), "no_buffer only supports page_size=1."
@@ -4284,20 +4254,17 @@ class ServerArgs:
             assert self.mamba_cache_chunk_size is not None
 
     def _handle_mamba_radix_cache(self, model_arch: str):
-        if self.disable_radix_cache:
-            return
+        # Resolution moved to the resolution pipeline (arg_groups/overrides.py:
+        # _mamba_radix_cache_resolution), invoked here at each legacy call
+        # slot; this handler keeps the validation.
+        from sglang.srt.arg_groups.overrides import (
+            _mamba_radix_cache_resolution,
+            run_post_process_pass,
+        )
 
-        self.uses_mamba_radix_cache = True
-        if self.mamba_radix_cache_strategy == "auto":
-            wants_overlap = not self.disable_overlap_schedule
-            wants_paging = self.page_size is not None and self.page_size > 1
-            if (
-                wants_overlap or wants_paging
-            ) and self._support_mamba_cache_extra_buffer(model_arch):
-                self.mamba_radix_cache_strategy = "extra_buffer"
-            else:
-                self.mamba_radix_cache_strategy = "no_buffer"
-                self.disable_overlap_schedule = True
+        run_post_process_pass(self, _mamba_radix_cache_resolution)
+        if not self.uses_mamba_radix_cache:
+            return
 
         if self.enable_mamba_extra_buffer():
             self._validate_mamba_extra_buffer(model_arch)
@@ -5292,11 +5259,14 @@ class ServerArgs:
                 self.expert_distribution_recorder_buffer_size = 1000
 
     def _handle_pipeline_parallelism(self):
-        if self.pp_size > 1:
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Pipeline parallelism is incompatible with overlap schedule."
-            )
+        # Moved to the resolution pipeline (arg_groups/overrides.py:
+        # _pipeline_parallel_overlap_disable), invoked here at its legacy slot.
+        from sglang.srt.arg_groups.overrides import (
+            _pipeline_parallel_overlap_disable,
+            run_post_process_pass,
+        )
+
+        run_post_process_pass(self, _pipeline_parallel_overlap_disable)
 
     def _validate_prefill_only_disable_kv_cache_args(self):
         """Validate --prefill-only-disable-kv-cache flag/precondition constraints.
@@ -6017,16 +5987,12 @@ class ServerArgs:
 
         from sglang.srt.arg_groups.overrides import (
             _dllm_attention_backend,
+            _dllm_overlap_disable,
             run_post_process_pass,
         )
 
         run_post_process_pass(self, _dllm_attention_backend)
-
-        if not self.disable_overlap_schedule:
-            logger.warning(
-                "Overlap schedule is disabled because of using diffusion LLM inference"
-            )
-            self.disable_overlap_schedule = True
+        run_post_process_pass(self, _dllm_overlap_disable)
 
         if not self.disable_radix_cache:
             # The page_size adjustment moved to the resolution pipeline
