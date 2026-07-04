@@ -5,7 +5,6 @@
 Decoding stage for diffusion pipelines.
 """
 
-import os
 import weakref
 
 import torch
@@ -39,8 +38,9 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 )
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     ActiveTargetCompiledCallable,
+    build_torch_compile_kwargs,
+    resolve_torch_compile_mode,
 )
-from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
 
@@ -170,19 +170,17 @@ class DecodingStage(PipelineStage):
             self._compiled_vae_decode.target_id != id(vae)
             or self._compiled_vae_decode.compiled_module is None
         )
-        compile_kwargs: dict[str, object] = {"fullgraph": False, "dynamic": None}
         if current_platform.is_npu():
-            compile_kwargs["backend"] = get_compiler_backend()
-            compile_kwargs["dynamic"] = False
+            compile_kwargs = build_torch_compile_kwargs(mode=None)
             if will_compile:
                 logger.info("Compiling VAE decode with torchair backend on NPU")
         else:
-            mode = (
-                os.environ.get("SGLANG_VAE_TORCH_COMPILE_MODE")
-                or os.environ.get("SGLANG_TORCH_COMPILE_MODE")
-                or "default"
+            mode = resolve_torch_compile_mode(
+                "SGLANG_VAE_TORCH_COMPILE_MODE",
+                "SGLANG_TORCH_COMPILE_MODE",
+                default="default",
             )
-            compile_kwargs["mode"] = mode
+            compile_kwargs = build_torch_compile_kwargs(mode=mode)
             if will_compile:
                 logger.info("Compiling VAE decode with mode: %s", mode)
 
