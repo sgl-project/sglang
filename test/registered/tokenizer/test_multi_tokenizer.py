@@ -83,10 +83,9 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
         # A batch of pre-tokenized `input_ids` (no text / multimodal) is the one
         # case that takes the batch-tokenization path (_send_batch_request ->
         # BatchTokenizedGenerateReqInput). In multi-tokenizer mode this batch
-        # must (1) carry per-request `rids` so the IPC name can be stamped and
-        # (2) stamp each sub-request's `http_worker_ipc` so the scheduler can
-        # route every reply back to its owning tokenizer worker. If either is
-        # missing the server crashes at dispatch or the requests hang forever.
+        # must stamp each sub-request's `http_worker_ipc` so the scheduler can
+        # route every reply back to its owning tokenizer worker. If it is missing,
+        # the requests hang forever.
         #
         # The existing ttft test only sends *text*, so it never exercises this
         # path — this case does, and uses a short timeout so a routing hang
