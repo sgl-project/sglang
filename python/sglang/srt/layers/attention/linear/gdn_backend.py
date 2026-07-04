@@ -156,77 +156,71 @@ if _HAVE_TRITON:
     #   T [B,HV,CS,CS], vnew [B,HV,CS,Dv], S/Snew [B,HV,Dk,Dv], out [B,HV,Dv].
 
     @triton.jit
-    def _gdn_prep_row_kernel(
+    def _gdn_prep_a_row_append_kernel(
         q_ptr, k_ptr, v_ptr, a_ptr, b_ptr, Alog_ptr, dtb_ptr,  # new token: q/k [B,HK,Dk], v [B,HV,Dv], a/b [B,HV]
-        qn_ptr, kn_ptr, kb_ptr, vb_ptr, g_ptr, gcum_ptr, i_ptr,
-        scale, HV: tl.constexpr, HK: tl.constexpr, Dk: tl.constexpr, Dv: tl.constexpr, CS: tl.constexpr,
+        qn_ptr, kn_ptr, kb_ptr, vb_ptr, g_ptr, gcum_ptr, A_ptr, T_ptr, i_ptr,
+        scale, HV: tl.constexpr, HK: tl.constexpr, Dk: tl.constexpr, Dv: tl.constexpr,
+        CS: tl.constexpr, QR: tl.constexpr,
     ):
-        """Per-token prep for the new decode token: shared triton l2norm (bit-identical to
-        torch_chunk's), GQA repeat, scale, and gating. Writes row i of the partial-chunk buffers.
-        gcum[i]=gcum[i-1]+g[i] is a single running add here; it is bit-identical to the shared
-        serial _chunk_cumsum_kernel prefix (same fp32 additions, same order), killing the torch
-        cumsum launch that the old path needed (tl.cumsum diverged from torch)."""
-        pid = tl.program_id(0)
-        bt = pid // HV
-        h = pid % HV
-        i = tl.load(i_ptr + bt)
-        rep: tl.constexpr = HV // HK
-        hk = h // rep
-        dk = tl.arange(0, Dk)
-        dv = tl.arange(0, Dv)
-        q = tl.load(q_ptr + (bt * HK + hk) * Dk + dk).to(tl.float32)
-        k = tl.load(k_ptr + (bt * HK + hk) * Dk + dk).to(tl.float32)
-        qn = (q * libdevice.rsqrt(tl.sum(q * q, 0) + 1e-6)).to(tl.bfloat16).to(tl.float32) * scale
-        kn = (k * libdevice.rsqrt(tl.sum(k * k, 0) + 1e-6)).to(tl.bfloat16).to(tl.float32)
-        a = tl.load(a_ptr + bt * HV + h).to(tl.float32)
-        bx = tl.load(b_ptr + bt * HV + h).to(tl.float32)
-        x = a + tl.load(dtb_ptr + h)
-        sp = tl.where(x > 20.0, x, libdevice.log1p(libdevice.exp(x)))
-        g = -libdevice.exp(tl.load(Alog_ptr + h)) * sp
-        beta = (1.0 / (1.0 + libdevice.exp(-bx))).to(tl.bfloat16).to(tl.float32)
-        v = tl.load(v_ptr + (bt * HV + h) * Dv + dv).to(tl.float32)
-        tl.store(qn_ptr + ((bt * CS + i) * HV + h) * Dk + dk, qn)
-        tl.store(kn_ptr + ((bt * CS + i) * HV + h) * Dk + dk, kn)
-        tl.store(kb_ptr + ((bt * CS + i) * HV + h) * Dk + dk, kn * beta)
-        tl.store(vb_ptr + ((bt * CS + i) * HV + h) * Dv + dv, v * beta)
-        tl.store(g_ptr + (bt * HV + h) * CS + i, g)
-        # gcum[i] = gcum[i-1] + g[i]. Reload g from the buffer (rounded fp32) before the add: g is a
-        # register product (-exp(A_log)*sp), so `prev + g` would contract into a single FMA (one
-        # rounding) and diverge from the shared _chunk_cumsum_kernel, which adds two already-stored
-        # fp32 operands (two roundings). The reload inserts that rounding barrier, keeping the decode
-        # append bit-identical to the serial scan (FMA contraction otherwise drifts ~1.9e-6).
-        g_r = tl.load(g_ptr + (bt * HV + h) * CS + i)
-        prev = tl.where(i > 0, tl.load(gcum_ptr + (bt * HV + h) * CS + i - 1, mask=(i > 0), other=0.0), 0.0)
-        tl.store(gcum_ptr + (bt * HV + h) * CS + i, prev + g_r)
+        """Fused prep + A-row + T-row-append for the new decode token (one launch instead of three).
 
-    @triton.jit
-    def _gdn_a_row_append_kernel(
-        kn_ptr, kb_ptr, gcum_ptr, A_ptr, T_ptr, i_ptr,
-        HV: tl.constexpr, Dk: tl.constexpr, CS: tl.constexpr, QR: tl.constexpr,
-    ):
-        """Fused A-row + T-row-append for the new decode token (one launch instead of two).
-        A row i = -(kb[i] @ kn^T) * exp(gcum[i]-gcum[j]) for j<i (strictly-lower); then append the
-        forward-substitution row T[i,j<i] = A[i,j] + sum_{m<i} A[i,m]*T[m,j].
+        Prep: shared triton l2norm (bit-identical to torch_chunk's), GQA repeat, scale, gating; writes
+        row i of the partial-chunk buffers. A row i = -(kb[i] @ kn^T) * exp(gcum[i]-gcum[j]) for j<i
+        (strictly-lower); append forward-sub row T[i,j<i] = A[i,j] + sum_{m<i} A[i,m]*T[m,j].
 
-        Bit-identity notes: (1) A is computed and consumed entirely in fp32, so feeding the append
-        from the in-register Arow is bit-identical to the old global round-trip (fp32 store then fp32
-        reload is identity); Arow is still stored to A_ptr to keep the buffer valid. (2) This kernel
-        MUST launch at Triton's DEFAULT num_warps (like the two kernels it replaces) so the append's
-        [CS,CS] tl.sum tree reduces in the same order as _fwd_sub_kernel's row i; running it at the
-        incr kernel's nw=8 would drift ~1e-9. QR-tile broadcasts kb[i] so tl.dot has M>=16."""
+        Bit-identity notes:
+        (1) Row i's kn/kb/gcum/qn/vb are computed in registers and stored to the global buffers (so the
+            later incr kernel reads them), then row i is OVERLAID from those SAME registers into the A-row
+            tiles. This avoids an intra-program store->load hazard AND is byte-identical to the old prep
+            kernel (fp32 store then fp32 reload is identity); rows r<i come from global (frozen prior steps).
+        (2) gcum[i]=gcum[i-1]+g[i] reloads g_r from the buffer (rounded fp32) before the add: g is the
+            register product -exp(A_log)*sp, so `prev + g` would contract into one FMA (one rounding) and
+            diverge from the shared serial _chunk_cumsum_kernel (two stored fp32 operands, two roundings).
+            The reload inserts the rounding barrier (FMA contraction otherwise drifts ~1.9e-6).
+        (3) A is computed and consumed entirely in fp32, so feeding the append from the in-register Arow
+            is bit-identical to a global round-trip; Arow is still stored to A_ptr to keep the buffer valid.
+        (4) MUST launch at Triton's DEFAULT num_warps (like the kernels it replaces) so the append's
+            [CS,CS] tl.sum tree reduces in the same order as _fwd_sub_kernel's row i; the incr kernel's
+            nw=8 would drift ~1e-9. QR-tile broadcasts kb[i] so tl.dot has M>=16."""
         pid = tl.program_id(0)
         bt = pid // HV
         h = pid % HV
         i = tl.load(i_ptr + bt)
         W = i + 1
+        rep: tl.constexpr = HV // HK
+        hk = h // rep
         r = tl.arange(0, CS)
         dk = tl.arange(0, Dk)
+        dv = tl.arange(0, Dv)
         qr = tl.arange(0, QR)
         valid = r < W
         base = (bt * HV + h) * CS
-        kb = tl.load(kb_ptr + ((bt * CS + i) * HV + h) * Dk + dk[None, :] + qr[:, None] * 0)  # [QR,Dk] all rows kb[i]
+        # --- prep row i (shared l2norm reduction, GQA repeat, scale, gating) ---
+        q = tl.load(q_ptr + (bt * HK + hk) * Dk + dk).to(tl.float32)
+        k = tl.load(k_ptr + (bt * HK + hk) * Dk + dk).to(tl.float32)
+        qn = (q * libdevice.rsqrt(tl.sum(q * q, 0) + 1e-6)).to(tl.bfloat16).to(tl.float32) * scale
+        kn_i = (k * libdevice.rsqrt(tl.sum(k * k, 0) + 1e-6)).to(tl.bfloat16).to(tl.float32)  # [Dk]
+        av = tl.load(a_ptr + bt * HV + h).to(tl.float32)
+        bx = tl.load(b_ptr + bt * HV + h).to(tl.float32)
+        x = av + tl.load(dtb_ptr + h)
+        sp = tl.where(x > 20.0, x, libdevice.log1p(libdevice.exp(x)))
+        g = -libdevice.exp(tl.load(Alog_ptr + h)) * sp
+        beta = (1.0 / (1.0 + libdevice.exp(-bx))).to(tl.bfloat16).to(tl.float32)
+        v = tl.load(v_ptr + (bt * HV + h) * Dv + dv).to(tl.float32)
+        kb_i = kn_i * beta  # [Dk]
+        tl.store(qn_ptr + ((bt * CS + i) * HV + h) * Dk + dk, qn)
+        tl.store(kn_ptr + ((bt * CS + i) * HV + h) * Dk + dk, kn_i)
+        tl.store(kb_ptr + ((bt * CS + i) * HV + h) * Dk + dk, kb_i)
+        tl.store(vb_ptr + ((bt * CS + i) * HV + h) * Dv + dv, v * beta)
+        tl.store(g_ptr + base + i, g)
+        # gcum[i]=gcum[i-1]+g[i]; reload g_r (rounded fp32) to insert the rounding barrier (see note 2).
+        g_r = tl.load(g_ptr + base + i)
+        prev = tl.where(i > 0, tl.load(gcum_ptr + base + i - 1, mask=(i > 0), other=0.0), 0.0)
+        gi = prev + g_r
+        tl.store(gcum_ptr + base + i, gi)
+        # --- A row i (rows r<i from frozen global buffers; row i overlaid from registers) ---
+        kb = kb_i[None, :] + qr[:, None] * 0.0  # [QR,Dk] all rows kb[i]
         kn = tl.load(kn_ptr + ((bt * CS + r[:, None]) * HV + h) * Dk + dk[None, :], mask=valid[:, None], other=0.0)
-        gi = tl.load(gcum_ptr + base + i)
         gj = tl.load(gcum_ptr + base + r, mask=valid, other=0.0)
         kept = (i > r) & valid
         decay = tl.where(kept[None, :], libdevice.exp(gi - gj[None, :]), 0.0)  # [QR,CS]
@@ -234,7 +228,7 @@ if _HAVE_TRITON:
         A = tl.where(kept[None, :], A, 0.0)
         Arow = tl.sum(tl.where(qr[:, None] == 0, A, 0.0), 0)  # [CS] tile row 0
         tl.store(A_ptr + base + r, Arow)
-        # Append the forward-substitution row using the cached final rows m<i.
+        # --- append the forward-substitution row using the cached final rows m<i ---
         M = tl.load(T_ptr + (base + r[:, None]) * CS + r[None, :])
         a_im = tl.where(r < i, Arow, 0.0)
         acc = tl.sum(a_im[:, None] * M, 0)
@@ -811,18 +805,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         entry["i_buf"].fill_(i)
         it = entry["i_buf"]
         scale = 1.0 / (Dk ** 0.5)
-        _gdn_prep_row_kernel[(HV,)](
+        # Fused prep + gcum append + A row + T-row append (one launch). gcum[i]=gcum[i-1]+g[i] is
+        # in-kernel (bit-identical to the shared serial scan), so no torch cumsum launch here.
+        _gdn_prep_a_row_append_kernel[(HV,)](
             q_tok, k_tok, v_tok, a_tok, b_tok, layer.A_log, layer.dt_bias,
-            entry["qn"], entry["kn"], entry["kb"], entry["vb"], entry["g"], entry["gcum"], it,
-            scale, HV=HV, HK=HK, Dk=Dk, Dv=Dv, CS=C,
+            entry["qn"], entry["kn"], entry["kb"], entry["vb"], entry["g"], entry["gcum"],
+            entry["A_row"], entry["T"], it,
+            scale, HV=HV, HK=HK, Dk=Dk, Dv=Dv, CS=C, QR=16,
         )
         w = i + 1
-        # gcum row i is appended in-kernel (gcum[i]=gcum[i-1]+g[i], bit-identical to the shared
-        # serial scan), so no torch cumsum launch here.
-        _gdn_a_row_append_kernel[(HV,)](
-            entry["kn"], entry["kb"], entry["gcum"], entry["A_row"], entry["T"], it,
-            HV=HV, Dk=Dk, CS=C, QR=16,
-        )
         _gdn_incr_kernel[(HV,)](
             entry["qn"], entry["kn"], entry["kb"], entry["vb"], entry["gcum"], entry["T"],
             entry["vnew"], entry["boundary"], entry["out"], entry["Snew"], it,
