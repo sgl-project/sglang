@@ -538,7 +538,7 @@ def create_sglang_python_pipeline(
     return pipeline, server_args
 
 
-def _run_sglang_python_once(pipeline, server_args, payload: dict[str, Any]):
+def _make_sglang_python_req(server_args, payload: dict[str, Any]):
     from sglang.multimodal_gen.runtime.entrypoints.action_utils import (
         build_action_sampling_params,
     )
@@ -547,12 +547,30 @@ def _run_sglang_python_once(pipeline, server_args, payload: dict[str, Any]):
     sampling_params = build_action_sampling_params(payload, server_args)
     req = prepare_request(server_args, sampling_params)
     req.suppress_logs = True
+    return req
+
+
+def _run_sglang_python_once(pipeline, server_args, payload: dict[str, Any]):
+    req = _make_sglang_python_req(server_args, payload)
     output_batch = pipeline.forward(req, server_args)
     if output_batch.error:
         raise RuntimeError(output_batch.error)
     if not output_batch.output:
         raise RuntimeError("SGLang Python policy returned no output")
     return output_batch.output[0]
+
+
+def _run_sglang_python_group(pipeline, server_args, payloads: list[dict[str, Any]]):
+    reqs = [_make_sglang_python_req(server_args, payload) for payload in payloads]
+    output_batches = pipeline.forward_batch(reqs, server_args)
+    outputs = []
+    for output_batch in output_batches:
+        if output_batch.error:
+            raise RuntimeError(output_batch.error)
+        if not output_batch.output:
+            raise RuntimeError("SGLang Python grouped policy returned no output")
+        outputs.append(output_batch.output[0])
+    return outputs
 
 
 def run_sglang_python(
@@ -563,6 +581,7 @@ def run_sglang_python(
     warmup: int,
     repeats: int,
     batch_size: int,
+    batch_mode: str,
 ) -> dict[str, Any]:
     pipeline, server_args = create_sglang_python_pipeline(
         model_path,
@@ -587,16 +606,22 @@ def run_sglang_python(
                 payloads[(warmup_idx * batch_size + offset) % len(payloads)]
                 for offset in range(batch_size)
             ]
-            for payload in batch:
-                _run_sglang_python_once(pipeline, server_args, payload)
+            if batch_mode == "grouped":
+                _run_sglang_python_group(pipeline, server_args, batch)
+            else:
+                for payload in batch:
+                    _run_sglang_python_once(pipeline, server_args, payload)
         for start_idx in range(repeats):
             batch = [
                 payloads[(start_idx * batch_size + offset) % len(payloads)]
                 for offset in range(batch_size)
             ]
             start = time.perf_counter()
-            for payload in batch:
-                _run_sglang_python_once(pipeline, server_args, payload)
+            if batch_mode == "grouped":
+                _run_sglang_python_group(pipeline, server_args, batch)
+            else:
+                for payload in batch:
+                    _run_sglang_python_once(pipeline, server_args, payload)
             batch_latencies.append((time.perf_counter() - start) * 1000)
 
     stage_timings = {}
@@ -612,7 +637,7 @@ def run_sglang_python(
             key: _stats_ms(values) for key, values in stage_timings.items()
         },
         "first_output": single_outputs[0] if single_outputs else None,
-        "batch_mode": "python_policy_loop",
+        "batch_mode": f"python_policy_{batch_mode}",
     }
 
 
@@ -863,6 +888,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sglang-model", default=None)
     parser.add_argument("--sglang-pipeline-config-path", default=None)
+    parser.add_argument(
+        "--sglang-python-batch-mode",
+        choices=("loop", "grouped"),
+        default="loop",
+    )
     parser.add_argument("--openpi-config", default=None)
     parser.add_argument("--openpi-checkpoint", default=None)
     parser.add_argument("--openpi-device", default="cuda")
@@ -1003,6 +1033,7 @@ def main() -> None:
             warmup=args.warmup,
             repeats=args.repeats,
             batch_size=args.batch_size,
+            batch_mode=args.sglang_python_batch_mode,
         )
     elif args.sglang_api == "openpi_ws":
         sglang_result = run_sglang_openpi_ws(
@@ -1038,6 +1069,7 @@ def main() -> None:
         "sglang_model": profile.sglang_model,
         "sglang_api": args.sglang_api,
         "sglang_pipeline_config_path": args.sglang_pipeline_config_path,
+        "sglang_python_batch_mode": args.sglang_python_batch_mode,
         "openpi_config": openpi_config,
         "openpi_checkpoint": openpi_checkpoint,
         "openpi_pytorch_compile_mode": args.openpi_pytorch_compile_mode,

@@ -40,6 +40,30 @@ class PrefixContext:
         return self
 
 
+def slice_prefix_context(context: PrefixContext, index: int) -> PrefixContext:
+    from transformers.cache_utils import DynamicCache
+
+    return PrefixContext(
+        past_key_values=DynamicCache(
+            tuple(
+                (
+                    keys[index : index + 1],
+                    values[index : index + 1],
+                    sliding_window,
+                )
+                for keys, values, sliding_window in context.past_key_values
+            )
+        ),
+        prefix_pad_masks=context.prefix_pad_masks[index : index + 1],
+        prefix_position_ids=context.prefix_position_ids[index : index + 1],
+        prefix_len=context.prefix_len,
+        dtype=context.dtype,
+        device=context.device,
+        layout=dict(context.layout),
+        cache_key_digest=context.cache_key_digest,
+    )
+
+
 @dataclass
 class Pi05PrefixCacheLookup:
     hit: bool

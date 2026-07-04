@@ -16,7 +16,9 @@ from sglang.multimodal_gen.runtime.models.pi05 import (
     broadcast_optional_tensor,
     broadcast_prefix_context,
     broadcast_timing,
+    collate_pi05_observation_batches,
     get_pi05_split_group,
+    slice_prefix_context,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
@@ -29,6 +31,51 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 def _timings(batch: Req) -> dict[str, float]:
     timings = batch.extra.setdefault("pi05_timings", {})
     return timings
+
+
+def _options(batch: Req) -> dict[str, Any]:
+    return batch.extra.get("pi05_options") or {}
+
+
+def _effective_prefix_cache_enabled(batch: Req, server_args: ServerArgs) -> bool:
+    options = _options(batch)
+    return bool(options.get("enable_prefix_cache", True)) and bool(
+        server_args.pipeline_config.enable_global_prefix_cache
+    )
+
+
+def _grouped_fingerprint(batch: Req, server_args: ServerArgs) -> tuple[Any, ...]:
+    if (
+        batch.is_warmup
+        or get_pi05_split_group() is not None
+        or _effective_prefix_cache_enabled(batch, server_args)
+        or batch.generator is not None
+    ):
+        return ("single", id(batch))
+
+    observation = batch.extra.get("pi05_observation_batch")
+    options = _options(batch)
+    camera_order = tuple(observation.metadata.get("camera_order", ()))
+    image_shapes = tuple(
+        (
+            name,
+            tuple(observation.images[name].shape),
+            bool(observation.image_masks[name].item()),
+        )
+        for name in camera_order
+    )
+    return (
+        "grouped",
+        camera_order,
+        image_shapes,
+        None if observation.state is None else tuple(observation.state.shape),
+        None if observation.noise is None else tuple(observation.noise.shape),
+        tuple(observation.tokens.shape),
+        tuple(observation.token_masks.shape),
+        int(options.get("action_horizon") or batch.action_horizon),
+        int(options.get("action_dim") or batch.action_dim),
+        int(options.get("num_inference_steps") or batch.num_inference_steps),
+    )
 
 
 class Pi05PreprocessStage(PipelineStage):
@@ -63,6 +110,58 @@ class Pi05PrefixStage(PipelineStage):
     @property
     def role_affinity(self) -> RoleType:
         return RoleType.ENCODER
+
+    def run_grouped_requests(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> list[Req]:
+        results: list[Req | None] = [None] * len(batches)
+        for fingerprint, group in self._group_requests_by_fingerprint(
+            batches, lambda batch: _grouped_fingerprint(batch, server_args)
+        ):
+            group_batches = [batch for _, batch in group]
+            if len(group_batches) == 1 or fingerprint[0] == "single":
+                for index, batch in group:
+                    results[index] = self(batch, server_args)
+                continue
+
+            prefix_start = time.perf_counter()
+            observations = [
+                batch.extra["pi05_observation_batch"] for batch in group_batches
+            ]
+            grouped_observation = collate_pi05_observation_batches(observations)
+            prefix_context = self.policy_model.encode_prefix(grouped_observation)
+            prefix_ms = (time.perf_counter() - prefix_start) * 1000
+
+            for offset, (index, batch) in enumerate(group):
+                batch.extra["pi05_observation_group"] = grouped_observation
+                batch.extra["pi05_prefix_context_group"] = prefix_context
+                batch.extra["pi05_prefix_context"] = slice_prefix_context(
+                    prefix_context,
+                    offset,
+                )
+                batch.extra["pi05_group_index"] = offset
+                batch.extra["pi05_group_size"] = len(group_batches)
+                batch.extra["pi05_cache"] = {
+                    "hit": False,
+                    "match_len": 0,
+                    "full_prefix_len": prefix_context.prefix_len,
+                    "grouped": True,
+                    "batch_size": len(group_batches),
+                }
+                timings = _timings(batch)
+                timings["cache_lookup_ms"] = 0.0
+                timings["prefix_ms"] = prefix_ms
+                results[index] = batch
+
+            if (
+                server_args.pipeline_config.empty_cache_after_prefix
+                and torch.cuda.is_available()
+            ):
+                torch.cuda.empty_cache()
+
+        return [result for result in results if result is not None]
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         if batch.is_warmup:
@@ -166,6 +265,60 @@ class Pi05ActionDenoisingStage(PipelineStage):
     @property
     def role_affinity(self) -> RoleType:
         return RoleType.DENOISER
+
+    def run_grouped_requests(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> list[Req]:
+        results: list[Req | None] = [None] * len(batches)
+
+        def action_fingerprint(batch: Req) -> tuple[Any, ...]:
+            prefix_context = batch.extra.get("pi05_prefix_context_group")
+            if prefix_context is None:
+                return ("single", id(batch))
+            return (
+                "grouped",
+                id(prefix_context),
+                int(
+                    _options(batch).get("num_inference_steps")
+                    or batch.num_inference_steps
+                ),
+            )
+
+        for _, group in self._group_requests_by_fingerprint(
+            batches,
+            action_fingerprint,
+        ):
+            group_batches = [batch for _, batch in group]
+            prefix_context = group_batches[0].extra.get("pi05_prefix_context_group")
+            if len(group_batches) == 1 or prefix_context is None:
+                for index, batch in group:
+                    results[index] = self(batch, server_args)
+                continue
+
+            start = time.perf_counter()
+            options = _options(group_batches[0])
+            observation = group_batches[0].extra["pi05_observation_group"]
+            actions = self.policy_model.sample_actions(
+                observation,
+                prefix_context,
+                noise=observation.noise,
+                num_steps=int(
+                    options.get("num_inference_steps")
+                    or group_batches[0].num_inference_steps
+                ),
+                use_cuda_graph=False,
+                generator=None,
+            )
+            action_ms = (time.perf_counter() - start) * 1000
+
+            for offset, (index, batch) in enumerate(group):
+                _timings(batch)["action_denoise_ms"] = action_ms
+                batch.extra["pi05_actions"] = actions[offset : offset + 1]
+                results[index] = batch
+
+        return [result for result in results if result is not None]
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         start = time.perf_counter()

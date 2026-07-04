@@ -20,10 +20,12 @@ from sglang.multimodal_gen.runtime.models.pi05.prefix_cache import (
     Pi05PrefixCacheKey,
     Pi05PrefixCacheManager,
     PrefixContext,
+    slice_prefix_context,
 )
 from sglang.multimodal_gen.runtime.models.pi05.preprocess import (
     Pi05ObservationBatch,
     Pi05Preprocessor,
+    collate_pi05_observation_batches,
 )
 
 __all__ = [
@@ -41,5 +43,7 @@ __all__ = [
     "broadcast_optional_tensor",
     "broadcast_prefix_context",
     "broadcast_timing",
+    "collate_pi05_observation_batches",
     "get_pi05_split_group",
+    "slice_prefix_context",
 ]
