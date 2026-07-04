@@ -34,11 +34,17 @@ class Ideogram4Transformer2DModel(torch.nn.Module):
     pass
 
 
+class ZImageTransformer2DModel(torch.nn.Module):
+    def rotary_emb(self, pos_ids):
+        return torch.zeros(pos_ids.shape[0], 8, device=pos_ids.device)
+
+
 class TestDiffusionBCGPadding(unittest.TestCase):
     def setUp(self):
         self.stage = DenoisingStage.__new__(DenoisingStage)
         self.qwen_model = QwenImageTransformer2DModel()
         self.ideogram_model = Ideogram4Transformer2DModel()
+        self.zimage_model = ZImageTransformer2DModel()
         self.other_model = OtherTransformer2DModel()
 
     def _patch_buckets(self, *buckets: int):
@@ -139,6 +145,42 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertIsNone(out["encoder_hidden_states_mask"])
         self.assertEqual(out["encoder_hidden_states"][0].shape[1], 47)
         self.assertEqual(out["txt_seq_lens"], [47])
+
+    def _zimage_kwargs(self, seq_len: int, *, fill: float = 1.0):
+        return {
+            "hidden_states": [torch.zeros(16, 1, 4, 4)],
+            "timestep": torch.zeros(1),
+            "guidance": torch.zeros(1),
+            "encoder_hidden_states": [
+                torch.full((seq_len, 16), fill, dtype=torch.float32)
+            ],
+            "encoder_hidden_states_mask": torch.ones(1, seq_len, dtype=torch.bool),
+            "freqs_cis": (
+                torch.zeros(seq_len, 8, dtype=torch.float32),
+                torch.zeros(256, 8, dtype=torch.float32),
+            ),
+            "image_seq_len_target": 256,
+        }
+
+    def test_zimage_prompt_lengths_share_bucket_signature(self):
+        with self._patch_buckets(64, 128):
+            short = self.stage._bcg_pad_prompt_kwargs(
+                self._zimage_kwargs(19), current_model=self.zimage_model
+            )
+            longer = self.stage._bcg_pad_prompt_kwargs(
+                self._zimage_kwargs(47), current_model=self.zimage_model
+            )
+
+        self.assertEqual(short["encoder_hidden_states"][0].shape, (64, 16))
+        self.assertEqual(longer["encoder_hidden_states"][0].shape, (64, 16))
+        self.assertEqual(short["encoder_hidden_states_mask"].shape, (1, 64))
+        self.assertEqual(short["caption_valid_lens"].shape, (1,))
+        self.assertEqual(short["caption_valid_lens"].item(), 19)
+        self.assertEqual(longer["caption_valid_lens"].item(), 47)
+        self.assertFalse(short["encoder_hidden_states_mask"][0, 19:].any())
+        self.assertFalse(longer["encoder_hidden_states_mask"][0, 47:].any())
+        self.assertEqual(short["freqs_cis"][0].shape, (64, 8))
+        self.assertEqual(_signature_kwargs(short), _signature_kwargs(longer))
 
     def _ideogram_kwargs(self, text_seq: int, *, image_seq: int = 4):
         total_seq = text_seq + image_seq

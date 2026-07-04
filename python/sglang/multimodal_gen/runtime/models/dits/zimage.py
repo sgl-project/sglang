@@ -1060,11 +1060,13 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         x = self._as_image_list(hidden_states)
         cap_feats = self._as_caption_list(encoder_hidden_states)
-        caption_valid_mask = self._caption_valid_mask_from_mask(
-            encoder_hidden_states_mask,
-            batch_size=len(cap_feats),
-            max_seq_len=max(cap_feat.shape[0] for cap_feat in cap_feats),
-        )
+        caption_valid_mask = None
+        if kwargs.pop("_use_caption_valid_mask", False):
+            caption_valid_mask = self._caption_valid_mask_from_mask(
+                encoder_hidden_states_mask,
+                batch_size=len(cap_feats),
+                max_seq_len=max(cap_feat.shape[0] for cap_feat in cap_feats),
+            )
         timestep = 1000.0 - timestep
         t = timestep
         t = self.t_embedder(t)
