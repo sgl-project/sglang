@@ -4798,9 +4798,10 @@ class ServerArgs:
                     f"tokenspeed_mla only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
                 )
                 self.page_size = 64
-            if self.kv_cache_dtype not in ["fp8_e4m3"]:
+            if self.kv_cache_dtype not in ["fp8_e4m3", "bf16", "bfloat16", "fp16"]:
                 raise ValueError(
-                    "tokenspeed_mla backend requires kv-cache-dtype=fp8_e4m3, "
+                    "tokenspeed_mla backend requires kv-cache-dtype="
+                    "fp8_e4m3, bf16, bfloat16, or fp16, "
                     f"got {self.kv_cache_dtype}."
                 )
 
