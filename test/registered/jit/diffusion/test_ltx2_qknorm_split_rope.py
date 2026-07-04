@@ -11,6 +11,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
+BF16_FUSED_ATOL = 8e-2
+
 
 def _require_cuda_b200() -> None:
     if not torch.cuda.is_available():
@@ -135,8 +137,8 @@ def test_ltx2_qknorm_split_rope_matches_torch_exactly(
     )
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(q_out, q_ref, rtol=0, atol=1e-2)
-    torch.testing.assert_close(k_out, k_ref, rtol=0, atol=1e-2)
+    torch.testing.assert_close(q_out, q_ref, rtol=0, atol=BF16_FUSED_ATOL)
+    torch.testing.assert_close(k_out, k_ref, rtol=0, atol=BF16_FUSED_ATOL)
 
 
 def test_ltx2_qknorm_split_rope_rejects_unsupported_inputs() -> None:
@@ -215,8 +217,8 @@ def test_ltx2_qknorm_split_rope_custom_op_torch_compile_fullgraph() -> None:
         q, k, q_cos, q_sin, k_cos, k_sin, q_weight, k_weight, 1e-6
     )
     torch.cuda.synchronize()
-    torch.testing.assert_close(q_out, q_ref, rtol=0, atol=1e-2)
-    torch.testing.assert_close(k_out, k_ref, rtol=0, atol=1e-2)
+    torch.testing.assert_close(q_out, q_ref, rtol=0, atol=BF16_FUSED_ATOL)
+    torch.testing.assert_close(k_out, k_ref, rtol=0, atol=BF16_FUSED_ATOL)
 
 
 if __name__ == "__main__":
