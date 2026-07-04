@@ -22,6 +22,7 @@ preserves the historical import path.
 from sglang.srt.breakable_cuda_graph.breakable_cuda_graph import (  # noqa: F401
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
+    _copy_output,
     break_graph,
     eager_on_graph,
     get_current_replay_token,
@@ -32,6 +33,7 @@ __all__ = [
     "eager_on_graph",
     "BreakableCUDAGraph",
     "BreakableCUDAGraphCapture",
+    "_copy_output",
     "break_graph",
     "get_current_stream",
     "get_current_replay_token",
