@@ -1463,7 +1463,13 @@ class ServerArgs:
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; uses cuBLAS via torch.nn.functional.linear), 'flashinfer' (FlashInfer's tgv/cublaslt BF16 GEMM, requires FlashInfer with CuTe DSL support on Blackwell (SM100)).",
+            help=(
+                "Choose the backend for unquantized BF16 GEMM operations. "
+                "Options: 'auto' (default; uses cuBLAS via "
+                "torch.nn.functional.linear), 'flashinfer' (uses SGLang's "
+                "local port of FlashInfer's CuTeDSL TGV BF16 GEMM, requires "
+                "Blackwell SM100/SM103 with CUDA >= 12.8)."
+            ),
             cli_name="--bf16-gemm-backend",
             choices=BF16_GEMM_BACKEND_CHOICES,
         ),

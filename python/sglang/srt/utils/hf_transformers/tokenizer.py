@@ -36,6 +36,7 @@ from .common import (
     check_gguf_file,
     resolve_runai_obj_uri,
 )
+from .config import _is_legacy_dsa_layer_types_error, get_config
 from .mistral_utils import (
     _MISTRAL_TOKENIZER_REDIRECTS,
     patch_mistral_common_tokenizer,
@@ -177,6 +178,15 @@ def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
         )
         raise RuntimeError(err_msg) from e
     except ValueError as e:
+        if _is_legacy_dsa_layer_types_error(e):
+            retry_kwargs = _kwargs_with_legacy_dsa_config(tokenizer_name, common_kwargs)
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_name, *args, **retry_kwargs
+            )
+            logging.getLogger(tokenizer.__class__.__module__).addFilter(
+                TokenizerWarningsFilter()
+            )
+            return tokenizer
         # MistralCommon tokenizers reject standard HF kwargs like
         # trust_remote_code, use_fast etc. Retry without them.
         if "are not supported by" in str(e) and "MistralCommon" in str(e):
@@ -197,6 +207,34 @@ def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
             )
             raise RuntimeError(err_msg) from e
         raise
+    except Exception as e:
+        if not _is_legacy_dsa_layer_types_error(e):
+            raise
+        retry_kwargs = _kwargs_with_legacy_dsa_config(tokenizer_name, common_kwargs)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, *args, **retry_kwargs)
+        logging.getLogger(tokenizer.__class__.__module__).addFilter(
+            TokenizerWarningsFilter()
+        )
+        return tokenizer
+
+
+def _kwargs_with_legacy_dsa_config(tokenizer_name, common_kwargs):
+    if "config" in common_kwargs:
+        return common_kwargs
+
+    config_kwargs = {}
+    for key in ("cache_dir", "force_download", "local_files_only", "token"):
+        if key in common_kwargs:
+            config_kwargs[key] = common_kwargs[key]
+
+    revision = common_kwargs.get("revision") or common_kwargs.get("tokenizer_revision")
+    config = get_config(
+        tokenizer_name,
+        trust_remote_code=common_kwargs.get("trust_remote_code", False),
+        revision=revision,
+        **config_kwargs,
+    )
+    return {**common_kwargs, "config": config}
 
 
 def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
@@ -219,10 +257,22 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
             tokenizer_name, *args, **common_kwargs
         )
     except (ValueError, TypeError, OSError, ImportError, RuntimeError) as e:
-        raise RuntimeError(
-            f"Retry with use_fast=False for {tokenizer_name} also failed "
-            f"(initial load returned TokenizersBackend): {e}"
-        ) from e
+        if not _is_legacy_dsa_layer_types_error(e):
+            raise RuntimeError(
+                f"Retry with use_fast=False for {tokenizer_name} also failed "
+                f"(initial load returned TokenizersBackend): {e}"
+            ) from e
+        common_kwargs = _kwargs_with_legacy_dsa_config(tokenizer_name, common_kwargs)
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name, *args, **common_kwargs
+        )
+    except Exception as e:
+        if not _is_legacy_dsa_layer_types_error(e):
+            raise
+        common_kwargs = _kwargs_with_legacy_dsa_config(tokenizer_name, common_kwargs)
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name, *args, **common_kwargs
+        )
 
     if type(tokenizer).__name__ == _TOKENIZERS_BACKEND:
         tokenizer = (

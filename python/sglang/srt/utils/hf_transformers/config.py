@@ -13,9 +13,12 @@
 # ==============================================================================
 """Config loading utilities."""
 
+import json
+import tempfile
 from pathlib import Path
 from typing import Optional
 
+from huggingface_hub import hf_hub_download
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.srt.configs.model_config_parser_registry import (
@@ -51,6 +54,84 @@ def _apply_deepseek_ocr_overrides(config, model):
     config._name_or_path = model
 
 
+def _is_legacy_dsa_layer_types_error(error: Exception) -> bool:
+    seen = set()
+    stack = [error]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+
+        message = f"{type(current).__name__}: {current!s} {current!r}"
+        if "validate_layer_type" in message and "deepseek_sparse_attention" in message:
+            return True
+
+        stack.extend(
+            (
+                getattr(current, "__cause__", None),
+                getattr(current, "__context__", None),
+            )
+        )
+    return False
+
+
+def _load_config_without_legacy_dsa_layer_types(
+    model,
+    trust_remote_code: bool,
+    revision: Optional[str],
+    **kwargs,
+):
+    if Path(str(model)).is_dir():
+        config_path = Path(str(model)) / "config.json"
+    else:
+        config_path = Path(
+            hf_hub_download(
+                repo_id=model,
+                filename="config.json",
+                revision=revision,
+                cache_dir=kwargs.get("cache_dir"),
+            )
+        )
+
+    config_dict = json.loads(config_path.read_text())
+    layer_types = config_dict.get("layer_types")
+    if not (
+        isinstance(layer_types, list)
+        and any(layer_type == "deepseek_sparse_attention" for layer_type in layer_types)
+    ):
+        raise ValueError(
+            "Expected legacy deepseek_sparse_attention entries in config layer_types."
+        )
+
+    config_dict.pop("layer_types")
+    with tempfile.TemporaryDirectory(prefix="sglang-glm-config-") as tmp_dir:
+        tmp_path = Path(tmp_dir) / "config.json"
+        tmp_path.write_text(json.dumps(config_dict))
+        config = AutoConfig.from_pretrained(
+            tmp_dir,
+            trust_remote_code=trust_remote_code,
+            **kwargs,
+        )
+
+    # Transformers' GLM DSA config currently rewrites qk_rope_head_dim to
+    # head_dim during construction. Keep the explicit checkpoint dimensions so
+    # SGLang builds tensors matching the stored weights.
+    for attr in (
+        "kv_lora_rank",
+        "q_lora_rank",
+        "qk_head_dim",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "v_head_dim",
+    ):
+        if attr in config_dict:
+            setattr(config, attr, config_dict[attr])
+
+    config._name_or_path = model
+    return config
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -60,12 +141,22 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = AutoConfig.from_pretrained(
-            model,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
+        try:
+            config = AutoConfig.from_pretrained(
+                model,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
+        except Exception as error:
+            if not _is_legacy_dsa_layer_types_error(error):
+                raise
+            config = _load_config_without_legacy_dsa_layer_types(
+                model,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
 
         if (
             config.architectures is not None
