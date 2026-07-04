@@ -200,14 +200,20 @@ if _HAVE_TRITON:
         tl.store(gcum_ptr + (bt * HV + h) * CS + i, prev + g_r)
 
     @triton.jit
-    def _gdn_a_row_kernel(
-        kn_ptr, kb_ptr, gcum_ptr, A_ptr, i_ptr,
+    def _gdn_a_row_append_kernel(
+        kn_ptr, kb_ptr, gcum_ptr, A_ptr, T_ptr, i_ptr,
         HV: tl.constexpr, Dk: tl.constexpr, CS: tl.constexpr, QR: tl.constexpr,
     ):
-        """A row i = -(kb[i] @ kn^T) * exp(gcum[i]-gcum[j]) for j<i (strictly-lower), stored to a
-        global fp32 tensor. The store rounds the (-dot*decay) product exactly as _gdn_replay_A_kernel
-        does; feeding the solve a globally-rounded A (not a register-resident dot accumulator) is what
-        keeps the replay bit-identical to torch_chunk. QR-tile broadcasts kb[i] so tl.dot has M>=16."""
+        """Fused A-row + T-row-append for the new decode token (one launch instead of two).
+        A row i = -(kb[i] @ kn^T) * exp(gcum[i]-gcum[j]) for j<i (strictly-lower); then append the
+        forward-substitution row T[i,j<i] = A[i,j] + sum_{m<i} A[i,m]*T[m,j].
+
+        Bit-identity notes: (1) A is computed and consumed entirely in fp32, so feeding the append
+        from the in-register Arow is bit-identical to the old global round-trip (fp32 store then fp32
+        reload is identity); Arow is still stored to A_ptr to keep the buffer valid. (2) This kernel
+        MUST launch at Triton's DEFAULT num_warps (like the two kernels it replaces) so the append's
+        [CS,CS] tl.sum tree reduces in the same order as _fwd_sub_kernel's row i; running it at the
+        incr kernel's nw=8 would drift ~1e-9. QR-tile broadcasts kb[i] so tl.dot has M>=16."""
         pid = tl.program_id(0)
         bt = pid // HV
         h = pid % HV
@@ -217,30 +223,19 @@ if _HAVE_TRITON:
         dk = tl.arange(0, Dk)
         qr = tl.arange(0, QR)
         valid = r < W
+        base = (bt * HV + h) * CS
         kb = tl.load(kb_ptr + ((bt * CS + i) * HV + h) * Dk + dk[None, :] + qr[:, None] * 0)  # [QR,Dk] all rows kb[i]
         kn = tl.load(kn_ptr + ((bt * CS + r[:, None]) * HV + h) * Dk + dk[None, :], mask=valid[:, None], other=0.0)
-        gi = tl.load(gcum_ptr + (bt * HV + h) * CS + i)
-        gj = tl.load(gcum_ptr + (bt * HV + h) * CS + r, mask=valid, other=0.0)
+        gi = tl.load(gcum_ptr + base + i)
+        gj = tl.load(gcum_ptr + base + r, mask=valid, other=0.0)
         kept = (i > r) & valid
         decay = tl.where(kept[None, :], libdevice.exp(gi - gj[None, :]), 0.0)  # [QR,CS]
         A = -tl.dot(kb, tl.trans(kn), input_precision="ieee") * decay
         A = tl.where(kept[None, :], A, 0.0)
         Arow = tl.sum(tl.where(qr[:, None] == 0, A, 0.0), 0)  # [CS] tile row 0
-        tl.store(A_ptr + (bt * HV + h) * CS + r, Arow)
-
-    @triton.jit
-    def _gdn_append_T_row_kernel(T_ptr, Arow_ptr, i_ptr, HV: tl.constexpr, CS: tl.constexpr):
-        """Append forward-substitution row i to the cached T: T[i,j<i] = A[i,j] + sum_{m<i} A[i,m]*T[m,j].
-        Bit-identical to _fwd_sub_kernel's row i because the [CS,CS] tl.sum tile with a_im zeroed for
-        m>=i reduces the same fixed tree over the same final cached rows m<i (padded terms are 0.0)."""
-        pid = tl.program_id(0)
-        bt = pid // HV
-        h = pid % HV
-        i = tl.load(i_ptr + bt)
-        r = tl.arange(0, CS)
-        base = (bt * HV + h) * CS
+        tl.store(A_ptr + base + r, Arow)
+        # Append the forward-substitution row using the cached final rows m<i.
         M = tl.load(T_ptr + (base + r[:, None]) * CS + r[None, :])
-        Arow = tl.load(Arow_ptr + base + r)
         a_im = tl.where(r < i, Arow, 0.0)
         acc = tl.sum(a_im[:, None] * M, 0)
         new_row = tl.where(r < i, Arow + acc, Arow)
@@ -824,9 +819,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         w = i + 1
         # gcum row i is appended in-kernel (gcum[i]=gcum[i-1]+g[i], bit-identical to the shared
         # serial scan), so no torch cumsum launch here.
-        _gdn_a_row_kernel[(HV,)](entry["kn"], entry["kb"], entry["gcum"], entry["A_row"], it,
-                                 HV=HV, Dk=Dk, CS=C, QR=16)
-        _gdn_append_T_row_kernel[(HV,)](entry["T"], entry["A_row"], it, HV=HV, CS=C)
+        _gdn_a_row_append_kernel[(HV,)](
+            entry["kn"], entry["kb"], entry["gcum"], entry["A_row"], entry["T"], it,
+            HV=HV, Dk=Dk, CS=C, QR=16,
+        )
         _gdn_incr_kernel[(HV,)](
             entry["qn"], entry["kn"], entry["kb"], entry["vb"], entry["gcum"], entry["T"],
             entry["vnew"], entry["boundary"], entry["out"], entry["Snew"], it,
