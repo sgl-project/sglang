@@ -592,6 +592,7 @@ class Pi05TorchModel(nn.Module):
         image_masks: list[torch.Tensor],
         tokens: torch.Tensor,
         token_masks: torch.Tensor,
+        prefix_full_attention_hint: bool | None = None,
     ):
         tokens, token_masks = trim_trailing_padding_tokens(tokens, token_masks)
         self._prepare_prefix_image_encoder_for_embed()
@@ -599,13 +600,17 @@ class Pi05TorchModel(nn.Module):
             images, image_masks, tokens, token_masks
         )
         self._offload_prefix_image_encoder_after_embed()
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        prefix_full_attention = bool(prefix_att_2d_masks.all().item())
-        attention_mask = self.prepare_attention_masks_4d(
-            prefix_att_2d_masks,
-            full_attention=prefix_full_attention,
-        )
+        prefix_full_attention = bool(prefix_full_attention_hint)
+        if prefix_full_attention:
+            attention_mask = None
+        else:
+            prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+            prefix_full_attention = bool(prefix_att_2d_masks.all().item())
+            attention_mask = self.prepare_attention_masks_4d(
+                prefix_att_2d_masks,
+                full_attention=prefix_full_attention,
+            )
         self._prepare_prefix_language_layers_for_forward()
         with set_forward_context(current_timestep=0, attn_metadata=None):
             _, past_key_values = self.paligemma_with_expert.forward(

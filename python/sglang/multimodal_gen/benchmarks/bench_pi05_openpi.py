@@ -285,6 +285,7 @@ def build_sglang_python_payload(
             "return_timing": True,
             "prefix_cache": prefix_cache,
             "cuda_graph": cuda_graph,
+            "output_format": "numpy",
         },
     }
 
@@ -304,6 +305,7 @@ def build_sglang_openpi_ws_payload(
         "num_inference_steps": num_inference_steps,
         "enable_pi_prefix_cache": prefix_cache,
         "enable_pi_cuda_graph": cuda_graph,
+        "output_format": "numpy",
     }
     for key, value in observation["images"].items():
         payload[f"observation.images.{key}"] = np.asarray(value)
@@ -312,10 +314,34 @@ def build_sglang_openpi_ws_payload(
     return payload
 
 
-def _post_action(url: str, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
-    response = requests.post(url, json=payload, timeout=timeout_s)
+def _post_action(
+    session: requests.Session,
+    url: str,
+    payload: dict[str, Any],
+    timeout_s: float,
+) -> dict[str, Any]:
+    response = session.post(url, json=payload, timeout=timeout_s)
     response.raise_for_status()
     return response.json()
+
+
+def _post_action_msgpack(
+    session: requests.Session,
+    url: str,
+    payload: dict[str, Any],
+    timeout_s: float,
+) -> dict[str, Any]:
+    response = session.post(
+        url,
+        data=pack_msgpack(payload),
+        headers={
+            "Content-Type": "application/msgpack",
+            "Accept": "application/msgpack",
+        },
+        timeout=timeout_s,
+    )
+    response.raise_for_status()
+    return unpack_msgpack(response.content)
 
 
 def run_sglang_http(
@@ -326,47 +352,52 @@ def run_sglang_http(
     repeats: int,
     batch_size: int,
     timeout_s: float,
+    msgpack: bool = False,
 ) -> dict[str, Any]:
     endpoint = url.rstrip("/") + "/v1/actions/generations"
-    for idx in range(min(warmup, len(payloads))):
-        _post_action(endpoint, payloads[idx], timeout_s)
+    post_action = _post_action_msgpack if msgpack else _post_action
 
     single_latencies = []
     single_outputs = []
-    for idx in range(repeats):
-        payload = payloads[idx % len(payloads)]
-        start = time.perf_counter()
-        output = _post_action(endpoint, payload, timeout_s)
-        single_latencies.append((time.perf_counter() - start) * 1000)
-        single_outputs.append(output)
-
     batch_latencies = []
+    with requests.Session() as session:
+        for idx in range(min(warmup, len(payloads))):
+            post_action(session, endpoint, payloads[idx], timeout_s)
+
+        for idx in range(repeats):
+            payload = payloads[idx % len(payloads)]
+            start = time.perf_counter()
+            output = post_action(session, endpoint, payload, timeout_s)
+            single_latencies.append((time.perf_counter() - start) * 1000)
+            single_outputs.append(output)
+
     if batch_size > 1:
-        with ThreadPoolExecutor(max_workers=batch_size) as pool:
-            for warmup_idx in range(warmup):
-                batch = [
-                    payloads[(warmup_idx * batch_size + offset) % len(payloads)]
-                    for offset in range(batch_size)
-                ]
-                list(
-                    pool.map(
-                        lambda payload: _post_action(endpoint, payload, timeout_s),
-                        batch,
-                    )
-                )
-            for start_idx in range(repeats):
-                batch = [
-                    payloads[(start_idx * batch_size + offset) % len(payloads)]
-                    for offset in range(batch_size)
-                ]
-                start = time.perf_counter()
-                list(
-                    pool.map(
-                        lambda payload: _post_action(endpoint, payload, timeout_s),
-                        batch,
-                    )
-                )
-                batch_latencies.append((time.perf_counter() - start) * 1000)
+        sessions = [requests.Session() for _ in range(batch_size)]
+        try:
+            with ThreadPoolExecutor(max_workers=batch_size) as pool:
+
+                def post_item(item):
+                    session, payload = item
+                    return post_action(session, endpoint, payload, timeout_s)
+
+                for warmup_idx in range(warmup):
+                    batch = [
+                        payloads[(warmup_idx * batch_size + offset) % len(payloads)]
+                        for offset in range(batch_size)
+                    ]
+                    list(pool.map(post_item, zip(sessions, batch)))
+
+                for start_idx in range(repeats):
+                    batch = [
+                        payloads[(start_idx * batch_size + offset) % len(payloads)]
+                        for offset in range(batch_size)
+                    ]
+                    start = time.perf_counter()
+                    list(pool.map(post_item, zip(sessions, batch)))
+                    batch_latencies.append((time.perf_counter() - start) * 1000)
+        finally:
+            for session in sessions:
+                session.close()
 
     stage_timings = {}
     for output in single_outputs:
@@ -381,7 +412,7 @@ def run_sglang_http(
             key: _stats_ms(values) for key, values in stage_timings.items()
         },
         "first_output": single_outputs[0] if single_outputs else None,
-        "batch_mode": "concurrent_http_requests",
+        "batch_mode": "concurrent_http_msgpack" if msgpack else "concurrent_http_json",
     }
 
 
@@ -600,6 +631,7 @@ def run_sglang_python(
         single_outputs.append(output)
 
     batch_latencies = []
+    batch_outputs = []
     if batch_size > 1:
         for warmup_idx in range(warmup):
             batch = [
@@ -618,16 +650,24 @@ def run_sglang_python(
             ]
             start = time.perf_counter()
             if batch_mode == "grouped":
-                _run_sglang_python_group(pipeline, server_args, batch)
+                outputs = _run_sglang_python_group(pipeline, server_args, batch)
             else:
+                outputs = []
                 for payload in batch:
-                    _run_sglang_python_once(pipeline, server_args, payload)
+                    outputs.append(
+                        _run_sglang_python_once(pipeline, server_args, payload)
+                    )
             batch_latencies.append((time.perf_counter() - start) * 1000)
+            batch_outputs.extend(outputs)
 
     stage_timings = {}
     for output in single_outputs:
         for key, value in output.get("timings", {}).items():
             stage_timings.setdefault(key, []).append(float(value))
+    batch_stage_timings = {}
+    for output in batch_outputs:
+        for key, value in output.get("timings", {}).items():
+            batch_stage_timings.setdefault(key, []).append(float(value))
 
     return {
         "single": _stats_ms(single_latencies),
@@ -635,6 +675,9 @@ def run_sglang_python(
         "batch_size": batch_size,
         "stage_timings": {
             key: _stats_ms(values) for key, values in stage_timings.items()
+        },
+        "batch_stage_timings": {
+            key: _stats_ms(values) for key, values in batch_stage_timings.items()
         },
         "first_output": single_outputs[0] if single_outputs else None,
         "batch_mode": f"python_policy_{batch_mode}",
@@ -883,7 +926,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sglang-url", default="http://127.0.0.1:30000")
     parser.add_argument(
         "--sglang-api",
-        choices=("http", "openpi_ws", "python"),
+        choices=("http", "http_msgpack", "openpi_ws", "python"),
         default="http",
     )
     parser.add_argument("--sglang-model", default=None)
@@ -971,7 +1014,7 @@ def main() -> None:
     payloads = []
     if args.skip_sglang:
         pass
-    elif args.sglang_api == "python":
+    elif args.sglang_api in ("python", "http_msgpack"):
         payloads = [
             build_sglang_python_payload(
                 profile,
@@ -1051,6 +1094,7 @@ def main() -> None:
             repeats=args.repeats,
             batch_size=args.batch_size,
             timeout_s=args.timeout_s,
+            msgpack=args.sglang_api == "http_msgpack",
         )
     openpi_result = None
     if openpi_policy is not None:

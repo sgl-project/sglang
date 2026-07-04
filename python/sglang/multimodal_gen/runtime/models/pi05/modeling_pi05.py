@@ -705,8 +705,17 @@ class Pi05PolicyModel(nn.Module):
         ]
         tokens = observation.tokens.to(self.device)
         token_masks = observation.token_masks.to(self.device)
+        prefix_full_attention_hint = all(
+            bool(observation.image_masks[name].all().item()) for name in camera_order
+        ) and bool(observation.token_masks.all().item())
         past_key_values, prefix_pad_masks, prefix_position_ids, full_attention = (
-            self.core_model.encode_prefix(images, image_masks, tokens, token_masks)
+            self.core_model.encode_prefix(
+                images,
+                image_masks,
+                tokens,
+                token_masks,
+                prefix_full_attention_hint=prefix_full_attention_hint,
+            )
         )
         return PrefixContext(
             past_key_values=past_key_values,
@@ -784,7 +793,7 @@ class Pi05PolicyModel(nn.Module):
         if x_t is None:
             x_t = self.sample_noise(observation.batch_size, generator=generator)
         else:
-            x_t = x_t.to(device=self.device, dtype=torch.float32)
+            x_t = x_t.to(device=self.device, dtype=torch.float32).clone()
 
         dt = -1.0 / num_steps
         timesteps = torch.linspace(
@@ -802,7 +811,7 @@ class Pi05PolicyModel(nn.Module):
                 timestep,
                 use_cuda_graph=use_cuda_graph,
             )
-            x_t = x_t + dt * velocity
+            x_t.add_(velocity, alpha=dt)
         if offload_action:
             self._move_action_modules_to_device(torch.device("cpu"))
             torch.cuda.empty_cache()

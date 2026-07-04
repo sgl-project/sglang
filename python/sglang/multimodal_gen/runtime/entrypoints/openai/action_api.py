@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import time
 import traceback
-from typing import Any
 
-from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Request, Response, WebSocket, WebSocketDisconnect
 
 from sglang.multimodal_gen.runtime.entrypoints.action_utils import (
     action_generation_response,
@@ -21,11 +20,31 @@ from sglang.srt.utils.json_response import orjson_response
 router = APIRouter(prefix="/v1/actions", tags=["actions"])
 
 
+def _wants_msgpack(request: Request) -> bool:
+    content_type = request.headers.get("content-type", "").lower()
+    accept = request.headers.get("accept", "").lower()
+    return "msgpack" in content_type or "msgpack" in accept
+
+
 @router.post("/generations")
-async def create_action_generation(request: Request, payload: dict[str, Any]):
+async def create_action_generation(request: Request):
     server_args: ServerArgs = request.app.state.server_args
+    if "msgpack" in request.headers.get("content-type", "").lower():
+        payload = unpack_msgpack(await request.body())
+    else:
+        payload = await request.json()
     output = await infer_action(payload, server_args)
-    return orjson_response(action_generation_response(output, server_args))
+    wants_msgpack = _wants_msgpack(request)
+    response = action_generation_response(
+        output,
+        server_args,
+        preserve_numpy=wants_msgpack,
+    )
+    if wants_msgpack:
+        return Response(
+            content=pack_msgpack(response), media_type="application/msgpack"
+        )
+    return orjson_response(response)
 
 
 @router.get("/metadata")
@@ -46,7 +65,11 @@ async def action_realtime_ws(websocket: WebSocket):
             payload = unpack_msgpack(await websocket.receive_bytes())
             infer_start = time.monotonic()
             output = await infer_action(payload, server_args)
-            response = action_generation_response(output, server_args)
+            response = action_generation_response(
+                output,
+                server_args,
+                preserve_numpy=True,
+            )
             response.setdefault("server_timing", {})["infer_ms"] = (
                 time.monotonic() - infer_start
             ) * 1000

@@ -28,6 +28,7 @@ class Pi05SamplingParams(SamplingParams):
 
     action_horizon: int = 50
     action_dim: int = 32
+    output_format: str = "list"
     return_timing: bool = True
     enable_prefix_cache: bool = True
     enable_cuda_graph: bool = True
@@ -74,6 +75,7 @@ class Pi05SamplingParams(SamplingParams):
         extra["pi05_options"] = {
             "action_horizon": self.action_horizon,
             "action_dim": self.action_dim,
+            "output_format": self.output_format,
             "num_inference_steps": self.num_inference_steps,
             "return_timing": self.return_timing,
             "enable_prefix_cache": self.enable_prefix_cache,
@@ -90,6 +92,8 @@ class Pi05SamplingParams(SamplingParams):
             raise ValueError("action_horizon must be positive")
         if self.action_dim <= 0:
             raise ValueError("action_dim must be positive")
+        if self.output_format not in ("list", "numpy"):
+            raise ValueError("output_format must be 'list' or 'numpy'")
 
     def _set_output_file_name(self):
         if self.output_file_name is None:

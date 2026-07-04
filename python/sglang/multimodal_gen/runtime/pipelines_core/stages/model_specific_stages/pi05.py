@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+import numpy as np
 import torch
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -35,6 +36,36 @@ def _timings(batch: Req) -> dict[str, float]:
 
 def _options(batch: Req) -> dict[str, Any]:
     return batch.extra.get("pi05_options") or {}
+
+
+def _materialize_action_batch(
+    actions: Any,
+    action_dim: int,
+    output_format: str,
+) -> Any:
+    output_format = output_format.lower()
+    if isinstance(actions, torch.Tensor):
+        actions_out = actions[..., :action_dim].detach().float().cpu().numpy()
+        if output_format != "numpy":
+            actions_out = actions_out.tolist()
+    elif isinstance(actions, np.ndarray):
+        actions_out = actions[..., :action_dim].astype(np.float32, copy=False)
+        if output_format != "numpy":
+            actions_out = actions_out.tolist()
+    else:
+        actions_out = actions
+    if not isinstance(actions_out, list):
+        return actions_out
+    if not actions_out:
+        return []
+    first = actions_out[0]
+    if isinstance(first, list) and first and isinstance(first[0], list):
+        actions_out = [[step[:action_dim] for step in sample] for sample in actions_out]
+    else:
+        actions_out = [[step[:action_dim] for step in actions_out]]
+    if output_format == "numpy":
+        return np.asarray(actions_out, dtype=np.float32)
+    return actions_out
 
 
 def _effective_prefix_cache_enabled(batch: Req, server_args: ServerArgs) -> bool:
@@ -311,11 +342,17 @@ class Pi05ActionDenoisingStage(PipelineStage):
                 use_cuda_graph=bool(options.get("enable_cuda_graph", True)),
                 generator=None,
             )
+            actions_out = _materialize_action_batch(
+                actions,
+                server_args.pipeline_config.output_action_dim,
+                str(options.get("output_format") or "list"),
+            )
             action_ms = (time.perf_counter() - start) * 1000
 
             for offset, (index, batch) in enumerate(group):
                 _timings(batch)["action_denoise_ms"] = action_ms
                 batch.extra["pi05_actions"] = actions[offset : offset + 1]
+                batch.extra["pi05_actions_output"] = actions_out[offset]
                 results[index] = batch
 
         return [result for result in results if result is not None]
@@ -378,21 +415,24 @@ class Pi05PostprocessStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         start = time.perf_counter()
-        actions = batch.extra["pi05_actions"]
-        if isinstance(actions, torch.Tensor):
-            actions_out = actions.detach().float().cpu().numpy().tolist()
-        else:
-            actions_out = actions
         action_dim = server_args.pipeline_config.output_action_dim
-        if isinstance(actions_out, list):
-            actions_out = [
-                [step[:action_dim] for step in sample] for sample in actions_out
-            ]
+        options: dict[str, Any] = batch.extra.get("pi05_options") or {}
+        actions_out = batch.extra.get("pi05_actions_output")
+        if actions_out is None:
+            action_batch = _materialize_action_batch(
+                batch.extra["pi05_actions"],
+                action_dim,
+                str(options.get("output_format") or "list"),
+            )
+            actions_out = (
+                action_batch[0] if isinstance(action_batch, list) else action_batch
+            )
+            if isinstance(action_batch, np.ndarray):
+                actions_out = action_batch[0]
 
         payload = {
-            "actions": actions_out[0] if isinstance(actions_out, list) else actions_out,
+            "actions": actions_out,
         }
-        options: dict[str, Any] = batch.extra.get("pi05_options") or {}
         payload["parameters"] = {
             "num_inference_steps": int(
                 options.get("num_inference_steps") or batch.num_inference_steps

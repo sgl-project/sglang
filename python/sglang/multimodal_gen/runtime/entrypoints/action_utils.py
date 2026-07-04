@@ -232,6 +232,17 @@ def build_action_sampling_params(
     cuda_graph = runtime.get("cuda_graph")
     if cuda_graph is None:
         cuda_graph = observation.get("enable_pi_cuda_graph")
+    output_format = str(
+        runtime.get(
+            "output_format",
+            parameters.get(
+                "output_format",
+                observation.get("output_format", "list"),
+            ),
+        )
+    ).lower()
+    if output_format not in ("list", "numpy"):
+        raise ValueError("output_format must be 'list' or 'numpy'")
 
     sp = Pi05SamplingParams(
         prompt=prompt,
@@ -262,6 +273,7 @@ def build_action_sampling_params(
                 ),
             )
         ),
+        output_format=output_format,
         return_timing=_runtime_bool(runtime.get("return_timing"), True),
         enable_prefix_cache=_runtime_bool(prefix_cache, True),
         enable_cuda_graph=_runtime_bool(cuda_graph, True),
@@ -287,10 +299,18 @@ async def infer_action(
 def action_generation_response(
     output: dict[str, Any],
     server_args: ServerArgs,
+    *,
+    preserve_numpy: bool = False,
 ) -> dict[str, Any]:
     actions = output["actions"]
-    horizon = len(actions) if isinstance(actions, list) else 0
-    action_dim = len(actions[0]) if horizon and isinstance(actions[0], list) else 0
+    if isinstance(actions, np.ndarray):
+        action_shape = list(actions.shape)
+        action_values = actions if preserve_numpy else actions.tolist()
+    else:
+        horizon = len(actions) if isinstance(actions, list) else 0
+        action_dim = len(actions[0]) if horizon and isinstance(actions[0], list) else 0
+        action_shape = [horizon, action_dim]
+        action_values = actions
     response = {
         "id": f"act_{uuid.uuid4().hex}",
         "object": "action.generation",
@@ -304,14 +324,14 @@ def action_generation_response(
                 "action": {
                     "type": "continuous",
                     "dtype": "float32",
-                    "shape": [horizon, action_dim],
-                    "values": actions,
+                    "shape": action_shape,
+                    "values": action_values,
                 },
             }
         ],
         "usage": {
-            "action_horizon": horizon,
-            "action_dim": action_dim,
+            "action_horizon": action_shape[0] if action_shape else 0,
+            "action_dim": action_shape[1] if len(action_shape) > 1 else 0,
             "denoise_steps": output.get("parameters", {}).get(
                 "num_inference_steps",
                 server_args.pipeline_config.default_num_inference_steps,

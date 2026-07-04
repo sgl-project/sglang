@@ -82,6 +82,7 @@ The command dispatches to the native `multimodal_gen` Pi0.5 pipeline. It does no
 | `runtime.return_timing` | boolean, optional | Return stage timing fields. Defaults to `true`. |
 | `runtime.prefix_cache` | boolean or `"auto"`, optional | Enable exact full-prefix cache lookup for this request. Defaults to `"auto"`. |
 | `runtime.cuda_graph` | boolean or `"auto"`, optional | Enable the action denoise CUDA graph path for this request when a matching shape bucket is available. Defaults to `"auto"`. |
+| `runtime.output_format` | `"list"` or `"numpy"`, optional | Use `"list"` for JSON compatibility. Use `"numpy"` with msgpack or Python clients to avoid Python-list materialization. Defaults to `"list"`. |
 
 ## 4. API Usage
 
@@ -126,6 +127,8 @@ actions = data["data"][0]["action"]["values"]
 print(len(actions), len(actions[0]))
 print(data.get("timings"))
 ```
+
+The same `/v1/actions/generations` endpoint also accepts `Content-Type: application/msgpack` and can return msgpack when `Accept: application/msgpack` is set. For msgpack clients, send numpy arrays directly using the `pack_numpy_payload` helper from the websocket example below and set `runtime.output_format` to `"numpy"`.
 
 For `lerobot/pi05_libero_base`, use the LIBERO camera names and an 8-dimensional state vector:
 
@@ -243,14 +246,14 @@ asyncio.run(main())
 
 For current public Pi0.5 checkpoints, a stable 16GB discrete GPU target is a reasonable v1 deployment bar for robot workstations. In practice, leave headroom for the driver, camera middleware, robot process, and allocator fragmentation. Jetson/Orin unified-memory devices need extra caution because system RAM and GPU memory share the same pool.
 
-SGLang materializes Pi0.5 in `bf16` by default. The public checkpoint tensors and `config.json` may report `float32`, but that is the source checkpoint dtype, not the recommended inference dtype. Keep `materialize_dtype` at `bf16` unless you are debugging numerical parity.
+SGLang materializes Pi0.5 in `bf16` by default. The public checkpoint tensors and `config.json` may report `float32`, but that is the source checkpoint dtype, not the recommended inference dtype. Attention backend selection follows the finalized PiGemma compute dtype, so current deployment numbers should be treated as bf16 + native attention results. Keep `materialize_dtype` at `bf16` unless you are debugging numerical parity.
 
 Current H100 pressure validation shows that the bf16 model path fits a 16GB-free budget without layerwise offload. The numbers below use the Python grouped API with global prefix cache disabled and CUDA graph enabled; rerun HTTP/OpenPI websocket on your target server before using the policy in a closed-loop robot.
 
 | Mode | Command Shape | Steady VRAM Snapshot | Notes |
 | --- | --- | --- | --- |
 | Single GPU bf16 | `--num-gpus 1`, no offload | fit with `16383 MiB` free before load in H100 pressure test | Recommended first path for 16GB-class discrete GPUs. |
-| ALOHA bf16 grouped | Python API, batch size 1 / 4 | same 16GB-free pressure | `93.9 ms` single; `177.0 ms / 4` grouped batch. |
+| ALOHA bf16 grouped | Python API, batch size 1 / 4 | same 16GB-free pressure | `94.2 ms` single; `175.7 ms / 4` grouped batch. |
 | LIBERO bf16 grouped | Python API, batch size 1 / 4 | same 16GB-free pressure | `157.1 ms` single; `232.7 ms / 4` grouped batch. |
 | Prefix cache disabled | `enable_global_prefix_cache=false` or request `runtime.prefix_cache=false` | avoids cache growth across changing frames | Recommended for tight edge budgets unless repeated exact frames are common. |
 | Offload fallback | config in 6.2 | target-dependent | Use only if the default bf16 path OOMs on the target device. |
@@ -394,6 +397,7 @@ python python/sglang/multimodal_gen/benchmarks/bench_pi05_openpi.py \
 The benchmark reports:
 
 - SGLang HTTP latency for `/v1/actions/generations`, including stage timings when the server returns them.
+- SGLang msgpack HTTP latency when `--sglang-api http_msgpack` is set. This keeps the generic HTTP endpoint but avoids JSON image-array overhead.
 - SGLang OpenPI-compatible websocket latency when `--sglang-api openpi_ws` is set. This uses persistent msgpack websocket connections and is closer to the robot client path than JSON-over-HTTP.
 - SGLang Python in-process latency when `--sglang-api python` is set. This loads the native Pi0.5 pipeline in the benchmark process and avoids HTTP, websocket, scheduler, and serialization overhead. Use `--sglang-python-batch-mode grouped` to exercise the conservative native grouped-batch path.
 - OpenPI single-request latency through `Policy.infer`.
@@ -418,7 +422,7 @@ python python/sglang/multimodal_gen/benchmarks/bench_pi05_openpi.py \
   --disable-cuda-graph
 ```
 
-Use `--skip-sglang --openpi-pytorch-compile-mode none` to measure an OpenPI eager baseline in the same environment. The `keep` mode preserves OpenPI's checkpoint default compile setting. The grouped Python path currently requires compatible fresh-prefix requests without split prefix/action workers or effective prefix-cache hits; other cases fall back to per-request execution.
+Use `--skip-sglang --openpi-pytorch-compile-mode none` to measure an OpenPI eager baseline in the same environment. For a PyTorch-native OpenPI baseline, point `--openpi-checkpoint` at a checkpoint directory containing `model.safetensors` and the OpenPI `assets/` norm-stat tree. The `keep` mode preserves OpenPI's checkpoint default compile setting. The grouped Python path currently requires compatible fresh-prefix requests without split prefix/action workers or effective prefix-cache hits; other cases fall back to per-request execution.
 
 ## 8. Validation Notes
 
@@ -431,14 +435,14 @@ The following checks were run on H100 GPUs with the native SGLang Pi0.5 path:
 | Action denoise CUDA graph | Eager 10-step denoise `125.4 ms`; steady graph replay `50.8 ms`; max output difference `0`. |
 | Exact full-prefix cache | First prefix pass about `203 ms`; exact cache hit prefix stage about `0.2 ms`. |
 | `lerobot/pi05_libero_base` direct end-to-end | Image keys `image`, `image2`, `empty_camera_0`; state dim `8`; output action dim `7`; output tensor shape `[1, 50, 32]`. |
-| `sglang serve` HTTP | `/v1/actions/generations` returned action shape `[50, 32]`; single-GPU HTTP timings were about `28 ms` preprocess, `239 ms` prefix, `207 ms` action denoise. |
-| OpenPI websocket | `/openpi/policy` returned action shape `[50, 32]`; exact cache hit request ran action denoise in about `51 ms`. |
+| `sglang serve` HTTP | `/v1/actions/generations` returned action shape `[50, 32]`. JSON-over-HTTP remains compatible but image-array serialization dominates; ALOHA p50 was about `179 ms` in the H100 validation. Msgpack HTTP reduced single-request mean latency to about `99.5 ms`. |
+| OpenPI websocket | `/openpi/policy` returned action shape `[50, 32]`; ALOHA single-request mean latency was about `97.5 ms` with prefix cache disabled. |
 | 2-GPU prefix/action split | `--num-gpus 2 --sp-degree 2 --ulysses-degree 2` returned action shape `[50, 32]`; output matched single-GPU HTTP with max absolute difference `0`. |
 | bf16 runtime dtype | Checkpoint source tensors are fp32, but SGLang inference materializes bf16 by default; backend logs showed `Using fa attention backend`. |
-| 16GB-free Python pressure | With an H100 artificially constrained to `16383 MiB` free before model load, single-GPU bf16 no-offload Python grouped path completed without OOM. ALOHA: `93.9 ms` single, `177.0 ms / 4`; LIBERO: `157.1 ms` single, `232.7 ms / 4`. |
+| 16GB-free Python pressure | With an H100 artificially constrained to `16381 MiB` free before model load, single-GPU bf16 no-offload Python grouped path completed without OOM. ALOHA: `94.2 ms` single, `175.7 ms / 4`; LIBERO: `157.1 ms` single, `232.7 ms / 4`. |
 | Low-VRAM switches | Disabling prefix cache prevents cache growth across changing robot frames. CUDA graph can stay enabled when the action expert remains resident; disable it only for offload fallback modes. |
 | Offload fallback | CPU/offload modes are retained as numerically lossless compatibility fallbacks, but earlier fp32-runtime offload latency numbers are stale after the bf16 dtype correction and should be revalidated before deployment decisions. |
 | Run:ai direct loader | Single-GPU serve streamed `13.5 GiB` safetensors to `cuda:0` in `1.86 s` and returned `[50, 32]` actions. Split/offload paths were validated with the guarded non-direct loader to avoid distributed startup stalls and low-VRAM pressure. |
-| OpenPI comparison status | OpenPI native was not available on the latest `pi05-perf-opt` validation image. Future comparison tables must report runtime dtype explicitly: fp32 vs fp32 for parity debugging, bf16 vs bf16/equivalent for deployment performance. |
+| OpenPI comparison status | OpenPI PyTorch eager baseline using the LeRobot HF `model.safetensors` plus OpenPI assets was validated without `torch.compile`. On 80GB H100, ALOHA OpenPI was `125.6 ms` single and `164.3 ms / 4`; under 16GB-free pressure it was `127.7 ms` single and `167.4 ms / 4`. SGLang is clearly faster for single-stream robot inference; OpenPI's private direct-model batch path is still faster than the current SGLang grouped batch path. |
 
 Run a full HTTP or websocket smoke test in your robot deployment environment before using the policy in a closed-loop controller.

@@ -26,6 +26,20 @@ from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
+def config_compute_dtype(config: GemmaConfig) -> torch.dtype | None:
+    dtype = getattr(config, "dtype", None)
+    if dtype is None or isinstance(dtype, torch.dtype):
+        return dtype
+    dtype_name = str(dtype).lower()
+    if dtype_name in ("bf16", "bfloat16", "torch.bfloat16"):
+        return torch.bfloat16
+    if dtype_name in ("fp16", "float16", "half", "torch.float16"):
+        return torch.float16
+    if dtype_name in ("fp32", "float32", "torch.float32"):
+        return torch.float32
+    return None
+
+
 def gated_residual(
     x: torch.Tensor | None,
     y: torch.Tensor | None,
@@ -97,6 +111,7 @@ class PiGemmaAttention(GemmaAttention):
                 AttentionBackendEnum.FA2,
                 AttentionBackendEnum.TORCH_SDPA,
             },
+            compute_dtype=config_compute_dtype(config),
             allow_cudnn_sdp=True,
         )
 
