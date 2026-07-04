@@ -40,6 +40,7 @@ annotation is equivalent to ``Arg(help=that_string)``.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import types
 from typing import (
     Annotated,
@@ -74,6 +75,24 @@ class Arg:
     # When True, this field is skipped by add_cli_args_from_dataclass.
     # Use for fields that have no CLI surface (e.g. injected via Python only).
     no_cli: bool = False
+    # When True, this field may be resolved by model overrides: it is part of
+    # the whitelist accepted by the apply_model_overrides gate, and its
+    # resolved value lives on the flags tier (the server_args field itself
+    # stays the pristine user input).
+    model_overridable: bool = False
+
+
+@functools.lru_cache(maxsize=None)
+def model_overridable_fields(cls) -> frozenset:
+    """Names of ``cls`` dataclass fields whose ``Arg`` metadata declares
+    ``model_overridable=True`` — the whitelist for model-override resolution."""
+    hints = get_type_hints(cls, include_extras=True)
+    names = set()
+    for field in dataclasses.fields(cls):
+        _, arg = _unwrap_annotated(hints.get(field.name, field.type))
+        if arg is not None and arg.model_overridable:
+            names.add(field.name)
+    return frozenset(names)
 
 
 # ---------------------------------------------------------------------------
