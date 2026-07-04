@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.server_args import (
 from sglang.multimodal_gen.runtime.utils.common import is_port_available
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import init_diffusion_tracing
+from sglang.multimodal_gen.utils import kill_itself_when_parent_died
 
 _SCHEDULER_SHUTDOWN_TIMEOUT_MS = 5000
 _WORKER_JOIN_TIMEOUT_S = 10
@@ -129,6 +130,11 @@ def _kill_alive_processes(processes, timeout_s: float) -> None:
     for process in alive:
         process.kill()
     _join_processes_with_deadline(alive, timeout_s)
+
+
+def _run_http_server_process(server_args: ServerArgs) -> None:
+    kill_itself_when_parent_died()
+    launch_http_server_only(server_args)
 
 
 def _request_monolithic_scheduler_shutdown(server_args: ServerArgs) -> None:
@@ -277,7 +283,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         if server_args.webui:
             logger.info("Launch FastAPI server in another process because of webui.")
             http_server_process = mp.Process(
-                target=launch_http_server_only,
+                target=_run_http_server_process,
                 args=(server_args,),
                 name="sglang-diffusion-webui",
                 daemon=True,
