@@ -768,6 +768,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 counts.append(max(1, num_tokens // int(tokens_per_req)))
         return counts
 
+    @staticmethod
+    def _prefill_bootstrap_tokens_per_req(
+        global_num_tokens: Optional[list[int]],
+    ) -> int:
+        if global_num_tokens is None:
+            return 0
+        return max((int(x) for x in global_num_tokens), default=0)
+
     def _materialize_disagg_prefill_hidden_to_draft_state(
         self,
         *,
@@ -1371,6 +1379,40 @@ class DSparkWorkerV2(BaseSpecWorker):
             if next_token_ids is None:
                 next_token_ids = torch.empty(
                     (0,), dtype=torch.int64, device=model_worker_batch.seq_lens.device
+                )
+            bootstrap_tokens_per_req = self._prefill_bootstrap_tokens_per_req(
+                model_worker_batch.global_num_tokens
+            )
+            bootstrap_global_num_reqs = self._prefill_bootstrap_global_req_counts(
+                model_worker_batch.global_num_tokens,
+                bootstrap_tokens_per_req,
+            )
+            if bootstrap_global_num_reqs is not None and any(
+                int(x) > 0 for x in bootstrap_global_num_reqs
+            ):
+                hidden_size = self._get_target_aux_hidden_size()
+                hidden_dtype = (
+                    logits_output.hidden_states.dtype
+                    if logits_output.hidden_states is not None
+                    else torch.float16
+                )
+                self._run_draft_bootstrap_forward(
+                    batch=model_worker_batch,
+                    main_hidden=torch.empty(
+                        (0, hidden_size), dtype=hidden_dtype, device=device
+                    ),
+                    input_ids=torch.empty((0,), dtype=torch.int64, device=device),
+                    positions=torch.empty((0,), dtype=torch.int64, device=device),
+                    out_cache_loc=torch.empty((0,), dtype=torch.int64, device=device),
+                    seq_lens=torch.empty((0,), dtype=torch.int64, device=device),
+                    req_pool_indices=torch.empty(
+                        (0,),
+                        dtype=model_worker_batch.req_pool_indices.dtype,
+                        device=device,
+                    ),
+                    dp_decode_global_num_tokens=bootstrap_global_num_reqs,
+                    num_tokens_per_req=bootstrap_tokens_per_req,
+                    use_draft_extend_v2=True,
                 )
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = None
