@@ -38,7 +38,6 @@ class TestXPUEmbedding(CustomTestCase):
                 "--is-embedding",
                 "--device",
                 "xpu",
-                "--disable-decode-cuda-graph",
             ],
         )
         cls.openai_url = cls.base_url + "/v1"
