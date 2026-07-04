@@ -752,6 +752,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch.global_num_tokens_for_logprob = old_global_num_tokens_for_logprob
             self.draft_model_runner.attn_backend = old_attn_backend
 
+    @staticmethod
+    def _prefill_bootstrap_global_req_counts(
+        global_num_tokens: Optional[list[int]],
+        tokens_per_req: int,
+    ) -> Optional[list[int]]:
+        if global_num_tokens is None or tokens_per_req <= 0:
+            return None
+        counts = []
+        for num_tokens in global_num_tokens:
+            num_tokens = int(num_tokens)
+            if num_tokens <= 0:
+                counts.append(0)
+            else:
+                counts.append(max(1, num_tokens // int(tokens_per_req)))
+        return counts
+
     def _materialize_disagg_prefill_hidden_to_draft_state(
         self,
         *,
@@ -1401,6 +1417,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not extend_lens_list:
             raise RuntimeError("DSpark prefill expected non-empty extend_lens.")
         if len(set(extend_lens_list)) == 1:
+            bootstrap_global_num_reqs = self._prefill_bootstrap_global_req_counts(
+                model_worker_batch.global_num_tokens,
+                extend_lens_list[0],
+            )
             self._run_draft_bootstrap_forward(
                 batch=model_worker_batch,
                 main_hidden=logits_output.hidden_states,
@@ -1409,6 +1429,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 out_cache_loc=model_worker_batch.out_cache_loc,
                 seq_lens=draft_seq_lens,
                 req_pool_indices=model_worker_batch.req_pool_indices,
+                dp_decode_global_num_tokens=bootstrap_global_num_reqs,
                 num_tokens_per_req=extend_lens_list[0],
                 use_draft_extend_v2=True,
             )
@@ -1416,6 +1437,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             offset = 0
             for i, extend_len in enumerate(extend_lens_list):
                 next_offset = offset + extend_len
+                bootstrap_global_num_reqs = self._prefill_bootstrap_global_req_counts(
+                    model_worker_batch.global_num_tokens,
+                    extend_len,
+                )
                 self._run_draft_bootstrap_forward(
                     batch=model_worker_batch,
                     main_hidden=logits_output.hidden_states[offset:next_offset],
@@ -1424,6 +1449,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     out_cache_loc=model_worker_batch.out_cache_loc[offset:next_offset],
                     seq_lens=draft_seq_lens[i : i + 1],
                     req_pool_indices=model_worker_batch.req_pool_indices[i : i + 1],
+                    dp_decode_global_num_tokens=bootstrap_global_num_reqs,
                     num_tokens_per_req=extend_len,
                     use_draft_extend_v2=True,
                 )
