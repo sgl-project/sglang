@@ -334,6 +334,30 @@ class PaliGemmaWithExpertModel(nn.Module):
             features = features.to(device=output_device, dtype=out_dtype)
         return features
 
+    def embed_images(self, images: list[torch.Tensor]) -> list[torch.Tensor]:
+        if len(images) == 1:
+            return [self.embed_image(images[0])]
+        out_dtype = images[0].dtype
+        vision_device = self._module_device(self.paligemma.model.vision_tower)
+        output_device = self._prefix_transformer_device()
+        batch_sizes = [image.shape[0] for image in images]
+        batched_images = torch.cat(
+            [
+                (
+                    image.to(device=vision_device, dtype=torch.float32)
+                    if image.device != vision_device or image.dtype != torch.float32
+                    else image
+                )
+                for image in images
+            ],
+            dim=0,
+        )
+        image_outputs = self.paligemma.model.get_image_features(batched_images)
+        features = image_outputs.pooler_output
+        if features.device != output_device or features.dtype != out_dtype:
+            features = features.to(device=output_device, dtype=out_dtype)
+        return list(features.split(batch_sizes, dim=0))
+
     def embed_language_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         embedding = self.paligemma.model.language_model.get_input_embeddings()
         embedding_device = self._module_device(embedding)
@@ -477,8 +501,8 @@ class Pi05TorchModel(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
-        for image, image_mask in zip(images, image_masks, strict=True):
-            image_emb = self.paligemma_with_expert.embed_image(image)
+        image_embs = self.paligemma_with_expert.embed_images(images)
+        for image_emb, image_mask in zip(image_embs, image_masks, strict=True):
             batch_size, num_image_embs = image_emb.shape[:2]
             embs.append(image_emb)
             pad_masks.append(image_mask[:, None].expand(batch_size, num_image_embs))
@@ -593,8 +617,10 @@ class Pi05TorchModel(nn.Module):
         tokens: torch.Tensor,
         token_masks: torch.Tensor,
         prefix_full_attention_hint: bool | None = None,
+        tokens_trimmed: bool = False,
     ):
-        tokens, token_masks = trim_trailing_padding_tokens(tokens, token_masks)
+        if not tokens_trimmed:
+            tokens, token_masks = trim_trailing_padding_tokens(tokens, token_masks)
         self._prepare_prefix_image_encoder_for_embed()
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, image_masks, tokens, token_masks

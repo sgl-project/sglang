@@ -703,11 +703,19 @@ class Pi05PolicyModel(nn.Module):
         image_masks = [
             observation.image_masks[name].to(self.device) for name in camera_order
         ]
-        tokens = observation.tokens.to(self.device)
-        token_masks = observation.token_masks.to(self.device)
+        token_len = int(observation.token_masks.sum(dim=1).max().item())
+        tokens_trimmed = token_len > 0
+        if tokens_trimmed and token_len < observation.tokens.shape[1]:
+            tokens_cpu = observation.tokens[:, :token_len]
+            token_masks_cpu = observation.token_masks[:, :token_len]
+        else:
+            tokens_cpu = observation.tokens
+            token_masks_cpu = observation.token_masks
+        tokens = tokens_cpu.to(self.device)
+        token_masks = token_masks_cpu.to(self.device)
         prefix_full_attention_hint = all(
             bool(observation.image_masks[name].all().item()) for name in camera_order
-        ) and bool(observation.token_masks.all().item())
+        ) and bool(token_masks_cpu.all().item())
         past_key_values, prefix_pad_masks, prefix_position_ids, full_attention = (
             self.core_model.encode_prefix(
                 images,
@@ -715,6 +723,7 @@ class Pi05PolicyModel(nn.Module):
                 tokens,
                 token_masks,
                 prefix_full_attention_hint=prefix_full_attention_hint,
+                tokens_trimmed=tokens_trimmed,
             )
         )
         return PrefixContext(
