@@ -784,7 +784,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         bs = len(prefix_lens)
         if hidden.numel() == 0 or bs == 0:
             return
-        if hidden.dim() != 2 or hidden.shape[0] != bs:
+        if hidden.dim() != 2:
+            return
+        if hidden.shape[0] != bs:
             logger.warning(
                 "Skip DSpark PD hidden bootstrap due to shape mismatch: "
                 "hidden_shape=%s bs=%s",
@@ -809,6 +811,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         positions = prefix_lens.to(torch.int64) - 1
         valid = (prefix_lens > 0) & (cache_loc >= 0)
+        hidden_valid_mask = draft_input.hidden_valid_mask
+        if hidden_valid_mask is not None and hidden_valid_mask.numel() == bs:
+            valid &= hidden_valid_mask.to(
+                device=valid.device, dtype=torch.bool, non_blocking=True
+            )
         if not valid.any():
             return
 
@@ -848,96 +855,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             positions=positions,
         )
 
-    def _make_draft_block_hidden_context(
-        self,
-        draft_input: DSparkDraftInputV2,
-        *,
-        bs: int,
-        block_size: int,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden = draft_input.hidden_states
-        if hidden is None or hidden.numel() == 0 or bs == 0:
-            return (
-                torch.empty((0, 0), dtype=torch.float16, device=device),
-                torch.empty((0,), dtype=torch.bool, device=device),
-            )
-
-        hidden = hidden.to(device=device, non_blocking=True)
-        mask = draft_input.hidden_valid_mask
-        if mask is not None:
-            mask = mask.to(device=device, dtype=torch.bool, non_blocking=True)
-
-        if hidden.dim() == 2:
-            if hidden.shape[0] != bs:
-                raise RuntimeError(
-                    "DSpark draft hidden batch mismatch: "
-                    f"hidden={tuple(hidden.shape)} bs={bs}"
-                )
-            hidden_window = hidden.new_zeros((bs, block_size, hidden.shape[-1]))
-            valid_mask = torch.zeros((bs, block_size), dtype=torch.bool, device=device)
-            hidden_window[:, 0, :].copy_(hidden)
-            if mask is None or mask.numel() == 0:
-                valid_mask[:, 0] = True
-            elif mask.dim() == 1:
-                if mask.shape[0] != bs:
-                    raise RuntimeError(
-                        "DSpark draft hidden mask batch mismatch: "
-                        f"mask={tuple(mask.shape)} bs={bs}"
-                    )
-                valid_mask[:, 0] = mask
-            else:
-                copy_len = min(block_size, int(mask.shape[1]))
-                valid_mask[:, :copy_len] = mask[:, :copy_len]
-            return hidden_window.reshape(bs * block_size, -1), valid_mask.reshape(-1)
-
-        if hidden.dim() != 3:
-            raise RuntimeError(
-                "DSpark draft hidden context must be rank-2 or rank-3, "
-                f"got shape={tuple(hidden.shape)}"
-            )
-        if hidden.shape[0] != bs:
-            raise RuntimeError(
-                "DSpark draft hidden batch mismatch: "
-                f"hidden={tuple(hidden.shape)} bs={bs}"
-            )
-
-        copy_len = min(block_size, int(hidden.shape[1]))
-        hidden_window = hidden.new_zeros((bs, block_size, hidden.shape[-1]))
-        valid_mask = torch.zeros((bs, block_size), dtype=torch.bool, device=device)
-        if copy_len > 0:
-            hidden_window[:, :copy_len, :].copy_(hidden[:, :copy_len, :])
-            if mask is None or mask.numel() == 0:
-                valid_mask[:, :copy_len] = True
-            else:
-                valid_mask[:, :copy_len] = mask[:, :copy_len]
-        return hidden_window.reshape(bs * block_size, -1), valid_mask.reshape(-1)
-
     def _run_draft_block(
         self,
         *,
         batch: ScheduleBatch,
-        draft_input: DSparkDraftInputV2,
         bs: int,
         block_ids: torch.Tensor,
         positions: torch.Tensor,
         verify_out_cache_loc: torch.Tensor,
         dp_decode_global_num_tokens: Optional[list[int]] = None,
     ) -> tuple[torch.Tensor, object]:
-        hidden_context, hidden_valid_mask = self._make_draft_block_hidden_context(
-            draft_input,
-            bs=bs,
-            block_size=int(self.block_size),
-            device=self.device,
-        )
         draft_block_spec_info = DSparkDraftBlockInput(
             draft_token=block_ids.reshape(-1),
             positions=positions,
             draft_token_num=int(self.block_size),
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            hidden_states=hidden_context,
-            hidden_valid_mask=hidden_valid_mask,
         )
         draft_forward_batch = draft_block_spec_info.prepare_for_draft_block(
             batch=batch,
@@ -1354,19 +1287,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         bonus_tokens: torch.Tensor,
         seq_lens: torch.Tensor,
         cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
-        hidden_valid_mask: Optional[torch.Tensor] = None,
     ) -> DSparkDraftInputV2:
-        if hidden_states is None:
-            hidden_states = torch.empty(
-                (0, 0), dtype=torch.float16, device=bonus_tokens.device
-            )
         return DSparkDraftInputV2(
             bonus_tokens=bonus_tokens.to(dtype=torch.int64),
             new_seq_lens=seq_lens.to(dtype=torch.int64),
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
-            hidden_states=hidden_states,
-            hidden_valid_mask=hidden_valid_mask,
         )
 
     def _get_transfer_warmup_rounds(
@@ -1384,21 +1309,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         new_seq_lens: torch.Tensor,
         cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None,
         transfer_warmup_rounds: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
-        hidden_valid_mask: Optional[torch.Tensor] = None,
     ) -> DSparkDraftInputV2:
         if transfer_warmup_rounds is None:
             transfer_warmup_rounds = torch.zeros_like(new_seq_lens, dtype=torch.int32)
-        if hidden_states is None:
-            hidden_states = torch.empty(
-                (0, 0), dtype=torch.float16, device=bonus_tokens.device
-            )
         return DSparkDraftInputV2(
             bonus_tokens=bonus_tokens.to(dtype=torch.int64),
             new_seq_lens=new_seq_lens.to(dtype=torch.int64),
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
-            hidden_states=hidden_states,
-            hidden_valid_mask=hidden_valid_mask,
             transfer_warmup_rounds=transfer_warmup_rounds.to(dtype=torch.int32),
         )
 
@@ -1485,30 +1402,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_forward_batch=draft_forward_batch,
         )
 
-        bs = len(extend_lens)
-        prefill_hidden_window = logits_output.hidden_states.new_zeros(
-            (bs, int(self.block_size), logits_output.hidden_states.shape[-1])
-        )
-        prefill_hidden_valid_mask = torch.zeros(
-            (bs, int(self.block_size)), dtype=torch.bool, device=device
-        )
-        extend_lens_tensor = torch.tensor(extend_lens, dtype=torch.int64, device=device)
-        if bs > 0 and bool((extend_lens_tensor > 0).any().item()):
-            last_offsets = torch.cumsum(extend_lens_tensor, dim=0) - 1
-            valid = extend_lens_tensor > 0
-            prefill_hidden_window[valid, 0, :].copy_(
-                logits_output.hidden_states[last_offsets[valid]]
-            )
-            prefill_hidden_valid_mask[valid, 0] = True
-
         logits_output.hidden_states = None
 
         batch_output.next_draft_input = self._make_next_draft_input_prefill(
             bonus_tokens=next_token_ids,
             seq_lens=model_worker_batch.seq_lens,
             cur_allocated_seq_lens_cpu=model_worker_batch.seq_lens_cpu,
-            hidden_states=prefill_hidden_window,
-            hidden_valid_mask=prefill_hidden_valid_mask,
         )
         verify_done = torch.get_device_module(device).Event()
         verify_done.record()
@@ -1582,7 +1481,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         ):
             block_hidden, draft_forward_batch = self._run_draft_block(
                 batch=model_worker_batch,
-                draft_input=draft_input,
                 bs=bs,
                 block_ids=block_ids,
                 positions=positions,
@@ -1724,12 +1622,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DSpark verify requires target main_hidden states, but got None."
             )
-        next_hidden_window = torch.empty(
-            (0, 0), dtype=torch.float16, device=device
-        )
-        next_hidden_valid_mask = torch.empty(
-            (0, 0), dtype=torch.bool, device=device
-        )
         if bs > 0:
             hidden = hidden.view(bs, block_size, -1)
             hidden_flat = hidden.reshape(-1, hidden.shape[-1])
@@ -1738,11 +1630,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 < commit_lens.unsqueeze(1).to(torch.int64)
             )
             commit_mask = commit_mask_2d.reshape(-1)
-            next_hidden_window = hidden.new_zeros((bs, block_size, hidden.shape[-1]))
-            next_hidden_valid_mask = commit_mask_2d.to(device=device, dtype=torch.bool)
-            next_hidden_window[next_hidden_valid_mask].copy_(
-                hidden[next_hidden_valid_mask]
-            )
             self._materialize_main_hidden_to_draft_state(
                 main_hidden=hidden_flat,
                 cache_loc=verify_out_cache_loc[commit_mask],
@@ -1763,8 +1650,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
             cur_allocated_seq_lens_cpu=draft_input.reserved_seq_lens_cpu,
             transfer_warmup_rounds=next_transfer_warmup_rounds,
-            hidden_states=next_hidden_window,
-            hidden_valid_mask=next_hidden_valid_mask,
         )
         next_draft_input.carry_prepare_buffers_from(draft_input)
         verify_done = torch.get_device_module(device).Event()

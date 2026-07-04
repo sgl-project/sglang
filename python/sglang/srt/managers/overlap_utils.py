@@ -189,8 +189,6 @@ class FutureMap:
         self.need_hidden_states = (
             self.spec_algo.is_some()
             and spec_need_hidden_states()
-            and payload.hidden_states is not None
-            and payload.hidden_states.numel() > 0
         )
 
         if self.need_topk:
@@ -206,21 +204,10 @@ class FutureMap:
                 dtype=topk_index0.dtype,
                 device=self.device,
             )
+        self.hidden_states_buf = None
+        self.hidden_valid_mask_buf = None
         if self.need_hidden_states:
-            hidden_states0 = payload.hidden_states[0]
-            self.hidden_states_buf = torch.empty(
-                (self.req_pool_size, *hidden_states0.shape),
-                dtype=hidden_states0.dtype,
-                device=self.device,
-            )
-            self.hidden_valid_mask_buf = None
-            if payload.hidden_valid_mask is not None:
-                hidden_valid_mask0 = payload.hidden_valid_mask[0]
-                self.hidden_valid_mask_buf = torch.empty(
-                    (self.req_pool_size, *hidden_valid_mask0.shape),
-                    dtype=hidden_valid_mask0.dtype,
-                    device=self.device,
-                )
+            self._maybe_init_hidden_buf(payload)
 
         self.draft_probs_buf = None
         if payload.draft_probs is not None:
@@ -241,6 +228,32 @@ class FutureMap:
             self.transfer_warmup_rounds_buf = torch.zeros(
                 (self.req_pool_size,),
                 dtype=dtype,
+                device=self.device,
+            )
+
+    def _maybe_init_hidden_buf(self, payload: RelayPayload) -> None:
+        if (
+            not getattr(self, "need_hidden_states", False)
+            or getattr(self, "hidden_states_buf", None) is not None
+            or payload.hidden_states is None
+            or payload.hidden_states.numel() == 0
+        ):
+            return
+        hidden_states0 = payload.hidden_states[0]
+        self.hidden_states_buf = torch.empty(
+            (self.req_pool_size, *hidden_states0.shape),
+            dtype=hidden_states0.dtype,
+            device=self.device,
+        )
+        self.hidden_valid_mask_buf = None
+        if (
+            payload.hidden_valid_mask is not None
+            and payload.hidden_valid_mask.numel() > 0
+        ):
+            hidden_valid_mask0 = payload.hidden_valid_mask[0]
+            self.hidden_valid_mask_buf = torch.empty(
+                (self.req_pool_size, *hidden_valid_mask0.shape),
+                dtype=hidden_valid_mask0.dtype,
                 device=self.device,
             )
 
@@ -298,7 +311,11 @@ class FutureMap:
             draft_input.transfer_warmup_rounds = self.transfer_warmup_rounds_buf[
                 indices
             ]
-        if self.need_hidden_states and not self.need_topk:
+        if (
+            self.need_hidden_states
+            and not self.need_topk
+            and self.hidden_states_buf is not None
+        ):
             draft_input.hidden_states = self.hidden_states_buf[indices]
             if (
                 getattr(self, "hidden_valid_mask_buf", None) is not None
@@ -388,6 +405,13 @@ class FutureMap:
                 self.topk_index_buf.dtype
             )
         if self.need_hidden_states:
+            self._maybe_init_hidden_buf(payload)
+        if (
+            self.need_hidden_states
+            and self.hidden_states_buf is not None
+            and payload.hidden_states is not None
+            and payload.hidden_states.numel() > 0
+        ):
             self.hidden_states_buf[indices] = payload.hidden_states.to(
                 self.hidden_states_buf.dtype
             )

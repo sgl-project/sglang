@@ -36,7 +36,7 @@ def build_dspark_disagg_draft_input(
     if all(hidden is not None for hidden in req_hidden_states):
         hidden_states = torch.stack(req_hidden_states, dim=0).to(batch.device)
         hidden_valid_mask = torch.ones(
-            (batch.batch_size(), 1), dtype=torch.bool, device=batch.device
+            (batch.batch_size(),), dtype=torch.bool, device=batch.device
         )
     else:
         hidden_states = torch.empty((0, 0), dtype=torch.float16, device=batch.device)

@@ -114,11 +114,6 @@ class _DSparkBlockInputBase(SpecInput):
 
 @dataclass
 class DSparkDraftBlockInput(_DSparkBlockInputBase):
-    hidden_states: torch.Tensor = field(
-        default_factory=lambda: torch.empty((0, 0), dtype=torch.float16)
-    )
-    hidden_valid_mask: Optional[torch.Tensor] = None
-
     def __post_init__(self):
         self._init_spec_input(SpecInputType.DSPARK_DRAFT_BLOCK)
 

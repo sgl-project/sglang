@@ -183,8 +183,8 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
 
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
     # multi_layer_eagle and DFLASH don't relay hidden_states through FutureMap.
-    # DSPARK carries accepted target hidden windows across decode iterations to
-    # match the DeepSpec draft-block conditioning semantics.
+    # DSPARK relays PD/bootstrap target hidden so decode-side draft state can be
+    # materialized from target context; normal draft blocks consume token embeds.
     # TODO(lsyin): also skip when step == 1.
     if server_args.speculative_algorithm in ("STANDALONE", "DFLASH"):
         return False

@@ -189,51 +189,6 @@ class DeepseekV4DSparkModel(nn.Module):
             )
         return hidden_states
 
-    def forward_backbone_from_mixed_main_hidden(
-        self,
-        main_hidden: torch.Tensor,
-        hidden_valid_mask: torch.Tensor,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
-        hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
-
-        hidden_valid_mask = hidden_valid_mask.to(
-            device=input_ids.device, dtype=torch.bool
-        ).reshape(-1)
-        if hidden_valid_mask.numel() != input_ids.numel():
-            raise RuntimeError(
-                "DSpark draft block hidden mask size mismatch: "
-                f"mask={hidden_valid_mask.numel()} input_ids={input_ids.numel()}"
-            )
-        if bool(hidden_valid_mask.any().item()):
-            projected = self.project_main_hidden(main_hidden[hidden_valid_mask])
-            projected = projected.unsqueeze(1).repeat(1, self.hc_mult, 1)
-            hidden_states = hidden_states.clone()
-            hidden_states[hidden_valid_mask] = projected
-
-        prev_residual, prev_post, prev_comb = None, None, None
-        last_layer = None
-        for layer in self.layers:
-            last_layer = layer
-            hidden_states, prev_residual, prev_post, prev_comb = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                input_ids=input_ids,
-                input_ids_global=input_ids,
-                prev_residual=prev_residual,
-                prev_post=prev_post,
-                prev_comb=prev_comb,
-            )
-        if last_layer is not None and prev_residual is not None:
-            hidden_states = last_layer.hc_post(
-                hidden_states, prev_residual, prev_post, prev_comb
-            )
-        return hidden_states
-
     def forward_backbone_from_main_hidden(
         self,
         main_hidden: torch.Tensor,
@@ -278,7 +233,6 @@ class DeepseekV4DSparkModel(nn.Module):
     ) -> torch.Tensor:
         spec_info = getattr(forward_batch, "spec_info", None)
         main_hidden = getattr(spec_info, "hidden_states", None)
-        hidden_valid_mask = getattr(spec_info, "hidden_valid_mask", None)
         spec_name = None
         if getattr(spec_info, "spec_input_type", None) is not None:
             spec_name = getattr(spec_info.spec_input_type, "name", None)
@@ -288,16 +242,6 @@ class DeepseekV4DSparkModel(nn.Module):
         ):
             hidden_states = self.forward_backbone_from_main_hidden(
                 main_hidden, input_ids, positions, forward_batch
-            )
-        elif (
-            spec_name == "DSPARK_DRAFT_BLOCK"
-            and main_hidden is not None
-            and main_hidden.numel() > 0
-            and hidden_valid_mask is not None
-            and hidden_valid_mask.numel() > 0
-        ):
-            hidden_states = self.forward_backbone_from_mixed_main_hidden(
-                main_hidden, hidden_valid_mask, input_ids, positions, forward_batch
             )
         else:
             hidden_states = self.forward_backbone(input_ids, positions, forward_batch)
