@@ -398,7 +398,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
 
   // We finally start setting up the read pointers for each thread. First, each thread jumps to the start of the
   // row it will read.
-  const T* thread_row_ptr = input + thread_row * ELTS_PER_ROW;
+  const T* thread_row_ptr = input + static_cast<int64_t>(thread_row) * ELTS_PER_ROW;
 
   // Now, we compute the group each thread belong to in order to determine the first column to start loads.
   const int thread_group_idx = threadIdx.x % THREADS_PER_ROW;

@@ -105,7 +105,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmaxPac
     return;
   }
 
-  const T* thread_row_ptr = input + thread_row * ELTS_PER_ROW;
+  const T* thread_row_ptr = input + static_cast<int64_t>(thread_row) * ELTS_PER_ROW;
   const int thread_group_idx = threadIdx.x % THREADS_PER_ROW;
   const int first_elt_read_by_thread = thread_group_idx * ELTS_PER_LDG;
   const T* thread_read_ptr = thread_row_ptr + first_elt_read_by_thread;
