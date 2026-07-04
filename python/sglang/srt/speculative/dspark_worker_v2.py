@@ -803,6 +803,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 expected_hidden_size,
             )
             return
+        hidden_valid_mask = draft_input.hidden_valid_mask
+        if hidden_valid_mask is None or hidden_valid_mask.numel() != bs:
+            return
 
         cache_loc = get_last_loc(
             self.model_runner.req_to_token_pool.req_to_token,
@@ -811,11 +814,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         positions = prefix_lens.to(torch.int64) - 1
         valid = (prefix_lens > 0) & (cache_loc >= 0)
-        hidden_valid_mask = draft_input.hidden_valid_mask
-        if hidden_valid_mask is not None and hidden_valid_mask.numel() == bs:
-            valid &= hidden_valid_mask.to(
-                device=valid.device, dtype=torch.bool, non_blocking=True
-            )
+        valid &= hidden_valid_mask.to(
+            device=valid.device, dtype=torch.bool, non_blocking=True
+        )
         if not valid.any():
             return
 

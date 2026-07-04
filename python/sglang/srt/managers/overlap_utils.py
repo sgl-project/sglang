@@ -256,6 +256,7 @@ class FutureMap:
                 dtype=hidden_valid_mask0.dtype,
                 device=self.device,
             )
+            self.hidden_valid_mask_buf.zero_()
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         if self.spec_algo.is_ngram():
@@ -422,6 +423,11 @@ class FutureMap:
                 self.hidden_valid_mask_buf[indices] = payload.hidden_valid_mask.to(
                     self.hidden_valid_mask_buf.dtype
                 )
+        elif (
+            self.need_hidden_states
+            and getattr(self, "hidden_valid_mask_buf", None) is not None
+        ):
+            self.hidden_valid_mask_buf[indices] = False
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
             self.draft_probs_buf[indices] = payload.draft_probs
         if (
