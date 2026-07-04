@@ -313,3 +313,32 @@
   - under a 16GB-class VRAM budget, SGLang Pi0.5 phase-offload is clearly faster than OpenPI native in-process policy, including OpenPI eager/no-compile mode
   - this does not contradict the 80GB resident result, where OpenPI native remains much faster; SGLang's current win is specifically the constrained-VRAM edge deployment path
   - current Pi0.5 batch mode is still request-loop/concurrent-request batching, not true model batching. The model tensor path supports batch dimensions, but `Pi05Preprocessor` currently rejects multi-sample prompt/state/noise and prefix cache/postprocess would need merge/split support before grouped execution is safe.
+
+## 2026-07-04 grouped Python batch path and 16GB comparison update
+
+- latest pushed grouped-batch commit before executor fix: `ee361d1304`
+- added a conservative native grouped Python path:
+  - `collate_pi05_observation_batches` batches compatible preprocessed Pi0.5 observations
+  - `slice_prefix_context` provides per-request views over a batched `PrefixContext`
+  - `Pi05PrefixStage.run_grouped_requests` runs one batched prefix encode for fresh-prefix compatible requests
+  - `Pi05ActionDenoisingStage.run_grouped_requests` runs one batched action denoise call and splits the action outputs
+  - benchmark flag: `--sglang-python-batch-mode grouped`
+- fixed grouped execution with component residency by using the first request as the residency metadata carrier while stages still receive the full request list
+- remote validation: `pi05-perf-opt`, 1x H100, GPU0 artificially constrained by ballast PID `4506`
+  - ballast used `65824 MiB`
+  - available memory before model load was about `15247 MiB`
+  - config: `/tmp/pi05_edge_16gb.json` with prefix cache disabled, CUDA graph disabled, vision after-embed offload, token embedding CPU, two prefix language layers phase-offloaded, action expert after-denoise offload, `empty_cache_after_prefix=true`
+- SGLang grouped Python phase-offload under the same 16GB-class pressure:
+  - single mean `1145.7 ms`
+  - grouped batch mean `1581.2 ms / 4`
+  - stage means: preprocess `3.35 ms`, prefix `746.0 ms`, action denoise `394.8 ms`, postprocess `0.11 ms`
+- comparison to earlier 16GB numbers:
+  - OpenPI native in-process: about `5401.9 ms` single, `11613.0 ms / 4` direct-model batch
+  - OpenPI eager/no-compile: about `5434.3 ms` single, `11736.0 ms / 4` direct-model batch
+  - SGLang Python request-loop path: about `1483.0 ms` single, `5532.9 ms / 4`
+  - SGLang OpenPI websocket server path: about `1225.2 ms` single, `5281.0 ms / 4`
+  - SGLang HTTP server path: about `1385.6 ms` single, `5150.3 ms / 4`
+- conclusion:
+  - grouped Python execution now removes the largest batch-mode inefficiency in the 16GB phase-offload path
+  - HTTP/websocket serving still use concurrent request dispatch rather than feeding grouped requests into the Pi0.5 grouped stage path, so server-side dynamic batching remains the next performance item
+  - the 80GB resident comparison is still unfavorable to SGLang versus OpenPI native policy; closing that gap requires action-expert graph/kernel work and server grouped batching, not just HTTP serialization cleanup

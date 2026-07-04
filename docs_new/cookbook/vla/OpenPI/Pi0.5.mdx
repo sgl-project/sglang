@@ -387,9 +387,9 @@ The benchmark reports:
 
 - SGLang HTTP latency for `/v1/actions/generations`, including stage timings when the server returns them.
 - SGLang OpenPI-compatible websocket latency when `--sglang-api openpi_ws` is set. This uses persistent msgpack websocket connections and is closer to the robot client path than JSON-over-HTTP.
-- SGLang Python in-process latency when `--sglang-api python` is set. This loads the native Pi0.5 pipeline in the benchmark process and avoids HTTP, websocket, scheduler, and serialization overhead.
+- SGLang Python in-process latency when `--sglang-api python` is set. This loads the native Pi0.5 pipeline in the benchmark process and avoids HTTP, websocket, scheduler, and serialization overhead. Use `--sglang-python-batch-mode grouped` to exercise the conservative native grouped-batch path.
 - OpenPI single-request latency through `Policy.infer`.
-- Batch latency for grouped robot streams. SGLang uses concurrent HTTP requests in HTTP mode and persistent multi-connection msgpack calls in websocket mode. OpenPI defaults to its internal direct model batch path because the public `Policy.infer` API is single-observation.
+- Batch latency for grouped robot streams. SGLang uses concurrent HTTP requests in HTTP mode and persistent multi-connection msgpack calls in websocket mode. The Python backend can use true grouped model execution for fresh-prefix requests. OpenPI defaults to its internal direct model batch path because the public `Policy.infer` API is single-observation.
 - Action difference on the common output prefix. Use `--deterministic-noise` for strict debugging when the SGLang and OpenPI horizons match. The `aloha` profile supports this directly; the LIBERO profile compares the common prefix because OpenPI's released LIBERO config uses a shorter output horizon than the LeRobot Pi0.5 checkpoint metadata.
 
 For one-sided 16GB-class checks, run each backend separately under the same VRAM pressure. The SGLang Python path accepts the same pipeline config override as serving:
@@ -398,6 +398,7 @@ For one-sided 16GB-class checks, run each backend separately under the same VRAM
 python python/sglang/multimodal_gen/benchmarks/bench_pi05_openpi.py \
   --profile aloha \
   --sglang-api python \
+  --sglang-python-batch-mode grouped \
   --skip-openpi \
   --sglang-pipeline-config-path pi05_edge_16gb.json \
   --num-inference-steps 10 \
@@ -409,7 +410,7 @@ python python/sglang/multimodal_gen/benchmarks/bench_pi05_openpi.py \
   --disable-cuda-graph
 ```
 
-Use `--skip-sglang --openpi-pytorch-compile-mode none` to measure an OpenPI eager baseline in the same environment. The `keep` mode preserves OpenPI's checkpoint default compile setting.
+Use `--skip-sglang --openpi-pytorch-compile-mode none` to measure an OpenPI eager baseline in the same environment. The `keep` mode preserves OpenPI's checkpoint default compile setting. The grouped Python path currently requires compatible fresh-prefix requests without split prefix/action workers or effective prefix-cache hits; other cases fall back to per-request execution.
 
 ## 8. Validation Notes
 
@@ -430,6 +431,6 @@ The following checks were run on H100 GPUs with the native SGLang Pi0.5 path:
 | 16GB-class phase-offload path | Single-GPU server with token embedding CPU, vision after-embed offload, two prefix language layers phase-offloaded, action expert after-denoise offload, prefix cache disabled, and CUDA graph disabled returned `[50, 32]` actions over both HTTP and OpenPI websocket under artificial VRAM pressure. Worker snapshot after request was about `12.8 GiB`; HTTP timings were about `32 ms` preprocess, `995 ms` prefix, `503 ms` action denoise. |
 | Full layerwise fallback | Split server with prefix CPU layerwise offload returned `[50, 32]` actions over both HTTP and OpenPI websocket under artificial VRAM pressure. Snapshot after request: prefix worker `7090 MiB`, action worker `8864 MiB`; HTTP timings were about `29 ms` preprocess, `5642 ms` prefix, `281 ms` action denoise. |
 | Run:ai direct loader | Single-GPU serve streamed `13.5 GiB` safetensors to `cuda:0` in `1.86 s` and returned `[50, 32]` actions. Split/offload paths were validated with the guarded non-direct loader to avoid distributed startup stalls and low-VRAM pressure. |
-| 16GB OpenPI comparison | With an H100 artificially constrained to about `15.2 GiB` free before model load, OpenPI native in-process policy took about `5.4 s` single request and `11.7 s / 4` direct-model batch in both default compile and eager modes. SGLang phase-offload under the same pressure took about `1.23 s` single over OpenPI websocket, `1.39 s` single over HTTP, and `1.48 s` single through the Python in-process benchmark. |
+| 16GB OpenPI comparison | With an H100 artificially constrained to about `15.2 GiB` free before model load, OpenPI native in-process policy took about `5.4 s` single request and `11.7 s / 4` direct-model batch in both default compile and eager modes. SGLang phase-offload under the same pressure took about `1.23 s` single over OpenPI websocket, `1.39 s` single over HTTP, and `1.15 s` single through the grouped Python benchmark. The grouped Python batch path took about `1.58 s / 4`, versus about `5.53 s / 4` for the request-loop Python path. |
 
 Run a full HTTP or websocket smoke test in your robot deployment environment before using the policy in a closed-loop controller.
