@@ -866,6 +866,7 @@ class Envs:
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
+    SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
@@ -904,6 +905,11 @@ class Envs:
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
+    # Opt-in: route DeepSeek-V3 grouped topk through the unified Triton router
+    # instead of the flashinfer/AOT grouped kernels. Off by default (flashinfer is
+    # the tuned production path); the Triton path is bit-exact on DeepSeek-V3.2 e2e
+    # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
+    SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
 
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.

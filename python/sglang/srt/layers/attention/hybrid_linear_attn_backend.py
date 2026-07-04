@@ -53,46 +53,6 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
 
-    def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
-        """Run deferred clear/COW ops on the forward stream to avoid races."""
-        if (
-            not forward_batch.forward_mode.is_extend()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-            or self.is_draft_worker
-        ):
-            return
-        if (
-            forward_batch.mamba_clear_indices is not None
-            and len(forward_batch.mamba_clear_indices) > 0
-        ):
-            # mamba_pool is a pure PHYSICAL store; translate before zeroing or
-            # clear_slots zeroes the wrong physical slots.
-            self.req_to_token_pool.mamba_pool.clear_slots(
-                self._translate_mamba_indices(forward_batch.mamba_clear_indices)
-            )
-        if (
-            forward_batch.mamba_cow_src_indices is not None
-            and len(forward_batch.mamba_cow_src_indices) > 0
-        ):
-            ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
-            if ckpt_pool is not None:
-                # int8 checkpoints: dequantize src int8 ckpt slot into the active bf16 dst.
-                ckpt_pool.load_to_active(
-                    self.req_to_token_pool.mamba_pool,
-                    forward_batch.mamba_cow_src_indices,
-                    forward_batch.mamba_cow_dst_indices,
-                )
-            else:
-                # mamba_pool is a pure PHYSICAL store; translate both COW slot ids.
-                self.req_to_token_pool.mamba_pool.copy_from(
-                    self._translate_mamba_indices(forward_batch.mamba_cow_src_indices),
-                    self._translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
-                )
-        forward_batch.mamba_clear_indices = None
-        forward_batch.mamba_cow_src_indices = None
-        forward_batch.mamba_cow_dst_indices = None
-
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba slot-id translate (identity for the non-unified
         pool). Must run everywhere mamba ids feed the SSM/conv kernels or mamba-pool
@@ -274,7 +234,6 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        self._execute_deferred_mamba_cow_and_clear(forward_batch)
         self.forward_metadata = self._forward_metadata(forward_batch)
 
     def _init_track_conv_indices(
@@ -767,7 +726,6 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        self._execute_deferred_mamba_cow_and_clear(forward_batch)
         metadata = self._forward_metadata(forward_batch)
         self.forward_metadata = Mamba2Metadata.prepare_mixed(
             metadata,
