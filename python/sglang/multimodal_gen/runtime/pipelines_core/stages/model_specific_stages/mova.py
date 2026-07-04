@@ -25,13 +25,16 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     cfg_model_parallel_all_reduce,
-    sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
-    get_sp_parallel_rank,
-    get_sp_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    SpShard,
+    gather_seq,
+    shard_seq,
+    tail_attn_meta,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 
@@ -651,64 +654,15 @@ class MOVADenoisingStage(PipelineStage):
 
     def _shard_sequence_for_sp(
         self, x: torch.Tensor, dim: int = 1
-    ) -> tuple[torch.Tensor, int]:
-        """
-        Shard tensor along sequence dimension for Sequence Parallelism.
-
-        Args:
-            x: Input tensor
-            dim: Dimension to shard along
-
-        Returns:
-            (sharded_tensor, pad_len)
-        """
-        sp_size = get_sp_world_size()
-        if sp_size <= 1:
-            return x, 0
-
-        sp_rank = get_sp_parallel_rank()
-        seq_len = x.shape[dim]
-
-        # Pad if needed
-        pad_len = (sp_size - (seq_len % sp_size)) % sp_size
-        if pad_len > 0:
-            pad_shape = list(x.shape)
-            pad_shape[dim] = pad_len
-            pad = torch.zeros(pad_shape, dtype=x.dtype, device=x.device)
-            x = torch.cat([x, pad], dim=dim)
-
-        # Shard
-        chunk_size = x.shape[dim] // sp_size
-        start = sp_rank * chunk_size
-        end = start + chunk_size
-        idx = [slice(None)] * x.dim()
-        idx[dim] = slice(start, end)
-        return x[tuple(idx)], pad_len
+    ) -> tuple[torch.Tensor, SpShard]:
+        """Tail-padded even shard along the sequence dim (sp_shard.shard_seq)."""
+        return shard_seq(x, dim=dim)
 
     def _gather_sequence_from_sp(
-        self, x: torch.Tensor, pad_len: int, dim: int = 1
+        self, x: torch.Tensor, shard: SpShard, dim: int = 1
     ) -> torch.Tensor:
-        """
-        Gather tensor along sequence dimension after Sequence Parallelism.
-
-        Args:
-            x: Sharded tensor
-            pad_len: Padding length that was added during sharding
-            dim: Dimension to gather along
-
-        Returns:
-            Gathered tensor with padding removed
-        """
-        sp_size = get_sp_world_size()
-        if sp_size <= 1:
-            return x
-
-        gathered = sequence_model_parallel_all_gather(x, dim=dim)
-        if pad_len > 0:
-            idx = [slice(None)] * gathered.dim()
-            idx[dim] = slice(0, gathered.shape[dim] - pad_len)
-            gathered = gathered[tuple(idx)]
-        return gathered
+        """Gather an SP-sharded tensor and trim the tail padding."""
+        return gather_seq(x, shard.orig_len, dim=dim)
 
     def inference_single_step(
         self,
@@ -817,12 +771,19 @@ class MOVADenoisingStage(PipelineStage):
         ).reshape(full_audio_seq_len, 1, -1)
 
         # Shard sequences for SP
-        visual_x, visual_pad_len = self._shard_sequence_for_sp(visual_x, dim=1)
-        audio_x, audio_pad_len = self._shard_sequence_for_sp(audio_x, dim=1)
+        visual_x, visual_shard = self._shard_sequence_for_sp(visual_x, dim=1)
+        audio_x, audio_shard = self._shard_sequence_for_sp(audio_x, dim=1)
 
         # Shard freqs to match local sequence length
         visual_freqs, _ = self._shard_sequence_for_sp(visual_freqs, dim=0)
         audio_freqs, _ = self._shard_sequence_for_sp(audio_freqs, dim=0)
+
+        # Tail-pad meta so self-attention excludes SP padding (built once per
+        # step, shared by every block).
+        visual_attn_meta = tail_attn_meta(
+            visual_shard, visual_x.shape[0], visual_x.device
+        )
+        audio_attn_meta = tail_attn_meta(audio_shard, audio_x.shape[0], audio_x.device)
 
         # Forward through dual-tower DiT
         visual_x, audio_x = self.forward_dual_tower_dit(
@@ -839,11 +800,13 @@ class MOVADenoisingStage(PipelineStage):
             video_fps=video_fps,
             full_visual_seq_len=full_visual_seq_len,
             full_audio_seq_len=full_audio_seq_len,
+            visual_attn_meta=visual_attn_meta,
+            audio_attn_meta=audio_attn_meta,
         )
 
         # Gather sequences back from SP before head/unpatchify
-        visual_x = self._gather_sequence_from_sp(visual_x, visual_pad_len, dim=1)
-        audio_x = self._gather_sequence_from_sp(audio_x, audio_pad_len, dim=1)
+        visual_x = self._gather_sequence_from_sp(visual_x, visual_shard, dim=1)
+        audio_x = self._gather_sequence_from_sp(audio_x, audio_shard, dim=1)
 
         visual_output = visual_dit.head(visual_x, visual_t)
         visual_output = visual_dit.unpatchify(visual_output, grid_size)
@@ -871,6 +834,8 @@ class MOVADenoisingStage(PipelineStage):
         condition_scale: float | None = 1.0,
         a2v_condition_scale: float | None = None,
         v2a_condition_scale: float | None = None,
+        visual_attn_meta: dict | None = None,
+        audio_attn_meta: dict | None = None,
     ):
         """
         Forward pass through dual-tower DiT with cross-modal interaction.
@@ -934,15 +899,29 @@ class MOVADenoisingStage(PipelineStage):
 
             # Self-attention and FFN in DiT blocks
             visual_x = visual_block(
-                visual_x, visual_context, visual_t_mod, visual_freqs
+                visual_x,
+                visual_context,
+                visual_t_mod,
+                visual_freqs,
+                attn_mask_meta=visual_attn_meta,
             )
-            audio_x = audio_block(audio_x, audio_context, audio_t_mod, audio_freqs)
+            audio_x = audio_block(
+                audio_x,
+                audio_context,
+                audio_t_mod,
+                audio_freqs,
+                attn_mask_meta=audio_attn_meta,
+            )
 
         # Process remaining visual layers (if visual has more layers than audio)
         for layer_idx in range(min_layers, visual_layers):
             visual_block = visual_dit.blocks[layer_idx]
             visual_x = visual_block(
-                visual_x, visual_context, visual_t_mod, visual_freqs
+                visual_x,
+                visual_context,
+                visual_t_mod,
+                visual_freqs,
+                attn_mask_meta=visual_attn_meta,
             )
 
         return visual_x, audio_x
