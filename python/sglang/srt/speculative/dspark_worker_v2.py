@@ -1024,10 +1024,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             if valid.numel() == 0:
                 return None
             valid = valid[: min(int(valid.numel()), 16)]
-            rows = get_swa_raw_buffer(int(layer_id))[valid]
+            raw = get_swa_raw_buffer(int(layer_id))
+            rows = raw[valid]
             rows_f = rows.float()
             return {
                 "layer_id": int(layer_id),
+                "raw_shape": [int(x) for x in raw.shape],
                 "num_rows": int(valid.numel()),
                 "swa_locs": [int(x) for x in valid.detach().cpu().tolist()],
                 "sum": float(rows_f.sum().detach().cpu()),
@@ -1072,7 +1074,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "full_last8": [int(x) for x in full_locs[-8:].detach().cpu().tolist()],
                 "swa_first8": [int(x) for x in swa_locs[:8].detach().cpu().tolist()],
                 "swa_last8": [int(x) for x in swa_locs[-8:].detach().cpu().tolist()],
-                "kv_checksums": [
+                "context_kv_checksums": [
+                    self._checksum_swa_kv_rows(
+                        layer_id=layer_id,
+                        swa_locs=swa_locs[: min(8, max(int(swa_locs.numel()) - int(block_size), 0))],
+                    )
+                    for layer_id in layer_ids
+                ],
+                "block_kv_checksums": [
                     self._checksum_swa_kv_rows(
                         layer_id=layer_id,
                         swa_locs=swa_locs[-int(block_size) :],
