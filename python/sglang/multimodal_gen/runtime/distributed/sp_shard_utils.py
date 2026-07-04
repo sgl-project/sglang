@@ -94,7 +94,7 @@ def shard_seq(
         zeroes: pad with zeroes at tail
         repeat_last: repeat the last token, only for rotary embedding
     """
-    shard = build_shard_plan(x.shape[dim])
+    shard = _build_shard_plan(x.shape[dim])
     return _shard_like(x, shard, dim=dim, pad_mode=pad_mode), shard
 
 
@@ -116,7 +116,7 @@ def shard_seq_prefix(
     rest = x.shape[dim] - prefix_len
     return torch.cat(
         [
-            shard_like(x.narrow(dim, 0, prefix_len), shard, dim=dim),
+            _shard_like(x.narrow(dim, 0, prefix_len), shard, dim=dim),
             x.narrow(dim, prefix_len, rest),
         ],
         dim=dim,
