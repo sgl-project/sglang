@@ -1025,13 +1025,31 @@ class DSparkWorkerV2(BaseSpecWorker):
                 return None
             valid = valid[: min(int(valid.numel()), 16)]
             raw = get_swa_raw_buffer(int(layer_id))
-            rows = raw[valid]
+            swa_pool = getattr(token_to_kv_pool, "swa_kv_pool", None)
+            page_size = int(getattr(swa_pool, "page_size", 1))
+            page_ids = torch.div(valid, page_size, rounding_mode="floor")
+            page_offsets = valid % page_size
+            in_bounds = page_ids < int(raw.shape[0])
+            page_ids = page_ids[in_bounds]
+            page_offsets = page_offsets[in_bounds]
+            valid = valid[in_bounds]
+            if valid.numel() == 0:
+                return None
+            page_rows = raw[page_ids].reshape(valid.shape[0], page_size, -1)
+            rows = page_rows[
+                torch.arange(valid.shape[0], device=valid.device), page_offsets
+            ]
             rows_f = rows.float()
             return {
                 "layer_id": int(layer_id),
                 "raw_shape": [int(x) for x in raw.shape],
+                "page_size": page_size,
                 "num_rows": int(valid.numel()),
                 "swa_locs": [int(x) for x in valid.detach().cpu().tolist()],
+                "page_ids": [int(x) for x in page_ids.detach().cpu().tolist()],
+                "page_offsets": [
+                    int(x) for x in page_offsets.detach().cpu().tolist()
+                ],
                 "sum": float(rows_f.sum().detach().cpu()),
                 "abs_sum": float(rows_f.abs().sum().detach().cpu()),
                 "max_abs": float(rows_f.abs().max().detach().cpu()),
