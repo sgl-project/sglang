@@ -532,8 +532,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # only, so a draft init cannot clobber target-derived global state).
         if not self.is_draft_worker:
             set_global_server_args_for_scheduler(server_args)
-            # FIXME: hacky set `use_mla_backend`
-            get_global_server_args().use_mla_backend = self.use_mla_backend
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":

@@ -553,6 +553,14 @@ class Scheduler(
 
         self.init_batch_result_processor()
 
+        # The config-resolution lifecycle of this scheduler process ends
+        # here: every load-time stage has run (target and draft model init,
+        # weight-resolved kv-cache dtype), so lock the static flag groups.
+        # flags.capture stays writable; late resolution writes now raise.
+        from sglang.srt.runtime_context import get_context
+
+        get_context().freeze_flags()
+
         self.is_initializing = False
 
     def init_zbal_on_npu(self):
