@@ -1492,7 +1492,7 @@ class ServerArgs:
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; uses cuBLAS via torch.nn.functional.linear), 'tgv' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X); dispatches between TGV and cuBLAS).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; uses cuBLAS via torch.nn.functional.linear), 'tgv' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between TGV and cuBLAS).",
             cli_name="--bf16-gemm-backend",
             choices=BF16_GEMM_BACKEND_CHOICES,
         ),

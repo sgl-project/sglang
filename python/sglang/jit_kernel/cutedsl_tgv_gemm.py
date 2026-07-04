@@ -138,7 +138,7 @@ class TgvGemmCuteExtKernel:
         # 1-CTA: cta_n ∈ [8, 256] step 8 (bf16 tcgen05.mma atom limit).
         # 2-CTA: cta_n ∈ [16, 256] step 16 (bf16 K-major cluster mma).
         min_n, step_n = (16, 16) if use_2cta else (8, 8)
-        if cta_n < min_n or cta_n % step_n != 0:
+        if cta_n < min_n or cta_n > 256 or cta_n % step_n != 0:
             raise ValueError(
                 f"cta_n={cta_n} invalid for use_2cta={use_2cta}: "
                 f"bf16 K-major mma requires N ∈ [{min_n}, 256] step {step_n}"
@@ -158,6 +158,13 @@ class TgvGemmCuteExtKernel:
             self.mma_tiler_mn = (cta_m, cta_n)
             self.cta_group = tcgen05.CtaGroup.ONE
             self.tma_op = cute_ext.OperationTypeEnum.SM90_TMA_LOAD
+
+    def __repr__(self) -> str:
+        return (
+            f"TgvGemmCuteExtKernel_cta{self.cta_m}x{self.cta_n}x{self.cta_k}"
+            f"_2cta{int(self.use_2cta)}_pdl{int(self.use_pdl)}"
+            f"_bias{int(self.has_bias)}"
+        )
 
     @cute.experimental.jit
     def __call__(
