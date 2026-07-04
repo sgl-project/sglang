@@ -481,7 +481,25 @@ class RuntimeContext:
     def _resolve_flags(self, server_args: ServerArgs) -> None:
         declarations = getattr(server_args, "_resolved_overrides", None)
         if declarations is None and not self._runtime_overrides:
-            return
+            # Stash-less publish. For a config-shaped object (a dataclass:
+            # mock ServerArgs fixtures, dummy-path instances that skipped the
+            # monolith) still materialize the whitelist from its own fields,
+            # so flag reads match legacy server_args reads. Skip only for
+            # field-less sentinels (tests publishing object()).
+            if not dataclasses.is_dataclass(server_args):
+                return
+            from sglang.srt.arg_groups.arg_utils import resolvable_fields
+
+            if any(
+                field not in vars(server_args)
+                for field in resolvable_fields(type(server_args))
+            ):
+                # Bare object.__new__ fixtures: dataclass defaults live on
+                # the class, not the instance — nothing was populated, so
+                # treat it as a sentinel (hasattr would see the class
+                # defaults and materialize them, clobbering resolved flags).
+                return
+            declarations = ()
         declarations = list(declarations or ()) + self._runtime_overrides
         from sglang.srt.arg_groups.overrides import (
             apply_model_overrides,

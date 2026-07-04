@@ -415,6 +415,20 @@ class TestRuntimeResolutionStages(_IsolatedServerArgs):
         finally:
             reset_context()
 
+    def test_bare_dataclass_publish_skips_materialization(self):
+        # object.__new__(ServerArgs) fixtures (no __init__, no field values)
+        # must publish without touching the flags tier — dataclass defaults
+        # live on the class, so materializing from them would clobber
+        # previously resolved flags with defaults.
+        from sglang.srt.server_args import ServerArgs
+
+        self._publish(page_size=64)
+        self.assertEqual(get_flags().page_size, 64)
+        bare = object.__new__(ServerArgs)
+        get_context().set_server_args(bare)
+        self.assertIs(get_server_args(), bare)
+        self.assertEqual(get_flags().page_size, 64)  # not clobbered
+
     def test_capture_tier_defaults_for_sentinel_publish(self):
         get_context().set_server_args(object())
         self.assertFalse(get_flags().capture.enable_torch_compile)

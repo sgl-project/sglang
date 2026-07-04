@@ -539,7 +539,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_threads_binding()
 
         # Set float32 matmul precision
-        if server_args.enable_tf32_matmul:
+        if get_flags().enable_tf32_matmul:
             torch.set_float32_matmul_precision("high")
 
         # Get available memory before model loading.
