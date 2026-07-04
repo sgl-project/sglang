@@ -377,3 +377,10 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("rvv")
+def create_rvv_backend(runner):
+    from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
+
+    return RVVAttnBackend(runner)

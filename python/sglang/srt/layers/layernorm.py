@@ -35,6 +35,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    cpu_has_rvv_support,
     get_bool_env_var,
     is_cpu,
     is_cuda,
@@ -52,6 +53,7 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu_rvv_available = cpu_has_rvv_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
@@ -507,7 +509,7 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if _is_cpu_amx_available:
+        if _is_cpu_amx_available or _is_cpu_rvv_available:
             if residual is not None:
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
@@ -636,7 +638,7 @@ class LayerNorm(MultiPlatformOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        if _is_cpu_amx_available:
+        if _is_cpu_amx_available or _is_cpu_rvv_available:
             bias_data = self.bias.data if self.use_bias else None
             return torch.ops.sgl_kernel.layernorm_cpu(
                 x, self.weight.data, bias_data, self.variance_epsilon
@@ -765,7 +767,7 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if _is_cpu_amx_available:
+        if _is_cpu_amx_available or _is_cpu_rvv_available:
             if residual is not None:
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
@@ -841,7 +843,7 @@ class Gemma3RMSNorm(MultiPlatformOp):
         return output.type_as(x)
 
     def forward_cpu(self, x):
-        if _is_cpu_amx_available and x.stride(-1) == 1:
+        if (_is_cpu_amx_available or _is_cpu_rvv_available) and x.stride(-1) == 1:
             return torch.ops.sgl_kernel.gemma3_rmsnorm_cpu(x, self.weight, self.eps)
         return self.forward_native(x)
 

@@ -22,12 +22,20 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_linear_ramp_mask,
 )
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.utils import cpu_has_amx_support, get_device, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    cpu_has_rvv_support,
+    get_device,
+    is_cuda,
+    is_hip,
+    is_npu,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu_rvv_available = cpu_has_rvv_support()
 
 if _is_npu:
     import torch_npu
@@ -526,7 +534,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         positions = torch.add(positions, offsets) if offsets is not None else positions
-        if _is_cpu_amx_available:
+        if _is_cpu_amx_available or _is_cpu_rvv_available:
             return torch.ops.sgl_kernel.rotary_embedding_cpu(
                 positions, query, key, self.head_size, self.cos_sin_cache, False
             )
