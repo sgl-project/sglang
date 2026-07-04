@@ -438,33 +438,18 @@ class ServerArgs(DisaggServerArgsMixin):
         self.nunchaku_config = resolution.nunchaku_config
 
     def adjust_pipeline_config(self):
-        # The text encoder runs in the encoding stage, before denoising, when
-        # every GPU in the DiT replica is idle. Parallel-fold (TP-shard) the T5
-        # encoder across all of them so cfg-parallel and mixed-parallel runs do
-        # not leave it on a single GPU while the rest sit idle.
-        #
-        # Fold over the whole single replica (world group) whenever the DiT
-        # parallelism spans more GPUs than TP alone (cfg/sp beyond tp). Pure TP
-        # (replica == tp) already uses every replica GPU, so it is left
-        # untouched (no folding, no extra gather). dp>1 / disaggregated runs
-        # keep the existing SP folding — a per-replica sub-group is a follow-up.
+        # The T5 encoder runs in the encoding stage while the whole DiT replica
+        # is idle, so fold (TP-shard) it across all replica GPUs — not just tp —
+        # when cfg/sp make the replica larger than tp. Pure TP already uses all.
         tp_size = self.tp_size or 1
         dp_size = self.dp_size or 1
         sp_degree = self.sp_degree or 1
-        # Size of one DiT replica = all its GPUs, however the DiT is split.
-        # Derive it from the authoritative GPU count rather than multiplying
-        # individual axes, so every parallelism (tp x cfg x ulysses x ring x
-        # pp x anything future) is covered without enumerating them. Runs after
-        # _adjust_parallelism(), so num_gpus / degrees are resolved.
+        # One replica = all its GPUs; derive from num_gpus so any axis combo
+        # (tp x cfg x ulysses x ring x pp) is covered without enumeration.
         replica_size = (self.num_gpus or tp_size) // dp_size
-        fold_world = (
-            dp_size == 1
-            # For dp==1 monolithic the world group == the single DiT replica.
-            # dp>1 (world spans replicas) and disaggregated / dedicated-VAE
-            # layouts keep the existing per-SP folding.
-            and not self.disagg_mode
-            and replica_size > tp_size
-        )
+        # dp==1 monolithic: world group == the single replica. dp>1 /
+        # disaggregated keep the existing per-SP folding.
+        fold_world = dp_size == 1 and not self.disagg_mode and replica_size > tp_size
 
         enabled_mode = None
         for text_encoder_config in self.pipeline_config.text_encoder_configs:

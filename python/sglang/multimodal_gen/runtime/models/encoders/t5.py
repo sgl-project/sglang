@@ -63,9 +63,8 @@ def _get_folding_tp_group(
         elif config.parallel_folding_mode == "ring":
             return get_sp_group().ring_group
         elif config.parallel_folding_mode == "world":
-            # Fold across the whole single-replica DiT (all GPUs), so the
-            # encoder uses every otherwise-idle GPU during the encoding stage
-            # regardless of the DiT's tp/sp/cfg split.
+            # Fold across the whole single-replica DiT (all GPUs), regardless
+            # of its tp/sp/cfg split.
             return get_world_group()
     return get_tp_group()
 
