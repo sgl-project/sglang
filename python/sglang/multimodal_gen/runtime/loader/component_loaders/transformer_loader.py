@@ -85,7 +85,12 @@ class TransformerLoader(ComponentLoader):
         component_server_args = _server_args_for_transformer_component(
             server_args, component_name
         )
-        return component_server_args.transformer_weights_path is not None
+        # Don't let a quantized load quietly fall back to the unquantized native
+        # model. That would drop the requested precision and bury the real error.
+        return (
+            component_server_args.transformer_weights_path is not None
+            or component_server_args.quantization is not None
+        )
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
@@ -165,6 +170,10 @@ class TransformerLoader(ComponentLoader):
             reduce_dtype=torch.float32,
             output_dtype=None,
             strict=False,
+            defer_cpu_offload_until_after_weight_processing=(
+                component_server_args.dit_cpu_offload
+                and quant_spec.requires_device_weight_processing
+            ),
         )
 
         # post-hooks (e.g., patch scales (nunchaku))
