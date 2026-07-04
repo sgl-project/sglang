@@ -41,8 +41,6 @@ OTHER_ARGS = [
     10,
     "--tp-size",
     2,
-    "--base-gpu-id",
-    4,
     "--mem-fraction-static",
     0.8,
     "--dtype",
