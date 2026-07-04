@@ -310,6 +310,29 @@ class BaseSpecWorker(ABC):
     def init_cuda_graphs(self):
         pass
 
+    def prepare_for_draft_extend(
+        self,
+        draft_extend_input: EagleDraftExtendInput,
+        batch: ScheduleBatch,
+        predict: torch.Tensor,
+        num_draft_tokens: int,
+        draft_model_runner: Any,
+        cuda_graph_runner: Any,
+    ):
+        # The draft-extend lifecycle is generic SpecV2 behavior, but the
+        # original implementation lives on EagleDraftWorkerBase. Expose the same
+        # helper on BaseSpecWorker so non-EAGLE workers such as DSpark can reuse
+        # the exact metadata/DP-token handling without relying on __getattr__.
+        return EagleDraftWorkerBase.prepare_for_draft_extend(
+            self,
+            draft_extend_input,
+            batch,
+            predict,
+            num_draft_tokens,
+            draft_model_runner,
+            cuda_graph_runner,
+        )
+
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
     ) -> None:
