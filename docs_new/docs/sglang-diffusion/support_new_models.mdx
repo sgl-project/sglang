@@ -7,6 +7,22 @@ This guide is a triage flow, not a directory tour. Start by finding the
 smallest change that can support the model. Most new model work should touch a
 small set of files, even though the runtime is split into separate folders.
 
+## Read the Code in This Order
+
+The files are split by runtime responsibility, so do not try to understand the
+whole tree first. For a new model, follow the request path:
+
+1. `registry.py` chooses the model family, sampling params, and pipeline config.
+2. `configs/pipeline_configs/{model}.py` defines model-specific denoising and
+   decoding behavior.
+3. `runtime/pipelines/{model}.py` wires modules into stages.
+4. `runtime/pipelines_core/stages/` runs the shared stage logic.
+5. `runtime/models/` contains native model components only when the architecture
+   cannot be reused.
+
+That is the dependency direction. Avoid making a model PR that requires readers
+to jump between folders in a different order.
+
 ## Start With the Smallest Change
 
 Before adding files, decide which path fits the model.
