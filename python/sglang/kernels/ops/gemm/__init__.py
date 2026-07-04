@@ -23,7 +23,6 @@ register_kernel(
         op="gemm.fp8_scaled_mm",
         backend=KernelBackend.CUDA_AOT,
         target="sgl_kernel:fp8_scaled_mm",
-        priority=10,
         format_signature=FormatSignature(
             supported_dtypes=("float8_e4m3fn",),
             description="C = (A_fp8 @ B_fp8) * scales_a * scales_b (+ bias)",
@@ -36,7 +35,6 @@ register_kernel(
         op="gemm.dsv3_fused_a_gemm",
         backend=KernelBackend.CUDA_AOT,
         target="sgl_kernel:dsv3_fused_a_gemm",
-        priority=10,
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
             description="DeepSeek-V3 fused QKV-A GEMM",
@@ -49,7 +47,6 @@ register_kernel(
         op="gemm.dsv3_fused_a_gemm",
         backend=KernelBackend.CUDA_JIT,
         target="sglang.jit_kernel.dsv3_fused_a_gemm:dsv3_fused_a_gemm",
-        priority=5,
         capability=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
@@ -63,7 +60,6 @@ register_kernel(
         op="gemm.dsv3_router_gemm",
         backend=KernelBackend.CUDA_JIT,
         target="sglang.jit_kernel.dsv3_router_gemm:dsv3_router_gemm",
-        priority=10,
         capability=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),

@@ -137,8 +137,6 @@ class KernelSpec(msgspec.Struct, frozen=True):
         Hardware requirement used by the selector to skip unusable backends.
     format_signature:
         Optional data-contract description for inventory/documentation.
-    priority:
-        Higher wins when the selector ranks otherwise-equal candidates.
     description:
         Human-readable one-liner.
     """
@@ -150,7 +148,6 @@ class KernelSpec(msgspec.Struct, frozen=True):
         default_factory=CapabilityRequirement
     )
     format_signature: FormatSignature = msgspec.field(default_factory=FormatSignature)
-    priority: int = 0
     description: str = ""
 
     @property

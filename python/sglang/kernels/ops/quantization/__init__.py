@@ -23,7 +23,6 @@ register_kernel(
         op="quantization.sgl_per_token_quant_fp8",
         backend=KernelBackend.CUDA_AOT,
         target="sgl_kernel:sgl_per_token_quant_fp8",
-        priority=10,
         format_signature=FormatSignature(
             supported_dtypes=("float8_e4m3fn",),
             in_place=True,
@@ -44,7 +43,6 @@ for _name in (
             op=f"quantization.{_name}",
             backend=KernelBackend.CUDA_AOT,
             target=f"sgl_kernel:{_name}",
-            priority=10,
             format_signature=FormatSignature(
                 in_place=True,
                 description="per-token-group 8-bit quantization",
@@ -59,7 +57,6 @@ register_kernel(
         op="quantization.sgl_per_token_group_quant_8bit",
         backend=KernelBackend.CUDA_JIT,
         target="sglang.jit_kernel.per_token_group_quant_8bit:per_token_group_quant_8bit",
-        priority=5,
         capability=_CUDA,
         format_signature=FormatSignature(
             in_place=True,

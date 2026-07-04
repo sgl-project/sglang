@@ -1,17 +1,16 @@
-"""Heuristic kernel selection over the :data:`registry`.
+"""Fixed-path kernel resolution over the :data:`registry`.
 
-RFC #29630 asks the first version to "start with a heuristic policy only" and
-leave autotuning for later. :func:`select_kernel` ranks the registered backends
-for an operator by:
+There is no priority ranking or heuristic backend selection. Each operator has
+a fixed call path — its :attr:`KernelSpec.target`:
 
-1. explicit backend request (if given, only that backend is considered);
-2. runnability on the target platform (capability check);
-3. spec ``priority`` (higher first);
-4. a stable backend preference order as the final tie-breaker.
+- an op with a single registered backend resolves to it directly;
+- an op with several registered backends must be resolved by naming the backend
+  explicitly (``backend=...``). The extra backends exist only as inventory, and
+  are never silently auto-picked.
 
 :func:`get_kernel` is the fast path used by the public ``ops.*`` wrappers: it
-resolves the selected spec to its callable and caches the result so repeated
-calls do not re-run selection or re-import.
+resolves the spec to its callable and caches the result so repeated calls do
+not re-run resolution or re-import.
 """
 
 from __future__ import annotations
@@ -20,44 +19,26 @@ from functools import lru_cache
 from typing import Callable, Optional
 
 from sglang.kernels.registry import registry
-from sglang.kernels.spec import KernelBackend, KernelSpec, PlatformInfo
-
-# Final tie-breaker when priority is equal. AOT (the stable wheel) is preferred
-# over JIT, then Triton, then the torch fallback last.
-_BACKEND_PREFERENCE = {
-    KernelBackend.CUDA_AOT: 6,
-    KernelBackend.FLASHINFER: 5,
-    KernelBackend.CUDA_JIT: 4,
-    KernelBackend.CUTE_DSL: 3,
-    KernelBackend.DEEPGEMM: 2,
-    KernelBackend.TRITON: 1,
-    KernelBackend.TORCH: 0,
-}
+from sglang.kernels.spec import KernelBackend, KernelSpec
 
 
-def select_kernel(
-    op: str,
-    backend: Optional[KernelBackend] = None,
-    platform: Optional[PlatformInfo] = None,
-) -> KernelSpec:
-    """Return the best :class:`KernelSpec` for ``op``.
+def select_kernel(op: str, backend: Optional[KernelBackend] = None) -> KernelSpec:
+    """Return the :class:`KernelSpec` for ``op`` (its fixed call path).
 
     Parameters
     ----------
     op:
         Operator id, ``"<group>.<name>"``.
     backend:
-        If given, restrict the choice to this backend (no heuristic ranking).
-    platform:
-        Platform to check capabilities against. Defaults to
-        :meth:`PlatformInfo.detect`.
+        Required only when ``op`` has more than one registered backend; selects
+        which one. For single-backend ops it is optional.
 
     Raises
     ------
     KeyError
         If ``op`` is unknown, or if ``backend`` is requested but not registered.
-    RuntimeError
-        If no registered backend can run on ``platform``.
+    ValueError
+        If ``op`` has multiple backends and ``backend`` is not given.
     """
     specs = registry.get(op)
     if not specs:
@@ -69,19 +50,13 @@ def select_kernel(
                 return spec
         raise KeyError(f"No '{backend.value}' backend registered for op {op!r}")
 
-    plat = platform if platform is not None else PlatformInfo.detect()
-    runnable = [s for s in specs if s.is_available(plat)]
-    if not runnable:
-        raise RuntimeError(
-            f"No registered backend for op {op!r} can run on platform {plat}. "
-            f"Registered backends: {[s.backend.value for s in specs]}"
-        )
+    if len(specs) == 1:
+        return specs[0]
 
-    runnable.sort(
-        key=lambda s: (s.priority, _BACKEND_PREFERENCE.get(s.backend, -1)),
-        reverse=True,
+    raise ValueError(
+        f"op {op!r} has multiple registered backends "
+        f"({[s.backend.value for s in specs]}); pass backend=... to choose one"
     )
-    return runnable[0]
 
 
 @lru_cache(maxsize=None)
@@ -93,10 +68,7 @@ def get_kernel(op: str, backend: Optional[KernelBackend] = None) -> Callable:
     """Resolve ``op`` to a callable kernel and cache it.
 
     This is what the public ``sglang.kernels.ops.*`` wrappers call. The first
-    call selects and imports the backend; later calls hit the cache. Note the
-    cache keys only on ``(op, backend)`` and therefore does not react to the
-    live platform — callers that need platform-sensitive re-selection should
-    use :func:`select_kernel` directly.
+    call resolves and imports the backend; later calls hit the cache.
     """
     return _resolve(op, backend)
 

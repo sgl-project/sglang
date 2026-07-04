@@ -22,7 +22,6 @@ register_kernel(
         op="kvcache.reshape_and_cache_flash",
         backend=KernelBackend.TRITON,
         target="sglang.srt.layers.attention.triton_ops.cache_ops:launch_reshape_and_cache_flash",
-        priority=10,
         format_signature=FormatSignature(
             in_place=True,
             description="write token-major K/V into paged KV cache layout",

@@ -23,7 +23,6 @@ register_kernel(
         op="moe.moe_align_block_size",
         backend=KernelBackend.CUDA_AOT,
         target="sgl_kernel:moe_align_block_size",
-        priority=10,
         format_signature=FormatSignature(
             in_place=True,
             description="align/sort expert token ids into block-padded buffers",
@@ -36,7 +35,6 @@ register_kernel(
         op="moe.moe_align_block_size",
         backend=KernelBackend.CUDA_JIT,
         target="sglang.jit_kernel.moe_align:moe_align_block_size",
-        priority=5,
         capability=_CUDA,
         format_signature=FormatSignature(
             in_place=True,
@@ -50,7 +48,6 @@ register_kernel(
         op="moe.topk_softmax",
         backend=KernelBackend.CUDA_AOT,
         target="sgl_kernel:topk_softmax",
-        priority=10,
         format_signature=FormatSignature(
             in_place=True,
             description="top-k softmax routing weights/ids",

@@ -38,7 +38,6 @@ for _name, (_aot_attr, _jit_attr) in _ACTIVATIONS.items():
             op=f"activation.{_name}",
             backend=KernelBackend.CUDA_AOT,
             target=f"sgl_kernel:{_aot_attr}",
-            priority=10,
             format_signature=FormatSignature(
                 supported_dtypes=_ACT_DTYPES,
                 description="gated activation; returns tensor",
@@ -51,7 +50,6 @@ for _name, (_aot_attr, _jit_attr) in _ACTIVATIONS.items():
             op=f"activation.{_name}",
             backend=KernelBackend.CUDA_JIT,
             target=f"sglang.jit_kernel.activation:{_jit_attr}",
-            priority=5,
             capability=_CUDA,
             format_signature=FormatSignature(
                 supported_dtypes=_ACT_DTYPES,

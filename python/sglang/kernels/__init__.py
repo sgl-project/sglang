@@ -29,9 +29,10 @@ from sglang.kernels.spec import (
     PlatformInfo,
 )
 
-# Importing the operator groups populates the registry (metadata only). This is
-# done last so the core modules above are fully initialized first.
-from sglang.kernels import ops  # noqa: E402
+# Importing the operator groups populates the registry (metadata only). Kept
+# after the core imports above (and guarded from isort reordering) so those
+# modules are fully initialized first.
+from sglang.kernels import ops  # noqa: E402  # isort: skip
 
 __all__ = [
     "ops",

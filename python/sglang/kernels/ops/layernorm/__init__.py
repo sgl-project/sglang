@@ -33,7 +33,6 @@ register_kernel(
         op="layernorm.rmsnorm",
         backend=KernelBackend.CUDA_AOT,
         target="sgl_kernel:rmsnorm",
-        priority=10,
         format_signature=FormatSignature(
             supported_dtypes=_NORM_DTYPES,
             description="out = (x / RMS(x)) * weight; returns tensor",
@@ -46,7 +45,6 @@ register_kernel(
         op="layernorm.rmsnorm",
         backend=KernelBackend.CUDA_JIT,
         target="sglang.jit_kernel.norm:rmsnorm",
-        priority=5,
         capability=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=_NORM_DTYPES,
@@ -61,7 +59,6 @@ register_kernel(
         op="layernorm.fused_add_rmsnorm",
         backend=KernelBackend.CUDA_AOT,
         target="sgl_kernel:fused_add_rmsnorm",
-        priority=10,
         format_signature=FormatSignature(
             supported_dtypes=_NORM_DTYPES,
             in_place=True,
@@ -75,7 +72,6 @@ register_kernel(
         op="layernorm.fused_add_rmsnorm",
         backend=KernelBackend.CUDA_JIT,
         target="sglang.jit_kernel.norm:fused_add_rmsnorm",
-        priority=5,
         capability=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=_NORM_DTYPES,
@@ -90,7 +86,6 @@ register_kernel(
         op="layernorm.gemma_rmsnorm",
         backend=KernelBackend.CUDA_AOT,
         target="sgl_kernel:gemma_rmsnorm",
-        priority=10,
         format_signature=FormatSignature(
             supported_dtypes=_NORM_DTYPES,
             description="out = (x / RMS(x)) * (weight + 1); returns tensor",
@@ -103,7 +98,6 @@ register_kernel(
         op="layernorm.gemma_fused_add_rmsnorm",
         backend=KernelBackend.CUDA_AOT,
         target="sgl_kernel:gemma_fused_add_rmsnorm",
-        priority=10,
         format_signature=FormatSignature(
             supported_dtypes=_NORM_DTYPES,
             in_place=True,

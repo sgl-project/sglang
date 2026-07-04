@@ -134,14 +134,20 @@ class TestKernelsNamespace(unittest.TestCase):
             for name in names:
                 self.assertTrue(callable(getattr(mod, name)), f"{module_name}.{name}")
 
-    def test_selector_default_prefers_aot(self):
-        # Every op that has an AOT backend should heuristically resolve to it.
+    def test_single_backend_op_resolves_without_backend(self):
+        # An op with exactly one registered backend has a fixed call path.
         for op, backends in EXPECTED_OPS.items():
-            if "cuda_aot" in backends:
+            if len(backends) == 1:
                 spec = self.K.select_kernel(op)
-                self.assertEqual(
-                    spec.backend, self.K.KernelBackend.CUDA_AOT, f"{op} default"
-                )
+                self.assertEqual(spec.backend.value, next(iter(backends)), op)
+
+    def test_multi_backend_op_requires_explicit_backend(self):
+        # No hidden ranking: a multi-backend op must be resolved explicitly.
+        multi = [op for op, b in EXPECTED_OPS.items() if len(b) > 1]
+        self.assertTrue(multi)  # sanity: we do have multi-backend ops
+        for op in multi:
+            with self.assertRaises(ValueError):
+                self.K.select_kernel(op)
 
     def test_selector_explicit_backend(self):
         spec = self.K.select_kernel(

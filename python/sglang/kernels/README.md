@@ -38,10 +38,10 @@ wrapper that forwards to a chosen backend, and every backend is described by a
   (`"<group>.<name>"`), a backend, and an import path (`"module:attr"`). No
   `torch` or kernel backend is imported, and no JIT compilation is triggered,
   until a kernel is actually called.
-- `select_kernel(op, backend=None, platform=None)` ranks the registered
-  backends by explicit request → platform capability → priority → a stable
-  backend preference (AOT wheel > FlashInfer > JIT > CuTe DSL > DeepGEMM >
-  Triton > torch). Autotuning is intentionally out of scope for now.
+- `select_kernel(op, backend=None)` resolves an op to its fixed call path.
+  There is **no** priority ranking or heuristic auto-selection: an op with a
+  single backend resolves to it; an op with several backends must be resolved
+  by naming one (`backend=...`). The extra backends are inventory only.
 - `get_kernel(op, backend)` resolves and caches the callable; the public
   wrappers use it, pinned to the backend whose signature they document.
 
