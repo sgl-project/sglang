@@ -273,6 +273,8 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
+BF16_GEMM_BACKEND_CHOICES = ["auto", "tgv"]
+
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
@@ -1485,6 +1487,14 @@ class ServerArgs:
             help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'cutlass' (SGLang CUTLASS kernel), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+). ",
             cli_name="--fp4-gemm-backend",
             choices=FP4_GEMM_RUNNER_BACKEND_CHOICES,
+        ),
+    ] = "auto"
+    bf16_gemm_backend: A[
+        str,
+        Arg(
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; uses cuBLAS via torch.nn.functional.linear), 'tgv' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X); dispatches between TGV and cuBLAS).",
+            cli_name="--bf16-gemm-backend",
+            choices=BF16_GEMM_BACKEND_CHOICES,
         ),
     ] = "auto"
     dsa_prefill_backend: A[

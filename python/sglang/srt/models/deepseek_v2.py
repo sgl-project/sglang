@@ -115,6 +115,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
 )
+from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
@@ -1974,12 +1975,23 @@ class DeepseekV2AttentionMLA(
         # When the module is wrapped with LoRA, the fused GEMM fast-path would
         # bypass the adapter because it reads weight.T directly.
         lora_active = getattr(self.fused_qkv_a_proj_with_mqa, "set_lora", False)
+        tgv_backend = get_bf16_gemm_backend().is_tgv()
+        if tgv_backend:
+            from sglang.jit_kernel.cutedsl_tgv_gemm import use_tgv_bf16_gemm
         if (
             (not isinstance(hidden_states, tuple))
             and hidden_states.shape[0] >= 1
             and hidden_states.shape[0] <= 16
             and self.use_min_latency_fused_a_gemm
             and not lora_active
+            and not (
+                tgv_backend
+                and use_tgv_bf16_gemm(
+                    hidden_states.shape[0],
+                    self.fused_qkv_a_proj_with_mqa.weight.shape[0],
+                    self.fused_qkv_a_proj_with_mqa.weight.shape[1],
+                )
+            )
         ):
             qkv_latent = dsv3_fused_a_gemm(
                 hidden_states,
