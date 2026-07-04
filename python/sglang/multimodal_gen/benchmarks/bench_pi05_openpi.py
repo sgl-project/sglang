@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import sys
 import time
@@ -477,11 +478,20 @@ def create_openpi_policy(
     *,
     pytorch_device: str,
     num_inference_steps: int,
+    pytorch_compile_mode: str | None,
 ):
     from openpi.policies import policy_config
     from openpi.training import config as openpi_config
 
     train_config = openpi_config.get_config(config_name)
+    if pytorch_compile_mode != "keep":
+        train_config = dataclasses.replace(
+            train_config,
+            model=dataclasses.replace(
+                train_config.model,
+                pytorch_compile_mode=pytorch_compile_mode,
+            ),
+        )
     return policy_config.create_trained_policy(
         train_config,
         checkpoint_dir,
@@ -712,6 +722,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--openpi-checkpoint", default=None)
     parser.add_argument("--openpi-device", default="cuda")
     parser.add_argument(
+        "--openpi-pytorch-compile-mode",
+        choices=(
+            "keep",
+            "none",
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        ),
+        default="keep",
+    )
+    parser.add_argument(
         "--openpi-batch-mode",
         choices=("direct_model", "policy_loop"),
         default="direct_model",
@@ -806,6 +828,11 @@ def main() -> None:
             openpi_checkpoint,
             pytorch_device=args.openpi_device,
             num_inference_steps=args.num_inference_steps,
+            pytorch_compile_mode=(
+                None
+                if args.openpi_pytorch_compile_mode == "none"
+                else args.openpi_pytorch_compile_mode
+            ),
         )
 
     sglang_result = None
@@ -846,6 +873,7 @@ def main() -> None:
         "sglang_api": args.sglang_api,
         "openpi_config": openpi_config,
         "openpi_checkpoint": openpi_checkpoint,
+        "openpi_pytorch_compile_mode": args.openpi_pytorch_compile_mode,
         "num_inference_steps": args.num_inference_steps,
         "num_samples": args.num_samples,
         "repeats": args.repeats,
