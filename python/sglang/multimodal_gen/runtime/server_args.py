@@ -859,6 +859,20 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.warmup_resolutions is not None:
             self.warmup = True
 
+        if (
+            self.enable_torch_compile
+            and self.warmup_mode is None
+            and not mode_explicit
+            and not legacy_explicit
+        ):
+            self.warmup = True
+            self.server_warmup = True
+            logger.info(
+                "Automatically enabled server warmup for torch.compile so first "
+                "real requests do not pay compile latency. Set --warmup-mode off "
+                "to disable this behavior."
+            )
+
         # BCG captures every graph during a synthetic warmup forward at startup
         # so that serving never records a fresh graph. That requires
         # server-based warmup (a real warmup request issued at startup), not
@@ -1428,7 +1442,9 @@ class ServerArgs(DisaggServerArgsMixin):
             "--enable-torch-compile",
             action=StoreBoolean,
             default=ServerArgs.enable_torch_compile,
-            help="Use torch.compile to speed up DiT inference."
+            help="Use torch.compile to speed up diffusion hot paths. "
+            + "When no warmup mode is configured, this enables server warmup "
+            + "so first real requests do not pay compile latency. "
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
         parser.add_argument(

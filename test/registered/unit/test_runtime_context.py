@@ -4,14 +4,23 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+import dataclasses
 import unittest
 from unittest.mock import patch
 
+import sglang.srt.server_args as server_args_module
 from sglang.srt.runtime_context import (
+    Flags,
     ParallelContext,
     RuntimeContext,
+    _FlagGroupBase,
+    _StaticFlags,
     get_context,
+    get_flags,
     get_parallel,
+    get_server_args,
+    reset_context,
+    resolve_flag_leaf,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -140,6 +149,156 @@ class TestParallelOverride(_IsolatedOverrides):
             with p.override(tp_sizee=1):  # typo
                 pass
         self.assertEqual(p._overrides, {})
+
+
+class _IsolatedServerArgs(CustomTestCase):
+    """Save/restore the published ServerArgs around each test (the slot is
+    process-global; another test file sharing the process may have published)."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_server_args = get_context()._server_args
+
+    def tearDown(self):
+        if self._saved_server_args is None:
+            reset_context()
+        else:
+            get_context().set_server_args(self._saved_server_args)
+        super().tearDown()
+
+
+class TestServerArgsOwnership(_IsolatedServerArgs):
+    """V2b: the context owns the slot; the legacy getters are identity shims."""
+
+    def test_legacy_setter_publishes_into_context(self):
+        # Identity (not equality) is the contract; publish accepts any object.
+        sentinel = object()
+        server_args_module.set_global_server_args_for_scheduler(sentinel)
+        self.assertIs(server_args_module.get_global_server_args(), sentinel)
+        self.assertIs(get_server_args(), sentinel)
+        self.assertIs(get_context().server_args, sentinel)
+
+    def test_context_publish_visible_through_legacy_getter(self):
+        sentinel = object()
+        get_context().set_server_args(sentinel)
+        self.assertIs(server_args_module.get_global_server_args(), sentinel)
+
+    def test_tokenizer_alias_is_same_function(self):
+        self.assertIs(
+            server_args_module.set_global_server_args_for_tokenizer,
+            server_args_module.set_global_server_args_for_scheduler,
+        )
+
+    def test_pre_publish_error_verbatim(self):
+        reset_context()
+        for accessor in (get_server_args, server_args_module.get_global_server_args):
+            with self.assertRaises(ValueError) as cm:
+                accessor()
+            self.assertEqual(str(cm.exception), "Global server args is not set yet!")
+
+    def test_republish_overwrite_allowed(self):
+        first, second = object(), object()
+        server_args_module.set_global_server_args_for_scheduler(first)
+        server_args_module.set_global_server_args_for_scheduler(second)
+        self.assertIs(get_server_args(), second)
+
+    def test_reset_context_clears_owned_store(self):
+        server_args_module.set_global_server_args_for_scheduler(object())
+        reset_context()
+        with self.assertRaises(ValueError):
+            get_server_args()
+
+    def test_module_global_removed(self):
+        # The legacy storage must not survive: a stale _global_server_args would
+        # silently fork the config into two objects.
+        self.assertFalse(hasattr(server_args_module, "_global_server_args"))
+
+
+@dataclasses.dataclass
+class _FakeStaticGroup(_StaticFlags):
+    alpha: int = 1
+    beta: str = "b"
+
+
+@dataclasses.dataclass
+class _FakeCaptureGroup(_FlagGroupBase):
+    gamma: int = 0
+
+
+class TestFlagsTier(_IsolatedServerArgs):
+    """V3a skeleton: typed dataclass groups, freeze guard, override primitive."""
+
+    def test_wiring_and_groups(self):
+        flags = get_flags()
+        self.assertIs(flags, get_context().flags)
+        self.assertIsInstance(flags, Flags)
+        for group in ("attn", "moe", "capture"):
+            self.assertTrue(hasattr(flags, group))
+        self.assertFalse(flags.frozen)
+
+    def test_typo_safety(self):
+        group = _FakeStaticGroup()
+        with self.assertRaises(AttributeError):
+            group.alpha_misspelled = 2  # undeclared leaf
+        with self.assertRaises(AttributeError):
+            get_flags().not_a_flag = 1
+
+    def test_static_group_writable_until_freeze(self):
+        group = _FakeStaticGroup()
+        group.alpha = 5
+        self.assertEqual(group.alpha, 5)
+        group.freeze()
+        with self.assertRaises(RuntimeError):
+            group.alpha = 6
+        self.assertEqual(group.alpha, 5)
+
+    def test_override_is_transactional_and_works_on_frozen(self):
+        group = _FakeStaticGroup()
+        group.freeze()
+        with group.override(alpha=99, beta="x"):
+            self.assertEqual(group.alpha, 99)
+            self.assertEqual(group.beta, "x")
+        self.assertEqual(group.alpha, 1)
+        self.assertEqual(group.beta, "b")
+        with self.assertRaises(ValueError):
+            with group.override(alpha=2, gamma=3):  # gamma undeclared
+                pass
+        self.assertEqual(group.alpha, 1)  # validated before any write
+
+    def test_non_static_group_has_no_freeze(self):
+        group = _FakeCaptureGroup()
+        group.gamma = 42
+        self.assertEqual(group.gamma, 42)
+        self.assertFalse(hasattr(group, "freeze"))
+
+    def test_container_freeze_cascades_except_capture(self):
+        flags = Flags()  # fresh container, not the process singleton
+        flags.freeze()
+        self.assertTrue(flags.frozen)
+        self.assertTrue(flags.attn.frozen)
+        self.assertTrue(flags.moe.frozen)
+        with self.assertRaises(RuntimeError):
+            flags.attn = flags.attn  # container leaves lock too
+        self.assertFalse(getattr(flags.capture, "_frozen", False))
+
+    def test_resolve_flag_leaf_flat_default_and_mapped(self):
+        flags = Flags()
+        owner, leaf = resolve_flag_leaf(flags, "some_field")
+        self.assertIs(owner, flags)
+        self.assertEqual(leaf, "some_field")
+        owner, leaf = resolve_flag_leaf(flags, "x", leaf_map={"x": "attn.x"})
+        self.assertIs(owner, flags.attn)
+        self.assertEqual(leaf, "x")
+
+    def test_reset_context_installs_fresh_unfrozen_flags(self):
+        try:
+            old = get_flags()
+            old.freeze()
+            reset_context()
+            self.assertIsNot(get_flags(), old)
+            self.assertFalse(get_flags().frozen)
+        finally:
+            reset_context()  # never leave the singleton frozen for other tests
 
 
 if __name__ == "__main__":

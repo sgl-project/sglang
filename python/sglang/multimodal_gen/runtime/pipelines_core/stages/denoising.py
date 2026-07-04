@@ -7,7 +7,6 @@ Denoising stage for diffusion pipelines.
 
 import inspect
 import math
-import os
 import time
 import weakref
 from collections.abc import Callable
@@ -117,8 +116,13 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_precision,
 )
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    CompiledModuleRegistry,
+    build_torch_compile_kwargs,
+    maybe_enable_inductor_compute_comm_overlap,
+    resolve_torch_compile_mode,
+)
 from sglang.multimodal_gen.utils import dict_to_3d_list
-from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
 
@@ -212,7 +216,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         self._cached_num_steps = None
-        self._torch_compiled_module_ids: set[int] = set()
+        self._torch_compile_registry = CompiledModuleRegistry()
         # Breakable CUDA graph runners, one per transformer module (lazy).
         self._bcg_runners: dict[int, Any] = {}
 
@@ -382,31 +386,21 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if envs.SGLANG_CACHE_DIT_ENABLED and not self._cache_dit_enabled:
             logger.debug("Deferring torch.compile until cache-dit is enabled")
             return
-        module_id = id(module)
-        if module_id in self._torch_compiled_module_ids:
+        if self._torch_compile_registry.is_compiled(module):
             return
 
-        compile_kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": None}
-
         if current_platform.is_npu():
-            backend = get_compiler_backend()
-            compile_kwargs["backend"] = backend
-            compile_kwargs["dynamic"] = False
+            compile_kwargs = build_torch_compile_kwargs(mode=None)
             logger.info("Compiling transformer with torchair backend on NPU")
         else:
-            try:
-                import torch._inductor.config as _inductor_cfg
-
-                _inductor_cfg.reorder_for_compute_comm_overlap = True
-            except ImportError:
-                pass
+            maybe_enable_inductor_compute_comm_overlap()
             dit_config = getattr(self.server_args.pipeline_config, "dit_config", None)
-            mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE") or getattr(
-                dit_config,
-                "torch_compile_mode",
-                "max-autotune-no-cudagraphs",
+            mode = resolve_torch_compile_mode(
+                "SGLANG_TORCH_COMPILE_MODE",
+                config=dit_config,
+                default="max-autotune-no-cudagraphs",
             )
-            compile_kwargs["mode"] = mode
+            compile_kwargs = build_torch_compile_kwargs(mode=mode)
             logger.info(f"Compiling transformer with mode: {mode}")
 
         if self._needs_nvfp4_jit_prewarm(module):
@@ -417,8 +411,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             prewarm_nvfp4_jit_modules()
 
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
-        module.compile(**compile_kwargs)
-        self._torch_compiled_module_ids.add(module_id)
+        self._torch_compile_registry.compile_once(
+            module,
+            compile_kwargs=compile_kwargs,
+        )
 
     def _maybe_enable_cache_dit_and_torch_compile(
         self, num_inference_steps: int | tuple[int, int], batch: Req

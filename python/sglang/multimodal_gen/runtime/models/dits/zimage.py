@@ -817,6 +817,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         patch_size: int,
         f_patch_size: int,
         image_seq_len_target: int | None = None,
+        caption_valid_lens: torch.Tensor | None = None,
         caption_valid_mask: torch.Tensor | None = None,
     ):
         """Patchify images and pad image/caption tokens to batch targets.
@@ -852,15 +853,19 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             for cap_feat in all_cap_feats
         )
 
+        if caption_valid_lens is not None:
+            caption_valid_lens = caption_valid_lens.to(
+                device=all_cap_feats[0].device, dtype=torch.long
+            )
+
         for idx, cap_feat in enumerate(all_cap_feats):
-            cap_ori_len = int(cap_feat.size(0))
+            cap_ori_len = cap_feat.size(0)
             cap_padding_len = cap_seq_len_target - cap_ori_len
             cap_padded_feat = torch.cat(
                 [cap_feat, cap_feat[-1:].repeat(cap_padding_len, 1)],
                 dim=0,
             )
             all_cap_feats_out.append(cap_padded_feat)
-            all_cap_valid_lens.append(cap_ori_len)
             if caption_valid_mask is not None:
                 mask_row = caption_valid_mask[idx].to(
                     device=cap_feat.device, dtype=torch.bool
@@ -876,6 +881,10 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                         value=0,
                     )
                 all_cap_valid_masks.append(mask_row)
+            if caption_valid_lens is None:
+                all_cap_valid_lens.append(cap_ori_len)
+            else:
+                all_cap_valid_lens.append(caption_valid_lens[idx])
 
         target_image_seq_len = image_seq_len_target or 0
         for image in all_image:
@@ -906,12 +915,15 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             all_image_size.append(image_size)
             all_image_valid_lens.append(image_ori_len)
 
+        cap_valid_lens_out = (
+            caption_valid_lens if caption_valid_lens is not None else all_cap_valid_lens
+        )
         return (
             torch.stack(all_image_out, dim=0),
             torch.stack(all_cap_feats_out, dim=0),
             all_image_size,
             all_image_valid_lens,
-            all_cap_valid_lens,
+            cap_valid_lens_out,
             (
                 torch.stack(all_cap_valid_masks, dim=0)
                 if caption_valid_mask is not None
@@ -988,19 +1000,22 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     @staticmethod
     def _replace_padding_with_token(
         tensor: torch.Tensor,
-        valid_lens: list[int],
+        valid_lens: list[int] | torch.Tensor,
         pad_token: torch.Tensor,
     ) -> torch.Tensor:
         """Replace padded token rows after each valid sequence length."""
-        if all(int(length) >= tensor.shape[1] for length in valid_lens):
+        if not torch.is_tensor(valid_lens) and all(
+            int(length) >= tensor.shape[1] for length in valid_lens
+        ):
             return tensor
         positions = torch.arange(tensor.shape[1], device=tensor.device).unsqueeze(0)
-        if len(valid_lens) == 1:
-            lengths = positions.new_full((1, 1), int(valid_lens[0]))
+        if torch.is_tensor(valid_lens):
+            lengths = valid_lens.to(device=tensor.device, dtype=torch.long)
         else:
-            lengths = positions.new_empty((len(valid_lens), 1))
-            for idx, length in enumerate(valid_lens):
-                lengths[idx, 0] = int(length)
+            lengths = torch.tensor(valid_lens, device=tensor.device)
+        if lengths.ndim == 0:
+            lengths = lengths.reshape(1)
+        lengths = lengths.unsqueeze(1)
         pad_mask = positions >= lengths
         tensor = tensor.clone()
         tensor[pad_mask] = pad_token.to(device=tensor.device, dtype=tensor.dtype)
@@ -1037,6 +1052,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         freqs_cis=None,
         image_seq_len_target: int | None = None,
         encoder_hidden_states_mask=None,
+        caption_valid_lens: torch.Tensor | None = None,
         **kwargs,
     ):
         assert patch_size in self.all_patch_size
@@ -1066,6 +1082,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             patch_size,
             f_patch_size,
             image_seq_len_target=image_seq_len_target,
+            caption_valid_lens=caption_valid_lens,
             caption_valid_mask=caption_valid_mask,
         )
 
