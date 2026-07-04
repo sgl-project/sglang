@@ -9,6 +9,9 @@ avoiding multiple `index_elementwise_kernel` launches.
 import torch
 import triton
 import triton.language as tl
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 
 @triton.jit
@@ -92,7 +95,7 @@ def track_mamba_states_if_needed(
     check_freed_slots: bool = False,
 ):
     """
-    Track mamba states using Triton kernel for better performance.
+    Track mamba states using Triton kernel (CUDA) or PyTorch ops (NPU).
 
     Args:
         conv_states: Convolution states tensor [pool_size, ...]
@@ -101,28 +104,70 @@ def track_mamba_states_if_needed(
         mamba_track_mask: Boolean mask indicating which elements to track [batch_size]
         mamba_track_indices: Indices to track for each batch element [batch_size]
         batch_size: Number of batch elements
+        check_freed_slots: Whether to skip entries with negative indices
     """
-    conv_state_numel_per_row = conv_states[0].numel()
-    ssm_state_numel_per_row = ssm_states[0].numel()
+    if not _is_npu:
+        conv_state_numel_per_row = conv_states[0].numel()
+        ssm_state_numel_per_row = ssm_states[0].numel()
 
-    # Choose BLOCK_SIZE based on the size of the data
-    BLOCK_SIZE = 1024
+        # Choose BLOCK_SIZE based on the size of the data
+        BLOCK_SIZE = 1024
 
-    # Launch kernel with batch_size blocks
-    grid = (batch_size,)
-    track_mamba_state_if_needed_kernel[grid](
-        conv_states,
-        ssm_states,
-        cache_indices,
-        mamba_track_mask,
-        mamba_track_indices,
-        conv_states.stride(0),
-        ssm_states.stride(0),
-        conv_state_numel_per_row,
-        ssm_state_numel_per_row,
-        BLOCK_SIZE,
-        check_freed_slots,
-    )
+        # Launch kernel with batch_size blocks
+        grid = (batch_size,)
+        track_mamba_state_if_needed_kernel[grid](
+            conv_states,
+            ssm_states,
+            cache_indices,
+            mamba_track_mask,
+            mamba_track_indices,
+            conv_states.stride(0),
+            ssm_states.stride(0),
+            conv_state_numel_per_row,
+            ssm_state_numel_per_row,
+            BLOCK_SIZE,
+            check_freed_slots,
+        )
+    else:
+        track_mamba_states_if_needed_torch(
+            conv_states,
+            ssm_states,
+            cache_indices,
+            mamba_track_mask,
+            mamba_track_indices,
+            batch_size,
+            check_freed_slots,
+        )
+
+def track_mamba_states_if_needed_torch(
+    conv_states: torch.Tensor,
+    ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+    mamba_track_mask: torch.Tensor,
+    mamba_track_indices: torch.Tensor,
+    batch_size: int,
+    check_freed_slots: bool = False,
+):
+    """NPU-compatible PyTorch fallback for tracking mamba states."""
+    if batch_size == 0:
+        return
+
+    # During CUDA graph capture, mamba_track_indices/cache_indices may be None
+    # since the caller only guards on mamba_track_mask. Return early.
+    if mamba_track_indices is None or cache_indices is None:
+        return
+
+    track_mask = mamba_track_mask.bool()
+    if check_freed_slots:
+        track_mask = track_mask & (cache_indices >= 0) & (mamba_track_indices >= 0)
+
+    # Select valid source and destination indices
+    src_indices = cache_indices[track_mask]
+    dst_indices = mamba_track_indices[track_mask]
+
+    # Copy conv_states and ssm_states rows from source to destination
+    conv_states[dst_indices] = conv_states[src_indices]
+    ssm_states[dst_indices] = ssm_states[src_indices]
 
 
 @triton.jit

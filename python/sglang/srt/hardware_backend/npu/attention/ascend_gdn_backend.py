@@ -85,6 +85,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
+        mamba_track_indices: Optional[torch.Tensor] = None,
     ):
         if forward_batch.forward_mode.is_draft_extend_v2():
             return
