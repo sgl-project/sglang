@@ -1104,11 +1104,12 @@ class DeepseekV4AttnBackend(
         assert seq_lens_cpu is not None
         if max_seq_len_override is None:
             max_seq_len_override = getattr(forward_batch, "max_seq_len_override", None)
-        max_seq_len = (
-            int(seq_lens_cpu.max().item())
-            if max_seq_len_override is None
-            else max_seq_len_override
-        )
+        if max_seq_len_override is None:
+            max_seq_len = (
+                int(seq_lens_cpu.max().item()) if seq_lens_cpu.numel() > 0 else 0
+            )
+        else:
+            max_seq_len = max_seq_len_override
         verify_bs = _get_target_verify_bs(forward_batch)
         online_c128_state_slot_offset = self.online_c128_mtp.prepare_forward(
             logical_forward_mode,
