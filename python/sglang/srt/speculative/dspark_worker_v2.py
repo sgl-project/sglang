@@ -1373,15 +1373,37 @@ class DSparkWorkerV2(BaseSpecWorker):
             int(sum(extend_lens)),
         )
 
-        draft_forward_batch = self._make_draft_prefill_forward_batch_for_materialize(
-            model_worker_batch
-        )
-        self._materialize_main_hidden_to_draft_state(
-            main_hidden=logits_output.hidden_states,
-            cache_loc=model_worker_batch.out_cache_loc,
-            positions=positions,
-            draft_forward_batch=draft_forward_batch,
-        )
+        extend_lens_list = [int(x) for x in extend_lens]
+        if not extend_lens_list:
+            raise RuntimeError("DSpark prefill expected non-empty extend_lens.")
+        if len(set(extend_lens_list)) == 1:
+            self._run_draft_bootstrap_forward(
+                batch=model_worker_batch,
+                main_hidden=logits_output.hidden_states,
+                input_ids=model_worker_batch.input_ids,
+                positions=positions,
+                out_cache_loc=model_worker_batch.out_cache_loc,
+                seq_lens=draft_seq_lens,
+                req_pool_indices=model_worker_batch.req_pool_indices,
+                num_tokens_per_req=extend_lens_list[0],
+                use_draft_extend_v2=True,
+            )
+        else:
+            offset = 0
+            for i, extend_len in enumerate(extend_lens_list):
+                next_offset = offset + extend_len
+                self._run_draft_bootstrap_forward(
+                    batch=model_worker_batch,
+                    main_hidden=logits_output.hidden_states[offset:next_offset],
+                    input_ids=model_worker_batch.input_ids[offset:next_offset],
+                    positions=positions[offset:next_offset],
+                    out_cache_loc=model_worker_batch.out_cache_loc[offset:next_offset],
+                    seq_lens=draft_seq_lens[i : i + 1],
+                    req_pool_indices=model_worker_batch.req_pool_indices[i : i + 1],
+                    num_tokens_per_req=extend_len,
+                    use_draft_extend_v2=True,
+                )
+                offset = next_offset
 
         logits_output.hidden_states = None
 
