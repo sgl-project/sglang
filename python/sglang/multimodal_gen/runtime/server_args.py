@@ -631,6 +631,8 @@ class ServerArgs(DisaggServerArgsMixin):
         normalized = backend.strip().lower()
         if normalized in ("fa3", "fa4"):
             normalized = "fa"
+        elif normalized == "cudnn_sdpa":
+            normalized = "torch_cudnn_sdpa"
         try:
             return AttentionBackendEnum[normalized.upper()].name.lower()
         except KeyError:
