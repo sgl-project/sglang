@@ -50,8 +50,6 @@ OTHER_ARGS = [
     "--enable-multimodal",
     "--mm-attention-backend",
     "ascend_attn",
-    "--base-gpu-id",
-    4,
 ]
 
 
