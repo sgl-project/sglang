@@ -237,3 +237,52 @@
 - Pi0.5 postprocess now includes the actual `parameters.num_inference_steps`, so generic action `usage.denoise_steps` reflects per-request overrides rather than only the checkpoint default
 - cookbook and `multimodal_gen` README were updated to document the generic action API; local Mint preview should be rechecked at `http://127.0.0.1:3000/cookbook/vla/OpenPI/Pi0.5`
 - cookbook now marks Pi0.5 as a diffusion Vision-Language-Action policy with a `dVLA` sidebar tag and LingBot World-style top tags (`dVLA`, `OpenPI / LeRobot`, `flow matching action`, `robot edge`)
+
+## 2026-07-04 Pi0.5 API tests and OpenPI comparison benchmark
+
+- commit before this update: `48b7c961d86f`
+- added unit coverage for the generic Pi0.5 action API:
+  - HTTP action request schema to `Pi05SamplingParams`
+  - raw OpenPI-style observation key normalization
+  - metadata response shape/capabilities
+  - action response envelope using actual denoise steps
+  - msgpack numpy roundtrip used by websocket adapters
+- added manual benchmark script `python/sglang/multimodal_gen/benchmarks/bench_pi05_openpi.py`
+  - compares SGLang `/v1/actions/generations` against OpenPI `Policy.infer`
+  - reports single-request latency, batch latency, SGLang stage timings, OpenPI timing fields, and first-action common-prefix diff
+  - supports `aloha` and `libero` profiles; `aloha` supports deterministic-noise strict debugging because horizons match
+  - OpenPI batch defaults to the direct model batch path because public `Policy.infer` is single-observation
+- cookbook now documents the benchmark command and explains the SGLang serving batch mode vs OpenPI direct-model batch mode
+- GPU benchmark numbers against OpenPI are not recorded yet in this local update; the script is the reproducible entry point for the next remote GPU validation pass
+
+## 2026-07-04 OpenPI comparison benchmark results
+
+- latest benchmark/script commit: `1af0dcb607`
+- remote GPU: `pi05-openpi-bench`, 1x H100 80GB, SGLang server on `127.0.0.1:30020`
+- SGLang server:
+  - model `lerobot/pi05_base`
+  - command shape `sglang serve lerobot/pi05_base --model-type diffusion --pipeline pi05 --warmup-mode off --num-gpus 1`
+  - required `HF_TOKEN` for gated `google/paligemma-3b-pt-224`
+  - base image lacked `msgpack`; `python[diffusion]` already declares it, but the devbox image needed a manual `pip install msgpack` for websocket validation
+  - Run:ai direct load streamed `13.5 GiB` to `cuda:0` in `1.51 s`; ready memory was about `19.4-20.1 GiB`
+- OpenPI baseline:
+  - repo `Physical-Intelligence/openpi`, isolated `uv sync` venv
+  - config `pi05_aloha`, checkpoint `gs://openpi-assets/checkpoints/pi05_base`
+  - benchmark used deterministic noise, `num_inference_steps=10`, `batch_size=4`, `warmup=2`, `repeats=5`
+- HTTP JSON SGLang API, prefix cache disabled:
+  - SGLang single mean `326.3 ms`; stage means: preprocess `2.86 ms`, prefix `53.82 ms`, action denoise `131.47 ms`, postprocess `0.09 ms`
+  - SGLang concurrent HTTP batch mean `1160.3 ms / 4 requests`
+  - OpenPI single mean `45.9 ms`; OpenPI direct-model batch mean `82.3 ms / 4`
+- OpenPI-compatible msgpack websocket SGLang API, prefix cache disabled:
+  - SGLang single mean `191.0 ms`; server `infer_ms` mean `190.2 ms`
+  - stage means: preprocess `2.37 ms`, prefix `53.35 ms`, action denoise `131.47 ms`, postprocess `0.07 ms`
+  - SGLang persistent-websocket batch mean `758.0 ms / 4 requests`
+  - OpenPI single mean `45.8 ms`; OpenPI direct-model batch mean `82.4 ms / 4`
+- action diff on common `[50, 14]` output prefix remained large: max abs about `1.94`, mean abs about `0.80`
+  - this is not a reliable parity result because SGLang uses the LeRobot HF checkpoint while the OpenPI baseline uses the OpenPI GCS checkpoint/output transform path
+  - LeRobot reference parity remains the stronger correctness signal for the native checkpoint path
+- conclusion:
+  - websocket/msgpack removes most HTTP/JSON overhead (`326 ms -> 191 ms` single), so robot clients should prefer `/openpi/policy` or `/v1/actions/realtime`
+  - current SGLang Pi0.5 serving is not yet performance competitive with OpenPI in-process policy on this benchmark
+  - main gaps are action-denoise runtime (`~131 ms` vs OpenPI policy infer `~40 ms`), lack of true grouped-request batching (`4` websocket requests serialize to about `4 x 190 ms`), and residual serving overhead
+  - next optimization should prioritize action expert graph/kernel path and request batching before spending more time on HTTP JSON

@@ -366,7 +366,32 @@ For split prefix/action serving, mixed CPU offload, and low-VRAM 16GB-class mode
 
 Run:ai Model Streamer does not reduce steady inference VRAM after parameters, caches, activations, CUDA contexts, and graph buffers are resident. For Pi0.5 low-VRAM work, prioritize component placement, prefix cache size, CUDA graph residency, and CPU/offload first. Model Streamer is a cold-start optimization after the steady-memory budget is correct.
 
-## 7. Validation Notes
+## 7. OpenPI Comparison Benchmark
+
+Use `bench_pi05_openpi.py` when you need a side-by-side latency and action-difference report against the OpenPI policy implementation. Start the SGLang Pi0.5 server first, then run the benchmark from the SGLang repository root:
+
+```bash Command
+python python/sglang/multimodal_gen/benchmarks/bench_pi05_openpi.py \
+  --profile aloha \
+  --sglang-url http://127.0.0.1:30000 \
+  --openpi-checkpoint gs://openpi-assets/checkpoints/pi05_base \
+  --num-inference-steps 10 \
+  --batch-size 4 \
+  --repeats 20 \
+  --warmup 3 \
+  --deterministic-noise \
+  --output-file pi05_openpi_compare.json
+```
+
+The benchmark reports:
+
+- SGLang HTTP latency for `/v1/actions/generations`, including stage timings when the server returns them.
+- SGLang OpenPI-compatible websocket latency when `--sglang-api openpi_ws` is set. This uses persistent msgpack websocket connections and is closer to the robot client path than JSON-over-HTTP.
+- OpenPI single-request latency through `Policy.infer`.
+- Batch latency for grouped robot streams. SGLang uses concurrent HTTP requests in HTTP mode and persistent multi-connection msgpack calls in websocket mode. OpenPI defaults to its internal direct model batch path because the public `Policy.infer` API is single-observation.
+- Action difference on the common output prefix. Use `--deterministic-noise` for strict debugging when the SGLang and OpenPI horizons match. The `aloha` profile supports this directly; the LIBERO profile compares the common prefix because OpenPI's released LIBERO config uses a shorter output horizon than the LeRobot Pi0.5 checkpoint metadata.
+
+## 8. Validation Notes
 
 The following checks were run on H100 GPUs with the native SGLang Pi0.5 path:
 
