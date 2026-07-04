@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_cache import (
         ContiguousAttentionKVCache,
+        WindowedAttentionKVCache,
     )
 
 
@@ -219,7 +220,10 @@ class MlxAOTKernelContext:
         req_ids: list[str],
         req_pool_idx: dict[str, int],
         req_to_token_pool: Any | None,
-        layer_caches: list[list[ContiguousAttentionKVCache]],
+        # Only .offset is read here (absolute on both cache kinds); windowed
+        # caches never reach the pool-scatter path (kv_pool is None without
+        # the radix pool).
+        layer_caches: list[list[ContiguousAttentionKVCache | WindowedAttentionKVCache]],
     ) -> MlxAOTKernelContext:
         """Build optional AOT context for one batched decode step."""
         if not aot_kernels.rope.enabled or kv_pool is None:

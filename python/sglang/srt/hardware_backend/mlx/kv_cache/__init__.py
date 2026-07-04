@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_cache import (
     AttentionOffsetCache,
     ContiguousAttentionKVCache,
     PoolBackedAttentionKVCache,
+    WindowedAttentionKVCache,
     make_attention_mask,
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_pool import (
@@ -64,4 +65,5 @@ __all__ = [
     "PoolBackedAttentionKVCache",
     "set_context",
     "uses_sliding_window_attention",
+    "WindowedAttentionKVCache",
 ]
