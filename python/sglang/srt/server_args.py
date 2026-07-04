@@ -7594,23 +7594,23 @@ class ServerArgs:
         }
 
 
-# NOTE: This is a global variable to hold the server args for scheduler.
-_global_server_args: Optional[ServerArgs] = None
-
-
+# NOTE: The process-wide ServerArgs is owned by the runtime context
+# (sglang.srt.runtime_context). The two functions below are thin shims kept for
+# the existing call-sites; they publish/read the same live object by reference.
+# Imports are in-function so the two modules stay cycle-free at import time.
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
-    global _global_server_args
-    _global_server_args = server_args
+    from sglang.srt.runtime_context import get_context
+
+    get_context().set_server_args(server_args)
 
 
 set_global_server_args_for_tokenizer = set_global_server_args_for_scheduler
 
 
 def get_global_server_args() -> ServerArgs:
-    if _global_server_args is None:
-        raise ValueError("Global server args is not set yet!")
+    from sglang.srt.runtime_context import get_context
 
-    return _global_server_args
+    return get_context().server_args
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
