@@ -126,15 +126,17 @@ def shard_seq_prefix(
 def join_seqs(
     prefix: torch.Tensor, body: torch.Tensor, local_pad: int, dim: int = 1
 ) -> torch.Tensor:
-    """Concatenate ``[prefix (txt tokens), body (img tokens)]`` for joint attention, relocating the
+    """Concatenate local sharded ``[prefix (txt tokens, padding tokens), body (img tokens)]`` for joint attention, while relocating the
      prefix's ``local_pad`` tail rows behind the body.
 
-    Why: the shard pads the *text* chunk, but the local joint layout is
-    [text, image]. after the ulysses gather that pad would sit mid-sequence
-    ([... txt_last, PAD, img_last]), which needs to be trimmed for attention
+    Why leave the padding at tail: the shard pads the *text* chunk, but the local joint layout is
+    [text, image].
 
-    With the pad relocated behind the image, the gathered padding forms one global-tail block that the zero-copy varlen
-    path (tail_attn_meta) skips for free. Same copy volume as a plain cat.
+    In naive implementation, after the ulysses all-to-all, that pad would sit mid-sequence (of last rank)
+    ([... txt_last, PAD, img_last]), which required further mem copy (for the padding tokens), inefficient in this case
+
+    With the pad relocated behind the image, the padding forms one global-tail block that the zero-copy varlen
+    path (tail_attn_meta, implemented in USPAttention.forward) skips for free
     """
     if local_pad > 0:
         real = prefix.shape[dim] - local_pad
