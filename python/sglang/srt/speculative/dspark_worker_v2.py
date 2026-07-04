@@ -1139,6 +1139,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         verify_out_cache_loc: torch.Tensor,
         prefix_lens: torch.Tensor,
         new_seq_lens: torch.Tensor,
+        positions: torch.Tensor,
         ignore_mask: Optional[torch.Tensor] = None,
     ) -> None:
         if not self._accept_anomaly_enabled or commit_lens.numel() == 0:
@@ -1180,6 +1181,39 @@ class DSparkWorkerV2(BaseSpecWorker):
             else None
         )
         verify_cache = verify_out_cache_loc.detach().cpu().view(bs, block_size)
+        position_rows = positions.detach().cpu().view(bs, block_size)
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        max_req_len = int(req_to_token.shape[1])
+        logical_probe = torch.stack(
+            (
+                torch.clamp(prefix_lens.to(torch.int64) - 1, min=0),
+                prefix_lens.to(torch.int64),
+                prefix_lens.to(torch.int64) + block_size - 1,
+            ),
+            dim=1,
+        ).clamp(max=max_req_len - 1)
+        req_pool_indices_gpu = model_worker_batch.req_pool_indices.to(
+            device=req_to_token.device
+        )
+        req_to_token_probe = req_to_token[
+            req_pool_indices_gpu[:, None], logical_probe.to(req_to_token.device)
+        ]
+        token_to_kv_pool = self.draft_model_runner.attn_backend.token_to_kv_pool
+        translate_swa = getattr(token_to_kv_pool, "translate_loc_from_full_to_swa", None)
+        if translate_swa is not None:
+            try:
+                probe_swa = translate_swa(req_to_token_probe).detach().cpu()
+                verify_swa = translate_swa(verify_out_cache_loc).detach().cpu().view(
+                    bs, block_size
+                )
+            except Exception:
+                probe_swa = None
+                verify_swa = None
+        else:
+            probe_swa = None
+            verify_swa = None
+        req_to_token_probe = req_to_token_probe.detach().cpu()
+        logical_probe = logical_probe.detach().cpu()
 
         active_keys = set()
         for i, req_pool_idx in enumerate(req_pool_indices):
@@ -1253,6 +1287,29 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "verify_cache_first": int(cache_row[0]) if block_size > 0 else None,
                     "verify_cache_last": (
                         int(cache_row[-1]) if block_size > 0 else None
+                    ),
+                    "pos_first": int(position_rows[i][0]) if block_size > 0 else None,
+                    "pos_last": int(position_rows[i][-1]) if block_size > 0 else None,
+                    "logical_prev_cur_last": [
+                        int(x) for x in logical_probe[i].tolist()
+                    ],
+                    "full_prev_cur_last": [
+                        int(x) for x in req_to_token_probe[i].tolist()
+                    ],
+                    "swa_prev_cur_last": (
+                        [int(x) for x in probe_swa[i].tolist()]
+                        if probe_swa is not None
+                        else None
+                    ),
+                    "verify_swa_first": (
+                        int(verify_swa[i][0])
+                        if verify_swa is not None and block_size > 0
+                        else None
+                    ),
+                    "verify_swa_last": (
+                        int(verify_swa[i][-1])
+                        if verify_swa is not None and block_size > 0
+                        else None
                     ),
                 }
             )
@@ -1674,6 +1731,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_out_cache_loc=verify_out_cache_loc,
             prefix_lens=prefix_lens,
             new_seq_lens=new_seq_lens,
+            positions=positions,
             ignore_mask=transfer_warmup_mask,
         )
         if on_publish is not None:
