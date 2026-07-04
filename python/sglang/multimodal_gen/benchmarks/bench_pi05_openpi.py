@@ -255,6 +255,40 @@ def build_sglang_payload(
     }
 
 
+def build_sglang_python_payload(
+    profile: Pi05BenchProfile,
+    observation: dict[str, Any],
+    *,
+    num_inference_steps: int,
+    prefix_cache: bool,
+    cuda_graph: bool,
+    noise: np.ndarray | None,
+) -> dict[str, Any]:
+    encoded_observation = {
+        "images": {
+            key: np.asarray(value) for key, value in observation["images"].items()
+        },
+        "state": np.asarray(observation["state"], dtype=np.float32),
+    }
+    if noise is not None:
+        encoded_observation["noise"] = noise.astype(np.float32)
+    return {
+        "model": profile.sglang_model,
+        "input": {
+            "task": profile.prompt,
+            "observation": encoded_observation,
+        },
+        "parameters": {
+            "num_inference_steps": num_inference_steps,
+        },
+        "runtime": {
+            "return_timing": True,
+            "prefix_cache": prefix_cache,
+            "cuda_graph": cuda_graph,
+        },
+    }
+
+
 def build_sglang_openpi_ws_payload(
     profile: Pi05BenchProfile,
     observation: dict[str, Any],
@@ -470,6 +504,116 @@ def run_sglang_openpi_ws(
             batch_size=batch_size,
         )
     )
+
+
+def create_sglang_python_pipeline(
+    model_path: str,
+    *,
+    pipeline_config_path: str | None,
+):
+    from sglang.multimodal_gen.runtime.pipelines.pi05 import Pi05Pipeline
+    from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import (
+        SyncExecutor,
+    )
+    from sglang.multimodal_gen.runtime.server_args import (
+        ServerArgs,
+        set_global_server_args,
+    )
+
+    kwargs: dict[str, Any] = {
+        "model_path": model_path,
+        "pipeline_class_name": "pi05",
+        "warmup_mode": "off",
+        "num_gpus": 1,
+    }
+    if pipeline_config_path:
+        kwargs["pipeline_config_path"] = pipeline_config_path
+    server_args = ServerArgs.from_kwargs(**kwargs)
+    set_global_server_args(server_args)
+    pipeline = Pi05Pipeline(
+        model_path,
+        server_args,
+        executor=SyncExecutor(server_args=server_args),
+    )
+    return pipeline, server_args
+
+
+def _run_sglang_python_once(pipeline, server_args, payload: dict[str, Any]):
+    from sglang.multimodal_gen.runtime.entrypoints.action_utils import (
+        build_action_sampling_params,
+    )
+    from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+
+    sampling_params = build_action_sampling_params(payload, server_args)
+    req = prepare_request(server_args, sampling_params)
+    req.suppress_logs = True
+    output_batch = pipeline.forward(req, server_args)
+    if output_batch.error:
+        raise RuntimeError(output_batch.error)
+    if not output_batch.output:
+        raise RuntimeError("SGLang Python policy returned no output")
+    return output_batch.output[0]
+
+
+def run_sglang_python(
+    model_path: str,
+    payloads: list[dict[str, Any]],
+    *,
+    pipeline_config_path: str | None,
+    warmup: int,
+    repeats: int,
+    batch_size: int,
+) -> dict[str, Any]:
+    pipeline, server_args = create_sglang_python_pipeline(
+        model_path,
+        pipeline_config_path=pipeline_config_path,
+    )
+    for idx in range(min(warmup, len(payloads))):
+        _run_sglang_python_once(pipeline, server_args, payloads[idx])
+
+    single_latencies = []
+    single_outputs = []
+    for idx in range(repeats):
+        payload = payloads[idx % len(payloads)]
+        start = time.perf_counter()
+        output = _run_sglang_python_once(pipeline, server_args, payload)
+        single_latencies.append((time.perf_counter() - start) * 1000)
+        single_outputs.append(output)
+
+    batch_latencies = []
+    if batch_size > 1:
+        for warmup_idx in range(warmup):
+            batch = [
+                payloads[(warmup_idx * batch_size + offset) % len(payloads)]
+                for offset in range(batch_size)
+            ]
+            for payload in batch:
+                _run_sglang_python_once(pipeline, server_args, payload)
+        for start_idx in range(repeats):
+            batch = [
+                payloads[(start_idx * batch_size + offset) % len(payloads)]
+                for offset in range(batch_size)
+            ]
+            start = time.perf_counter()
+            for payload in batch:
+                _run_sglang_python_once(pipeline, server_args, payload)
+            batch_latencies.append((time.perf_counter() - start) * 1000)
+
+    stage_timings = {}
+    for output in single_outputs:
+        for key, value in output.get("timings", {}).items():
+            stage_timings.setdefault(key, []).append(float(value))
+
+    return {
+        "single": _stats_ms(single_latencies),
+        "batch": _stats_ms(batch_latencies),
+        "batch_size": batch_size,
+        "stage_timings": {
+            key: _stats_ms(values) for key, values in stage_timings.items()
+        },
+        "first_output": single_outputs[0] if single_outputs else None,
+        "batch_mode": "python_policy_loop",
+    }
 
 
 def create_openpi_policy(
@@ -714,10 +858,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sglang-url", default="http://127.0.0.1:30000")
     parser.add_argument(
         "--sglang-api",
-        choices=("http", "openpi_ws"),
+        choices=("http", "openpi_ws", "python"),
         default="http",
     )
     parser.add_argument("--sglang-model", default=None)
+    parser.add_argument("--sglang-pipeline-config-path", default=None)
     parser.add_argument("--openpi-config", default=None)
     parser.add_argument("--openpi-checkpoint", default=None)
     parser.add_argument("--openpi-device", default="cuda")
@@ -796,6 +941,18 @@ def main() -> None:
     payloads = []
     if args.skip_sglang:
         pass
+    elif args.sglang_api == "python":
+        payloads = [
+            build_sglang_python_payload(
+                profile,
+                observation,
+                num_inference_steps=args.num_inference_steps,
+                prefix_cache=not args.disable_prefix_cache,
+                cuda_graph=not args.disable_cuda_graph,
+                noise=noise,
+            )
+            for observation in sglang_observations
+        ]
     elif args.sglang_api == "openpi_ws":
         payloads = [
             build_sglang_openpi_ws_payload(
@@ -838,6 +995,15 @@ def main() -> None:
     sglang_result = None
     if args.skip_sglang:
         pass
+    elif args.sglang_api == "python":
+        sglang_result = run_sglang_python(
+            profile.sglang_model,
+            payloads,
+            pipeline_config_path=args.sglang_pipeline_config_path,
+            warmup=args.warmup,
+            repeats=args.repeats,
+            batch_size=args.batch_size,
+        )
     elif args.sglang_api == "openpi_ws":
         sglang_result = run_sglang_openpi_ws(
             args.sglang_url,
@@ -871,6 +1037,7 @@ def main() -> None:
         "profile": profile.name,
         "sglang_model": profile.sglang_model,
         "sglang_api": args.sglang_api,
+        "sglang_pipeline_config_path": args.sglang_pipeline_config_path,
         "openpi_config": openpi_config,
         "openpi_checkpoint": openpi_checkpoint,
         "openpi_pytorch_compile_mode": args.openpi_pytorch_compile_mode,
