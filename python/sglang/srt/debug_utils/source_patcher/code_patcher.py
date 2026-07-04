@@ -78,6 +78,11 @@ def patch_function(
 
     Returns PatchState that can restore the original code.
     """
+    # Decorated targets (e.g. @torch.no_grad()) resolve to the functools wrapper,
+    # whose __globals__ is the decorator's module (NameError on exec) and whose
+    # __code__ swap would not affect the real body. Patch the wrapped function.
+    target = inspect.unwrap(target)
+
     original_code: types.CodeType = target.__code__
 
     source: str = inspect.getsource(target)
@@ -96,7 +101,9 @@ def patch_function(
     temp_namespace: dict[str, Any] = {}
     exec(code, target.__globals__, temp_namespace)
 
-    new_fn: Any = temp_namespace[target.__name__]
+    # The source includes decorator lines, so exec re-wraps; unwrap to reach the
+    # body's code object (the original outer wrapper keeps calling `target`).
+    new_fn: Any = inspect.unwrap(temp_namespace[target.__name__])
     target.__code__ = new_fn.__code__
 
     return PatchState(target_fn=target, original_code=original_code)
