@@ -80,6 +80,18 @@ _AITER_GFX95_CK_W8A8_MAX_SAFE_M = {
 }
 
 
+class _MXFP4QuantizedData(MXFP4QuantizeUtil):
+    def __init__(
+        self,
+        original_shape: torch.Size,
+        original_dtype: torch.dtype,
+        quantized_data: torch.Tensor,
+    ):
+        self.original_shape = original_shape
+        self.original_dtype = original_dtype
+        self.quantized_data = quantized_data
+
+
 # Force CK bpreshuffle (not Triton) for the dense w8a8-block GEMMs (MLA q/kv/o
 # projections), to match ATOM (CK preshuffle; Triton FP8 blockscale is slower).
 # Default OFF; DeepseekV4 enables it via set_force_ck_w8a8(True). The env var
@@ -1281,6 +1293,30 @@ def block_quant_dequant(
     x_scale_repeat = x_scale_repeat[..., :n, :k]
 
     return (x_q_block.to(torch.float32) * x_scale_repeat).to(dtype)
+
+
+def quantize_block_fp8_weight_to_mxfp4(
+    fp8_weight: torch.Tensor,
+    fp8_scale: torch.Tensor,
+    weight_block_size: List[int],
+    mxfp4_block_size: int = 32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    fp8_weight_dequant = block_quant_dequant(
+        fp8_weight,
+        fp8_scale.to(torch.float32),
+        weight_block_size,
+        torch.bfloat16,
+    )
+    fp4_weight, fp4_scale = _MXFP4QuantizedData.quantize(
+        fp8_weight_dequant, block_size=mxfp4_block_size
+    )
+    fp4_weight = fp4_weight.quantized_data
+    fp4_weight = fp4_weight.contiguous().view(torch.int8)
+    fp4_scale = fp4_scale.view(
+        *fp8_weight_dequant.shape[:-1],
+        fp8_weight_dequant.shape[-1] // mxfp4_block_size,
+    )
+    return fp4_weight, fp4_scale.contiguous().view(torch.float8_e8m0fnu)
 
 
 def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
