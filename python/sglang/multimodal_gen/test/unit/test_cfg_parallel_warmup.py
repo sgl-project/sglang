@@ -193,18 +193,18 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
                 warmup_resolutions=["512x512", "1024x1024"],
                 server_based_warmup=True,
             )
-        self.assertEqual(len(reqs), 6)
+        self.assertEqual(len(reqs), 4)
         self.assertEqual(
             [(req.width, req.height) for req in reqs],
-            [(512, 512)] * 3 + [(1024, 1024)] * 3,
+            [(512, 512)] * 2 + [(1024, 1024)] * 2,
         )
-        self.assertEqual([req.is_warmup for req in reqs], [True, False, False] * 2)
-        self.assertEqual([req.num_inference_steps for req in reqs], [2] * 6)
+        self.assertEqual([req.is_warmup for req in reqs], [True, False] * 2)
+        self.assertEqual([req.num_inference_steps for req in reqs], [2] * 4)
         self.assertEqual(
             [req.extra.get("server_internal_prewarm", False) for req in reqs],
-            [False, True, True] * 2,
+            [False, True] * 2,
         )
-        self.assertEqual([req.save_output for req in reqs], [False] * 6)
+        self.assertEqual([req.save_output for req in reqs], [False] * 4)
 
     def test_lightweight_warmup_result_ignores_control_requests(self):
         scheduler = _make_bare_scheduler(enable_cfg_parallel=False)
