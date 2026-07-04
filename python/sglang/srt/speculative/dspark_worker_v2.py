@@ -1008,6 +1008,81 @@ class DSparkWorkerV2(BaseSpecWorker):
             ),
         }
 
+    def _checksum_swa_kv_rows(
+        self,
+        *,
+        layer_id: int,
+        swa_locs: torch.Tensor,
+    ) -> Optional[dict]:
+        try:
+            token_to_kv_pool = self.draft_model_runner.attn_backend.token_to_kv_pool
+            get_swa_raw_buffer = getattr(token_to_kv_pool, "get_swa_raw_buffer", None)
+            if get_swa_raw_buffer is None or swa_locs.numel() == 0:
+                return None
+            valid = swa_locs.to(device=self.device, dtype=torch.int64)
+            valid = valid[valid >= 0]
+            if valid.numel() == 0:
+                return None
+            valid = valid[: min(int(valid.numel()), 16)]
+            rows = get_swa_raw_buffer(int(layer_id))[valid]
+            rows_f = rows.float()
+            return {
+                "layer_id": int(layer_id),
+                "num_rows": int(valid.numel()),
+                "swa_locs": [int(x) for x in valid.detach().cpu().tolist()],
+                "sum": float(rows_f.sum().detach().cpu()),
+                "abs_sum": float(rows_f.abs().sum().detach().cpu()),
+                "max_abs": float(rows_f.abs().max().detach().cpu()),
+            }
+        except Exception as e:
+            return {"layer_id": int(layer_id), "error": str(e)}
+
+    def _build_accept_anomaly_kv_debug(
+        self,
+        *,
+        req_pool_idx: int,
+        prefix_len: int,
+        block_size: int,
+    ) -> Optional[dict]:
+        try:
+            req_to_token = self.model_runner.req_to_token_pool.req_to_token
+            token_to_kv_pool = self.draft_model_runner.attn_backend.token_to_kv_pool
+            translate_swa = getattr(token_to_kv_pool, "translate_loc_from_full_to_swa", None)
+            if translate_swa is None:
+                return None
+            start = max(int(prefix_len) - 128, 0)
+            end = int(prefix_len) + int(block_size)
+            if end <= start:
+                return None
+            logical = torch.arange(start, end, device=req_to_token.device, dtype=torch.int64)
+            full_locs = req_to_token[
+                torch.tensor(int(req_pool_idx), device=req_to_token.device).view(1),
+                logical,
+            ].view(-1)
+            swa_locs = translate_swa(full_locs)
+            layers = getattr(self._draft_inner, "layers", [])
+            layer_ids = []
+            if layers:
+                layer_ids.append(int(layers[0].self_attn.layer_id))
+                if len(layers) > 1:
+                    layer_ids.append(int(layers[-1].self_attn.layer_id))
+            return {
+                "logical_first_last": [int(start), int(end - 1)],
+                "full_first8": [int(x) for x in full_locs[:8].detach().cpu().tolist()],
+                "full_last8": [int(x) for x in full_locs[-8:].detach().cpu().tolist()],
+                "swa_first8": [int(x) for x in swa_locs[:8].detach().cpu().tolist()],
+                "swa_last8": [int(x) for x in swa_locs[-8:].detach().cpu().tolist()],
+                "kv_checksums": [
+                    self._checksum_swa_kv_rows(
+                        layer_id=layer_id,
+                        swa_locs=swa_locs[-int(block_size) :],
+                    )
+                    for layer_id in layer_ids
+                ],
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
     def _ensure_markov_refine_buffers(self, bs: int, device: torch.device) -> None:
         cap = self._markov_refine_buffer_cap
         if (
@@ -1397,10 +1472,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             ):
                 self._accept_anomaly_dumped.add(key)
                 self._accept_anomaly_dump_count += 1
+                kv_debug = self._build_accept_anomaly_kv_debug(
+                    req_pool_idx=int(req_pool_idx),
+                    prefix_len=int(seq_lens[i]),
+                    block_size=int(block_size),
+                )
                 logger.warning(
                     "DSpark accept anomaly detected: dp_rank=%s tp_rank=%s "
                     "ep_rank=%s req_pool_idx=%s rid=%s zero_draft_streak=%s "
-                    "history=%s",
+                    "history=%s kv_debug=%s",
                     self.dp_rank,
                     self.tp_rank,
                     self.moe_ep_rank,
@@ -1408,6 +1488,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     rid,
                     streak,
                     list(history),
+                    kv_debug,
                 )
 
         stale_keys = set(self._accept_anomaly_histories) - active_keys
