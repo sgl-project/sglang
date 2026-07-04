@@ -1,3 +1,4 @@
+import json
 import unittest
 
 import openai
@@ -122,6 +123,59 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
             outputs.append(response.choices[0].text)
         print(f"determinism: {outputs=}")
         self.assertEqual(outputs[0], outputs[1])
+        assert self.process.poll() is None
+
+    def test_grammar_constrained_decoding(self):
+        # Regression: DFLASH used to reject any grammar-constrained request
+        # (json_schema / regex / ebnf / structural_tag -- i.e. tool_choice=required,
+        # named tool_choice, response_format=json_*) with HTTP 400. The verify path
+        # now applies the grammar vocab mask along the linear draft chain, so these
+        # requests must succeed and the output must obey the constraint. The grammar
+        # backend enforces structure regardless of the (small) CI model's quality.
+        client = openai.Client(base_url=self.base_url + "/v1", api_key="EMPTY")
+
+        # 1) response_format = json_schema -> output must be schema-valid JSON.
+        schema = {
+            "type": "object",
+            "properties": {"capital": {"type": "string"}},
+            "required": ["capital"],
+            "additionalProperties": False,
+        }
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "What is the capital of France? Reply as JSON.",
+                }
+            ],
+            max_tokens=128,
+            temperature=0,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "capital_answer", "schema": schema},
+            },
+        )
+        content = response.choices[0].message.content
+        print(f"json_schema: content={content!r}")
+        parsed = json.loads(content)  # must be valid JSON (would raise otherwise)
+        self.assertIn("capital", parsed)
+        self.assertIsInstance(parsed["capital"], str)
+
+        # 2) regex constraint -> output must match the pattern exactly.
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "user", "content": "Is the sky blue? Answer Yes or No."}
+            ],
+            max_tokens=8,
+            temperature=0,
+            extra_body={"regex": r"(Yes|No)"},
+        )
+        content = response.choices[0].message.content
+        print(f"regex: content={content!r}")
+        self.assertRegex(content.strip(), r"^(Yes|No)$")
+
         assert self.process.poll() is None
 
 

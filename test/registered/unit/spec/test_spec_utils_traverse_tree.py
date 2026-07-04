@@ -66,6 +66,61 @@ class TestTraverseTreePassesIntsToGrammar(unittest.TestCase):
         for idx in fill_calls:
             self.assertIsInstance(idx, int)
 
+    def test_linear_chain_visits_all_positions_in_order(self):
+        # DFLASH verify is a *linear chain* (block_size draft tokens, no branching),
+        # which is a degenerate tree that DFlashWorkerV2 feeds to generate_token_bitmask
+        # by building retrieve_next_token = [1, 2, ..., -1] and retrieve_next_sibling
+        # = [-1, ...]. This checks that traverse_tree walks the whole chain in order:
+        #   0 ── 1 ── 2 ── 3
+        block_size = 4
+        retrieve_next_token = torch.tensor([1, 2, 3, -1], dtype=torch.int32)
+        retrieve_next_sibling = torch.full((block_size,), -1, dtype=torch.int32)
+        # column 0 is the current (already-committed) token; 1: are draft proposals
+        draft_tokens = torch.tensor([100, 11, 22, 33], dtype=torch.int64)
+        bitmask = torch.full((block_size, 4), -1, dtype=torch.int32)  # all allowed
+
+        grammar, accept_calls, fill_calls = self._record_grammar()
+        traverse_tree(
+            retrieve_next_token,
+            retrieve_next_sibling,
+            draft_tokens,
+            grammar,
+            bitmask,
+        )
+
+        # Root (col 0) is never accepted; every draft token is, in chain order.
+        self.assertEqual(accept_calls, [11, 22, 33])
+        self.assertEqual(fill_calls, [0, 1, 2, 3])
+        for token in accept_calls:
+            self.assertIsInstance(token, int)
+        for idx in fill_calls:
+            self.assertIsInstance(idx, int)
+
+    def test_linear_chain_stops_at_grammar_reject(self):
+        # If a draft token in the chain is not allowed by the grammar, traversal
+        # must stop descending there: no accept/fill for that node or anything
+        # after it. Chain: 0 ── 1 ── 2 ── 3, with token at position 2 disallowed.
+        block_size = 4
+        retrieve_next_token = torch.tensor([1, 2, 3, -1], dtype=torch.int32)
+        retrieve_next_sibling = torch.full((block_size,), -1, dtype=torch.int32)
+        draft_tokens = torch.tensor([100, 5, 7, 9], dtype=torch.int64)
+        bitmask = torch.full((block_size, 4), -1, dtype=torch.int32)  # all allowed
+        # Disallow token id 7 (draft_tokens[2]) in node 1's mask (its parent).
+        bitmask[1, 7 // 32] &= ~(1 << (7 % 32))
+
+        grammar, accept_calls, fill_calls = self._record_grammar()
+        traverse_tree(
+            retrieve_next_token,
+            retrieve_next_sibling,
+            draft_tokens,
+            grammar,
+            bitmask,
+        )
+
+        # Node 1 accepted+filled; node 2 rejected -> node 2 and node 3 skipped.
+        self.assertEqual(accept_calls, [5])
+        self.assertEqual(fill_calls, [0, 1])
+
 
 if __name__ == "__main__":
     unittest.main()
