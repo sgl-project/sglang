@@ -473,6 +473,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             torch.inference_mode(),
         ):
             main_x = self.draft_model.project_main_hidden(main_hidden)
+            main_x = main_x.unsqueeze(1).repeat(1, self.draft_model.model.hc_mult, 1)
             if self._stacked_wqkv_fp8_proj is None:
                 for layer in self._draft_inner.layers:
                     layer.self_attn.kv_from_hidden(
