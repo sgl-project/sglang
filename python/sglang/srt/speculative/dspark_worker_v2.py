@@ -1205,12 +1205,28 @@ class DSparkWorkerV2(BaseSpecWorker):
             debug_enabled = bool(self._accept_anomaly_enabled)
             if debug_enabled:
                 base_top1 = torch.argmax(base_logits, dim=-1)
+                base_top1_logit = torch.gather(
+                    base_logits, dim=-1, index=base_top1.unsqueeze(-1)
+                ).squeeze(-1)
+                hidden_f = block_hidden.float()
+                hidden_norm = hidden_f.norm(dim=-1)
+                hidden_abs_mean = hidden_f.abs().mean(dim=-1)
+                if block_size > 1:
+                    hidden_cos_adjacent = torch.nn.functional.cosine_similarity(
+                        hidden_f[:, :-1, :], hidden_f[:, 1:, :], dim=-1
+                    )
+                else:
+                    hidden_cos_adjacent = hidden_f.new_empty((bs, 0))
                 markov_top1 = torch.empty(
                     (bs, block_size), dtype=torch.int64, device=block_hidden.device
                 )
                 prev_token_debug = torch.empty_like(markov_top1)
             else:
                 base_top1 = None
+                base_top1_logit = None
+                hidden_norm = None
+                hidden_abs_mean = None
+                hidden_cos_adjacent = None
                 markov_top1 = None
                 prev_token_debug = None
             prev_tokens = candidates[:, 0]
@@ -1233,10 +1249,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             confidence = confidence_head(block_hidden, markov_embeds)
             if debug_enabled:
                 assert base_top1 is not None
+                assert base_top1_logit is not None
+                assert hidden_norm is not None
+                assert hidden_abs_mean is not None
+                assert hidden_cos_adjacent is not None
                 assert markov_top1 is not None
                 assert prev_token_debug is not None
                 self._last_markov_refine_debug = {
                     "base_top1": base_top1[:output_bs].detach(),
+                    "base_top1_logit": base_top1_logit[:output_bs].detach(),
+                    "hidden_norm": hidden_norm[:output_bs].detach(),
+                    "hidden_abs_mean": hidden_abs_mean[:output_bs].detach(),
+                    "hidden_cos_adjacent": hidden_cos_adjacent[:output_bs].detach(),
                     "markov_top1": markov_top1[:output_bs].detach(),
                     "prev_tokens": prev_token_debug[:output_bs].detach(),
                 }
@@ -1339,9 +1363,21 @@ class DSparkWorkerV2(BaseSpecWorker):
             if not debug:
                 return None
             base_top1 = debug.get("base_top1")
+            base_top1_logit = debug.get("base_top1_logit")
+            hidden_norm = debug.get("hidden_norm")
+            hidden_abs_mean = debug.get("hidden_abs_mean")
+            hidden_cos_adjacent = debug.get("hidden_cos_adjacent")
             markov_top1 = debug.get("markov_top1")
             prev_tokens = debug.get("prev_tokens")
-            if base_top1 is None or markov_top1 is None or prev_tokens is None:
+            if (
+                base_top1 is None
+                or base_top1_logit is None
+                or hidden_norm is None
+                or hidden_abs_mean is None
+                or hidden_cos_adjacent is None
+                or markov_top1 is None
+                or prev_tokens is None
+            ):
                 return None
             if int(row_idx) >= int(markov_top1.shape[0]):
                 return None
@@ -1351,6 +1387,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             target_row = target_predict[row_idx]
             confidence_row = confidence[row_idx]
             row_base = base_top1[row_idx, :limit].detach().cpu()
+            row_base_top1_logit = base_top1_logit[row_idx, :limit].detach().cpu()
+            row_hidden_norm = hidden_norm[row_idx, :limit].detach().cpu()
+            row_hidden_abs_mean = hidden_abs_mean[row_idx, :limit].detach().cpu()
+            row_hidden_cos_adjacent = (
+                hidden_cos_adjacent[row_idx, : max(limit - 1, 0)].detach().cpu()
+            )
             row_markov = markov_top1[row_idx].detach().cpu()
             row_prev = prev_tokens[row_idx, :limit].detach().cpu()
             payload = {
@@ -1359,6 +1401,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "from block_hidden[i] and maps to candidate[i+1] for i < block_size-1"
                 ),
                 "base_top1_first": [int(x) for x in row_base.tolist()],
+                "base_top1_logit_first": [
+                    float(x) for x in row_base_top1_logit.tolist()
+                ],
+                "hidden_norm_first": [float(x) for x in row_hidden_norm.tolist()],
+                "hidden_abs_mean_first": [
+                    float(x) for x in row_hidden_abs_mean.tolist()
+                ],
+                "hidden_cos_adjacent_first": [
+                    float(x) for x in row_hidden_cos_adjacent.tolist()
+                ],
                 "markov_top1_first": [
                     int(x) for x in row_markov[:limit].tolist()
                 ],
