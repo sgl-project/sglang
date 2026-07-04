@@ -230,6 +230,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
 
     _handle_dflash_tree(server_args)
+    _resolve_dflash_draft_attention_backend(server_args)
 
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
@@ -264,6 +265,45 @@ def _handle_dflash_tree(server_args: ServerArgs) -> None:
         "but the live verify-loop integration is the #29524 GPU follow-up. "
         "Use --speculative-dflash-tree-width 1 (linear chain)."
     )
+
+
+def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
+    """Resolve `speculative_draft_attention_backend` to a final, supported value.
+
+    Consumed by ModelRunner's `is_draft_worker` override (one backend for all
+    draft modes).
+    """
+    from sglang.srt.utils import is_hip
+
+    supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton", "ascend")
+    # Use triton on ROCm (no FlashInfer), flashinfer on CUDA.
+    fallback_backend = "triton" if is_hip() else "flashinfer"
+
+    draft_backend = server_args.speculative_draft_attention_backend
+    if draft_backend is None:
+        draft_backend, _ = server_args.get_attention_backends()
+    if draft_backend is None:
+        draft_backend = fallback_backend
+    elif draft_backend == "trtllm_mha":
+        logger.warning(
+            "DFLASH draft worker does not support 'trtllm_mha' because the "
+            "draft path requires per-layer DFlash attention. Falling back to "
+            "'%s'.",
+            fallback_backend,
+        )
+        draft_backend = fallback_backend
+    elif draft_backend not in supported_draft_backends:
+        logger.warning(
+            "DFLASH draft worker only supports attention_backend in %s for now, "
+            "but got %r. Falling back to '%s'.",
+            supported_draft_backends,
+            draft_backend,
+            fallback_backend,
+        )
+        draft_backend = fallback_backend
+    # FIXME: avoid overriding server args directly; pass the resolved draft
+    # backend to the draft worker explicitly instead.
+    server_args.speculative_draft_attention_backend = draft_backend
 
 
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:

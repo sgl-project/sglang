@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import (
@@ -14,6 +15,13 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.dcp import (
+    all_gather_kv_cache_for_mla_extend,
+    all_gather_q_for_mla_decode,
+    cp_lse_ag_out_rs_mla,
+    dcp_enabled,
+    get_attention_dcp_world_size,
+)
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     per_tensor_quant_mla_fp8,
@@ -21,14 +29,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
-from sglang.srt.layers.utils.dcp_utils import (
-    all_gather_kv_cache_for_mla_extend,
-    all_gather_q_for_mla_decode,
-    cp_lse_ag_out_rs,
-    dcp_enabled,
-    get_attention_dcp_group,
-    get_attention_dcp_world_size,
-)
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
 )
@@ -162,6 +162,14 @@ if _use_aiter_gfx95:
         fused_rms_mxfp4_quant,
     )
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
+
+
+def _should_defer_dsa_cp_kv_gather(
+    *,
+    dsa_prefill_cp: bool,
+    fuse_rope_for_trtllm_mla: bool,
+) -> bool:
+    return dsa_prefill_cp and fuse_rope_for_trtllm_mla
 
 
 class DeepseekMLAForwardMixin:
@@ -522,18 +530,25 @@ class DeepseekMLAForwardMixin:
             elif is_kv_b_lora_active(self):
                 q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
+        fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
         skip_rope_for_dsa_tilelang_fused = self._skip_rope_for_dsa_tilelang_fused()
         skip_rope_for_aiter_fused_mla = self._skip_rope_for_aiter_fused_mla()
         if (
             self.rotary_emb is not None
-            and (not self._fuse_rope_for_trtllm_mla(forward_batch))
+            and (not fuse_rope_for_trtllm_mla)
             and (not skip_rope_for_dsa_tilelang_fused)
             and (not skip_rope_for_aiter_fused_mla)
             and (not _use_aiter or not _is_gfx95_supported or self.use_dsa)
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+        dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
+        mla_prefill_cp = mla_use_prefill_cp(forward_batch)
+        defer_kv_gather_until_after_rope = _should_defer_dsa_cp_kv_gather(
+            dsa_prefill_cp=dsa_prefill_cp,
+            fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
+        )
+        if (dsa_prefill_cp or mla_prefill_cp) and not defer_kv_gather_until_after_rope:
             # support allgather+rerrange
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
@@ -774,7 +789,7 @@ class DeepseekMLAForwardMixin:
                 self.num_local_heads * get_attention_dcp_world_size(),
                 self.kv_lora_rank,
             )
-            attn_output = cp_lse_ag_out_rs(attn_output, lse, get_attention_dcp_group())
+            attn_output = cp_lse_ag_out_rs_mla(attn_output, lse, get_dcp_group())
             attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 

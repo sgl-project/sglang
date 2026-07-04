@@ -68,6 +68,7 @@ class ForwardMetadata:
     seq_lens_list_cumsum: Optional[List[int]] = None
     seq_lens: Optional[torch.Tensor] = None
     actual_seq_lengths_q: Optional[torch.Tensor] = None
+    actual_seq_lengths_q_pa: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
 
     # swa attention mask for graph mode decode
@@ -684,7 +685,7 @@ class AscendAttnBackend(AttentionBackend):
             metadata.swa_mask[:bs, 0, :].copy_(mask)
             metadata.swa_mask[bs:, :, :].fill_(True)
         metadata.block_tables[:bs, :max_seq_pages].copy_(
-            self.req_to_token[req_pool_indices[:bs], :max_len][:, :: self.page_size]
+            self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
             // self.page_size
         )
 
@@ -2043,6 +2044,16 @@ class AscendAttnBackend(AttentionBackend):
                 self.speculative_num_draft_tokens,
             )
 
+            # When not in graph_mode, query is sliced to num_token_non_padded
+            # which may drop finished requests. The FIA TND kernel requires
+            # block_table.shape[0] == len(actual_seq_lengths); slice to match.
+            if not self.graph_mode:
+                actual_bs = len(actual_seq_lengths)
+                block_table = self.forward_metadata.block_tables[:actual_bs]
+                actual_seq_lengths_kv = actual_seq_lengths_kv[:actual_bs]
+            else:
+                block_table = self.forward_metadata.block_tables
+
             if (
                 self.q_head_num_padding is not None
                 and self.q_head_num_padding > self.tp_q_head_num
@@ -2088,7 +2099,7 @@ class AscendAttnBackend(AttentionBackend):
                 scale=layer.scaling,
                 antiquant_mode=0,
                 antiquant_scale=None,
-                block_table=self.forward_metadata.block_tables,
+                block_table=block_table,
                 block_size=self.page_size,
                 sparse_mode=3,
                 atten_mask=self.mtp_mask,
@@ -2109,7 +2120,7 @@ class AscendAttnBackend(AttentionBackend):
                 scale=layer.scaling,
                 antiquant_mode=0,
                 antiquant_scale=None,
-                block_table=self.forward_metadata.block_tables,
+                block_table=block_table,
                 block_size=self.page_size,
                 sparse_mode=3,
                 atten_mask=self.mtp_mask,
@@ -2417,6 +2428,7 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
+        **kwargs,
     ):
         if is_mla_preprocess_enabled() and self.use_mla:
             # MLAPO does saving kv_cache
