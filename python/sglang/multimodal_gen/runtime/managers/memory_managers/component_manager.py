@@ -186,7 +186,10 @@ class ComponentResidencyManager:
     ) -> None:
         """A hook called before processing an actual request"""
         self.refresh_server_args(server_args)
-        self.state = ResidencyState(stages=stages, batch_is_warmup=batch.is_warmup)
+        self.state = ResidencyState(
+            stages=stages,
+            batch_is_warmup=self._is_warmup_batch(batch),
+        )
         self._active_use = None
         self._active_use_module = None
         self._disable_active_nvtx()
@@ -200,6 +203,14 @@ class ComponentResidencyManager:
         self._ordered_uses = tuple(
             use for uses in self._stage_uses_by_index for use in uses
         )
+
+    @staticmethod
+    def _is_warmup_batch(batch: ResidencyBatch | list[ResidencyBatch]) -> bool:
+        if isinstance(batch, list):
+            return bool(batch) and all(
+                getattr(item, "is_warmup", False) for item in batch
+            )
+        return batch.is_warmup
 
     def before_stage(
         self,
