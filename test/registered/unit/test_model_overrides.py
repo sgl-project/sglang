@@ -846,6 +846,142 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _sparse_head_overlap_disable(view), {"disable_overlap_schedule": True}
             )
 
+    def test_deepseek_v4_overrides_at_callable_level(self):
+        from sglang.srt.arg_groups.overrides import _deepseek_v4_overrides
+        from sglang.srt.server_args import ServerArgs
+
+        hf = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+
+        def _args(**kw):
+            defaults = dict(
+                device="cuda",
+                swa_full_tokens_ratio=ServerArgs.swa_full_tokens_ratio,
+                moe_runner_backend="auto",
+                get_model_config=lambda: SimpleNamespace(nvfp4_moe_meta=None),
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        self.assertEqual(
+            _deepseek_v4_overrides(_args(), hf),
+            {
+                "attention_backend": "dsv4",
+                "page_size": 256,
+                "swa_full_tokens_ratio": 0.1,
+            },
+        )
+        # NPU pool geometry
+        self.assertEqual(
+            _deepseek_v4_overrides(_args(device="npu"), hf)["page_size"], 128
+        )
+        # user-set window ratio survives
+        self.assertNotIn(
+            "swa_full_tokens_ratio",
+            _deepseek_v4_overrides(_args(swa_full_tokens_ratio=0.5), hf),
+        )
+        # nvfp4 hybrid checkpoint routes the MoE runner
+        self.assertEqual(
+            _deepseek_v4_overrides(
+                _args(
+                    get_model_config=lambda: SimpleNamespace(nvfp4_moe_meta=object())
+                ),
+                hf,
+            )["moe_runner_backend"],
+            "flashinfer_trtllm_routed",
+        )
+
+    def test_deepseek_v4_sm120_moe_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deepseek_v4_sm120_moe,
+        )
+
+        def _view(arch="DeepseekV4ForCausalLM", **kw):
+            hf = SimpleNamespace(architectures=[arch])
+            defaults = dict(moe_runner_backend="auto")
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(
+                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+                )
+            )
+
+        with patch.object(overrides_module, "is_sm120_supported", return_value=True):
+            self.assertEqual(
+                _deepseek_v4_sm120_moe(_view()), {"moe_runner_backend": "marlin"}
+            )
+            self.assertEqual(
+                _deepseek_v4_sm120_moe(_view(moe_runner_backend="triton")), {}
+            )
+            self.assertEqual(_deepseek_v4_sm120_moe(_view(arch="LlamaForCausalLM")), {})
+        with patch.object(overrides_module, "is_sm120_supported", return_value=False):
+            self.assertEqual(_deepseek_v4_sm120_moe(_view()), {})
+
+    def test_nemotron_h_overrides_at_callable_level(self):
+        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+
+        def _hf(quant_algo="NVFP4"):
+            return SimpleNamespace(
+                architectures=["NemotronHForCausalLM"],
+                mlp_hidden_act="relu2",
+                quantization_config={"quant_algo": quant_algo},
+            )
+
+        def _args(mc_quant, hf, **kw):
+            mc = SimpleNamespace(quantization=mc_quant, hf_config=hf)
+            defaults = dict(
+                quantization=None,
+                moe_runner_backend="auto",
+                moe_a2a_backend="none",
+                attention_backend=None,
+                get_model_config=lambda: mc,
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        hf = _hf()
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            # modelopt checkpoint: quant algo resolution + sm100 defaults
+            self.assertEqual(
+                _nemotron_h_overrides(_args("modelopt", hf), hf),
+                {
+                    "quantization": "modelopt_fp4",
+                    "moe_runner_backend": "flashinfer_trtllm",
+                    "attention_backend": "flashinfer",
+                },
+            )
+            hf_mixed = _hf("MIXED_PRECISION")
+            self.assertEqual(
+                _nemotron_h_overrides(_args("modelopt", hf_mixed), hf_mixed)[
+                    "quantization"
+                ],
+                "modelopt_mixed",
+            )
+        with (
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            patch.object(overrides_module, "is_cuda", return_value=True),
+            patch.object(
+                overrides_module, "get_device_capability", return_value=(9, 0)
+            ),
+        ):
+            # SM80-SM90 fp4: marlin
+            self.assertEqual(
+                _nemotron_h_overrides(_args("modelopt_fp4", hf), hf),
+                {"quantization": "modelopt_fp4", "moe_runner_backend": "marlin"},
+            )
+            # unquantized checkpoint: cutlass fallback, no quant declared
+            self.assertEqual(
+                _nemotron_h_overrides(_args(None, hf), hf),
+                {"moe_runner_backend": "flashinfer_cutlass"},
+            )
+            # non-modelopt quantized checkpoint: nothing declared
+            self.assertEqual(_nemotron_h_overrides(_args("fp8", hf), hf), {})
+            # user-set moe backend survives
+            self.assertEqual(
+                _nemotron_h_overrides(_args(None, hf, moe_runner_backend="triton"), hf),
+                {},
+            )
+
     def test_mamba_radix_cache_resolution_pass(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,

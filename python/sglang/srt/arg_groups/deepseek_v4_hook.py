@@ -12,8 +12,15 @@ logger = logging.getLogger(__name__)
 
 
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
-    """Apply DeepSeek V4 model-specific server arg defaults and constraints."""
-    from sglang.srt.server_args import ServerArgs
+    """Residual imperative arm of the DeepSeek V4 defaults.
+
+    The attention/page/window/MoE-runner declarations moved to the override
+    registry (arg_groups/overrides.py: _deepseek_v4_overrides). This keeps,
+    at the legacy slot: the ROCm env fill (env-write policy), the kv-cache
+    dtype and NPU split-backend writes (kv/split-backend resolution is R2
+    territory), the max_running_requests fill (the speculative hook is a
+    later writer of that field) and the validations.
+    """
     from sglang.srt.utils import is_hip
 
     # FlashMLA sparse prefill (SGLANG_OPT_FLASHMLA_SPARSE_PREFILL, default on)
@@ -28,8 +35,6 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         )
         envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
 
-    server_args.attention_backend = "dsv4"
-    server_args.page_size = 256
     if server_args.kv_cache_dtype == "auto":
         server_args.kv_cache_dtype = "fp8_e4m3"
         logger.warning(
@@ -43,12 +48,8 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         # generic NPU models; undo that here so V4 stays consistently on dsv4.
         server_args.prefill_attention_backend = "dsv4"
         server_args.decode_attention_backend = "dsv4"
-        server_args.page_size = 128
         server_args.kv_cache_dtype = "bfloat16"
 
-    logger.info(
-        f"Use dsv4 attention backend for {model_arch}, setting page_size to {server_args.page_size}."
-    )
     assert server_args.kv_cache_dtype in [
         "fp8_e4m3",
         "bfloat16",
@@ -67,23 +68,6 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         assert (
             server_args.speculative_eagle_topk == 1
         ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
-
-    if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
-        server_args.swa_full_tokens_ratio = 0.1
-        logger.info(
-            f"Setting swa_full_tokens_ratio to {server_args.swa_full_tokens_ratio} for {model_arch}."
-        )
-
-    # nvidia/DeepSeek-V4-Pro-NVFP4 uses flashinfer_trtllm_routed MoE runner backend.
-    if (
-        server_args.moe_runner_backend == "auto"
-        and server_args.get_model_config().nvfp4_moe_meta is not None
-    ):
-        server_args.moe_runner_backend = "flashinfer_trtllm_routed"
-        logger.info(
-            "Use flashinfer_trtllm_routed as MoE runner backend for "
-            f"{model_arch} hybrid FP8+NVFP4 checkpoint."
-        )
 
 
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:

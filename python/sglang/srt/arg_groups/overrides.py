@@ -37,6 +37,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import resolve_flag_leaf
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
+    get_device_capability,
     get_device_sm,
     get_nvidia_driver_version,
     get_quantization_config,
@@ -581,6 +582,103 @@ def _lfm2_overrides(server_args: Any, hf_config: Any) -> dict:
     return {}
 
 
+@_register_for("DeepseekV4ForCausalLM")
+def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
+    """DeepSeek V4 attention/page/window/MoE-runner defaults (from
+    arg_groups/deepseek_v4_hook.py). The kv-cache dtype and NPU split-backend
+    writes, the max_running_requests fill and the validations stay in the
+    hook at its legacy slot."""
+    from sglang.srt.server_args import ServerArgs
+
+    model_arch = hf_config.architectures[0]
+    overrides: Dict[str, Any] = {"attention_backend": "dsv4"}
+
+    page_size = 256
+    if server_args.device == "npu":
+        # NPU keeps the device-aware "dsv4" backend (the registry routes it to
+        # the Ascend V4 subclass); only the pool geometry / dtype differ.
+        page_size = 128
+    overrides["page_size"] = page_size
+    logger.info(
+        f"Use dsv4 attention backend for {model_arch}, setting page_size to {page_size}."
+    )
+
+    if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
+        overrides["swa_full_tokens_ratio"] = 0.1
+        logger.info(f"Setting swa_full_tokens_ratio to 0.1 for {model_arch}.")
+
+    # nvidia/DeepSeek-V4-Pro-NVFP4 uses flashinfer_trtllm_routed MoE runner backend.
+    if (
+        server_args.moe_runner_backend == "auto"
+        and server_args.get_model_config().nvfp4_moe_meta is not None
+    ):
+        overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
+        logger.info(
+            "Use flashinfer_trtllm_routed as MoE runner backend for "
+            f"{model_arch} hybrid FP8+NVFP4 checkpoint."
+        )
+    return overrides
+
+
+@_register_for("NemotronHForCausalLM", "NemotronHPuzzleForCausalLM")
+def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
+    """NemotronH quantization / MoE runner / attention backend defaults
+    (absorbed from the retired arg_groups/nemotron_h_hook.py; the mamba radix
+    cache handling and the triton-backend assert stay in the arch branch)."""
+    model_arch = hf_config.architectures[0]
+    model_config = server_args.get_model_config()
+    overrides: Dict[str, Any] = {}
+
+    is_modelopt = model_config.quantization in [
+        "modelopt",
+        "modelopt_fp8",
+        "modelopt_fp4",
+        "modelopt_mixed",
+    ]
+    quantization = server_args.quantization
+    if is_modelopt:
+        assert model_config.hf_config.mlp_hidden_act == "relu2"
+        if model_config.quantization == "modelopt":
+            quant_algo = model_config.hf_config.quantization_config["quant_algo"]
+            if quant_algo == "MIXED_PRECISION":
+                quantization = "modelopt_mixed"
+            else:
+                quantization = (
+                    "modelopt_fp4" if quant_algo == "NVFP4" else "modelopt_fp8"
+                )
+        else:
+            quantization = model_config.quantization
+        overrides["quantization"] = quantization
+
+    if (is_modelopt or model_config.quantization is None) and (
+        server_args.moe_runner_backend == "auto"
+    ):
+        if is_sm100_supported() and server_args.moe_a2a_backend == "none":
+            overrides["moe_runner_backend"] = "flashinfer_trtllm"
+            logger.info(
+                f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
+            )
+        elif (
+            (
+                model_config.quantization in ("modelopt_fp4", "modelopt_mixed")
+                or quantization == "modelopt_fp4"
+            )
+            and is_cuda()
+            and (8, 0) <= get_device_capability() < (10, 0)
+        ):
+            overrides["moe_runner_backend"] = "marlin"
+            logger.info(
+                "Use marlin as MoE runner backend on SM80-SM90 for "
+                f"{model_arch} {model_config.quantization}"
+            )
+        else:
+            overrides["moe_runner_backend"] = "flashinfer_cutlass"
+
+    if is_sm100_supported() and server_args.attention_backend is None:
+        overrides["attention_backend"] = "flashinfer"
+    return overrides
+
+
 @_register_for(
     "Qwen3NextForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
@@ -927,6 +1025,21 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
                     "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
                 )
     return overrides
+
+
+@register_post_process
+def _deepseek_v4_sm120_moe(view: Any) -> dict:
+    """Slot pass in the DeepSeek V4 validation branch: SM120 lacks
+    tcgen05/TMEM, fall back to the marlin MoE runner (reads the
+    mid-resolution moe_runner_backend, after the dispatch-time nvfp4
+    default)."""
+    hf_config = view.get_model_config().hf_config
+    if hf_config.architectures[0] != "DeepseekV4ForCausalLM":
+        return {}
+    if is_sm120_supported() and view.moe_runner_backend == "auto":
+        logger.info("Use marlin as MoE runner backend on SM120 for DeepseekV4")
+        return {"moe_runner_backend": "marlin"}
+    return {}
 
 
 @register_post_process

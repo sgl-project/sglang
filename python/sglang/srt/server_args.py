@@ -3934,12 +3934,16 @@ class ServerArgs:
 
             validate_deepseek_v4_cp(self)
 
+            # The SM120 marlin fallback moved to the resolution pipeline
+            # (arg_groups/overrides.py: _deepseek_v4_sm120_moe), invoked here
+            # at its legacy slot.
+            from sglang.srt.arg_groups.overrides import (
+                _deepseek_v4_sm120_moe,
+                run_post_process_pass,
+            )
+
+            run_post_process_pass(self, _deepseek_v4_sm120_moe)
             if is_sm120_supported():
-                if self.moe_runner_backend == "auto":
-                    self.moe_runner_backend = "marlin"
-                    logger.info(
-                        "Use marlin as MoE runner backend on SM120 for DeepseekV4"
-                    )
                 # SM120 lacks tcgen05/TMEM: disable features that depend on
                 # DeepGEMM or require >99KB SMEM (topk_v2).
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
@@ -4124,11 +4128,13 @@ class ServerArgs:
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
             )
         elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
-            from sglang.srt.arg_groups.nemotron_h_hook import (
-                apply_nemotron_h_defaults,
+            # Quantization / MoE runner / attention backend defaults moved to
+            # the override registry (arg_groups/overrides.py:
+            # _nemotron_h_overrides).
+            assert self.attention_backend != "triton", (
+                "NemotronHForCausalLM does not support triton attention backend,"
+                "as the first layer might not be an attention layer"
             )
-
-            apply_nemotron_h_defaults(self, model_arch)
         elif model_arch in [
             "Qwen3MoeForCausalLM",
             "Qwen3VLMoeForConditionalGeneration",
