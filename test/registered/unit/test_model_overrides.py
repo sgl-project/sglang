@@ -67,6 +67,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "enable_multi_layer_eagle",
                     "swa_full_tokens_ratio",
                     "disable_hybrid_swa_memory",
+                    "sampling_backend",
                 }
             ),
         )
@@ -160,6 +161,53 @@ class TestModelOverrideRegistry(_IsolatedRegistry):
         self.assertEqual(
             collect_model_override_declarations("OtherForCausalLM", None, None), []
         )
+
+
+class TestResolvedViewAndPasses(CustomTestCase):
+    """Pipeline skeleton: read-only view semantics + transition invocation."""
+
+    def test_view_forwards_reads_and_rejects_writes(self):
+        from sglang.srt.arg_groups.overrides import ResolvedView
+
+        live = SimpleNamespace(a=1, method=lambda: "m")
+        view = ResolvedView(live)
+        self.assertEqual(view.a, 1)
+        self.assertEqual(view.method(), "m")  # method forwarding
+        live.a = 2
+        self.assertEqual(view.a, 2)  # live, not a snapshot
+        with self.assertRaises(AttributeError):
+            view.a = 3
+
+    def test_view_overlay_wins(self):
+        from sglang.srt.arg_groups.overrides import ResolvedView
+
+        view = ResolvedView(SimpleNamespace(a=1, b=2), overlay={"a": 10})
+        self.assertEqual(view.a, 10)
+        self.assertEqual(view.b, 2)
+
+    def test_run_pass_appends_stash_and_dual_applies(self):
+        from sglang.srt.arg_groups.overrides import run_post_process_pass
+
+        live = SimpleNamespace(x=None, _resolved_overrides=[])
+
+        def _fill_x(view):
+            return {"x": "filled"} if view.x is None else {}
+
+        run_post_process_pass(live, _fill_x)
+        self.assertEqual(live.x, "filled")  # dual-applied in place
+        self.assertEqual(
+            live._resolved_overrides, [(_fill_x.__qualname__, {"x": "filled"})]
+        )
+        run_post_process_pass(live, _fill_x)  # now a no-op
+        self.assertEqual(len(live._resolved_overrides), 1)
+
+    def test_run_pass_rejects_non_dict(self):
+        from sglang.srt.arg_groups.overrides import run_post_process_pass
+
+        with self.assertRaises(TypeError):
+            run_post_process_pass(
+                SimpleNamespace(_resolved_overrides=[]), lambda view: None
+            )
 
 
 @dataclasses.dataclass
@@ -346,9 +394,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_mistral_large3_forces_bfloat16(self):
         sa = self._construct("MistralLarge3ForCausalLM", "mistral")
         self.assertEqual(sa.dtype, "bfloat16")  # dual-apply == legacy write
-        self.assertEqual(
+        self.assertIn(
+            ("MODEL_OVERRIDES['MistralLarge3ForCausalLM']", {"dtype": "bfloat16"}),
             sa._resolved_overrides,
-            [("MODEL_OVERRIDES['MistralLarge3ForCausalLM']", {"dtype": "bfloat16"})],
         )
         self.assertEqual(self._publish(sa).dtype, "bfloat16")
 
@@ -368,7 +416,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_control_arch_keeps_pristine_dtype(self):
         sa = self._construct("LlamaForCausalLM", "llama")
         self.assertEqual(sa.dtype, "auto")
-        self.assertEqual(sa._resolved_overrides, [])
+        declared = {f for _s, d in sa._resolved_overrides for f in d}
+        self.assertNotIn("dtype", declared)  # no arch declaration for Llama
         # publish still materializes the whitelisted leaf with the pristine
         # value: readers only ever read flags.
         self.assertEqual(self._publish(sa).dtype, "auto")
@@ -376,9 +425,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")
         self.assertTrue(sa.enable_tf32_matmul)  # dual-apply == legacy write
-        self.assertEqual(
+        self.assertIn(
+            ("_minimax_m2_overrides", {"enable_tf32_matmul": True}),
             sa._resolved_overrides,
-            [("_minimax_m2_overrides", {"enable_tf32_matmul": True})],
         )
         flags = self._publish(sa)
         self.assertTrue(flags.enable_tf32_matmul)
@@ -430,9 +479,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_gemma2_disables_hybrid_swa_memory(self):
         sa = self._construct("Gemma2ForCausalLM", "llama")
         self.assertTrue(sa.disable_hybrid_swa_memory)  # dual-apply == legacy
-        self.assertEqual(
+        self.assertIn(
+            ("_gemma2_gemma3_overrides", {"disable_hybrid_swa_memory": True}),
             sa._resolved_overrides,
-            [("_gemma2_gemma3_overrides", {"disable_hybrid_swa_memory": True})],
         )
         self.assertTrue(self._publish(sa).disable_hybrid_swa_memory)
 
@@ -489,6 +538,46 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     SimpleNamespace(dtype="float16"),
                     SimpleNamespace(architectures=["GptOssForCausalLM"]),
                 )
+
+    def test_sampling_backend_default_pass(self):
+        from sglang.srt.utils.common import is_flashinfer_available
+
+        sa = self._construct("LlamaForCausalLM", "llama")
+        expected = "flashinfer" if is_flashinfer_available() else "pytorch"
+        self.assertEqual(sa.sampling_backend, expected)
+        self.assertIn(
+            ("_sampling_backend_default", {"sampling_backend": expected}),
+            sa._resolved_overrides,
+        )
+        self.assertEqual(self._publish(sa).sampling_backend, expected)
+
+    def test_sampling_backend_user_choice_survives(self):
+        sa = self._construct("LlamaForCausalLM", "llama", sampling_backend="pytorch")
+        self.assertEqual(sa.sampling_backend, "pytorch")
+        # the pass declared nothing; publish materializes the pristine choice
+        self.assertEqual(self._publish(sa).sampling_backend, "pytorch")
+
+    def test_deterministic_inference_forces_pytorch_sampling(self):
+        sa = self._construct(
+            "LlamaForCausalLM", "llama", enable_deterministic_inference=True
+        )
+        # two pass writers chain: default fill, then the deterministic force —
+        # last writer wins on the flags leaf and parity holds end-to-end.
+        self.assertEqual(sa.sampling_backend, "pytorch")
+        self.assertEqual(self._publish(sa).sampling_backend, "pytorch")
+
+    def test_deterministic_ascend_is_left_alone(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deterministic_sampling_backend,
+        )
+
+        view = ResolvedView(
+            SimpleNamespace(
+                enable_deterministic_inference=True, sampling_backend="ascend"
+            )
+        )
+        self.assertEqual(_deterministic_sampling_backend(view), {})
 
     def test_step3p_declarations_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _step3p_overrides

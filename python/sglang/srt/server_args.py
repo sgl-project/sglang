@@ -1430,6 +1430,7 @@ class ServerArgs:
         Arg(
             help="Choose the kernels for sampling layers.",
             choices=SAMPLING_BACKEND_CHOICES,
+            model_overridable=True,
         ),
     ] = None
     grammar_backend: A[
@@ -4611,10 +4612,14 @@ class ServerArgs:
             self._validate_mamba_no_buffer(model_arch)
 
     def _handle_sampling_backend(self):
-        if self.sampling_backend is None:
-            self.sampling_backend = (
-                "flashinfer" if is_flashinfer_available() else "pytorch"
-            )
+        # Moved to the resolution pipeline (arg_groups/overrides.py:
+        # _sampling_backend_default), invoked here at its legacy slot.
+        from sglang.srt.arg_groups.overrides import (
+            _sampling_backend_default,
+            run_post_process_pass,
+        )
+
+        run_post_process_pass(self, _sampling_backend_default)
 
     def _get_default_attn_backend(self, use_mla_backend: bool, model_config):
         """
@@ -6307,12 +6312,15 @@ class ServerArgs:
                 )
                 self.flashinfer_allreduce_fusion_backend = None
 
-            # Check sampling backend
-            if self.sampling_backend != "ascend":
-                self.sampling_backend = "pytorch"
-                logger.warning(
-                    "Sampling backend is set to pytorch for deterministic inference."
-                )
+            # The forced-pytorch sampling write moved to the resolution
+            # pipeline (arg_groups/overrides.py:
+            # _deterministic_sampling_backend), invoked at its legacy slot.
+            from sglang.srt.arg_groups.overrides import (
+                _deterministic_sampling_backend,
+                run_post_process_pass,
+            )
+
+            run_post_process_pass(self, _deterministic_sampling_backend)
             is_deepseek_model = False
             if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
                 try:
