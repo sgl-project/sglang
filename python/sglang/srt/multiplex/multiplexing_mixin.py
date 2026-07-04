@@ -210,6 +210,10 @@ class SchedulerMultiplexMixin:
                         )
                         if self.running_batch and not self.running_batch.is_empty():
                             self.running_batch.merge_batch(self.split_prefill_batch)
+                            # merge batch on prefill stream, decode stream wait for prefill stream to finish
+                            prefill_commit_done = torch.cuda.Event()
+                            prefill_commit_done.record(prefill_stream)
+                            decode_stream.wait_event(prefill_commit_done)
                         else:
                             self.running_batch = self.split_prefill_batch
 
