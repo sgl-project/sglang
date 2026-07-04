@@ -89,6 +89,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dsa_decode_backend",
                     "prefill_attention_backend",
                     "decode_attention_backend",
+                    "flashinfer_allreduce_fusion_backend",
                 }
             ),
         )
@@ -1095,6 +1096,103 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "dsa_decode_backend": "tilelang",
                 },
             )
+
+    def test_flashinfer_allreduce_fusion_passes(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deterministic_allreduce_fusion_disable,
+            _enforce_disable_allreduce_fusion,
+            _flashinfer_allreduce_fusion_auto_enable,
+        )
+
+        def _view(arch="Qwen3MoeForCausalLM", **kw):
+            hf = SimpleNamespace(architectures=[arch])
+            defaults = dict(
+                flashinfer_allreduce_fusion_backend=None,
+                tp_size=2,
+                enable_dp_attention=False,
+                nnodes=1,
+                moe_a2a_backend="none",
+                enforce_disable_flashinfer_allreduce_fusion=False,
+                enable_deterministic_inference=False,
+            )
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(
+                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+                )
+            )
+
+        with (
+            patch.object(overrides_module, "is_sm90_supported", return_value=True),
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+        ):
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(_view()),
+                {"flashinfer_allreduce_fusion_backend": "auto"},
+            )
+            # guards: unsupported arch / tp==1 / dp attention / a2a backend
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(
+                    _view(arch="LlamaForCausalLM")
+                ),
+                {},
+            )
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(_view(tp_size=1)), {}
+            )
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(
+                    _view(enable_dp_attention=True)
+                ),
+                {},
+            )
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(
+                    _view(moe_a2a_backend="deepep")
+                ),
+                {},
+            )
+            # SM90 multi-node: blocked (nnodes>1 needs SM100)
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(_view(nnodes=2)), {}
+            )
+            # user-set backend survives
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(
+                    _view(flashinfer_allreduce_fusion_backend="trtllm")
+                ),
+                {},
+            )
+
+        # enforce-disable wins over everything
+        self.assertEqual(
+            _enforce_disable_allreduce_fusion(
+                _view(
+                    flashinfer_allreduce_fusion_backend="auto",
+                    enforce_disable_flashinfer_allreduce_fusion=True,
+                )
+            ),
+            {"flashinfer_allreduce_fusion_backend": None},
+        )
+        self.assertEqual(_enforce_disable_allreduce_fusion(_view()), {})
+
+        # deterministic inference disables an enabled fusion
+        self.assertEqual(
+            _deterministic_allreduce_fusion_disable(
+                _view(
+                    flashinfer_allreduce_fusion_backend="auto",
+                    enable_deterministic_inference=True,
+                )
+            ),
+            {"flashinfer_allreduce_fusion_backend": None},
+        )
+        self.assertEqual(
+            _deterministic_allreduce_fusion_disable(
+                _view(enable_deterministic_inference=True)
+            ),
+            {},
+        )
 
     def test_cutedsl_prefill_backend_fill_pass(self):
         from sglang.srt.arg_groups.overrides import (

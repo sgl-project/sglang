@@ -1284,6 +1284,68 @@ def _sparse_head_overlap_disable(view: Any) -> dict:
     return {}
 
 
+# Architectures with explicit FlashInfer AllReduce Fusion support. Keep in
+# sync with the model-side fusion implementations.
+_FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
+    {
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "GptOssForCausalLM",
+        "GlmMoeDsaForCausalLM",
+        "Glm4MoeForCausalLM",
+        "Glm4MoeLiteForCausalLM",
+        "MistralLarge3ForCausalLM",
+        "Qwen3MoeForCausalLM",
+        "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3NextForCausalLM",
+        "KimiK25ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+        "InternS2PreviewForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "NemotronHForCausalLM",
+        "NemotronHPuzzleForCausalLM",
+    }
+)
+
+
+@register_post_process
+def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
+    """Slot pass at the monolith tail: auto-enable FlashInfer AllReduce
+    Fusion on SM90/SM100 for models with explicit support. auto resolves to
+    mnnvl on Blackwell (single- and multi-node) and trtllm on SM90
+    single-node systems. Reads the mid-resolution enable_dp_attention /
+    moe_a2a_backend (after the DeepSeek CP and a2a declarations), exactly
+    like the legacy tail block."""
+    model_arch = view.get_model_config().hf_config.architectures[0]
+    if (
+        view.flashinfer_allreduce_fusion_backend is None
+        and model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS
+        and (is_sm90_supported() or is_sm100_supported())
+        and view.tp_size > 1
+        and not view.enable_dp_attention
+        and (view.nnodes == 1 or is_sm100_supported())
+        and view.moe_a2a_backend == "none"
+    ):
+        logger.info(
+            f"Auto-enabling FlashInfer AllReduce Fusion on SM90/SM10X for {model_arch}"
+        )
+        return {"flashinfer_allreduce_fusion_backend": "auto"}
+    return {}
+
+
+@register_post_process
+def _enforce_disable_allreduce_fusion(view: Any) -> dict:
+    """Slot pass right after the auto-enable: the user's enforce-disable
+    switch wins over every model-specific adjustment."""
+    if view.enforce_disable_flashinfer_allreduce_fusion:
+        logger.info(
+            "FlashInfer allreduce fusion is forcibly disabled "
+            "via --enforce-disable-flashinfer-allreduce-fusion."
+        )
+        return {"flashinfer_allreduce_fusion_backend": None}
+    return {}
+
+
 @register_post_process
 def _sampling_backend_default(view: Any) -> dict:
     if view.sampling_backend is None:
@@ -1325,6 +1387,19 @@ def _deterministic_is_deepseek_model(view: Any) -> bool:
         ]
     except Exception:
         return False
+
+
+@register_post_process
+def _deterministic_allreduce_fusion_disable(view: Any) -> dict:
+    if (
+        view.enable_deterministic_inference
+        and view.flashinfer_allreduce_fusion_backend is not None
+    ):
+        logger.warning(
+            "Disable --flashinfer-allreduce-fusion-backend because deterministic inference is enabled."
+        )
+        return {"flashinfer_allreduce_fusion_backend": None}
+    return {}
 
 
 @register_post_process

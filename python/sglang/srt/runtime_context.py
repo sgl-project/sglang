@@ -336,6 +336,7 @@ class Flags(_StaticFlags):
     kv_cache_dtype: str = "auto"
     dsa_prefill_backend: str | None = None
     dsa_decode_backend: str | None = None
+    flashinfer_allreduce_fusion_backend: str | None = None
     # Parallel-request fields: flat transitional home, to be re-homed by the
     # Parallel Parameters Clarification module.
     enable_dp_attention: bool = False

@@ -2233,6 +2233,7 @@ class ServerArgs:
                 "single-node or multi-node systems via MNNVL fabric. "
                 "Fuses allreduce with Residual + RMSNorm for supported MoE models."
             ),
+            resolvable=True,
         ),
     ] = None
     enable_aiter_allreduce_fusion: A[bool, "Enable Aiter AllReduce Fusion."] = False
@@ -4114,49 +4115,18 @@ class ServerArgs:
 
         run_post_process_pass(self, _sparse_head_overlap_disable)
 
-        # Auto-enable FlashInfer AllReduce Fusion on SM90/SM100, for models with
-        # explicit support (DeepseekV3, GptOss, Glm4Moe, MistralLarge3,
-        # Qwen3/Qwen3-VL/Qwen3Next/Qwen3.5 MoE families). auto resolves to mnnvl on
-        # Blackwell (single- and multi-node) and trtllm on SM90 single-node systems.
-        if (
-            self.flashinfer_allreduce_fusion_backend is None
-            and model_arch
-            in [
-                "DeepseekV3ForCausalLM",
-                "DeepseekV32ForCausalLM",
-                "GptOssForCausalLM",
-                "GlmMoeDsaForCausalLM",
-                "Glm4MoeForCausalLM",
-                "Glm4MoeLiteForCausalLM",
-                "MistralLarge3ForCausalLM",
-                "Qwen3MoeForCausalLM",
-                "Qwen3VLMoeForConditionalGeneration",
-                "Qwen3NextForCausalLM",
-                "KimiK25ForConditionalGeneration",
-                "Qwen3_5MoeForConditionalGeneration",
-                "InternS2PreviewForConditionalGeneration",
-                "Qwen3_5ForConditionalGeneration",
-                "NemotronHForCausalLM",
-                "NemotronHPuzzleForCausalLM",
-            ]
-            and (is_sm90_supported() or is_sm100_supported())
-            and self.tp_size > 1
-            and not self.enable_dp_attention
-            and (self.nnodes == 1 or is_sm100_supported())
-            and self.moe_a2a_backend == "none"
-        ):
-            self.flashinfer_allreduce_fusion_backend = "auto"
-            logger.info(
-                f"Auto-enabling FlashInfer AllReduce Fusion on SM90/SM10X for {model_arch}"
-            )
+        # The FlashInfer AllReduce Fusion auto-enable and the enforce-disable
+        # terminal moved to the resolution pipeline (arg_groups/overrides.py:
+        # _flashinfer_allreduce_fusion_auto_enable /
+        # _enforce_disable_allreduce_fusion), invoked here at their legacy
+        # slots.
+        from sglang.srt.arg_groups.overrides import (
+            _enforce_disable_allreduce_fusion,
+            _flashinfer_allreduce_fusion_auto_enable,
+        )
 
-        # Apply enforce_disable_flashinfer_allreduce_fusion after all model-specific adjustments
-        if self.enforce_disable_flashinfer_allreduce_fusion:
-            self.flashinfer_allreduce_fusion_backend = None
-            logger.info(
-                "FlashInfer allreduce fusion is forcibly disabled "
-                "via --enforce-disable-flashinfer-allreduce-fusion."
-            )
+        run_post_process_pass(self, _flashinfer_allreduce_fusion_auto_enable)
+        run_post_process_pass(self, _enforce_disable_allreduce_fusion)
 
     def _support_mamba_cache_extra_buffer(self, model_arch: str):
         from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
@@ -5745,11 +5715,15 @@ class ServerArgs:
                 )
                 self.enable_aiter_allreduce_fusion = False
 
-            if self.flashinfer_allreduce_fusion_backend is not None:
-                logger.warning(
-                    "Disable --flashinfer-allreduce-fusion-backend because deterministic inference is enabled."
-                )
-                self.flashinfer_allreduce_fusion_backend = None
+            # Moved to the resolution pipeline (arg_groups/overrides.py:
+            # _deterministic_allreduce_fusion_disable), invoked here at its
+            # legacy slot.
+            from sglang.srt.arg_groups.overrides import (
+                _deterministic_allreduce_fusion_disable,
+                run_post_process_pass,
+            )
+
+            run_post_process_pass(self, _deterministic_allreduce_fusion_disable)
 
             # The forced-pytorch sampling write and the attention backend
             # fill/validation moved to the resolution pipeline
