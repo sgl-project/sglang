@@ -8,7 +8,9 @@ from sglang.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
 from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, suite="base-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(
+    est_time=30, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
 
 
 HIDDEN_SIZE_LIST = sorted([1536, *range(1024, 8192 + 1, 1024)])

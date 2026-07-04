@@ -6,7 +6,9 @@ from sglang.jit_kernel.norm import fused_inplace_qknorm_across_heads
 from sglang.srt.utils import get_current_device_stream_fast
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=12, suite="base-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(
+    est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
 
 alt_stream = torch.cuda.Stream()
 
