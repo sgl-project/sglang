@@ -1508,7 +1508,28 @@ class DSparkWorkerV2(BaseSpecWorker):
             extend_lens = [req.extend_range.length for req in reqs]
 
         ctx_lens = torch.tensor(extend_lens, dtype=torch.int32, device=device)
-        draft_seq_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
+        prefix_lens_tensor = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
+        # For chunked prefill, the draft-context RoPE start is the logical start
+        # of this chunk. Derive it from post-prefill seq_lens so context KV
+        # materialization stays correct even if prefix_lens only reflects a
+        # cache-prefix notion on a specialized scheduling path.
+        draft_seq_lens = (
+            model_worker_batch.seq_lens.to(device=device, dtype=torch.int32) - ctx_lens
+        ).clamp_min_(0)
+        if self._accept_anomaly_enabled and not torch.equal(
+            draft_seq_lens, prefix_lens_tensor
+        ):
+            logger.warning(
+                "DSpark prefill materialize prefix mismatch: prefix_lens=%s "
+                "seq_lens_minus_extend=%s extend_lens=%s seq_lens=%s",
+                [int(x) for x in prefix_lens_tensor.detach().cpu().tolist()],
+                [int(x) for x in draft_seq_lens.detach().cpu().tolist()],
+                [int(x) for x in ctx_lens.detach().cpu().tolist()],
+                [
+                    int(x)
+                    for x in model_worker_batch.seq_lens.detach().cpu().tolist()
+                ],
+            )
         positions, _ = compute_position(
             self.model_runner.server_args.attention_backend,
             draft_seq_lens,
