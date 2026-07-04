@@ -1791,10 +1791,10 @@ class DeepseekV4AttnBackend(
         topk_lengths_blk = seq_end - start_pos
         index_width = ceil_align(SWA_WINDOW + int(block_size), PAGE_INDEX_ALIGNED_SIZE)
 
-        offsets = start_pos.unsqueeze(1) + torch.arange(
+        offsets = (seq_end - 1).unsqueeze(1) - torch.arange(
             index_width, **self.cuda_int32_kwargs
         ).unsqueeze(0)
-        invalid_offset_mask = offsets >= seq_end.unsqueeze(1)
+        invalid_offset_mask = offsets < start_pos.unsqueeze(1)
         offsets.masked_fill_(invalid_offset_mask, 0)
 
         req_pool_indices_blk = req_pool_indices_repeated[last_row]
