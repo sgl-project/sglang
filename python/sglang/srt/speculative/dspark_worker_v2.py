@@ -935,8 +935,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         prefix_lens: torch.Tensor,
     ) -> None:
-        hidden = draft_input.hidden_states
-        mask = draft_input.hidden_valid_mask
+        hidden = draft_input.prefill_tail_hidden_states
+        mask = draft_input.prefill_tail_valid_mask
         bs = len(prefix_lens)
         if (
             hidden.numel() == 0
@@ -1562,23 +1562,23 @@ class DSparkWorkerV2(BaseSpecWorker):
         bonus_tokens: torch.Tensor,
         seq_lens: torch.Tensor,
         cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
-        hidden_valid_mask: Optional[torch.Tensor] = None,
+        prefill_tail_hidden_states: Optional[torch.Tensor] = None,
+        prefill_tail_valid_mask: Optional[torch.Tensor] = None,
     ) -> DSparkDraftInputV2:
-        if hidden_states is None:
-            hidden_states = torch.empty(
-                (0, 0), dtype=torch.float16, device=bonus_tokens.device
+        if prefill_tail_hidden_states is None:
+            prefill_tail_hidden_states = torch.empty(
+                (0, 0, 0), dtype=torch.float16, device=bonus_tokens.device
             )
-        if hidden_valid_mask is None:
-            hidden_valid_mask = torch.empty(
+        if prefill_tail_valid_mask is None:
+            prefill_tail_valid_mask = torch.empty(
                 (0, 0), dtype=torch.bool, device=bonus_tokens.device
             )
         return DSparkDraftInputV2(
             bonus_tokens=bonus_tokens.to(dtype=torch.int64),
             new_seq_lens=seq_lens.to(dtype=torch.int64),
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
-            hidden_states=hidden_states,
-            hidden_valid_mask=hidden_valid_mask,
+            prefill_tail_hidden_states=prefill_tail_hidden_states,
+            prefill_tail_valid_mask=prefill_tail_valid_mask,
             transfer_warmup_rounds=torch.zeros_like(seq_lens, dtype=torch.int32),
         )
 
@@ -1749,8 +1749,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=next_token_ids,
             seq_lens=model_worker_batch.seq_lens,
             cur_allocated_seq_lens_cpu=model_worker_batch.seq_lens_cpu,
-            hidden_states=prefill_tail_hidden,
-            hidden_valid_mask=prefill_tail_mask,
+            prefill_tail_hidden_states=prefill_tail_hidden,
+            prefill_tail_valid_mask=prefill_tail_mask,
         )
         verify_done = torch.get_device_module(device).Event()
         verify_done.record()

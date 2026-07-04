@@ -111,6 +111,8 @@ class RelayPayload:
     topk_index: Optional[torch.Tensor] = None
     hidden_states: Optional[torch.Tensor] = None
     hidden_valid_mask: Optional[torch.Tensor] = None
+    prefill_tail_hidden_states: Optional[torch.Tensor] = None
+    prefill_tail_valid_mask: Optional[torch.Tensor] = None
     draft_probs: Optional[torch.Tensor] = None
     transfer_warmup_rounds: Optional[torch.Tensor] = None
 
@@ -122,6 +124,12 @@ class RelayPayload:
             topk_index=draft_input.topk_index,
             hidden_states=draft_input.hidden_states,
             hidden_valid_mask=getattr(draft_input, "hidden_valid_mask", None),
+            prefill_tail_hidden_states=getattr(
+                draft_input, "prefill_tail_hidden_states", None
+            ),
+            prefill_tail_valid_mask=getattr(
+                draft_input, "prefill_tail_valid_mask", None
+            ),
             draft_probs=getattr(draft_input, "draft_probs", None),
             transfer_warmup_rounds=getattr(
                 draft_input, "transfer_warmup_rounds", None
@@ -258,6 +266,33 @@ class FutureMap:
             )
             self.hidden_valid_mask_buf.zero_()
 
+    def _maybe_init_prefill_tail_buf(self, payload: RelayPayload) -> None:
+        if (
+            not self.spec_algo.is_dspark()
+            or getattr(self, "prefill_tail_hidden_states_buf", None) is not None
+            or payload.prefill_tail_hidden_states is None
+            or payload.prefill_tail_hidden_states.numel() == 0
+        ):
+            return
+        tail0 = payload.prefill_tail_hidden_states[0]
+        self.prefill_tail_hidden_states_buf = torch.empty(
+            (self.req_pool_size, *tail0.shape),
+            dtype=tail0.dtype,
+            device=self.device,
+        )
+        self.prefill_tail_valid_mask_buf = None
+        if (
+            payload.prefill_tail_valid_mask is not None
+            and payload.prefill_tail_valid_mask.numel() > 0
+        ):
+            tail_mask0 = payload.prefill_tail_valid_mask[0]
+            self.prefill_tail_valid_mask_buf = torch.empty(
+                (self.req_pool_size, *tail_mask0.shape),
+                dtype=tail_mask0.dtype,
+                device=self.device,
+            )
+            self.prefill_tail_valid_mask_buf.zero_()
+
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         if self.spec_algo.is_ngram():
             # FIXME: remove once precomputed draft is supported.
@@ -323,6 +358,21 @@ class FutureMap:
                 and hasattr(draft_input, "hidden_valid_mask")
             ):
                 draft_input.hidden_valid_mask = self.hidden_valid_mask_buf[indices]
+        if (
+            self.spec_algo.is_dspark()
+            and getattr(self, "prefill_tail_hidden_states_buf", None) is not None
+            and hasattr(draft_input, "prefill_tail_hidden_states")
+        ):
+            draft_input.prefill_tail_hidden_states = (
+                self.prefill_tail_hidden_states_buf[indices]
+            )
+            if (
+                getattr(self, "prefill_tail_valid_mask_buf", None) is not None
+                and hasattr(draft_input, "prefill_tail_valid_mask")
+            ):
+                draft_input.prefill_tail_valid_mask = (
+                    self.prefill_tail_valid_mask_buf[indices]
+                )
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
@@ -419,6 +469,7 @@ class FutureMap:
             )
         if self.need_hidden_states:
             self._maybe_init_hidden_buf(payload)
+        self._maybe_init_prefill_tail_buf(payload)
         if (
             self.need_hidden_states
             and self.hidden_states_buf is not None
@@ -440,6 +491,27 @@ class FutureMap:
             and getattr(self, "hidden_valid_mask_buf", None) is not None
         ):
             self.hidden_valid_mask_buf[indices] = False
+        if (
+            getattr(self, "prefill_tail_hidden_states_buf", None) is not None
+            and payload.prefill_tail_hidden_states is not None
+            and payload.prefill_tail_hidden_states.numel() > 0
+        ):
+            self.prefill_tail_hidden_states_buf[indices] = (
+                payload.prefill_tail_hidden_states.to(
+                    self.prefill_tail_hidden_states_buf.dtype
+                )
+            )
+            if (
+                getattr(self, "prefill_tail_valid_mask_buf", None) is not None
+                and payload.prefill_tail_valid_mask is not None
+            ):
+                self.prefill_tail_valid_mask_buf[indices] = (
+                    payload.prefill_tail_valid_mask.to(
+                        self.prefill_tail_valid_mask_buf.dtype
+                    )
+                )
+        elif getattr(self, "prefill_tail_valid_mask_buf", None) is not None:
+            self.prefill_tail_valid_mask_buf[indices] = False
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
             self.draft_probs_buf[indices] = payload.draft_probs
         if (
