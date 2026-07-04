@@ -20,7 +20,7 @@ Usage:
     python3 benchmark/kernels/lora_csgmv/tune_lora_csgmv.py \
         --model Qwen/Qwen3-Embedding-0.6B --max-lora-rank 64
 
-    # Configs saved to python/sglang/srt/lora/triton_ops/configs/
+    # Configs saved to python/sglang/kernels/ops/gemm/configs/
 
     # Server automatically picks them up:
     python3 -m sglang.launch_server --model ... --enable-lora --lora-backend csgmv
