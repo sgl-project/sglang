@@ -142,13 +142,18 @@ class CommonKVManager(BaseKVManager):
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
-        hybrid_mla_needs_all_cp_ranks = self.is_hybrid_mla_backend and (
-            self.attn_cp_size > 1 or disaggregation_mode == DisaggregationMode.DECODE
+        cp_sharded_prefill = self.attn_cp_size > 1 and (
+            self.is_hybrid_mla_backend or server_args.enable_dsa_cache_layer_split
+        )
+
+        hybrid_decode_pulls_all_ranks = (
+            self.is_hybrid_mla_backend
+            and disaggregation_mode == DisaggregationMode.DECODE
         )
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
-            or hybrid_mla_needs_all_cp_ranks
-            or (server_args.enable_dsa_cache_layer_split and self.attn_cp_size > 1)
+            or cp_sharded_prefill
+            or hybrid_decode_pulls_all_ranks
         )
 
         # bind zmq socket
