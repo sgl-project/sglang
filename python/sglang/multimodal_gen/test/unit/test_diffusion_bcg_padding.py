@@ -244,7 +244,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.stage._cache_dit_enabled = False
 
         self.assertIsNone(self.stage._maybe_get_bcg_runner(self.qwen_model))
-        self.stage._maybe_enable_torch_compile(self.qwen_model)
+        self.stage._maybe_torch_compile(self.qwen_model)
         self.stage._maybe_enable_cache_dit(1, SimpleNamespace(is_warmup=True))
         self.assertEqual(self.stage._bcg_runners, {})
 
