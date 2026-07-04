@@ -1124,6 +1124,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         self.assertTrue(torch.equal(schedule_batch.input_ids, token_ids))
         self.assertIs(scheduler.processed_batch, batch_copy)
         self.assertIs(scheduler.processed_result, scheduler.tp_worker.result)
+        self.assertEqual(scheduler.forward_ct, 1)
 
     def test_overlap_loop_materializes_prefill_input_ids(self):
         # Regression: the MLX overlap loop must materialize batch.input_ids
@@ -1513,6 +1514,10 @@ if _HAS_MLX:
             self.last_batch = None
             self.processed_batch = None
             self.processed_result = None
+            self.forward_ct = 0
+            self.profiler_manager = SimpleNamespace(
+                _profile_batch_predicate=lambda batch: None
+            )
 
         def process_batch_result(self, batch, result):
             self.processed_batch = batch
