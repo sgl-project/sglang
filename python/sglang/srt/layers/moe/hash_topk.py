@@ -178,14 +178,13 @@ class HashTopK(nn.Module):
 
         return topk_weights, topk_ids
 
-    def _forward_impl(
+    def forward(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-        apply_deepep_waterfill: bool = True,
     ):
         assert (
             input_ids.shape[0] == hidden_states.shape[0] == router_logits.shape[0]
@@ -223,12 +222,7 @@ class HashTopK(nn.Module):
 
             lplb_solver = get_global_lplb_solver(self.layer_id)
             if lplb_solver is not None:
-                lplb_solver_input = (
-                    topk_ids[:, :-num_fused_shared_experts]
-                    if has_per_rank_fused_shared_slots(num_fused_shared_experts)
-                    else topk_ids
-                )
-                log2phy_prob = lplb_solver.solve(lplb_solver_input)
+                log2phy_prob = lplb_solver.solve(topk_ids)
 
         recorder_topk_ids = None
         if has_per_rank_fused_shared_slots(num_fused_shared_experts):
@@ -274,46 +268,9 @@ class HashTopK(nn.Module):
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
         )
-        if apply_deepep_waterfill:
-            topk_output = self._apply_deepep_waterfill(
-                topk_output, hidden_states.shape[0]
-            )
+        topk_output = self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
         if is_hip():
             _zero_topk_weights_padded_region(
                 topk_output.topk_weights, num_token_non_padded
             )
         return topk_output
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        input_ids: torch.Tensor,
-        num_token_non_padded: Optional[torch.Tensor] = None,
-        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-    ):
-        return self._forward_impl(
-            hidden_states,
-            router_logits,
-            input_ids,
-            num_token_non_padded=num_token_non_padded,
-            expert_location_dispatch_info=expert_location_dispatch_info,
-            apply_deepep_waterfill=True,
-        )
-
-    def forward_without_deepep_waterfill(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        input_ids: torch.Tensor,
-        num_token_non_padded: Optional[torch.Tensor] = None,
-        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-    ):
-        return self._forward_impl(
-            hidden_states,
-            router_logits,
-            input_ids,
-            num_token_non_padded=num_token_non_padded,
-            expert_location_dispatch_info=expert_location_dispatch_info,
-            apply_deepep_waterfill=False,
-        )

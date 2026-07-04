@@ -45,22 +45,6 @@ def _jit_mega_moe_pre_dispatch_module(quant_group_size: int):
 
 
 @cache_once
-def _jit_mega_moe_pre_dispatch_waterfill_rank2_module(quant_group_size: int):
-    args = make_cpp_args(quant_group_size, is_arch_support_pdl())
-    return load_jit(
-        make_name("mega_moe_pre_dispatch_waterfill_rank2"),
-        *args,
-        cuda_files=["deepseek_v4/mega_moe_pre_dispatch.cuh"],
-        cuda_wrappers=[
-            (
-                "run",
-                f"MegaMoEPreDispatchWaterfillRank2Kernel<{args}>::run",
-            )
-        ],
-    )
-
-
-@cache_once
 def _jit_silu_mul_quant_varlen_module(
     quant_group_size: int,
     scale_ue8m0: bool,
@@ -183,51 +167,6 @@ def mega_moe_pre_dispatch(
         buf_x_sf,
         buf_topk_idx,
         buf_topk_weights,
-    )
-
-
-def mega_moe_pre_dispatch_waterfill_rank2(
-    x: torch.Tensor,
-    topk_idx: torch.Tensor,
-    topk_weights: torch.Tensor,
-    rank_load: torch.Tensor,
-    buf_x: torch.Tensor,
-    buf_x_sf: torch.Tensor,
-    buf_topk_idx: torch.Tensor,
-    buf_topk_weights: torch.Tensor,
-    *,
-    source_rank: int,
-    shared_weight: float,
-    local_pref_numer: int,
-    local_pref_denom: int,
-    remote_cost_tokens: int,
-    allow_all_ranks: bool,
-    one_way_remote_shared: bool,
-    old_experts_per_rank: int,
-    new_experts_per_rank: int,
-    shared_replicas_per_rank: int,
-    quant_group_size: int = 32,
-) -> None:
-    module = _jit_mega_moe_pre_dispatch_waterfill_rank2_module(quant_group_size)
-    module.run(
-        x,
-        topk_idx,
-        topk_weights,
-        rank_load,
-        buf_x,
-        buf_x_sf,
-        buf_topk_idx,
-        buf_topk_weights,
-        source_rank,
-        float(shared_weight),
-        local_pref_numer,
-        local_pref_denom,
-        remote_cost_tokens,
-        allow_all_ranks,
-        one_way_remote_shared,
-        old_experts_per_rank,
-        new_experts_per_rank,
-        shared_replicas_per_rank,
     )
 
 

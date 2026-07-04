@@ -1359,17 +1359,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w13_weight_scale_inv.format_ue8m0 = True
                     layer.w2_weight_scale_inv.format_ue8m0 = True
 
-            if not self.is_fp4_expert and get_moe_a2a_backend().is_megamoe():
-                from sglang.srt.layers.moe.mega_moe import (
-                    build_mega_moe_experts_weights,
-                    convert_fp8_experts_to_fp4_for_mega_moe,
-                )
-
-                weight_block_size = self.quant_config.weight_block_size
-                convert_fp8_experts_to_fp4_for_mega_moe(layer, weight_block_size)
-                build_mega_moe_experts_weights(layer)
-                return
-
             if not self.is_fp4_expert:
                 weight_block_size = self.quant_config.weight_block_size
                 if requant_block_scale_ue8m0_for_deepgemm(
@@ -1378,10 +1367,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     weight_block_size,
                     use_deepgemm_runner=will_use_deepgemm,
                 ):
-                    assert (
-                        isinstance(layer, DeepEPMoE)
-                        or get_moe_a2a_backend().is_megamoe()
-                    ), "DeepGemm MoE is only supported with DeepEPMoE or MegaMOE"
+                    assert isinstance(
+                        layer, DeepEPMoE
+                    ), "DeepGemm MoE is only supported with DeepEPMoE"
                     requant_block_scale_ue8m0_for_deepgemm(
                         layer.w2_weight,
                         layer.w2_weight_scale_inv,

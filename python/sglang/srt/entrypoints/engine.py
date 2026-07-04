@@ -1256,25 +1256,8 @@ class Engine(EngineScoreMixin, EngineBase):
 
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
-    from sglang.srt.environ import envs
-
-    mega_moe_symm_backend = (
-        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_SYMM_MEM_BACKEND.get().strip().upper()
-    )
-    # DeepGEMM Mega-MoE uses torch symmetric memory. On Blackwell we select
-    # torch's NCCL symmetric-memory backend later in the MoE layer, and NCCL must
-    # see CUMEM enabled before communicator creation.
-    enable_cumem_for_mega_moe = (
-        server_args.moe_a2a_backend == "megamoe" and mega_moe_symm_backend != "NVSHMEM"
-    )
-    if (
-        "NCCL_CUMEM_ENABLE" not in os.environ
-        or server_args.enable_symm_mem
-        or enable_cumem_for_mega_moe
-    ):
-        os.environ["NCCL_CUMEM_ENABLE"] = str(
-            int(server_args.enable_symm_mem or enable_cumem_for_mega_moe)
-        )
+    if "NCCL_CUMEM_ENABLE" not in os.environ or server_args.enable_symm_mem:
+        os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
     if (
         "NCCL_NVLS_ENABLE" not in os.environ
         or server_args.enable_nccl_nvls

@@ -45,22 +45,6 @@ class TestDeepseekV4SharedExpertFusionPolicy(unittest.TestCase):
         self.assertEqual(model.num_fused_shared_experts, 1)
         self.assertFalse(server_args.disable_shared_experts_fusion)
 
-    def test_enables_shared_fusion_for_waterfill(self):
-        server_args = SimpleNamespace(
-            disable_shared_experts_fusion=False,
-            enforce_shared_experts_fusion=False,
-            enable_deepep_waterfill=True,
-        )
-        model = self._make_model()
-
-        with patch.object(
-            deepseek_v4_module, "get_global_server_args", return_value=server_args
-        ):
-            DeepseekV4ForCausalLM.determine_num_fused_shared_experts(model)
-
-        self.assertEqual(model.num_fused_shared_experts, 1)
-        self.assertFalse(server_args.disable_shared_experts_fusion)
-
 
 if __name__ == "__main__":
     unittest.main()

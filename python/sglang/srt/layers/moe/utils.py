@@ -374,25 +374,6 @@ def uses_per_rank_fused_shared_slots() -> bool:
     return is_deepep_class_backend() or get_moe_a2a_backend().is_megamoe()
 
 
-def get_fused_shared_expert_replicas_per_rank() -> int:
-    """Number of physical replicas for each logical fused shared expert per EP rank."""
-    if not uses_per_rank_fused_shared_slots():
-        return 1
-
-    env_field = envs.SGLANG_WATERFILL_SHARED_REPLICAS_PER_RANK
-    env_raw = os.environ.get(env_field.name)
-    if env_raw not in (None, ""):
-        return max(env_field.get(), 1)
-
-    server_args = get_global_server_args()
-    if get_moe_a2a_backend().is_megamoe() and getattr(
-        server_args, "enable_deepep_waterfill", False
-    ):
-        return 4
-
-    return 1
-
-
 def has_per_rank_fused_shared_slots(num_fused_shared_experts: int) -> bool:
     """Check whether this layer has fused shared experts in per-rank slots."""
     return num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()

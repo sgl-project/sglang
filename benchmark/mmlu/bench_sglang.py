@@ -1,11 +1,9 @@
 import argparse
 import json
 import os
-import random
 import subprocess
 import tarfile
 import time
-from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -88,7 +86,7 @@ def main(args):
     # Build prompts
     arguments = []
     labels = []
-    example_subjects = []
+    num_questions = []
 
     for subject in subjects[: args.nsub]:
         dev_df = pd.read_csv(
@@ -97,6 +95,8 @@ def main(args):
         test_df = pd.read_csv(
             os.path.join(args.data_dir, "test", subject + "_test.csv"), header=None
         )
+        num_questions.append(test_df.shape[0])
+
         k = args.ntrain
         few_shot_examples = gen_prompt(dev_df, subject, k)
         while len(tokenizer.encode(few_shot_examples)) > 1536:
@@ -115,14 +115,6 @@ def main(args):
 
             label = test_df.iloc[i, test_df.shape[1] - 1]
             labels.append(label)
-            example_subjects.append(subject)
-
-    if args.num_examples is not None and args.num_examples < len(arguments):
-        rng = random.Random(0)
-        indices = rng.sample(range(len(arguments)), args.num_examples)
-        arguments = [arguments[i] for i in indices]
-        labels = [labels[i] for i in indices]
-        example_subjects = [example_subjects[i] for i in indices]
 
     #####################################
     ######### SGL Program Begin #########
@@ -168,13 +160,13 @@ def main(args):
     # Compute accuracy
     cors = [pred == label for pred, label in zip(preds, labels)]
 
-    subject_cors = defaultdict(list)
-    for subject, correct in zip(example_subjects, cors):
-        subject_cors[subject].append(correct)
-    for subject in subjects[: args.nsub]:
-        values = subject_cors.get(subject)
-        if values:
-            print(f"subject: {subject}, #q:{len(values)}, acc: {np.mean(values):.3f}")
+    pt = 0
+    for subject, num_qs in zip(subjects[: args.nsub], num_questions):
+        print(
+            f"subject: {subject}, #q:{num_qs}, acc: {np.mean(cors[pt: pt + num_qs]):.3f}"
+        )
+        pt += num_qs
+    assert pt == len(cors)
     weighted_acc = np.mean(cors)
 
     dump_bench_raw_result(
@@ -200,7 +192,6 @@ def main(args):
             "other": {
                 "nsub": args.nsub,
                 "parallel": args.parallel,
-                "num_examples": args.num_examples,
             },
         }
         fout.write(json.dumps(value) + "\n")
@@ -214,7 +205,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--save_dir", "-s", type=str, default="results")
     parser.add_argument("--nsub", type=int, default=60)
-    parser.add_argument("--num-examples", type=int, default=None)
     args = add_common_sglang_args_and_parse(parser)
     download_data(args.data_dir)
     main(args)

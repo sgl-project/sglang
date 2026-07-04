@@ -25,16 +25,6 @@ class MXFP4QuantizeUtil:
     E2M1_values = [0, 0.5, 1, 1.5, 2, 3, 4, 6]
     E2M1_bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5])
 
-    def __init__(
-        self,
-        original_shape: torch.Size,
-        original_dtype: torch.dtype,
-        quantized_data: torch.Tensor,
-    ):
-        self.original_shape = original_shape
-        self.original_dtype = original_dtype
-        self.quantized_data = quantized_data
-
     @classmethod
     def quantize(cls, input: torch.Tensor, block_size: Optional[int]) -> tuple:
         """Converting a tensor to a quantized format based on MXFP4 quantization. Only E4M3 is supported.
@@ -143,29 +133,3 @@ class MXFP4QuantizeUtil:
 
         # Reshape back to the original shape
         return x_float.reshape(original_shape).to(dtype)
-
-
-def quantize_fp8_weight_to_mxfp4(
-    fp8_weight: torch.Tensor,
-    fp8_scale: torch.Tensor,
-    *,
-    fp4_block_size: int = 32,
-    fp8_scale_block_size: int = 128,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convert an FP8 block-scaled checkpoint weight to packed MXFP4."""
-    fp8_scale = fp8_scale.to(torch.float32)
-    dequant_weight = (
-        fp8_weight.to(torch.float32)
-        * fp8_scale.repeat_interleave(fp8_scale_block_size, dim=-2).repeat_interleave(
-            fp8_scale_block_size, dim=-1
-        )[..., : fp8_weight.shape[-2], : fp8_weight.shape[-1]]
-    ).to(torch.bfloat16)
-
-    fp4_quantized, fp4_scale = MXFP4QuantizeUtil.quantize(
-        dequant_weight, block_size=fp4_block_size
-    )
-    fp4_weight = fp4_quantized.quantized_data.contiguous().view(torch.int8)
-    fp4_scale = fp4_scale.view(
-        *dequant_weight.shape[:-1], dequant_weight.shape[-1] // fp4_block_size
-    )
-    return fp4_weight, fp4_scale.contiguous().view(torch.float8_e8m0fnu)

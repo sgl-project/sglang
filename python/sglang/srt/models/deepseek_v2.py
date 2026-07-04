@@ -98,7 +98,6 @@ from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputForma
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
-    get_fused_shared_expert_replicas_per_rank,
     has_per_rank_fused_shared_slots,
     is_deepep_class_backend,
     is_sbo_enabled,
@@ -562,20 +561,10 @@ class DeepseekV2MoE(nn.Module):
         _uses_per_rank_shared_slots = has_per_rank_fused_shared_slots(
             self.num_fused_shared_experts
         )
-        _shared_replicas_per_rank = (
-            get_fused_shared_expert_replicas_per_rank()
-            if _uses_per_rank_shared_slots
-            else 1
-        )
 
         if _uses_per_rank_shared_slots:
-            # 256 routed + EP_size * replicas shared slots.
-            num_experts_for_moe = (
-                config.n_routed_experts
-                + self.moe_ep_size
-                * self.num_fused_shared_experts
-                * _shared_replicas_per_rank
-            )
+            # 256 routed + EP_size shared slots = 272 experts total (for EP=16)
+            num_experts_for_moe = config.n_routed_experts + self.moe_ep_size
             top_k_for_moe = config.num_experts_per_tok + 1  # 8 routed + 1 shared
             # Interleaving for DeepEP/MegaMOE dispatch is handled by TopK internally.
         else:

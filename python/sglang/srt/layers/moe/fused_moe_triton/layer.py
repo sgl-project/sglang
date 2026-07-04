@@ -47,7 +47,6 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
-    get_fused_shared_expert_replicas_per_rank,
     has_per_rank_fused_shared_slots,
     uses_per_rank_fused_shared_slots,
 )
@@ -194,7 +193,6 @@ class FusedMoE(torch.nn.Module):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_fused_shared_experts = num_fused_shared_experts
-        self.num_fused_shared_expert_replicas_per_rank = 1
 
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
@@ -209,26 +207,14 @@ class FusedMoE(torch.nn.Module):
         # shared experts as global shared slots. When fusion is disabled,
         # num_fused_shared_experts is 0 and no shared slots are added here.
         if has_per_rank_fused_shared_slots(num_fused_shared_experts):
-            self.num_fused_shared_expert_replicas_per_rank = (
-                get_fused_shared_expert_replicas_per_rank()
-            )
-            num_shared_slots = (
-                num_fused_shared_experts
-                * self.moe_ep_size
-                * self.num_fused_shared_expert_replicas_per_rank
-            )
+            num_shared_slots = num_fused_shared_experts * self.moe_ep_size
         else:
             num_shared_slots = num_fused_shared_experts
 
         assert (num_experts - num_shared_slots) % self.moe_ep_size == 0
         self._num_global_routed = num_experts - num_shared_slots
         self._num_local_routed = self._num_global_routed // self.moe_ep_size
-        self.num_local_fused_shared_experts = (
-            num_fused_shared_experts * self.num_fused_shared_expert_replicas_per_rank
-        )
-        self.num_local_experts = (
-            self._num_local_routed + self.num_local_fused_shared_experts
-        )
+        self.num_local_experts = self._num_local_routed + num_fused_shared_experts
         self._has_fused_shared = num_fused_shared_experts > 0
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
         self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
@@ -767,23 +753,15 @@ class FusedMoE(torch.nn.Module):
         if 0 <= shared_expert_id < self.num_fused_shared_experts:
             # Checkpoint shared experts start after logical routed experts, while
             # local fused MoE weights store them after physical routed experts.
-            shared_replica_base = (
-                shared_expert_id * self.num_fused_shared_expert_replicas_per_rank
-            )
             if require_global_experts and uses_per_rank_fused_shared_slots():
                 physical_expert_ids = [
                     rank * self.num_local_experts
                     + self._num_local_routed
-                    + shared_replica_base
-                    + replica
+                    + shared_expert_id
                     for rank in range(self.moe_ep_size)
-                    for replica in range(self.num_fused_shared_expert_replicas_per_rank)
                 ]
             else:
-                physical_expert_ids = [
-                    self._num_global_routed + shared_replica_base + replica
-                    for replica in range(self.num_fused_shared_expert_replicas_per_rank)
-                ]
+                physical_expert_ids = [self._num_global_routed + shared_expert_id]
         else:
             physical_expert_ids = (
                 global_expert_location_metadata.logical_to_all_physical(

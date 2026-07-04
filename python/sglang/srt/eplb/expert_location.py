@@ -19,7 +19,7 @@ import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.distributed
@@ -41,10 +41,6 @@ class ExpertLocationMetadata:
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
     # (layers, num_logical_experts)
     logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
-    # (layers, ep_size), derived from logical_count when init_expert_location has it.
-    rank_load: Optional[torch.Tensor] = None
-    # (layers, source_ep_rank, destination_ep_rank), same estimate split by source.
-    rank_load_by_source: Optional[torch.Tensor] = None
 
     # -------------------------------- properties ------------------------------------
 
@@ -82,10 +78,6 @@ class ExpertLocationMetadata:
         assert num_layers_0 == num_layers_1 == num_layers_2
         assert num_logical_experts_0 == num_logical_experts_1
         assert num_physical_experts_0 == num_physical_experts_1
-        if self.rank_load is not None:
-            assert self.rank_load.shape[0] == num_layers_0
-        if self.rank_load_by_source is not None:
-            assert self.rank_load_by_source.shape[0] == num_layers_0
 
     # -------------------------------- construction ------------------------------------
 
@@ -185,7 +177,7 @@ class ExpertLocationMetadata:
             )
         )
 
-        metadata = ExpertLocationMetadata._init_raw(
+        return ExpertLocationMetadata._init_raw(
             server_args=server_args,
             ep_size=common["ep_size"],
             physical_to_logical_map=physical_to_logical_map.to(server_args.device),
@@ -193,17 +185,6 @@ class ExpertLocationMetadata:
                 server_args.device
             ),
         )
-        if metadata is not None and getattr(
-            server_args, "enable_deepep_waterfill", False
-        ):
-            metadata.rank_load, metadata.rank_load_by_source = _compute_rank_load(
-                server_args,
-                logical_count,
-                metadata.logical_to_all_physical_map,
-                common["ep_size"],
-                metadata.num_physical_experts,
-            )
-        return metadata
 
     @staticmethod
     def _init_common(server_args: ServerArgs, model_config: ModelConfig):
@@ -299,32 +280,6 @@ class ExpertLocationMetadata:
                 mask_update = mask_update.to(self_field.device, non_blocking=True)
                 self_field[...] = torch.where(mask_update, other_field, self_field)
 
-        if other.rank_load is not None:
-            if self.rank_load is None:
-                self.rank_load = torch.zeros_like(other.rank_load)
-            mask_update = torch.tensor(
-                [i in update_layer_ids for i in range(self.num_layers)]
-            )
-            mask_update = mask_update.view(-1, 1).to(
-                self.rank_load.device, non_blocking=True
-            )
-            self.rank_load[...] = torch.where(
-                mask_update, other.rank_load, self.rank_load
-            )
-
-        if other.rank_load_by_source is not None:
-            if self.rank_load_by_source is None:
-                self.rank_load_by_source = torch.zeros_like(other.rank_load_by_source)
-            mask_update = torch.tensor(
-                [i in update_layer_ids for i in range(self.num_layers)]
-            )
-            mask_update = mask_update.view(-1, 1, 1).to(
-                self.rank_load_by_source.device, non_blocking=True
-            )
-            self.rank_load_by_source[...] = torch.where(
-                mask_update, other.rank_load_by_source, self.rank_load_by_source
-            )
-
     # -------------------------------- usage ------------------------------------
 
     def logical_to_all_physical(
@@ -390,10 +345,6 @@ def broadcast_global_expert_location_metadata(
         metadata.logical_to_rank_dispatch_physical_map = (
             metadata.logical_to_rank_dispatch_physical_map.contiguous()
         )
-    if metadata.rank_load is not None:
-        metadata.rank_load = metadata.rank_load.contiguous()
-    if metadata.rank_load_by_source is not None:
-        metadata.rank_load_by_source = metadata.rank_load_by_source.contiguous()
 
     device_tensors = [
         metadata.physical_to_logical_map,
@@ -402,10 +353,6 @@ def broadcast_global_expert_location_metadata(
     ]
     if metadata.logical_to_rank_dispatch_physical_map is not None:
         device_tensors.append(metadata.logical_to_rank_dispatch_physical_map)
-    if metadata.rank_load is not None:
-        device_tensors.append(metadata.rank_load)
-    if metadata.rank_load_by_source is not None:
-        device_tensors.append(metadata.rank_load_by_source)
 
     for tensor in device_tensors:
         torch.distributed.broadcast(tensor, src=src_rank, group=group)
@@ -631,58 +578,6 @@ class ModelConfigForExpertLocation:
             )
         else:
             return None
-
-
-def _compute_rank_load(
-    server_args: ServerArgs,
-    logical_count: torch.Tensor,
-    logical_to_all_physical_map: torch.Tensor,
-    ep_size: int,
-    num_physical_experts: int,
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Estimate per-rank routed load from logical counts and static dispatch."""
-    if server_args.ep_dispatch_algorithm != "static":
-        return None, None
-    if not isinstance(logical_count, torch.Tensor):
-        logical_count = torch.tensor(logical_count)
-    if logical_count.dim() == 3:
-        logical_count = logical_count.float().mean(dim=0)
-    elif logical_count.dim() != 2:
-        return None, None
-
-    device = logical_to_all_physical_map.device
-    logical_count = logical_count.to(device=device, dtype=torch.float64)
-    num_layers, _ = logical_count.shape
-    num_local_physical_experts = num_physical_experts // ep_size
-    rank_load = torch.zeros(num_layers, ep_size, dtype=torch.float64, device=device)
-    rank_load_by_source = torch.zeros(
-        num_layers, ep_size, ep_size, dtype=torch.float64, device=device
-    )
-    per_source_logical_count = logical_count / ep_size
-
-    for source_rank in range(ep_size):
-        dispatch_physical = compute_logical_to_rank_dispatch_physical_map(
-            server_args=server_args,
-            logical_to_all_physical_map=logical_to_all_physical_map,
-            ep_size=ep_size,
-            num_physical_experts=num_physical_experts,
-            ep_rank=source_rank,
-        ).long()
-        dispatch_rank = torch.div(
-            dispatch_physical,
-            num_local_physical_experts,
-            rounding_mode="floor",
-        ).clamp_(0, ep_size - 1)
-        for rank in range(ep_size):
-            source_rank_load = torch.where(
-                dispatch_rank == rank,
-                per_source_logical_count,
-                torch.zeros_like(per_source_logical_count),
-            ).sum(dim=1)
-            rank_load_by_source[:, source_rank, rank] = source_rank_load
-            rank_load[:, rank] += source_rank_load
-
-    return rank_load, rank_load_by_source
 
 
 def compute_initial_expert_location_metadata(

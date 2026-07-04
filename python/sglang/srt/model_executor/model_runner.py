@@ -546,12 +546,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
         self.pre_model_load_memory = self.init_torch_distributed()
-        if self._should_pre_initialize_mega_moe_symm_buffers():
-            from sglang.srt.layers.moe.mega_moe import (
-                pre_initialize_mega_moe_symm_buffers_from_config,
-            )
-
-            pre_initialize_mega_moe_symm_buffers_from_config(self.model_config)
 
         # Initialize MooncakeTransferEngine
         self.init_shared_mooncake_transfer_engine()
@@ -935,13 +929,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         self.graph_shared_output = GraphSharedOutput.create_for_model_runner(self)
 
-        if self._should_pre_initialize_mega_moe_symm_buffers():
-            from sglang.srt.layers.moe.mega_moe import (
-                pre_initialize_mega_moe_symm_buffers,
-            )
-
-            pre_initialize_mega_moe_symm_buffers(self.model)
-
         # The eager (no-cuda-graph) phase runner, built AFTER the attention
         # backend so its __init__ can warm up kernels (run-once) and allocate the
         # fixed-max static buffer — both before the cuda-graph runners, so that
@@ -981,16 +968,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.canary_manager is not None and not self.is_draft_worker:
             self.canary_manager.mark_init_finished()
-
-    def _should_pre_initialize_mega_moe_symm_buffers(self) -> bool:
-        if self.server_args.moe_a2a_backend != "megamoe" or self.device != "cuda":
-            return False
-
-        override = os.getenv("SGLANG_MEGA_MOE_PREINIT_SYMM_BUFFERS")
-        if override:
-            return override == "1"
-
-        return False
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:

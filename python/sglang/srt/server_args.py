@@ -2573,7 +2573,6 @@ class ServerArgs:
 
         # Normalize load balancing defaults early (before dummy-model short-circuit).
         self._handle_load_balance_method()
-        self._handle_ep_dispatch_algorithm_default()
 
         # Validate mm_process_config before dummy-model early return.
         self._handle_multimodal()
@@ -4362,7 +4361,9 @@ class ServerArgs:
         elif model_arch in ["BailingMoeV2_5ForCausalLM"]:
             self._handle_mamba_radix_cache(model_arch=model_arch)
         elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
-            from sglang.srt.arg_groups.nemotron_h_hook import apply_nemotron_h_defaults
+            from sglang.srt.arg_groups.nemotron_h_hook import (
+                apply_nemotron_h_defaults,
+            )
 
             apply_nemotron_h_defaults(self, model_arch)
         elif model_arch in [
@@ -5722,21 +5723,13 @@ class ServerArgs:
                 "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
             )
 
-        self._handle_ep_dispatch_algorithm_default()
+        if (self.enable_eplb or (self.init_expert_location != "trivial")) and (
+            self.ep_dispatch_algorithm is None
+        ):
+            self.ep_dispatch_algorithm = "static"
 
         if self.enable_eplb:
             assert self.ep_size > 1
-
-    def _handle_ep_dispatch_algorithm_default(self):
-        if (
-            self.enable_eplb
-            or (self.init_expert_location != "trivial")
-            or self.ep_num_redundant_experts > 0
-        ) and (self.ep_dispatch_algorithm is None):
-            # Redundant physical experts are only reachable after logical topk
-            # ids are remapped to physical ids. Without a dispatch algorithm,
-            # the extra experts are allocated/loaded but never selected.
-            self.ep_dispatch_algorithm = "static"
 
     def _handle_elastic_ep(self):
         if self.elastic_ep_backend is not None:

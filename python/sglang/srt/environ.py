@@ -645,27 +645,6 @@ class Envs:
     # Force dynamic DeepEP Waterfill with runtime EP all-reduce instead of the
     # default static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
-    SGLANG_WATERFILL_DISABLE_STATIC_RANK_LOAD = EnvBool(False)
-    SGLANG_WATERFILL_LOG_STATS_INTERVAL = EnvInt(0)
-    SGLANG_WATERFILL_FORCE_LOCAL_SHARED = EnvBool(False)
-    SGLANG_WATERFILL_STATIC_ALLOW_ALL_RANKS = EnvBool(True)
-    SGLANG_WATERFILL_LOCAL_PREF_NUMER = EnvInt(11)
-    SGLANG_WATERFILL_LOCAL_PREF_DENOM = EnvInt(10)
-    SGLANG_WATERFILL_REMOTE_COST_TOKENS = EnvInt(0)
-    SGLANG_WATERFILL_ONE_WAY_REMOTE_SHARED = EnvBool(False)
-    SGLANG_WATERFILL_SOURCE_AWARE_STATIC_LOAD = EnvBool(False)
-    SGLANG_WATERFILL_REUSE_TOPK_BUFFER = EnvBool(False)
-    SGLANG_WATERFILL_REUSE_TOPK_BUFFER_CACHE_SIZE = EnvInt(8)
-    SGLANG_WATERFILL_MIN_BATCH_FOR_BALANCE = EnvInt(64)
-    # Experimental B200 Mega-MoE path: do not materialize Waterfill TopK [N, 9]
-    # as a standalone tensor. Instead, fuse shared-column generation into the
-    # Mega-MoE pre-dispatch kernel that writes DeepGEMM's symmetric buffer.
-    SGLANG_WATERFILL_FUSE_MEGA_MOE_PREDISPATCH = EnvBool(False)
-    SGLANG_WATERFILL_FUSE_MEGA_MOE_PREDISPATCH_LOG_INTERVAL = EnvInt(0)
-    SGLANG_WATERFILL_RANK2_SINGLE_BLOCK_COUNT_MAX_TOKENS = EnvInt(512)
-    SGLANG_WATERFILL_SHARED_REPLICAS_PER_RANK = EnvInt(1)
-    SGLANG_MEGA_MOE_LOG_TOPK_STATS_INTERVAL = EnvInt(0)
-    SGLANG_MEGA_MOE_LOG_TIMING_INTERVAL = EnvInt(0)
 
     # NIXL-EP
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
@@ -910,20 +889,6 @@ class Envs:
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
-    # Optional comma-separated cap buckets for DeepGEMM Mega-MoE symmetric
-    # buffers, e.g. "1024,2048,4096,8320". When set, eager Mega-MoE selects the
-    # smallest bucket that can hold the current per-rank token count, while the
-    # max cap above remains the fallback and hard upper bound.
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK_BUCKETS = EnvStr("")
-    # Pre-initialize every configured Mega-MoE cap bucket. This is off by
-    # default because each DeepGEMM symmetric buffer is large; B200 DSV4 can OOM
-    # when all buckets are materialized at startup.
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_PREINIT_ALL_CAP_BUCKETS = EnvBool(False)
-    # Guard for selecting a smaller cap bucket at runtime. If free HBM is below
-    # this threshold, Mega-MoE falls back to the largest configured cap to avoid
-    # creating another large symmetric buffer and OOMing later in the layer.
-    # Set to 0 to force bucket selection for experiments.
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_CAP_BUCKET_MIN_FREE_GB = EnvFloat(4.0)
 
     # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
     # Halves symm-buffer footprint and unlocks the MXF4 mainloop downstream.
@@ -935,10 +900,6 @@ class Envs:
     # SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS is also set; DeepGEMM asserts
     # this combination on the host side.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
-    # Optional torch symmetric-memory backend override for DeepGEMM Mega-MoE.
-    # Valid settable torch values are NCCL and NVSHMEM. Leave empty to use
-    # SGLang's auto choice.
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_SYMM_MEM_BACKEND = EnvStr("")
     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
 
     # TopK

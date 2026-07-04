@@ -516,22 +516,6 @@ class TestContextParallelServerArgs(CustomTestCase):
                 )
 
 
-class TestEPLBDispatchArgs(unittest.TestCase):
-    def test_redundant_experts_default_to_static_dispatch(self):
-        server_args = ServerArgs(model_path="dummy", ep_num_redundant_experts=32)
-
-        self.assertEqual(server_args.ep_dispatch_algorithm, "static")
-
-    def test_explicit_dispatch_algorithm_is_preserved(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            ep_num_redundant_experts=32,
-            ep_dispatch_algorithm="dynamic",
-        )
-
-        self.assertEqual(server_args.ep_dispatch_algorithm, "dynamic")
-
-
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
@@ -1122,83 +1106,6 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
 
         self.assertEqual(server_args.moe_a2a_backend, "deepep")
         self.assertTrue(server_args.enforce_shared_experts_fusion)
-
-    def test_waterfill_keeps_explicit_megamoe_backend(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            moe_a2a_backend="megamoe",
-            enable_deepep_waterfill=True,
-            disable_shared_experts_fusion=True,
-        )
-        # dummy-model path short-circuits __post_init__; invoke the handler directly.
-        server_args._handle_a2a_moe()
-
-        self.assertEqual(server_args.moe_a2a_backend, "megamoe")
-        self.assertFalse(server_args.disable_shared_experts_fusion)
-        self.assertTrue(server_args.enforce_shared_experts_fusion)
-
-    def test_waterfill_uses_megamoe_env(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            moe_a2a_backend="none",
-            enable_deepep_waterfill=True,
-        )
-        # dummy-model path short-circuits __post_init__; invoke the handler directly.
-        with server_args_module.envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.override(True):
-            server_args._handle_a2a_moe()
-
-        self.assertEqual(server_args.moe_a2a_backend, "megamoe")
-        self.assertTrue(server_args.enforce_shared_experts_fusion)
-
-    def test_waterfill_megamoe_does_not_auto_configure_cap_buckets(self):
-        buckets = (
-            server_args_module.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK_BUCKETS
-        )
-        old_present = buckets.name in os.environ
-        old_value = os.environ.get(buckets.name)
-        try:
-            buckets.clear()
-            with server_args_module.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
-                8320
-            ):
-                server_args = ServerArgs(
-                    model_path="dummy",
-                    moe_a2a_backend="megamoe",
-                    enable_deepep_waterfill=True,
-                )
-                # dummy-model path short-circuits __post_init__; invoke the
-                # handler directly.
-                server_args._handle_a2a_moe()
-
-                self.assertEqual(buckets.get(), "")
-        finally:
-            if old_present:
-                os.environ[buckets.name] = old_value
-            else:
-                buckets.clear()
-
-    def test_waterfill_megamoe_preserves_explicit_cap_buckets(self):
-        with (
-            server_args_module.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
-                8320
-            ),
-            server_args_module.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK_BUCKETS.override(
-                ""
-            ),
-        ):
-            server_args = ServerArgs(
-                model_path="dummy",
-                moe_a2a_backend="megamoe",
-                enable_deepep_waterfill=True,
-            )
-            # dummy-model path short-circuits __post_init__; invoke the handler
-            # directly.
-            server_args._handle_a2a_moe()
-
-            self.assertEqual(
-                server_args_module.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK_BUCKETS.get(),
-                "",
-            )
 
     def test_waterfill_supports_deepep_low_latency_mode(self):
         server_args = ServerArgs(
