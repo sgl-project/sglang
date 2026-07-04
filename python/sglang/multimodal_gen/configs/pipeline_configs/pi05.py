@@ -85,10 +85,10 @@ class Pi05PipelineConfig(PipelineConfig):
     )
 
     def supports_dynamic_batching(self):
-        # Request observations have large in-memory image/state payloads and
-        # exact-prefix cache semantics. Keep batching explicit until grouped
-        # robot streams are validated.
-        return False
+        return True
+
+    def supports_native_grouped_requests(self):
+        return True
 
     def estimate_request_cost(self, batch) -> float:
         return float(

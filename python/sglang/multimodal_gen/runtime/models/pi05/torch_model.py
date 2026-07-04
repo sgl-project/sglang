@@ -14,6 +14,7 @@ from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.pi05.pi_gemma import (
     PaliGemmaForConditionalGenerationWithPiGemma,
     PiGemmaForCausalLM,
@@ -92,15 +93,57 @@ def make_att_2d_masks(
     return att_2d_masks & pad_2d_masks
 
 
-def clone_past_key_values(past_key_values):
-    from transformers.cache_utils import DynamicCache
+def trim_trailing_padding_tokens(
+    tokens: torch.Tensor,
+    token_masks: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    token_len = int(token_masks.sum(dim=1).max().item())
+    if token_len <= 0 or token_len >= tokens.shape[1]:
+        return tokens, token_masks
+    return tokens[:, :token_len], token_masks[:, :token_len]
 
-    return DynamicCache(
-        tuple(
-            (keys.clone(), values.clone(), sliding_window)
-            for keys, values, sliding_window in past_key_values
+
+def prepare_optional_full_attention_mask(
+    att_2d_masks: torch.Tensor,
+    *,
+    full_attention: bool | None = None,
+) -> torch.Tensor | None:
+    if full_attention is None:
+        full_attention = bool(att_2d_masks.all().item())
+    if full_attention:
+        return None
+    masks_4d = att_2d_masks[:, None, :, :]
+    return torch.where(masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
+
+
+class ReadOnlyPrefixCache:
+    def __init__(self, past_key_values):
+        self.layers = tuple(past_key_values)
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        if layer_idx >= len(self.layers):
+            return 0
+        return int(self.layers[layer_idx][0].shape[-2])
+
+    def get_mask_sizes(
+        self,
+        cache_position: torch.Tensor,
+        layer_idx: int,
+    ) -> tuple[int, int]:
+        return self.get_seq_length(layer_idx) + int(cache_position.shape[0]), 0
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        prefix_keys, prefix_values, _ = self.layers[layer_idx]
+        return (
+            torch.cat([prefix_keys, key_states], dim=-2),
+            torch.cat([prefix_values, value_states], dim=-2),
         )
-    )
 
 
 def compute_layer_complete(
@@ -207,9 +250,11 @@ class PaliGemmaWithExpertModel(nn.Module):
             vlm_config_hf.text_config.num_hidden_layers = vlm_config.depth
             vlm_config_hf.text_config.num_key_value_heads = vlm_config.num_kv_heads
             vlm_config_hf.text_config.hidden_activation = "gelu_pytorch_tanh"
-            vlm_config_hf.text_config.dtype = "float32"
+            vlm_config_hf.text_config.dtype = precision
             vlm_config_hf.text_config.vocab_size = PALIGEMMA_VOCAB_SIZE
             vlm_config_hf.text_config.use_adarms = use_adarms[0]
+            vlm_config_hf.text_config.is_causal = False
+            vlm_config_hf.text_config.use_bidirectional_attention = True
             vlm_config_hf.text_config.adarms_cond_dim = (
                 vlm_config.width if use_adarms[0] else None
             )
@@ -233,8 +278,10 @@ class PaliGemmaWithExpertModel(nn.Module):
                 num_key_value_heads=action_expert_config.num_kv_heads,
                 vocab_size=PALIGEMMA_VOCAB_SIZE,
                 hidden_activation="gelu_pytorch_tanh",
-                dtype="float32",
+                dtype=precision,
                 use_adarms=use_adarms[1],
+                is_causal=False,
+                use_bidirectional_attention=True,
                 adarms_cond_dim=(action_expert_config.width if use_adarms[1] else None),
             )
             self.gemma_expert = PiGemmaForCausalLM(config=action_config_hf)
@@ -409,9 +456,16 @@ class Pi05TorchModel(nn.Module):
         if role in ("action", "idle"):
             self.paligemma_with_expert.paligemma = None
 
-    def prepare_attention_masks_4d(self, att_2d_masks: torch.Tensor) -> torch.Tensor:
-        masks_4d = att_2d_masks[:, None, :, :]
-        return torch.where(masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
+    def prepare_attention_masks_4d(
+        self,
+        att_2d_masks: torch.Tensor,
+        *,
+        full_attention: bool | None = None,
+    ) -> torch.Tensor | None:
+        return prepare_optional_full_attention_mask(
+            att_2d_masks,
+            full_attention=full_attention,
+        )
 
     def embed_prefix(
         self,
@@ -452,8 +506,10 @@ class Pi05TorchModel(nn.Module):
             min_period=self.config.time_embedding_min_period,
             max_period=self.config.time_embedding_max_period,
         )
-        time_emb = time_emb.type(dtype=timestep.dtype)
-        action_emb = self.action_in_proj(noisy_actions)
+        action_emb = self.action_in_proj(
+            noisy_actions.to(dtype=self.action_in_proj.weight.dtype)
+        )
+        time_emb = time_emb.to(dtype=self.time_mlp_in.weight.dtype)
         time_emb = self.time_mlp_in(time_emb)
         time_emb = F.silu(time_emb)
         time_emb = self.time_mlp_out(time_emb)
@@ -537,6 +593,7 @@ class Pi05TorchModel(nn.Module):
         tokens: torch.Tensor,
         token_masks: torch.Tensor,
     ):
+        tokens, token_masks = trim_trailing_padding_tokens(tokens, token_masks)
         self._prepare_prefix_image_encoder_for_embed()
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, image_masks, tokens, token_masks
@@ -544,20 +601,27 @@ class Pi05TorchModel(nn.Module):
         self._offload_prefix_image_encoder_after_embed()
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        attention_mask = self.prepare_attention_masks_4d(prefix_att_2d_masks)
+        prefix_full_attention = bool(prefix_att_2d_masks.all().item())
+        attention_mask = self.prepare_attention_masks_4d(
+            prefix_att_2d_masks,
+            full_attention=prefix_full_attention,
+        )
         self._prepare_prefix_language_layers_for_forward()
-        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = (
-            "eager"
-        )
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=attention_mask,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
+        with set_forward_context(current_timestep=0, attn_metadata=None):
+            _, past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=attention_mask,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
         self._offload_prefix_language_layers_after_prefix()
-        return past_key_values, prefix_pad_masks, prefix_position_ids
+        return (
+            past_key_values,
+            prefix_pad_masks,
+            prefix_position_ids,
+            prefix_full_attention,
+        )
 
     @torch.no_grad()
     def denoise_step(
@@ -566,6 +630,7 @@ class Pi05TorchModel(nn.Module):
         past_key_values,
         x_t: torch.Tensor,
         timestep: torch.Tensor,
+        prefix_full_attention: bool = False,
     ) -> torch.Tensor:
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
             self.embed_suffix(x_t, timestep)
@@ -573,24 +638,30 @@ class Pi05TorchModel(nn.Module):
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
-            batch_size, suffix_len, prefix_len
-        )
-        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+        if prefix_full_attention:
+            attention_mask = None
+        else:
+            prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
+                batch_size, suffix_len, prefix_len
+            )
+            suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+            full_att_2d_masks = torch.cat(
+                [prefix_pad_2d_masks, suffix_att_2d_masks],
+                dim=2,
+            )
+            attention_mask = self.prepare_attention_masks_4d(full_att_2d_masks)
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
-        attention_mask = self.prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = (
-            "eager"
-        )
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=clone_past_key_values(past_key_values),
-            inputs_embeds=[None, suffix_embs],
-            use_cache=False,
-            adarms_cond=[None, adarms_cond],
-        )
+        with set_forward_context(current_timestep=0, attn_metadata=None):
+            outputs_embeds, _ = self.paligemma_with_expert.forward(
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=ReadOnlyPrefixCache(past_key_values),
+                inputs_embeds=[None, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
         suffix_out = outputs_embeds[1][:, -self.config.action_horizon :]
-        return self.action_out_proj(suffix_out.to(dtype=torch.float32))
+        return self.action_out_proj(
+            suffix_out.to(dtype=self.action_out_proj.weight.dtype)
+        ).to(dtype=torch.float32)

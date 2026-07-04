@@ -282,6 +282,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             if len(reqs) == 1 or not allow_dynamic_batching:
                 return self.worker.execute_forward(reqs)
 
+            if self.server_args.pipeline_config.supports_native_grouped_requests():
+                return self._execute_generation_grouped(reqs)
+
             merged_req = self._try_merge_generation_reqs(reqs)
             if merged_req is None:
                 return self._execute_generation_sequential(reqs)
@@ -326,6 +329,48 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     reqs=reqs,
                     error_msg=f"Dynamic batching failed: {e}",
                 )
+
+    def _execute_generation_grouped(self, reqs: List[Req]) -> List[OutputBatch]:
+        batch_size = len(reqs)
+        try:
+            output_batch = self.worker.execute_forward(reqs)
+            if output_batch.error:
+                logger.error(
+                    "Native grouped execution returned error. Returning per-request errors: %s",
+                    output_batch.error,
+                )
+                return self._build_dynamic_batch_error_outputs(
+                    reqs=reqs,
+                    error_msg=output_batch.error,
+                )
+
+            split_outputs = self._split_batched_output(output_batch, reqs)
+            if split_outputs is None:
+                logger.error(
+                    "Failed to split native grouped output cleanly. Returning per-request errors."
+                )
+                return self._build_dynamic_batch_error_outputs(
+                    reqs=reqs,
+                    error_msg="Native grouped execution failed: could not split output.",
+                )
+
+            logger.info(
+                "Processed native grouped batch of %d/%d request(s) with max_delay=%.2fms",
+                batch_size,
+                self._batching_max_size,
+                self._batching_delay_s * 1000.0,
+            )
+            return split_outputs
+        except Exception as e:
+            logger.error(
+                "Native grouped execution failed (%s). Returning per-request errors.",
+                e,
+                exc_info=True,
+            )
+            return self._build_dynamic_batch_error_outputs(
+                reqs=reqs,
+                error_msg=f"Native grouped execution failed: {e}",
+            )
 
     def _execute_generation_sequential(self, reqs: List[Req]) -> List[OutputBatch]:
         return [self.worker.execute_forward([req]) for req in reqs]
@@ -722,8 +767,14 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         outputs: list[OutputBatch] = []
         start = 0
-        for req, req_count in zip(reqs, per_req_counts):
+        for req_index, (req, req_count) in enumerate(zip(reqs, per_req_counts)):
             end = start + req_count
+            metrics = (
+                deepcopy(output_batch.metrics_list[req_index])
+                if output_batch.metrics_list is not None
+                and req_index < len(output_batch.metrics_list)
+                else deepcopy(output_batch.metrics)
+            )
             split = OutputBatch(
                 output=self._slice_batched_value(
                     output_batch.output, start, end, total_items
@@ -748,7 +799,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 output_file_paths=self._slice_batched_value(
                     output_batch.output_file_paths, start, end, total_items
                 ),
-                metrics=deepcopy(output_batch.metrics),
+                metrics=metrics,
                 noise_pred=self._slice_batched_value(
                     output_batch.noise_pred, start, end, total_items
                 ),

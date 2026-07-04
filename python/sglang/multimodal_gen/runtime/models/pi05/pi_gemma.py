@@ -15,11 +15,15 @@ from transformers.models.gemma.modeling_gemma import (
     GemmaForCausalLM,
     GemmaMLP,
     GemmaModel,
+    apply_rotary_pos_emb,
 )
 from transformers.models.paligemma.modeling_paligemma import (
     PaliGemmaForConditionalGeneration,
     PaliGemmaModel,
 )
+
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 def gated_residual(
@@ -71,7 +75,7 @@ class PiGemmaRMSNorm(nn.Module):
             normed = normed * (1.0 + self.weight.float())
             return normed.type_as(x), None
 
-        modulation = self.dense(cond)
+        modulation = self.dense(cond.to(dtype=self.dense.weight.dtype))
         if x.ndim == 3:
             modulation = modulation.unsqueeze(1)
         scale, shift, gate = modulation.chunk(3, dim=-1)
@@ -79,11 +83,71 @@ class PiGemmaRMSNorm(nn.Module):
         return normed.to(dtype), gate.to(dtype)
 
 
+class PiGemmaAttention(GemmaAttention):
+    def __init__(self, config: GemmaConfig, layer_idx: int):
+        super().__init__(config=config, layer_idx=layer_idx)
+        self.native_attn = LocalAttention(
+            num_heads=config.num_attention_heads,
+            head_size=self.head_dim,
+            num_kv_heads=config.num_key_value_heads,
+            softmax_scale=self.scaling,
+            causal=self.is_causal,
+            supported_attention_backends={
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.FA2,
+                AttentionBackendEnum.TORCH_SDPA,
+            },
+            allow_cudnn_sdp=True,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values=None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, None]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states,
+            key_states,
+            cos,
+            sin,
+        )
+
+        if past_key_values is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(
+                key_states,
+                value_states,
+                self.layer_idx,
+                cache_kwargs,
+            )
+
+        attn_output = self.native_attn(
+            query_states.transpose(1, 2),
+            key_states.transpose(1, 2),
+            value_states.transpose(1, 2),
+            attn_mask=attention_mask,
+        )
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        return self.o_proj(attn_output), None
+
+
 class PiGemmaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: GemmaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = GemmaAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = PiGemmaAttention(config=config, layer_idx=layer_idx)
         self.mlp = GemmaMLP(config)
         cond_dim = (
             getattr(config, "adarms_cond_dim", None)
@@ -277,14 +341,17 @@ class PiGemmaModel(GemmaModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = create_causal_mask(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-        )
+        if attention_mask is None and not getattr(self.config, "is_causal", True):
+            causal_mask = None
+        else:
+            causal_mask = create_causal_mask(
+                config=self.config,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+            )
 
         hidden_states = inputs_embeds
         if (

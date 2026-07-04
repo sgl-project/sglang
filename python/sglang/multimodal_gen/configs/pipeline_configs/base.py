@@ -378,6 +378,10 @@ class PipelineConfig:
         """
         return self.task_type in (ModelTaskType.T2I, ModelTaskType.T2V)
 
+    def supports_native_grouped_requests(self):
+        """Return whether dynamic batches should run as grouped Req lists."""
+        return False
+
     def estimate_request_cost(self, batch) -> float:
         """Return the relative cost used for batching admission caps.
 

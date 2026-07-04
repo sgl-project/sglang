@@ -308,7 +308,7 @@ class Pi05ActionDenoisingStage(PipelineStage):
                     options.get("num_inference_steps")
                     or group_batches[0].num_inference_steps
                 ),
-                use_cuda_graph=False,
+                use_cuda_graph=bool(options.get("enable_cuda_graph", True)),
                 generator=None,
             )
             action_ms = (time.perf_counter() - start) * 1000
@@ -335,9 +335,6 @@ class Pi05ActionDenoisingStage(PipelineStage):
             options: dict[str, Any] = batch.extra.get("pi05_options") or {}
             prefix_context = batch.extra["pi05_prefix_context"]
             noise = observation.noise if observation is not None else None
-            # graph replay owns static prefix buffers, so use it only when the
-            # PrefixContext is cache-resident and stable across requests
-            cache_info = batch.extra.get("pi05_cache") or {}
             actions = self.policy_model.sample_actions(
                 observation,
                 prefix_context,
@@ -345,8 +342,7 @@ class Pi05ActionDenoisingStage(PipelineStage):
                 num_steps=int(
                     options.get("num_inference_steps") or batch.num_inference_steps
                 ),
-                use_cuda_graph=bool(options.get("enable_cuda_graph", True))
-                and bool(cache_info.get("hit", False)),
+                use_cuda_graph=bool(options.get("enable_cuda_graph", True)),
                 generator=batch.generator,
             )
         else:

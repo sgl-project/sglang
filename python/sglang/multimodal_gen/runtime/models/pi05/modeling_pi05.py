@@ -11,8 +11,13 @@ from typing import Any
 import torch
 from safetensors import safe_open
 from torch import nn
+from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
+from sglang.multimodal_gen.runtime.loader.utils import (
+    set_default_torch_dtype,
+    skip_init_modules,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
@@ -34,6 +39,7 @@ from sglang.multimodal_gen.runtime.models.pi05.torch_model import Pi05TorchModel
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
 logger = init_logger(__name__)
 
@@ -63,6 +69,7 @@ class Pi05ActionExpert(nn.Module):
             prefix_context.past_key_values,
             x_t,
             timestep,
+            bool(prefix_context.layout.get("full_attention", False)),
         )
 
 
@@ -90,7 +97,20 @@ class Pi05PolicyModel(nn.Module):
         self.dtype = dtype
         self.manifest = manifest
         self.runtime_role = self._resolve_runtime_role()
-        self.core_model = Pi05TorchModel(config, runtime_role=self.runtime_role)
+        mp_policy = MixedPrecisionPolicy(
+            dtype,
+            dtype,
+            dtype,
+            cast_forward_inputs=False,
+        )
+        set_mixed_precision_policy(
+            param_dtype=dtype,
+            reduce_dtype=dtype,
+            output_dtype=dtype,
+            mp_policy=mp_policy,
+        )
+        with set_default_torch_dtype(dtype), skip_init_modules():
+            self.core_model = Pi05TorchModel(config, runtime_role=self.runtime_role)
         self.core_model.eval()
         if device.type == "cuda":
             if self._use_componentwise_empty_init():
@@ -402,11 +422,6 @@ class Pi05PolicyModel(nn.Module):
         if "image_resolution" in payload:
             resolution = tuple(payload["image_resolution"])
             config.image_size = (int(resolution[0]), int(resolution[1]))
-        if payload.get("dtype") == "float32":
-            config.materialize_dtype = "fp32"
-        elif payload.get("dtype") == "bfloat16":
-            config.materialize_dtype = "bf16"
-
         input_features = payload.get("input_features") or {}
         image_keys = []
         for key, feature in input_features.items():
@@ -690,7 +705,7 @@ class Pi05PolicyModel(nn.Module):
         ]
         tokens = observation.tokens.to(self.device)
         token_masks = observation.token_masks.to(self.device)
-        past_key_values, prefix_pad_masks, prefix_position_ids = (
+        past_key_values, prefix_pad_masks, prefix_position_ids, full_attention = (
             self.core_model.encode_prefix(images, image_masks, tokens, token_masks)
         )
         return PrefixContext(
@@ -702,6 +717,7 @@ class Pi05PolicyModel(nn.Module):
             device=self.device,
             layout={
                 "camera_order": camera_order,
+                "full_attention": full_attention,
                 "parallel_layout_version": self.config.parallel_layout_version,
             },
         )
@@ -729,6 +745,8 @@ class Pi05PolicyModel(nn.Module):
         *,
         use_cuda_graph: bool = True,
     ) -> torch.Tensor:
+        if not bool(prefix_context.layout.get("full_attention", False)):
+            use_cuda_graph = False
         if not use_cuda_graph:
             return self.action_expert(prefix_context, x_t, timestep)
         bucket = Pi05DenoiseShapeBucket(
@@ -768,10 +786,16 @@ class Pi05PolicyModel(nn.Module):
         else:
             x_t = x_t.to(device=self.device, dtype=torch.float32)
 
-        dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=self.device)
-        time = torch.tensor(1.0, dtype=torch.float32, device=self.device)
-        while time >= -dt / 2:
-            timestep = time.expand(observation.batch_size)
+        dt = -1.0 / num_steps
+        timesteps = torch.linspace(
+            1.0,
+            1.0 / num_steps,
+            num_steps,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        for timestep_value in timesteps:
+            timestep = timestep_value.expand(observation.batch_size)
             velocity = self.denoise_step(
                 prefix_context,
                 x_t,
@@ -779,7 +803,6 @@ class Pi05PolicyModel(nn.Module):
                 use_cuda_graph=use_cuda_graph,
             )
             x_t = x_t + dt * velocity
-            time = time + dt
         if offload_action:
             self._move_action_modules_to_device(torch.device("cpu"))
             torch.cuda.empty_cache()
