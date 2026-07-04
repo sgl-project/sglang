@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     _prepare_nvfp4_weight_bytes,
@@ -56,9 +57,11 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _filter_duplicate_precision_variant_safetensors,
     _Flux2Nvfp4FallbackAdapter,
+    _needs_device_weight_postprocess,
     resolve_transformer_quant_load_spec,
     resolve_transformer_safetensors_to_load,
 )
+from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     build_nvfp4_config_from_safetensors_list,
@@ -181,6 +184,27 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         resolved = _filter_duplicate_precision_variant_safetensors(files)
 
         self.assertEqual(resolved, files)
+
+    def test_weight_load_plan_defers_cpu_offload_for_device_postprocess(self):
+        device = torch.device("cuda:0")
+
+        plan = WeightLoadPlan.for_component(
+            checkpoint_load_device=device,
+            needs_device_weight_postprocess=True,
+            component_cpu_offload=True,
+        )
+
+        self.assertEqual(plan.checkpoint_load_device, device)
+        self.assertEqual(plan.weight_postprocess_device, device)
+        self.assertTrue(plan.defer_component_cpu_offload)
+
+    def test_online_fp8_needs_device_weight_postprocess(self):
+        self.assertTrue(_needs_device_weight_postprocess(Fp8Config()))
+        self.assertFalse(
+            _needs_device_weight_postprocess(
+                Fp8Config(is_checkpoint_fp8_serialized=True)
+            )
+        )
 
     @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",
