@@ -1480,7 +1480,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 logger.warning(
                     "DSpark accept anomaly detected: dp_rank=%s tp_rank=%s "
                     "ep_rank=%s req_pool_idx=%s rid=%s zero_draft_streak=%s "
-                    "history=%s kv_debug=%s",
+                    "history=%s",
                     self.dp_rank,
                     self.tp_rank,
                     self.moe_ep_rank,
@@ -1488,6 +1488,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                     rid,
                     streak,
                     list(history),
+                )
+                logger.warning(
+                    "DSpark accept anomaly KV debug: dp_rank=%s tp_rank=%s "
+                    "ep_rank=%s req_pool_idx=%s rid=%s kv_debug=%s",
+                    self.dp_rank,
+                    self.tp_rank,
+                    self.moe_ep_rank,
+                    int(req_pool_idx),
+                    rid,
                     kv_debug,
                 )
 
