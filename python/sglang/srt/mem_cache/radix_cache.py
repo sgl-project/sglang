@@ -454,10 +454,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
 
-        from sglang.srt.speculative.spec_utils import align_spec_prefix_len
-
-        cache_token_len = align_spec_prefix_len(kv_committed_len)
-        token_ids = (req.origin_input_ids + req.output_ids)[:cache_token_len]
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
@@ -499,17 +496,13 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return
 
-        from sglang.srt.speculative.spec_utils import align_spec_prefix_len
-
         full_token_ids = req.get_fill_ids()
-        cache_token_len = align_spec_prefix_len(len(full_token_ids))
-        token_ids = full_token_ids[:cache_token_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(full_token_ids)
         ]
 
         radix_key = RadixKey(
-            token_ids, req.extra_key, is_bigram=self.is_eagle
+            full_token_ids, req.extra_key, is_bigram=self.is_eagle
         ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 

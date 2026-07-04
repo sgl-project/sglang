@@ -176,7 +176,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._markov_refine_buffer_cap: int = 0
         self._markov_candidates_buf: Optional[torch.Tensor] = None
         self._markov_embeds_buf: Optional[torch.Tensor] = None
-        self._materialize_draft_compressors_enabled = True
         self.draft_attn_backend = None
         self.draft_extend_attn_backend = None
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
@@ -494,8 +493,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         main_hidden: torch.Tensor,
         draft_forward_batch,
     ) -> None:
-        if not self._materialize_draft_compressors_enabled:
-            return
         if main_hidden is None:
             raise RuntimeError("DSpark missing target main_hidden context features.")
         if main_hidden.numel() == 0 or draft_forward_batch is None:
@@ -518,23 +515,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # this draft verify batch before replaying compressor writes with
                 # target hidden; PD overlap can otherwise observe stale metadata.
                 attn_backend.init_forward_metadata(draft_forward_batch)
-                metadata = getattr(attn_backend, "forward_metadata", None)
-                c128_out_loc = getattr(
-                    getattr(metadata, "core_metadata", None), "c128_out_loc", None
-                )
-                if (
-                    c128_out_loc is not None
-                    and c128_out_loc.shape[0] != main_hidden.shape[0]
-                ):
-                    self._materialize_draft_compressors_enabled = False
-                    logger.warning(
-                        "Skip DSpark draft compressor materialization due to "
-                        "metadata shape mismatch: out_loc=%s hidden=%s",
-                        c128_out_loc.shape[0],
-                        main_hidden.shape[0],
-                    )
-                    return
-
                 main_x = self.draft_model.project_main_hidden(main_hidden)
                 for layer in self._draft_inner.layers:
                     attn = layer.self_attn
@@ -565,10 +545,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_forward_batch=draft_forward_batch,
             )
         except Exception as e:
-            self._materialize_draft_compressors_enabled = False
             logger.warning(
                 "DSpark draft compressor materialization failed; "
-                "falling back to SWA-only materialization: %s",
+                "skip compressor materialization for this call: %s",
                 e,
             )
         if kv_main_hidden is None:

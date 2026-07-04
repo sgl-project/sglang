@@ -72,26 +72,6 @@ else:
 logger = logging.getLogger(__name__)
 
 
-DSPARK_C128_PREFIX_ALIGNMENT = 128
-
-
-def get_spec_prefix_cache_alignment() -> int:
-    server_args = get_global_server_args()
-    if (
-        server_args.speculative_algorithm is not None
-        and server_args.speculative_algorithm.upper() == "DSPARK"
-    ):
-        return DSPARK_C128_PREFIX_ALIGNMENT
-    return 1
-
-
-def align_spec_prefix_len(length: int) -> int:
-    alignment = get_spec_prefix_cache_alignment()
-    if alignment <= 1:
-        return length
-    return length // alignment * alignment
-
-
 def fast_sample(probs: torch.Tensor, num_samples: int = 1):
     sample_index = torch.multinomial(probs, num_samples=num_samples)
     sample_p = probs.gather(1, sample_index)

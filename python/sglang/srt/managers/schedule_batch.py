@@ -1179,27 +1179,6 @@ class Req(ReqDllmMixin):
                     cow_mamba=cow_mamba,
                 )
             )
-            matched_len = len(match_result.device_indices) + int(
-                match_result.host_hit_length
-            )
-            from sglang.srt.speculative.spec_utils import align_spec_prefix_len
-
-            aligned_len = align_spec_prefix_len(matched_len)
-            if aligned_len != matched_len:
-                if aligned_len == 0:
-                    match_result = zero_match_result(tree_cache, match_result)
-                else:
-                    match_result = tree_cache.match_prefix(
-                        MatchPrefixParams(
-                            key=RadixKey(
-                                token_ids=token_ids_to_match,
-                                extra_key=self.extra_key,
-                                limit=aligned_len,
-                            ),
-                            req=self,
-                            cow_mamba=cow_mamba,
-                        )
-                    )
             if envs.SGLANG_RADIX_FORCE_MISS.get():
                 match_result = zero_match_result(tree_cache, match_result)
             (

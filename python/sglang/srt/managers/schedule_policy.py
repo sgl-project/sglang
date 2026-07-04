@@ -54,7 +54,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.speculative.spec_utils import align_spec_prefix_len
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -107,23 +106,6 @@ def match_prefix_for_req(
             req=req if include_req else None,
         )
     )
-    matched_len = len(match_result.device_indices) + int(match_result.host_hit_length)
-    aligned_len = align_spec_prefix_len(matched_len)
-    if aligned_len != matched_len:
-        if aligned_len == 0:
-            match_result = zero_match_result(tree_cache, match_result)
-        else:
-            match_result = tree_cache.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(
-                        token_ids=token_ids,
-                        extra_key=req.extra_key,
-                        limit=aligned_len,
-                    ),
-                    cow_mamba=cow_mamba,
-                    req=req if include_req else None,
-                )
-            )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
         match_result = zero_match_result(tree_cache, match_result)
     (
