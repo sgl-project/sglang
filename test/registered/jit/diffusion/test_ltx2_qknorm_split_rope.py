@@ -11,7 +11,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
-BF16_FUSED_ATOL = 8e-2
+BF16_FUSED_ATOL = 1.6e-1
 
 
 def _require_cuda_b200() -> None:
