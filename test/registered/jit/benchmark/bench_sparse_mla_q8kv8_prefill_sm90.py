@@ -3,14 +3,11 @@ from __future__ import annotations
 import math
 
 import torch
-import triton
-import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import run_benchmark_no_cudagraph
+from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import sparse_mla_q8kv8_prefill_fwd
 from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
 
 try:
     from sgl_kernel.flash_mla import flash_mla_sparse_fwd
@@ -24,36 +21,29 @@ register_cuda_ci(
     est_time=120, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
 
-IS_CI = is_in_ci()
 DTYPE_FP8 = torch.float8_e4m3fn
 D_V = 512
 H_KV = 1
 
-if IS_CI:
-    CASES = [
-        (2, 1024, 64, 512, 128),
-        (2, 1024, 64, 576, 128),
-    ]
-else:
-    CASES = [
-        (4096, 8192, 128, 576, 2048),
-        (4096, 32768, 128, 576, 2048),
-        (4096, 65536, 128, 576, 2048),
-        (4096, 8192, 64, 512, 512),
-        (4096, 32768, 64, 512, 512),
-    ]
+CASES = [
+    (4096, 8192, 128, 576, 2048),
+    (4096, 32768, 128, 576, 2048),
+    (4096, 65536, 128, 576, 2048),
+    (4096, 8192, 64, 512, 512),
+    (4096, 32768, 64, 512, 512),
+]
+CASES_CI = [
+    (2, 1024, 64, 512, 128),
+    (2, 1024, 64, 576, 128),
+]
 
-    # This official benchmark intentionally measures the no-sink path. Current
-    # DeepSeek NSA E2E does not pass a per-head attention sink into sparse MLA, so
-    # sink-enabled timings are kernel feature coverage rather than E2E proxy data.
+# This official benchmark intentionally measures the no-sink path. Current
+# DeepSeek NSA E2E does not pass a per-head attention sink into sparse MLA, so
+# sink-enabled timings are kernel feature coverage rather than E2E proxy data.
 
 LINE_VALS = ["q8_fp8_jit"]
-LINE_NAMES = ["Q8 FP8 JIT"]
-STYLES = [("blue", "-")]
 if HAS_Q16_FLASHMLA:
     LINE_VALS.insert(0, "q16_bf16_flashmla")
-    LINE_NAMES.insert(0, "Q16 BF16 FlashMLA")
-    STYLES.insert(0, ("orange", "--"))
 
 
 def _sm90_available() -> bool:
@@ -104,27 +94,14 @@ def _make_q8_inputs(s_q: int, s_kv: int, h_q: int, d_qk: int, topk: int):
     return q, kv, indices, sm_scale, q_scale, kv_scale
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["s_q", "s_kv", "h_q", "d_qk", "topk"],
-        x_vals=CASES,
-        line_arg="provider",
-        line_vals=LINE_VALS,
-        line_names=LINE_NAMES,
-        styles=STYLES,
-        ylabel="us",
-        plot_name="sparse-mla-q8kv8-prefill-sm90-performance",
-        args={},
-    )
-)
+@marker.parametrize("s_q,s_kv,h_q,d_qk,topk", CASES, CASES_CI)
+@marker.benchmark("provider", LINE_VALS)
 def bench_sparse_mla_q8kv8_prefill_sm90(
     s_q: int, s_kv: int, h_q: int, d_qk: int, topk: int, provider: str
-):
+) -> marker.BenchResult:
     if provider == "q16_bf16_flashmla":
         if not HAS_Q16_FLASHMLA:
-            raise RuntimeError(
-                "sgl_kernel.flash_mla.flash_mla_sparse_fwd is not available"
-            )
+            marker.skip("sgl_kernel.flash_mla.flash_mla_sparse_fwd is unavailable")
         q, kv, indices, sm_scale = _make_q16_inputs(s_q, s_kv, h_q, d_qk, topk)
 
         def fn():
@@ -132,7 +109,7 @@ def bench_sparse_mla_q8kv8_prefill_sm90(
 
     elif provider == "q8_fp8_jit":
         if not _sm90_available():
-            raise RuntimeError("Q8KV8 sparse prefill benchmark requires SM90 CUDA")
+            marker.skip("Q8KV8 sparse prefill benchmark requires SM90 CUDA")
         q, kv, indices, sm_scale, q_scale, kv_scale = _make_q8_inputs(
             s_q, s_kv, h_q, d_qk, topk
         )
@@ -145,8 +122,8 @@ def bench_sparse_mla_q8kv8_prefill_sm90(
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
-    return run_benchmark_no_cudagraph(fn)
+    return marker.do_bench(fn, use_cuda_graph=False, disable_log_bandwidth=True)
 
 
 if __name__ == "__main__":
-    bench_sparse_mla_q8kv8_prefill_sm90.run(print_data=True)
+    bench_sparse_mla_q8kv8_prefill_sm90.run()

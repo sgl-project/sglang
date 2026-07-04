@@ -7,7 +7,6 @@ Run on SM90+ (Hopper or later):
 
 import torch
 import torch.nn.functional as F
-import triton.testing
 from sgl_kernel import dsv3_fused_a_gemm as sgl_kernel_dsv3_fused_a_gemm
 
 from sglang.jit_kernel.benchmark import marker
@@ -18,13 +17,10 @@ from sglang.jit_kernel.dsv3_fused_a_gemm import dsv3_fused_a_gemm
 from sglang.jit_kernel.utils import get_jit_cuda_arch, is_hip_runtime
 from sglang.srt.utils.common import is_sm120_supported
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
 
 register_cuda_ci(
     est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-
-IS_CI = is_in_ci()
 
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
@@ -34,27 +30,18 @@ HD_IN_LIST = [6144, 7168]
 AOT_HD_IN = 7168
 HAS_AOT = not is_sm120_supported()
 
-NUM_TOKENS_LIST = [1, 8, 16] if IS_CI else list(range(1, 17))
+NUM_TOKENS_LIST = list(range(1, 17))
+NUM_TOKENS_CI_LIST = [1, 8, 16]
 
 LINE_VALS = ["cutedsl", "jit", "sgl_kernel", "torch"]
-LINE_NAMES = ["CuTe DSL", "CUDA JIT", "sgl_kernel AOT", "torch F.linear"]
-STYLES = [("blue", "-"), ("orange", "--"), ("red", ":"), ("green", "-.")]
 
 
-def _median_us(fn, *args) -> float:
-    result = marker.do_bench(
-        fn,
-        input_args=args,
-        use_cuda_graph=True,
-        metrics=(0.5,),
-        disable_log_bandwidth=True,
-    )
-    return result.times[0] * 1e6
-
-
-def _bench(num_tokens, provider, hd_in):
+@marker.parametrize("hd_in", HD_IN_LIST)
+@marker.parametrize("num_tokens", NUM_TOKENS_LIST, NUM_TOKENS_CI_LIST)
+@marker.benchmark("provider", LINE_VALS)
+def benchmark(num_tokens: int, provider: str, hd_in: int) -> marker.BenchResult:
     if provider == "sgl_kernel" and not (HAS_AOT and hd_in == AOT_HD_IN):
-        return float("nan")
+        marker.skip("sgl_kernel AOT is only available for the supported HD_IN")
 
     mat_a = torch.randn((num_tokens, hd_in), dtype=DTYPE, device=DEVICE)
     mat_b = torch.randn((HD_OUT, hd_in), dtype=DTYPE, device=DEVICE).transpose(0, 1)
@@ -64,27 +51,13 @@ def _bench(num_tokens, provider, hd_in):
         "sgl_kernel": sgl_kernel_dsv3_fused_a_gemm,
         "torch": lambda a, b: F.linear(a, b.T),
     }
-    return _median_us(fn_map[provider], mat_a, mat_b)
-
-
-@triton.testing.perf_report(
-    [
-        triton.testing.Benchmark(
-            x_names=["num_tokens"],
-            x_vals=NUM_TOKENS_LIST,
-            line_arg="provider",
-            line_vals=LINE_VALS,
-            line_names=LINE_NAMES,
-            styles=STYLES,
-            ylabel="us",
-            plot_name=f"dsv3-fused-a-gemm-bf16-K{hd_in}-N{HD_OUT}",
-            args={"hd_in": hd_in},
-        )
-        for hd_in in HD_IN_LIST
-    ]
-)
-def benchmark(num_tokens, provider, hd_in):
-    return _bench(num_tokens, provider, hd_in)
+    return marker.do_bench(
+        fn_map[provider],
+        input_args=(mat_a, mat_b),
+        use_cuda_graph=True,
+        metrics=(0.5,),
+        disable_log_bandwidth=True,
+    )
 
 
 if __name__ == "__main__":
@@ -93,4 +66,4 @@ if __name__ == "__main__":
             "dsv3_fused_a_gemm JIT kernel requires SM90+ (Hopper). Skipping benchmark."
         )
     else:
-        benchmark.run(print_data=True)
+        benchmark.run()
