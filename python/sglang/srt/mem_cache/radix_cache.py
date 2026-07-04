@@ -454,9 +454,12 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        from sglang.srt.speculative.spec_utils import align_spec_prefix_len
+
+        cache_token_len = align_spec_prefix_len(kv_committed_len)
+        token_ids = (req.origin_input_ids + req.output_ids)[:cache_token_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, :kv_committed_len
         ]
 
         radix_key = RadixKey(
@@ -466,7 +469,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
-        if is_insert:
+        if is_insert and key_len > 0:
             priority = getattr(req, "priority", 0) or 0
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
@@ -496,9 +499,13 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return
 
-        token_ids = req.get_fill_ids()
+        from sglang.srt.speculative.spec_utils import align_spec_prefix_len
+
+        full_token_ids = req.get_fill_ids()
+        cache_token_len = align_spec_prefix_len(len(full_token_ids))
+        token_ids = full_token_ids[:cache_token_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, : len(full_token_ids)
         ]
 
         radix_key = RadixKey(
@@ -507,15 +514,18 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
-        result = self.insert(
-            InsertParams(
-                key=radix_key,
-                value=values,
-                chunked=chunked,
-                priority=getattr(req, "priority", 0) or 0,
+        if len(radix_key) > 0:
+            result = self.insert(
+                InsertParams(
+                    key=radix_key,
+                    value=values,
+                    chunked=chunked,
+                    priority=getattr(req, "priority", 0) or 0,
+                )
             )
-        )
-        new_prefix_len = result.prefix_len
+            new_prefix_len = result.prefix_len
+        else:
+            new_prefix_len = 0
 
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.cache_protected_len : new_prefix_len]

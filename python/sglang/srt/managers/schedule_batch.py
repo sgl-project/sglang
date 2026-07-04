@@ -123,50 +123,12 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
-DSPARK_C128_PREFIX_ALIGNMENT = 128
 
 # Constant used as the base offset for MM (multimodal) pad values.
 # This ensures pad_values don't overlap with valid text token IDs.
 MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
-
-
-def _maybe_align_dspark_prefix_match(
-    *,
-    tree_cache: BasePrefixCache,
-    req,
-    token_ids: array,
-    match_result,
-    cow_mamba: bool,
-):
-    server_args = get_global_server_args()
-    if (
-        server_args.speculative_algorithm is None
-        or server_args.speculative_algorithm.upper() != "DSPARK"
-    ):
-        return match_result
-
-    matched_len = len(match_result.device_indices) + int(match_result.host_hit_length)
-    aligned_len = (
-        matched_len // DSPARK_C128_PREFIX_ALIGNMENT
-    ) * DSPARK_C128_PREFIX_ALIGNMENT
-    if aligned_len == matched_len:
-        return match_result
-    if aligned_len == 0:
-        return zero_match_result(tree_cache, match_result)
-
-    return tree_cache.match_prefix(
-        MatchPrefixParams(
-            key=RadixKey(
-                token_ids=token_ids,
-                extra_key=req.extra_key,
-                limit=aligned_len,
-            ),
-            req=req,
-            cow_mamba=cow_mamba,
-        )
-    )
 
 
 @lru_cache(maxsize=1)
@@ -1217,13 +1179,27 @@ class Req(ReqDllmMixin):
                     cow_mamba=cow_mamba,
                 )
             )
-            match_result = _maybe_align_dspark_prefix_match(
-                tree_cache=tree_cache,
-                req=self,
-                token_ids=token_ids_to_match,
-                match_result=match_result,
-                cow_mamba=cow_mamba,
+            matched_len = len(match_result.device_indices) + int(
+                match_result.host_hit_length
             )
+            from sglang.srt.speculative.spec_utils import align_spec_prefix_len
+
+            aligned_len = align_spec_prefix_len(matched_len)
+            if aligned_len != matched_len:
+                if aligned_len == 0:
+                    match_result = zero_match_result(tree_cache, match_result)
+                else:
+                    match_result = tree_cache.match_prefix(
+                        MatchPrefixParams(
+                            key=RadixKey(
+                                token_ids=token_ids_to_match,
+                                extra_key=self.extra_key,
+                                limit=aligned_len,
+                            ),
+                            req=self,
+                            cow_mamba=cow_mamba,
+                        )
+                    )
             if envs.SGLANG_RADIX_FORCE_MISS.get():
                 match_result = zero_match_result(tree_cache, match_result)
             (
