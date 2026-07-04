@@ -62,9 +62,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
     from sglang.srt.lora.trtllm_lora_temp.shared_add_overlap import (
         maybe_overlap_staged_shared_add,
     )
-    from sglang.srt.lora.trtllm_lora_temp.triton_ops import (
-        merged_experts_fused_moe_lora_add,
-    )
+    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import merged_experts_fused_moe_lora_add
     from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
     assert runner_config.activation == "silu" and runner_config.is_gated, (
@@ -323,9 +321,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
-    from sglang.srt.lora.trtllm_lora_temp.triton_ops import (
-        merged_experts_fused_moe_lora_add,
-    )
+    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import merged_experts_fused_moe_lora_add
     from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
     assert (
@@ -474,9 +470,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
-    from sglang.srt.lora.trtllm_lora_temp.triton_ops import (
-        merged_experts_fused_moe_lora_add,
-    )
+    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import merged_experts_fused_moe_lora_add
     from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
     assert (

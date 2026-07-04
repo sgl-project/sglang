@@ -29,10 +29,10 @@ step_a_q_fwd = step_a_v_fwd = step_b_q_fwd = step_b_v_fwd = None
 def _ensure_step_kernels() -> None:
     global step_a_q_fwd, step_a_v_fwd, step_b_q_fwd, step_b_v_fwd
     if step_a_q_fwd is None:
-        from sglang.srt.lora.trtllm_lora_temp.triton_ops import step_a_q_fwd as _aq
-        from sglang.srt.lora.trtllm_lora_temp.triton_ops import step_a_v_fwd as _av
-        from sglang.srt.lora.trtllm_lora_temp.triton_ops import step_b_q_fwd as _bq
-        from sglang.srt.lora.trtllm_lora_temp.triton_ops import step_b_v_fwd as _bv
+        from sglang.kernels.ops.gemm.trtllm_lora_temp.kv_b_lora_absorbed import step_a_q_fwd as _aq
+        from sglang.kernels.ops.gemm.trtllm_lora_temp.kv_b_lora_absorbed import step_a_v_fwd as _av
+        from sglang.kernels.ops.gemm.trtllm_lora_temp.kv_b_lora_absorbed import step_b_q_fwd as _bq
+        from sglang.kernels.ops.gemm.trtllm_lora_temp.kv_b_lora_absorbed import step_b_v_fwd as _bv
 
         step_a_q_fwd, step_a_v_fwd, step_b_q_fwd, step_b_v_fwd = _aq, _av, _bq, _bv
 
