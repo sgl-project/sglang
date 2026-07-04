@@ -45,7 +45,6 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.layers.utils.dcp_utils import DecodeContextParallelMetadata
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
@@ -61,6 +60,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
@@ -504,7 +504,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
 
-    # For decode context parallel
+    # For decode context parallel.
+    # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the
+    # import block above) — available for annotations but NOT bound at runtime in this
+    # module. Import it from sglang.srt.layers.dcp.metadata if a runtime use is added.
     attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None
 
     # Decode context parallel KV write mask.
