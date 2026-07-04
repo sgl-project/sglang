@@ -1216,18 +1216,18 @@ class Indexer(MultiPlatformOp):
             "DSA forward_indexer (non-CUDA loop path) not supported under "
             "piecewise/breakable CUDA graph"
         )
-        if not _is_npu:
+        if not (_is_npu or _is_cpu):
             from sglang.srt.layers.attention.dsa.tilelang_kernel import fp8_index
+        elif _is_cpu and _cpu_amx:
+            from sglang.srt.layers.attention.dsa.cpu_kernel import fp8_index
+            from sglang.srt.layers.attention.dsa.index_buf_accessor import GetK, GetS
 
-        page_size = get_token_to_kv_pool().page_size
-        assert page_size == 64, "only support page size 64"
+        kv_pool = get_token_to_kv_pool()
+        page_size = kv_pool.page_size
+        # assert page_size == 64, f"only support page size 64, but get {page_size}"
 
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
-
-        # logits = deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)
-        k_fp8_list = []
-        k_scale_list = []
 
         topk_indices_list = []
 
@@ -1235,9 +1235,14 @@ class Indexer(MultiPlatformOp):
             forward_batch.req_pool_indices, :
         ]
         strided_indices = torch.arange(
-            0, block_tables.shape[-1], page_size, device="cuda"
+            0,
+            block_tables.shape[-1],
+            page_size,
+            device=block_tables.device,
         )
         block_tables = block_tables[:, strided_indices] // page_size
+        if _is_cpu and _cpu_amx:
+            index_k_with_scale_buffer = kv_pool.get_index_k_with_scale_buffer(layer_id)
 
         q_len_start = 0
 
@@ -1256,18 +1261,33 @@ class Indexer(MultiPlatformOp):
             weights_partial = weights[q_len_start:q_len_end]
             weights_partial = weights_partial.squeeze(-1).unsqueeze(0).contiguous()
 
-            k_fp8 = get_token_to_kv_pool().get_index_k_continuous(
-                layer_id,
-                seq_len,
-                block_tables[i],
-            )
-            k_scale = get_token_to_kv_pool().get_index_k_scale_continuous(
-                layer_id,
-                seq_len,
-                block_tables[i],
-            )
+            if _is_cpu and _cpu_amx:
+                k_fp8 = GetK.torch_fast(
+                    kv_pool,
+                    index_k_with_scale_buffer,
+                    seq_len,
+                    block_tables[i],
+                )
+                k_scale = GetS.torch_fast(
+                    kv_pool,
+                    index_k_with_scale_buffer,
+                    seq_len,
+                    block_tables[i],
+                )
+            else:
+                k_fp8 = kv_pool.get_index_k_continuous(
+                    layer_id,
+                    seq_len,
+                    block_tables[i],
+                )
+                k_scale = kv_pool.get_index_k_scale_continuous(
+                    layer_id,
+                    seq_len,
+                    block_tables[i],
+                )
 
-            k_fp8 = k_fp8.view(torch.float8_e4m3fn).unsqueeze(0).contiguous()
+            k_fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
+            k_fp8 = k_fp8.view(k_fp8_dtype).unsqueeze(0).contiguous()
             k_scale = k_scale.view(torch.float32).squeeze(-1).unsqueeze(0).contiguous()
 
             index_score = fp8_index(
