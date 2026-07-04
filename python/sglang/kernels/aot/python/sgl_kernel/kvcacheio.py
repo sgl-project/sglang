@@ -241,7 +241,7 @@ def transfer_kv_per_layer_mla(
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
     item_size: int,
-    block_quota: int = 2,
+    block_quota: int = _default_mla_block_quota(),
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_per_layer_mla.default(
