@@ -154,7 +154,9 @@ async def run_async_client_warmup(
                 raise RuntimeError(response.error)
     except Exception as e:
         if fail_open:
-            logger.warning("Synthetic server warmup failed; continuing startup: %s", e)
+            logger.warning(
+                "Synthetic server warmup failed; continuing startup", exc_info=True
+            )
             return
         raise
 
@@ -278,7 +280,7 @@ class SchedulerWarmupMixin:
                 self._logged_server_ready_after_warmup = True
         else:
             warmup_desc = self._format_warmup_req(req_or_group)
-            logger.info(f"{warmup_desc} processing failed")
+            logger.warning("%s processing failed: %s", warmup_desc, output_batch.error)
 
     def process_received_reqs_with_req_based_warmup(
         self, recv_reqs: list[tuple[bytes, Any]]
