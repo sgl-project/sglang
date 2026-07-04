@@ -434,8 +434,11 @@ class FutureMap:
             self.transfer_warmup_rounds_buf is not None
             and payload.transfer_warmup_rounds is not None
         ):
-            self.transfer_warmup_rounds_buf[indices] = (
-                payload.transfer_warmup_rounds.to(
-                    self.transfer_warmup_rounds_buf.dtype
+            if payload.transfer_warmup_rounds.numel() == indices.numel():
+                self.transfer_warmup_rounds_buf[indices] = (
+                    payload.transfer_warmup_rounds.to(
+                        self.transfer_warmup_rounds_buf.dtype
+                    )
                 )
-            )
+            else:
+                self.transfer_warmup_rounds_buf[indices] = 0

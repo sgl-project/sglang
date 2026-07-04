@@ -1293,6 +1293,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=bonus_tokens.to(dtype=torch.int64),
             new_seq_lens=seq_lens.to(dtype=torch.int64),
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
+            transfer_warmup_rounds=torch.zeros_like(seq_lens, dtype=torch.int32),
         )
 
     def _get_transfer_warmup_rounds(
