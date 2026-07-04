@@ -120,18 +120,6 @@ def prepare_rope_tables(
     return rope_cos.contiguous(), rope_sin.contiguous()
 
 
-def _precompute_inv_rms(
-    qkv: torch.Tensor, idx: int, C: int, eps: float = 1e-5
-) -> torch.Tensor:
-    """Compute 1/RMS for one component of QKV over the full C = H*D channel dim.
-
-    qkv: (B, N, 3, H, D); idx: 0=Q, 1=K, 2=V; C: H*D. Returns (B, N) float32.
-    """
-    raw = qkv[:, :, idx].float()  # (B, N, H, D)
-    sq_sum = (raw * raw).sum(dim=(-2, -1))  # (B, N)
-    return torch.rsqrt(sq_sum / C + eps)
-
-
 # =====================================================================
 #  Fused single-pass Q+K inverse-RMS Triton kernel
 # =====================================================================
@@ -182,7 +170,7 @@ def fused_qk_inv_rms(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Single-pass Triton fused Q+K inverse-RMS.
 
-    Replaces two ``_precompute_inv_rms`` scans with one launch that reads each
+    Replaces two separate PyTorch RMS scans with one launch that reads each
     ``(b, n)`` row of ``qkv`` exactly once.
     qkv: (B, N, 3, H, D) contiguous. Returns (q_inv_rms, k_inv_rms), each (B, N) float32.
     """
@@ -230,7 +218,7 @@ def fused_bigdn_func(
     """Bidirectional fused GDN. Returns ``(B, N, H, D)``.
 
     Thin entry point kept for call-site stability; delegates to
-    :func:`fused_bigdn_bidi_chunkwise` from ``fused_gdn_chunkwise``.
+    :func:`fused_bigdn_bidi_chunkwise` from ``sana_wm_gdn_chunkwise``.
     """
     from sglang.jit_kernel.diffusion.triton.sana_wm_gdn_chunkwise import (
         fused_bigdn_bidi_chunkwise,

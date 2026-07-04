@@ -232,6 +232,12 @@ class Envs:
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
+    # HTTP server
+    # Decompress request bodies tagged with `x-body-compressed`.
+    SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
+    # Override parsed request fields from headers.
+    SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
+
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
@@ -288,14 +294,28 @@ class Envs:
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
+    SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
+    # Disable lazy compaction in the unified memory pool allocator and
+    # fall back to the per-free eager compaction. Used for production
+    # A/B and quick rollback. Default False (lazy compaction on).
+    SGLANG_DISABLE_LAZY_COMPACTION = EnvBool(False)
+    # Sort the multi-ended allocator's free list after a merge (perf A/B knob).
+    SGLANG_SORT_FREE_LIST_AFTER_MERGE = EnvBool(False)
+    # Periodically log lazy-compaction stats per sub-pool (observability only).
+    SGLANG_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
+    SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC = EnvInt(30)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
+
+    # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
+    # page tables (DP attn); paged backends like trtllm_mha consume it directly.
+    SGLANG_USE_HND_KVCACHE = EnvBool(False)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
@@ -578,6 +598,8 @@ class Envs:
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
     SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
+    # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
+    SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
@@ -644,7 +666,9 @@ class Envs:
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
+    SGLANG_DSA_USE_FUSED_METADATA_GENERATION = EnvBool(True)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -735,8 +759,10 @@ class Envs:
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
 
-    # Breakable CUDA Graph
+    # CUDA Graph
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
+    # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
+    SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
@@ -840,21 +866,22 @@ class Envs:
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
+    SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+    # Deprecated: DSV4 compressor V2 is always used.
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
-    SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(False)
+    SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
     # SWA radix cache
     # TODO(DSV4): @ispobock this has bug on main branch when retract
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
     SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
-    SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN = EnvBool(False)
 
     # Unified radix cache
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(False)
@@ -878,10 +905,19 @@ class Envs:
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
+    # Opt-in: route DeepSeek-V3 grouped topk through the unified Triton router
+    # instead of the flashinfer/AOT grouped kernels. Off by default (flashinfer is
+    # the tuned production path); the Triton path is bit-exact on DeepSeek-V3.2 e2e
+    # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
+    SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
 
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
+
+    # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
+    # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.
+    SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
 
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
@@ -1006,6 +1042,7 @@ def _convert_SGL_to_SGLANG():
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
     )
     _print_deprecated_env("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
+    _print_deprecated_env("SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN")
     _print_deprecated_env("SGLANG_ENABLE_THINKING", "SGLANG_DEFAULT_THINKING")
     _print_deprecated_env("SGLANG_REASONING_EFFORT", "SGLANG_DSV4_REASONING_EFFORT")
     _print_deprecated_env(

@@ -360,6 +360,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         sampling_params=sampling_params,
                         stream=request.stream,
                         rid=request.request_id,
+                        session_id=request.session_id,
                         extra_key=self._compute_extra_key(request),
                         background=request.background,
                     )
@@ -671,6 +672,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 stream_reasoning=False,
                 force_reasoning=self._is_thinking_enabled_for_request(request),
                 request=request,
+                tokenizer=self.tokenizer_manager.tokenizer,
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
         else:
@@ -713,7 +715,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             and self.tool_call_parser
             and request.tool_choice != "none"
         ):
-            parser = FunctionCallParser(chat_tools, self.tool_call_parser)
+            parser = FunctionCallParser(
+                chat_tools,
+                self.tool_call_parser,
+                tokenizer=self.tokenizer_manager.tokenizer,
+            )
             should_try_native = (
                 not is_required or parser.detector.supports_structural_tag()
             )
@@ -1688,7 +1694,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
 
         async def empty_async_generator():
-            if False:
+            for _ in ():
                 yield
 
         final_response = await self.responses_full_generator(
@@ -1798,14 +1804,22 @@ class OpenAIServingResponses(OpenAIServingChat):
         if chat_tools and request.tool_choice != "none":
             native_supports_structural_tag = False
             if self.tool_call_parser:
-                probe = FunctionCallParser(chat_tools, self.tool_call_parser)
+                probe = FunctionCallParser(
+                    chat_tools,
+                    self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                )
                 native_supports_structural_tag = (
                     probe.detector.supports_structural_tag()
                 )
             if is_required and not native_supports_structural_tag:
                 tool_parser = JsonArrayParser()
             elif self.tool_call_parser:
-                tool_parser = FunctionCallParser(chat_tools, self.tool_call_parser)
+                tool_parser = FunctionCallParser(
+                    chat_tools,
+                    self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if self.reasoning_parser:
             reasoning_parser_obj = ReasoningParser(
@@ -1813,6 +1827,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 stream_reasoning=True,
                 force_reasoning=self._is_thinking_enabled_for_request(request),
                 request=request,
+                tokenizer=self.tokenizer_manager.tokenizer,
             )
 
         current_output_index = -1
@@ -2362,6 +2377,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 sampling_params=sampling_params,
                 stream=adapted_request.stream,
                 rid=request_id,
+                session_id=adapted_request.session_id,
                 extra_key=adapted_request.extra_key,
                 return_logprob=adapted_request.return_logprob,
                 logprob_start_len=adapted_request.logprob_start_len,

@@ -172,6 +172,18 @@ export const Nemotron3UltraDeployment = () => {
       ],
       commandRule: (value) => value === 'float16' ? '--mamba-ssm-dtype float16' : null
     },
+    mambastochasticrounding: {
+      name: 'mambastochasticrounding',
+      title: 'Mamba Stochastic Rounding',
+      items: [
+        { id: 'disabled', label: 'Disabled', default: true  },
+        { id: 'enabled',  label: 'Enabled',  subtitle: 'FP16 SSM' }
+      ],
+      commandRule: (value, state) =>
+        value === 'enabled' && state.mambassmdtype === 'float16'
+          ? '--enable-mamba-cache-stochastic-rounding'
+          : null
+    },
     thinking: {
       name: 'thinking',
       title: 'Reasoning Parser',
