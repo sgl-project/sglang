@@ -14,13 +14,13 @@ permissions:
 
 jobs:
   mlx-unit-test:
-    # Label-gated on 'mlx', reusing the repo's run-ci label-gate mechanism
+    # Label-gated on 'apple-silicon', reusing the repo's run-ci label-gate mechanism
     # (pr-test-rust.yml). The gate keys on the PR's current label set, so any
     # event on a labeled PR re-runs the tests and a later unrelated label can't
     # mask a prior result. The non-pull_request clause covers push / dispatch.
     if: |
       github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'mlx')
+      contains(github.event.pull_request.labels.*.name, 'apple-silicon')
     runs-on: macos-26
     timeout-minutes: 60
     env:

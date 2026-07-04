@@ -3059,6 +3059,22 @@ class ServerArgs:
 
     def _handle_xpu_backends(self):
         if self.device == "xpu":
+            # Decode graph is opt-in on XPU: unless the user explicitly set
+            # --cuda-graph-backend-decode (or --cuda-graph-config), keep it
+            # disabled so the default startup doesn't require graph capture.
+            if (Phase.DECODE, "backend") not in self._cuda_graph_config_locked:
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+            elif self.cuda_graph_config.decode.backend not in (
+                Backend.DISABLED,
+                Backend.FULL,
+            ):
+                logger.warning(
+                    "XPU platform only supports decode backend 'full'; "
+                    "disabling unsupported decode backend '%s'.",
+                    self.cuda_graph_config.decode.backend,
+                )
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+
             if self.cuda_graph_config.prefill.backend not in (
                 Backend.DISABLED,
                 Backend.TC_PIECEWISE,

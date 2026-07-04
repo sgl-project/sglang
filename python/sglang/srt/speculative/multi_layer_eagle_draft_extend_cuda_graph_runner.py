@@ -337,6 +337,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         attn_backend = self.eagle_worker.draft_extend_attn_backend_list[self.step]
 
         def run_once():
+            attn_backend.init_forward_metadata_in_graph(forward_batch)
+
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
