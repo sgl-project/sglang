@@ -70,6 +70,7 @@ from sglang.srt.entrypoints.openai.realtime.protocol import (
 )
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
+    is_cjk_char,
     needs_space,
     normalize_whitespace,
     process_asr_chunk,
@@ -84,10 +85,11 @@ from sglang.srt.utils import random_uuid
 logger = logging.getLogger(__name__)
 
 
-_DEFERRED_SENTENCE_PUNCT = frozenset(".!?")
+_DEFERRED_SENTENCE_PUNCT = frozenset(".!?。！？")
+_CJK_SENTENCE_PUNCT = frozenset("。！？")
 
 
-CLIENT_EVENT_TYPES: Dict[str, type] = {
+_CLIENT_EVENT_TYPES: Dict[str, type] = {
     "session.update": SessionUpdateEvent,
     "input_audio_buffer.append": InputAudioBufferAppendEvent,
     "input_audio_buffer.commit": InputAudioBufferCommitEvent,
@@ -95,15 +97,15 @@ CLIENT_EVENT_TYPES: Dict[str, type] = {
 }
 
 
-def parse_client_event(raw: Dict[str, Any]) -> Optional[BaseModel]:
-    cls = CLIENT_EVENT_TYPES.get(raw.get("type"))
+def _parse_client_event(raw: Dict[str, Any]) -> Optional[BaseModel]:
+    cls = _CLIENT_EVENT_TYPES.get(raw.get("type"))
     if cls is None:
         return None
     return cls.model_validate(raw)
 
 
 @dataclass
-class SessionConfig:
+class _SessionConfig:
     input_sample_rate: int = DEFAULT_INPUT_SAMPLE_RATE
     language: Optional[str] = None
     client_model: Optional[str] = None
@@ -112,7 +114,7 @@ class SessionConfig:
 
 
 @dataclass
-class ItemState:
+class _ItemState:
     current_item_id: str
     previous_item_id: Optional[str] = None
     emitted_deltas: List[str] = field(default_factory=list)
@@ -129,11 +131,16 @@ def split_trailing_sentence_punctuation(delta: str) -> tuple[str, str]:
     return delta[:start].rstrip(), delta[start:end]
 
 
-def should_emit_pending_sentence_punctuation(next_delta: str) -> bool:
+def should_emit_pending_sentence_punctuation(pending: str, next_delta: str) -> bool:
     next_delta = next_delta.lstrip()
     if not next_delta:
         return True
     first = next_delta[0]
+    # CJK has no case: after a deferred CJK sentence ender, a same-script
+    # continuation means the boundary re-transcription continued the clause.
+    # A pending Latin '.' before CJK text still flushes (language switch).
+    if pending and pending[-1] in _CJK_SENTENCE_PUNCT and is_cjk_char(first):
+        return False
     return not (first.isalpha() and first.islower())
 
 
@@ -174,11 +181,12 @@ class RealtimeConnection:
         self.bytes_per_second = self.model_sample_rate * PCM_SAMPLE_WIDTH
         self.max_buffer_seconds = server_args.asr_max_buffer_seconds
 
-        self.config = SessionConfig()
+        self.config = _SessionConfig()
 
         slicing_cfg = adapter.realtime_slicing_config
-        slicing_requested = bool(slicing_cfg.get("enabled", False)) and not bool(
-            getattr(server_args, "asr_disable_input_slicing", False)
+        slicing_requested = (
+            bool(slicing_cfg.get("enabled", False))
+            and not server_args.asr_disable_input_slicing
         )
         left_overlap_ms = int(slicing_cfg.get("left_overlap_ms", 0))
         min_audio_sec = float(slicing_cfg.get("min_audio_sec", 0.0))
@@ -214,6 +222,9 @@ class RealtimeConnection:
 
         left_overlap_bytes = int(left_overlap_ms / 1000 * self.bytes_per_second)
         left_overlap_bytes -= left_overlap_bytes % PCM_SAMPLE_WIDTH
+        # chunk_index counts inference windows, each consuming >= chunk_size_sec
+        # of audio, so this proxy can only delay the gate past min_audio_sec
+        # (staying cumulative longer), never fire it early.
         slicing_min_chunk_index = (
             math.ceil(min_audio_sec / state.chunk_size_sec) if slicing_requested else 0
         )
@@ -237,7 +248,7 @@ class RealtimeConnection:
             slicing_enabled=slicing_enabled,
         )
 
-        self.item = ItemState(current_item_id=f"item_{random_uuid()}")
+        self.item = _ItemState(current_item_id=f"item_{random_uuid()}")
 
     async def run(self) -> None:
         await self._send(
@@ -294,7 +305,7 @@ class RealtimeConnection:
 
             self._current_client_event_id = raw.get("event_id")
             try:
-                event = parse_client_event(raw)
+                event = _parse_client_event(raw)
             except ValidationError as e:
                 # Report first error only; matches OpenAI server behavior.
                 err = e.errors()[0]
@@ -613,7 +624,11 @@ class RealtimeConnection:
     # 4. commit: advance scheduling for every attempt, but advance inferred bytes
     #    and compact PCM only after a real accepted inference.
     async def _run_inference(self, is_last: bool) -> bool:
-        """Prepare, execute, emit, then commit one ASR window."""
+        """Prepare, execute, emit, then commit one ASR window.
+
+        Returns False only on inference failure, after the failure handler has
+        already emitted the error (append-time also closes the socket).
+        """
         plan = await self._prepare_asr_window(is_last)
         try:
             result = await self._execute_asr_window(plan)
@@ -645,7 +660,7 @@ class RealtimeConnection:
             dedupe_against: Optional[str] = committed_text
             slice_start_global = max(
                 0,
-                self.audio.last_sliced_buffer_end_bytes - self.audio.left_overlap_bytes,
+                self.audio.last_inferred_offset_bytes - self.audio.left_overlap_bytes,
             )
         else:
             prompt = None
@@ -686,7 +701,7 @@ class RealtimeConnection:
                 return _ASRWindowResult(delta="", skipped=False)
             audio_samples = await asyncio.to_thread(pcm_to_float_samples, full_slice)
             delta = await self._run_asr_on_samples(
-                plan, audio_samples, is_last=True, overlap_seconds=0.0
+                plan, audio_samples, overlap_seconds=0.0
             )
             return _ASRWindowResult(delta=delta, skipped=False)
 
@@ -695,7 +710,6 @@ class RealtimeConnection:
         delta = await self._run_asr_on_samples(
             plan,
             audio_samples,
-            is_last=plan.is_last,
             overlap_seconds=plan.overlap_seconds,
             defer_if_unverified=plan.use_slicing and not plan.is_last,
             verified_out=verified_out,
@@ -714,7 +728,6 @@ class RealtimeConnection:
         plan: _ASRWindowPlan,
         audio_samples: np.ndarray,
         *,
-        is_last: bool,
         overlap_seconds: float,
         defer_if_unverified: bool = False,
         verified_out: Optional[Dict[str, Any]] = None,
@@ -726,7 +739,7 @@ class RealtimeConnection:
             state=self.audio.state,
             audio_data=audio_samples,
             sampling_params=self.config.sampling_params,
-            is_last=is_last,
+            is_last=plan.is_last,
             prompt=plan.prompt,
             dedupe_against=plan.dedupe_against,
             sample_rate=self.model_sample_rate,
@@ -742,7 +755,6 @@ class RealtimeConnection:
         self.audio.last_scheduled_offset_bytes = plan.slice_end_global
         if not result.skipped:
             self.audio.last_inferred_offset_bytes = plan.slice_end_global
-            self.audio.last_sliced_buffer_end_bytes = plan.slice_end_global
             if plan.use_slicing and not plan.is_last:
                 self.audio.compact_after_sliced_inference()
 
@@ -795,7 +807,9 @@ class RealtimeConnection:
         if self.item.pending_sentence_punctuation:
             punctuation = self.item.pending_sentence_punctuation
             self.item.pending_sentence_punctuation = ""
-            if should_emit_pending_sentence_punctuation(delta):
+            # A lowercase (or same-script CJK) continuation means the deferred
+            # punctuation was a false sentence end at a slice boundary; drop it.
+            if should_emit_pending_sentence_punctuation(punctuation, delta):
                 await self._emit_transcription_delta_text(punctuation)
         if defer_trailing_sentence_punctuation:
             delta, punctuation = split_trailing_sentence_punctuation(delta)

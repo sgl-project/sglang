@@ -14,7 +14,7 @@ from sglang.srt.entrypoints.openai.realtime.session import (
 )
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
-    dedupe_overlap,
+    _dedupe_by_word,
     process_asr_chunk,
 )
 from sglang.srt.utils import get_or_create_event_loop
@@ -142,23 +142,43 @@ class TestProcessAsrChunk(CustomTestCase):
         self._chunk(state, "你好世界好")
         self.assertEqual(state.emitted_text, "你好世界")
 
-    def test_dedupe_overlap_only_trims_verbatim_prefix(self):
+        # A sliced window's CJK text is final on arrival: char holdback would
+        # silently drop its tail once the next window replaces the state.
+        state = self._state(emitted_text="latin prefix")
+        _, out = self._chunk(
+            state, "你好世界", prompt="PROMPT:", dedupe_against="latin prefix"
+        )
+        self.assertEqual(out, "你好世界")
+
+        # A clause-ending "。" at a sliced boundary must not block the exact
+        # re-emitted-prefix trim when the next window extends the clause.
+        state = self._state(emitted_text="甚至出现交易几乎停。")
+        _, out = self._chunk(
+            state,
+            "甚至出现交易几乎停滞的情况。",
+            prompt="PROMPT:",
+            dedupe_against="甚至出现交易几乎停。",
+            is_last=True,
+        )
+        self.assertEqual(out, "滞的情况。")
+
+    def test_dedupe_by_word_only_trims_verbatim_prefix(self):
         self.assertEqual(
-            dedupe_overlap(
+            _dedupe_by_word(
                 "he hoped there would be stew for dinner turnips",
                 "turnips and carrots and bruised",
             ),
-            "and carrots and bruised",
+            ("and carrots and bruised", True),
         )
         self.assertEqual(
-            dedupe_overlap(
+            _dedupe_by_word(
                 "one two three four five six", "x y three four five six seven"
             ),
-            "x y three four five six seven",
+            ("x y three four five six seven", False),
         )
         self.assertEqual(
-            dedupe_overlap("alpha beta", "fresh dinner—turnips text"),
-            "fresh dinner—turnips text",
+            _dedupe_by_word("alpha beta", "fresh dinner—turnips text"),
+            ("fresh dinner—turnips text", False),
         )
 
 
@@ -256,11 +276,10 @@ class TestRealtimePCMCompaction(CustomTestCase):
         conn.config.sampling_params = {}
         return conn
 
-    def _prime_sliced_state(self, conn):
-        conn.audio.append_pcm(bytes(range(12)))
-        conn.audio.last_scheduled_offset_bytes = 8
-        conn.audio.last_inferred_offset_bytes = 8
-        conn.audio.last_sliced_buffer_end_bytes = 8
+    def _prime_sliced_state(self, conn, pcm=bytes(range(12)), offset=8):
+        conn.audio.append_pcm(pcm)
+        conn.audio.last_scheduled_offset_bytes = offset
+        conn.audio.last_inferred_offset_bytes = offset
         conn.audio.state.chunk_index = 2
         conn.audio.state.emitted_text = "alpha"
 
@@ -307,12 +326,7 @@ class TestRealtimePCMCompaction(CustomTestCase):
     def test_skipped_window_cursor_semantics_and_final_commit(self):
         tokenizer_manager = _MockTokenizerManager("unused")
         conn = self._conn(tokenizer_manager)
-        conn.audio.append_pcm(np.zeros(8, dtype=np.int16).tobytes())
-        conn.audio.last_scheduled_offset_bytes = 8
-        conn.audio.last_inferred_offset_bytes = 8
-        conn.audio.last_sliced_buffer_end_bytes = 8
-        conn.audio.state.chunk_index = 2
-        conn.audio.state.emitted_text = "alpha"
+        self._prime_sliced_state(conn, np.zeros(8, dtype=np.int16).tobytes())
 
         ok = _run(conn._run_inference(is_last=False))
 
@@ -320,18 +334,12 @@ class TestRealtimePCMCompaction(CustomTestCase):
         self.assertEqual(len(tokenizer_manager.requests), 0)
         self.assertEqual(conn.audio.last_scheduled_offset_bytes, 16)
         self.assertEqual(conn.audio.last_inferred_offset_bytes, 8)
-        self.assertEqual(conn.audio.last_sliced_buffer_end_bytes, 8)
 
         tokenizer_manager = _MockTokenizerManager(["alpha beta gamma"])
         conn = self._conn(tokenizer_manager)
         voiced = np.full(6, 12000, dtype=np.int16).tobytes()
         silent = np.zeros(4, dtype=np.int16).tobytes()
-        conn.audio.append_pcm(voiced + silent)
-        conn.audio.last_scheduled_offset_bytes = 12
-        conn.audio.last_inferred_offset_bytes = 12
-        conn.audio.last_sliced_buffer_end_bytes = 16
-        conn.audio.state.chunk_index = 2
-        conn.audio.state.emitted_text = "alpha"
+        self._prime_sliced_state(conn, voiced + silent, offset=16)
 
         ok = _run(conn._run_inference(is_last=True))
 
@@ -345,12 +353,7 @@ class TestRealtimePCMCompaction(CustomTestCase):
         conn = self._conn(tokenizer_manager)
         samples = np.zeros(6, dtype=np.int16)
         samples[3] = 12000
-        conn.audio.append_pcm(samples.tobytes())
-        conn.audio.last_scheduled_offset_bytes = 8
-        conn.audio.last_inferred_offset_bytes = 8
-        conn.audio.last_sliced_buffer_end_bytes = 8
-        conn.audio.state.chunk_index = 2
-        conn.audio.state.emitted_text = "alpha"
+        self._prime_sliced_state(conn, samples.tobytes())
 
         ok = _run(conn._run_inference(is_last=False))
 
@@ -359,7 +362,6 @@ class TestRealtimePCMCompaction(CustomTestCase):
         self.assertEqual(conn.item.emitted_deltas, [])
         self.assertEqual(conn.audio.last_scheduled_offset_bytes, 12)
         self.assertEqual(conn.audio.last_inferred_offset_bytes, 8)
-        self.assertEqual(conn.audio.last_sliced_buffer_end_bytes, 8)
         self.assertEqual(conn.audio.pcm_buffer_base_offset_bytes, 0)
         self.assertEqual(len(conn.audio.pcm_buffer), 12)
         self.assertEqual(conn.audio.state.chunk_index, 2)
@@ -368,12 +370,7 @@ class TestRealtimePCMCompaction(CustomTestCase):
         conn = self._conn(tokenizer_manager)
         samples = np.zeros(6, dtype=np.int16)
         samples[3] = 12000
-        conn.audio.append_pcm(samples.tobytes())
-        conn.audio.last_scheduled_offset_bytes = 8
-        conn.audio.last_inferred_offset_bytes = 8
-        conn.audio.last_sliced_buffer_end_bytes = 8
-        conn.audio.state.chunk_index = 2
-        conn.audio.state.emitted_text = "alpha"
+        self._prime_sliced_state(conn, samples.tobytes())
 
         ok = _run(conn._run_inference(is_last=True))
 
@@ -392,15 +389,62 @@ class TestRealtimePCMCompaction(CustomTestCase):
 
         self.assertFalse(ok)
         self.assertEqual(bytes(conn.audio.pcm_buffer), bytes(range(12)))
-        self.assertEqual(conn.audio.last_sliced_buffer_end_bytes, 8)
+        self.assertEqual(conn.audio.last_inferred_offset_bytes, 8)
+        # Append-time failure closes the socket with 1011 (internal error).
+        self.assertEqual(conn.websocket.closed_code, 1011)
 
         conn._reset_inference_state()
 
         self.assertEqual(conn.audio.pcm_buffer, bytearray())
         self.assertEqual(conn.audio.total_pcm_bytes_received, 0)
-        self.assertEqual(conn.audio.last_sliced_buffer_end_bytes, 0)
         self.assertEqual(conn.audio.last_scheduled_offset_bytes, 0)
         self.assertEqual(conn.audio.last_inferred_offset_bytes, 0)
+
+    def test_deferred_sentence_punctuation_flush_and_drop(self):
+        conn = self._conn(_MockTokenizerManager("unused"))
+
+        _run(
+            conn._emit_transcription_delta(
+                "Hello there.", defer_trailing_sentence_punctuation=True
+            )
+        )
+        self.assertEqual("".join(conn.item.emitted_deltas), "Hello there")
+        self.assertEqual(conn.item.pending_sentence_punctuation, ".")
+
+        # Lowercase continuation: the deferred '.' was a false sentence end.
+        _run(
+            conn._emit_transcription_delta(
+                "and more.", defer_trailing_sentence_punctuation=True
+            )
+        )
+        self.assertEqual("".join(conn.item.emitted_deltas), "Hello there and more")
+
+        # Non-lowercase continuation flushes the pending punctuation first.
+        _run(conn._emit_transcription_delta("Next"))
+        self.assertEqual(
+            "".join(conn.item.emitted_deltas), "Hello there and more. Next"
+        )
+
+        # Commit-time flush emits whatever is still pending.
+        conn.item.pending_sentence_punctuation = "?"
+        _run(conn._flush_pending_sentence_punctuation())
+        self.assertEqual(
+            "".join(conn.item.emitted_deltas), "Hello there and more. Next?"
+        )
+
+        # CJK ender is deferred; a same-script CJK continuation drops it so the
+        # boundary re-transcription can extend the clause seamlessly.
+        conn = self._conn(_MockTokenizerManager("unused"))
+        _run(
+            conn._emit_transcription_delta(
+                "甚至出现交易几乎停。", defer_trailing_sentence_punctuation=True
+            )
+        )
+        self.assertEqual(conn.item.pending_sentence_punctuation, "。")
+        _run(conn._emit_transcription_delta("滞的情况。"))
+        self.assertEqual(
+            "".join(conn.item.emitted_deltas), "甚至出现交易几乎停滞的情况。"
+        )
 
 
 if __name__ == "__main__":

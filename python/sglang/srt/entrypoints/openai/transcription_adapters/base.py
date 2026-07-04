@@ -113,7 +113,10 @@ class TranscriptionAdapter(ABC):
         overriding with ``enabled=True`` and model-tuned values.
         ``left_overlap_ms`` is the audio kept across the sliced boundary for
         dedupe context; ``min_audio_sec`` is the floor below which slicing stays
-        off.
+        off. ``left_overlap_ms`` must stay below ``unfixed_chunk_num *
+        chunk_size_sec * 1000`` from ``chunked_streaming_config``; otherwise the
+        session logs a warning and falls back to cumulative inference. Negative
+        values likewise disable slicing with a warning.
         """
         return {"enabled": False, "left_overlap_ms": 0, "min_audio_sec": 0.0}
 

@@ -99,11 +99,15 @@ class StreamingASRState:
         """Drop an already-emitted leading CJK run after char/word path flips."""
         if not delta or not self.emitted_text:
             return delta
-        max_k = min(len(delta), len(self.emitted_text))
+        # Ignore trailing sentence enders when aligning: a sliced boundary can
+        # close a clause ("...停。") that the re-transcription then extends
+        # ("...停滞..."), mirroring the word path's edge-punctuation stripping.
+        emitted = self.emitted_text.rstrip("。！？.!?")
+        max_k = min(len(delta), len(emitted))
         for k in range(max_k, 0, -1):
-            if self.emitted_text[-k:] != delta[:k]:
+            if emitted[-k:] != delta[:k]:
                 continue
-            if all(_is_cjk(c) for c in delta[:k]):
+            if all(is_cjk_char(c) for c in delta[:k]):
                 return delta[k:].lstrip()
         return delta
 
@@ -114,6 +118,8 @@ class StreamingASRState:
 
         delta_words = delta.split()
         emitted_words = self.emitted_text.split()
+        # ~16 words/sec outpaces real speech, so a delta this long that also
+        # prefix-matches emitted text is a prompt echo, not new audio content.
         max_words_for_chunk = max(24, int(self.chunk_size_sec * 16))
         if len(delta_words) <= max_words_for_chunk or not emitted_words:
             return delta
@@ -134,7 +140,7 @@ class StreamingASRState:
 
     def update(self, new_transcript: str, *, cumulative: bool = True) -> str:
         if _is_cjk_no_whitespace(new_transcript):
-            return self._update_chars(new_transcript)
+            return self._update_chars(new_transcript, cumulative=cumulative)
 
         old_confirmed = self.confirmed_text
         words = new_transcript.split()
@@ -161,10 +167,12 @@ class StreamingASRState:
             delta = self._trim_large_cumulative_prompt_echo(delta)
         return self._record_emit(delta)
 
-    def _update_chars(self, new_transcript: str) -> str:
+    def _update_chars(self, new_transcript: str, *, cumulative: bool = True) -> str:
         """Use character rollback when whitespace cannot define stable words."""
         old_confirmed = self.confirmed_text
-        holdback = max(0, self.unfixed_token_num)
+        # Sliced windows are final on arrival (like the word path): no holdback,
+        # and no prefix diff against the unrelated previous window's text.
+        holdback = max(0, self.unfixed_token_num) if cumulative else 0
         if holdback == 0:
             cut = len(new_transcript)
         elif len(new_transcript) > holdback:
@@ -182,7 +190,9 @@ class StreamingASRState:
         self.full_transcript = new_transcript
         self.chunk_index += 1
 
-        common_count = _common_prefix_len(old_confirmed, self.confirmed_text)
+        common_count = (
+            _common_prefix_len(old_confirmed, self.confirmed_text) if cumulative else 0
+        )
         delta = self.confirmed_text[common_count:]
         if common_count == 0:
             delta = self._trim_cjk_emitted_overlap(delta)
@@ -192,7 +202,11 @@ class StreamingASRState:
         if _is_cjk_no_whitespace(self.full_transcript):
             old_confirmed = self.confirmed_text
             self.confirmed_text = self.full_transcript
-            common_count = _common_prefix_len(old_confirmed, self.full_transcript)
+            common_count = (
+                _common_prefix_len(old_confirmed, self.full_transcript)
+                if cumulative
+                else 0
+            )
             delta = self.full_transcript[common_count:]
             if common_count == 0:
                 delta = self._trim_cjk_emitted_overlap(delta)
@@ -246,7 +260,7 @@ _NO_SPACE_BEFORE = frozenset(".,!?;:%)]}，。！？；：、）】》」』")
 _NO_SPACE_AFTER = frozenset("([{（【《「『")
 
 
-def _is_cjk(c: str) -> bool:
+def is_cjk_char(c: str) -> bool:
     """CJK-context character that takes no inter-word space."""
     cp = ord(c)
     if 0xFFA0 <= cp <= 0xFFDC:  # halfwidth Hangul jamo -- Korean is space-delimited
@@ -262,14 +276,14 @@ def _is_cjk(c: str) -> bool:
 
 
 def _is_word_char(c: str) -> bool:
-    return c.isalnum() and not _is_cjk(c)
+    return c.isalnum() and not is_cjk_char(c)
 
 
 def _is_cjk_no_whitespace(text: str) -> bool:
     return (
         bool(text)
         and not any(c.isspace() for c in text)
-        and any(_is_cjk(c) for c in text)
+        and any(is_cjk_char(c) for c in text)
     )
 
 
@@ -289,7 +303,7 @@ def needs_space(prev: str, cur: str) -> bool:
         return False
     if cur[0] in _NO_SPACE_BEFORE or prev[-1] in _NO_SPACE_AFTER:
         return False
-    if _is_cjk(prev[-1]) and _is_cjk(cur[0]):
+    if is_cjk_char(prev[-1]) and is_cjk_char(cur[0]):
         return False
     return True
 
@@ -338,13 +352,6 @@ def _dedupe_by_word(committed_text: str, candidate_out: str) -> "tuple[str, bool
     if cut == 0:
         return candidate_out, False
     return " ".join(candidate_words[cut:]), True
-
-
-def dedupe_overlap(committed_text: str, candidate_out: str) -> str:
-    """Word-level exact-prefix dedupe for sliced ASR overlap."""
-    if not committed_text or not candidate_out:
-        return candidate_out
-    return _dedupe_by_word(committed_text, candidate_out)[0]
 
 
 async def process_asr_chunk(
