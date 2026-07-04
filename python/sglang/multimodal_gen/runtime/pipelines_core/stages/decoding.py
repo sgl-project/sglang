@@ -166,11 +166,16 @@ class DecodingStage(PipelineStage):
         if not server_args.enable_torch_compile or not isinstance(vae, nn.Module):
             return vae.decode
 
+        will_compile = (
+            self._compiled_vae_decode.target_id != id(vae)
+            or self._compiled_vae_decode.compiled_module is None
+        )
         compile_kwargs: dict[str, object] = {"fullgraph": False, "dynamic": None}
         if current_platform.is_npu():
             compile_kwargs["backend"] = get_compiler_backend()
             compile_kwargs["dynamic"] = False
-            logger.info("Compiling VAE decode with torchair backend on NPU")
+            if will_compile:
+                logger.info("Compiling VAE decode with torchair backend on NPU")
         else:
             mode = (
                 os.environ.get("SGLANG_VAE_TORCH_COMPILE_MODE")
@@ -178,7 +183,8 @@ class DecodingStage(PipelineStage):
                 or "default"
             )
             compile_kwargs["mode"] = mode
-            logger.info("Compiling VAE decode with mode: %s", mode)
+            if will_compile:
+                logger.info("Compiling VAE decode with mode: %s", mode)
 
         return self._compiled_vae_decode.get_or_compile(
             vae, vae.decode, compile_kwargs=compile_kwargs
