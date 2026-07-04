@@ -109,6 +109,61 @@ class TestGDNChunkReplayDecode(unittest.TestCase):
                             msg=f"pl={pl} nd={nd} seed={seed} token={p} not bit-identical",
                         )
 
+    def test_batched_decode_bit_identical(self):
+        """B>1 decode: several sequences with different prompt lengths (so their partial-chunk
+        widths and fold phases differ) decoded together through one _gdn_chunk_replay_decode call
+        per step. Each row must reproduce its own full-sequence torch_chunk row bit-for-bit. Guards
+        the batched slot-arena path (the B=1 dumper never exercises cross-slot indexing)."""
+        with set_batch_invariant_mode(True):
+            HV, HK, K, V = 48, 16, 128, 128  # real Qwen3.6 GDN dims
+            A_log = torch.randn(HV, device="cuda")
+            dt_bias = torch.randn(HV, device="cuda")
+            layer = _FakeLayer(HV, HK, K, V, A_log, dt_bias)
+            dim = layer.q_dim + layer.k_dim + layer.v_dim
+            # Distinct prompt lengths -> distinct widths/fold phases across the batch, incl a
+            # PAD slot. nd chosen so at least one sequence crosses a 64-fold during decode.
+            pls = [60, 30, 128, 1]
+            slots = [7, 2, 11, PAD_SLOT_ID]
+            nd = 10
+            torch.manual_seed(1234)
+            seqs = []
+            for pl in pls:
+                mixed = torch.randn(pl + nd, dim, device="cuda", dtype=torch.bfloat16)
+                a = torch.randn(pl + nd, HV, device="cuda", dtype=torch.bfloat16)
+                b = torch.randn(pl + nd, HV, device="cuda", dtype=torch.bfloat16)
+                ref = self._full_ref(mixed, a, b, layer)
+                seqs.append((pl, mixed, a, b, ref))
+
+            be = self._make_backend()
+            cidx = torch.tensor(slots, dtype=torch.long, device="cuda")
+            # Seed all non-pad sequences (packed, one query_start_loc covering the batch).
+            valid = [(pl, m, a, b, r, s) for (pl, m, a, b, r), s in zip(seqs, slots) if s != PAD_SLOT_ID]
+            qsl = [0]
+            for pl, *_ in valid:
+                qsl.append(qsl[-1] + pl)
+            mixed_cat = torch.cat([m[:pl] for pl, m, *_ in valid], dim=0)
+            a_cat = torch.cat([a[:pl] for pl, m, a, *_ in valid], dim=0)
+            b_cat = torch.cat([b[:pl] for pl, m, a, b, *_ in valid], dim=0)
+            be._seed_gdn_replay_cache(
+                layer, mixed_cat, a_cat, b_cat,
+                torch.tensor(qsl, dtype=torch.int32, device="cuda"),
+                torch.tensor([s for *_, s in valid], dtype=torch.long, device="cuda"),
+                None,
+            )
+            for t in range(nd):
+                mixed_row = torch.stack([seqs[j][1][pls[j] + t] for j in range(len(pls))], dim=0)
+                a_row = torch.stack([seqs[j][2][pls[j] + t] for j in range(len(pls))], dim=0)
+                b_row = torch.stack([seqs[j][3][pls[j] + t] for j in range(len(pls))], dim=0)
+                out = be._gdn_chunk_replay_decode(layer, mixed_row, a_row, b_row, cidx)
+                for j in range(len(pls)):
+                    if slots[j] == PAD_SLOT_ID:
+                        self.assertTrue(bool((out[0, j] == 0).all()))
+                        continue
+                    self.assertTrue(
+                        torch.equal(out[0, j].to(torch.bfloat16), seqs[j][4][pls[j] + t]),
+                        msg=f"batched decode slot={slots[j]} pl={pls[j]} t={t} not bit-identical",
+                    )
+
     def test_incremental_replay_matches_torch_chunk_seeded(self):
         """Incremental per-token replay vs torch_chunk over a single partial chunk seeded by a
         nonzero boundary state S (the misaligned-prompt path decode continues from). Advances the
