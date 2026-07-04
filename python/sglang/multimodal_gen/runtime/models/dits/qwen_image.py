@@ -23,9 +23,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.distributed.sp_shard import (
+    join_seqs,
     plan_shard,
-    plan_text_strategy,
     shard_like,
+    should_shard_text,
+    split_seqs,
     tail_attn_meta,
 )
 from sglang.multimodal_gen.runtime.layers.attention import (
@@ -747,24 +749,11 @@ class QwenImageCrossAttention(nn.Module):
                 txt_query, txt_key, txt_cache, is_neox=False
             )
 
-        # Concatenate for joint attention. Order: [text, image]; on the last SP
-        # rank the text tail-pad rows are relocated behind the image so the
-        # gathered joint sequence keeps all padding in one global-tail block.
-        txt_real = seq_len_txt - sp_txt_pad
-        if sp_txt_pad > 0:
-            joint_query = torch.cat(
-                [txt_query[:, :txt_real], img_query, txt_query[:, txt_real:]], dim=1
-            )
-            joint_key = torch.cat(
-                [txt_key[:, :txt_real], img_key, txt_key[:, txt_real:]], dim=1
-            )
-            joint_value = torch.cat(
-                [txt_value[:, :txt_real], img_value, txt_value[:, txt_real:]], dim=1
-            )
-        else:
-            joint_query = torch.cat([txt_query, img_query], dim=1)
-            joint_key = torch.cat([txt_key, img_key], dim=1)
-            joint_value = torch.cat([txt_value, img_value], dim=1)
+        # Joint order [text, image]; join_seqs relocates any SP text tail-pad
+        # behind the image (see sp_shard.join_seqs for why).
+        joint_query = join_seqs(txt_query, img_query, sp_txt_pad)
+        joint_key = join_seqs(txt_key, img_key, sp_txt_pad)
+        joint_value = join_seqs(txt_value, img_value, sp_txt_pad)
         if attn_mask is None and encoder_hidden_states_mask is not None:
             image_mask = torch.ones(
                 (hidden_states.shape[0], img_query.shape[1]),
@@ -790,21 +779,10 @@ class QwenImageCrossAttention(nn.Module):
         joint_hidden_states = joint_hidden_states.flatten(2, 3)
         joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
 
-        # Split attention outputs back (pad rows rejoin the text tail so the
-        # residual text stream keeps its per-rank shape).
-        if sp_txt_pad > 0:
-            img_end = joint_hidden_states.shape[1] - sp_txt_pad
-            img_attn_output = joint_hidden_states[:, txt_real:img_end, :]
-            txt_attn_output = torch.cat(
-                [
-                    joint_hidden_states[:, :txt_real, :],
-                    joint_hidden_states[:, img_end:, :],
-                ],
-                dim=1,
-            )
-        else:
-            txt_attn_output = joint_hidden_states[:, :seq_len_txt, :]  # Text part
-            img_attn_output = joint_hidden_states[:, seq_len_txt:, :]  # Image part
+        # Split attention outputs back
+        txt_attn_output, img_attn_output = split_seqs(
+            joint_hidden_states, seq_len_txt, sp_txt_pad
+        )
 
         # Apply output projections
         img_attn_output, _ = self.to_out[0](img_attn_output)
@@ -1440,7 +1418,6 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         block_attention_kwargs = attention_kwargs.copy() if attention_kwargs else {}
         sp_text_sharded = False
-        sp_size = get_sp_world_size()
         if encoder_hidden_states_mask is not None:
             encoder_hidden_states_mask = encoder_hidden_states_mask.to(
                 device=hidden_states.device, dtype=torch.bool
@@ -1458,10 +1435,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             block_attention_kwargs["attn_mask_meta"] = build_varlen_mask_meta(
                 joint_mask
             )
-        elif (
-            sp_size > 1
-            and plan_text_strategy(encoder_hidden_states.shape[1]) == "shard"
-        ):
+        elif should_shard_text(encoder_hidden_states.shape[1]):
             # Shard the replicated text stream across SP ranks; non-divisible
             # lengths tail-pad the last rank and attention skips the pad via the
             # per-request tail meta. Otherwise fall through to replicated text.

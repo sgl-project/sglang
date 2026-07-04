@@ -30,13 +30,15 @@ from torch.nn import LayerNorm as LayerNorm
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
-    get_sp_world_size,
     get_tp_world_size,
 )
 from sglang.multimodal_gen.runtime.distributed.sp_shard import (
+    join_seqs,
     plan_shard,
-    plan_text_strategy,
     shard_like,
+    shard_seq_prefix,
+    should_shard_text,
+    split_seqs,
     tail_attn_meta,
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
@@ -512,24 +514,12 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 allow_inplace=True,
             )
 
-            # On the last SP rank relocate the text tail-pad rows behind the
-            # image so the gathered joint sequence pads at its global tail.
+            # join_seqs relocates any SP text tail-pad behind the image (see
+            # sp_shard.join_seqs for why).
             sp_txt_pad = (attn_mask_meta or {}).get("local_pad", 0)
-            if sp_txt_pad > 0:
-                t_real = text_seq_len - sp_txt_pad
-                query = torch.cat(
-                    [encoder_query[:, :t_real], query, encoder_query[:, t_real:]], dim=1
-                )
-                key = torch.cat(
-                    [encoder_key[:, :t_real], key, encoder_key[:, t_real:]], dim=1
-                )
-                value = torch.cat(
-                    [encoder_value[:, :t_real], value, encoder_value[:, t_real:]], dim=1
-                )
-            else:
-                query = torch.cat([encoder_query, query], dim=1)
-                key = torch.cat([encoder_key, key], dim=1)
-                value = torch.cat([encoder_value, value], dim=1)
+            query = join_seqs(encoder_query, query, sp_txt_pad)
+            key = join_seqs(encoder_key, key, sp_txt_pad)
+            value = join_seqs(encoder_value, value, sp_txt_pad)
         else:
             query, key = apply_qk_norm_with_optional_rope(
                 q=query,
@@ -554,23 +544,9 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         x = x.to(query.dtype)
 
         if encoder_hidden_states is not None:
-            if sp_txt_pad > 0:
-                # Pad rows rejoin the text tail so the residual stream keeps its
-                # per-rank shape.
-                t_real = encoder_hidden_states.shape[1] - sp_txt_pad
-                img_end = x.shape[1] - sp_txt_pad
-                encoder_hidden_states = torch.cat(
-                    [x[:, :t_real], x[:, img_end:]], dim=1
-                )
-                x = x[:, t_real:img_end]
-            else:
-                encoder_hidden_states, x = x.split_with_sizes(
-                    [
-                        encoder_hidden_states.shape[1],
-                        x.shape[1] - encoder_hidden_states.shape[1],
-                    ],
-                    dim=1,
-                )
+            encoder_hidden_states, x = split_seqs(
+                x, encoder_hidden_states.shape[1], sp_txt_pad
+            )
             if not self.pre_only:
                 x, _ = self.to_out[0](x)
                 if len(self.to_out) == 2:
@@ -713,24 +689,12 @@ class FluxSingleTransformerBlock(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         text_seq_len = encoder_hidden_states.shape[1]
         joint_attention_kwargs = joint_attention_kwargs or {}
-        # Same relocation as the double blocks: text tail-pad rows go behind the
-        # image so the gathered sequence pads at its global tail (the caller
-        # hands single blocks a RoPE cache reordered to match).
+        # join_seqs relocates any SP text tail-pad behind the image; the caller
+        # hands single blocks a RoPE cache reordered the same way.
         sp_txt_pad = (joint_attention_kwargs.get("attn_mask_meta") or {}).get(
             "local_pad", 0
         )
-        if sp_txt_pad > 0:
-            t_real = text_seq_len - sp_txt_pad
-            hidden_states = torch.cat(
-                [
-                    encoder_hidden_states[:, :t_real],
-                    hidden_states,
-                    encoder_hidden_states[:, t_real:],
-                ],
-                dim=1,
-            )
-        else:
-            hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        hidden_states = join_seqs(encoder_hidden_states, hidden_states, sp_txt_pad)
 
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
@@ -778,18 +742,9 @@ class FluxSingleTransformerBlock(nn.Module):
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
 
-        if sp_txt_pad > 0:
-            t_real = text_seq_len - sp_txt_pad
-            img_end = hidden_states.shape[1] - sp_txt_pad
-            encoder_hidden_states = torch.cat(
-                [hidden_states[:, :t_real], hidden_states[:, img_end:]], dim=1
-            )
-            hidden_states = hidden_states[:, t_real:img_end]
-        else:
-            encoder_hidden_states, hidden_states = (
-                hidden_states[:, :text_seq_len],
-                hidden_states[:, text_seq_len:],
-            )
+        encoder_hidden_states, hidden_states = split_seqs(
+            hidden_states, text_seq_len, sp_txt_pad
+        )
         return encoder_hidden_states, hidden_states
 
 
@@ -1153,23 +1108,13 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # per-request tail meta lets attention skip the pad for free.
         num_replicated_prefix = num_txt_tokens
         singles_freqs_cis = freqs_cis
-        if get_sp_world_size() > 1 and plan_text_strategy(num_txt_tokens) == "shard":
+        if should_shard_text(num_txt_tokens):
             txt_shard = plan_shard(num_txt_tokens)
             encoder_hidden_states = shard_like(encoder_hidden_states, txt_shard)
             if freqs_cis is not None:
                 cos, sin = freqs_cis
-                cos = torch.cat(
-                    [
-                        shard_like(cos[:num_txt_tokens], txt_shard, dim=0),
-                        cos[num_txt_tokens:],
-                    ]
-                )
-                sin = torch.cat(
-                    [
-                        shard_like(sin[:num_txt_tokens], txt_shard, dim=0),
-                        sin[num_txt_tokens:],
-                    ]
-                )
+                cos = shard_seq_prefix(cos, num_txt_tokens, txt_shard)
+                sin = shard_seq_prefix(sin, num_txt_tokens, txt_shard)
                 freqs_cis = (cos, sin)
                 singles_freqs_cis = freqs_cis
             num_replicated_prefix = 0
@@ -1187,11 +1132,11 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 # Single blocks apply RoPE on the relocated [txt_real, img, pad]
                 # layout, so hand them a cache reordered the same way.
                 if freqs_cis is not None:
-                    t_real = txt_shard.local_real_len
                     t_loc = txt_shard.local_len
+                    pad = txt_shard.local_pad
                     singles_freqs_cis = (
-                        torch.cat([cos[:t_real], cos[t_loc:], cos[t_real:t_loc]]),
-                        torch.cat([sin[:t_real], sin[t_loc:], sin[t_real:t_loc]]),
+                        join_seqs(cos[:t_loc], cos[t_loc:], pad, dim=0),
+                        join_seqs(sin[:t_loc], sin[t_loc:], pad, dim=0),
                     )
 
         if (

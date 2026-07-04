@@ -23,13 +23,15 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
-    get_sp_world_size,
     get_tp_world_size,
 )
 from sglang.multimodal_gen.runtime.distributed.sp_shard import (
+    join_seqs,
     plan_shard,
-    plan_text_strategy,
     shard_like,
+    shard_seq_prefix,
+    should_shard_text,
+    split_seqs,
     tail_attn_meta,
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
@@ -361,24 +363,12 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 allow_inplace=True,
             )
 
-            # On the last SP rank relocate the text tail-pad rows behind the
-            # image so the gathered joint sequence pads at its global tail.
+            # join_seqs relocates any SP text tail-pad behind the image (see
+            # sp_shard.join_seqs for why).
             sp_txt_pad = (attn_mask_meta or {}).get("local_pad", 0)
-            if sp_txt_pad > 0:
-                t_real = text_seq_len - sp_txt_pad
-                query = torch.cat(
-                    [encoder_query[:, :t_real], query, encoder_query[:, t_real:]], dim=1
-                )
-                key = torch.cat(
-                    [encoder_key[:, :t_real], key, encoder_key[:, t_real:]], dim=1
-                )
-                value = torch.cat(
-                    [encoder_value[:, :t_real], value, encoder_value[:, t_real:]], dim=1
-                )
-            else:
-                query = torch.cat([encoder_query, query], dim=1)
-                key = torch.cat([encoder_key, key], dim=1)
-                value = torch.cat([encoder_value, value], dim=1)
+            query = join_seqs(encoder_query, query, sp_txt_pad)
+            key = join_seqs(encoder_key, key, sp_txt_pad)
+            value = join_seqs(encoder_value, value, sp_txt_pad)
         else:
             query, key = apply_qk_norm_with_optional_rope(
                 q=query,
@@ -404,23 +394,9 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         hidden_states = hidden_states.to(query.dtype)
 
         if encoder_hidden_states is not None:
-            if sp_txt_pad > 0:
-                # Pad rows rejoin the text tail so the residual stream keeps its
-                # per-rank shape.
-                t_real = encoder_hidden_states.shape[1] - sp_txt_pad
-                img_end = hidden_states.shape[1] - sp_txt_pad
-                encoder_hidden_states = torch.cat(
-                    [hidden_states[:, :t_real], hidden_states[:, img_end:]], dim=1
-                )
-                hidden_states = hidden_states[:, t_real:img_end]
-            else:
-                encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
-                    [
-                        encoder_hidden_states.shape[1],
-                        hidden_states.shape[1] - encoder_hidden_states.shape[1],
-                    ],
-                    dim=1,
-                )
+            encoder_hidden_states, hidden_states = split_seqs(
+                hidden_states, encoder_hidden_states.shape[1], sp_txt_pad
+            )
             encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states)
 
         hidden_states, _ = self.to_out[0](hidden_states)
@@ -1123,23 +1099,13 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         num_replicated_prefix = num_txt_tokens
         sp_txt_pad = 0
         singles_freqs_cis = freqs_cis
-        if get_sp_world_size() > 1 and plan_text_strategy(num_txt_tokens) == "shard":
+        if should_shard_text(num_txt_tokens):
             txt_shard = plan_shard(num_txt_tokens)
             encoder_hidden_states = shard_like(encoder_hidden_states, txt_shard)
             if freqs_cis is not None:
                 cos, sin = freqs_cis
-                cos = torch.cat(
-                    [
-                        shard_like(cos[:num_txt_tokens], txt_shard, dim=0),
-                        cos[num_txt_tokens:],
-                    ]
-                )
-                sin = torch.cat(
-                    [
-                        shard_like(sin[:num_txt_tokens], txt_shard, dim=0),
-                        sin[num_txt_tokens:],
-                    ]
-                )
+                cos = shard_seq_prefix(cos, num_txt_tokens, txt_shard)
+                sin = shard_seq_prefix(sin, num_txt_tokens, txt_shard)
                 freqs_cis = (cos, sin)
                 singles_freqs_cis = freqs_cis
             num_replicated_prefix = 0
@@ -1159,11 +1125,10 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 # The single-stream trunk applies RoPE on the relocated
                 # [txt_real, img, pad] layout; reorder its cache to match.
                 if freqs_cis is not None:
-                    t_real = txt_shard.local_real_len
                     t_loc = txt_shard.local_len
                     singles_freqs_cis = (
-                        torch.cat([cos[:t_real], cos[t_loc:], cos[t_real:t_loc]]),
-                        torch.cat([sin[:t_real], sin[t_loc:], sin[t_real:t_loc]]),
+                        join_seqs(cos[:t_loc], cos[t_loc:], sp_txt_pad, dim=0),
+                        join_seqs(sin[:t_loc], sin[t_loc:], sp_txt_pad, dim=0),
                     )
 
         # 4. Double Stream Transformer Blocks
@@ -1177,21 +1142,11 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 joint_attention_kwargs=joint_attention_kwargs,
                 num_replicated_prefix=num_replicated_prefix,
             )
-        # Concatenate text and image streams for single-block inference; text
-        # tail-pad rows are relocated behind the image once for the whole trunk
-        # so the gathered sequence pads at its global tail.
+        # Concatenate text and image streams for single-block inference;
+        # join_seqs relocates any SP text tail-pad behind the image once for
+        # the whole trunk (see sp_shard.join_seqs for why).
         txt_real = num_txt_tokens - sp_txt_pad
-        if sp_txt_pad > 0:
-            hidden_states = torch.cat(
-                [
-                    encoder_hidden_states[:, :txt_real],
-                    hidden_states,
-                    encoder_hidden_states[:, txt_real:],
-                ],
-                dim=1,
-            )
-        else:
-            hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        hidden_states = join_seqs(encoder_hidden_states, hidden_states, sp_txt_pad)
 
         # 5. Single Stream Transformer Blocks
         for index_block, block in enumerate(self.single_transformer_blocks):
