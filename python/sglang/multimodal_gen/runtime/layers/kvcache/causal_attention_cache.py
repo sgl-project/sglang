@@ -96,6 +96,13 @@ class CausalSelfAttentionKVCache:
         if self.attention_window_size == old_cache_size:
             self.attention_window_size = new_cache_size
 
+    def can_direct_current_attention(self, num_new_tokens: int) -> bool:
+        return (
+            self.sink_tokens == 0
+            and self.cache_size == num_new_tokens
+            and self.attention_window_size == num_new_tokens
+        )
+
     def update_and_get_attention_kv(
         self,
         *,

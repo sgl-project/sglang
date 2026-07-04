@@ -64,13 +64,13 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
 )
-from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
     eagle_sample,
+    get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
     per_step_draft_out_cache_loc,
 )
@@ -88,6 +88,7 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
+from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -102,6 +103,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_xpu,
     log_info_on_rank0,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
@@ -110,6 +112,7 @@ _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
@@ -188,14 +191,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
-        self.eagle_use_aux_hidden_state = False
-        if self.speculative_algorithm.is_eagle3():
-            eagle_config = getattr(
-                self.draft_runner.model_config.hf_config, "eagle_config", {}
-            )
-            self.eagle_use_aux_hidden_state = eagle_config.get(
-                "use_aux_hidden_state", True
-            )
         # Reuse the first draft step's NSA/DSA indexer topk across the rest;
         # topk == 1 only (select_top_k_tokens reorders rows, desyncing indices).
         self.index_share_for_mtp_iteration = (
@@ -247,16 +242,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
 
     def init_attention_backends(self):
-        with self.draft_tp_context(
-            self.draft_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with (
+            self.draft_tp_context(self.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             self.draft_worker.init_attention_backends()
             self.init_attention_backend()
 
     def init_cuda_graphs(self):
-        with self.draft_tp_context(
-            self.draft_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with (
+            self.draft_tp_context(self.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
             if check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
                 self.draft_runner.init_prefill_cuda_graph(force_for_draft_worker=True)
@@ -380,6 +379,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             return
 
         Device2DraftCudaGraphRunner = {
+            "xpu": EAGLEDraftCudaGraphRunner,
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
@@ -409,6 +409,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
         Device2ExtendCudaGraphRunner = {
+            "xpu": EAGLEDraftExtendCudaGraphRunner,
             "npu": EAGLEDraftExtendNpuGraphRunner,
             "cuda": EAGLEDraftExtendCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
@@ -424,15 +425,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_attn_backend, AiterMultiStepDraftBackend
             )
 
+        graph_supported_backend_types = [
+            TritonAttnBackend,
+            TRTLLMMLABackend,
+            TRTLLMHAAttnBackend,
+            TokenspeedMLABackend,
+            FlashInferAttnBackend,
+        ]
+        if _is_cuda or _is_musa:
+            # DSA is CUDA-only; import lazily so non-CUDA builds don't pull in
+            # deep_gemm and the rest of the sparse-attention stack at import time.
+            from sglang.srt.layers.attention.dsa_backend import (
+                DeepseekSparseAttnBackend,
+            )
+
+            graph_supported_backend_types.append(DeepseekSparseAttnBackend)
+
         graph_supported_backend = isinstance(
             self.draft_extend_attn_backend,
-            (
-                TritonAttnBackend,
-                TRTLLMMLABackend,
-                TRTLLMHAAttnBackend,
-                TokenspeedMLABackend,
-                FlashInferAttnBackend,
-            ),
+            tuple(graph_supported_backend_types),
         )
         supports_cuda_draft_extend_graph = (
             _is_cuda or _is_musa
@@ -441,6 +452,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # TODO: support draft extend cuda graph for more attention backends
         if self.draft_extend_attn_backend and (
             _is_npu
+            or _is_xpu
             or supports_cuda_draft_extend_graph
             or supports_hip_aiter_draft_extend_graph
         ):
@@ -605,7 +617,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         scores = None
         if self.index_share_for_mtp_iteration:
             forward_batch.reuse_mtp_topk_indices = True
-            forward_batch.topk_indices = None
+            spec_info.mtp_topk_indices = None
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -681,7 +693,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             forward_batch.positions.add_(1)
 
         if self.index_share_for_mtp_iteration:
-            forward_batch.topk_indices = None
+            spec_info.mtp_topk_indices = None
             forward_batch.reuse_mtp_topk_indices = False
 
         # Organize the results
@@ -821,8 +833,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
         select_index = (
-            torch.arange(len(batch.seq_lens), device=self.device)
-            * self.speculative_num_draft_tokens
+            torch.arange(
+                0,
+                len(batch.seq_lens) * self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens,
+                device=self.device,
+            )
             + batch_result.accept_lens
             - 1
         )
@@ -1112,10 +1128,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     if self.speculative_algorithm.is_standalone()
                     else CaptureHiddenMode.LAST
                 )
+                hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+                    self.draft_worker.draft_runner
+                )
                 batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
-                    hidden_size=EagleDraftInput.hidden_size_for(self.draft_worker),
-                    dtype=EagleDraftInput.dtype_for(self.draft_worker),
+                    hidden_size=hidden_size,
+                    dtype=hidden_dtype,
                     topk=self.topk,
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
@@ -1235,11 +1254,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         next_draft_input.topk_index = torch.zeros(
             (bs, self.topk), dtype=torch.int64, device=device
         )
-        hidden_size = EagleDraftInput.hidden_size_for(self.draft_worker)
+        hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+            self.draft_worker.draft_runner
+        )
         if hidden_size is not None:
             next_draft_input.hidden_states = torch.zeros(
                 (bs, hidden_size),
-                dtype=EagleDraftInput.dtype_for(self.draft_worker),
+                dtype=hidden_dtype,
                 device=device,
             )
 
@@ -1528,6 +1549,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_index,
         ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
+        clear_unaccepted_c128 = getattr(
+            self.token_to_kv_pool_allocator.get_kvcache(),
+            "clear_unaccepted_c128_draft_states",
+            None,
+        )
+        if clear_unaccepted_c128 is not None and not batch.forward_mode.is_idle():
+            clear_unaccepted_c128(
+                batch.req_pool_indices,
+                batch.seq_lens,
+                accept_lens,
+                self.speculative_num_draft_tokens,
+            )
 
         # Update mamba state for hybrid GDN models after verification
         commit_mamba_states_after_verify(
