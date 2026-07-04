@@ -678,9 +678,15 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
-    if batch.spec_algorithm.is_dflash() or batch.spec_algorithm.is_dspark():
+    if batch.spec_algorithm.is_dflash():
         batch.spec_info.prepare_for_decode(batch)
     else:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
 
+        if batch.spec_algorithm.is_dspark():
+            verify_done = getattr(batch.spec_info, "verify_done", None)
+            if verify_done is not None:
+                torch.get_device_module(batch.device).current_stream().wait_event(
+                    verify_done
+                )
         eagle_prepare_for_decode(batch)
