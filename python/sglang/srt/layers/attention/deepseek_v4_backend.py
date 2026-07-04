@@ -692,6 +692,10 @@ class DeepseekV4AttnBackend(
         use_prefill_cuda_graph: bool = False,
         online_c128_state_slot_offset: int = 0,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
+        is_dspark_draft_worker = (
+            self.model_runner.spec_algorithm.is_dspark()
+            and self.model_runner.is_draft_worker
+        )
         if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
             assert out_cache_loc is not None
             seq_lens_cpu_list = (
@@ -711,13 +715,17 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=out_cache_loc,
                 extend_seq_lens=extend_seq_lens,
                 seq_lens_cpu=seq_lens_cpu_list,
-                c128_compress_metadata=self._make_target_verify_c128_metadata(
-                    req_pool_indices,
-                    seq_lens,
-                    seq_lens_cpu_list,
-                    extend_seq_lens,
-                    use_prefill_cuda_graph,
-                    online_c128_state_slot_offset,
+                c128_compress_metadata=(
+                    None
+                    if is_dspark_draft_worker
+                    else self._make_target_verify_c128_metadata(
+                        req_pool_indices,
+                        seq_lens,
+                        seq_lens_cpu_list,
+                        extend_seq_lens,
+                        use_prefill_cuda_graph,
+                        online_c128_state_slot_offset,
+                    )
                 ),
             )
         else:
@@ -742,6 +750,10 @@ class DeepseekV4AttnBackend(
         use_prefill_cuda_graph: bool = False,
         online_c128_state_slot_offset: int = 0,
     ) -> DSV4Metadata:
+        is_dspark_draft_worker = (
+            self.model_runner.spec_algorithm.is_dspark()
+            and self.model_runner.is_draft_worker
+        )
         batch_size = len(seq_lens)
         seq_lens = seq_lens + self.speculative_num_draft_tokens
         seq_lens_cpu = [x + self.speculative_num_draft_tokens for x in seq_lens_cpu]
@@ -760,7 +772,7 @@ class DeepseekV4AttnBackend(
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_start_loc=None,
-            need_compress=True,
+            need_compress=not is_dspark_draft_worker,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             online_c128_state_slot_offset=online_c128_state_slot_offset,
         )
@@ -784,15 +796,25 @@ class DeepseekV4AttnBackend(
                 bs, num_draft_tokens, seq_lens, req_pool_indices
             )
         )
+        need_compress = not (
+            self.model_runner.spec_algorithm.is_dspark()
+            and self.model_runner.is_draft_worker
+        )
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
             seq_lens_casual=seq_lens_casual,
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
-            need_compress=True,
+            need_compress=need_compress,
         )
-        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
+        indexer_metadata = (
+            self.init_forward_metadata_indexer(core_attn_metadata)
+            if need_compress
+            else None
+        )
+        if not need_compress:
+            return DSV4Metadata(core_attn_metadata, indexer_metadata)
         create = functools.partial(
             create_paged_compressor_data,
             is_prefill=True,
