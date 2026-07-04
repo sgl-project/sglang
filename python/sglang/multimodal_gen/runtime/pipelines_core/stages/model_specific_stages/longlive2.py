@@ -450,9 +450,9 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        if self._use_cfg(batch):
-            return self._forward_one_shot_cfg(batch, server_args)
-        return self._forward_one_shot(batch, server_args)
+        return self._forward_one_shot_common(
+            batch, server_args, use_cfg=self._use_cfg(batch)
+        )
 
     @staticmethod
     def _i2v_clamp_active(batch: Req) -> bool:
@@ -762,7 +762,9 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
             )
         return self.causal_kv_cache_neg, self.crossattn_cache_neg
 
-    def _forward_one_shot(self, batch: Req, server_args: ServerArgs) -> Req:
+    def _forward_one_shot_common(
+        self, batch: Req, server_args: ServerArgs, *, use_cfg: bool
+    ) -> Req:
         ctx = self._prepare_causal_dmd_forward_context(batch, server_args)
         target_dtype = ctx.target_dtype
         autocast_enabled = ctx.autocast_enabled
@@ -775,200 +777,13 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
         prompt_embeds = ctx.prompt_embeds
         t, h, w = ctx.num_frames, ctx.height, ctx.width
 
-        independent_first_frame = self.transformer.independent_first_frame
-        use_shot_sink = self._multi_shot_sink_enabled(batch)
-        kv_cache_kwargs = {"use_shot_sink": True} if use_shot_sink else None
-        self._rope_temporal_offset = 0.0
-
-        if self._cache_needs_reinit_for_batch(self.causal_kv_cache, batch):
-            self._initialize_causal_caches(
-                batch_size=latents.shape[0],
-                max_text_len=self._get_max_text_len(server_args),
-                dtype=target_dtype,
-                device=latents.device,
-                kv_cache_kwargs=kv_cache_kwargs,
+        negative_prompt_embeds = None
+        neg_cond_kwargs = None
+        if use_cfg:
+            neg_cond_kwargs = self._prepare_causal_dmd_neg_cond_kwargs(
+                batch, server_args, target_dtype
             )
-        else:
-            assert self.crossattn_cache is not None
-            self._reset_causal_caches(
-                kv_cache=self.causal_kv_cache,
-                crossattn_cache=self.crossattn_cache,
-            )
-
-        current_start_frame = 0
-        clamp_i2v = self._i2v_clamp_active(batch)
-        self._i2v_image_latent = batch.image_latent if clamp_i2v else None
-        if getattr(batch, "image_latent", None) is not None and not clamp_i2v:
-            image_latent = batch.image_latent
-            assert image_latent is not None
-            input_frames = image_latent.shape[2]
-            warmup_prompt_embeds = self._select_block_prompt_embeds(
-                batch,
-                prompt_embeds,
-                0,
-            )
-            warmup_pos_cond_kwargs = self._select_block_cond_kwargs(
-                batch,
-                pos_cond_kwargs,
-                0,
-            )
-            if independent_first_frame and input_frames >= 1:
-                self._warm_up_causal_context_cache(
-                    batch,
-                    server_args,
-                    context_input=image_latent[:, :, :1, :, :],
-                    prompt_embeds=warmup_prompt_embeds,
-                    kv_cache=self.causal_kv_cache,
-                    crossattn_cache=self.crossattn_cache,
-                    current_start_frame=current_start_frame,
-                    image_kwargs=image_kwargs,
-                    pos_cond_kwargs=warmup_pos_cond_kwargs,
-                    target_dtype=target_dtype,
-                    autocast_enabled=autocast_enabled,
-                )
-                current_start_frame += 1
-                remaining_frames = input_frames - 1
-            else:
-                remaining_frames = input_frames
-
-            while remaining_frames > 0:
-                block = min(self.num_frames_per_block, remaining_frames)
-                context_input = image_latent[
-                    :, :, current_start_frame : current_start_frame + block, :, :
-                ]
-                self._warm_up_causal_context_cache(
-                    batch,
-                    server_args,
-                    context_input=context_input,
-                    prompt_embeds=warmup_prompt_embeds,
-                    kv_cache=self.causal_kv_cache,
-                    crossattn_cache=self.crossattn_cache,
-                    current_start_frame=current_start_frame,
-                    image_kwargs=image_kwargs,
-                    pos_cond_kwargs=warmup_pos_cond_kwargs,
-                    target_dtype=target_dtype,
-                    autocast_enabled=autocast_enabled,
-                )
-                current_start_frame += block
-                remaining_frames -= block
-
-        pos_start_base = current_start_frame
-
-        if not independent_first_frame or (
-            independent_first_frame and batch.image_latent is not None
-        ):
-            if t % self.num_frames_per_block != 0:
-                raise ValueError(
-                    "num_frames must be divisible by num_frames_per_block for causal DMD denoising"
-                )
-            num_blocks = t // self.num_frames_per_block
-            block_sizes = [self.num_frames_per_block] * num_blocks
-            start_index = 0
-        else:
-            if (t - 1) % self.num_frames_per_block != 0:
-                raise ValueError(
-                    "(num_frames - 1) must be divisible by num_frame_per_block when independent_first_frame=True"
-                )
-            num_blocks = (t - 1) // self.num_frames_per_block
-            block_sizes = [1] + [self.num_frames_per_block] * num_blocks
-            start_index = 0
-
-        self._validate_block_prompt_count(batch, block_sizes)
-
-        def prepare_context_input(current_latents: torch.Tensor) -> torch.Tensor:
-            return current_latents
-
-        with self.progress_bar(total=len(block_sizes) * len(timesteps)) as progress_bar:
-            for block_index, current_num_frames in enumerate(block_sizes):
-                self._set_rope_temporal_offset(
-                    batch,
-                    self._shot_index(batch, block_index),
-                )
-                is_scene_cut = self._is_scene_cut(batch, block_index)
-
-                current_latents = latents[
-                    :, :, start_index : start_index + current_num_frames, :, :
-                ]
-                current_prompt_embeds = self._select_block_prompt_embeds(
-                    batch,
-                    prompt_embeds,
-                    block_index,
-                )
-                current_pos_cond_kwargs = self._select_block_cond_kwargs(
-                    batch,
-                    pos_cond_kwargs,
-                    block_index,
-                )
-                self._reset_crossattn_cache_for_block(batch, self.crossattn_cache)
-
-                def prepare_model_input(current_latents: torch.Tensor) -> torch.Tensor:
-                    latent_model_input = current_latents
-                    if (
-                        batch.image_latent is not None
-                        and independent_first_frame
-                        and start_index == 0
-                    ):
-                        latent_model_input = torch.cat(
-                            [latent_model_input, batch.image_latent],
-                            dim=2,
-                        )
-                    return latent_model_input
-
-                current_start_tokens = (
-                    pos_start_base + start_index
-                ) * self.num_token_per_frame
-                current_latents = self._denoise_and_update_causal_block(
-                    batch,
-                    server_args,
-                    chunk_latents=current_latents,
-                    scheduler=scheduler,
-                    timesteps=timesteps,
-                    prompt_embeds=current_prompt_embeds,
-                    kv_cache=self.causal_kv_cache,
-                    crossattn_cache=self.crossattn_cache,
-                    current_start_tokens=current_start_tokens,
-                    start_frame=start_index,
-                    image_kwargs=image_kwargs,
-                    pos_cond_kwargs=current_pos_cond_kwargs,
-                    target_dtype=target_dtype,
-                    autocast_enabled=autocast_enabled,
-                    device=device,
-                    attn_raw_latent_shape=(current_num_frames, h, w),
-                    prepare_model_input=prepare_model_input,
-                    prepare_context_input=prepare_context_input,
-                    progress_bar=progress_bar,
-                )
-
-                if is_scene_cut:
-                    self._pin_current_chunk(self.causal_kv_cache, current_num_frames)
-
-                latents[:, :, start_index : start_index + current_num_frames, :, :] = (
-                    current_latents
-                )
-                start_index += current_num_frames
-
-        self._rope_temporal_offset = 0.0
-        batch.latents = latents
-        return batch
-
-    def _forward_one_shot_cfg(self, batch: Req, server_args: ServerArgs) -> Req:
-        ctx = self._prepare_causal_dmd_forward_context(batch, server_args)
-        target_dtype = ctx.target_dtype
-        autocast_enabled = ctx.autocast_enabled
-        scheduler = ctx.scheduler
-        device = ctx.device
-        timesteps = ctx.timesteps
-        image_kwargs = ctx.image_kwargs
-        pos_cond_kwargs = ctx.pos_cond_kwargs
-        neg_cond_kwargs = self._prepare_causal_dmd_neg_cond_kwargs(
-            batch,
-            server_args,
-            target_dtype,
-        )
-        latents = ctx.latents
-        prompt_embeds = ctx.prompt_embeds
-        negative_prompt_embeds = self._get_negative_prompt_embeds(batch)
-        t, h, w = ctx.num_frames, ctx.height, ctx.width
+            negative_prompt_embeds = self._get_negative_prompt_embeds(batch)
 
         independent_first_frame = self.transformer.independent_first_frame
         max_text_len = self._get_max_text_len(server_args)
@@ -977,7 +792,7 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
         self._rope_temporal_offset = 0.0
 
         if self._cache_needs_reinit_for_batch(self.causal_kv_cache, batch):
-            self.causal_kv_cache, self.crossattn_cache = self._new_causal_cache_pair(
+            self._initialize_causal_caches(
                 batch_size=latents.shape[0],
                 max_text_len=max_text_len,
                 dtype=target_dtype,
@@ -991,14 +806,17 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
                 crossattn_cache=self.crossattn_cache,
             )
 
-        causal_kv_cache_neg, crossattn_cache_neg = self._reset_or_init_negative_caches(
-            batch=batch,
-            batch_size=latents.shape[0],
-            max_text_len=max_text_len,
-            dtype=target_dtype,
-            device=latents.device,
-            kv_cache_kwargs=kv_cache_kwargs,
-        )
+        kv_cache_neg = None
+        crossattn_cache_neg = None
+        if use_cfg:
+            kv_cache_neg, crossattn_cache_neg = self._reset_or_init_negative_caches(
+                batch=batch,
+                batch_size=latents.shape[0],
+                max_text_len=max_text_len,
+                dtype=target_dtype,
+                device=latents.device,
+                kv_cache_kwargs=kv_cache_kwargs,
+            )
 
         current_start_frame = 0
         clamp_i2v = self._i2v_clamp_active(batch)
@@ -1008,52 +826,53 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
             assert image_latent is not None
             input_frames = image_latent.shape[2]
             warmup_prompt_embeds = self._select_block_prompt_embeds(
-                batch,
-                prompt_embeds,
-                0,
-            )
-            warmup_negative_prompt_embeds = self._select_block_prompt_embeds(
-                batch,
-                negative_prompt_embeds,
-                0,
+                batch, prompt_embeds, 0
             )
             warmup_pos_cond_kwargs = self._select_block_cond_kwargs(
-                batch,
-                pos_cond_kwargs,
-                0,
+                batch, pos_cond_kwargs, 0
             )
-            warmup_neg_cond_kwargs = self._select_block_cond_kwargs(
-                batch,
-                neg_cond_kwargs,
-                0,
+            warmup_neg_prompt_embeds = (
+                self._select_block_prompt_embeds(batch, negative_prompt_embeds, 0)
+                if use_cfg
+                else None
             )
-            if independent_first_frame and input_frames >= 1:
+            warmup_neg_cond_kwargs = (
+                self._select_block_cond_kwargs(batch, neg_cond_kwargs, 0)
+                if use_cfg
+                else None
+            )
+
+            def warm_up(context_input, start_frame):
                 self._warm_up_causal_context_cache(
                     batch,
                     server_args,
-                    context_input=image_latent[:, :, :1, :, :],
+                    context_input=context_input,
                     prompt_embeds=warmup_prompt_embeds,
                     kv_cache=self.causal_kv_cache,
                     crossattn_cache=self.crossattn_cache,
-                    current_start_frame=current_start_frame,
+                    current_start_frame=start_frame,
                     image_kwargs=image_kwargs,
                     pos_cond_kwargs=warmup_pos_cond_kwargs,
                     target_dtype=target_dtype,
                     autocast_enabled=autocast_enabled,
                 )
-                self._warm_up_causal_context_cache(
-                    batch,
-                    server_args,
-                    context_input=image_latent[:, :, :1, :, :],
-                    prompt_embeds=warmup_negative_prompt_embeds,
-                    kv_cache=causal_kv_cache_neg,
-                    crossattn_cache=crossattn_cache_neg,
-                    current_start_frame=current_start_frame,
-                    image_kwargs=image_kwargs,
-                    pos_cond_kwargs=warmup_neg_cond_kwargs,
-                    target_dtype=target_dtype,
-                    autocast_enabled=autocast_enabled,
-                )
+                if use_cfg:
+                    self._warm_up_causal_context_cache(
+                        batch,
+                        server_args,
+                        context_input=context_input,
+                        prompt_embeds=warmup_neg_prompt_embeds,
+                        kv_cache=kv_cache_neg,
+                        crossattn_cache=crossattn_cache_neg,
+                        current_start_frame=start_frame,
+                        image_kwargs=image_kwargs,
+                        pos_cond_kwargs=warmup_neg_cond_kwargs,
+                        target_dtype=target_dtype,
+                        autocast_enabled=autocast_enabled,
+                    )
+
+            if independent_first_frame and input_frames >= 1:
+                warm_up(image_latent[:, :, :1, :, :], current_start_frame)
                 current_start_frame += 1
                 remaining_frames = input_frames - 1
             else:
@@ -1061,34 +880,11 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
 
             while remaining_frames > 0:
                 block = min(self.num_frames_per_block, remaining_frames)
-                context_input = image_latent[
-                    :, :, current_start_frame : current_start_frame + block, :, :
-                ]
-                self._warm_up_causal_context_cache(
-                    batch,
-                    server_args,
-                    context_input=context_input,
-                    prompt_embeds=warmup_prompt_embeds,
-                    kv_cache=self.causal_kv_cache,
-                    crossattn_cache=self.crossattn_cache,
-                    current_start_frame=current_start_frame,
-                    image_kwargs=image_kwargs,
-                    pos_cond_kwargs=warmup_pos_cond_kwargs,
-                    target_dtype=target_dtype,
-                    autocast_enabled=autocast_enabled,
-                )
-                self._warm_up_causal_context_cache(
-                    batch,
-                    server_args,
-                    context_input=context_input,
-                    prompt_embeds=warmup_negative_prompt_embeds,
-                    kv_cache=causal_kv_cache_neg,
-                    crossattn_cache=crossattn_cache_neg,
-                    current_start_frame=current_start_frame,
-                    image_kwargs=image_kwargs,
-                    pos_cond_kwargs=warmup_neg_cond_kwargs,
-                    target_dtype=target_dtype,
-                    autocast_enabled=autocast_enabled,
+                warm_up(
+                    image_latent[
+                        :, :, current_start_frame : current_start_frame + block, :, :
+                    ],
+                    current_start_frame,
                 )
                 current_start_frame += block
                 remaining_frames -= block
@@ -1104,7 +900,6 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
                 )
             num_blocks = t // self.num_frames_per_block
             block_sizes = [self.num_frames_per_block] * num_blocks
-            start_index = 0
         else:
             if (t - 1) % self.num_frames_per_block != 0:
                 raise ValueError(
@@ -1112,18 +907,17 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
                 )
             num_blocks = (t - 1) // self.num_frames_per_block
             block_sizes = [1] + [self.num_frames_per_block] * num_blocks
-            start_index = 0
 
+        start_index = 0
         self._validate_block_prompt_count(batch, block_sizes)
 
-        def prepare_context_input(current_latents: torch.Tensor) -> torch.Tensor:
+        def prepare_context_input(current_latents):
             return current_latents
 
         with self.progress_bar(total=len(block_sizes) * len(timesteps)) as progress_bar:
             for block_index, current_num_frames in enumerate(block_sizes):
                 self._set_rope_temporal_offset(
-                    batch,
-                    self._shot_index(batch, block_index),
+                    batch, self._shot_index(batch, block_index)
                 )
                 is_scene_cut = self._is_scene_cut(batch, block_index)
 
@@ -1131,32 +925,18 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
                     :, :, start_index : start_index + current_num_frames, :, :
                 ]
                 current_prompt_embeds = self._select_block_prompt_embeds(
-                    batch,
-                    prompt_embeds,
-                    block_index,
-                )
-                current_negative_prompt_embeds = self._select_block_prompt_embeds(
-                    batch,
-                    negative_prompt_embeds,
-                    block_index,
+                    batch, prompt_embeds, block_index
                 )
                 current_pos_cond_kwargs = self._select_block_cond_kwargs(
-                    batch,
-                    pos_cond_kwargs,
-                    block_index,
-                )
-                current_neg_cond_kwargs = self._select_block_cond_kwargs(
-                    batch,
-                    neg_cond_kwargs,
-                    block_index,
-                )
-                self._reset_crossattn_cache_for_block(
-                    batch,
-                    self.crossattn_cache,
-                    crossattn_cache_neg,
+                    batch, pos_cond_kwargs, block_index
                 )
 
-                def prepare_model_input(current_latents: torch.Tensor) -> torch.Tensor:
+                caches = [self.crossattn_cache]
+                if use_cfg:
+                    caches.append(crossattn_cache_neg)
+                self._reset_crossattn_cache_for_block(batch, *caches)
+
+                def prepare_model_input(current_latents):
                     latent_model_input = current_latents
                     if (
                         batch.image_latent is not None
@@ -1164,31 +944,24 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
                         and start_index == 0
                     ):
                         latent_model_input = torch.cat(
-                            [latent_model_input, batch.image_latent],
-                            dim=2,
+                            [latent_model_input, batch.image_latent], dim=2
                         )
                     return latent_model_input
 
                 current_start_tokens = (
                     pos_start_base + start_index
                 ) * self.num_token_per_frame
-                current_latents = self._denoise_and_update_causal_block_cfg(
-                    batch,
-                    server_args,
+                block_kwargs = dict(
                     chunk_latents=current_latents,
                     scheduler=scheduler,
                     timesteps=timesteps,
                     prompt_embeds=current_prompt_embeds,
-                    negative_prompt_embeds=current_negative_prompt_embeds,
                     kv_cache=self.causal_kv_cache,
                     crossattn_cache=self.crossattn_cache,
-                    kv_cache_neg=causal_kv_cache_neg,
-                    crossattn_cache_neg=crossattn_cache_neg,
                     current_start_tokens=current_start_tokens,
                     start_frame=start_index,
                     image_kwargs=image_kwargs,
                     pos_cond_kwargs=current_pos_cond_kwargs,
-                    neg_cond_kwargs=current_neg_cond_kwargs,
                     target_dtype=target_dtype,
                     autocast_enabled=autocast_enabled,
                     device=device,
@@ -1197,10 +970,29 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
                     prepare_context_input=prepare_context_input,
                     progress_bar=progress_bar,
                 )
+                if use_cfg:
+                    current_latents = self._denoise_and_update_causal_block_cfg(
+                        batch,
+                        server_args,
+                        negative_prompt_embeds=self._select_block_prompt_embeds(
+                            batch, negative_prompt_embeds, block_index
+                        ),
+                        kv_cache_neg=kv_cache_neg,
+                        crossattn_cache_neg=crossattn_cache_neg,
+                        neg_cond_kwargs=self._select_block_cond_kwargs(
+                            batch, neg_cond_kwargs, block_index
+                        ),
+                        **block_kwargs,
+                    )
+                else:
+                    current_latents = self._denoise_and_update_causal_block(
+                        batch, server_args, **block_kwargs
+                    )
 
                 if is_scene_cut:
                     self._pin_current_chunk(self.causal_kv_cache, current_num_frames)
-                    self._pin_current_chunk(causal_kv_cache_neg, current_num_frames)
+                    if use_cfg:
+                        self._pin_current_chunk(kv_cache_neg, current_num_frames)
 
                 latents[:, :, start_index : start_index + current_num_frames, :, :] = (
                     current_latents

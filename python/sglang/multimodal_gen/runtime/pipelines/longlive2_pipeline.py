@@ -21,6 +21,7 @@ class LongLive2Pipeline(WanCausalDMDPipeline):
     pipeline_name = "LongLive2Pipeline"
     pipeline_config_cls = LongLive2T2VConfig
     sampling_params_cls = LongLive2SamplingParams
+
     def initialize_pipeline(self, server_args: ServerArgs):
         self.modules["scheduler"] = FlowUniPCMultistepScheduler(
             num_train_timesteps=1000,
@@ -55,5 +56,6 @@ class LongLive2Pipeline(WanCausalDMDPipeline):
             ),
         )
         self.add_standard_decoding_stage()
+
 
 EntryClass = LongLive2Pipeline

@@ -26,6 +26,7 @@ class LongLive2T2VConfig(Wan2_2_TI2V_5B_Config):
     expand_timesteps: bool = False
 
     dit_config: DiTConfig = field(default_factory=LongLive2VideoConfig)
+
     def adjust_num_frames(self, num_frames: int) -> int:
         num_frames = super().adjust_num_frames(num_frames)
         vae_scale_factor_temporal = self.vae_config.arch_config.scale_factor_temporal
