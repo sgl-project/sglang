@@ -269,12 +269,16 @@ class FutureMap:
     def _maybe_init_prefill_tail_buf(self, payload: RelayPayload) -> None:
         if (
             not self.spec_algo.is_dspark()
-            or getattr(self, "prefill_tail_hidden_states_buf", None) is not None
             or payload.prefill_tail_hidden_states is None
             or payload.prefill_tail_hidden_states.numel() == 0
         ):
             return
+        if payload.prefill_tail_hidden_states.dim() != 3:
+            return
         tail0 = payload.prefill_tail_hidden_states[0]
+        existing = getattr(self, "prefill_tail_hidden_states_buf", None)
+        if existing is not None and tuple(existing.shape[1:]) == tuple(tail0.shape):
+            return
         self.prefill_tail_hidden_states_buf = torch.empty(
             (self.req_pool_size, *tail0.shape),
             dtype=tail0.dtype,
@@ -292,6 +296,32 @@ class FutureMap:
                 device=self.device,
             )
             self.prefill_tail_valid_mask_buf.zero_()
+
+    def _normalize_prefill_tail_payload(
+        self, payload: RelayPayload, num_indices: int
+    ) -> None:
+        if (
+            not self.spec_algo.is_dspark()
+            or payload.prefill_tail_hidden_states is None
+            or payload.prefill_tail_hidden_states.numel() == 0
+        ):
+            return
+
+        # Some singleton overlap paths relay one request's tail as [tail, hidden].
+        # FutureMap buffers are request-indexed, so normalize it to
+        # [bs, tail, hidden] before lazy init and stash.
+        if payload.prefill_tail_hidden_states.dim() == 2 and num_indices == 1:
+            payload.prefill_tail_hidden_states = (
+                payload.prefill_tail_hidden_states.unsqueeze(0)
+            )
+            if (
+                payload.prefill_tail_valid_mask is not None
+                and payload.prefill_tail_valid_mask.numel() > 0
+                and payload.prefill_tail_valid_mask.dim() == 1
+            ):
+                payload.prefill_tail_valid_mask = (
+                    payload.prefill_tail_valid_mask.unsqueeze(0)
+                )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         if self.spec_algo.is_ngram():
@@ -469,6 +499,7 @@ class FutureMap:
             )
         if self.need_hidden_states:
             self._maybe_init_hidden_buf(payload)
+        self._normalize_prefill_tail_payload(payload, indices.numel())
         self._maybe_init_prefill_tail_buf(payload)
         if (
             self.need_hidden_states
@@ -495,6 +526,9 @@ class FutureMap:
             getattr(self, "prefill_tail_hidden_states_buf", None) is not None
             and payload.prefill_tail_hidden_states is not None
             and payload.prefill_tail_hidden_states.numel() > 0
+            and payload.prefill_tail_hidden_states.dim() == 3
+            and tuple(self.prefill_tail_hidden_states_buf.shape[1:])
+            == tuple(payload.prefill_tail_hidden_states.shape[1:])
         ):
             self.prefill_tail_hidden_states_buf[indices] = (
                 payload.prefill_tail_hidden_states.to(
