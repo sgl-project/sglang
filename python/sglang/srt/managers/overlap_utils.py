@@ -112,6 +112,7 @@ class RelayPayload:
     hidden_states: Optional[torch.Tensor] = None
     hidden_valid_mask: Optional[torch.Tensor] = None
     prefill_tail_hidden_states: Optional[torch.Tensor] = None
+    prefill_tail_input_ids: Optional[torch.Tensor] = None
     prefill_tail_valid_mask: Optional[torch.Tensor] = None
     draft_probs: Optional[torch.Tensor] = None
     transfer_warmup_rounds: Optional[torch.Tensor] = None
@@ -126,6 +127,9 @@ class RelayPayload:
             hidden_valid_mask=getattr(draft_input, "hidden_valid_mask", None),
             prefill_tail_hidden_states=getattr(
                 draft_input, "prefill_tail_hidden_states", None
+            ),
+            prefill_tail_input_ids=getattr(
+                draft_input, "prefill_tail_input_ids", None
             ),
             prefill_tail_valid_mask=getattr(
                 draft_input, "prefill_tail_valid_mask", None
@@ -276,8 +280,27 @@ class FutureMap:
         if payload.prefill_tail_hidden_states.dim() != 3:
             return
         tail0 = payload.prefill_tail_hidden_states[0]
+        tail_input_ids0 = None
+        if (
+            payload.prefill_tail_input_ids is not None
+            and payload.prefill_tail_input_ids.numel() > 0
+            and payload.prefill_tail_input_ids.dim() == 2
+        ):
+            tail_input_ids0 = payload.prefill_tail_input_ids[0]
         existing = getattr(self, "prefill_tail_hidden_states_buf", None)
-        if existing is not None and tuple(existing.shape[1:]) == tuple(tail0.shape):
+        input_ids_existing = getattr(self, "prefill_tail_input_ids_buf", None)
+        if (
+            existing is not None
+            and tuple(existing.shape[1:]) == tuple(tail0.shape)
+            and (
+                tail_input_ids0 is None
+                or (
+                    input_ids_existing is not None
+                    and tuple(input_ids_existing.shape[1:])
+                    == tuple(tail_input_ids0.shape)
+                )
+            )
+        ):
             return
         self.prefill_tail_hidden_states_buf = torch.empty(
             (self.req_pool_size, *tail0.shape),
@@ -285,6 +308,7 @@ class FutureMap:
             device=self.device,
         )
         self.prefill_tail_valid_mask_buf = None
+        self.prefill_tail_input_ids_buf = None
         if (
             payload.prefill_tail_valid_mask is not None
             and payload.prefill_tail_valid_mask.numel() > 0
@@ -296,6 +320,12 @@ class FutureMap:
                 device=self.device,
             )
             self.prefill_tail_valid_mask_buf.zero_()
+        if tail_input_ids0 is not None:
+            self.prefill_tail_input_ids_buf = torch.empty(
+                (self.req_pool_size, *tail_input_ids0.shape),
+                dtype=tail_input_ids0.dtype,
+                device=self.device,
+            )
 
     def _normalize_prefill_tail_payload(
         self, payload: RelayPayload, num_indices: int
@@ -310,6 +340,15 @@ class FutureMap:
         # Some singleton overlap paths relay one request's tail as [tail, hidden].
         # FutureMap buffers are request-indexed, so normalize it to
         # [bs, tail, hidden] before lazy init and stash.
+        if (
+            payload.prefill_tail_input_ids is not None
+            and payload.prefill_tail_input_ids.numel() > 0
+            and payload.prefill_tail_input_ids.dim() == 1
+            and num_indices == 1
+        ):
+            payload.prefill_tail_input_ids = (
+                payload.prefill_tail_input_ids.unsqueeze(0)
+            )
         if payload.prefill_tail_hidden_states.dim() == 2 and num_indices == 1:
             payload.prefill_tail_hidden_states = (
                 payload.prefill_tail_hidden_states.unsqueeze(0)
@@ -396,6 +435,13 @@ class FutureMap:
             draft_input.prefill_tail_hidden_states = (
                 self.prefill_tail_hidden_states_buf[indices]
             )
+            if (
+                getattr(self, "prefill_tail_input_ids_buf", None) is not None
+                and hasattr(draft_input, "prefill_tail_input_ids")
+            ):
+                draft_input.prefill_tail_input_ids = (
+                    self.prefill_tail_input_ids_buf[indices]
+                )
             if (
                 getattr(self, "prefill_tail_valid_mask_buf", None) is not None
                 and hasattr(draft_input, "prefill_tail_valid_mask")
@@ -542,6 +588,19 @@ class FutureMap:
                 self.prefill_tail_valid_mask_buf[indices] = (
                     payload.prefill_tail_valid_mask.to(
                         self.prefill_tail_valid_mask_buf.dtype
+                    )
+                )
+            if (
+                getattr(self, "prefill_tail_input_ids_buf", None) is not None
+                and payload.prefill_tail_input_ids is not None
+                and payload.prefill_tail_input_ids.numel() > 0
+                and payload.prefill_tail_input_ids.dim() == 2
+                and tuple(self.prefill_tail_input_ids_buf.shape[1:])
+                == tuple(payload.prefill_tail_input_ids.shape[1:])
+            ):
+                self.prefill_tail_input_ids_buf[indices] = (
+                    payload.prefill_tail_input_ids.to(
+                        self.prefill_tail_input_ids_buf.dtype
                     )
                 )
         elif getattr(self, "prefill_tail_valid_mask_buf", None) is not None:
