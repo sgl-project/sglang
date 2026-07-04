@@ -72,6 +72,12 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "page_size",
                     "moe_runner_backend",
                     "quantization",
+                    "enable_dp_attention",
+                    "enable_dp_lm_head",
+                    "moe_a2a_backend",
+                    "ep_size",
+                    "moe_dense_tp_size",
+                    "attn_cp_size",
                 }
             ),
         )
@@ -1101,6 +1107,200 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "enable_tf32_matmul": True,
                 },
             )
+
+    def test_deepseek_moe_quant_slot_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deepseek_moe_quant_resolution,
+        )
+
+        def _view(arch="DeepseekV32ForCausalLM", quant_cfg=None, **kw):
+            defaults = dict(
+                quantization=None,
+                _quantization_explicitly_unset=False,
+                moe_a2a_backend="none",
+                moe_runner_backend="auto",
+                get_model_config=lambda: SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        architectures=[arch], quantization_config=quant_cfg
+                    )
+                ),
+            )
+            defaults.update(kw)
+            return ResolvedView(SimpleNamespace(**defaults))
+
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            with patch.object(
+                overrides_module, "get_quantization_config", return_value="fp8"
+            ):
+                # config-declared quant: detected + moe runner
+                self.assertEqual(
+                    _deepseek_moe_quant_resolution(_view()),
+                    {
+                        "quantization": "fp8",
+                        "moe_runner_backend": "flashinfer_trtllm",
+                    },
+                )
+            # non-deepseek arch guard (end-state list execution safety)
+            self.assertEqual(
+                _deepseek_moe_quant_resolution(_view(arch="LlamaForCausalLM")), {}
+            )
+        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+            self.assertEqual(_deepseek_moe_quant_resolution(_view()), {})
+
+    def test_data_parallelism_and_a2a_passes(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _a2a_backend_overrides,
+            _a2a_ep_size,
+            _data_parallelism_defaults,
+        )
+
+        self.assertEqual(
+            _data_parallelism_defaults(ResolvedView(SimpleNamespace(dp_size=1))),
+            {"enable_dp_attention": False, "enable_dp_lm_head": False},
+        )
+        self.assertEqual(
+            _data_parallelism_defaults(ResolvedView(SimpleNamespace(dp_size=2))), {}
+        )
+
+        with patch("sglang.srt.environ.envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE") as e:
+            e.get.return_value = False
+            self.assertEqual(
+                _a2a_backend_overrides(
+                    ResolvedView(
+                        SimpleNamespace(
+                            enable_deepep_waterfill=True, moe_a2a_backend="none"
+                        )
+                    )
+                ),
+                {"moe_a2a_backend": "deepep"},
+            )
+            e.get.return_value = True
+            # megamoe env wins over the waterfill override (chained, last write)
+            self.assertEqual(
+                _a2a_backend_overrides(
+                    ResolvedView(
+                        SimpleNamespace(
+                            enable_deepep_waterfill=True, moe_a2a_backend="none"
+                        )
+                    )
+                ),
+                {"moe_a2a_backend": "megamoe"},
+            )
+
+        self.assertEqual(
+            _a2a_ep_size(
+                ResolvedView(SimpleNamespace(moe_a2a_backend="deepep", tp_size=8))
+            ),
+            {"ep_size": 8},
+        )
+        self.assertEqual(
+            _a2a_ep_size(
+                ResolvedView(SimpleNamespace(moe_a2a_backend="none", tp_size=8))
+            ),
+            {},
+        )
+
+    def test_deepseek_family_order_safe_declarations(self):
+        from sglang.srt.arg_groups.overrides import _deepseek_family_overrides
+
+        def _args(**kw):
+            defaults = dict(
+                is_attention_backend_not_set=lambda: True,
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                enable_prefill_cp=False,
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        # DSA path on CUDA: dsa fill + page 64
+        with patch(
+            "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
+        ):
+            with patch.object(overrides_module, "is_npu", return_value=False):
+                with patch.object(overrides_module, "is_xpu", return_value=False):
+                    with patch.object(overrides_module, "is_hip", return_value=False):
+                        self.assertEqual(
+                            _deepseek_family_overrides(_args(), None),
+                            {"attention_backend": "dsa", "page_size": 64},
+                        )
+                    # HIP without the preshuffle path: page 1
+                    with patch.object(overrides_module, "is_hip", return_value=True):
+                        with patch(
+                            "sglang.srt.layers.attention.dsa.utils.aiter_can_use_preshuffle_paged_mqa",
+                            return_value=False,
+                        ):
+                            self.assertEqual(
+                                _deepseek_family_overrides(_args(), None),
+                                {"attention_backend": "dsa", "page_size": 1},
+                            )
+        # DSA CP (zigzag): the coupled parallel-field declaration
+        with patch(
+            "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
+        ):
+            with patch.object(overrides_module, "is_npu", return_value=False):
+                with patch.object(overrides_module, "is_xpu", return_value=False):
+                    with patch.object(overrides_module, "is_hip", return_value=False):
+                        result = _deepseek_family_overrides(
+                            _args(
+                                enable_prefill_cp=True,
+                                cp_strategy="zigzag",
+                                tp_size=8,
+                                dp_size=1,
+                                ep_size=1,
+                                moe_a2a_backend="none",
+                                kv_cache_dtype="auto",
+                            ),
+                            None,
+                        )
+                        self.assertEqual(
+                            result,
+                            {
+                                "attention_backend": "dsa",
+                                "page_size": 64,
+                                "enable_dp_attention": True,
+                                "moe_dense_tp_size": 1,
+                                "moe_a2a_backend": "deepep",
+                                "ep_size": 8,
+                                "attn_cp_size": 8,
+                            },
+                        )
+                        # interleave CP with dp>1 must assert
+                        with self.assertRaises(AssertionError):
+                            _deepseek_family_overrides(
+                                _args(
+                                    enable_prefill_cp=True,
+                                    cp_strategy="interleave",
+                                    tp_size=8,
+                                    dp_size=2,
+                                ),
+                                None,
+                            )
+
+        # MLA path on sm100: trtllm_mla fill (all three backends unset)
+        with patch(
+            "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=False
+        ):
+            with patch.object(
+                overrides_module, "is_sm100_supported", return_value=True
+            ):
+                self.assertEqual(
+                    _deepseek_family_overrides(_args(), None),
+                    {"attention_backend": "trtllm_mla"},
+                )
+                self.assertEqual(
+                    _deepseek_family_overrides(
+                        _args(decode_attention_backend="fa3"), None
+                    ),
+                    {},
+                )
+            with patch.object(
+                overrides_module, "is_sm100_supported", return_value=False
+            ):
+                self.assertEqual(_deepseek_family_overrides(_args(), None), {})
 
     def test_qwen3_moe_family_quant_absorption(self):
         from sglang.srt.arg_groups.overrides import _qwen3_moe_family_overrides
