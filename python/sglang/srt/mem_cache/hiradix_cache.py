@@ -1566,7 +1566,7 @@ class HiRadixCache(RadixCache):
 
         fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = operation.host_indices[:min_completed_tokens]
-        matched_length = self._insert_helper_host(
+        matched_length, inserted_length = self._insert_helper_host(
             last_host_node,
             fetched_key,
             written_indices,
@@ -1584,7 +1584,7 @@ class HiRadixCache(RadixCache):
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
         # Track tokens actually loaded from storage for this request (L3 hits)
-        loaded_from_storage = min_completed_tokens - matched_length
+        loaded_from_storage = inserted_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
 
         if self.enable_storage_metrics:
@@ -1716,10 +1716,15 @@ class HiRadixCache(RadixCache):
 
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value
-    ):
+    ) -> Tuple[int, int]:
+        # Returns (matched_length, inserted_length):
+        #   matched_length  -- prefix that overlapped existing nodes; the caller
+        #                       frees `host_indices[:matched_length]` (redundant copy).
+        #   inserted_length -- tokens actually materialized into the host tree
+        #                       (used for L3-hit metrics); 0 when nothing was inserted.
         node.last_access_time = time.monotonic()
         if len(key) == 0:
-            return 0
+            return 0, 0
 
         child_key = key.child_key(self.page_size)
 
@@ -1741,6 +1746,21 @@ class HiRadixCache(RadixCache):
                 child_key = key.child_key(self.page_size)
 
         if len(key):
+            # Backup invariant (mirrors write_backup): a host-backed node must
+            # have a host-backed parent, so backed-up nodes form a contiguous
+            # prefix from the root. During the prefetch window `node` may have
+            # become a device-only, not-yet-backed-up node (inserted by another
+            # request, or not selected under write_through_selective). Attaching
+            # a host-only child under it would break the invariant and later
+            # trip the `_evict_regular` "non-leaf" assertion during eviction.
+            # Skip the insert and free the host pages that would have backed the
+            # dropped suffix, so they are not leaked. `matched_length` is left as
+            # the real overlap length; the caller frees `host_indices[:matched_length]`
+            # and these two ranges together cover the whole prefetched buffer.
+            if node is not self.root_node and not node.backuped:
+                self.cache_controller.mem_pool_host.free(host_value)
+                return matched_length, 0
+
             new_node = TreeNode(priority=node.priority)
             new_node.parent = node
             new_node.key = key
@@ -1755,7 +1775,7 @@ class HiRadixCache(RadixCache):
             # cache indexers can resolve descendants that extend this L2-only prefix.
             self._record_store_event(new_node, medium=StorageMedium.CPU)
 
-        return matched_length
+        return matched_length, len(key)
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
