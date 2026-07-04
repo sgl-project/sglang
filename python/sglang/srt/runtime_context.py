@@ -331,6 +331,7 @@ class Flags(_StaticFlags):
     speculative_moe_runner_backend: str | None = None
     speculative_moe_a2a_backend: str | None = None
     disable_shared_experts_fusion: bool = False
+    kv_cache_dtype: str = "auto"
     # Parallel-request fields: flat transitional home, to be re-homed by the
     # Parallel Parameters Clarification module.
     enable_dp_attention: bool = False

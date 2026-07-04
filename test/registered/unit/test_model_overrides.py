@@ -84,6 +84,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "speculative_moe_runner_backend",
                     "speculative_moe_a2a_backend",
                     "disable_shared_experts_fusion",
+                    "kv_cache_dtype",
                 }
             ),
         )
@@ -1012,6 +1013,90 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
             ),
             {},
+        )
+
+    def test_dsa_kv_cache_dtype_default_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _dsa_kv_cache_dtype_default,
+        )
+
+        def _view(**kw):
+            hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
+            defaults = dict(
+                kv_cache_dtype="auto",
+                dsa_prefill_backend=None,
+                dsa_decode_backend=None,
+            )
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(
+                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+                )
+            )
+
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch.object(overrides_module, "is_npu", return_value=False),
+            patch.object(overrides_module, "is_xpu", return_value=False),
+        ):
+            with patch("torch.cuda.get_device_capability", return_value=(9, 0)):
+                # Hopper: auto -> bfloat16
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view()),
+                    {"kv_cache_dtype": "bfloat16"},
+                )
+                # alias normalization
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="bf16")),
+                    {"kv_cache_dtype": "bfloat16"},
+                )
+                # explicit value survives (no declaration)
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="fp8_e4m3")), {}
+                )
+                # unsupported dtype rejected
+                with self.assertRaises(AssertionError):
+                    _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="fp8_e5m2"))
+            with patch("torch.cuda.get_device_capability", return_value=(10, 0)):
+                # Blackwell: auto -> fp8
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view()),
+                    {"kv_cache_dtype": "fp8_e4m3"},
+                )
+
+    def test_deepseek_v4_kv_cache_dtype_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deepseek_v4_kv_cache_dtype,
+        )
+
+        def _view(arch="DeepseekV4ForCausalLM", **kw):
+            hf = SimpleNamespace(architectures=[arch])
+            defaults = dict(kv_cache_dtype="auto", device="cuda")
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(
+                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+                )
+            )
+
+        self.assertEqual(
+            _deepseek_v4_kv_cache_dtype(_view()), {"kv_cache_dtype": "fp8_e4m3"}
+        )
+        # NPU pins bfloat16 regardless of the auto default
+        self.assertEqual(
+            _deepseek_v4_kv_cache_dtype(_view(device="npu")),
+            {"kv_cache_dtype": "bfloat16"},
+        )
+        # explicit supported value survives
+        self.assertEqual(
+            _deepseek_v4_kv_cache_dtype(_view(kv_cache_dtype="bfloat16")), {}
+        )
+        with self.assertRaises(AssertionError):
+            _deepseek_v4_kv_cache_dtype(_view(kv_cache_dtype="fp8_e5m2"))
+        self.assertEqual(
+            _deepseek_v4_kv_cache_dtype(_view(arch="LlamaForCausalLM")), {}
         )
 
     def test_deepseek_spec_moe_resolution_pass(self):

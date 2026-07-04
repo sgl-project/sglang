@@ -15,11 +15,13 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     """Residual imperative arm of the DeepSeek V4 defaults.
 
     The attention/page/window/MoE-runner declarations moved to the override
-    registry (arg_groups/overrides.py: _deepseek_v4_overrides). This keeps,
-    at the legacy slot: the ROCm env fill (env-write policy), the kv-cache
-    dtype and NPU split-backend writes (kv/split-backend resolution is R2
-    territory), the max_running_requests fill (the speculative hook is a
-    later writer of that field) and the validations.
+    registry (arg_groups/overrides.py: _deepseek_v4_overrides) and the
+    kv-cache dtype default to the resolution pipeline
+    (_deepseek_v4_kv_cache_dtype, invoked below at its legacy slot). This
+    keeps, at the legacy slot: the ROCm env fill (env-write policy), the NPU
+    split-backend writes (split fields not yet resolvable), the
+    max_running_requests fill (the speculative hook is a later writer of
+    that field) and the validations.
     """
     from sglang.srt.utils import is_hip
 
@@ -35,11 +37,15 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         )
         envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
 
-    if server_args.kv_cache_dtype == "auto":
-        server_args.kv_cache_dtype = "fp8_e4m3"
-        logger.warning(
-            f"Setting KV cache dtype to {server_args.kv_cache_dtype} for {model_arch}."
-        )
+    # The kv-cache dtype default moved to the resolution pipeline
+    # (arg_groups/overrides.py: _deepseek_v4_kv_cache_dtype), invoked here at
+    # its legacy slot.
+    from sglang.srt.arg_groups.overrides import (
+        _deepseek_v4_kv_cache_dtype,
+        run_post_process_pass,
+    )
+
+    run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
 
     if server_args.device == "npu":
         # NPU keeps the device-aware "dsv4" backend (the registry routes it to
@@ -48,12 +54,6 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         # generic NPU models; undo that here so V4 stays consistently on dsv4.
         server_args.prefill_attention_backend = "dsv4"
         server_args.decode_attention_backend = "dsv4"
-        server_args.kv_cache_dtype = "bfloat16"
-
-    assert server_args.kv_cache_dtype in [
-        "fp8_e4m3",
-        "bfloat16",
-    ], f"{server_args.kv_cache_dtype} is not supported for {model_arch}"
 
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 256

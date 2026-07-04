@@ -600,6 +600,7 @@ class ServerArgs:
                 "mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+"
             ),
             choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
+            resolvable=True,
         ),
     ] = "auto"
     enable_fp32_lm_head: A[
@@ -3672,33 +3673,15 @@ class ServerArgs:
 
         return capture_sizes
 
-    def _set_default_dsa_kv_cache_dtype(self, major: int, quantization: str) -> str:
-        user_set_prefill = self.dsa_prefill_backend is not None
-        user_set_decode = self.dsa_decode_backend is not None
+    def _set_default_dsa_kv_cache_dtype(self, major: int, quantization: str) -> None:
+        # Moved to the resolution pipeline (arg_groups/overrides.py:
+        # _dsa_kv_cache_dtype_default), invoked here at its legacy slot.
+        from sglang.srt.arg_groups.overrides import (
+            _dsa_kv_cache_dtype_default,
+            run_post_process_pass,
+        )
 
-        # If user specified a backend but didn't explicitly set kv_cache_dtype,
-        # suggest them to be explicit about kv_cache_dtype to avoid surprises
-        if (user_set_prefill or user_set_decode) and self.kv_cache_dtype == "auto":
-            logger.warning(
-                "When specifying --dsa-prefill-backend or --dsa-decode-backend, "
-                "you should also explicitly set --kv-cache-dtype (e.g., 'fp8_e4m3' or 'bfloat16'). "
-                "DeepSeek V3.2 defaults to FP8 KV cache which may not be compatible with all backends."
-            )
-
-        if self.kv_cache_dtype == "auto":
-            if major >= 10:
-                self.kv_cache_dtype = "fp8_e4m3"
-            else:
-                self.kv_cache_dtype = "bfloat16"
-            logger.warning(
-                f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek DSA on SM{major} device."
-            )
-        if self.kv_cache_dtype == "bf16":
-            self.kv_cache_dtype = "bfloat16"
-        assert self.kv_cache_dtype in [
-            "bfloat16",
-            "fp8_e4m3",
-        ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+        run_post_process_pass(self, _dsa_kv_cache_dtype_default)
 
     def _set_default_dsa_backends(self, kv_cache_dtype: str, major: int) -> str:
         from sglang.srt.arg_groups.hisparse_hook import (

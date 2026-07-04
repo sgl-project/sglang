@@ -963,6 +963,54 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     return declared
 
 
+@register_post_process
+def _dsa_kv_cache_dtype_default(view: Any) -> dict:
+    """Slot pass in the DSA arm, ordered before the split-backend
+    resolution: default the kv-cache dtype from the device capability
+    (Blackwell FP8, Hopper bf16) and normalize the bf16 alias. Reads the
+    PRISTINE dsa split backends (their resolution runs after this pass)."""
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    hf_config = view.get_model_config().hf_config
+    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
+        return {}
+    if not is_deepseek_dsa(hf_config):
+        return {}
+    if is_npu() or is_xpu():
+        return {}
+
+    import torch
+
+    major, _ = torch.cuda.get_device_capability()
+
+    # If user specified a backend but didn't explicitly set kv_cache_dtype,
+    # suggest them to be explicit about kv_cache_dtype to avoid surprises
+    if (
+        view.dsa_prefill_backend is not None or view.dsa_decode_backend is not None
+    ) and view.kv_cache_dtype == "auto":
+        logger.warning(
+            "When specifying --dsa-prefill-backend or --dsa-decode-backend, "
+            "you should also explicitly set --kv-cache-dtype (e.g., 'fp8_e4m3' or 'bfloat16'). "
+            "DeepSeek V3.2 defaults to FP8 KV cache which may not be compatible with all backends."
+        )
+
+    kv_cache_dtype = view.kv_cache_dtype
+    if kv_cache_dtype == "auto":
+        kv_cache_dtype = "fp8_e4m3" if major >= 10 else "bfloat16"
+        logger.warning(
+            f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA on SM{major} device."
+        )
+    if kv_cache_dtype == "bf16":
+        kv_cache_dtype = "bfloat16"
+    assert kv_cache_dtype in [
+        "bfloat16",
+        "fp8_e4m3",
+    ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+    if kv_cache_dtype != view.kv_cache_dtype:
+        return {"kv_cache_dtype": kv_cache_dtype}
+    return {}
+
+
 # Keep in sync with the DeepSeek family list on _deepseek_family_overrides.
 _DEEPSEEK_FAMILY_ARCHS = frozenset(
     {
@@ -1095,6 +1143,31 @@ def _deepseek_spec_moe_resolution(view: Any) -> dict:
         "speculative_moe_runner_backend": "triton",
         "speculative_moe_a2a_backend": "none",
     }
+
+
+@register_post_process
+def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
+    """Slot pass in the DeepSeek V4 hook: default the kv-cache dtype to FP8
+    (bfloat16 on NPU, where the pool geometry differs) and validate the
+    result. The NPU split-backend writes stay in the hook."""
+    hf_config = view.get_model_config().hf_config
+    model_arch = hf_config.architectures[0]
+    if model_arch != "DeepseekV4ForCausalLM":
+        return {}
+
+    kv_cache_dtype = view.kv_cache_dtype
+    if kv_cache_dtype == "auto":
+        kv_cache_dtype = "fp8_e4m3"
+        logger.warning(f"Setting KV cache dtype to {kv_cache_dtype} for {model_arch}.")
+    if view.device == "npu":
+        kv_cache_dtype = "bfloat16"
+    assert kv_cache_dtype in [
+        "fp8_e4m3",
+        "bfloat16",
+    ], f"{kv_cache_dtype} is not supported for {model_arch}"
+    if kv_cache_dtype != view.kv_cache_dtype:
+        return {"kv_cache_dtype": kv_cache_dtype}
+    return {}
 
 
 @register_post_process
