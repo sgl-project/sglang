@@ -28,6 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import (
     ServerArgs,
     get_global_server_args,
@@ -382,18 +383,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         local_count = torch.tensor(
             [int(local_num_tokens)], dtype=torch.int64, device=self.device
         )
+        tp_group = self.draft_model_runner.tp_group
         gathered = torch.empty(
-            (attn_dp_size,), dtype=torch.int64, device=self.device
+            (tp_group.world_size,), dtype=torch.int64, device=self.device
         )
-        get_attn_tp_group().all_gather_into_tensor(
-            gathered, local_count.contiguous()
-        )
-        if gathered.numel() != attn_dp_size:
+        tp_group.all_gather_into_tensor(gathered, local_count.contiguous())
+
+        parallel = get_parallel()
+        stride = int(parallel.attn_tp_size) * int(parallel.attn_cp_size)
+        if gathered.numel() < attn_dp_size * stride:
             raise RuntimeError(
                 "DSpark accepted-path DP token gather size mismatch: "
-                f"gathered={gathered.numel()} expected={attn_dp_size}"
+                f"gathered={gathered.numel()} expected_at_least={attn_dp_size * stride}"
             )
-        return [int(x) for x in gathered.cpu().tolist()]
+        gathered_cpu = gathered.cpu().tolist()
+        return [int(gathered_cpu[i * stride]) for i in range(attn_dp_size)]
 
     def _get_target_aux_hidden_size(self) -> int:
         target_layer_ids = getattr(self._draft_inner, "target_layer_ids", None) or []
