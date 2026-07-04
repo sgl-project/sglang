@@ -25,9 +25,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.environ import envs
-from sglang.srt.layers.utils.dcp_utils import (
-    dcp_enabled,
-)
+from sglang.srt.layers.dcp import dcp_enabled
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
@@ -52,17 +50,17 @@ def get_draft_kv_pool(
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
 ):
-    """Return (draft_token_to_kv_pool, draft_model_config) for the current
-    draft worker, or (None, None) when no draft KV pool is available."""
+    """Return the draft token-to-KV pool for the current draft worker,
+    or None when no draft KV pool is available."""
     if draft_worker is None or spec_algorithm.is_ngram():
-        return None, None
+        return None
 
     # V2 workers nest the draft runner under `.draft_worker`.
     if server_args.enable_multi_layer_eagle:
         draft_runner = draft_worker.draft_worker.draft_runner_list[0]
     else:
         draft_runner = draft_worker.draft_worker.draft_runner
-    return draft_runner.token_to_kv_pool, draft_runner.model_config
+    return draft_runner.token_to_kv_pool
 
 
 def maybe_register_hicache_draft(
@@ -78,7 +76,7 @@ def maybe_register_hicache_draft(
     if not enable_hierarchical_cache:
         return
 
-    draft_kv_pool, _ = get_draft_kv_pool(
+    draft_kv_pool = get_draft_kv_pool(
         draft_worker=draft_worker,
         spec_algorithm=spec_algorithm,
         server_args=server_args,
@@ -108,6 +106,7 @@ def maybe_register_hicache_draft(
         host_size=0,
         page_size=page_size,
         layout=server_args.hicache_mem_layout,
+        allocator_type=server_args.hicache_storage_backend,
     )
     if isinstance(pool, MHATokenToKVPool):
         draft_host_pool = get_mha_host_pool_cls(pool)(pool, **kw)
@@ -219,6 +218,7 @@ def build_kv_cache(
         eviction_policy=server_args.radix_eviction_policy,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
+        enable_session_radix_cache=server_args.enable_session_radix_cache,
         enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
         enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
         pp_rank=ps.pp_rank,
@@ -232,6 +232,7 @@ def build_kv_cache(
             server_args=server_args,
             params=params,
             is_hybrid_swa=is_hybrid_swa,
+            full_tokens_per_layer=full_tokens_per_layer,
             is_hybrid_ssm=is_hybrid_ssm,
             enable_hierarchical_cache=enable_hierarchical_cache,
             disable_radix_cache=disable_radix_cache,

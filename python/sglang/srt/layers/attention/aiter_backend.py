@@ -845,6 +845,8 @@ class AiterAttnBackend(AttentionBackend):
             reduce_final_map,
             reduce_partial_map,
             tile_q,
+            # Prefill PS metadata has no split cap; 0 keeps AITER's default reduce sizing.
+            0,
             output,
             final_lse,
         )
