@@ -1409,40 +1409,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 next_token_ids = torch.empty(
                     (0,), dtype=torch.int64, device=model_worker_batch.seq_lens.device
                 )
-            bootstrap_tokens_per_req = self._prefill_bootstrap_tokens_per_req(
-                model_worker_batch.global_num_tokens
-            )
-            bootstrap_global_num_reqs = self._prefill_bootstrap_global_req_counts(
-                model_worker_batch.global_num_tokens,
-                bootstrap_tokens_per_req,
-            )
-            if bootstrap_global_num_reqs is not None and any(
-                int(x) > 0 for x in bootstrap_global_num_reqs
-            ):
-                hidden_size = self._get_target_aux_hidden_size()
-                hidden_dtype = (
-                    logits_output.hidden_states.dtype
-                    if logits_output.hidden_states is not None
-                    else torch.float16
-                )
-                self._run_draft_bootstrap_forward(
-                    batch=model_worker_batch,
-                    main_hidden=torch.empty(
-                        (0, hidden_size), dtype=hidden_dtype, device=device
-                    ),
-                    input_ids=torch.empty((0,), dtype=torch.int64, device=device),
-                    positions=torch.empty((0,), dtype=torch.int64, device=device),
-                    out_cache_loc=torch.empty((0,), dtype=torch.int64, device=device),
-                    seq_lens=torch.empty((0,), dtype=torch.int64, device=device),
-                    req_pool_indices=torch.empty(
-                        (0,),
-                        dtype=model_worker_batch.req_pool_indices.dtype,
-                        device=device,
-                    ),
-                    dp_decode_global_num_tokens=bootstrap_global_num_reqs,
-                    num_tokens_per_req=bootstrap_tokens_per_req,
-                    use_draft_extend_v2=True,
-                )
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = None
             batch_output.next_draft_input = self._make_next_draft_input_prefill(
@@ -1487,55 +1453,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         extend_lens_list = [int(x) for x in extend_lens]
         if not extend_lens_list:
             raise RuntimeError("DSpark prefill expected non-empty extend_lens.")
-        bootstrap_predict_ids = self._prefill_bootstrap_predict_ids(
-            model_worker_batch,
-            next_token_ids,
-            extend_lens_list,
-        )
-        if len(set(extend_lens_list)) == 1:
-            bootstrap_global_num_reqs = self._prefill_bootstrap_global_req_counts(
-                model_worker_batch.global_num_tokens,
-                extend_lens_list[0],
-            )
-            self._run_draft_bootstrap_forward(
-                batch=model_worker_batch,
-                main_hidden=logits_output.hidden_states,
-                input_ids=bootstrap_predict_ids,
-                positions=positions,
-                out_cache_loc=model_worker_batch.out_cache_loc,
-                seq_lens=draft_seq_lens,
-                req_pool_indices=model_worker_batch.req_pool_indices,
-                dp_decode_global_num_tokens=bootstrap_global_num_reqs,
-                num_tokens_per_req=extend_lens_list[0],
-                use_draft_extend_v2=True,
-            )
-        else:
-            offset = 0
-            for i, extend_len in enumerate(extend_lens_list):
-                next_offset = offset + extend_len
-                bootstrap_global_num_reqs = self._prefill_bootstrap_global_req_counts(
-                    model_worker_batch.global_num_tokens,
-                    extend_len,
-                )
-                self._run_draft_bootstrap_forward(
-                    batch=model_worker_batch,
-                    main_hidden=logits_output.hidden_states[offset:next_offset],
-                    input_ids=bootstrap_predict_ids[offset:next_offset],
-                    positions=positions[offset:next_offset],
-                    out_cache_loc=model_worker_batch.out_cache_loc[offset:next_offset],
-                    seq_lens=draft_seq_lens[i : i + 1],
-                    req_pool_indices=model_worker_batch.req_pool_indices[i : i + 1],
-                    dp_decode_global_num_tokens=bootstrap_global_num_reqs,
-                    num_tokens_per_req=extend_len,
-                    use_draft_extend_v2=True,
-                )
-                offset = next_offset
 
         draft_forward_batch = self._make_draft_prefill_forward_batch_for_materialize(
             model_worker_batch
         )
-        self._materialize_main_hidden_to_draft_compressors(
+        self._materialize_main_hidden_to_draft_state(
             main_hidden=logits_output.hidden_states,
+            cache_loc=model_worker_batch.out_cache_loc,
+            positions=positions,
             draft_forward_batch=draft_forward_batch,
         )
 
