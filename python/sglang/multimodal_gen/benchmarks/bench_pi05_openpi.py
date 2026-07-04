@@ -676,17 +676,19 @@ def compare_first_actions(
 
 def print_summary(result: dict[str, Any]) -> None:
     print(json.dumps(result, indent=2, sort_keys=True))
-    sgl = result["sglang"]["single"].get("mean_ms")
-    opi = result["openpi"]["single"].get("mean_ms")
+    sglang_result = result.get("sglang") or {}
+    openpi_result = result.get("openpi") or {}
+    sgl = sglang_result.get("single", {}).get("mean_ms")
+    opi = openpi_result.get("single", {}).get("mean_ms")
     if sgl and opi:
         print(
             "\nSingle mean latency: "
             f"SGLang={sgl:.2f} ms, OpenPI={opi:.2f} ms, "
             f"speedup={opi / sgl:.2f}x"
         )
-    sgl_batch = result["sglang"]["batch"].get("mean_ms")
-    opi_batch = result["openpi"]["batch"].get("mean_ms")
-    batch_size = result["sglang"].get("batch_size", 0)
+    sgl_batch = sglang_result.get("batch", {}).get("mean_ms")
+    opi_batch = openpi_result.get("batch", {}).get("mean_ms")
+    batch_size = sglang_result.get("batch_size") or openpi_result.get("batch_size", 0)
     if sgl_batch and opi_batch and batch_size:
         print(
             "Batch mean latency: "
@@ -724,6 +726,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-prefix-cache", action="store_true")
     parser.add_argument("--disable-cuda-graph", action="store_true")
     parser.add_argument("--deterministic-noise", action="store_true")
+    parser.add_argument("--skip-sglang", action="store_true")
+    parser.add_argument("--skip-openpi", action="store_true")
     parser.add_argument("--output-file", default="")
     return parser.parse_args()
 
@@ -752,6 +756,8 @@ def main() -> None:
         args.seed,
     )
     noise = None
+    if args.skip_sglang and args.skip_openpi:
+        raise ValueError("At least one backend must be enabled")
     if args.deterministic_noise:
         if profile.sglang_action_horizon != profile.openpi_action_horizon:
             raise ValueError(
@@ -765,7 +771,10 @@ def main() -> None:
             dtype=np.float32,
         )
 
-    if args.sglang_api == "openpi_ws":
+    payloads = []
+    if args.skip_sglang:
+        pass
+    elif args.sglang_api == "openpi_ws":
         payloads = [
             build_sglang_openpi_ws_payload(
                 profile,
@@ -790,14 +799,19 @@ def main() -> None:
             for observation in sglang_observations
         ]
 
-    openpi_policy = create_openpi_policy(
-        openpi_config,
-        openpi_checkpoint,
-        pytorch_device=args.openpi_device,
-        num_inference_steps=args.num_inference_steps,
-    )
+    openpi_policy = None
+    if not args.skip_openpi:
+        openpi_policy = create_openpi_policy(
+            openpi_config,
+            openpi_checkpoint,
+            pytorch_device=args.openpi_device,
+            num_inference_steps=args.num_inference_steps,
+        )
 
-    if args.sglang_api == "openpi_ws":
+    sglang_result = None
+    if args.skip_sglang:
+        pass
+    elif args.sglang_api == "openpi_ws":
         sglang_result = run_sglang_openpi_ws(
             args.sglang_url,
             payloads,
@@ -814,15 +828,17 @@ def main() -> None:
             batch_size=args.batch_size,
             timeout_s=args.timeout_s,
         )
-    openpi_result = run_openpi_policy(
-        openpi_policy,
-        openpi_observations,
-        warmup=args.warmup,
-        repeats=args.repeats,
-        batch_size=args.batch_size,
-        noise=noise,
-        batch_mode=args.openpi_batch_mode,
-    )
+    openpi_result = None
+    if openpi_policy is not None:
+        openpi_result = run_openpi_policy(
+            openpi_policy,
+            openpi_observations,
+            warmup=args.warmup,
+            repeats=args.repeats,
+            batch_size=args.batch_size,
+            noise=noise,
+            batch_mode=args.openpi_batch_mode,
+        )
 
     result = {
         "profile": profile.name,
@@ -836,19 +852,27 @@ def main() -> None:
         "warmup": args.warmup,
         "deterministic_noise": args.deterministic_noise,
         "action_diff": compare_first_actions(
-            sglang_result.get("first_output"),
-            openpi_result.get("first_output"),
+            None if sglang_result is None else sglang_result.get("first_output"),
+            None if openpi_result is None else openpi_result.get("first_output"),
         ),
-        "sglang": {
-            key: value
-            for key, value in sglang_result.items()
-            if key not in ("first_output",)
-        },
-        "openpi": {
-            key: value
-            for key, value in openpi_result.items()
-            if key not in ("first_output",)
-        },
+        "sglang": (
+            None
+            if sglang_result is None
+            else {
+                key: value
+                for key, value in sglang_result.items()
+                if key not in ("first_output",)
+            }
+        ),
+        "openpi": (
+            None
+            if openpi_result is None
+            else {
+                key: value
+                for key, value in openpi_result.items()
+                if key not in ("first_output",)
+            }
+        ),
     }
     if args.output_file:
         with open(args.output_file, "w", encoding="utf-8") as f:
