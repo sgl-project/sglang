@@ -162,7 +162,7 @@ if _HAVE_TRITON:
     def _gdn_step_kernel(
         q_ptr, k_ptr, v_ptr, a_ptr, b_ptr, Alog_ptr, dtb_ptr,  # new token: q/k [B,HK,Dk], v [B,HV,Dv], a/b [B,HV]
         qn_ptr, kn_ptr, kb_ptr, vb_ptr, g_ptr, gcum_ptr, A_ptr, T_ptr,
-        vnew_ptr, S_ptr, out_ptr, Snew_ptr, i_ptr,
+        vnew_ptr, S_ptr, out_ptr, i_ptr, inext_ptr,
         scale, HV: tl.constexpr, HK: tl.constexpr, Dk: tl.constexpr, Dv: tl.constexpr,
         CS: tl.constexpr, QR: tl.constexpr,
     ):
@@ -278,12 +278,21 @@ if _HAVE_TRITON:
         core_row = tl.sum(tl.where(qr[:, None] == 0, core, 0.0), 0)
         tl.store(out_ptr + (bt * HV + h) * Dv + dv, core_row)
         tl.store(vnew_ptr + (base + i) * Dv + dv, vnew_row)
+        # In-kernel width advance + boundary fold (was python-side, blocking cuda-graph capture).
+        # On the 64th token fold Snew straight into the boundary S (S already read into registers
+        # above, so overwriting S_ptr here is safe) and restart the partial chunk at width 0; else
+        # advance to width W. inext_ptr is a separate buffer from i_ptr so this store never races the
+        # in-flight reads of i_ptr this launch (python swaps the two buffers between launches). All HV
+        # programs for this slot write the SAME next width, so the concurrent stores are a benign tie.
         if W == CS:
             glast = tl.sum(tl.where(r == (CS - 1), gcum, 0.0), 0)
             kdec = kn * libdevice.exp(glast - gcum)[:, None]
             upd = tl.where(dk[:, None] >= 0, tl.dot(tl.trans(kdec), vnew_full, input_precision="ieee"), 0.0)
             Snew = S * libdevice.exp(glast) + upd
-            tl.store(Snew_ptr + (bt * HV + h) * Dk * Dv + dk[:, None] * Dv + dv[None, :], Snew)
+            tl.store(S_ptr + (bt * HV + h) * Dk * Dv + dk[:, None] * Dv + dv[None, :], Snew)
+            tl.store(inext_ptr + bt, 0)
+        else:
+            tl.store(inext_ptr + bt, W)
 
 
 def _solve_fwd_sub(attn: torch.Tensor) -> torch.Tensor:
@@ -775,13 +784,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         z = lambda *s: torch.zeros(*s, device=device, dtype=torch.float32)
         return {
             "boundary": z(1, HV, Dk, Dv),
-            "Snew": z(1, HV, Dk, Dv),
             "qn": z(C, HV, Dk), "kn": z(C, HV, Dk), "kb": z(C, HV, Dk), "vb": z(C, HV, Dv),
             "g": z(HV, C), "gcum": z(HV, C), "A_row": z(HV, C),
             "T": z(HV, C, C), "vnew": z(HV, C, Dv),
             "out": z(1, HV, Dv),
+            # GPU-resident width double-buffer: kernel reads i_buf, writes the next width to inext_buf;
+            # python swaps the two references between launches (no GPU sync, no cuda-graph break).
             "i_buf": torch.zeros(1, device=device, dtype=torch.int32),
-            "w": 0,
+            "inext_buf": torch.zeros(1, device=device, dtype=torch.int32),
         }
 
     def _gdn_incr_advance(self, entry, layer, q_tok, k_tok, v_tok, a_tok, b_tok):
@@ -792,28 +802,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
         C = FLA_CHUNK_SIZE
         HV, HK = layer.num_v_heads, layer.num_k_heads
         Dk, Dv = layer.head_k_dim, layer.head_v_dim
-        i = entry["w"]
-        entry["i_buf"].fill_(i)
-        it = entry["i_buf"]
         scale = 1.0 / (Dk ** 0.5)
         # Whole decode step in one launch: prep + gcum append + A row + T-row append + core/v_new +
-        # boundary fold. gcum[i]=gcum[i-1]+g[i] is in-kernel (bit-identical to the shared serial scan).
+        # in-kernel width advance + boundary fold. gcum[i]=gcum[i-1]+g[i] is in-kernel (bit-identical
+        # to the shared serial scan). Width is GPU-resident (i_buf); the kernel writes the next width
+        # to inext_buf and, on the 64th token, folds Snew straight into boundary and restarts at 0.
+        # No python-side GPU->CPU sync, so this composes with cuda-graph capture. Stale T/vnew/g rows
+        # after a fold are never read (all downstream loads mask on r<i / r<W), so no reset needed.
         _gdn_step_kernel[(HV,)](
             q_tok, k_tok, v_tok, a_tok, b_tok, layer.A_log, layer.dt_bias,
             entry["qn"], entry["kn"], entry["kb"], entry["vb"], entry["g"], entry["gcum"],
-            entry["A_row"], entry["T"], entry["vnew"], entry["boundary"], entry["out"], entry["Snew"], it,
+            entry["A_row"], entry["T"], entry["vnew"], entry["boundary"], entry["out"],
+            entry["i_buf"], entry["inext_buf"],
             scale, HV=HV, HK=HK, Dk=Dk, Dv=Dv, CS=C, QR=16, num_warps=8,
         )
-        w = i + 1
-        core = entry["out"][0]
-        if w == C:
-            # Completed a 64-chunk: fold the fresh boundary and reset the partial-chunk state.
-            entry["boundary"].copy_(entry["Snew"])
-            entry["w"] = 0
-            entry["T"].zero_(); entry["vnew"].zero_(); entry["g"].zero_()
-        else:
-            entry["w"] = w
-        return core
+        # Swap width buffers: this step's inext becomes next step's i (no copy, no sync).
+        entry["i_buf"], entry["inext_buf"] = entry["inext_buf"], entry["i_buf"]
+        return entry["out"][0]
 
     def _gdn_chunk_replay_decode(
         self,
