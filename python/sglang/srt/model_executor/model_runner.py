@@ -142,7 +142,7 @@ from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -528,12 +528,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Model-specific adjustment
         self.model_specific_adjustment()
 
-        # Set the global server_args in the scheduler process
-        set_global_server_args_for_scheduler(server_args)
-        global_server_args = get_global_server_args()
-
-        # FIXME: hacky set `use_mla_backend`
-        global_server_args.use_mla_backend = self.use_mla_backend
+        # Set the global server_args in the scheduler process (target worker
+        # only, so a draft init cannot clobber target-derived global state).
+        if not self.is_draft_worker:
+            set_global_server_args_for_scheduler(server_args)
+            # FIXME: hacky set `use_mla_backend`
+            get_global_server_args().use_mla_backend = self.use_mla_backend
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
@@ -1064,7 +1064,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def remote_instance_init_transfer_engine(self):
         try:
             from mooncake.engine import TransferEngine
-        except ImportError as e:
+        except ImportError:
             logger.warning(
                 "Please install mooncake for using remote instance transfer engine: pip install mooncake-transfer-engine"
             )
@@ -1128,6 +1128,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
     def model_specific_adjustment(self):
+        if self.is_draft_worker:
+            return
+
         server_args = self.server_args
 
         # HRM-Text needs bidirectional prompt attention (prefill), which only the
@@ -3072,6 +3075,54 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         return output
 
+    def _maybe_execute_deferred_mamba_cow_and_clear(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        """Run deferred clear/COW on the forward stream, before the mamba layers
+        read the pool, so the copies don't race the scheduler copy stream.
+
+        No-op unless this is an extend forward on a mamba model's target worker;
+        COW/clear only happen at prefix match on extend.
+        """
+        pool = self.req_to_token_pool
+        if (
+            not isinstance(pool, HybridReqToTokenPool)
+            or self.is_draft_worker
+            or not forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            return
+        if (
+            forward_batch.mamba_clear_indices is not None
+            and len(forward_batch.mamba_clear_indices) > 0
+        ):
+            # mamba_pool is a pure PHYSICAL store; translate before zeroing or
+            # clear_slots zeroes the wrong physical slots.
+            pool.mamba_pool.clear_slots(
+                pool.translate_mamba_indices(forward_batch.mamba_clear_indices)
+            )
+        if (
+            forward_batch.mamba_cow_src_indices is not None
+            and len(forward_batch.mamba_cow_src_indices) > 0
+        ):
+            if pool.mamba_ckpt_pool is not None:
+                # int8 checkpoints: dequantize src int8 ckpt slot into the active bf16 dst.
+                pool.mamba_ckpt_pool.load_to_active(
+                    pool.mamba_pool,
+                    forward_batch.mamba_cow_src_indices,
+                    forward_batch.mamba_cow_dst_indices,
+                )
+            else:
+                # mamba_pool is a pure PHYSICAL store; translate both COW slot ids.
+                pool.mamba_pool.copy_from(
+                    pool.translate_mamba_indices(forward_batch.mamba_cow_src_indices),
+                    pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
+                )
+        forward_batch.mamba_clear_indices = None
+        forward_batch.mamba_cow_src_indices = None
+        forward_batch.mamba_cow_dst_indices = None
+
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
@@ -3118,6 +3169,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # global_dp_buffer_len / padded token counts that graph eligibility
             # and the collectives depend on.
             self._prepare_eager_forward_batch(forward_batch)
+
+            # Deferred mamba COW/clear on the forward stream, before the extend
+            # dispatch below reads the pool.
+            self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
 
             if forward_batch.forward_mode.is_split_prefill():
                 # Layer-split mode; stays on ModelRunner, not the eager runner.

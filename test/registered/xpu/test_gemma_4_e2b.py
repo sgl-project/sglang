@@ -53,7 +53,6 @@ XPU_SERVER_ARGS = [
     "intel_xpu",
     "--model-impl",
     "sglang",
-    "--disable-decode-cuda-graph",
 ]
 
 # Standard sglang e2e Q&A prompt (see test_openai_server.py::run_chat_completion).

@@ -177,19 +177,19 @@ struct CausalConv3dCatPadKernel {
     auto out_h = SymbolicSize{"out_h"};
     auto out_w = SymbolicSize{"out_w"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({bsz, channels, t_size, h_size, w_size})
         .with_dtype<T>()
-        .template with_device<kDLCUDA>(device)
+        .template with_device<kDLGPU>(device)
         .verify(x);
     TensorMatcher({bsz, channels, cache_t, h_size, w_size})
         .with_dtype<T>()
-        .template with_device<kDLCUDA>(device)
+        .template with_device<kDLGPU>(device)
         .verify(cache);
     TensorMatcher({bsz, channels, out_t, out_h, out_w})
         .with_dtype<T>()
-        .template with_device<kDLCUDA>(device)
+        .template with_device<kDLGPU>(device)
         .verify(out);
 
     const int64_t depth_left = pad_d_left - cache_t.unwrap();

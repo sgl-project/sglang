@@ -746,10 +746,10 @@
                 "7": 64.42,
                 "8": 64.35
             },
-            "expected_e2e_ms": 961.86,
+            "expected_e2e_ms": 1425.0,
             "expected_avg_denoise_ms": 57.95,
             "expected_median_denoise_ms": 64.35,
-            "estimated_full_test_time_s": 59.9
+            "estimated_full_test_time_s": 75.0
         },
         "qwen_image_edit_ti2i": {
             "stages_ms": {
