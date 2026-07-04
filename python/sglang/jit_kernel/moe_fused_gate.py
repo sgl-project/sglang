@@ -167,6 +167,9 @@ def _router_triton_kernel(
 
     biased = tl.where(mask_n[None, :], biased, -float("inf"))  # [BLOCK_M, BLOCK_N]
 
+    # Map NaN -> a finite floor
+    biased = tl.where(biased == biased, biased, -1e30)  # [BLOCK_M, BLOCK_N]
+
     # Grouped routing (DeepSeek-V3 noaux_tc): per-group score = sum of the top-2
     # biased values; keep TOPK_GROUP groups (lowest group id wins ties); mask the
     # experts of dropped groups to -inf before the top-k below. Weight is still the

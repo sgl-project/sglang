@@ -510,6 +510,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
         warmup=False,
         server_warmup=False,
         warmup_resolutions=None,
+        enable_torch_compile=False,
         disagg_role=None,
         explicit=(),
     ):
@@ -520,6 +521,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
         sa.warmup = warmup
         sa.server_warmup = server_warmup
         sa.warmup_resolutions = warmup_resolutions
+        sa.enable_torch_compile = enable_torch_compile
         sa.disagg_role = RoleType.MONOLITHIC if disagg_role is None else disagg_role
         sa._explicit_arg_names = set(explicit)
         sa._adjust_warmup()
@@ -589,11 +591,39 @@ class TestWarmupModeNormalization(unittest.TestCase):
         self.assertFalse(sa.server_warmup)
         self.assertEqual(sa.warmup_mode, "request")
 
+    def test_torch_compile_defaults_to_server_warmup(self):
+        sa = self._resolve(enable_torch_compile=True)
+
+        self.assertEqual(sa.warmup_mode, "server")
+        self.assertTrue(sa.warmup)
+        self.assertTrue(sa.server_warmup)
+
     def test_legacy_warmup_on_uses_defaulted_server_mode(self):
         # `serve --warmup` (legacy ON, mode defaulted to "server" but not
         # explicit) must resolve to server-based warmup, not silently downgrade
         # to request mode.
         sa = self._resolve(warmup_mode="server", warmup=True, explicit=("warmup",))
+
+        self.assertEqual(sa.warmup_mode, "server")
+        self.assertTrue(sa.warmup)
+        self.assertTrue(sa.server_warmup)
+
+    def test_torch_compile_respects_explicit_warmup_off(self):
+        sa = self._resolve(
+            warmup_mode="off",
+            enable_torch_compile=True,
+            explicit=("warmup_mode",),
+        )
+        self.assertEqual(sa.warmup_mode, "off")
+        self.assertFalse(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+
+    def test_torch_compile_uses_server_warmup_for_explicit_resolutions(self):
+        sa = self._resolve(
+            warmup_resolutions=["1024x1024"],
+            enable_torch_compile=True,
+            explicit=("warmup_resolutions",),
+        )
         self.assertEqual(sa.warmup_mode, "server")
         self.assertTrue(sa.warmup)
         self.assertTrue(sa.server_warmup)
@@ -623,6 +653,14 @@ class TestWarmupModeNormalization(unittest.TestCase):
         self.assertTrue(sa.warmup)
         self.assertFalse(sa.server_warmup)
         self.assertEqual(sa.warmup_mode, "request")
+
+    def test_torch_compile_server_warmup_disabled_for_disagg_role(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        sa = self._resolve(enable_torch_compile=True, disagg_role=RoleType.DENOISER)
+        self.assertEqual(sa.warmup_mode, "request")
+        self.assertTrue(sa.warmup)
+        self.assertFalse(sa.server_warmup)
 
     def test_invalid_mode_raises(self):
         with self.assertRaises(ValueError):

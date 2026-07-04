@@ -1184,6 +1184,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not server_args.disable_chunked_prefix_cache:
             log_info_on_rank0(logger, "Chunked prefix cache is turned on.")
 
+        # The imperative adjustments above may overwrite fields the resolution passes
+        # already declared (HRM-Text forces attention_backend); redeclare the
+        # adjusted values so publish parity holds.
+        from sglang.srt.arg_groups.overrides import refresh_declared_fields
+
+        refresh_declared_fields(server_args, ("attention_backend",))
+
     def check_quantized_moe_compatibility(self):
         if (
             quantization_config := getattr(
