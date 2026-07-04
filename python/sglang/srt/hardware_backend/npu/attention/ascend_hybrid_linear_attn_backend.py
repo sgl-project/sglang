@@ -33,6 +33,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             max_num_tokens % max_bs == 0
         ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
         draft_token_num = max_num_tokens // max_bs
+        self.mamba_track_indices_buf = torch.zeros(
+            (max_bs,), dtype=torch.int64, device=self.device
+        )
         for i in range(max_bs):
             self.state_indices_list.append(
                 torch.full(
@@ -148,6 +151,12 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         mamba_indices[bs - num_padding :] = 0
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        track_buf = None
+        if mamba_track_indices is not None:
+            track_buf = self.mamba_track_indices_buf
+            track_buf[: len(mamba_track_indices)].copy_(
+                self._translate_mamba_indices(mamba_track_indices)
+            )
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
@@ -193,7 +202,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
-                mamba_track_indices=mamba_track_indices,
+                mamba_track_indices=track_buf,
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
@@ -203,7 +212,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_cache_indices_gdn=self.state_indices_list_gdn[bs - 1],
-                mamba_track_indices=mamba_track_indices,
+                mamba_track_indices=track_buf,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
