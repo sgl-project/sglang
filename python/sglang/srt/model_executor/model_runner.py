@@ -48,6 +48,7 @@ from sglang.srt.configs import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3NextConfig,
+    Rwkv7Config,
     ZayaConfig,
 )
 from sglang.srt.configs.device_config import DeviceConfig
@@ -2348,6 +2349,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return config
         return None
 
+    @property
+    def rwkv7_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, Rwkv7Config):
+            return config
+        return None
+
     def _get_linear_attn_registry_result(self):
         if self._linear_attn_registry_cache is _UNSET:
             self._linear_attn_registry_cache = get_linear_attn_config(
@@ -2367,6 +2375,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or self.hybrid_gdn_config
             or self.kimi_linear_config
             or self.hybrid_lightning_config
+            or self.rwkv7_config
         )
         if existing:
             return existing
@@ -2537,7 +2546,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if backend_str not in ATTENTION_BACKENDS:
             raise ValueError(f"Invalid attention backend: {backend_str}")
         self.init_new_workspace = init_new_workspace
-        full_attention_backend = ATTENTION_BACKENDS[backend_str](self)
+        if self.rwkv7_config is not None:
+            # RWKV-7 is all-linear (zero full-attention layers). Do not construct a
+            # real full-attn backend (they probe the empty full KV pool or reject
+            # fp32); HybridLinearAttnBackend only needs a no-op stub here.
+            from sglang.srt.layers.attention.linear.rwkv7_backend import (
+                Rwkv7NoOpFullAttnBackend,
+            )
+
+            full_attention_backend = Rwkv7NoOpFullAttnBackend(self)
+        else:
+            full_attention_backend = ATTENTION_BACKENDS[backend_str](self)
         return attn_backend_wrapper(self, full_attention_backend)
 
     def maybe_init_ngram_embedding(self):

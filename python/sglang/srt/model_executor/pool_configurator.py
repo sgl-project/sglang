@@ -136,6 +136,29 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = mr.num_effective_layers
 
         self._cell_size = self._compute_cell_size(mr, num_layers)
+        # All-linear models (e.g. RWKV-7) have zero full-attention layers ->
+        # cell_size == 0. Token capacity is then not bounded by full-attn KV
+        # memory but by the mamba/linear-state pool concurrency: bound it by
+        # max_mamba_cache_size * context_len, clamped to keep the token
+        # allocator index tensor reasonable.
+        if self._cell_size == 0:
+            assert mr.server_args.max_mamba_cache_size is not None, (
+                "all-linear model needs max_mamba_cache_size resolved before "
+                "pool sizing (handle_max_mamba_cache runs in _profile_available_bytes)"
+            )
+            self._all_linear_token_cap = min(
+                mr.server_args.max_mamba_cache_size * mr.model_config.context_len,
+                1 << 20,
+            )
+            logger.info(
+                "All-linear model: token capacity capped at %d "
+                "(max_mamba_cache_size=%d x context_len=%d, clamp 1<<20).",
+                self._all_linear_token_cap,
+                mr.server_args.max_mamba_cache_size,
+                mr.model_config.context_len,
+            )
+        else:
+            self._all_linear_token_cap = None
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
         # Assumes draft and target share the same per-layer KV size (head_dim,
@@ -279,7 +302,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        max_total_num_tokens = available_bytes // self._cell_size
+        if self._cell_size == 0:
+            max_total_num_tokens = self._all_linear_token_cap
+        else:
+            max_total_num_tokens = available_bytes // self._cell_size
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
