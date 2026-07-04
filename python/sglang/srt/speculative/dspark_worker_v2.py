@@ -365,6 +365,11 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         return [int(x) for x in batch.global_num_tokens]
 
+    def _get_target_aux_hidden_size(self) -> int:
+        target_layer_ids = getattr(self._draft_inner, "target_layer_ids", None) or []
+        hidden_size = int(getattr(self.model_runner.model_config, "hidden_size", 0))
+        return hidden_size * max(1, len(target_layer_ids))
+
     @property
     def target_worker(self) -> TpModelWorker:
         return self._target_worker
@@ -641,10 +646,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         out_cache_loc: torch.Tensor,
         seq_lens: Optional[torch.Tensor] = None,
         req_pool_indices: Optional[torch.Tensor] = None,
+        dp_decode_global_num_tokens: Optional[list[int]] = None,
         num_tokens_per_req: int = 1,
         use_draft_extend_v2: bool = False,
     ) -> None:
-        if main_hidden.numel() == 0:
+        participates_in_dp_decode = (
+            self.server_args.enable_dp_attention
+            and dp_decode_global_num_tokens is not None
+            and any(int(x) > 0 for x in dp_decode_global_num_tokens)
+        )
+        if main_hidden.numel() == 0 and not participates_in_dp_decode:
             return
         if not use_draft_extend_v2:
             raise RuntimeError(
@@ -653,21 +664,31 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         bs = int(len(seq_lens if seq_lens is not None else batch.seq_lens))
         num_tokens = int(input_ids.numel())
-        if bs == 0 or num_tokens == 0:
+        if bs == 0:
+            if num_tokens != 0 or main_hidden.shape[0] != 0:
+                raise RuntimeError(
+                    "DSpark idle draft-extend bootstrap expected empty local "
+                    f"inputs: hidden={tuple(main_hidden.shape)} "
+                    f"input_tokens={num_tokens}"
+                )
+            if not participates_in_dp_decode:
+                return
+        elif num_tokens == 0:
             return
         if main_hidden.shape[0] != num_tokens:
             raise RuntimeError(
                 "DSpark draft bootstrap hidden/input size mismatch: "
                 f"hidden={tuple(main_hidden.shape)} input_tokens={num_tokens}"
             )
-        if num_tokens % bs != 0:
+        if bs > 0 and num_tokens % bs != 0:
             raise RuntimeError(
                 "DSpark draft-extend-v2 bootstrap requires fixed tokens per "
                 f"request: num_tokens={num_tokens} bs={bs}"
             )
-        inferred_tokens_per_req = num_tokens // bs
-        if int(num_tokens_per_req) != inferred_tokens_per_req:
-            num_tokens_per_req = inferred_tokens_per_req
+        if bs > 0:
+            inferred_tokens_per_req = num_tokens // bs
+            if int(num_tokens_per_req) != inferred_tokens_per_req:
+                num_tokens_per_req = inferred_tokens_per_req
 
         old_input_ids = batch.input_ids
         old_out_cache_loc = batch.out_cache_loc
@@ -681,6 +702,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         old_prefix_lens = batch.prefix_lens
         old_extend_lens = batch.extend_lens
         old_extend_num_tokens = batch.extend_num_tokens
+        old_global_num_tokens = batch.global_num_tokens
+        old_global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
         old_attn_backend = self.draft_model_runner.attn_backend
         try:
             if self.draft_extend_attn_backend is None:
@@ -698,6 +721,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 batch.req_pool_indices = req_pool_indices.to(
                     device=self.device, dtype=old_req_pool_indices.dtype
                 )
+            if dp_decode_global_num_tokens is not None:
+                batch.global_num_tokens = dp_decode_global_num_tokens
+                batch.global_num_tokens_for_logprob = dp_decode_global_num_tokens
 
             draft_extend_input = DSparkDraftExtendInput(
                 hidden_states=main_hidden.to(self.device, non_blocking=True),
@@ -743,6 +769,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch.prefix_lens = old_prefix_lens
             batch.extend_lens = old_extend_lens
             batch.extend_num_tokens = old_extend_num_tokens
+            batch.global_num_tokens = old_global_num_tokens
+            batch.global_num_tokens_for_logprob = old_global_num_tokens_for_logprob
             self.draft_model_runner.attn_backend = old_attn_backend
 
     def _materialize_disagg_prefill_hidden_to_draft_state(
@@ -764,11 +792,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 bs,
             )
             return
-        target_layer_ids = getattr(self._draft_inner, "target_layer_ids", None) or []
-        expected_hidden_size = int(
-            getattr(self.model_runner.model_config, "hidden_size", 0)
-        )
-        expected_hidden_size *= max(1, len(target_layer_ids))
+        expected_hidden_size = self._get_target_aux_hidden_size()
         if expected_hidden_size and hidden.shape[-1] != expected_hidden_size:
             logger.warning(
                 "Skip DSpark PD hidden bootstrap due to hidden size mismatch: "
@@ -1587,13 +1611,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             on_publish(new_seq_lens)
 
         hidden = logits_output.hidden_states
-        if hidden is None:
+        if hidden is None and bs > 0:
             raise RuntimeError(
                 "DSpark verify requires target main_hidden states, but got None."
             )
-        if bs > 0:
-            hidden = hidden.view(bs, block_size, -1)
-            hidden_flat = hidden.reshape(-1, hidden.shape[-1])
+        if bs > 0 or participates_in_dp_decode:
+            if hidden is None:
+                hidden = torch.empty(
+                    (0, self._get_target_aux_hidden_size()),
+                    dtype=self.draft_model.lm_head.weight.dtype,
+                    device=device,
+                )
+            if bs > 0:
+                hidden = hidden.view(bs, block_size, -1)
+                hidden_flat = hidden.reshape(-1, hidden.shape[-1])
+            else:
+                hidden_flat = hidden.reshape(0, hidden.shape[-1])
             self._run_draft_bootstrap_forward(
                 batch=model_worker_batch,
                 main_hidden=hidden_flat,
@@ -1601,6 +1634,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 positions=positions,
                 out_cache_loc=verify_out_cache_loc,
                 seq_lens=prefix_lens,
+                dp_decode_global_num_tokens=dp_decode_global_num_tokens,
                 num_tokens_per_req=block_size,
                 use_draft_extend_v2=True,
             )
