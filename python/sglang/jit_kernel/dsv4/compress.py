@@ -102,6 +102,11 @@ def _jit_compress_plan_module() -> Module:
 # Plan tensor sizes (must match the C++ structs in compress.cuh).
 # ----------------------------------------------------------------------------
 _PREFILL_PLAN_BYTES = 24
+# sizeof(CompressPlan)==16, sizeof(WritePlan)==8, sizeof(DecodePlan)==16
+# (static_assert in the C++). The plan out-params are [rows, these widths] uint8.
+_PLAN_C_BYTES = 16
+_PLAN_W_BYTES = 8
+_PLAN_D_BYTES = 16
 
 
 # ----------------------------------------------------------------------------
@@ -130,17 +135,30 @@ class CompressorDecodePlan(NamedTuple):
         swa_page_size: int,
         ring_size: int,
     ) -> CompressorDecodePlan:
+        # Allocate the plan out-param with torch (stream-ordered lifetime) and
+        # pass it in, mirroring generate_online / the prefill path. Previously the
+        # C++ allocated it via ffi::empty and returned it through DLPack, giving it
+        # a non-stream-ordered lifetime -> the caching allocator could recycle the
+        # memory while an enqueued consumer kernel was still reading it (the
+        # cuda-graph-capture wild store / IMA).
+        batch_size = int(req_pool_indices.shape[0])
+        plan_d = torch.empty(
+            (batch_size, _PLAN_D_BYTES),
+            dtype=torch.uint8,
+            device=req_pool_indices.device,
+        )
         module = _jit_compress_plan_module()
-        plan_d = module.plan_decode(
+        module.plan_decode(
             req_pool_indices,
             req_to_token,
             full_to_state,
             seq_lens,
+            plan_d,
             int(compress_ratio),
             int(swa_page_size),
             int(ring_size),
         )
-        return CompressorDecodePlan(compress_ratio, torch.from_dlpack(plan_d))
+        return CompressorDecodePlan(compress_ratio, plan_d)
 
     @staticmethod
     def generate_legacy(
@@ -148,9 +166,15 @@ class CompressorDecodePlan(NamedTuple):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
     ) -> CompressorDecodePlan:
+        batch_size = int(req_pool_indices.shape[0])
+        plan_d = torch.empty(
+            (batch_size, _PLAN_D_BYTES),
+            dtype=torch.uint8,
+            device=req_pool_indices.device,
+        )
         module = _jit_compress_plan_module()
-        plan_d = module.plan_decode_legacy(req_pool_indices, seq_lens, compress_ratio)
-        return CompressorDecodePlan(compress_ratio, torch.from_dlpack(plan_d))
+        module.plan_decode_legacy(req_pool_indices, seq_lens, plan_d, compress_ratio)
+        return CompressorDecodePlan(compress_ratio, plan_d)
 
     @staticmethod
     def generate_online(
@@ -211,14 +235,29 @@ class CompressorPrefillPlan(NamedTuple):
             dtype=torch.uint8,
             pin_memory=not is_gpu_input,
         )
+        # Allocate the plan out-params with torch (stream-ordered lifetime) and
+        # pass them in, mirroring the online path. Previously the C++ allocated
+        # them via ffi::empty and returned them through DLPack, giving them a
+        # non-stream-ordered lifetime: dropping the Python ref let the caching
+        # allocator recycle the memory while an enqueued consumer kernel was
+        # still reading it (the cuda-graph-capture wild store / IMA).
+        device = req_pool_indices.device
+        plan_c_dev = torch.empty(
+            (num_q_tokens, _PLAN_C_BYTES), dtype=torch.uint8, device=device
+        )
+        plan_w_dev = torch.empty(
+            (num_q_tokens, _PLAN_W_BYTES), dtype=torch.uint8, device=device
+        )
         module = _jit_compress_plan_module()
-        plan_c, plan_w = module.plan_prefill(
+        num_c, num_w = module.plan_prefill(
             req_pool_indices,
             req_to_token,
             full_to_state,
             seq_lens,
             extend_lens,
             pin_buffer,
+            plan_c_dev,
+            plan_w_dev,
             int(num_q_tokens),
             int(compress_ratio),
             int(swa_page_size),
@@ -227,8 +266,8 @@ class CompressorPrefillPlan(NamedTuple):
         )
         return CompressorPrefillPlan(
             compress_ratio,
-            torch.from_dlpack(plan_c),
-            torch.from_dlpack(plan_w),
+            plan_c_dev[: int(num_c)],
+            plan_w_dev[: int(num_w)],
             pin_buffer,
         )
 

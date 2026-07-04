@@ -460,6 +460,8 @@ __global__ void plan_compress_decode_legacy_kernel(const DecodeParamsLegacy para
 }
 
 using PrefillPlan = tvm::ffi::Tuple<tvm::ffi::Tensor, tvm::ffi::Tensor>;
+// (num_c, num_w) counts; plan tensors are now caller-allocated out-params.
+using PrefillPlanCounts = tvm::ffi::Tuple<uint32_t, uint32_t>;
 
 /**
  * \brief Build c4/c128 prefill plan tensors. CPU-resident.
@@ -477,13 +479,24 @@ using PrefillPlan = tvm::ffi::Tuple<tvm::ffi::Tensor, tvm::ffi::Tensor>;
  * @param use_cuda_graph Whether the plans will be used with cuda graph (affects padding)
  * @return (compress plan tensor, write plan tensor)
  */
-inline PrefillPlan plan_compress_prefill(
+// Root-fix: the compress plan tensors (plan_c/plan_w) are consumed by
+// downstream store kernels that stay in flight past this call (esp. during
+// cuda-graph capture warmup). Allocating them internally via ffi::empty and
+// handing them back through DLPack gave them a non-stream-ordered lifetime:
+// once the Python ref dropped, the caching allocator could recycle the memory
+// while an enqueued consumer kernel was still reading it -> wild store / IMA.
+// Mirror the online path: the caller (Python) allocates plan_c_dev_/plan_w_dev_
+// with torch (stream-ordered lifetime) and passes them in as out-params; we
+// fill them and return the (num_c, num_w) counts.
+inline PrefillPlanCounts plan_compress_prefill(
     const tvm::ffi::TensorView req_pool_indices,  // GPU
     const tvm::ffi::TensorView req_to_token,      // GPU
     const tvm::ffi::TensorView full_to_state,     // GPU
     const tvm::ffi::TensorView seq_lens,          // CPU/GPU
     const tvm::ffi::TensorView extend_lens,       // CPU/GPU
     const tvm::ffi::TensorView pin_buffer,        // CPU
+    const tvm::ffi::TensorView plan_c_dev_,       // GPU out (torch-allocated)
+    const tvm::ffi::TensorView plan_w_dev_,       // GPU out (torch-allocated)
     const uint32_t num_q_tokens,
     const int32_t compress_ratio,
     const int32_t swa_page_size,
@@ -517,6 +530,19 @@ inline PrefillPlan plan_compress_prefill(
       .with_dtype<uint8_t>()
       .with_device<kDLCPU>()
       .verify(pin_buffer);
+  // Caller-allocated GPU out-params: [>= num_q_tokens, sizeof(Plan*)] uint8.
+  TensorMatcher({-1, sizeof(PlanC)})  //
+      .with_dtype<uint8_t>()
+      .with_device(device_)
+      .verify(plan_c_dev_);
+  TensorMatcher({-1, sizeof(PlanW)})  //
+      .with_dtype<uint8_t>()
+      .with_device(device_)
+      .verify(plan_w_dev_);
+  RuntimeCheck(
+      static_cast<uint32_t>(plan_c_dev_.size(0)) >= num_q_tokens &&
+          static_cast<uint32_t>(plan_w_dev_.size(0)) >= num_q_tokens,
+      "plan out-params must have >= num_q_tokens rows");
 
   const bool is_overlap = (compress_ratio == 4);
   const int32_t window_size = compress_ratio * (is_overlap ? 2 : 1);
@@ -546,11 +572,11 @@ inline PrefillPlan plan_compress_prefill(
     // SWA-translated read/write locations. Used for MTP / cuda-graph capture where
     // a host sync would be expensive.
     RuntimeCheck(batch_size <= kMaxPrefillBatchSize, "GPU plan only support batch size up to ", kMaxPrefillBatchSize);
-    auto C = ffi::empty({num_q_tokens, sizeof(PlanC)}, kDLUInt8, device);
-    auto W = ffi::empty({num_q_tokens, sizeof(PlanW)}, kDLUInt8, device);
+    auto* const plan_c_ptr_dev = static_cast<PlanC*>(plan_c_dev_.data_ptr());
+    auto* const plan_w_ptr_dev = static_cast<PlanW*>(plan_w_dev_.data_ptr());
     const auto params0 = Prefill0Params{
-        .plan_c = static_cast<PlanC*>(C.data_ptr()),
-        .plan_w = static_cast<PlanW*>(W.data_ptr()),
+        .plan_c = plan_c_ptr_dev,
+        .plan_w = plan_w_ptr_dev,
         .seq_lens_ptr = seq_ptr,
         .extend_lens_ptr = ext_ptr,
         .batch_size = batch_size,
@@ -562,8 +588,8 @@ inline PrefillPlan plan_compress_prefill(
     LaunchKernel(1, kMaxPrefillBatchSize, device)(plan_compress_prefill_kernel0, params0);
     // kernel_1 sees the already-padded buffers, so num_c == num_w == num_padded == num_q_tokens.
     const auto params1 = Prefill1Params{
-        .plan_c = static_cast<PlanC*>(C.data_ptr()),
-        .plan_w = static_cast<PlanW*>(W.data_ptr()),
+        .plan_c = plan_c_ptr_dev,
+        .plan_w = plan_w_ptr_dev,
         .rid_ptr = rid_ptr,
         .r2t_ptr = r2t_ptr,
         .f2s_ptr = f2s_ptr,
@@ -580,7 +606,7 @@ inline PrefillPlan plan_compress_prefill(
     const auto block_size_1 = 256;
     const auto num_blocks_1 = div_ceil(params1.num_work, block_size_1);
     LaunchKernel(num_blocks_1, block_size_1, device)(plan_compress_prefill_kernel_1, params1);
-    return PrefillPlan{std::move(C), std::move(W)};
+    return PrefillPlanCounts{num_q_tokens, num_q_tokens};
   }
 
   // CPU input path: only here do we need the pinned scratch buffer.
@@ -633,13 +659,16 @@ inline PrefillPlan plan_compress_prefill(
   };
   const auto num_c_padded = use_cuda_graph ? num_q_tokens : counter_c;
   const auto num_w_padded = use_cuda_graph ? num_q_tokens : counter_w;
-  auto C = ffi::empty({num_c_padded, sizeof(PlanC)}, kDLUInt8, device);
-  auto W = ffi::empty({num_w_padded, sizeof(PlanW)}, kDLUInt8, device);
-  copy_to_device(C.data_ptr(), plan_c_ptr, counter_c);
-  copy_to_device(W.data_ptr(), plan_w_ptr, counter_w);
+  // Write into the caller-allocated (torch, stream-ordered) out-params; they
+  // are sized [>= num_q_tokens] >= num_*_padded, so the copy + kernel_1 pad
+  // stay in bounds and the consumer slices [:num_*_padded].
+  auto* const plan_c_ptr_dev = static_cast<PlanC*>(plan_c_dev_.data_ptr());
+  auto* const plan_w_ptr_dev = static_cast<PlanW*>(plan_w_dev_.data_ptr());
+  copy_to_device(plan_c_ptr_dev, plan_c_ptr, counter_c);
+  copy_to_device(plan_w_ptr_dev, plan_w_ptr, counter_w);
   const auto params = Prefill1Params{
-      .plan_c = static_cast<PlanC*>(C.data_ptr()),
-      .plan_w = static_cast<PlanW*>(W.data_ptr()),
+      .plan_c = plan_c_ptr_dev,
+      .plan_w = plan_w_ptr_dev,
       .rid_ptr = rid_ptr,
       .r2t_ptr = r2t_ptr,
       .f2s_ptr = f2s_ptr,
@@ -656,14 +685,22 @@ inline PrefillPlan plan_compress_prefill(
   const auto block_size = 256;
   const auto num_blocks = div_ceil(params.num_work, block_size);
   LaunchKernel(num_blocks, block_size, device)(plan_compress_prefill_kernel_1, params);
-  return PrefillPlan{std::move(C), std::move(W)};
+  return PrefillPlanCounts{num_c_padded, num_w_padded};
 }
 
-inline tvm::ffi::Tensor plan_compress_decode(
+// Root-fix (mirror plan_compress_prefill): the decode plan tensor is consumed by
+// downstream store/rope kernels that stay in flight past this call (esp. during
+// cuda-graph capture warmup). Allocating it internally via ffi::empty and handing
+// it back through DLPack gave it a non-stream-ordered lifetime: once the Python
+// ref dropped, the caching allocator could recycle the memory while an enqueued
+// consumer kernel was still reading it -> wild store / IMA. The caller (Python)
+// now allocates plan_d_dev_ with torch (stream-ordered lifetime) and passes it in.
+inline void plan_compress_decode(
     const tvm::ffi::TensorView req_pool_indices,  // GPU
     const tvm::ffi::TensorView req_to_token,      // GPU
     const tvm::ffi::TensorView full_to_state,     // GPU
     const tvm::ffi::TensorView seq_lens,          // CPU/GPU
+    const tvm::ffi::TensorView plan_d_dev_,       // GPU out (torch-allocated)
     const int32_t compress_ratio,
     const int32_t swa_page_size,
     const int32_t ring_size) {
@@ -687,12 +724,15 @@ inline tvm::ffi::Tensor plan_compress_decode(
       .with_dtype<IDX_T>()
       .with_device(device_)
       .verify(seq_lens);
+  TensorMatcher({B, sizeof(PlanD)})  //
+      .with_dtype<uint8_t>()
+      .with_device(device_)
+      .verify(plan_d_dev_);
 
   const auto batch_size = static_cast<uint32_t>(B.unwrap());
   const auto device = device_.unwrap();
-  auto D = ffi::empty({batch_size, sizeof(PlanD)}, kDLUInt8, device);
   const auto params = DecodeParams{
-      .plan_d = static_cast<PlanD*>(D.data_ptr()),
+      .plan_d = static_cast<PlanD*>(plan_d_dev_.data_ptr()),
       .rid_ptr = static_cast<const RID_T*>(req_pool_indices.data_ptr()),
       .r2t_ptr = static_cast<const R2T_T*>(req_to_token.data_ptr()),
       .f2s_ptr = static_cast<const F2S_T*>(full_to_state.data_ptr()),
@@ -706,7 +746,6 @@ inline tvm::ffi::Tensor plan_compress_decode(
   const auto block_size = 256;
   const auto num_blocks = div_ceil(batch_size, block_size);
   LaunchKernel(num_blocks, block_size, device)(plan_compress_decode_kernel, params);
-  return D;
 }
 
 /**
@@ -829,9 +868,12 @@ inline PrefillPlan plan_compress_prefill_legacy(
   return PrefillPlan{std::move(C), std::move(W)};
 }
 
-inline tvm::ffi::Tensor plan_compress_decode_legacy(
+// Root-fix (mirror plan_compress_decode): torch-allocated, stream-ordered
+// plan_d_dev_ out-param instead of an ffi::empty tensor returned via DLPack.
+inline void plan_compress_decode_legacy(
     const tvm::ffi::TensorView req_pool_indices,  // GPU
     const tvm::ffi::TensorView seq_lens,          // GPU
+    const tvm::ffi::TensorView plan_d_dev_,       // GPU out (torch-allocated)
     const int32_t compress_ratio) {
   auto B = SymbolicSize{"batch_size"};
   auto device_ = SymbolicDevice{};
@@ -845,13 +887,16 @@ inline tvm::ffi::Tensor plan_compress_decode_legacy(
       .with_dtype<IDX_T>()
       .with_device(device_)
       .verify(seq_lens);
+  TensorMatcher({B, sizeof(PlanD)})  //
+      .with_dtype<uint8_t>()
+      .with_device(device_)
+      .verify(plan_d_dev_);
   RuntimeCheck(compress_ratio == 4 || compress_ratio == 128);
 
   const auto batch_size = static_cast<uint32_t>(B.unwrap());
   const auto device = device_.unwrap();
-  auto D = ffi::empty({batch_size, sizeof(PlanD)}, kDLUInt8, device);
   const auto params = DecodeParamsLegacy{
-      .plan_d = static_cast<PlanD*>(D.data_ptr()),
+      .plan_d = static_cast<PlanD*>(plan_d_dev_.data_ptr()),
       .rid_ptr = static_cast<const RID_T*>(req_pool_indices.data_ptr()),
       .seq_ptr = static_cast<const IDX_T*>(seq_lens.data_ptr()),
       .batch_size = batch_size,
@@ -860,7 +905,6 @@ inline tvm::ffi::Tensor plan_compress_decode_legacy(
   const auto block_size = 256;
   const auto num_blocks = div_ceil(batch_size, block_size);
   LaunchKernel(num_blocks, block_size, device)(plan_compress_decode_legacy_kernel, params);
-  return D;
 }
 
 }  // namespace host::compress
