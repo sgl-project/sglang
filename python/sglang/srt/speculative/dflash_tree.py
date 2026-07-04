@@ -260,9 +260,11 @@ def build_tree_custom_mask(trees, num_verify_tokens, kv_lens, device="cpu"):
     parts = []
     for b, tree in enumerate(trees):
         kv = kv_lens[b]
-        anc = build_ancestor_mask(_padded_parents(tree, n), n)  # [N, N]
-        ctx = torch.ones((n, kv), dtype=torch.bool)  # [N, kv]
-        parts.append(torch.cat([ctx, anc], dim=1).reshape(-1))  # row-major per req
+        ancestor_mask = build_ancestor_mask(_padded_parents(tree, n), n)  # [N, N]
+        context_mask = torch.ones((n, kv), dtype=torch.bool)  # [N, kv]
+        parts.append(
+            torch.cat([context_mask, ancestor_mask], dim=1).reshape(-1)
+        )  # row-major per req
     mask = torch.cat(parts, dim=0)
     return mask.to(device) if device != "cpu" else mask
 

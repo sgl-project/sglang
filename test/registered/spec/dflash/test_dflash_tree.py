@@ -203,8 +203,12 @@ class TestTreeMask(unittest.TestCase):
 
     def test_context_all_allowed(self):
         tree = DFlashDraftTree([0, 1], [-1, 0], [0, 1], 2)
-        mask = build_tree_custom_mask([tree], num_verify_tokens=2, kv_lens=[3])
-        self.assertTrue(bool(mask[: 3 * 2].all()))
+        n, kv = 2, 3
+        mask = build_tree_custom_mask([tree], num_verify_tokens=n, kv_lens=[kv])
+        # Per-row layout is [kv context cols | N block cols] (row-major, matching the
+        # Triton reader's row*kv_len+col indexing). The context columns of every row
+        # must be all-allowed; the block columns carry the ancestor mask.
+        self.assertTrue(bool(mask.view(n, kv + n)[:, :kv].all()))
 
 
 class TestAcceptOracle(unittest.TestCase):

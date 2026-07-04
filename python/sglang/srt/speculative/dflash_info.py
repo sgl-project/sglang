@@ -56,7 +56,7 @@ class DFlashVerifyInput(SpecInput):
         tree_width: int,
         num_nodes: int,
         **kwargs,
-    ) -> "DFlashVerifyInput":
+    ) -> DFlashVerifyInput:
         """Build a tree-mode verify input (#29524): ``topk = tree_width`` and a
         tree-causal ``custom_mask``. Field semantics are unchanged from the linear
         chain case; only the previously-fixed ``topk``/``custom_mask`` are populated."""
@@ -183,7 +183,7 @@ def build_dflash_tree_verify_input(
     base_positions: list[int],
     kv_lens: list[int],
     device,
-) -> Tuple["DFlashVerifyInput", dict]:
+) -> Tuple[DFlashVerifyInput, dict]:
     """Bridge from per-request draft-head top-W output to a tree-mode verify input
     (#29524, JetSpec). Builds one tree per request, materializes the verify buffers +
     tree-causal mask, and packs them into a ``DFlashVerifyInput.from_tree``.
