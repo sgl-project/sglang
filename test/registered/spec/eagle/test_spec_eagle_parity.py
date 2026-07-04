@@ -42,6 +42,10 @@ class TestEagle3ParityXPU(SpecParityKit, _Eagle3ParityBase):
 
     disable_overlap = False
     attention_backend = "triton"
+    # Decode full-graph was active by default when this test was added
+    # (via XPUCudaGraphBackend). Opt in explicitly now that it is disabled
+    # by default so the coverage is preserved.
+    extra_args = ("--cuda-graph-config", '{"decode":{"backend":"full"}}')
 
 
 if __name__ == "__main__":
