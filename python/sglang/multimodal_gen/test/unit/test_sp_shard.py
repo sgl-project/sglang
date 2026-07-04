@@ -143,6 +143,45 @@ def test_strategy_min_len_threshold(monkeypatch):
     assert sps.plan_text_strategy(64) == "shard"
 
 
+# --- join_seqs / split_seqs / shard_seq_prefix ------------------------------
+
+
+def test_join_split_roundtrip_with_pad():
+    # Joint [text, image] with 2 tail-pad rows relocated behind the image.
+    txt = torch.arange(6, dtype=torch.float32).view(1, 6, 1)  # rows 4,5 are pad
+    img = (torch.arange(3, dtype=torch.float32) + 100).view(1, 3, 1)
+    joint = sps.join_seqs(txt, img, local_pad=2)
+    assert joint[0, :, 0].tolist() == [0, 1, 2, 3, 100, 101, 102, 4, 5]
+    txt_back, img_back = sps.split_seqs(joint, prefix_len=6, local_pad=2)
+    assert torch.equal(txt_back, txt) and torch.equal(img_back, img)
+
+
+def test_join_split_roundtrip_no_pad():
+    txt = torch.randn(1, 4, 2)
+    img = torch.randn(1, 3, 2)
+    joint = sps.join_seqs(txt, img, local_pad=0)
+    assert torch.equal(joint, torch.cat([txt, img], dim=1))
+    txt_back, img_back = sps.split_seqs(joint, prefix_len=4, local_pad=0)
+    assert torch.equal(txt_back, txt) and torch.equal(img_back, img)
+
+
+def test_shard_seq_prefix_only_touches_prefix():
+    # Joint RoPE cache [txt(15); img(4)]: text segment shards, image stays.
+    shard = SpShard(orig_len=15, local_len=8, num_pad=1, sp_size=2, sp_rank=1)
+    cache = torch.arange(19, dtype=torch.float32).unsqueeze(-1)
+    out = sps.shard_seq_prefix(cache, 15, shard, dim=0)
+    assert out.shape[0] == 8 + 4
+    assert out[0, 0].item() == 8.0  # rank1 text chunk starts at token 8
+    assert out[-4:, 0].flatten().tolist() == [15, 16, 17, 18]  # image untouched
+
+
+def test_should_shard_text_gate(monkeypatch):
+    _fake_sp(monkeypatch, 2)
+    assert sps.should_shard_text(15) is True
+    _fake_sp(monkeypatch, 1)
+    assert sps.should_shard_text(15) is False
+
+
 # --- gather_seq -------------------------------------------------------------
 
 

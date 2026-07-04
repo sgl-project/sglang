@@ -108,6 +108,75 @@ def gather_seq(local: torch.Tensor, orig_len: int, dim: int = 1) -> torch.Tensor
     return full
 
 
+def shard_seq_prefix(
+    x: torch.Tensor, prefix_len: int, shard: SpShard, dim: int = 0
+) -> torch.Tensor:
+    """Shard only the leading ``prefix_len`` rows (e.g. the text segment of a
+    joint RoPE cache) with an existing plan; the remainder is kept as-is."""
+    rest = x.shape[dim] - prefix_len
+    return torch.cat(
+        [
+            shard_like(x.narrow(dim, 0, prefix_len), shard, dim=dim),
+            x.narrow(dim, prefix_len, rest),
+        ],
+        dim=dim,
+    )
+
+
+def join_seqs(
+    prefix: torch.Tensor, body: torch.Tensor, local_pad: int, dim: int = 1
+) -> torch.Tensor:
+    """Concatenate ``[prefix, body]`` for joint attention, relocating the
+    prefix's ``local_pad`` tail rows behind the body.
+
+    Why: the shard pads the *text* chunk, but the local joint layout is
+    [text, image] - after the ulysses gather that pad would sit mid-sequence
+    ([... txt_last, PAD, img_last]), and attention can only skip a mid-sequence
+    hole by repacking q/k/v. With the pad relocated behind the image, the
+    gathered padding forms one global-tail block that the zero-copy varlen
+    path (tail_attn_meta) skips for free. Same copy volume as a plain cat.
+    """
+    if local_pad > 0:
+        real = prefix.shape[dim] - local_pad
+        return torch.cat(
+            [
+                prefix.narrow(dim, 0, real),
+                body,
+                prefix.narrow(dim, real, local_pad),
+            ],
+            dim=dim,
+        )
+    return torch.cat([prefix, body], dim=dim)
+
+
+def split_seqs(
+    joint: torch.Tensor, prefix_len: int, local_pad: int, dim: int = 1
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Inverse of ``join_seqs``: recover ``(prefix, body)`` from the joint
+    output, with the pad rows rejoining the prefix tail so the residual text
+    stream keeps its per-rank shape (their content is garbage and is excluded
+    from every attention, so carrying them along is free)."""
+    total = joint.shape[dim]
+    if local_pad > 0:
+        real = prefix_len - local_pad
+        body_end = total - local_pad
+        prefix = torch.cat(
+            [joint.narrow(dim, 0, real), joint.narrow(dim, body_end, local_pad)],
+            dim=dim,
+        )
+        return prefix, joint.narrow(dim, real, body_end - real)
+    return (
+        joint.narrow(dim, 0, prefix_len),
+        joint.narrow(dim, prefix_len, total - prefix_len),
+    )
+
+
+def should_shard_text(txt_len: int) -> bool:
+    """True when the joint-attention text stream should be SP-sharded here
+    (see plan_text_strategy for the policy)."""
+    return get_sp_world_size() > 1 and plan_text_strategy(txt_len) == "shard"
+
+
 def tail_attn_meta(
     shard: SpShard,
     batch_size: int,
