@@ -311,7 +311,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         args.model_config.hf_config.dual_chunk_attention_config = None
         return args
 
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
     @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
     def test_combined_attention_backend_fa4_forces_page_size_128(
         self, _mock_mla, _mock_sm100
@@ -323,7 +323,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         self.assertEqual(args.page_size, 128)
 
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
     @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
     def test_explicit_prefill_fa4_forces_page_size_128(self, _mock_mla, _mock_sm100):
         # `--prefill-attention-backend fa4`: the previously-covered path.

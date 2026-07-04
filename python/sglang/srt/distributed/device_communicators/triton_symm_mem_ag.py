@@ -462,6 +462,20 @@ class MultimemAllGatherer:
         self._skip_entry_sync = skip_entry_sync
         # None => always NCCL; _UNINIT => build on first eager call.
         self._state = self._UNINIT if enabled else None
+        if self._state is self._UNINIT:
+            # Lazy import avoids a module-load dependency on the distributed facade.
+            from sglang.srt.distributed import get_tp_group
+            from sglang.srt.distributed.parallel_state import in_the_same_node_as
+
+            tp_group = get_tp_group()
+            if tp_group.world_size > 1 and not all(
+                in_the_same_node_as(tp_group.cpu_group, source_rank=0)
+            ):
+                logger.warning(
+                    "multimem all-gather disabled because the TP group spans "
+                    "across nodes."
+                )
+                self._state = None
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         state = self._state
