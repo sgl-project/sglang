@@ -898,7 +898,11 @@ class Envs:
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
 
-    SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT = EnvBool(True)
+    # Opt-in JIT rewrite of the plain-2D per-token-group fp8 quant. It is
+    # byte-identical to the V2 kernel but reroutes the generic fp8 path (every
+    # model, not just MiniMax), so it stays off by default until a follow-up
+    # lands non-MiniMax before/after + accuracy numbers.
+    SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT = EnvBool(False)
     SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
     SGLANG_DISABLE_MSA = EnvBool(False)
