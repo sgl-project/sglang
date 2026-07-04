@@ -30,9 +30,14 @@ from torch.nn import LayerNorm as LayerNorm
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
-    get_sp_parallel_rank,
     get_sp_world_size,
     get_tp_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.sp_shard import (
+    plan_shard,
+    plan_text_strategy,
+    shard_like,
+    tail_attn_meta,
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
@@ -67,99 +72,6 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
-
-
-def _shard_text_for_sp(
-    encoder_hidden_states: torch.Tensor,
-    freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]],
-    image_seq_len: int,
-    num_txt_tokens: int,
-) -> Tuple[
-    torch.Tensor,
-    Optional[Tuple[torch.Tensor, torch.Tensor]],
-    int,
-    Optional[torch.Tensor],
-    Optional[Dict[str, int]],
-]:
-    sp_size = get_sp_world_size()
-    num_replicated_prefix = num_txt_tokens
-    if sp_size == 1:
-        return encoder_hidden_states, freqs_cis, num_replicated_prefix, None, None
-
-    sp_rank = get_sp_parallel_rank()
-    local_txt_tokens = (num_txt_tokens + sp_size - 1) // sp_size
-    padded_txt_tokens = local_txt_tokens * sp_size
-    num_pad_tokens = padded_txt_tokens - num_txt_tokens
-
-    if num_pad_tokens > 0:
-        pad_hidden_states = encoder_hidden_states.new_zeros(
-            encoder_hidden_states.shape[0],
-            num_pad_tokens,
-            encoder_hidden_states.shape[2],
-        )
-        encoder_hidden_states = torch.cat(
-            [encoder_hidden_states, pad_hidden_states], dim=1
-        )
-
-    encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_size, dim=1)[sp_rank]
-    if freqs_cis is not None:
-        cos, sin = freqs_cis
-        txt_cos = cos[:num_txt_tokens]
-        txt_sin = sin[:num_txt_tokens]
-        if num_pad_tokens > 0:
-            pad_cos = txt_cos.new_ones(num_pad_tokens, txt_cos.shape[1])
-            pad_sin = txt_sin.new_zeros(num_pad_tokens, txt_sin.shape[1])
-            txt_cos = torch.cat([txt_cos, pad_cos], dim=0)
-            txt_sin = torch.cat([txt_sin, pad_sin], dim=0)
-        freqs_cis = (
-            torch.cat(
-                [
-                    torch.chunk(txt_cos, sp_size, dim=0)[sp_rank],
-                    cos[num_txt_tokens:],
-                ],
-                dim=0,
-            ),
-            torch.cat(
-                [
-                    torch.chunk(txt_sin, sp_size, dim=0)[sp_rank],
-                    sin[num_txt_tokens:],
-                ],
-                dim=0,
-            ),
-        )
-
-    num_replicated_prefix = 0
-    if num_pad_tokens == 0:
-        return encoder_hidden_states, freqs_cis, num_replicated_prefix, None, None
-
-    txt_start = sp_rank * local_txt_tokens
-    valid_txt_tokens = min(local_txt_tokens, max(num_txt_tokens - txt_start, 0))
-    text_mask = torch.zeros(
-        encoder_hidden_states.shape[0],
-        local_txt_tokens,
-        dtype=torch.bool,
-        device=encoder_hidden_states.device,
-    )
-    text_mask[:, :valid_txt_tokens] = True
-    image_mask = torch.ones(
-        encoder_hidden_states.shape[0],
-        image_seq_len,
-        dtype=torch.bool,
-        device=encoder_hidden_states.device,
-    )
-    return (
-        encoder_hidden_states,
-        freqs_cis,
-        num_replicated_prefix,
-        torch.cat([text_mask, image_mask], dim=1),
-        {
-            "gap_start": (sp_size - 1) * (local_txt_tokens + image_seq_len)
-            + local_txt_tokens
-            - num_pad_tokens,
-            "gap_end": (sp_size - 1) * (local_txt_tokens + image_seq_len)
-            + local_txt_tokens,
-        },
-    )
 
 
 try:
@@ -600,9 +512,24 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 allow_inplace=True,
             )
 
-            query = torch.cat([encoder_query, query], dim=1)
-            key = torch.cat([encoder_key, key], dim=1)
-            value = torch.cat([encoder_value, value], dim=1)
+            # On the last SP rank relocate the text tail-pad rows behind the
+            # image so the gathered joint sequence pads at its global tail.
+            sp_txt_pad = (attn_mask_meta or {}).get("local_pad", 0)
+            if sp_txt_pad > 0:
+                t_real = text_seq_len - sp_txt_pad
+                query = torch.cat(
+                    [encoder_query[:, :t_real], query, encoder_query[:, t_real:]], dim=1
+                )
+                key = torch.cat(
+                    [encoder_key[:, :t_real], key, encoder_key[:, t_real:]], dim=1
+                )
+                value = torch.cat(
+                    [encoder_value[:, :t_real], value, encoder_value[:, t_real:]], dim=1
+                )
+            else:
+                query = torch.cat([encoder_query, query], dim=1)
+                key = torch.cat([encoder_key, key], dim=1)
+                value = torch.cat([encoder_value, value], dim=1)
         else:
             query, key = apply_qk_norm_with_optional_rope(
                 q=query,
@@ -627,13 +554,23 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         x = x.to(query.dtype)
 
         if encoder_hidden_states is not None:
-            encoder_hidden_states, x = x.split_with_sizes(
-                [
-                    encoder_hidden_states.shape[1],
-                    x.shape[1] - encoder_hidden_states.shape[1],
-                ],
-                dim=1,
-            )
+            if sp_txt_pad > 0:
+                # Pad rows rejoin the text tail so the residual stream keeps its
+                # per-rank shape.
+                t_real = encoder_hidden_states.shape[1] - sp_txt_pad
+                img_end = x.shape[1] - sp_txt_pad
+                encoder_hidden_states = torch.cat(
+                    [x[:, :t_real], x[:, img_end:]], dim=1
+                )
+                x = x[:, t_real:img_end]
+            else:
+                encoder_hidden_states, x = x.split_with_sizes(
+                    [
+                        encoder_hidden_states.shape[1],
+                        x.shape[1] - encoder_hidden_states.shape[1],
+                    ],
+                    dim=1,
+                )
             if not self.pre_only:
                 x, _ = self.to_out[0](x)
                 if len(self.to_out) == 2:
@@ -775,11 +712,28 @@ class FluxSingleTransformerBlock(nn.Module):
         num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         text_seq_len = encoder_hidden_states.shape[1]
-        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        joint_attention_kwargs = joint_attention_kwargs or {}
+        # Same relocation as the double blocks: text tail-pad rows go behind the
+        # image so the gathered sequence pads at its global tail (the caller
+        # hands single blocks a RoPE cache reordered to match).
+        sp_txt_pad = (joint_attention_kwargs.get("attn_mask_meta") or {}).get(
+            "local_pad", 0
+        )
+        if sp_txt_pad > 0:
+            t_real = text_seq_len - sp_txt_pad
+            hidden_states = torch.cat(
+                [
+                    encoder_hidden_states[:, :t_real],
+                    hidden_states,
+                    encoder_hidden_states[:, t_real:],
+                ],
+                dim=1,
+            )
+        else:
+            hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-        joint_attention_kwargs = joint_attention_kwargs or {}
 
         if self.use_nunchaku_structure:
             if _nunchaku_fused_ops_available:
@@ -824,10 +778,18 @@ class FluxSingleTransformerBlock(nn.Module):
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
 
-        encoder_hidden_states, hidden_states = (
-            hidden_states[:, :text_seq_len],
-            hidden_states[:, text_seq_len:],
-        )
+        if sp_txt_pad > 0:
+            t_real = text_seq_len - sp_txt_pad
+            img_end = hidden_states.shape[1] - sp_txt_pad
+            encoder_hidden_states = torch.cat(
+                [hidden_states[:, :t_real], hidden_states[:, img_end:]], dim=1
+            )
+            hidden_states = hidden_states[:, t_real:img_end]
+        else:
+            encoder_hidden_states, hidden_states = (
+                hidden_states[:, :text_seq_len],
+                hidden_states[:, text_seq_len:],
+            )
         return encoder_hidden_states, hidden_states
 
 
@@ -1186,24 +1148,51 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         num_txt_tokens = encoder_hidden_states.shape[1]
         encoder_hidden_states, _ = self.context_embedder(encoder_hidden_states)
 
-        (
-            encoder_hidden_states,
-            freqs_cis,
-            num_replicated_prefix,
-            attn_mask,
-            attn_mask_meta,
-        ) = _shard_text_for_sp(
-            encoder_hidden_states,
-            freqs_cis,
-            hidden_states.shape[1],
-            num_txt_tokens,
-        )
-        if attn_mask is not None:
-            joint_attention_kwargs = (
-                joint_attention_kwargs.copy() if joint_attention_kwargs else {}
+        # Shard the replicated text stream across SP ranks (image latents are
+        # already sharded); non-divisible lengths tail-pad the last rank and the
+        # per-request tail meta lets attention skip the pad for free.
+        num_replicated_prefix = num_txt_tokens
+        singles_freqs_cis = freqs_cis
+        if get_sp_world_size() > 1 and plan_text_strategy(num_txt_tokens) == "shard":
+            txt_shard = plan_shard(num_txt_tokens)
+            encoder_hidden_states = shard_like(encoder_hidden_states, txt_shard)
+            if freqs_cis is not None:
+                cos, sin = freqs_cis
+                cos = torch.cat(
+                    [
+                        shard_like(cos[:num_txt_tokens], txt_shard, dim=0),
+                        cos[num_txt_tokens:],
+                    ]
+                )
+                sin = torch.cat(
+                    [
+                        shard_like(sin[:num_txt_tokens], txt_shard, dim=0),
+                        sin[num_txt_tokens:],
+                    ]
+                )
+                freqs_cis = (cos, sin)
+                singles_freqs_cis = freqs_cis
+            num_replicated_prefix = 0
+            tail_meta = tail_attn_meta(
+                txt_shard,
+                encoder_hidden_states.shape[0],
+                hidden_states.device,
+                image_seq_len=hidden_states.shape[1],
             )
-            joint_attention_kwargs["attn_mask"] = attn_mask
-            joint_attention_kwargs["attn_mask_meta"] = attn_mask_meta
+            if tail_meta is not None:
+                joint_attention_kwargs = (
+                    joint_attention_kwargs.copy() if joint_attention_kwargs else {}
+                )
+                joint_attention_kwargs["attn_mask_meta"] = tail_meta
+                # Single blocks apply RoPE on the relocated [txt_real, img, pad]
+                # layout, so hand them a cache reordered the same way.
+                if freqs_cis is not None:
+                    t_real = txt_shard.local_real_len
+                    t_loc = txt_shard.local_len
+                    singles_freqs_cis = (
+                        torch.cat([cos[:t_real], cos[t_loc:], cos[t_real:t_loc]]),
+                        torch.cat([sin[:t_real], sin[t_loc:], sin[t_real:t_loc]]),
+                    )
 
         if (
             joint_attention_kwargs is not None
@@ -1229,7 +1218,7 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
-                freqs_cis=freqs_cis,
+                freqs_cis=singles_freqs_cis,
                 joint_attention_kwargs=joint_attention_kwargs,
                 num_replicated_prefix=num_replicated_prefix,
             )

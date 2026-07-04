@@ -20,9 +20,13 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_ring_parallel_world_size,
-    get_sp_parallel_rank,
     get_sp_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.sp_shard import (
+    plan_shard,
+    plan_text_strategy,
+    shard_like,
+    tail_attn_meta,
 )
 from sglang.multimodal_gen.runtime.layers.attention import (
     USPAttention,
@@ -78,99 +82,6 @@ def _local_seq_len(seq_len: int, sp_world_size: int) -> int:
     if padded_len % sp_world_size != 0:
         padded_len += sp_world_size - (padded_len % sp_world_size)
     return padded_len // sp_world_size
-
-
-def _shard_text_for_sp(
-    encoder_hidden_states: torch.Tensor,
-    freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]],
-) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-    """Shard the replicated text stream evenly across SP ranks.
-
-    The image latents are already sharded by the pipeline while the text stream
-    is replicated. This splits the text embeddings (and their RoPE cache) so each
-    rank keeps ``1/sp_size`` of the text tokens, making the joint attention fully
-    sequence-sharded (``num_replicated_prefix=0``). Callers must ensure the text
-    length divides evenly across SP ranks.
-    """
-    sp_size = get_sp_world_size()
-    if sp_size == 1:
-        return encoder_hidden_states, freqs_cis
-
-    sp_rank = get_sp_parallel_rank()
-    encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_size, dim=1)[sp_rank]
-
-    if freqs_cis is not None:
-        img_cache, txt_cache = freqs_cis
-        txt_cache = torch.chunk(txt_cache, sp_size, dim=0)[sp_rank]
-        freqs_cis = (img_cache, txt_cache)
-
-    return encoder_hidden_states, freqs_cis
-
-
-def _pad_shard_text_for_sp_varlen(
-    encoder_hidden_states: torch.Tensor,
-    freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]],
-    image_seq_len: int,
-) -> Tuple[
-    torch.Tensor,
-    Optional[Tuple[torch.Tensor, torch.Tensor]],
-    torch.Tensor,
-    Dict[str, int],
-]:
-    """Right-pad a non-divisible replicated text stream to a multiple of the SP
-    world size and shard it evenly across ranks, so the joint ``[text, image]``
-    sequence is fully sequence-parallel.
-
-    The pad tokens occupy a single contiguous block at the tail of the last
-    rank's text chunk. The returned ``attn_mask`` (joint ``[text, image]``
-    validity mask) and ``attn_mask_meta`` (``gap_start`` / ``gap_end``) describe
-    that block so ``USPAttention`` excludes it from attention via the varlen
-    kernel.
-
-    Callers must ensure the text length is NOT divisible by the SP world size;
-    the evenly-divisible case is a plain ``_shard_text_for_sp`` with no mask.
-
-    Returns ``(encoder_hidden_states, freqs_cis, attn_mask, attn_mask_meta)``.
-    """
-    sp_size = get_sp_world_size()
-    t_real = encoder_hidden_states.shape[1]
-    num_pad = sp_size - t_real % sp_size
-
-    encoder_hidden_states = F.pad(encoder_hidden_states, (0, 0, 0, num_pad))
-    if freqs_cis is not None:
-        img_cache, txt_cache = freqs_cis
-        txt_cache = F.pad(txt_cache, (0, 0, 0, num_pad))
-        freqs_cis = (img_cache, txt_cache)
-
-    local_txt = (t_real + num_pad) // sp_size
-    encoder_hidden_states, freqs_cis = _shard_text_for_sp(
-        encoder_hidden_states, freqs_cis
-    )
-
-    sp_rank = get_sp_parallel_rank()
-    txt_start = sp_rank * local_txt
-    valid_txt = min(local_txt, max(t_real - txt_start, 0))
-    text_mask = torch.zeros(
-        encoder_hidden_states.shape[0],
-        local_txt,
-        dtype=torch.bool,
-        device=encoder_hidden_states.device,
-    )
-    text_mask[:, :valid_txt] = True
-    image_mask = torch.ones(
-        encoder_hidden_states.shape[0],
-        image_seq_len,
-        dtype=torch.bool,
-        device=encoder_hidden_states.device,
-    )
-    joint_mask = torch.cat([text_mask, image_mask], dim=1)
-    # Gathered joint layout is rank-major [txt_0, img_0, ..., txt_{sp-1},
-    # img_{sp-1}]; the pad block is the tail of the last rank's text chunk.
-    gap_meta = {
-        "gap_start": (sp_size - 1) * (local_txt + image_seq_len) + local_txt - num_pad,
-        "gap_end": (sp_size - 1) * (local_txt + image_seq_len) + local_txt,
-    }
-    return encoder_hidden_states, freqs_cis, joint_mask, gap_meta
 
 
 def _get_qkv_projections(
@@ -776,6 +687,8 @@ class QwenImageCrossAttention(nn.Module):
         # When the text stream is sharded across SP ranks the joint sequence is
         # fully sequence-parallel, so no leading tokens are replicated.
         sp_text_sharded = cross_attention_kwargs.get("sp_text_sharded", False)
+        # Rows of tail padding inside THIS rank's text chunk (sp_shard meta).
+        sp_txt_pad = (attn_mask_meta or {}).get("local_pad", 0)
 
         (
             img_query,
@@ -834,11 +747,24 @@ class QwenImageCrossAttention(nn.Module):
                 txt_query, txt_key, txt_cache, is_neox=False
             )
 
-        # Concatenate for joint attention
-        # Order: [text, image]
-        joint_query = torch.cat([txt_query, img_query], dim=1)
-        joint_key = torch.cat([txt_key, img_key], dim=1)
-        joint_value = torch.cat([txt_value, img_value], dim=1)
+        # Concatenate for joint attention. Order: [text, image]; on the last SP
+        # rank the text tail-pad rows are relocated behind the image so the
+        # gathered joint sequence keeps all padding in one global-tail block.
+        txt_real = seq_len_txt - sp_txt_pad
+        if sp_txt_pad > 0:
+            joint_query = torch.cat(
+                [txt_query[:, :txt_real], img_query, txt_query[:, txt_real:]], dim=1
+            )
+            joint_key = torch.cat(
+                [txt_key[:, :txt_real], img_key, txt_key[:, txt_real:]], dim=1
+            )
+            joint_value = torch.cat(
+                [txt_value[:, :txt_real], img_value, txt_value[:, txt_real:]], dim=1
+            )
+        else:
+            joint_query = torch.cat([txt_query, img_query], dim=1)
+            joint_key = torch.cat([txt_key, img_key], dim=1)
+            joint_value = torch.cat([txt_value, img_value], dim=1)
         if attn_mask is None and encoder_hidden_states_mask is not None:
             image_mask = torch.ones(
                 (hidden_states.shape[0], img_query.shape[1]),
@@ -864,9 +790,21 @@ class QwenImageCrossAttention(nn.Module):
         joint_hidden_states = joint_hidden_states.flatten(2, 3)
         joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
 
-        # Split attention outputs back
-        txt_attn_output = joint_hidden_states[:, :seq_len_txt, :]  # Text part
-        img_attn_output = joint_hidden_states[:, seq_len_txt:, :]  # Image part
+        # Split attention outputs back (pad rows rejoin the text tail so the
+        # residual text stream keeps its per-rank shape).
+        if sp_txt_pad > 0:
+            img_end = joint_hidden_states.shape[1] - sp_txt_pad
+            img_attn_output = joint_hidden_states[:, txt_real:img_end, :]
+            txt_attn_output = torch.cat(
+                [
+                    joint_hidden_states[:, :txt_real, :],
+                    joint_hidden_states[:, img_end:, :],
+                ],
+                dim=1,
+            )
+        else:
+            txt_attn_output = joint_hidden_states[:, :seq_len_txt, :]  # Text part
+            img_attn_output = joint_hidden_states[:, seq_len_txt:, :]  # Image part
 
         # Apply output projections
         img_attn_output, _ = self.to_out[0](img_attn_output)
@@ -1520,29 +1458,27 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             block_attention_kwargs["attn_mask_meta"] = build_varlen_mask_meta(
                 joint_mask
             )
-        elif sp_size > 1 and encoder_hidden_states.shape[1] % sp_size == 0:
-            # Text divides evenly across SP ranks: plain even shard, no mask.
-            encoder_hidden_states, freqs_cis = _shard_text_for_sp(
-                encoder_hidden_states, freqs_cis
+        elif (
+            sp_size > 1
+            and plan_text_strategy(encoder_hidden_states.shape[1]) == "shard"
+        ):
+            # Shard the replicated text stream across SP ranks; non-divisible
+            # lengths tail-pad the last rank and attention skips the pad via the
+            # per-request tail meta. Otherwise fall through to replicated text.
+            txt_shard = plan_shard(encoder_hidden_states.shape[1])
+            encoder_hidden_states = shard_like(encoder_hidden_states, txt_shard)
+            if freqs_cis is not None:
+                img_cache, txt_cache = freqs_cis
+                freqs_cis = (img_cache, shard_like(txt_cache, txt_shard, dim=0))
+            tail_meta = tail_attn_meta(
+                txt_shard,
+                encoder_hidden_states.shape[0],
+                hidden_states.device,
+                image_seq_len=hidden_states.shape[1],
             )
+            if tail_meta is not None:
+                block_attention_kwargs["attn_mask_meta"] = tail_meta
             sp_text_sharded = True
-        elif sp_size > 1 and get_ring_parallel_world_size() == 1:
-            # Text does not divide evenly: pad to an SP multiple and shard, with a
-            # pad-gap mask so USPAttention excludes the padding via the varlen
-            # kernel. The varlen masked path does not support ring parallelism, so
-            # uneven text under ring>1 instead falls through to the replicated
-            # path below.
-            (
-                encoder_hidden_states,
-                freqs_cis,
-                pad_mask,
-                pad_meta,
-            ) = _pad_shard_text_for_sp_varlen(
-                encoder_hidden_states, freqs_cis, hidden_states.shape[1]
-            )
-            sp_text_sharded = True
-            block_attention_kwargs["attn_mask"] = pad_mask
-            block_attention_kwargs["attn_mask_meta"] = pad_meta
         block_attention_kwargs["sp_text_sharded"] = sp_text_sharded
 
         temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
