@@ -6,7 +6,7 @@ import time
 from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -543,6 +543,15 @@ class SchedulerPPMixin:
         self.require_attn_tp_allgather = (
             not self.server_args.enable_dsa_prefill_context_parallel
         )
+        # Proxy tensors a model declares as NOT replicated across the
+        # attention-TP group (e.g. a per-rank shard it carries across PP
+        # stages) must skip send_tensor_dict's slice/all-gather optimization,
+        # which is only lossless for replicated tensors (#30015).
+        self.pp_proxy_all_gather_exclude: Optional[Set[str]] = None
+        model = getattr(getattr(self.tp_worker, "model_runner", None), "model", None)
+        exclude = getattr(model, "pp_proxy_tensors_all_gather_exclude", None)
+        if exclude:
+            self.pp_proxy_all_gather_exclude = frozenset(exclude)
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
@@ -1009,6 +1018,7 @@ class SchedulerPPMixin:
                     self.attn_tp_group if self.require_attn_tp_allgather else None
                 ),
                 async_send=async_send,
+                all_gather_exclude=self.pp_proxy_all_gather_exclude,
             )
         )
         return p2p_work

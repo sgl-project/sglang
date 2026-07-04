@@ -35,7 +35,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 from unittest.mock import patch
 
 import torch
@@ -71,7 +71,13 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 
-TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
+# `send_whole=True` marks a tensor that must bypass the send-slice/all-gather
+# optimization in send/recv_tensor_dict (it is NOT replicated across the
+# all-gather group, so slice reassembly would corrupt it — see #30015). The
+# flag travels in the metadata, so the receiver needs no extra arguments.
+TensorMetadata = namedtuple(
+    "TensorMetadata", ["device", "dtype", "size", "send_whole"], defaults=(False,)
+)
 
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
@@ -112,11 +118,17 @@ class P2PWork:
 
 def _split_tensor_dict(
     tensor_dict: Dict[str, Union[torch.Tensor, Any]],
+    send_whole_keys: Optional[Set[str]] = None,
 ) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
     """Split the tensor dictionary into two parts:
     1. A list of (key, value) pairs. If the value is a tensor, it is replaced
          by its metadata.
     2. A list of tensors.
+
+    Keys in `send_whole_keys` get `send_whole=True` in their TensorMetadata:
+    send/recv_tensor_dict will transfer them whole instead of using the
+    slice/all-gather optimization (required for tensors that are not
+    replicated across the all-gather group).
     """
     metadata_list: List[Tuple[str, Any]] = []
     tensor_list: List[torch.Tensor] = []
@@ -127,8 +139,9 @@ def _split_tensor_dict(
             # index (e.g. "cuda:0"). We only need the device type.
             # receiving side will set the device index.
             device = value.device.type
+            send_whole = bool(send_whole_keys and key in send_whole_keys)
             metadata_list.append(
-                (key, TensorMetadata(device, value.dtype, value.size()))
+                (key, TensorMetadata(device, value.dtype, value.size(), send_whole))
             )
             tensor_list.append(value)
         else:
@@ -1448,9 +1461,17 @@ class GroupCoordinator:
         dst: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
         async_send: bool = False,
+        all_gather_exclude: Optional[Set[str]] = None,
     ) -> Optional[List[P2PWork]]:
         """Send the input tensor dictionary.
         NOTE: `dst` is the local rank of the source rank.
+
+        `all_gather_exclude` names keys whose tensors are NOT replicated
+        across `all_gather_group` (e.g. TP-sharded tensors a model carries
+        across PP stages). Those tensors are sent whole instead of using the
+        send-slice/all-gather optimization, which is only lossless for
+        replicated tensors (#30015). The exclusion is recorded in the wire
+        metadata, so `recv_tensor_dict` honors it without any extra argument.
         """
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
@@ -1471,7 +1492,9 @@ class GroupCoordinator:
         assert isinstance(
             tensor_dict, dict
         ), f"Expecting a dictionary, got {type(tensor_dict)}"
-        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+        metadata_list, tensor_list = _split_tensor_dict(
+            tensor_dict, send_whole_keys=all_gather_exclude
+        )
         # Note: While switching to Device-to-Device (D2D) would introduce an extra
         # Device-to-Host (D2H) memory copy overhead for serialization, our benchmarks
         # show better overall transmission performance with D2D due to:
@@ -1482,13 +1505,18 @@ class GroupCoordinator:
         send_func = torch.distributed.isend if async_send else torch.distributed.send
         p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
 
-        for tensor in tensor_list:
+        tensor_metadata = [v for _, v in metadata_list if isinstance(v, TensorMetadata)]
+        for metadata, tensor in zip(tensor_metadata, tensor_list):
             if tensor.numel() == 0:
                 # Skip sending empty tensors.
                 continue
 
             # send-allgather: send only a slice, then do allgather.
-            if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
+            if (
+                all_gather_group is not None
+                and tensor.numel() % all_gather_size == 0
+                and not metadata.send_whole
+            ):
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             comm_group = metadata_group if tensor.is_cpu else group
@@ -1532,9 +1560,12 @@ class GroupCoordinator:
                     continue
 
                 # send-allgather: send only a slice, then do allgather.
+                # Tensors marked send_whole in the metadata (see
+                # send_tensor_dict's all_gather_exclude) arrive whole.
                 use_all_gather = (
                     all_gather_group is not None
                     and tensor.numel() % all_gather_size == 0
+                    and not getattr(value, "send_whole", False)
                 )
 
                 if use_all_gather:

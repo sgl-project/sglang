@@ -1496,6 +1496,13 @@ def build_inner_fb_view(
 
 class PPProxyTensors:
     # adapted from https://github.com/vllm-project/vllm/blob/d14e98d924724b284dc5eaf8070d935e214e50c0/vllm/sequence.py#L1103
+    #
+    # NOTE: proxy tensors are sent across PP stages with an attention-TP
+    # slice/all-gather optimization that is only lossless for tensors
+    # REPLICATED across the attention-TP group. If a model carries a
+    # TP-sharded tensor here (different data per rank), it must declare the
+    # key in a class attribute `pp_proxy_tensors_all_gather_exclude`
+    # (an iterable of key names) so the scheduler sends it whole (#30015).
     tensors: Dict[str, torch.Tensor]
 
     def __init__(self, tensors):
