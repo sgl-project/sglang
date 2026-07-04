@@ -961,8 +961,17 @@ class MOVADecodingStage(PipelineStage):
         stage_name = self._component_stage_name(stage_name)
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         return [
-            ComponentUse(stage_name, "video_vae", target_dtype=vae_dtype),
-            ComponentUse(stage_name, "audio_vae"),
+            ComponentUse(
+                stage_name,
+                "video_vae",
+                target_dtype=vae_dtype,
+                finish_after_response=server_args.vae_cpu_offload,
+            ),
+            ComponentUse(
+                stage_name,
+                "audio_vae",
+                finish_after_response=server_args.vae_cpu_offload,
+            ),
         ]
 
     @property

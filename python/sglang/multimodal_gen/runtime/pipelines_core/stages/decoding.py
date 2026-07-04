@@ -126,6 +126,7 @@ class DecodingStage(PipelineStage):
                 self.component_name,
                 target_dtype=vae_dtype,
                 keep_ready_after_warmup=True,
+                finish_after_response=server_args.vae_cpu_offload,
             )
         ]
 

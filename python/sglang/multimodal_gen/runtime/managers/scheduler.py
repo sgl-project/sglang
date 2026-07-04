@@ -1018,6 +1018,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 continue
 
             try:
+                self.worker.wait_post_response_tasks()
                 handler_result = self._dispatch_items(items)
             except Exception as e:
                 logger.error(
@@ -1072,11 +1073,14 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 # Reply failed; log and keep loop alive to accept future requests
                 logger.error(f"ZMQ error sending reply: {e}")
                 continue
+            finally:
+                self.worker.submit_post_response_tasks()
 
         self._log_batch_metrics_summary()
 
         if self.receiver is not None:
             self.receiver.close()
+        self.worker.shutdown_post_response_tasks()
         self._cleanup_disagg()
         self.context.destroy(linger=0)
 

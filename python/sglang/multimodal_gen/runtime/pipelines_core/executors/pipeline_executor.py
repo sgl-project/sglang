@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Callable, List
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_world_rank
+from sglang.multimodal_gen.runtime.managers.post_response_tasks import PostResponseTask
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -50,6 +51,7 @@ class PipelineExecutor(ABC):
     def __init__(self, server_args):
         self.server_args = server_args
         self.component_residency_manager = None
+        self._post_response_tasks: list[PostResponseTask] = []
 
     def begin_component_residency_request(
         self,
@@ -72,7 +74,14 @@ class PipelineExecutor(ABC):
         )
 
     def finish_component_residency_request(self) -> None:
-        self.component_residency_manager.finish_request()
+        self._post_response_tasks.extend(
+            self.component_residency_manager.finish_request()
+        )
+
+    def pop_post_response_tasks(self) -> list[PostResponseTask]:
+        tasks = self._post_response_tasks
+        self._post_response_tasks = []
+        return tasks
 
     @contextlib.contextmanager
     def _component_residency_request(
