@@ -38,7 +38,10 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if server_args.speculative_algorithm is not None and server_args.disaggregation_transfer_backend != "ascend":
+            if (
+                server_args.speculative_algorithm is not None
+                and server_args.disaggregation_transfer_backend != "ascend"
+            ):
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with speculative decoding "
