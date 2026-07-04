@@ -335,10 +335,22 @@ class FutureMap:
         draft_input = batch.spec_info
         if draft_input is None:
             return
-        if (self.spec_algo.is_dflash() or self.spec_algo.is_dspark()) and getattr(
+        if self.spec_algo.is_dflash() and getattr(
             draft_input, "direct_carry_valid", False
         ):
             batch.seq_lens = draft_input.new_seq_lens
+            return
+        if self.spec_algo.is_dspark() and getattr(
+            draft_input, "direct_carry_valid", False
+        ):
+            batch.seq_lens = draft_input.new_seq_lens
+            # DSv4 target-verify/draft-block metadata consumes both the GPU
+            # seq_lens tensor and the CPU mirror. Keep them in lockstep on
+            # DSpark's direct-carry path; otherwise overlap can leave the CPU
+            # mirror at the previous committed length while the GPU side has
+            # advanced to the published new length.
+            batch.seq_lens_cpu = batch.seq_lens.cpu()
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
             return
 
         fi = draft_input.future_indices
