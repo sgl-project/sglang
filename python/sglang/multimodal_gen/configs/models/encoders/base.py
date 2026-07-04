@@ -76,15 +76,20 @@ class EncoderConfig(ModelConfig):
     quant_config: QuantizationConfig | None = None
     lora_config: Any | None = None
 
+    # Parallel folding: during the encoding stage the whole DiT replica is idle,
+    # so TP-shard the encoder across those otherwise-unused GPUs instead of
+    # running it on a single rank. Lives on the base so every text/image encoder
+    # inherits it (a bare EncoderConfig would otherwise AttributeError when the
+    # server enables folding). Enabled by ServerArgs.adjust_pipeline_config().
+    parallel_folding: bool = False
+    # Which group to fold over: "sp" | "ulysses" | "ring" | "world"
+    # ("world" = the full single-replica DiT, used for any parallelism combo).
+    parallel_folding_mode: str = "sp"
+
 
 @dataclass
 class TextEncoderConfig(EncoderConfig):
     arch_config: ArchConfig = field(default_factory=TextEncoderArchConfig)
-
-    # Use the SP Group of the transformer as the TP Group of T5.
-    parallel_folding: bool = False
-    # "sp" or "ulysses" or "ring"
-    parallel_folding_mode: str = "sp"
 
 
 @dataclass

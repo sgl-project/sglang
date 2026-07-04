@@ -3,6 +3,7 @@ import glob
 import os
 import re
 from collections.abc import Generator, Iterable
+from contextlib import nullcontext
 from typing import cast
 
 import torch
@@ -15,7 +16,14 @@ from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
 )
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_tp_group,
+)
+from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    patch_tensor_parallel_group,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
@@ -30,6 +38,7 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
 )
+from sglang.multimodal_gen.runtime.models.encoders.base import get_folding_tp_group
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -374,7 +383,25 @@ class TextEncoderLoader(ComponentLoader):
         else:
             model_device = local_torch_device
 
-        with set_default_torch_dtype(PRECISION_TO_TYPE[dtype]):
+        # Parallel folding: build + shard the encoder over the folding group (the
+        # idle DiT replica during the encoding stage) instead of the default TP
+        # group, so every encoder — not just T5 — folds without threading the
+        # group through each layer. Patching the global here means all parallel
+        # Linears/embeddings bake in the folding group at construction, and
+        # weight loading shards to match. Only resolve/patch when folding is
+        # actually enabled (always multi-GPU, so the groups exist) and the group
+        # is a real GroupCoordinator different from the current TP (ulysses/ring
+        # sub-groups keep their own explicit threading).
+        fold_ctx = nullcontext()
+        if getattr(model_config, "parallel_folding", False):
+            folding_group = get_folding_tp_group(model_config)
+            if (
+                isinstance(folding_group, GroupCoordinator)
+                and folding_group is not get_tp_group()
+            ):
+                fold_ctx = patch_tensor_parallel_group(folding_group)
+
+        with fold_ctx, set_default_torch_dtype(PRECISION_TO_TYPE[dtype]):
             with model_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)

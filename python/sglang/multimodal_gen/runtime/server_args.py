@@ -20,7 +20,6 @@ import addict
 import yaml
 
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
@@ -437,10 +436,38 @@ class ServerArgs(DisaggServerArgsMixin):
             self.transformer_weights_path = resolution.transformer_weights_path
         self.nunchaku_config = resolution.nunchaku_config
 
+    # Attribute spellings used across encoder arch configs for the two dims a
+    # TP shard splits: attention heads and MLP intermediate. Read through
+    # ModelConfig.__getattr__ (which delegates to arch_config).
+    _ENCODER_HEAD_ATTRS = ("num_attention_heads", "num_heads", "n_heads")
+    _ENCODER_FFN_ATTRS = ("intermediate_size", "d_ff", "ffn_dim", "ffn_hidden_size")
+
+    @staticmethod
+    def _encoder_shard_dims(encoder_config):
+        """Best-effort (attention_heads, mlp_intermediate) for an encoder config.
+
+        Returns None for either dim we cannot resolve, so the caller skips
+        folding rather than risk a shard that does not divide.
+        """
+
+        def first(attrs):
+            for name in attrs:
+                try:
+                    value = getattr(encoder_config, name)
+                except AttributeError:
+                    continue
+                if isinstance(value, int) and value > 0:
+                    return value
+            return None
+
+        return first(ServerArgs._ENCODER_HEAD_ATTRS), first(
+            ServerArgs._ENCODER_FFN_ATTRS
+        )
+
     def adjust_pipeline_config(self):
-        # The T5 encoder runs in the encoding stage while the whole DiT replica
-        # is idle, so fold (TP-shard) it across all replica GPUs — not just tp —
-        # when cfg/sp make the replica larger than tp. Pure TP already uses all.
+        # Every encoder runs in the encoding stage while the whole DiT replica is
+        # idle, so fold (TP-shard) each one across all replica GPUs — not just tp
+        # — when cfg/sp make the replica larger than tp. Pure TP already uses all.
         tp_size = self.tp_size or 1
         dp_size = self.dp_size or 1
         sp_degree = self.sp_degree or 1
@@ -451,30 +478,40 @@ class ServerArgs(DisaggServerArgsMixin):
         # disaggregated keep the existing per-SP folding.
         fold_world = dp_size == 1 and not self.disagg_mode and replica_size > tp_size
 
-        enabled_mode = None
-        for text_encoder_config in self.pipeline_config.text_encoder_configs:
-            if not isinstance(text_encoder_config, T5Config):
-                continue
-            if (
-                fold_world
-                and text_encoder_config.num_heads % replica_size == 0
-                and text_encoder_config.d_ff % replica_size == 0
-            ):
-                text_encoder_config.parallel_folding = True
-                text_encoder_config.parallel_folding_mode = "world"
-                enabled_mode = "world"
-            elif tp_size == 1 and sp_degree > 1:
-                # Preserve prior behavior for dp>1 / disaggregated SP runs.
-                text_encoder_config.parallel_folding = True
-                text_encoder_config.parallel_folding_mode = "sp"
-                enabled_mode = enabled_mode or "sp"
+        if fold_world:
+            mode, group_size = "world", replica_size
+        elif tp_size == 1 and sp_degree > 1:
+            # Preserve prior behavior for dp>1 / disaggregated SP runs.
+            mode, group_size = "sp", sp_degree
+        else:
+            return
 
-        if enabled_mode:
+        # Text encoders always run; image encoders too when a pipeline declares
+        # them (config fields live on the shared base so both are foldable).
+        encoder_configs = list(self.pipeline_config.text_encoder_configs) + list(
+            getattr(self.pipeline_config, "image_encoder_configs", ()) or ()
+        )
+        enabled = []
+        for encoder_config in encoder_configs:
+            # Only fold when both the attention heads and the MLP intermediate
+            # divide the group; otherwise the parallel Linears cannot shard.
+            # Encoders whose dims we cannot introspect are left unfolded (safe).
+            heads, inter = ServerArgs._encoder_shard_dims(encoder_config)
+            if heads is None or inter is None:
+                continue
+            if heads % group_size != 0 or inter % group_size != 0:
+                continue
+            encoder_config.parallel_folding = True
+            encoder_config.parallel_folding_mode = mode
+            enabled.append(type(encoder_config).__name__)
+
+        if enabled:
             logger.info(
-                "Enabled T5 text encoder parallel folding (mode=%s) for %s "
+                "Enabled encoder parallel folding (mode=%s) for %s: %s "
                 "(tp=%s sp=%s cfg=%s replica=%s).",
-                enabled_mode,
+                mode,
                 self.__class__.__name__,
+                ", ".join(enabled),
                 tp_size,
                 sp_degree,
                 self.cfg_parallel_degree or 1,
