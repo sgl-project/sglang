@@ -175,6 +175,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._markov_refine_buffer_cap: int = 0
         self._markov_candidates_buf: Optional[torch.Tensor] = None
         self._markov_embeds_buf: Optional[torch.Tensor] = None
+        self._last_markov_refine_debug: Optional[dict] = None
         self.draft_attn_backend = None
         self.draft_extend_attn_backend = None
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
@@ -1196,8 +1197,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             base_logits = _gather_full_vocab(
                 F.linear(block_hidden, lm_head.weight), lm_head
             )
+            debug_enabled = bool(self._accept_anomaly_enabled)
+            if debug_enabled:
+                base_top1 = torch.argmax(base_logits, dim=-1)
+                markov_top1 = torch.empty(
+                    (bs, block_size), dtype=torch.int64, device=block_hidden.device
+                )
+                prev_token_debug = torch.empty_like(markov_top1)
+            else:
+                base_top1 = None
+                markov_top1 = None
+                prev_token_debug = None
             prev_tokens = candidates[:, 0]
             for i in range(block_size):
+                if debug_enabled:
+                    assert prev_token_debug is not None
+                    prev_token_debug[:, i].copy_(prev_tokens)
                 prev_embed = markov_head.get_prev_embeddings(prev_tokens)
                 markov_embeds[:, i].copy_(prev_embed)
                 bias = _gather_full_vocab(
@@ -1205,11 +1220,25 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
                 bias.add_(base_logits[:, i])
                 next_tokens = torch.argmax(bias, dim=-1)
+                if debug_enabled:
+                    assert markov_top1 is not None
+                    markov_top1[:, i].copy_(next_tokens)
                 if i + 1 < block_size:
                     candidates[:, i + 1].copy_(next_tokens)
                 prev_tokens = next_tokens
 
             confidence = confidence_head(block_hidden, markov_embeds)
+            if debug_enabled:
+                assert base_top1 is not None
+                assert markov_top1 is not None
+                assert prev_token_debug is not None
+                self._last_markov_refine_debug = {
+                    "base_top1": base_top1[:output_bs].detach(),
+                    "markov_top1": markov_top1[:output_bs].detach(),
+                    "prev_tokens": prev_token_debug[:output_bs].detach(),
+                }
+            else:
+                self._last_markov_refine_debug = None
 
         return candidates[:output_bs], confidence[:output_bs]
 
@@ -1293,6 +1322,70 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens.unsqueeze(1).to(torch.int64),
         )
         return commit_lens, bonus_tokens, out_tokens
+
+    def _build_accept_anomaly_markov_debug(
+        self,
+        *,
+        row_idx: int,
+        candidates: torch.Tensor,
+        target_predict: torch.Tensor,
+        confidence: torch.Tensor,
+    ) -> Optional[dict]:
+        try:
+            debug = self._last_markov_refine_debug
+            if not debug:
+                return None
+            base_top1 = debug.get("base_top1")
+            markov_top1 = debug.get("markov_top1")
+            prev_tokens = debug.get("prev_tokens")
+            if base_top1 is None or markov_top1 is None or prev_tokens is None:
+                return None
+            if int(row_idx) >= int(markov_top1.shape[0]):
+                return None
+            block_size = int(candidates.shape[1])
+            limit = min(block_size, 8)
+            candidate_row = candidates[row_idx]
+            target_row = target_predict[row_idx]
+            confidence_row = confidence[row_idx]
+            row_base = base_top1[row_idx, :limit].detach().cpu()
+            row_markov = markov_top1[row_idx].detach().cpu()
+            row_prev = prev_tokens[row_idx, :limit].detach().cpu()
+            payload = {
+                "layout": (
+                    "candidate0 is verify anchor; markov_top1[i] is sampled "
+                    "from block_hidden[i] and maps to candidate[i+1] for i < block_size-1"
+                ),
+                "base_top1_first": [int(x) for x in row_base.tolist()],
+                "markov_top1_first": [
+                    int(x) for x in row_markov[:limit].tolist()
+                ],
+                "prev_tokens_first": [int(x) for x in row_prev.tolist()],
+                "candidates_first": [
+                    int(x) for x in candidate_row[:limit].tolist()
+                ],
+                "target_first": [int(x) for x in target_row[:limit].tolist()],
+                "confidence_first": [
+                    float(x) for x in confidence_row[:limit].tolist()
+                ],
+            }
+            if block_size > 0:
+                payload["markov0_eq_target0"] = bool(row_markov[0] == target_row[0])
+                payload["candidate1_eq_markov0"] = (
+                    bool(candidate_row[1] == row_markov[0])
+                    if block_size > 1
+                    else None
+                )
+            if block_size > 1:
+                payload["markov1_eq_target0"] = bool(row_markov[1] == target_row[0])
+                payload["markov1_eq_target1"] = bool(row_markov[1] == target_row[1])
+                payload["candidate2_eq_markov1"] = (
+                    bool(candidate_row[2] == row_markov[1])
+                    if block_size > 2
+                    else None
+                )
+            return payload
+        except Exception as e:
+            return {"error": str(e)}
 
     def _maybe_log_accept_anomaly(
         self,
@@ -1504,6 +1597,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                     prefix_len=int(seq_lens[i]),
                     block_size=int(block_size),
                 )
+                markov_debug = self._build_accept_anomaly_markov_debug(
+                    row_idx=i,
+                    candidates=candidate_cpu,
+                    target_predict=target_cpu,
+                    confidence=confidence_cpu,
+                )
                 logger.warning(
                     "DSpark accept anomaly detected: dp_rank=%s tp_rank=%s "
                     "ep_rank=%s req_pool_idx=%s rid=%s zero_draft_streak=%s "
@@ -1525,6 +1624,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                     int(req_pool_idx),
                     rid,
                     kv_debug,
+                )
+                logger.warning(
+                    "DSpark accept anomaly Markov debug: dp_rank=%s tp_rank=%s "
+                    "ep_rank=%s req_pool_idx=%s rid=%s markov_debug=%s",
+                    self.dp_rank,
+                    self.tp_rank,
+                    self.moe_ep_rank,
+                    int(req_pool_idx),
+                    rid,
+                    markov_debug,
                 )
 
         stale_keys = set(self._accept_anomaly_histories) - active_keys
