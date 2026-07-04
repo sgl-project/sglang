@@ -10,7 +10,6 @@ import torch.nn.functional as F
 
 from sglang.srt.distributed import (
     get_attn_tp_group,
-    get_moe_dp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
@@ -379,17 +378,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         ):
             return None
 
-        dp_group = get_moe_dp_group()
+        attn_dp_size = len(dp_decode_global_num_tokens)
         local_count = torch.tensor(
             [int(local_num_tokens)], dtype=torch.int64, device=self.device
         )
-        if dp_group.world_size == 1:
-            return [int(local_num_tokens)]
-
         gathered = torch.empty(
-            (dp_group.world_size,), dtype=torch.int64, device=self.device
+            (attn_dp_size,), dtype=torch.int64, device=self.device
         )
-        dp_group.all_gather_into_tensor(gathered, local_count.contiguous())
+        get_attn_tp_group().all_gather_into_tensor(
+            gathered, local_count.contiguous()
+        )
+        if gathered.numel() != attn_dp_size:
+            raise RuntimeError(
+                "DSpark accepted-path DP token gather size mismatch: "
+                f"gathered={gathered.numel()} expected={attn_dp_size}"
+            )
         return [int(x) for x in gathered.cpu().tolist()]
 
     def _get_target_aux_hidden_size(self) -> int:
