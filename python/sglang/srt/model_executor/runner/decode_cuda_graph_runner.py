@@ -969,6 +969,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             is_encoder_decoder=self.is_encoder_decoder,
         )
         attn_backend.init_forward_metadata_out_graph(fb_view)
+        if (
+            self.model_runner.spec_algorithm.is_dspark()
+            and self.model_runner.is_draft_worker
+        ):
+            self.model_runner._dspark_last_graph_attn_backend = attn_backend
 
         # Store fields
         self.raw_bs = raw_bs

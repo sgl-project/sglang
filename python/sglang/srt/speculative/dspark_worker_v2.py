@@ -927,7 +927,19 @@ class DSparkWorkerV2(BaseSpecWorker):
         _dsv4_be._DSPARK_BLOCK_FULL_ATTN = int(self.block_size)
         try:
             with torch.inference_mode():
-                draft_runner_out = self.draft_model_runner.forward(draft_forward_batch)
+                if os.getenv("SGLANG_DSPARK_DISABLE_DRAFT_CUDA_GRAPH", "0") == "1":
+                    graph_runner = self.draft_model_runner.decode_cuda_graph_runner
+                    self.draft_model_runner.decode_cuda_graph_runner = None
+                    try:
+                        draft_runner_out = self.draft_model_runner.forward(
+                            draft_forward_batch
+                        )
+                    finally:
+                        self.draft_model_runner.decode_cuda_graph_runner = graph_runner
+                else:
+                    draft_runner_out = self.draft_model_runner.forward(
+                        draft_forward_batch
+                    )
                 self._last_draft_block_metadata_debug = (
                     self._snapshot_draft_block_metadata(
                         draft_forward_batch=draft_forward_batch,
@@ -968,7 +980,10 @@ class DSparkWorkerV2(BaseSpecWorker):
     ) -> Optional[dict]:
         if not self._accept_anomaly_enabled:
             return None
-        attn_backend = self.draft_model_runner.attn_backend
+        attn_backend = (
+            getattr(self.draft_model_runner, "_dspark_last_graph_attn_backend", None)
+            or self.draft_model_runner.attn_backend
+        )
         metadata = getattr(attn_backend, "forward_metadata", None)
         if getattr(metadata, "core_attn_metadata", None) is None:
             inner_backends = getattr(attn_backend, "attn_backends", None)
