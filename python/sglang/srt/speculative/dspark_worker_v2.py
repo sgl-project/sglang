@@ -1395,6 +1395,21 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             row_markov = markov_top1[row_idx].detach().cpu()
             row_prev = prev_tokens[row_idx, :limit].detach().cpu()
+            candidate_target_hits = []
+            for cand_idx in range(1, min(block_size, 6)):
+                hits = torch.nonzero(
+                    target_row[:limit] == candidate_row[cand_idx],
+                    as_tuple=False,
+                ).view(-1)
+                candidate_target_hits.append(
+                    {
+                        "candidate_idx": int(cand_idx),
+                        "candidate": int(candidate_row[cand_idx]),
+                        "target_hit_indices": [
+                            int(x) for x in hits[:4].tolist()
+                        ],
+                    }
+                )
             payload = {
                 "layout": (
                     "candidate0 is verify anchor; markov_top1[i] is sampled "
@@ -1419,6 +1434,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     int(x) for x in candidate_row[:limit].tolist()
                 ],
                 "target_first": [int(x) for x in target_row[:limit].tolist()],
+                "candidate_target_hits": candidate_target_hits,
                 "confidence_first": [
                     float(x) for x in confidence_row[:limit].tolist()
                 ],
