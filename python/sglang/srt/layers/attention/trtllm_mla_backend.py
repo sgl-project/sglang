@@ -18,15 +18,15 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
-from sglang.srt.layers.attention.triton_ops.kv_indices import (
+from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
     get_num_page_per_block_flashmla,
 )
-from sglang.srt.layers.attention.triton_ops.pad import (
+from sglang.kernels.ops.attention.pad import (
     pad_draft_extend_query as pad_draft_extend_query_triton,
 )
-from sglang.srt.layers.attention.triton_ops.pad import (
+from sglang.kernels.ops.attention.pad import (
     unpad_draft_extend_output as unpad_draft_extend_output_triton,
 )
 from sglang.srt.layers.attention.utils import (

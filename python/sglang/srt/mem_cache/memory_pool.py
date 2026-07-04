@@ -58,7 +58,7 @@ from sglang.srt.mem_cache.layout.page_major import (
     mamba_entry_bytes,
     mha_entry_bytes,
 )
-from sglang.srt.mem_cache.triton_ops.cache_move import (
+from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_tiled,
     set_kv_buffer_prefix_valid_tiled,
     store_cache_4d,

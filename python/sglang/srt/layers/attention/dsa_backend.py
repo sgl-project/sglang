@@ -1275,7 +1275,7 @@ class DeepseekSparseAttnBackend(
             max_len = metadata.page_table_1.shape[1]
 
             if _USE_FUSED_METADATA_GENERATION and is_cuda():
-                from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_decode_metadata,
                 )
 
@@ -1317,7 +1317,7 @@ class DeepseekSparseAttnBackend(
             max_seqlen_k = metadata.page_table_1.shape[1]
 
             if _USE_FUSED_METADATA_GENERATION and is_cuda():
-                from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_target_verify_metadata,
                 )
 
@@ -1415,7 +1415,7 @@ class DeepseekSparseAttnBackend(
             )
 
             if _USE_FUSED_METADATA_GENERATION and is_cuda():
-                from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_draft_extend_metadata,
                 )
 

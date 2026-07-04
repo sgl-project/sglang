@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+from sglang.kernels.ops.attention.dsa_metadata import (
     fused_dsa_decode_metadata,
     fused_dsa_draft_extend_metadata,
     fused_dsa_target_verify_metadata,

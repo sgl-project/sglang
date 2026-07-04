@@ -23,7 +23,7 @@ from sglang.srt.speculative.spec_utils import (
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
-from sglang.srt.speculative.triton_ops.cache_locs import (
+from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan

@@ -16,10 +16,10 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
 )
-from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
+from sglang.kernels.ops.kvcache.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
-from sglang.srt.layers.attention.triton_ops.trtllm_mha_page_table import (
+from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.layers.attention.utils import canonicalize_stride

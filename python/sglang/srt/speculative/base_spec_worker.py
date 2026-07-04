@@ -187,7 +187,7 @@ class EagleDraftWorkerBase(ABC):
             CaptureHiddenMode,
             ForwardBatch,
         )
-        from sglang.srt.speculative.triton_ops.cache_locs import (
+        from sglang.kernels.ops.speculative.cache_locs import (
             assign_draft_cache_locs_contiguous,
         )
 

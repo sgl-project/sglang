@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.memory_pool import (
     unwrap_write_loc,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.triton_ops.cache_move import store_cache_4d_kernel
+from sglang.kernels.ops.kvcache.cache_move import store_cache_4d_kernel
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)

@@ -4,43 +4,43 @@ import triton.language as tl
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.layers.attention.triton_ops.cache_ops import (
+from sglang.kernels.ops.kvcache.cache_ops import (
     concat_and_cast_mha_k_kernel as concat_and_cast_mha_k_kernel,
 )
-from sglang.srt.layers.attention.triton_ops.cache_ops import (
+from sglang.kernels.ops.kvcache.cache_ops import (
     concat_and_cast_mha_k_triton as concat_and_cast_mha_k_triton,
 )
-from sglang.srt.layers.attention.triton_ops.cache_ops import (
+from sglang.kernels.ops.kvcache.cache_ops import (
     launch_reshape_and_cache_flash as launch_reshape_and_cache_flash,
 )
-from sglang.srt.layers.attention.triton_ops.cache_ops import (
+from sglang.kernels.ops.kvcache.cache_ops import (
     reshape_and_cache_flash as reshape_and_cache_flash,
 )
-from sglang.srt.layers.attention.triton_ops.kv_indices import (
+from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton as create_flashinfer_kv_indices_triton,
 )
-from sglang.srt.layers.attention.triton_ops.kv_indices import (
+from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashmla_kv_indices_triton as create_flashmla_kv_indices_triton,
 )
-from sglang.srt.layers.attention.triton_ops.kv_indices import (
+from sglang.kernels.ops.kvcache.kv_indices import (
     get_num_kv_index_blocks_flashmla as get_num_kv_index_blocks_flashmla,
 )
-from sglang.srt.layers.attention.triton_ops.kv_indices import (
+from sglang.kernels.ops.kvcache.kv_indices import (
     get_num_page_per_block_flashmla as get_num_page_per_block_flashmla,
 )
-from sglang.srt.layers.attention.triton_ops.pad import (
+from sglang.kernels.ops.attention.pad import (
     pad_sequence_with_mask as pad_sequence_with_mask,
 )
-from sglang.srt.layers.attention.triton_ops.pad import (
+from sglang.kernels.ops.attention.pad import (
     pad_sequence_with_mask_kernel as pad_sequence_with_mask_kernel,
 )
-from sglang.srt.layers.attention.triton_ops.pad import (
+from sglang.kernels.ops.attention.pad import (
     seqlens_expand_kernel as seqlens_expand_kernel,
 )
-from sglang.srt.layers.attention.triton_ops.pad import (
+from sglang.kernels.ops.attention.pad import (
     seqlens_expand_triton as seqlens_expand_triton,
 )
-from sglang.srt.layers.attention.triton_ops.rope_cache import (
+from sglang.kernels.ops.kvcache.rope_cache import (
     fused_qk_rope_reshape_and_cache as fused_qk_rope_reshape_and_cache,
 )
 from sglang.srt.utils import is_cuda

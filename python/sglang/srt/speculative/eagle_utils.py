@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.common import (
     get_alloc_reserve_per_decode,
     get_last_loc,
 )
-from sglang.srt.speculative.triton_ops.spec_tree import (
+from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
 )
@@ -467,7 +467,7 @@ def eagle_prepare_for_verify(
         ForwardMode,
     )
     from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
-    from sglang.srt.speculative.triton_ops.cache_locs import (
+    from sglang.kernels.ops.speculative.cache_locs import (
         assign_extend_cache_locs_func,
     )
 

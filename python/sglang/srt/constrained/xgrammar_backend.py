@@ -43,14 +43,14 @@ _is_hip = is_hip()
 if _is_hip:
     from sgl_kernel import apply_token_bitmask_inplace_cuda
 else:
-    from sglang.srt.constrained.triton_ops.bitmask_ops import (
+    from sglang.kernels.ops.grammar.bitmask_ops import (
         apply_token_bitmask_inplace_triton,
     )
 
 from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
     set_token_filter_torch,
 )
-from sglang.srt.constrained.triton_ops.token_filter_ops import set_token_filter_triton
+from sglang.kernels.ops.grammar.token_filter_ops import set_token_filter_triton
 
 logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200

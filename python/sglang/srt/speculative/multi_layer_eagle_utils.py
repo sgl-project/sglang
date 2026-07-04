@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-from sglang.srt.speculative.triton_ops.multi_layer_eagle import (
+from sglang.kernels.ops.speculative.multi_layer_eagle import (
     rotate_input_ids_kernel,
     rotate_input_ids_triton,
 )

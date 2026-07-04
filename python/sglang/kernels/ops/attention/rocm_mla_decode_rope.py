@@ -23,7 +23,7 @@ It supports page size = 1.
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.triton_ops.decode_attention import (
+from sglang.kernels.ops.attention.decode_attention import (
     _decode_softmax_reducev_fwd,
 )
 

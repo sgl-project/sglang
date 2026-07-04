@@ -37,7 +37,7 @@ from sglang.srt.mem_cache.allocator.paged import (
     alloc_extend_kernel,
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.triton_ops.virtual_slot import alloc_bind_inplace
+from sglang.kernels.ops.memory.virtual_slot import alloc_bind_inplace
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 

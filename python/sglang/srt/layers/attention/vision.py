@@ -66,7 +66,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.distributed import utils as dist_utils
-from sglang.srt.layers.attention.triton_ops.prefill_attention import (
+from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
 from sglang.srt.layers.layernorm import RMSNorm

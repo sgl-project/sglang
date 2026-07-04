@@ -1,9 +1,8 @@
 """KV-cache write/transfer kernels.
 
-This group wraps the Triton ``reshape_and_cache`` launcher that currently lives
-under ``sglang.srt.layers.attention.triton_ops``. Only a thin wrapper is added
-here; physically moving the Triton source into this package is deferred to a
-later phase (RFC #29630) to keep this change low-risk.
+This group wraps the Triton ``reshape_and_cache`` launcher, whose implementation
+now lives in this package (``sglang.kernels.ops.kvcache.cache_ops``) after being
+migrated out of ``sglang.srt.layers.attention.triton_ops`` (RFC #29630).
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ register_kernel(
     KernelSpec(
         op="kvcache.reshape_and_cache_flash",
         backend=KernelBackend.TRITON,
-        target="sglang.srt.layers.attention.triton_ops.cache_ops:launch_reshape_and_cache_flash",
+        target="sglang.kernels.ops.kvcache.cache_ops:launch_reshape_and_cache_flash",
         format_signature=FormatSignature(
             in_place=True,
             description="write token-major K/V into paged KV cache layout",
