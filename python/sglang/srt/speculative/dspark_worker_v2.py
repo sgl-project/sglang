@@ -1615,28 +1615,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DSpark verify requires target main_hidden states, but got None."
             )
-        if bs > 0 or participates_in_dp_decode:
-            if hidden is None:
-                hidden = torch.empty(
-                    (0, self._get_target_aux_hidden_size()),
-                    dtype=self.draft_model.lm_head.weight.dtype,
-                    device=device,
-                )
-            if bs > 0:
-                hidden = hidden.view(bs, block_size, -1)
-                hidden_flat = hidden.reshape(-1, hidden.shape[-1])
-            else:
-                hidden_flat = hidden.reshape(0, hidden.shape[-1])
-            self._run_draft_bootstrap_forward(
-                batch=model_worker_batch,
+        if bs > 0:
+            hidden = hidden.view(bs, block_size, -1)
+            hidden_flat = hidden.reshape(-1, hidden.shape[-1])
+            commit_mask = (
+                self._block_pos_offsets.unsqueeze(0)
+                < commit_lens.unsqueeze(1).to(torch.int64)
+            ).reshape(-1)
+            self._materialize_main_hidden_to_draft_state(
                 main_hidden=hidden_flat,
-                input_ids=candidates.reshape(-1),
-                positions=positions,
-                out_cache_loc=verify_out_cache_loc,
-                seq_lens=prefix_lens,
-                dp_decode_global_num_tokens=dp_decode_global_num_tokens,
-                num_tokens_per_req=block_size,
-                use_draft_extend_v2=True,
+                cache_loc=verify_out_cache_loc[commit_mask],
+                positions=positions[commit_mask],
+                draft_forward_batch=draft_forward_batch,
+                kv_main_hidden=hidden_flat[commit_mask],
             )
             self._clear_unaccepted_c128_draft_states(
                 batch=model_worker_batch,
