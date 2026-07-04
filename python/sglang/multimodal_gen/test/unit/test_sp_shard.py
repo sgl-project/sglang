@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from sglang.multimodal_gen.runtime.distributed import sp_shard as sps
-from sglang.multimodal_gen.runtime.distributed.sp_shard import (
+from sglang.multimodal_gen.runtime.distributed import sp_shard_utils as sps
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     SpShard,
     shard_like,
     tail_attn_meta,
@@ -17,7 +17,7 @@ def _fake_sp(monkeypatch, sp_size, sp_rank=0, ring=1):
     monkeypatch.setattr(sps, "get_ring_parallel_world_size", lambda: ring)
 
 
-# --- plan_shard math --------------------------------------------------------
+# --- build_shard_plan math --------------------------------------------------------
 
 
 def test_plan_shard_divisible(monkeypatch):
@@ -97,6 +97,14 @@ def test_tail_meta_joint_layout_and_batch():
     meta = tail_attn_meta(shard, 2, torch.device("cpu"), image_seq_len=100)
     assert meta["pad_start"] == 215 and meta["pad_end"] == 216
     assert meta["cu_seqlens_tail"].tolist() == [0, 215, 216, 431, 432]
+
+
+def test_tail_meta_max_seqlen_covers_pad_segment():
+    # Degenerate short sequence: num_pad (3) > valid (1). FA requires
+    # max_seqlen >= the longest segment, i.e. the pad block here.
+    shard = SpShard(orig_len=1, local_len=1, num_pad=3, sp_size=4, sp_rank=3)
+    meta = tail_attn_meta(shard, 1, torch.device("cpu"))
+    assert meta["max_seqlen_tail"] == 3
 
 
 def test_tail_meta_matches_legacy_gap_formula():

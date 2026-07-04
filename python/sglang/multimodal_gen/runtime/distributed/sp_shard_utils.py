@@ -50,7 +50,7 @@ class SpShard:
         return self.local_len - self.local_pad
 
 
-def _build_shard_plan(seq_len: int) -> SpShard:
+def build_shard_plan(seq_len: int) -> SpShard:
     """Shard math only; tensors are sliced separately via `shard_like`."""
     sp_size = get_sp_world_size()
     if sp_size <= 1:
@@ -65,7 +65,7 @@ def _build_shard_plan(seq_len: int) -> SpShard:
     )
 
 
-def _shard_like(
+def shard_like(
     x: torch.Tensor, shard: SpShard, dim: int = 1, pad_mode: str = "zeros"
 ) -> torch.Tensor:
     """Apply a planned shard to one tensor (RoPE caches use the same plan as
@@ -94,8 +94,8 @@ def shard_seq(
         zeroes: pad with zeroes at tail
         repeat_last: repeat the last token, only for rotary embedding
     """
-    shard = _build_shard_plan(x.shape[dim])
-    return _shard_like(x, shard, dim=dim, pad_mode=pad_mode), shard
+    shard = build_shard_plan(x.shape[dim])
+    return shard_like(x, shard, dim=dim, pad_mode=pad_mode), shard
 
 
 def gather_seq(local: torch.Tensor, orig_len: int, dim: int = 1) -> torch.Tensor:
@@ -116,7 +116,7 @@ def shard_seq_prefix(
     rest = x.shape[dim] - prefix_len
     return torch.cat(
         [
-            _shard_like(x.narrow(dim, 0, prefix_len), shard, dim=dim),
+            shard_like(x.narrow(dim, 0, prefix_len), shard, dim=dim),
             x.narrow(dim, prefix_len, rest),
         ],
         dim=dim,
@@ -205,7 +205,7 @@ def tail_attn_meta(
         "pad_end": seq,
         "local_pad": shard.local_pad,
         "cu_seqlens_tail": cu_seqlens,
-        "max_seqlen_tail": valid,
+        "max_seqlen_tail": max(valid, shard.num_pad),
     }
 
 

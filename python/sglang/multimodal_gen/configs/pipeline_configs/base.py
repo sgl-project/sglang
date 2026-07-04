@@ -149,7 +149,7 @@ def shard_rotary_emb_for_sp(emb):
     lengths pad by repeating the last row (position labels, never attention
     K/V, so the pad value only needs to stay finite)."""
     try:
-        from sglang.multimodal_gen.runtime.distributed.sp_shard import shard_seq
+        from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import shard_seq
 
         return shard_seq(emb, dim=0, pad_mode="repeat_last")[0]
     except Exception:

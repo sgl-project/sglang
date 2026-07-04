@@ -30,7 +30,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
 )
-from sglang.multimodal_gen.runtime.distributed.sp_shard import (
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     SpShard,
     gather_seq,
     shard_seq,

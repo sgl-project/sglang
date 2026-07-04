@@ -22,9 +22,9 @@ from sglang.multimodal_gen.runtime.distributed import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
-from sglang.multimodal_gen.runtime.distributed.sp_shard import (
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     join_seqs,
-    plan_shard,
+    build_shard_plan,
     shard_like,
     should_shard_text,
     split_seqs,
@@ -1439,7 +1439,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             # Shard the replicated text stream across SP ranks; non-divisible
             # lengths tail-pad the last rank and attention skips the pad via the
             # per-request tail meta. Otherwise fall through to replicated text.
-            txt_shard = plan_shard(encoder_hidden_states.shape[1])
+            txt_shard = build_shard_plan(encoder_hidden_states.shape[1])
             encoder_hidden_states = shard_like(encoder_hidden_states, txt_shard)
             if freqs_cis is not None:
                 img_cache, txt_cache = freqs_cis

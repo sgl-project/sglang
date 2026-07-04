@@ -32,9 +32,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_tp_world_size,
 )
-from sglang.multimodal_gen.runtime.distributed.sp_shard import (
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     join_seqs,
-    plan_shard,
+    build_shard_plan,
     shard_like,
     shard_seq_prefix,
     should_shard_text,
@@ -1109,7 +1109,7 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         num_replicated_prefix = num_txt_tokens
         singles_freqs_cis = freqs_cis
         if should_shard_text(num_txt_tokens):
-            txt_shard = plan_shard(num_txt_tokens)
+            txt_shard = build_shard_plan(num_txt_tokens)
             encoder_hidden_states = shard_like(encoder_hidden_states, txt_shard)
             if freqs_cis is not None:
                 cos, sin = freqs_cis
