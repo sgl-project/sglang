@@ -221,6 +221,8 @@ void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, 
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 
+at::Tensor fp8_index_cpu(at::Tensor& q, at::Tensor& q_s, at::Tensor& k, at::Tensor& k_s);
+
 // fused moe
 at::Tensor fused_experts_cpu(
     at::Tensor& hidden_states,
@@ -588,6 +590,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("bmm_cpu", torch::kCPU, &bmm_cpu);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
+
+  // DSA indexer FP8 index score (ragged loop path)
+  m.def("fp8_index_cpu(Tensor q, Tensor q_s, Tensor k, Tensor k_s) -> Tensor");
+  m.impl("fp8_index_cpu", torch::kCPU, &fp8_index_cpu);
+
   // moe
   m.def(
       "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
