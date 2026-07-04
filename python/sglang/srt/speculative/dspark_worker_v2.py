@@ -446,6 +446,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         main_hidden: torch.Tensor,
         cache_loc: torch.Tensor,
         positions: torch.Tensor,
+        projected: bool = False,
     ) -> None:
         if main_hidden is None:
             raise RuntimeError("DSpark missing target main_hidden context features.")
@@ -477,7 +478,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             # ctx hidden would change k_ctx/v_ctx. SGLang realizes cat(ctx, block)
             # through KV cache: write ctx KV here, then let draft_block write/read
             # block KV with full-block metadata.
-            ctx_x = self.draft_model.project_main_hidden(main_hidden)
+            ctx_x = (
+                main_hidden
+                if projected
+                else self.draft_model.project_main_hidden(main_hidden)
+            )
             if self._stacked_wqkv_fp8_proj is None:
                 for layer in self._draft_inner.layers:
                     layer.self_attn.kv_from_hidden(
@@ -507,6 +512,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         *,
         main_hidden: torch.Tensor,
         draft_forward_batch,
+        projected: bool = False,
     ) -> None:
         if main_hidden is None:
             raise RuntimeError("DSpark missing target main_hidden context features.")
@@ -530,7 +536,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # this draft verify batch before replaying compressor writes with
                 # target hidden; PD overlap can otherwise observe stale metadata.
                 attn_backend.init_forward_metadata(draft_forward_batch)
-                main_x = self.draft_model.project_main_hidden(main_hidden)
+                main_x = (
+                    main_hidden
+                    if projected
+                    else self.draft_model.project_main_hidden(main_hidden)
+                )
                 for layer in self._draft_inner.layers:
                     attn = layer.self_attn
                     compressor = getattr(attn, "compressor", None)
@@ -553,11 +563,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         positions: torch.Tensor,
         draft_forward_batch: Optional[ForwardBatch],
         kv_main_hidden: Optional[torch.Tensor] = None,
+        projected: bool = False,
     ) -> None:
         try:
             self._materialize_main_hidden_to_draft_compressors(
                 main_hidden=main_hidden,
                 draft_forward_batch=draft_forward_batch,
+                projected=projected,
             )
         except Exception as e:
             logger.warning(
@@ -571,6 +583,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             main_hidden=kv_main_hidden,
             cache_loc=cache_loc,
             positions=positions,
+            projected=projected,
         )
 
     def _make_draft_prefill_forward_batch_for_materialize(
@@ -842,6 +855,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             cache_loc=flat_cache_locs,
             positions=flat_positions,
             draft_forward_batch=None,
+            projected=True,
         )
 
     def _write_draft_kv_from_projected_kv(
@@ -1600,14 +1614,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_forward_batch = self._make_draft_prefill_forward_batch_for_materialize(
             model_worker_batch
         )
+        main_x = self.draft_model.project_main_hidden(logits_output.hidden_states)
         self._materialize_main_hidden_to_draft_state(
-            main_hidden=logits_output.hidden_states,
+            main_hidden=main_x,
             cache_loc=model_worker_batch.out_cache_loc,
             positions=positions,
             draft_forward_batch=draft_forward_batch,
+            projected=True,
         )
         prefill_tail_hidden, prefill_tail_mask = self._pack_prefill_tail_hidden(
-            hidden=logits_output.hidden_states,
+            hidden=main_x,
             extend_lens=extend_lens_list,
         )
 
@@ -1842,17 +1858,19 @@ class DSparkWorkerV2(BaseSpecWorker):
         if bs > 0:
             hidden = hidden.view(bs, block_size, -1)
             hidden_flat = hidden.reshape(-1, hidden.shape[-1])
+            main_x_flat = self.draft_model.project_main_hidden(hidden_flat)
             commit_mask_2d = (
                 self._block_pos_offsets.unsqueeze(0)
                 < commit_lens.unsqueeze(1).to(torch.int64)
             )
             commit_mask = commit_mask_2d.reshape(-1)
             self._materialize_main_hidden_to_draft_state(
-                main_hidden=hidden_flat,
+                main_hidden=main_x_flat,
                 cache_loc=verify_out_cache_loc[commit_mask],
                 positions=positions[commit_mask],
                 draft_forward_batch=draft_forward_batch,
-                kv_main_hidden=hidden_flat[commit_mask],
+                kv_main_hidden=main_x_flat[commit_mask],
+                projected=True,
             )
             self._clear_unaccepted_c128_draft_states(
                 batch=model_worker_batch,
