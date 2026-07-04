@@ -169,8 +169,6 @@ def _router_triton_kernel(
 
     # Map NaN -> a finite floor
     biased = tl.where(biased == biased, biased, -1e30)  # [BLOCK_M, BLOCK_N]
-    # Zero NaN weights so degenerate rows don't feed NaN into topk_weights
-    activated = tl.where(activated == activated, activated, 0.0)  # [BLOCK_M, BLOCK_N]
 
     # Grouped routing (DeepSeek-V3 noaux_tc): per-group score = sum of the top-2
     # biased values; keep TOPK_GROUP groups (lowest group id wins ties); mask the
