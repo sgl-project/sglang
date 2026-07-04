@@ -21,7 +21,12 @@ from sglang.srt.arg_groups.overrides import (
     collect_model_override_declarations,
     register_model_override,
 )
-from sglang.srt.runtime_context import _StaticFlags
+from sglang.srt.runtime_context import (
+    _StaticFlags,
+    get_context,
+    get_server_args,
+    reset_context,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -49,6 +54,9 @@ class TestModelOverridableWhitelist(CustomTestCase):
         from sglang.srt.server_args import ServerArgs
 
         self.assertEqual(model_overridable_fields(ServerArgs), frozenset())
+
+    def test_non_dataclass_yields_empty_whitelist(self):
+        self.assertEqual(model_overridable_fields(SimpleNamespace), frozenset())
 
 
 class _IsolatedRegistry(CustomTestCase):
@@ -197,6 +205,59 @@ class TestApplyModelOverridesGate(CustomTestCase):
         )
         self.assertEqual(flags.attn.backend, "fa3")
         self.assertEqual(flags.resolved_by_model, "unset")  # flat leaf untouched
+
+
+class _IsolatedPublish(CustomTestCase):
+    """Publishing writes the process-global context; save/restore around it."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_server_args = get_context()._server_args
+
+    def tearDown(self):
+        reset_context()
+        if self._saved_server_args is not None:
+            get_context()._server_args = self._saved_server_args
+        super().tearDown()
+
+
+@dataclasses.dataclass
+class _NoOverridableArgs:
+    x: int = 1
+
+
+class TestPublishResolvesFlags(_IsolatedPublish):
+    """Publish wiring: stash-carrying publishes resolve into flags via the
+    gate; publishes without the stash skip resolution."""
+
+    def test_dummy_fixture_has_empty_stash_and_publishes_cleanly(self):
+        from sglang.srt.server_args import (
+            ServerArgs,
+            set_global_server_args_for_scheduler,
+        )
+
+        sa = ServerArgs(model_path="dummy")  # __post_init__ early-returns
+        # The stash is created before the dummy short-circuit and stays empty.
+        self.assertEqual(sa._resolved_overrides, [])
+        set_global_server_args_for_scheduler(sa)
+        self.assertIs(get_server_args(), sa)
+
+    def test_empty_stash_publish_runs_gate_as_noop(self):
+        sa = _NoOverridableArgs()
+        sa._resolved_overrides = []
+        get_context().set_server_args(sa)
+        self.assertIs(get_server_args(), sa)
+
+    def test_non_whitelisted_declaration_fails_at_publish(self):
+        from sglang.srt.runtime_context import get_flags
+
+        flags_before = get_flags()
+        sa = _NoOverridableArgs()
+        sa._resolved_overrides = [("rogue", {"x": 2})]
+        with self.assertRaises(ValueError):
+            get_context().set_server_args(sa)
+        # a failed publish must leave BOTH the slot and the flags untouched
+        self.assertIs(get_flags(), flags_before)
 
 
 class TestDualApplyParity(CustomTestCase):

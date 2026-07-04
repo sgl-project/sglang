@@ -172,7 +172,23 @@ def apply_declarations_to_server_args(
 
     Retired per field once that field's readers have all flipped to the flags
     tier (at which point the server_args field returns to pristine).
+
+    Validates against the same whitelist as the publish gate BEFORE any write:
+    a registry typo or a not-yet-resolvable field must fail fast here, not
+    mutate ``server_args`` and only be rejected at publish time.
     """
+    # Non-dataclass fixtures carry no Arg metadata (mirrors the
+    # model_overridable_fields escape); only real ServerArgs is validated.
+    if dataclasses.is_dataclass(type(server_args)):
+        whitelist = model_overridable_fields(type(server_args))
+        for source, decl in list(declarations) + list(terminal):
+            unknown = set(decl) - whitelist
+            if unknown:
+                raise ValueError(
+                    f"{source}: {sorted(unknown)} not model-overridable; the "
+                    "transition dual-apply refuses fields the publish gate "
+                    "would reject."
+                )
     for _source, decl in list(declarations) + list(terminal):
         for field, value in decl.items():
             setattr(server_args, field, value)
