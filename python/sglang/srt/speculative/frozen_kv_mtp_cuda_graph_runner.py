@@ -25,6 +25,9 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
+from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    maybe_flashinfer_autotune_speculative_draft,
+)
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -291,6 +294,15 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         )
 
         def run_once():
+            # Record the metadata rebuild against the committed target-prefix
+            # geometry (spec_info nulled → plain target-length decode), matching
+            # every other frozen-KV metadata init. Without the view, backends
+            # that key seqlen offsets off spec_info (trtllm_mha's draft-decode
+            # branch adds speculative_step_id + 1) bake a +1 offset into the
+            # captured graph and replay reads one extra, never-written KV slot.
+            with self.frozen_kv_mtp_worker._frozen_kv_target_view(forward_batch):
+                self.draft_attn_backend.init_forward_metadata_in_graph(forward_batch)
+
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
                 global_dp_buffer_len,
@@ -321,13 +333,20 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
                 )
                 self.deepep_adapter.capture(is_extend_in_batch=False)
                 shape_key = self._make_graph_key(request_bs)
+                post_warmup_hook = getattr(
+                    self.draft_attn_backend, "on_after_cuda_graph_warmup", None
+                )
+                maybe_flashinfer_autotune_speculative_draft(
+                    self,
+                    run_once,
+                    post_warmup_hook=post_warmup_hook,
+                    skip_logits=False,
+                )
                 self.backend.capture_one(
                     shape_key,
                     run_once,
                     dummies=None,
-                    post_warmup_hook=getattr(
-                        self.draft_attn_backend, "on_after_cuda_graph_warmup", None
-                    ),
+                    post_warmup_hook=post_warmup_hook,
                 )
         finally:
             self.draft_attn_backend.token_to_kv_pool = saved_backend_pool
