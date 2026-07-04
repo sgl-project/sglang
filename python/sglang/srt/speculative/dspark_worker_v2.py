@@ -1774,7 +1774,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 < commit_lens.unsqueeze(1).to(torch.int64)
             ).reshape(-1)
             accepted_hidden = hidden_flat[commit_mask]
-            accepted_input_ids = candidates.reshape(-1)[commit_mask]
+            accepted_input_ids = out_tokens.reshape(-1)[commit_mask]
             accepted_positions = positions[commit_mask]
             accepted_cache_loc = verify_out_cache_loc[commit_mask]
             accepted_extend_lens = commit_lens.to(torch.int64)
