@@ -73,6 +73,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_evict_dsv4_state,
 )
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.prefix_cache_namespace import compose_prefix_cache_extra_key
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
@@ -779,13 +780,8 @@ class Req(ReqDllmMixin):
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
 
-        # extra key for classifying the request (e.g. cache_salt)
-        if lora_id is not None:
-            extra_key = (
-                extra_key or ""
-            ) + lora_id  # lora_id is concatenated to the extra key
-
-        self.extra_key = extra_key
+        # extra key for classifying the request (e.g. cache_salt, lora_id)
+        self.extra_key = compose_prefix_cache_extra_key(extra_key, lora_id)
         self.lora_id = lora_id
         self.routing_key = routing_key
 
