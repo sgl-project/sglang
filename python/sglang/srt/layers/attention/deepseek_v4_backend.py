@@ -1697,30 +1697,27 @@ class DeepseekV4AttnBackend(
 
         seq_lens_casual = seq_lens_casual.to(torch.int32)
 
-        swa_page_indices = self.get_swa_page_indices(
-            seq_lens_casual=seq_lens_casual,
-            req_pool_indices_repeated=req_pool_indices_repeated,
-        )
-
-        swa_page_indices = _pad_last_dim(
-            swa_page_indices, multiples_of=PAGE_INDEX_ALIGNED_SIZE
-        )
-
         raw_positions = seq_lens_casual - 1
-        swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
 
         block_full = _DSPARK_BLOCK_FULL_ATTN
         n_qo = seq_lens_casual.size(0)
         if block_full and n_qo % block_full == 0:
-            bs_blk = n_qo // block_full
-            last_row = (
-                torch.arange(
-                    bs_blk, device=seq_lens_casual.device, dtype=torch.long
-                ).repeat_interleave(block_full)
-                + 1
-            ) * block_full - 1
-            swa_page_indices = swa_page_indices[last_row]
-            swa_topk_lengths = swa_topk_lengths[last_row]
+            swa_page_indices, swa_topk_lengths = (
+                self.get_dspark_noncausal_swa_page_indices(
+                    seq_lens_casual=seq_lens_casual,
+                    req_pool_indices_repeated=req_pool_indices_repeated,
+                    block_size=block_full,
+                )
+            )
+        else:
+            swa_page_indices = self.get_swa_page_indices(
+                seq_lens_casual=seq_lens_casual,
+                req_pool_indices_repeated=req_pool_indices_repeated,
+            )
+            swa_page_indices = _pad_last_dim(
+                swa_page_indices, multiples_of=PAGE_INDEX_ALIGNED_SIZE
+            )
+            swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
 
         page_table = req_to_token[
             req_pool_indices_repeated, : max_seq_len : self.page_size
@@ -1769,6 +1766,50 @@ class DeepseekV4AttnBackend(
         swa_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(raw_indices)
         # flash_mla attention requires int32 page indices.
         return swa_indices.to(torch.int32)
+
+    def get_dspark_noncausal_swa_page_indices(
+        self,
+        seq_lens_casual: torch.Tensor,
+        req_pool_indices_repeated: torch.Tensor,
+        block_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build DeepSpec/vLLM-style DSpark non-causal SWA indices.
+
+        Every query in a draft block attends to the same contiguous range:
+        trailing SWA context plus the full draft block, including future draft
+        tokens. This is wider than the normal 128-token SWA window.
+        """
+        num_qo_tokens = seq_lens_casual.size(0)
+        bs_blk = num_qo_tokens // int(block_size)
+        last_row = (
+            torch.arange(bs_blk, device=seq_lens_casual.device, dtype=torch.long) + 1
+        ) * int(block_size) - 1
+
+        seq_end = seq_lens_casual[last_row]
+        prefix_len = torch.clamp(seq_end - int(block_size), min=0)
+        start_pos = torch.clamp(prefix_len - SWA_WINDOW, min=0)
+        topk_lengths_blk = seq_end - start_pos
+        index_width = ceil_align(SWA_WINDOW + int(block_size), PAGE_INDEX_ALIGNED_SIZE)
+
+        offsets = start_pos.unsqueeze(1) + torch.arange(
+            index_width, **self.cuda_int32_kwargs
+        ).unsqueeze(0)
+        invalid_offset_mask = offsets >= seq_end.unsqueeze(1)
+        offsets.masked_fill_(invalid_offset_mask, 0)
+
+        req_pool_indices_blk = req_pool_indices_repeated[last_row]
+        raw_indices = self.req_to_token[req_pool_indices_blk[:, None], offsets]
+        assert raw_indices.shape == (bs_blk, index_width)
+        raw_indices.masked_fill_(invalid_offset_mask, -1)
+        swa_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(raw_indices)
+
+        swa_indices = swa_indices.to(torch.int32).repeat_interleave(
+            int(block_size), dim=0
+        )
+        topk_lengths = topk_lengths_blk.to(torch.int32).repeat_interleave(
+            int(block_size)
+        )
+        return swa_indices, topk_lengths
 
 
 class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
