@@ -102,21 +102,19 @@ _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
 
 def conv_window_dedup_enabled(
-    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int]
+    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int], is_kda: bool
 ) -> bool:
     """Whether the deduplicated sliding-window conv-intermediate layout is safe.
 
-    It is only correct for a *linear* draft chain (``speculative_eagle_topk <= 1``,
-    i.e. NEXTN / MTP): consecutive draft tokens then form a true sliding window, so
-    the overlapping physical columns hold identical values. Under EAGLE *tree*
-    verify (``topk > 1``) the conv kernel walks per-token tree ancestors, so aliased
-    columns can need different values from different parent chains -> fall back to
-    the dense layout. NPU/CPU also keep the dense layout (their kernels assume
-    contiguous per-step windows). See ``MambaPool.__init__``.
+    It is safe for CUDA linear draft chains whose kernels consume the window raw.
+    Tree verify, NPU/CPU, and KDA keep dense windows: tree ancestors need independent
+    windows, platform kernels expect contiguous steps, and KDA transposes the window
+    before conv so the overlapping ``as_strided`` layout would corrupt stores.
     """
     return (
         not is_npu
         and not is_cpu
+        and not is_kda
         and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
     )
 
@@ -529,7 +527,7 @@ class MambaPool:
                 # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
                 # so the dense fallback reads correctly through the same code path.
                 dedup_conv_window = conv_window_dedup_enabled(
-                    _is_npu, _is_cpu, speculative_eagle_topk
+                    _is_npu, _is_cpu, speculative_eagle_topk, cache_params.is_kda
                 )
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:
