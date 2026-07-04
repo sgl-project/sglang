@@ -421,7 +421,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
-            self._draft_worker.init_cuda_graphs()
+            from sglang.srt.layers.attention import deepseek_v4_backend as _dsv4_be
+
+            # Draft-block replay must use the same full-block attention metadata
+            # as eager draft-block forward. Otherwise the captured graph can keep
+            # causal block metadata even though runtime sets the DSpark flag.
+            _dsv4_be._DSPARK_BLOCK_FULL_ATTN = int(self.block_size)
+            try:
+                self._draft_worker.init_cuda_graphs()
+            finally:
+                _dsv4_be._DSPARK_BLOCK_FULL_ATTN = 0
 
     def clear_cache_pool(self):
         pass
