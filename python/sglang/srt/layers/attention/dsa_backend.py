@@ -755,6 +755,14 @@ class DeepseekSparseAttnBackend(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
             )
         elif forward_batch.forward_mode.is_draft_extend_v2():
+            if forward_batch.extend_prefix_lens_cpu is None:
+                assert forward_batch.extend_prefix_lens is not None
+                forward_batch.extend_prefix_lens_cpu = (
+                    forward_batch.extend_prefix_lens.cpu().tolist()
+                )
+            if forward_batch.seq_lens_cpu is None:
+                forward_batch.seq_lens_cpu = forward_batch.seq_lens.cpu()
+                forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens is not None
