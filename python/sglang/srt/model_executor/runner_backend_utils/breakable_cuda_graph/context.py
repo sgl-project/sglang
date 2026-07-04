@@ -17,11 +17,13 @@ See :mod:`sglang.srt.breakable_cuda_graph.context`.
 """
 
 from sglang.srt.breakable_cuda_graph.context import (  # noqa: F401
+    BCG_FAILURE_HINT,
     enable_breakable_cuda_graph,
     is_in_breakable_cuda_graph,
 )
 
 __all__ = [
+    "BCG_FAILURE_HINT",
     "enable_breakable_cuda_graph",
     "is_in_breakable_cuda_graph",
 ]

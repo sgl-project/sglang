@@ -27,6 +27,14 @@ from contextlib import contextmanager
 
 _in_breakable_cuda_graph = False
 
+BCG_FAILURE_HINT = (
+    "1. change to tc_piecewise by --cuda-graph-backend-prefill=tc_piecewise\n"
+    "2. disable the prefill CUDA graph by --cuda-graph-backend-prefill=disabled\n"
+    "3. if it is an OOM problem, set --mem-fraction-static to a smaller value "
+    "(e.g., 0.8 or 0.7) or set --cuda-graph-max-bs-prefill to a smaller value "
+    "(e.g., 2048)\n"
+)
+
 
 def is_in_breakable_cuda_graph() -> bool:
     return _in_breakable_cuda_graph
