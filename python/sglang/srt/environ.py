@@ -317,6 +317,12 @@ class Envs:
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
 
+    # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
+    # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
+    # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
+    # for the new path; pairs with SGLANG_AITER_UNIFIED_VERIFY. Default on.
+    SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
+
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)

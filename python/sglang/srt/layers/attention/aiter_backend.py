@@ -61,6 +61,7 @@ except ImportError:
     )
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
@@ -2288,6 +2289,64 @@ class AiterAttnBackend(AttentionBackend):
                     1.0,  # v_scale
                     layer.scaling,
                     logit_cap=layer.logit_cap,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            # draft_extend (EAGLE-v2 KV catch-up) is decode-shaped: short Q
+            # (accepted tokens) against long paged KV, GQA. The default
+            # mha_batch_prefill_func FMHA has no split-KV, so at short Q it is
+            # occupancy-starved (~0.2% HBM BW, ~400x over the memory floor).
+            # Route it through unified_attention (GQA-packed + split-KV), exactly
+            # like target_verify, so it runs near the memory floor.
+            if (
+                self._use_unified_verify
+                and forward_batch.forward_mode.is_draft_extend_v2()
+                and envs.SGLANG_AITER_UNIFIED_DRAFT_EXTEND.get()
+            ):
+                bs = forward_batch.batch_size
+                if layer.qk_head_dim != layer.v_head_dim:
+                    o = q.new_empty(
+                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                    )
+                else:
+                    o = torch.empty_like(q)
+                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                page_table, swa_page_table = self._build_unified_page_table_from_spec(
+                    self.forward_metadata, bs
+                )
+                pt = page_table
+                de_window = (-1, -1)
+                if (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > -1
+                ):
+                    de_window = (layer.sliding_window_size - 1, 0)
+                    if swa_page_table is not None:
+                        pt = swa_page_table
+                kv_indptr = self.forward_metadata.kv_indptr
+                seqused_k = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int32)
+                unified_attention(
+                    q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k=k_cache.view(
+                        -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                    ),
+                    v=v_cache.view(
+                        -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                    ),
+                    out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    cu_seqlens_q=self.qo_indptr[: bs + 1],
+                    seqused_k=seqused_k,
+                    max_seqlen_q=self.forward_metadata.max_q_len,
+                    max_seqlen_k=pt.shape[1] * self.page_size,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    window_size=de_window,
+                    block_table=pt,
+                    softcap=layer.logit_cap,
+                    q_descale=None,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    sinks=sinks,
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
