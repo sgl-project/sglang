@@ -1,7 +1,11 @@
 import unittest
 
+from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
+    TestNpuAccuracyTestCaseBase,
+)
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     BENCHMARK_TOOL_DEFAULT,
+    DEFAULT_URL_FOR_TEST,
     QWEN3_6_35B_A3B_MODEL_PATH,
     TestNpuPerformanceTestCaseBase,
 )
@@ -14,20 +18,21 @@ register_npu_ci(
     disabled="performance testcase",
 )
 
-QWEN3_6_35B_A3B_128K_PREFIX_ENVS = {
+QWEN3_6_35B_A3B_64K_PREFIX_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
+    "HCCL_BUFFSIZE": "300",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_ENABLE_SPEC_V2": "1",
-    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "0",
     "ASCEND_USE_FIA": "1",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "30",
+    "GDN_ATTN_BACKEND_TRITON": "1",
 }
 
-QWEN3_6_35B_A3B_128K_PREFIX_OTHER_ARGS = [
+QWEN3_6_35B_A3B_64K_PREFIX_OTHER_ARGS = [
     "--tp-size",
     2,
     "--nnodes",
@@ -37,30 +42,28 @@ QWEN3_6_35B_A3B_128K_PREFIX_OTHER_ARGS = [
     "--device",
     "npu",
     "--chunked-prefill-size",
-    16384,
+    -1,
+    "--max-total-tokens",
+    470784,
     "--max-prefill-tokens",
     65536,
     "--trust-remote-code",
-    "--enable-prefill-delayer",
     "--mamba-scheduler-strategy",
     "extra_buffer",
     "--max-running-requests",
-    103,
+    40,
     "--max-mamba-cache-size",
-    85,
+    200,
     "--mem-fraction-static",
-    0.85,
+    0.9,
     "--cuda-graph-bs",
     2,
-    4,
     8,
     16,
+    24,
     32,
-    48,
-    64,
-    80,
-    96,
-    103,
+    36,
+    40,
     "--enable-multimodal",
     "--mm-attention-backend",
     "ascend_attn",
@@ -83,28 +86,60 @@ QWEN3_6_35B_A3B_128K_PREFIX_OTHER_ARGS = [
 ]
 
 
-class TestNPUQwen3_6_35BA3B_1P_In128k_Out1k_Prefix90_50ms(
+class TestNPUQwen3_6_35BA3B_1P_AIME2026(TestNpuAccuracyTestCaseBase):
+    """Test NPU accuracy for Qwen3.6-35B-A3B 1p on AIME2026"""
+
+    model = QWEN3_6_35B_A3B_MODEL_PATH
+    other_args = QWEN3_6_35B_A3B_64K_PREFIX_OTHER_ARGS
+    envs = QWEN3_6_35B_A3B_64K_PREFIX_ENVS
+    accuracy = 0.927
+    datasets = ["aime26"]
+    few_shot_num = 0
+    eval_batch_size = 64
+    generation_config = {
+        "max_tokens": 65536,
+        "temperature": 0.2,
+        "repetition_penalty": 1.08,
+    }
+
+    @classmethod
+    def tearDownClass(cls):
+        pass
+
+    def test_npu_qwen3_6_35b_a3b_1p_aime2026(self):
+        """Run NPU accuracy test for Qwen3.6-35B-A3B on AIME2026"""
+        self.run_accuracy()
+
+
+class TestNPUQwen3_6_35BA3B_1P_In64k_Out1k_Prefix90_50ms(
     TestNpuPerformanceTestCaseBase
 ):
-    """Test NPU performance for Qwen3.6-35B-A3B 1p in128k out1k prefix90 50ms"""
+    """Test NPU performance for Qwen3.6-35B-A3B 1p in64k out1k prefix90 50ms"""
 
+    base_url = DEFAULT_URL_FOR_TEST
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     model = QWEN3_6_35B_A3B_MODEL_PATH
-    other_args = QWEN3_6_35B_A3B_128K_PREFIX_OTHER_ARGS
-    envs = QWEN3_6_35B_A3B_128K_PREFIX_ENVS
+    other_args = QWEN3_6_35B_A3B_64K_PREFIX_OTHER_ARGS
+    envs = QWEN3_6_35B_A3B_64K_PREFIX_ENVS
     dataset_name = "generated-shared-prefix"
-    max_concurrency = 103
-    num_prompts = 412
-    input_len = 128000
-    output_len = 1000
+    max_concurrency = 40
+    num_prompts = 40
+    input_len = 65536
+    output_len = 1024
     random_range_ratio = 1
     repeat_rate = 0.9
+    seed = 1
     tpot = 50
     request_rate = float("inf")
-    output_token_throughput = 308.2
+    output_token_throughput = 660
+    pop_sglang_is_in_ci_for_gsp = True
 
-    def test_npu_qwen3_6_35b_a3b_1p_in128k_out1k_prefix90_50ms(self):
-        """Run NPU performance test for Qwen3.6-35B-A3B in128k out1k prefix90 50ms"""
+    @classmethod
+    def setUpClass(cls):
+        pass
+
+    def test_npu_qwen3_6_35b_a3b_1p_in64k_out1k_prefix90_50ms(self):
+        """Run NPU performance test for Qwen3.6-35B-A3B in64k out1k prefix90 50ms"""
         self.run_throughput()
 
 
