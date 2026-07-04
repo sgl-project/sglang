@@ -103,6 +103,22 @@ if _HAVE_TRITON:
             tl.store(o_ptr + row * D + d, y.to(tl.bfloat16))
 
     @triton.jit
+    def _chunk_cumsum_kernel(g_ptr, o_ptr, N, C: tl.constexpr):
+        # One program per (batch*head*chunk) row: serial left-to-right fp32 scan over the
+        # chunk_size dim. A serial scan (not tl.cumsum's parallel tree, not torch.cumsum's
+        # blocked reduction) is what makes the decode incremental append gcum[i]=gcum[i-1]+g[i]
+        # bit-identical to prefill by construction (same fp32 additions, same order). Shared by
+        # BOTH Megatron's and SGLang's torch_chunk_gated_delta_rule AND the decode prep kernel
+        # (which inlines the same running add), so all three engines stay bit-for-bit identical.
+        # Length-invariant: exactly C serial adds per row regardless of how many chunks exist.
+        row = tl.program_id(0)
+        if row < N:
+            acc = 0.0
+            for j in range(C):
+                acc += tl.load(g_ptr + row * C + j)
+                tl.store(o_ptr + row * C + j, acc)
+
+    @triton.jit
     def _fwd_sub_kernel(A, C: tl.constexpr):
         # One program per (batch*head*chunk). A points at a [C, C] row-major fp32 matrix
         # holding the strictly-lower A_strict (zeros on/above the diagonal). The whole
@@ -142,12 +158,14 @@ if _HAVE_TRITON:
     @triton.jit
     def _gdn_prep_row_kernel(
         q_ptr, k_ptr, v_ptr, a_ptr, b_ptr, Alog_ptr, dtb_ptr,  # new token: q/k [B,HK,Dk], v [B,HV,Dv], a/b [B,HV]
-        qn_ptr, kn_ptr, kb_ptr, vb_ptr, g_ptr, i_ptr,
+        qn_ptr, kn_ptr, kb_ptr, vb_ptr, g_ptr, gcum_ptr, i_ptr,
         scale, HV: tl.constexpr, HK: tl.constexpr, Dk: tl.constexpr, Dv: tl.constexpr, CS: tl.constexpr,
     ):
         """Per-token prep for the new decode token: shared triton l2norm (bit-identical to
         torch_chunk's), GQA repeat, scale, and gating. Writes row i of the partial-chunk buffers.
-        gcum is computed by a torch cumsum over g afterwards (tl.cumsum diverges from torch)."""
+        gcum[i]=gcum[i-1]+g[i] is a single running add here; it is bit-identical to the shared
+        serial _chunk_cumsum_kernel prefix (same fp32 additions, same order), killing the torch
+        cumsum launch that the old path needed (tl.cumsum diverged from torch)."""
         pid = tl.program_id(0)
         bt = pid // HV
         h = pid % HV
@@ -172,6 +190,14 @@ if _HAVE_TRITON:
         tl.store(kb_ptr + ((bt * CS + i) * HV + h) * Dk + dk, kn * beta)
         tl.store(vb_ptr + ((bt * CS + i) * HV + h) * Dv + dv, v * beta)
         tl.store(g_ptr + (bt * HV + h) * CS + i, g)
+        # gcum[i] = gcum[i-1] + g[i]. Reload g from the buffer (rounded fp32) before the add: g is a
+        # register product (-exp(A_log)*sp), so `prev + g` would contract into a single FMA (one
+        # rounding) and diverge from the shared _chunk_cumsum_kernel, which adds two already-stored
+        # fp32 operands (two roundings). The reload inserts that rounding barrier, keeping the decode
+        # append bit-identical to the serial scan (FMA contraction otherwise drifts ~1.9e-6).
+        g_r = tl.load(g_ptr + (bt * HV + h) * CS + i)
+        prev = tl.where(i > 0, tl.load(gcum_ptr + (bt * HV + h) * CS + i - 1, mask=(i > 0), other=0.0), 0.0)
+        tl.store(gcum_ptr + (bt * HV + h) * CS + i, prev + g_r)
 
     @triton.jit
     def _gdn_a_row_kernel(
@@ -356,6 +382,38 @@ class _L2NormBf16(torch.autograd.Function):
         return grad_x.reshape(grad_y.shape).to(grad_y.dtype), None
 
 
+def chunk_cumsum(g: torch.Tensor) -> torch.Tensor:
+    """Serial fp32 cumsum over the last dim, via the shared _chunk_cumsum_kernel.
+
+    Replaces the per-chunk `torch.stack([g[:,:,i].cumsum(-1) ...])` in both Megatron's and
+    SGLang's torch_chunk_gated_delta_rule. A serial left-to-right scan makes the decode
+    incremental append gcum[i]=gcum[i-1]+g[i] bit-identical to prefill by construction, and
+    is length-invariant (C adds/row regardless of chunk count), so all engines match bit-for-bit.
+    Differentiable via the cumsum VJP grad_x[i]=sum_{j>=i} grad_y[j] (reverse cumsum). Falls back
+    to per-chunk torch.cumsum when Triton or CUDA is unavailable.
+    """
+    if not _HAVE_TRITON or not g.is_cuda:
+        return torch.stack([g[:, :, i].cumsum(dim=-1) for i in range(g.shape[2])], dim=2)
+    return _ChunkCumsum.apply(g)
+
+
+class _ChunkCumsum(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, g):
+        C = g.shape[-1]
+        gf = g.detach().reshape(-1, C).contiguous().float()
+        o = torch.empty_like(gf)
+        N = gf.shape[0]
+        _chunk_cumsum_kernel[(N,)](gf, o, N, C=C)
+        return o.reshape(g.shape).to(g.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_y):
+        # cumsum VJP: grad_x[i] = sum_{j>=i} grad_y[j] = flip(cumsum(flip(grad_y))).
+        gy = grad_y.flip(-1).cumsum(-1).flip(-1)
+        return gy
+
+
 def torch_gdn_gating(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -436,13 +494,11 @@ def torch_chunk_gated_delta_rule(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0
     )
 
-    # Per-chunk cumsum. torch.cumsum on the full [b, h, num_chunks, chunk_size] tensor
-    # batches all num_chunks rows into one reduction whose fp32 accumulation order depends
-    # on the row count, so a longer sequence (more chunks) shifts chunk 0 by ~1 bf16 ULP
-    # (7.6e-6) and propagates through g.exp() to core_attn_out (1.5e-5). Running cumsum per
-    # chunk keeps the reduction row count constant, making it independent of sequence length
-    # so sglang (short prefill) and Megatron (full teacher-forced sequence) match bit-exactly.
-    g = torch.stack([g[:, :, i].cumsum(dim=-1) for i in range(g.shape[2])], dim=2)
+    # Shared serial fp32 cumsum over the chunk dim (see chunk_cumsum). A serial left-to-right
+    # scan is length-invariant (C adds/row regardless of chunk count) so sglang (short prefill)
+    # and Megatron (full teacher-forced sequence) match bit-exactly, and it makes the decode
+    # incremental append gcum[i]=gcum[i-1]+g[i] bit-identical to this prefix by construction.
+    g = chunk_cumsum(g)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
     attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
     # Forward-substitution triangular solve. One Triton launch (one program per
@@ -762,12 +818,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         scale = 1.0 / (Dk ** 0.5)
         _gdn_prep_row_kernel[(HV,)](
             q_tok, k_tok, v_tok, a_tok, b_tok, layer.A_log, layer.dt_bias,
-            entry["qn"], entry["kn"], entry["kb"], entry["vb"], entry["g"], it,
+            entry["qn"], entry["kn"], entry["kb"], entry["vb"], entry["g"], entry["gcum"], it,
             scale, HV=HV, HK=HK, Dk=Dk, Dv=Dv, CS=C,
         )
         w = i + 1
-        # gcum over the head-major g buffer (no transpose); torch cumsum matches torch_chunk's.
-        entry["gcum"][:, :w] = entry["g"][:, :w].cumsum(-1)
+        # gcum row i is appended in-kernel (gcum[i]=gcum[i-1]+g[i], bit-identical to the shared
+        # serial scan), so no torch cumsum launch here.
         _gdn_a_row_kernel[(HV,)](entry["kn"], entry["kb"], entry["gcum"], entry["A_row"], it,
                                  HV=HV, Dk=Dk, CS=C, QR=16)
         _gdn_append_T_row_kernel[(HV,)](entry["T"], entry["A_row"], it, HV=HV, CS=C)

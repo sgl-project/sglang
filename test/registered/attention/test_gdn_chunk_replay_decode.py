@@ -182,7 +182,7 @@ class TestGDNChunkReplayDecode(unittest.TestCase):
     def _prep_fp32(self, qh, kh, vh, a, b, A_log, dt_bias):
         """torch_chunk's per-token prep (shared l2norm, GQA repeat, scale, gating, per-chunk
         cumsum), returning qn,kn,kb [w,HV,Dk], vb [w,HV,Dv], gcum [w,HV] fp32."""
-        from sglang.srt.layers.attention.linear.gdn_backend import l2norm_bf16
+        from sglang.srt.layers.attention.linear.gdn_backend import chunk_cumsum, l2norm_bf16
 
         w, HK, Dk = qh.shape
         HV = vh.shape[1]
@@ -195,7 +195,11 @@ class TestGDNChunkReplayDecode(unittest.TestCase):
         beta = beta[0].contiguous().float()
         kb = kn * beta[..., None]
         vb = vh.float() * beta[..., None]
-        gcum = g.transpose(0, 1).contiguous().cumsum(-1).transpose(0, 1).contiguous()
+        # Shared serial chunk_cumsum (what torch_chunk_gated_delta_rule now uses), not torch.cumsum:
+        # the serial scan differs from torch.cumsum ~1 fp32 ULP and the decode append reproduces the
+        # serial scan bit-for-bit, so the fp32 reference must scan the same way.
+        gt = g.transpose(0, 1).contiguous()  # [HV,w]
+        gcum = chunk_cumsum(gt.view(1, HV, 1, w))[0, :, 0].transpose(0, 1).contiguous()
         return qn.contiguous(), kn.contiguous(), kb.contiguous(), vb.contiguous(), gcum
 
     def _torch_chunk_fp32(self, qh, kh, vh, a, b, A_log, dt_bias, S):
