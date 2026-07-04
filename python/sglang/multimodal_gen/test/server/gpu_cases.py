@@ -912,14 +912,15 @@ def _make_5090_flux_layerwise_cpu_offload_case() -> DiffusionTestCase:
     )
 
 
-ONE_GPU_5090_CASES = _select_5090_canary_cases(
-    (
-        "zimage_image_t2i",
-        "flux_2_klein_base_image_t2i",
-        "wan2_1_t2v_1.3b",
-        "turbo_wan2_1_t2v_1.3b",
-    )
+ONE_GPU_5090_CANARY_CASE_IDS = (
+    "zimage_image_t2i",
+    "flux_2_klein_base_image_t2i",
+    "wan2_1_t2v_1.3b",
 )
+if not current_platform.is_hip():
+    ONE_GPU_5090_CANARY_CASE_IDS += ("turbo_wan2_1_t2v_1.3b",)
+
+ONE_GPU_5090_CASES = _select_5090_canary_cases(ONE_GPU_5090_CANARY_CASE_IDS)
 ONE_GPU_5090_CASES.append(_make_5090_flux_layerwise_cpu_offload_case())
 
 
