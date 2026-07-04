@@ -32,13 +32,14 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-DEFAULT_PLACEHOLDER_PROMPT = "A detailed image."
+DEFAULT_PLACEHOLDER_PROMPT = "warmup"
+DEFAULT_DETAILED_PLACEHOLDER_PROMPT = "A detailed image."
 DEFAULT_EXTENDED_PLACEHOLDER_PROMPT = (
     "A high quality image with a clear subject, natural lighting, detailed "
     "textures, and balanced composition."
 )
 TORCH_COMPILE_REAL_PATH_PREWARM_PROMPTS = (
-    DEFAULT_PLACEHOLDER_PROMPT,
+    DEFAULT_DETAILED_PLACEHOLDER_PROMPT,
     DEFAULT_EXTENDED_PLACEHOLDER_PROMPT,
 )
 DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION = (64, 64)
