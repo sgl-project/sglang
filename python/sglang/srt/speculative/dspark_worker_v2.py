@@ -968,7 +968,12 @@ class DSparkWorkerV2(BaseSpecWorker):
     ) -> Optional[dict]:
         if not self._accept_anomaly_enabled:
             return None
-        metadata = getattr(self.draft_model_runner.attn_backend, "forward_metadata", None)
+        attn_backend = self.draft_model_runner.attn_backend
+        metadata = getattr(attn_backend, "forward_metadata", None)
+        if getattr(metadata, "core_attn_metadata", None) is None:
+            inner_backends = getattr(attn_backend, "attn_backends", None)
+            if inner_backends:
+                metadata = getattr(inner_backends[0], "forward_metadata", None)
         core = getattr(metadata, "core_attn_metadata", None)
         if core is None:
             return {"draft_can_run_graph": can_run_graph, "draft_metadata": None}

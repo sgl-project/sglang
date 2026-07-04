@@ -1768,6 +1768,14 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
                 )
             )
 
+    def _runtime_metadata_steps(self) -> int:
+        if (
+            self.model_runner.spec_algorithm.is_dspark()
+            and self.model_runner.is_draft_worker
+        ):
+            return 1
+        return self.speculative_num_steps - 1
+
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         for attn_backend in self.attn_backends:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
@@ -1803,11 +1811,12 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
                     inner_fb, in_capture=True
                 )
         else:
-            if self.speculative_num_steps == 1:
+            runtime_steps = self._runtime_metadata_steps()
+            if runtime_steps <= 0:
                 return
             self.attn_backends[0].init_forward_metadata_out_graph(inner_fb)
             temp_metadata = self.attn_backends[0].forward_metadata
-            for i in range(1, self.speculative_num_steps - 1):
+            for i in range(1, runtime_steps):
                 self.attn_backends[i].replay_cuda_graph_metadata_from(
                     bs=forward_batch.batch_size,
                     temp_metadata=temp_metadata,
@@ -1815,14 +1824,14 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
                 )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        for i in range(self.speculative_num_steps - 1):
+        for i in range(self._runtime_metadata_steps()):
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ):
         ret = []
-        for i in range(self.speculative_num_steps - 1):
+        for i in range(self._runtime_metadata_steps()):
             ret.append(
                 self.attn_backends[
                     i
@@ -1837,8 +1846,9 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         *,
         static_forward_batch: Optional[ForwardBatch] = None,
     ) -> None:
-        assert len(capture_metadata) == self.speculative_num_steps - 1
-        for i in range(self.speculative_num_steps - 1):
+        runtime_steps = self._runtime_metadata_steps()
+        assert len(capture_metadata) == runtime_steps
+        for i in range(runtime_steps):
             self.attn_backends[
                 i
             ].prepare_forward_metadata_for_breakable_cuda_graph_replay(
