@@ -286,3 +286,30 @@
   - current SGLang Pi0.5 serving is not yet performance competitive with OpenPI in-process policy on this benchmark
   - main gaps are action-denoise runtime (`~131 ms` vs OpenPI policy infer `~40 ms`), lack of true grouped-request batching (`4` websocket requests serialize to about `4 x 190 ms`), and residual serving overhead
   - next optimization should prioritize action expert graph/kernel path and request batching before spending more time on HTTP JSON
+
+## 2026-07-04 16GB OpenPI baseline and SGLang Python benchmark
+
+- latest pushed benchmark commit: `0c3201a9f9`
+- added `--sglang-api python` to `python/sglang/multimodal_gen/benchmarks/bench_pi05_openpi.py`
+  - loads native `Pi05Pipeline` in the benchmark process with `SyncExecutor`
+  - calls the same action sampling-param builder as HTTP/websocket
+  - uses numpy observations directly, so it avoids JSON/msgpack, server, scheduler, and network overhead
+  - added `--sglang-pipeline-config-path` so the same low-VRAM config can be used without starting a server
+- fixed the Python direct path by setting `set_global_server_args(server_args)` before constructing Pi0.5 stages; server/scheduler paths already do this
+- remote GPU: `pi05-perf-opt`, 1x H100, GPU0 artificially constrained by ballast PID `747`
+  - ballast used `65824 MiB`
+  - available memory before model load was about `15247 MiB`
+  - config: `/tmp/pi05_edge_16gb.json` with prefix cache disabled, CUDA graph disabled, vision after-embed offload, token embedding CPU, two prefix language layers phase-offloaded, action expert after-denoise offload, `empty_cache_after_prefix=true`
+- OpenPI native in-process under the same 16GB-class pressure:
+  - default checkpoint compile mode: single mean `5401.9 ms`, direct-model batch mean `11613.0 ms / 4`
+  - eager mode (`--openpi-pytorch-compile-mode none`): single mean `5434.3 ms`, direct-model batch mean `11736.0 ms / 4`
+  - OpenPI `policy_timing.infer_ms` was asynchronous/noisy under pressure and is not a reliable end-to-end number here; wall-clock benchmark latency is the useful signal
+- SGLang phase-offload under the same pressure:
+  - OpenPI websocket server path: single mean `1225.2 ms`, persistent websocket batch mean `5281.0 ms / 4`
+  - HTTP server path: single mean `1385.6 ms`, concurrent HTTP batch mean `5150.3 ms / 4`
+  - Python in-process path: single mean `1483.0 ms`, loop batch mean `5532.9 ms / 4`
+  - Python stage means: preprocess `3.40 ms`, prefix `1063.8 ms`, action denoise `414.1 ms`, postprocess `0.12 ms`
+- conclusion:
+  - under a 16GB-class VRAM budget, SGLang Pi0.5 phase-offload is clearly faster than OpenPI native in-process policy, including OpenPI eager/no-compile mode
+  - this does not contradict the 80GB resident result, where OpenPI native remains much faster; SGLang's current win is specifically the constrained-VRAM edge deployment path
+  - current Pi0.5 batch mode is still request-loop/concurrent-request batching, not true model batching. The model tensor path supports batch dimensions, but `Pi05Preprocessor` currently rejects multi-sample prompt/state/noise and prefix cache/postprocess would need merge/split support before grouped execution is safe.
