@@ -1497,6 +1497,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
                 offset = next_offset
 
+        draft_forward_batch = self._make_draft_prefill_forward_batch_for_materialize(
+            model_worker_batch
+        )
+        self._materialize_main_hidden_to_draft_compressors(
+            main_hidden=logits_output.hidden_states,
+            draft_forward_batch=draft_forward_batch,
+        )
+
         logits_output.hidden_states = None
 
         batch_output.next_draft_input = self._make_next_draft_input_prefill(
