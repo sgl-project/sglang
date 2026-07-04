@@ -72,10 +72,14 @@ def test_disagg_not_world_folded():
     assert _decide(tp=1, sp=2, cfg=2, disagg=True) == (True, "sp")
 
 
-def test_separate_vae_gpus_not_world_folded():
-    # num_gpus > replica (dedicated VAE ranks): world != replica, so no world
-    # fold; falls back to SP behavior.
-    assert _decide(tp=1, sp=2, cfg=1, num_gpus=4) == (True, "sp")
+def test_num_gpus_is_authoritative_for_replica():
+    # Replica size comes from num_gpus // dp, so any parallelism reflected in
+    # the GPU count (beyond the tp/sp/cfg named here — e.g. a future axis) is
+    # covered without enumerating it: num_gpus=8, tp=2 -> replica 8 > tp -> fold.
+    assert _decide(tp=2, sp=1, cfg=1, num_gpus=8, heads=16, d_ff=64) == (
+        True,
+        "world",
+    )
 
 
 def test_indivisible_replica_not_folded():

@@ -449,15 +449,20 @@ class ServerArgs(DisaggServerArgsMixin):
         # untouched (no folding, no extra gather). dp>1 / disaggregated runs
         # keep the existing SP folding — a per-replica sub-group is a follow-up.
         tp_size = self.tp_size or 1
+        dp_size = self.dp_size or 1
         sp_degree = self.sp_degree or 1
-        cfg_degree = self.cfg_parallel_degree or 1
-        replica_size = tp_size * sp_degree * cfg_degree
+        # Size of one DiT replica = all its GPUs, however the DiT is split.
+        # Derive it from the authoritative GPU count rather than multiplying
+        # individual axes, so every parallelism (tp x cfg x ulysses x ring x
+        # pp x anything future) is covered without enumerating them. Runs after
+        # _adjust_parallelism(), so num_gpus / degrees are resolved.
+        replica_size = (self.num_gpus or tp_size) // dp_size
         fold_world = (
-            self.dp_size == 1
+            dp_size == 1
+            # For dp==1 monolithic the world group == the single DiT replica.
+            # dp>1 (world spans replicas) and disaggregated / dedicated-VAE
+            # layouts keep the existing per-SP folding.
             and not self.disagg_mode
-            # world group must be exactly the DiT replica (no separate VAE/other
-            # ranks), else folding over it would pull in non-DiT GPUs.
-            and self.num_gpus == replica_size
             and replica_size > tp_size
         )
 
@@ -487,7 +492,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.__class__.__name__,
                 tp_size,
                 sp_degree,
-                cfg_degree,
+                self.cfg_parallel_degree or 1,
                 replica_size,
             )
 
