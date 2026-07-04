@@ -978,7 +978,7 @@ class DeepseekV4AttnBackend(
         seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
 
-        actual_max_seq_len = seq_lens_cpu.max().item()
+        actual_max_seq_len = seq_lens_cpu.max().item() if seq_lens_cpu.numel() else 0
         chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
         assert actual_max_seq_len <= chosen_max_seq_len
 

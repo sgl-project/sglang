@@ -1518,6 +1518,13 @@ def compute_position(
     extend_seq_lens: torch.Tensor,
     extend_seq_lens_sum: int,
 ):
+    if extend_seq_lens.numel() == 0:
+        return (
+            torch.empty((0,), dtype=torch.int64, device=extend_seq_lens.device),
+            torch.empty(
+                (0,), dtype=extend_seq_lens.dtype, device=extend_seq_lens.device
+            ),
+        )
     if support_triton(attn_backend):
         positions, extend_start_loc = compute_position_triton(
             extend_prefix_lens,

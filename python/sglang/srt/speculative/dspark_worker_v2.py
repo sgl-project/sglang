@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from sglang.srt.distributed import (
     get_attn_tp_group,
+    get_moe_dp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
@@ -48,7 +49,7 @@ from sglang.srt.speculative.triton_ops.dspark import (
     _compute_dspark_accept_bonus_triton_unchecked,
 )
 from sglang.srt.utils import is_cuda, is_hip
-from sglang.srt.utils.common import empty_context
+from sglang.srt.utils.common import empty_context, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +365,32 @@ class DSparkWorkerV2(BaseSpecWorker):
             return None
 
         return [int(x) for x in batch.global_num_tokens]
+
+    def _get_dp_accepted_global_num_tokens(
+        self,
+        *,
+        local_num_tokens: int,
+        dp_decode_global_num_tokens: Optional[list[int]],
+    ) -> Optional[list[int]]:
+        if (
+            not self.server_args.enable_dp_attention
+            or dp_decode_global_num_tokens is None
+            or not any(int(x) > 0 for x in dp_decode_global_num_tokens)
+        ):
+            return None
+
+        dp_group = get_moe_dp_group()
+        local_count = torch.tensor(
+            [int(local_num_tokens)], dtype=torch.int64, device=self.device
+        )
+        if dp_group.world_size == 1:
+            return [int(local_num_tokens)]
+
+        gathered = torch.empty(
+            (dp_group.world_size,), dtype=torch.int64, device=self.device
+        )
+        dp_group.all_gather_into_tensor(gathered, local_count.contiguous())
+        return [int(x) for x in gathered.cpu().tolist()]
 
     def _get_target_aux_hidden_size(self) -> int:
         target_layer_ids = getattr(self._draft_inner, "target_layer_ids", None) or []
@@ -766,6 +793,123 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch.seq_lens_cpu = old_seq_lens_cpu
             batch.seq_lens_sum = old_seq_lens_sum
             batch.req_pool_indices = old_req_pool_indices
+            batch.prefix_lens = old_prefix_lens
+            batch.extend_lens = old_extend_lens
+            batch.extend_num_tokens = old_extend_num_tokens
+            batch.global_num_tokens = old_global_num_tokens
+            batch.global_num_tokens_for_logprob = old_global_num_tokens_for_logprob
+            self.draft_model_runner.attn_backend = old_attn_backend
+
+    def _run_accepted_path_draft_extend(
+        self,
+        *,
+        batch: ScheduleBatch,
+        main_hidden: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        extend_lens: torch.Tensor,
+        dp_global_num_tokens: Optional[list[int]],
+    ) -> None:
+        local_num_tokens = int(input_ids.numel())
+        participates_in_dp_extend = (
+            self.server_args.enable_dp_attention
+            and dp_global_num_tokens is not None
+            and any(int(x) > 0 for x in dp_global_num_tokens)
+        )
+        if local_num_tokens == 0 and not participates_in_dp_extend:
+            return
+        if main_hidden.shape[0] != local_num_tokens:
+            raise RuntimeError(
+                "DSpark accepted-path draft extend hidden/input size mismatch: "
+                f"hidden={tuple(main_hidden.shape)} input_tokens={local_num_tokens}"
+            )
+        if int(extend_lens.sum().item()) != local_num_tokens:
+            raise RuntimeError(
+                "DSpark accepted-path draft extend length mismatch: "
+                f"extend_lens_sum={int(extend_lens.sum().item())} "
+                f"input_tokens={local_num_tokens}"
+            )
+
+        old_input_ids = batch.input_ids
+        old_out_cache_loc = batch.out_cache_loc
+        old_spec_info = batch.spec_info
+        old_forward_mode = batch.forward_mode
+        old_capture_hidden_mode = batch.capture_hidden_mode
+        old_seq_lens = batch.seq_lens
+        old_seq_lens_cpu = batch.seq_lens_cpu
+        old_seq_lens_sum = batch.seq_lens_sum
+        old_prefix_lens = batch.prefix_lens
+        old_extend_lens = batch.extend_lens
+        old_extend_num_tokens = batch.extend_num_tokens
+        old_global_num_tokens = batch.global_num_tokens
+        old_global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
+        old_attn_backend = self.draft_model_runner.attn_backend
+        try:
+            if self.draft_extend_attn_backend is None:
+                raise RuntimeError(
+                    "DSpark draft_extend_attn_backend is not initialized."
+                )
+
+            prefix_lens = prefix_lens.to(device=self.device, dtype=old_seq_lens.dtype)
+            extend_lens = extend_lens.to(device=self.device, dtype=old_seq_lens.dtype)
+            seq_lens = prefix_lens + extend_lens
+
+            batch.input_ids = input_ids.to(device=self.device, dtype=torch.int64)
+            batch.out_cache_loc = out_cache_loc.to(device=self.device)
+            batch.spec_info = DSparkDraftExtendInput(
+                hidden_states=main_hidden.to(self.device, non_blocking=True),
+                positions=positions.to(device=self.device),
+                num_tokens_per_req=1,
+                num_tokens_for_logprob_per_req=1,
+            )
+            batch.seq_lens = seq_lens
+            batch.seq_lens_cpu = seq_lens.detach().cpu()
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+            batch.prefix_lens = prefix_lens.detach().cpu().tolist()
+            batch.extend_lens = extend_lens.detach().cpu().tolist()
+            batch.extend_num_tokens = local_num_tokens
+            if dp_global_num_tokens is not None:
+                batch.global_num_tokens = dp_global_num_tokens
+                batch.global_num_tokens_for_logprob = dp_global_num_tokens
+            batch.forward_mode = ForwardMode.EXTEND
+            batch.capture_hidden_mode = CaptureHiddenMode.NULL
+            self.draft_model_runner.attn_backend = self.draft_extend_attn_backend
+
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft_extend_accepted"),
+                torch.inference_mode(),
+            ):
+                with self.plan_stream_ctx:
+                    forward_batch = ForwardBatch.init_new(
+                        batch, self.draft_model_runner
+                    )
+                    forward_batch.return_logprob = False
+                    forward_batch.lora_ids = [None] * forward_batch.batch_size
+                    if not batch.forward_mode.is_idle():
+                        self.draft_model_runner.attn_backend.init_forward_metadata(
+                            forward_batch
+                        )
+                        if not is_npu():
+                            forward_batch.mark_forward_metadata_ready()
+                if self.plan_stream:
+                    torch.get_device_module(self.device).current_stream().wait_stream(
+                        self.plan_stream
+                    )
+                self.draft_model_runner.forward(forward_batch)
+        finally:
+            batch.input_ids = old_input_ids
+            batch.out_cache_loc = old_out_cache_loc
+            batch.spec_info = old_spec_info
+            batch.forward_mode = old_forward_mode
+            batch.capture_hidden_mode = old_capture_hidden_mode
+            batch.seq_lens = old_seq_lens
+            batch.seq_lens_cpu = old_seq_lens_cpu
+            batch.seq_lens_sum = old_seq_lens_sum
             batch.prefix_lens = old_prefix_lens
             batch.extend_lens = old_extend_lens
             batch.extend_num_tokens = old_extend_num_tokens
@@ -1622,13 +1766,44 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._block_pos_offsets.unsqueeze(0)
                 < commit_lens.unsqueeze(1).to(torch.int64)
             ).reshape(-1)
-            self._materialize_main_hidden_to_draft_state(
-                main_hidden=hidden_flat,
-                cache_loc=verify_out_cache_loc[commit_mask],
-                positions=positions[commit_mask],
-                draft_forward_batch=draft_forward_batch,
-                kv_main_hidden=hidden_flat[commit_mask],
+            accepted_hidden = hidden_flat[commit_mask]
+            accepted_input_ids = candidates.reshape(-1)[commit_mask]
+            accepted_positions = positions[commit_mask]
+            accepted_cache_loc = verify_out_cache_loc[commit_mask]
+            accepted_extend_lens = commit_lens.to(torch.int64)
+        else:
+            hidden_flat = torch.empty(
+                (0, self._get_target_aux_hidden_size()),
+                dtype=self.draft_model.lm_head.weight.dtype,
+                device=device,
             )
+            accepted_hidden = hidden_flat
+            accepted_input_ids = torch.empty((0,), dtype=torch.int64, device=device)
+            accepted_positions = torch.empty((0,), dtype=positions.dtype, device=device)
+            accepted_cache_loc = torch.empty(
+                (0,), dtype=verify_out_cache_loc.dtype, device=device
+            )
+            accepted_extend_lens = commit_lens.to(torch.int64)
+
+        accepted_global_num_tokens = self._get_dp_accepted_global_num_tokens(
+            local_num_tokens=int(accepted_input_ids.numel()),
+            dp_decode_global_num_tokens=dp_decode_global_num_tokens,
+        )
+        if bs > 0 or (
+            accepted_global_num_tokens is not None
+            and any(int(x) > 0 for x in accepted_global_num_tokens)
+        ):
+            self._run_accepted_path_draft_extend(
+                batch=model_worker_batch,
+                main_hidden=accepted_hidden,
+                input_ids=accepted_input_ids,
+                positions=accepted_positions,
+                out_cache_loc=accepted_cache_loc,
+                prefix_lens=prefix_lens,
+                extend_lens=accepted_extend_lens,
+                dp_global_num_tokens=accepted_global_num_tokens,
+            )
+        if bs > 0:
             self._clear_unaccepted_c128_draft_states(
                 batch=model_worker_batch,
                 prefix_lens=prefix_lens,
