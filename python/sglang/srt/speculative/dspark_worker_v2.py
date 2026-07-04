@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.distributed import (
     get_attn_tp_group,
@@ -1167,6 +1166,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         markov_head = self._draft_inner.markov_head
         confidence_head = self._draft_inner.confidence_head
         lm_head = self.draft_model.lm_head
+        logits_processor = self.draft_model.logits_processor
 
         vocab_size = int(self._draft_inner.vocab_size)
 
@@ -1185,6 +1185,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ..., :vocab_size
             ]
 
+        def _compute_full_vocab_logits(
+            hidden_states: torch.Tensor,
+            head,
+        ) -> torch.Tensor:
+            logits_shard = logits_processor._compute_lm_head(hidden_states, head)
+            return _gather_full_vocab(logits_shard, head)
+
         if bonus_tokens.numel() == bs:
             first_tokens = bonus_tokens.view(-1).to(torch.int64)
         else:
@@ -1194,9 +1201,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         candidates[:, 0].copy_(first_tokens)
 
         with torch.inference_mode():
-            base_logits = _gather_full_vocab(
-                F.linear(block_hidden, lm_head.weight), lm_head
-            )
+            base_logits = _compute_full_vocab_logits(block_hidden, lm_head)
             debug_enabled = bool(self._accept_anomaly_enabled)
             if debug_enabled:
                 base_top1 = torch.argmax(base_logits, dim=-1)
@@ -1215,9 +1220,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     prev_token_debug[:, i].copy_(prev_tokens)
                 prev_embed = markov_head.get_prev_embeddings(prev_tokens)
                 markov_embeds[:, i].copy_(prev_embed)
-                bias = _gather_full_vocab(
-                    markov_head.project_bias(prev_embed), markov_head.markov_w2
-                )
+                bias = _compute_full_vocab_logits(prev_embed, markov_head.markov_w2)
                 bias.add_(base_logits[:, i])
                 next_tokens = torch.argmax(bias, dim=-1)
                 if debug_enabled:
