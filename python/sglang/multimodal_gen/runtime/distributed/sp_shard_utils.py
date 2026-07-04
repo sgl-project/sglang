@@ -90,9 +90,9 @@ def shard_seq(
     x: torch.Tensor, dim: int = 1, pad_mode: str = "zeros"
 ) -> tuple[torch.Tensor, SpShard]:
     """
-        mode:
-            zeroes: pad with zeroes at tail
-            repeat_last: repeat the last token, only for rotary embedding
+    mode:
+        zeroes: pad with zeroes at tail
+        repeat_last: repeat the last token, only for rotary embedding
     """
     shard = build_shard_plan(x.shape[dim])
     return _shard_like(x, shard, dim=dim, pad_mode=pad_mode), shard
@@ -126,22 +126,24 @@ def shard_seq_prefix(
 def join_seqs(
     prefix: torch.Tensor, body: torch.Tensor, local_pad: int, dim: int = 1
 ) -> torch.Tensor:
-    """Concatenate ``[prefix, body]`` for joint attention, relocating the
-    prefix's ``local_pad`` tail rows behind the body.
+    """Concatenate ``[prefix (txt tokens), body (img tokens)]`` for joint attention, relocating the
+     prefix's ``local_pad`` tail rows behind the body.
 
     Why: the shard pads the *text* chunk, but the local joint layout is
-    [text, image] - after the ulysses gather that pad would sit mid-sequence
-    ([... txt_last, PAD, img_last]), and attention can only skip a mid-sequence
-    hole by repacking q/k/v. With the pad relocated behind the image, the
-    gathered padding forms one global-tail block that the zero-copy varlen
+    [text, image]. after the ulysses gather that pad would sit mid-sequence
+    ([... txt_last, PAD, img_last]), which needs to be trimmed for attention
+
+    With the pad relocated behind the image, the gathered padding forms one global-tail block that the zero-copy varlen
     path (tail_attn_meta) skips for free. Same copy volume as a plain cat.
     """
     if local_pad > 0:
         real = prefix.shape[dim] - local_pad
         return torch.cat(
             [
+                # txt tokens
                 prefix.narrow(dim, 0, real),
                 body,
+                # leave the padding at global-tail
                 prefix.narrow(dim, real, local_pad),
             ],
             dim=dim,
@@ -152,10 +154,11 @@ def join_seqs(
 def split_seqs(
     joint: torch.Tensor, prefix_len: int, local_pad: int, dim: int = 1
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Inverse of ``join_seqs``: recover ``(prefix, body)`` from the joint
-    output, with the pad rows rejoining the prefix tail so the residual text
-    stream keeps its per-rank shape (their content is garbage and is excluded
-    from every attention, so carrying them along is free)."""
+    """Inverse of ``join_seqs``: recover ``(prefix, body)`` from the joint output, with the pad rows rejoining the prefix tail so the residual text
+    stream keeps its per-rank shape.
+
+     ([... txt_last, PAD, img_last]) -> prefix (txt + pad), body (img)
+    """
     total = joint.shape[dim]
     if local_pad > 0:
         real = prefix_len - local_pad
@@ -207,9 +210,9 @@ def tail_attn_meta(
 def plan_text_strategy(txt_len: int) -> str:
     """Choose "shard" or "replicate" for the joint-attention text stream.
 
-       Prefer "shard" by default. for small sequence (shorter than SGLANG_SP_TEXT_SHARD_MIN), choose "replicate" for better performance
+    Prefer "shard" by default. for small sequence (shorter than SGLANG_SP_TEXT_SHARD_MIN), choose "replicate" for better performance
 
-        """
+    """
     sp_size = get_sp_world_size()
     if sp_size <= 1:
         return "replicate"
