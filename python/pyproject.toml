@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-rust>=1.10", "setuptools-scm>=8.0", "wheel"]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "setuptools-rust>=1.10", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -42,6 +42,7 @@ dependencies = [
   "modelscope",
   "msgspec",
   "ninja",
+  "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "numpy",
   "nvidia-cutlass-dsl[cu13]==4.5.2",
   "nvidia-mathdx==25.6.0",
@@ -157,6 +158,7 @@ test = [
   "sentence_transformers",
   "sglang[fastokens]",
   "tabulate",
+  "granian>=2.6.0",
 ]
 
 dev = ["sglang[test]"]

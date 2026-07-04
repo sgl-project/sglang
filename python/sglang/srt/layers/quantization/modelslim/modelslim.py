@@ -5,6 +5,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
+import numpy as np
 
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _NPULinearMethodBase,
@@ -21,6 +22,14 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW8A8Int8,
     ModelSlimW8A8Int8MoE,
 )
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.layers.parameter import ChannelQuantScaleParameter, _ColumnvLLMParameter
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import apply_module_patch
 
@@ -120,6 +129,10 @@ class ModelSlimConfig(QuantizationConfig):
                     [npu_wrapper_rmsnorm_forward],
                 )
 
+        self.kv_cache_scheme = None
+        if quant_config.get("kv_quant_type", "") == "C8":
+            self.kv_cache_scheme = "int8"
+
     def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
         self.packed_modules_mapping.update(mapping)
 
@@ -154,7 +167,6 @@ class ModelSlimConfig(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-
         if isinstance(layer, LinearBase):
             # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
             key = "model"
@@ -183,6 +195,8 @@ class ModelSlimConfig(QuantizationConfig):
         elif isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer, prefix)
             return ModelSlimFusedMoEMethod(self)
+        elif (self.kv_cache_scheme is not None) and isinstance(layer, RadixAttention):
+            return ModelSlimKVCacheMethod(self)
         return None
 
     def get_linear_scheme(
@@ -398,3 +412,119 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
             group_list,
             output_dtype,
         )
+
+
+class ModelSlimKVCacheMethod(BaseKVCacheMethod):
+    def __init__(self, config):
+        super().__init__(config)
+        self.is_dynamic = False
+
+    def create_weights(
+        self,
+        layer: nn.Module,
+        #head_size: int,
+        #num_kv_heads: int,
+        #tp_rank: int,
+        **extra_weight_attrs,
+    ):
+        # Deleting scales created in base Attention class to register new ones.
+        del layer.k_scale
+        del layer.v_scale
+        self.kv_size = extra_weight_attrs['num_kv_heads'] * extra_weight_attrs['head_size']
+        self.tp_rank = extra_weight_attrs['tp_rank']
+
+        k_scale = ChannelQuantScaleParameter(
+            data=torch.full([self.kv_size], fill_value=-1, dtype=torch.float32),
+            output_dim=0,
+            weight_loader=self.weight_loader,
+        )
+        layer.register_parameter("k_scale", k_scale)
+        v_scale = ChannelQuantScaleParameter(
+            data=torch.full([self.kv_size], fill_value=-1, dtype=torch.float32),
+            output_dim=0,
+            weight_loader=self.weight_loader,
+        )
+        layer.register_parameter("v_scale", v_scale)
+        k_offset = ChannelQuantScaleParameter(
+            data=torch.full([self.kv_size], fill_value=-1, dtype=torch.float32),
+            output_dim=0,
+            weight_loader=self.weight_loader,
+        )
+        layer.register_parameter("k_offset", k_offset)
+        v_offset = ChannelQuantScaleParameter(
+            data=torch.full([self.kv_size], fill_value=-1, dtype=torch.float32),
+            output_dim=0,
+            weight_loader=self.weight_loader,
+        )
+        layer.register_parameter("v_offset", v_offset)
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        device = layer.k_scale.device
+        dtype = torch.bfloat16
+
+        k_offset = torch.from_numpy(np.frombuffer(layer.k_offset.to(torch.float32).cpu().numpy().tobytes(), dtype=np.int32
+        ).copy()).to(device)
+        v_offset = torch.from_numpy(np.frombuffer(layer.v_offset.to(torch.float32).cpu().numpy().tobytes(), dtype=np.int32
+        ).copy()).to(device)
+
+        layer.k_quant_offset = torch.nn.Parameter(k_offset.to(dtype), requires_grad=False).unsqueeze(0)
+        layer.v_quant_offset = torch.nn.Parameter(v_offset.to(dtype), requires_grad=False).unsqueeze(0)
+        layer.k_dequant_scale = torch.nn.Parameter(layer.k_scale.to(dtype), requires_grad=False).unsqueeze(0)
+        layer.v_dequant_scale = torch.nn.Parameter(layer.v_scale.to(dtype), requires_grad=False).unsqueeze(0)
+        layer.k_quant_scale = torch.nn.Parameter(layer.k_scale.reciprocal().to(dtype), requires_grad=False).unsqueeze(0)
+        layer.v_quant_scale = torch.nn.Parameter(layer.v_scale.reciprocal().to(dtype), requires_grad=False).unsqueeze(0)
+
+    def anti_quant_int8(self, k_cache, v_cache, layer):
+        old_shape = k_cache.shape
+        k_cache = k_cache.view(-1, self.kv_size)
+        v_cache = v_cache.view(-1, self.kv_size)
+        k_cache = torch.ops.npu.npu_anti_quant(
+            x=k_cache,
+            scale=layer.k_scale,
+            dst_dtype=torch.bfloat16
+        )
+        v_cache = torch.ops.npu.npu_anti_quant(
+            x=v_cache,
+            scale=layer.v_scale,
+            dst_dtype=torch.bfloat16
+        )
+        k_cache = k_cache.view(old_shape)
+        v_cache = v_cache.view(old_shape)
+        return k_cache, v_cache
+
+    def apply(self, k_cache, v_cache, layer):
+        #TODO: add dynamic quantization support
+        old_shape = k_cache.shape
+        k_cache = k_cache.view(-1, self.kv_size)
+        v_cache = v_cache.view(-1, self.kv_size)
+
+        key_int8 = torch.ops.npu.npu_quantize(
+                    k_cache,
+                    layer.k_quant_scale.squeeze(),
+                    layer.k_quant_offset.squeeze() if hasattr(layer,"k_quant_offset") else None,
+                    torch.qint8,
+                    -1,
+                    False)
+
+        value_int8 = torch.ops.npu.npu_quantize(
+                    v_cache,
+                    layer.v_quant_scale.squeeze(),
+                    layer.v_quant_offset.squeeze() if hasattr(layer,"v_quant_offset") else None,
+                    torch.qint8,
+                    -1,
+                    False)
+
+        key_int8 = key_int8.view(old_shape)
+        value_int8 = value_int8.view(old_shape)
+
+        return key_int8, value_int8
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        if isinstance(param, _ColumnvLLMParameter):
+            logger.info_once(f"Loading kv cache scales...")
+            param.load_column_parallel_weight(
+                loaded_weight,
+                tp_rank=self.tp_rank,
+                use_presharded_weights=False,
+            )
+        
