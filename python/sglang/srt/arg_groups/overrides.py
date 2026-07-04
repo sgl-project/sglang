@@ -570,6 +570,23 @@ def _gemma4_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
+@_register_for("MossVLForConditionalGeneration")
+def _moss_vl_overrides(server_args: Any, hf_config: Any) -> dict:
+    overrides: Dict[str, Any] = {}
+    if server_args.is_attention_backend_not_set():
+        overrides["prefill_attention_backend"] = "flashinfer"
+        logger.info("Use flashinfer as default prefill attention backend for Moss-VL")
+    prefill_backend = (
+        overrides.get("prefill_attention_backend")
+        or server_args.get_attention_backends()[0]
+    )
+    assert prefill_backend == "flashinfer", (
+        "MossVLForConditionalGeneration requires flashinfer prefill "
+        "attention backend for cross-attention custom mask support."
+    )
+    return overrides
+
+
 @_register_for("MiniCPMV4_6ForConditionalGeneration")
 def _minicpm_v4_6_overrides(server_args: Any, hf_config: Any) -> dict:
     if is_sm100_supported() and server_args.attention_backend is None:
@@ -618,7 +635,12 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     if server_args.device == "npu":
         # NPU keeps the device-aware "dsv4" backend (the registry routes it to
         # the Ascend V4 subclass); only the pool geometry / dtype differ.
+        # set_default_server_args() pins all three backends to "ascend" for
+        # generic NPU models; override that here so V4 stays consistently on
+        # dsv4.
         page_size = 128
+        overrides["prefill_attention_backend"] = "dsv4"
+        overrides["decode_attention_backend"] = "dsv4"
     overrides["page_size"] = page_size
     logger.info(
         f"Use dsv4 attention backend for {model_arch}, setting page_size to {page_size}."
@@ -1011,6 +1033,71 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     return {}
 
 
+@register_post_process
+def _dsa_split_backend_resolution(view: Any) -> dict:
+    """Slot pass in the DSA arm: default the DSA prefill/decode split
+    backends from the mid-resolution kv-cache dtype and the device
+    capability. The hisparse arm takes precedence under --enable-hisparse."""
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    hf_config = view.get_model_config().hf_config
+    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
+        return {}
+    if not is_deepseek_dsa(hf_config):
+        return {}
+    if is_npu() or is_xpu():
+        return {}
+
+    import torch
+
+    major, _ = torch.cuda.get_device_capability()
+    kv_cache_dtype = view.kv_cache_dtype
+    user_set_prefill = view.dsa_prefill_backend is not None
+    user_set_decode = view.dsa_decode_backend is not None
+    declared: Dict[str, Any] = {}
+
+    if view.enable_hisparse:
+        from sglang.srt.arg_groups.hisparse_hook import _hisparse_default_backend
+
+        backend = _hisparse_default_backend(kv_cache_dtype)
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = backend
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = backend
+        prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
+        decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+        logger.warning(
+            f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
+            f"prefill={prefill}, decode={decode}."
+        )
+        return declared
+
+    if not user_set_prefill and not user_set_decode and is_hip():
+        declared["dsa_prefill_backend"] = "tilelang"
+        declared["dsa_decode_backend"] = "tilelang"
+    elif kv_cache_dtype == "fp8_e4m3":
+        # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
+        default = "trtllm" if major >= 10 else "flashmla_kv"
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = default
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = default
+    else:
+        # Set prefill/decode backends based on hardware architecture.
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "flashmla_sparse"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "trtllm" if major >= 10 else "fa3"
+
+    prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
+    decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+    logger.warning(
+        f"Set DSA backends for {kv_cache_dtype} KV Cache: "
+        f"prefill={prefill}, decode={decode}."
+    )
+    return declared
+
+
 # Keep in sync with the DeepSeek family list on _deepseek_family_overrides.
 _DEEPSEEK_FAMILY_ARCHS = frozenset(
     {
@@ -1354,6 +1441,39 @@ def _mla_backend_page_constraints(view: Any) -> dict:
             page_size = 64
     if page_size != view.page_size:
         return {"page_size": page_size}
+    return {}
+
+
+@register_post_process
+def _cutedsl_prefill_backend_fill(view: Any) -> dict:
+    """Slot pass in the attention-backend compatibility handler: CuteDSL MLA
+    is decode-only, so validate the combination and default the prefill side
+    to trtllm_mla. The trtllm_mha check that follows at the legacy slot reads
+    the dual-applied value."""
+    if not (
+        view.attention_backend == "cutedsl_mla"
+        or view.decode_attention_backend == "cutedsl_mla"
+        or view.prefill_attention_backend == "cutedsl_mla"
+    ):
+        return {}
+    assert (
+        view.prefill_attention_backend != "cutedsl_mla"
+    ), "CuteDSL MLA only supports decoding for now"
+    if not is_sm100_supported():
+        raise ValueError(
+            "CuteDSL MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
+        )
+    if view.kv_cache_dtype not in [
+        "fp8_e4m3",
+        "bf16",
+        "bfloat16",
+        "auto",
+    ]:
+        raise ValueError(
+            "CuteDSL MLA backend only supports kv-cache-dtype of fp8_e4m3, bf16, or auto."
+        )
+    if view.prefill_attention_backend is None:
+        return {"prefill_attention_backend": "trtllm_mla"}
     return {}
 
 

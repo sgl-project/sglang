@@ -284,6 +284,8 @@ class AttnFlags(_StaticFlags):
     # Resolved attention backend; the pristine user request stays on
     # server_args.attention_backend.
     backend: str | None = None
+    prefill_backend: str | None = None
+    decode_backend: str | None = None
 
 
 @dataclasses.dataclass
@@ -332,6 +334,8 @@ class Flags(_StaticFlags):
     speculative_moe_a2a_backend: str | None = None
     disable_shared_experts_fusion: bool = False
     kv_cache_dtype: str = "auto"
+    dsa_prefill_backend: str | None = None
+    dsa_decode_backend: str | None = None
     # Parallel-request fields: flat transitional home, to be re-homed by the
     # Parallel Parameters Clarification module.
     enable_dp_attention: bool = False
@@ -355,6 +359,8 @@ class Flags(_StaticFlags):
 # family as readers migrate.
 FLAG_LEAF_MAP: dict[str, str] = {
     "attention_backend": "attn.backend",
+    "prefill_attention_backend": "attn.prefill_backend",
+    "decode_attention_backend": "attn.decode_backend",
     "moe_runner_backend": "moe.runner_backend",
 }
 

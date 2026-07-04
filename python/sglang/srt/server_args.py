@@ -1430,6 +1430,7 @@ class ServerArgs:
         Arg(
             help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
             choices=ATTENTION_BACKEND_CHOICES,
+            resolvable=True,
         ),
     ] = None
     prefill_attention_backend: A[
@@ -1437,6 +1438,7 @@ class ServerArgs:
         Arg(
             help="Choose the kernels for prefill attention layers (have priority over --attention-backend).",
             choices=ATTENTION_BACKEND_CHOICES,
+            resolvable=True,
         ),
     ] = None
     sampling_backend: A[
@@ -1496,6 +1498,7 @@ class ServerArgs:
         Arg(
             help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
             choices=DSA_CHOICES,
+            resolvable=True,
         ),
     ] = None
     dsa_decode_backend: A[
@@ -1503,6 +1506,7 @@ class ServerArgs:
         Arg(
             help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
             choices=DSA_CHOICES,
+            resolvable=True,
         ),
     ] = None
     dsa_topk_backend: A[
@@ -3683,51 +3687,15 @@ class ServerArgs:
 
         run_post_process_pass(self, _dsa_kv_cache_dtype_default)
 
-    def _set_default_dsa_backends(self, kv_cache_dtype: str, major: int) -> str:
-        from sglang.srt.arg_groups.hisparse_hook import (
-            apply_hisparse_dsa_backend_defaults,
+    def _set_default_dsa_backends(self, kv_cache_dtype: str, major: int) -> None:
+        # Moved to the resolution pipeline (arg_groups/overrides.py:
+        # _dsa_split_backend_resolution), invoked here at its legacy slot.
+        from sglang.srt.arg_groups.overrides import (
+            _dsa_split_backend_resolution,
+            run_post_process_pass,
         )
 
-        user_set_prefill = self.dsa_prefill_backend is not None
-        user_set_decode = self.dsa_decode_backend is not None
-
-        if apply_hisparse_dsa_backend_defaults(
-            self, user_set_prefill, user_set_decode, kv_cache_dtype
-        ):
-            return
-
-        if not user_set_prefill and not user_set_decode and is_hip():
-            self.dsa_prefill_backend = "tilelang"
-            self.dsa_decode_backend = "tilelang"
-        elif kv_cache_dtype == "fp8_e4m3":
-            if major >= 10:
-                if not user_set_prefill:
-                    self.dsa_prefill_backend = "trtllm"
-                if not user_set_decode:
-                    self.dsa_decode_backend = "trtllm"
-            else:
-                # Hopper FP8 defaults to flashmla_kv for both prefill and decode.
-                if not user_set_prefill:
-                    self.dsa_prefill_backend = "flashmla_kv"
-                if not user_set_decode:
-                    self.dsa_decode_backend = "flashmla_kv"
-        else:
-            # set prefill/decode backends based on hardware architecture.
-            if major >= 10:
-                if not user_set_prefill:
-                    self.dsa_prefill_backend = "flashmla_sparse"
-                if not user_set_decode:
-                    self.dsa_decode_backend = "trtllm"
-            else:
-                # Hopper defaults for bfloat16
-                if not user_set_prefill:
-                    self.dsa_prefill_backend = "flashmla_sparse"
-                if not user_set_decode:
-                    self.dsa_decode_backend = "fa3"
-
-        logger.warning(
-            f"Set DSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.dsa_prefill_backend}, decode={self.dsa_decode_backend}."
-        )
+        run_post_process_pass(self, _dsa_split_backend_resolution)
 
     def _validate_hisparse_dsa_backend(self, attr: str, label: str):
         from sglang.srt.arg_groups.hisparse_hook import validate_hisparse_dsa_backend
@@ -4062,16 +4030,9 @@ class ServerArgs:
             # The quantization/moe_runner_backend resolution moved to the override
             # registry (arg_groups/overrides.py: _gemma4_overrides).
         elif model_arch == "MossVLForConditionalGeneration":
-            if self.is_attention_backend_not_set():
-                self.prefill_attention_backend = "flashinfer"
-                logger.info(
-                    "Use flashinfer as default prefill attention backend for Moss-VL"
-                )
-            prefill_backend, _ = self.get_attention_backends()
-            assert prefill_backend == "flashinfer", (
-                "MossVLForConditionalGeneration requires flashinfer prefill "
-                "attention backend for cross-attention custom mask support."
-            )
+            # The prefill attention backend default + validation moved to the
+            # override registry (arg_groups/overrides.py: _moss_vl_overrides).
+            pass
         elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
             if hf_config.sliding_window_pattern is not None:
                 # disable_hybrid_swa_memory moved to the override registry
@@ -4405,29 +4366,12 @@ class ServerArgs:
                     f"got {self.kv_cache_dtype}."
                 )
 
-        if (
-            self.attention_backend == "cutedsl_mla"
-            or self.decode_attention_backend == "cutedsl_mla"
-            or self.prefill_attention_backend == "cutedsl_mla"
-        ):
-            assert (
-                self.prefill_attention_backend != "cutedsl_mla"
-            ), "CuteDSL MLA only supports decoding for now"
-            if not is_sm100_supported():
-                raise ValueError(
-                    "CuteDSL MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
-                )
-            if self.kv_cache_dtype not in [
-                "fp8_e4m3",
-                "bf16",
-                "bfloat16",
-                "auto",
-            ]:
-                raise ValueError(
-                    "CuteDSL MLA backend only supports kv-cache-dtype of fp8_e4m3, bf16, or auto."
-                )
-            if self.prefill_attention_backend is None:
-                self.prefill_attention_backend = "trtllm_mla"
+        # The CuteDSL MLA validation + prefill fill moved to the resolution
+        # pipeline (arg_groups/overrides.py: _cutedsl_prefill_backend_fill),
+        # invoked here at its legacy slot.
+        from sglang.srt.arg_groups.overrides import _cutedsl_prefill_backend_fill
+
+        run_post_process_pass(self, _cutedsl_prefill_backend_fill)
 
         if (
             self.attention_backend == "trtllm_mha"

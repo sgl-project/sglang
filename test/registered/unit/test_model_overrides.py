@@ -85,6 +85,10 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "speculative_moe_a2a_backend",
                     "disable_shared_experts_fusion",
                     "kv_cache_dtype",
+                    "dsa_prefill_backend",
+                    "dsa_decode_backend",
+                    "prefill_attention_backend",
+                    "decode_attention_backend",
                 }
             ),
         )
@@ -1014,6 +1018,162 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             {},
         )
+
+    def test_dsa_split_backend_resolution_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _dsa_split_backend_resolution,
+        )
+
+        def _view(arch="DeepseekV32ForCausalLM", **kw):
+            hf = SimpleNamespace(architectures=[arch])
+            defaults = dict(
+                kv_cache_dtype="fp8_e4m3",
+                dsa_prefill_backend=None,
+                dsa_decode_backend=None,
+                enable_hisparse=False,
+            )
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(
+                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+                )
+            )
+
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch.object(overrides_module, "is_npu", return_value=False),
+            patch.object(overrides_module, "is_xpu", return_value=False),
+            patch.object(overrides_module, "is_hip", return_value=False),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            # Hopper FP8 -> flashmla_kv both
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view()),
+                {
+                    "dsa_prefill_backend": "flashmla_kv",
+                    "dsa_decode_backend": "flashmla_kv",
+                },
+            )
+            # Hopper bf16 -> flashmla_sparse / fa3
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(kv_cache_dtype="bfloat16")),
+                {
+                    "dsa_prefill_backend": "flashmla_sparse",
+                    "dsa_decode_backend": "fa3",
+                },
+            )
+            # user-set prefill survives; only decode defaulted
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(dsa_prefill_backend="trtllm")),
+                {"dsa_decode_backend": "flashmla_kv"},
+            )
+            # hisparse arm takes precedence (CUDA fp8 -> flashmla_kv)
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(enable_hisparse=True)),
+                {
+                    "dsa_prefill_backend": "flashmla_kv",
+                    "dsa_decode_backend": "flashmla_kv",
+                },
+            )
+            # non-family arch declares nothing
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(arch="LlamaForCausalLM")), {}
+            )
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch.object(overrides_module, "is_npu", return_value=False),
+            patch.object(overrides_module, "is_xpu", return_value=False),
+            patch.object(overrides_module, "is_hip", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=(9, 4)),
+        ):
+            # ROCm with both unset -> tilelang
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(kv_cache_dtype="bfloat16")),
+                {
+                    "dsa_prefill_backend": "tilelang",
+                    "dsa_decode_backend": "tilelang",
+                },
+            )
+
+    def test_cutedsl_prefill_backend_fill_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _cutedsl_prefill_backend_fill,
+        )
+
+        def _view(**kw):
+            defaults = dict(
+                attention_backend=None,
+                decode_attention_backend="cutedsl_mla",
+                prefill_attention_backend=None,
+                kv_cache_dtype="auto",
+            )
+            defaults.update(kw)
+            return ResolvedView(SimpleNamespace(**defaults))
+
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            # decode-only cutedsl: prefill defaults to trtllm_mla
+            self.assertEqual(
+                _cutedsl_prefill_backend_fill(_view()),
+                {"prefill_attention_backend": "trtllm_mla"},
+            )
+            # user-set prefill survives
+            self.assertEqual(
+                _cutedsl_prefill_backend_fill(_view(prefill_attention_backend="fa3")),
+                {},
+            )
+            # cutedsl on the prefill side is rejected
+            with self.assertRaises(AssertionError):
+                _cutedsl_prefill_backend_fill(
+                    _view(prefill_attention_backend="cutedsl_mla")
+                )
+            # unsupported kv dtype rejected
+            with self.assertRaises(ValueError):
+                _cutedsl_prefill_backend_fill(_view(kv_cache_dtype="fp8_e5m2"))
+            # not a cutedsl config: nothing declared
+            self.assertEqual(
+                _cutedsl_prefill_backend_fill(_view(decode_attention_backend=None)),
+                {},
+            )
+        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+            with self.assertRaises(ValueError):
+                _cutedsl_prefill_backend_fill(_view())
+
+    def test_moss_vl_overrides_at_callable_level(self):
+        from sglang.srt.arg_groups.overrides import _moss_vl_overrides
+
+        def _args(**kw):
+            defaults = dict(
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+            )
+            defaults.update(kw)
+            ns = SimpleNamespace(**defaults)
+            ns.is_attention_backend_not_set = lambda: (
+                ns.attention_backend is None
+                and ns.prefill_attention_backend is None
+                and ns.decode_attention_backend is None
+            )
+            ns.get_attention_backends = lambda: (
+                ns.prefill_attention_backend or ns.attention_backend,
+                ns.decode_attention_backend or ns.attention_backend,
+            )
+            return ns
+
+        # nothing set: prefill defaults to flashinfer
+        self.assertEqual(
+            _moss_vl_overrides(_args(), None),
+            {"prefill_attention_backend": "flashinfer"},
+        )
+        # compatible user choice passes with no declaration
+        self.assertEqual(
+            _moss_vl_overrides(_args(attention_backend="flashinfer"), None), {}
+        )
+        # incompatible user choice rejected
+        with self.assertRaises(AssertionError):
+            _moss_vl_overrides(_args(attention_backend="fa3"), None)
 
     def test_dsa_kv_cache_dtype_default_pass(self):
         from sglang.srt.arg_groups.overrides import (

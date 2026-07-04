@@ -18,8 +18,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     registry (arg_groups/overrides.py: _deepseek_v4_overrides) and the
     kv-cache dtype default to the resolution pipeline
     (_deepseek_v4_kv_cache_dtype, invoked below at its legacy slot). This
-    keeps, at the legacy slot: the ROCm env fill (env-write policy), the NPU
-    split-backend writes (split fields not yet resolvable), the
+    keeps, at the legacy slot: the ROCm env fill (env-write policy), the
     max_running_requests fill (the speculative hook is a later writer of
     that field) and the validations.
     """
@@ -46,14 +45,6 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     )
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
-
-    if server_args.device == "npu":
-        # NPU keeps the device-aware "dsv4" backend (the registry routes it to
-        # the Ascend V4 subclass); only the pool geometry / dtype differ.
-        # set_default_server_args() pins all three backends to "ascend" for
-        # generic NPU models; undo that here so V4 stays consistently on dsv4.
-        server_args.prefill_attention_backend = "dsv4"
-        server_args.decode_attention_backend = "dsv4"
 
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 256
