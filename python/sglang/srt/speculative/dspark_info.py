@@ -238,9 +238,6 @@ class DSparkDraftInputV2(SpecInput):
     prefill_tail_hidden_states: torch.Tensor = field(
         default_factory=lambda: torch.empty((0, 0, 0), dtype=torch.float16)
     )
-    prefill_tail_input_ids: torch.Tensor = field(
-        default_factory=lambda: torch.empty((0, 0), dtype=torch.int64)
-    )
     prefill_tail_valid_mask: Optional[torch.Tensor] = None
     transfer_warmup_rounds: torch.Tensor = field(
         default_factory=lambda: torch.empty((0,), dtype=torch.int32)
@@ -268,9 +265,6 @@ class DSparkDraftInputV2(SpecInput):
         self.hidden_valid_mask = move_empty_to_device(self.hidden_valid_mask)
         self.prefill_tail_hidden_states = move_empty_to_device(
             self.prefill_tail_hidden_states
-        )
-        self.prefill_tail_input_ids = move_empty_to_device(
-            self.prefill_tail_input_ids
         )
         self.prefill_tail_valid_mask = move_empty_to_device(
             self.prefill_tail_valid_mask
@@ -336,9 +330,6 @@ class DSparkDraftInputV2(SpecInput):
             hidden_valid_mask=torch.empty((0, 0), device=device, dtype=torch.bool),
             prefill_tail_hidden_states=torch.empty(
                 (0, 0, 0), device=device, dtype=torch.float16
-            ),
-            prefill_tail_input_ids=torch.empty(
-                (0, 0), device=device, dtype=torch.int64
             ),
             prefill_tail_valid_mask=torch.empty(
                 (0, 0), device=device, dtype=torch.bool
@@ -454,8 +445,6 @@ class DSparkDraftInputV2(SpecInput):
                 self.prefill_tail_hidden_states = self.prefill_tail_hidden_states[
                     new_indices
                 ]
-            if self.prefill_tail_input_ids.numel() > 0:
-                self.prefill_tail_input_ids = self.prefill_tail_input_ids[new_indices]
             if (
                 self.prefill_tail_valid_mask is not None
                 and self.prefill_tail_valid_mask.numel() > 0
@@ -486,8 +475,6 @@ class DSparkDraftInputV2(SpecInput):
             self.prefill_tail_hidden_states = self.prefill_tail_hidden_states[
                 new_indices
             ]
-        if self.prefill_tail_input_ids.numel() > 0:
-            self.prefill_tail_input_ids = self.prefill_tail_input_ids[new_indices]
         if (
             self.prefill_tail_valid_mask is not None
             and self.prefill_tail_valid_mask.numel() > 0
@@ -547,13 +534,6 @@ class DSparkDraftInputV2(SpecInput):
                         self.prefill_tail_hidden_states,
                         spec_info.prefill_tail_hidden_states,
                     ],
-                    dim=0,
-                )
-            if self.prefill_tail_input_ids.numel() == 0:
-                self.prefill_tail_input_ids = spec_info.prefill_tail_input_ids
-            elif spec_info.prefill_tail_input_ids.numel() > 0:
-                self.prefill_tail_input_ids = torch.cat(
-                    [self.prefill_tail_input_ids, spec_info.prefill_tail_input_ids],
                     dim=0,
                 )
             if (
@@ -620,15 +600,6 @@ class DSparkDraftInputV2(SpecInput):
                     self.prefill_tail_hidden_states,
                     spec_info.prefill_tail_hidden_states,
                 ],
-                dim=0,
-            )
-        if self.prefill_tail_input_ids.numel() == 0:
-            self.prefill_tail_input_ids = spec_info.prefill_tail_input_ids
-        elif spec_info.prefill_tail_input_ids.numel() == 0:
-            pass
-        else:
-            self.prefill_tail_input_ids = torch.cat(
-                [self.prefill_tail_input_ids, spec_info.prefill_tail_input_ids],
                 dim=0,
             )
         if (
