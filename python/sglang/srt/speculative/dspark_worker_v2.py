@@ -776,6 +776,35 @@ class DSparkWorkerV2(BaseSpecWorker):
             return 0
         return max((int(x) for x in global_num_tokens), default=0)
 
+    @staticmethod
+    def _prefill_bootstrap_predict_ids(
+        batch: ScheduleBatch,
+        next_token_ids: torch.Tensor,
+        extend_lens: list[int],
+    ) -> torch.Tensor:
+        predict = batch.input_ids.clone()
+        tail_tokens = next_token_ids.to(dtype=predict.dtype, device=predict.device)
+        next_prompt_token = getattr(batch, "chunked_req_next_prompt_token", None)
+        if next_prompt_token is not None:
+            for i, req in enumerate(getattr(batch, "reqs", []) or []):
+                if req is getattr(batch, "chunked_req", None):
+                    tail_tokens = tail_tokens.clone()
+                    tail_tokens[i] = next_prompt_token
+                    break
+
+        offset = 0
+        for i, extend_len in enumerate(extend_lens):
+            next_offset = offset + int(extend_len)
+            if extend_len > 0:
+                predict[offset:next_offset] = torch.cat(
+                    (
+                        predict[offset + 1 : next_offset],
+                        tail_tokens[i].reshape(1),
+                    )
+                )
+            offset = next_offset
+        return predict
+
     def _materialize_disagg_prefill_hidden_to_draft_state(
         self,
         *,
@@ -1458,6 +1487,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         extend_lens_list = [int(x) for x in extend_lens]
         if not extend_lens_list:
             raise RuntimeError("DSpark prefill expected non-empty extend_lens.")
+        bootstrap_predict_ids = self._prefill_bootstrap_predict_ids(
+            model_worker_batch,
+            next_token_ids,
+            extend_lens_list,
+        )
         if len(set(extend_lens_list)) == 1:
             bootstrap_global_num_reqs = self._prefill_bootstrap_global_req_counts(
                 model_worker_batch.global_num_tokens,
@@ -1466,7 +1500,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._run_draft_bootstrap_forward(
                 batch=model_worker_batch,
                 main_hidden=logits_output.hidden_states,
-                input_ids=model_worker_batch.input_ids,
+                input_ids=bootstrap_predict_ids,
                 positions=positions,
                 out_cache_loc=model_worker_batch.out_cache_loc,
                 seq_lens=draft_seq_lens,
@@ -1486,7 +1520,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._run_draft_bootstrap_forward(
                     batch=model_worker_batch,
                     main_hidden=logits_output.hidden_states[offset:next_offset],
-                    input_ids=model_worker_batch.input_ids[offset:next_offset],
+                    input_ids=bootstrap_predict_ids[offset:next_offset],
                     positions=positions[offset:next_offset],
                     out_cache_loc=model_worker_batch.out_cache_loc[offset:next_offset],
                     seq_lens=draft_seq_lens[i : i + 1],
