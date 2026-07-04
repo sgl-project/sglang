@@ -229,12 +229,6 @@
             "psnr_threshold": 30.0,
             "mean_abs_diff_threshold": 5.6
         },
-        "mova_360p_ring1_uly2": {
-            "clip_threshold": 0.96,
-            "ssim_threshold": 0.91,
-            "psnr_threshold": 30.0,
-            "mean_abs_diff_threshold": 6.2
-        },
         "wan2_1_i2v_14b_lora_2gpu": {
             "clip_threshold": 0.97,
             "ssim_threshold": 0.90,
