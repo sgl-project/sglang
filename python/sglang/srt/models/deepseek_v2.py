@@ -175,7 +175,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -886,7 +886,7 @@ class DeepseekV2MoE(nn.Module):
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
                 and not (
-                    server_args.enable_torch_compile
+                    get_flags().capture.enable_torch_compile
                     and hidden_states.shape[0]
                     <= server_args.torch_compile_max_bs
                     * (server_args.speculative_num_draft_tokens or 1)

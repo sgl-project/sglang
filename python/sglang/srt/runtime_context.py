@@ -301,6 +301,10 @@ class MoeFlags(_StaticFlags):
 class CaptureFlags(_FlagGroupBase):
     """Capture-time flags; never frozen (written during cuda-graph capture)."""
 
+    # Seeded from server_args at publish; a model whose _can_torch_compile is
+    # False clears it during warmup (the only post-publish writer).
+    enable_torch_compile: bool = False
+
 
 @dataclasses.dataclass
 class Flags(_StaticFlags):
@@ -430,6 +434,11 @@ class RuntimeContext:
         except BaseException:
             self._runtime_overrides = saved_runtime_overrides
             raise
+        # Seed the capture tier for the new lifecycle (defaults for sentinel
+        # and mock publishes, which carry no config).
+        self.flags.capture.enable_torch_compile = getattr(
+            server_args, "enable_torch_compile", False
+        )
         self._server_args = server_args
 
     def record_runtime_overrides(
@@ -493,6 +502,10 @@ class RuntimeContext:
             server_args,
             {field for _source, decl in declarations for field in decl},
         )
+        # The capture tier is not part of the static resolution: carry it
+        # across re-resolves so runtime-stage recording cannot clobber a
+        # capture-time write (set_server_args re-seeds it per lifecycle).
+        flags.capture = self.flags.capture
         self.flags = flags
 
 

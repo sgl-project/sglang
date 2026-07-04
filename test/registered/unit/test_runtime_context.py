@@ -394,6 +394,31 @@ class TestRuntimeResolutionStages(_IsolatedServerArgs):
             get_context()._runtime_overrides, [("stage", {"page_size": 64})]
         )
 
+    def test_capture_tier_seeded_at_publish_and_survives_stages(self):
+        # seeded from the published config
+        args = self._publish(page_size=1)
+        args.enable_torch_compile = True
+        get_context().set_server_args(args)  # re-publish picks up the value
+        self.assertTrue(get_flags().capture.enable_torch_compile)
+        # capture-time write (B4) targets the capture leaf
+        get_flags().capture.enable_torch_compile = False
+        self.assertFalse(get_flags().capture.enable_torch_compile)
+        # a runtime-stage re-resolve must not clobber the capture write
+        args.page_size = 64
+        get_context().record_runtime_overrides([("stage", {"page_size": 64})])
+        self.assertFalse(get_flags().capture.enable_torch_compile)
+        # capture stays writable after freeze
+        try:
+            get_context().freeze_flags()
+            get_flags().capture.enable_torch_compile = True
+            self.assertTrue(get_flags().capture.enable_torch_compile)
+        finally:
+            reset_context()
+
+    def test_capture_tier_defaults_for_sentinel_publish(self):
+        get_context().set_server_args(object())
+        self.assertFalse(get_flags().capture.enable_torch_compile)
+
     def test_republish_clears_runtime_overrides(self):
         args = self._publish(page_size=1)
         args.page_size = 64
