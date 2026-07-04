@@ -1787,9 +1787,15 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
     ):
         from types import SimpleNamespace
 
+        inner_forward_mode = ForwardMode.DECODE
+        if (
+            self.model_runner.spec_algorithm.is_dspark()
+            and self.model_runner.is_draft_worker
+        ):
+            inner_forward_mode = forward_batch.forward_mode
         inner_fb = SimpleNamespace(
             batch_size=forward_batch.batch_size,
-            forward_mode=ForwardMode.DECODE,
+            forward_mode=inner_forward_mode,
             # Propagate the real runtime mode so inner backends can detect IDLE
             # and apply their idle substitution.
             actual_forward_mode=getattr(
