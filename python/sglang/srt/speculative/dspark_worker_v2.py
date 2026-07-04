@@ -894,6 +894,88 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_forward_batch=draft_forward_batch,
         )
 
+    def _pack_prefill_tail_hidden(
+        self,
+        *,
+        hidden: torch.Tensor,
+        extend_lens: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        bs = len(extend_lens)
+        if hidden.numel() == 0 or bs == 0:
+            return (
+                torch.empty((0, 0), dtype=hidden.dtype, device=hidden.device),
+                torch.empty((0, 0), dtype=torch.bool, device=hidden.device),
+            )
+        max_extend_len = max((int(x) for x in extend_lens), default=0)
+        tail_len = min(128, max_extend_len)
+        if tail_len <= 0:
+            return (
+                torch.empty((0, 0), dtype=hidden.dtype, device=hidden.device),
+                torch.empty((0, 0), dtype=torch.bool, device=hidden.device),
+            )
+        tail_hidden = hidden.new_zeros((bs, tail_len, hidden.shape[-1]))
+        tail_mask = torch.zeros((bs, tail_len), dtype=torch.bool, device=hidden.device)
+        offset = 0
+        for i, extend_len in enumerate(extend_lens):
+            extend_len = int(extend_len)
+            next_offset = offset + extend_len
+            copy_len = min(tail_len, extend_len)
+            if copy_len > 0:
+                tail_hidden[i, tail_len - copy_len : tail_len].copy_(
+                    hidden[next_offset - copy_len : next_offset]
+                )
+                tail_mask[i, tail_len - copy_len : tail_len] = True
+            offset = next_offset
+        return tail_hidden, tail_mask
+
+    def _materialize_prefill_tail_hidden_to_draft_state(
+        self,
+        *,
+        draft_input: DSparkDraftInputV2,
+        batch: ScheduleBatch,
+        prefix_lens: torch.Tensor,
+    ) -> None:
+        hidden = draft_input.hidden_states
+        mask = draft_input.hidden_valid_mask
+        bs = len(prefix_lens)
+        if (
+            hidden.numel() == 0
+            or hidden.dim() != 3
+            or mask is None
+            or mask.shape != hidden.shape[:2]
+            or hidden.shape[0] != bs
+        ):
+            return
+
+        tail_len = hidden.shape[1]
+        device = self.device
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        positions = (
+            prefix_lens.to(device=device, dtype=torch.int64).unsqueeze(1)
+            - tail_len
+            + torch.arange(tail_len, device=device, dtype=torch.int64).unsqueeze(0)
+        )
+        valid = mask.to(device=device, dtype=torch.bool, non_blocking=True)
+        valid &= positions >= 0
+        if not valid.any():
+            return
+
+        req_pool_indices = batch.req_pool_indices.to(device=device, dtype=torch.int64)
+        cache_locs = req_to_token[req_pool_indices.unsqueeze(1), positions.clamp_min(0)]
+        valid &= cache_locs >= 0
+        if not valid.any():
+            return
+
+        flat_hidden = hidden.to(device=device, non_blocking=True)[valid]
+        flat_cache_locs = cache_locs[valid].to(torch.int64)
+        flat_positions = positions[valid].to(torch.int64)
+        self._materialize_main_hidden_to_draft_state(
+            main_hidden=flat_hidden,
+            cache_loc=flat_cache_locs,
+            positions=flat_positions,
+            draft_forward_batch=None,
+        )
+
     def _write_draft_kv_from_projected_kv(
         self,
         *,
@@ -1480,11 +1562,23 @@ class DSparkWorkerV2(BaseSpecWorker):
         bonus_tokens: torch.Tensor,
         seq_lens: torch.Tensor,
         cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        hidden_valid_mask: Optional[torch.Tensor] = None,
     ) -> DSparkDraftInputV2:
+        if hidden_states is None:
+            hidden_states = torch.empty(
+                (0, 0), dtype=torch.float16, device=bonus_tokens.device
+            )
+        if hidden_valid_mask is None:
+            hidden_valid_mask = torch.empty(
+                (0, 0), dtype=torch.bool, device=bonus_tokens.device
+            )
         return DSparkDraftInputV2(
             bonus_tokens=bonus_tokens.to(dtype=torch.int64),
             new_seq_lens=seq_lens.to(dtype=torch.int64),
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
+            hidden_states=hidden_states,
+            hidden_valid_mask=hidden_valid_mask,
             transfer_warmup_rounds=torch.zeros_like(seq_lens, dtype=torch.int32),
         )
 
@@ -1644,6 +1738,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             positions=positions,
             draft_forward_batch=draft_forward_batch,
         )
+        prefill_tail_hidden, prefill_tail_mask = self._pack_prefill_tail_hidden(
+            hidden=logits_output.hidden_states,
+            extend_lens=extend_lens_list,
+        )
 
         logits_output.hidden_states = None
 
@@ -1651,6 +1749,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=next_token_ids,
             seq_lens=model_worker_batch.seq_lens,
             cur_allocated_seq_lens_cpu=model_worker_batch.seq_lens_cpu,
+            hidden_states=prefill_tail_hidden,
+            hidden_valid_mask=prefill_tail_mask,
         )
         verify_done = torch.get_device_module(device).Event()
         verify_done.record()
@@ -1712,6 +1812,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             device=device,
         )
         self._materialize_disagg_prefill_hidden_to_draft_state(
+            draft_input=draft_input,
+            batch=model_worker_batch,
+            prefix_lens=prefix_lens,
+        )
+        self._materialize_prefill_tail_hidden_to_draft_state(
             draft_input=draft_input,
             batch=model_worker_batch,
             prefix_lens=prefix_lens,
