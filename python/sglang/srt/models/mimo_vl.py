@@ -301,6 +301,7 @@ class MiMoVisionTransformer(nn.Module):
         self.merger = Qwen2_5_VisionPatchMerger(
             dim=vision_config.out_hidden_size,
             context_dim=hidden_size,
+            padded_context_dim=hidden_size,
             spatial_merge_size=spatial_merge_size,
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),
