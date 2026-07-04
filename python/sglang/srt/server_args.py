@@ -6470,19 +6470,6 @@ class ServerArgs:
             )
 
     def _handle_other_validations(self):
-        if (
-            self.speculative_algorithm is not None
-            and self.speculative_algorithm.upper() == "DSPARK"
-            and not self.disable_radix_cache
-        ):
-            logger.warning(
-                "Radix cache is disabled because --speculative-algo DSPARK needs "
-                "complete target hidden states to bootstrap draft-side KV/C128 "
-                "state after prefill. Prefix-cache hits currently do not carry "
-                "DSpark draft state."
-            )
-            self.disable_radix_cache = True
-
         # Handle optimistic prefill validation
         if (
             self.optimistic_prefill_retries > 0

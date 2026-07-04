@@ -83,6 +83,45 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
 
 
 IGNORE_EOS_RESERVE_TOKENS = 1
+DSPARK_C128_PREFIX_ALIGNMENT = 128
+
+
+def _maybe_align_dspark_prefix_match(
+    *,
+    tree_cache: BasePrefixCache,
+    req: Req,
+    token_ids: array[int],
+    match_result,
+    cow_mamba: bool,
+    include_req: bool,
+):
+    server_args = get_global_server_args()
+    if (
+        server_args.speculative_algorithm is None
+        or server_args.speculative_algorithm.upper() != "DSPARK"
+    ):
+        return match_result
+
+    matched_len = len(match_result.device_indices) + int(match_result.host_hit_length)
+    aligned_len = (
+        matched_len // DSPARK_C128_PREFIX_ALIGNMENT
+    ) * DSPARK_C128_PREFIX_ALIGNMENT
+    if aligned_len == matched_len:
+        return match_result
+    if aligned_len == 0:
+        return zero_match_result(tree_cache, match_result)
+
+    return tree_cache.match_prefix(
+        MatchPrefixParams(
+            key=RadixKey(
+                token_ids=token_ids,
+                extra_key=req.extra_key,
+                limit=aligned_len,
+            ),
+            cow_mamba=cow_mamba,
+            req=req if include_req else None,
+        )
+    )
 
 
 def match_prefix_for_req(
@@ -98,10 +137,21 @@ def match_prefix_for_req(
 
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
-            key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
+            key=RadixKey(
+                token_ids=token_ids,
+                extra_key=req.extra_key,
+            ),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
         )
+    )
+    match_result = _maybe_align_dspark_prefix_match(
+        tree_cache=tree_cache,
+        req=req,
+        token_ids=token_ids,
+        match_result=match_result,
+        cow_mamba=cow_mamba,
+        include_req=include_req,
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
         match_result = zero_match_result(tree_cache, match_result)
