@@ -1204,6 +1204,45 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             return None
         return [None if x is None else x[row_mask] for x in state_cpu]
 
+    def _filter_swa_cpu_copy(
+        self,
+        swa_cpu,
+        old_swa_indices: torch.Tensor,
+        row_mask: torch.Tensor,
+    ):
+        if swa_cpu is None:
+            return None
+        if row_mask is None or bool(torch.all(row_mask).item()):
+            return swa_cpu
+
+        old_swa_indices = old_swa_indices.to(row_mask.device)
+        old_page_indices = torch.unique_consecutive(
+            old_swa_indices // self.swa_kv_pool.page_size
+        )
+        kept_page_indices = torch.unique_consecutive(
+            old_swa_indices[row_mask] // self.swa_kv_pool.page_size
+        )
+        page_mask = torch.isin(old_page_indices, kept_page_indices)
+
+        chunk_size = max(
+            1,
+            self.swa_kv_pool.cpu_offloading_chunk_size // self.swa_kv_pool.page_size,
+        )
+        filtered = []
+        for layer_chunks in swa_cpu:
+            if len(layer_chunks) == 0:
+                filtered.append([])
+                continue
+
+            layer_cpu = torch.cat(layer_chunks, dim=0)
+            layer_cpu = layer_cpu[page_mask]
+
+            filtered_layer = []
+            for i in range(0, len(layer_cpu), chunk_size):
+                filtered_layer.append(layer_cpu[i : i + chunk_size])
+            filtered.append(filtered_layer)
+        return filtered
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         c4_indices, _ = self._compressed_indices_from_full(indices, 4)
         c128_indices, _ = self._compressed_indices_from_full(indices, 128)
@@ -1230,6 +1269,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return {
             "swa": swa_cpu,
             "swa_mask": swa_mask,
+            "swa_indices": None if swa_indices is None else swa_indices.cpu(),
             "c4": c4_cpu,
             "c4_indexer": c4_indexer_cpu,
             "c128": c128_cpu,
@@ -1270,6 +1310,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if swa_indices.numel() == 0:
             return
 
+        swa_cpu = self._filter_swa_cpu_copy(
+            swa_cpu, kv_cache_cpu.get("swa_indices"), row_mask
+        )
         self.swa_kv_pool.load_cpu_copy(swa_cpu, swa_indices)
         self._load_state_cpu_copy(
             self.compress_state_pools,
