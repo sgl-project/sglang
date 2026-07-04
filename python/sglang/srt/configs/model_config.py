@@ -491,6 +491,9 @@ class ModelConfig:
             if is_draft_model
             else server_args.quantization
         )
+        # Convert "unquant" to None (same as main model path in server_args.py:2590)
+        if quantization == "unquant":
+            quantization = None
         override_config_file = (
             server_args.decrypted_draft_config_file
             if is_draft_model

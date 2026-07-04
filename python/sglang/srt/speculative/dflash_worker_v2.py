@@ -5,6 +5,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -730,7 +731,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 end = min(num_tokens, start + fast_chunk_size)
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
-                    base_logits = torch.matmul(hs, weight[:num_org].T)
+                    if hasattr(lm_head, 'quant_method') and not isinstance(lm_head.quant_method, UnquantizedEmbeddingMethod):
+                        target_dtype = self.target_worker.model_runner.model_config.dtype
+                        full_logits = lm_head.quant_method.apply(lm_head, hidden_states[start:end].to(target_dtype), None)
+                        base_logits = full_logits[:, :num_org]
+                    else:
+                        base_logits = torch.matmul(hs, weight[:num_org].T)
                     local_max, local_arg = _ensure_local_reduce_buffers(
                         end - start, base_logits.dtype, hs.device
                     )
@@ -748,7 +754,12 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             # Base vocab logits.
             if num_org > 0:
-                base_logits = torch.matmul(hs, weight[:num_org].T)
+                if hasattr(lm_head, 'quant_method') and not isinstance(lm_head.quant_method, UnquantizedEmbeddingMethod):
+                    target_dtype = self.target_worker.model_runner.model_config.dtype
+                    full_logits = lm_head.quant_method.apply(lm_head, hidden_states[start:end].to(target_dtype), None)
+                    base_logits = full_logits[:, :num_org]
+                else:
+                    base_logits = torch.matmul(hs, weight[:num_org].T)
                 local_max, local_arg = _ensure_local_reduce_buffers(
                     chunk_len, base_logits.dtype, hs.device
                 )
