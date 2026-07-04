@@ -202,6 +202,74 @@ def _sm120_sparse_decode_fwd(
 _sm120_default_backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
 
 
+_SM120_DECODE_MAX_TOKENS = 64
+
+
+def _flash_mla_sm120_prefill(
+    q,
+    k_cache,
+    indices,
+    topk_length,
+    attn_sink,
+    head_dim_v,
+    softmax_scale,
+    extra_k_cache,
+    extra_indices,
+    extra_topk_length,
+):
+    from flashinfer.mla._sparse_mla_sm120 import _sparse_mla_sm120_paged_attention
+
+    q2 = q.squeeze(1) if q.ndim == 4 else q
+    num_tokens, num_heads, _ = q2.shape
+    dev = q2.device
+    kv_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
+    src_pbs = k_cache.shape[1] if k_cache.ndim >= 3 else _PBS_SRC
+    idx = indices.squeeze(1) if indices.dim() == 3 else indices
+    if src_pbs != _PBS_DST:
+        N_src = kv_u8.shape[0]
+        rmask = _ref_mask_buf.get(kv_u8.device)
+        if rmask is None or rmask.shape[0] < N_src:
+            rmask = torch.zeros(N_src, dtype=torch.uint8, device=kv_u8.device)
+            _ref_mask_buf[kv_u8.device] = rmask
+        rmask = rmask[:N_src]
+        rmask.zero_()
+        ref_pages = torch.clamp(idx.reshape(-1) // src_pbs, min=0, max=N_src - 1).to(
+            torch.long
+        )
+        rmask.index_fill_(0, ref_pages, 1)
+        kv_64 = _split_kv_pages_to_64(kv_u8, src_pbs, rmask)
+    else:
+        kv_64 = kv_u8
+    extra_kv_u8 = (
+        extra_k_cache.view(torch.uint8)
+        if extra_k_cache is not None and extra_k_cache.dtype != torch.uint8
+        else extra_k_cache
+    )
+    extra_idx = (
+        extra_indices.squeeze(1)
+        if extra_indices is not None and extra_indices.dim() == 3
+        else extra_indices
+    )
+    output = q2.new_empty((num_tokens, num_heads, head_dim_v), dtype=torch.bfloat16)
+    out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=dev)
+    _sparse_mla_sm120_paged_attention(
+        q2,
+        kv_64,
+        idx,
+        output,
+        out_lse,
+        softmax_scale,
+        topk_length=topk_length,
+        attn_sink=attn_sink,
+        extra_kv_cache=extra_kv_u8,
+        extra_indices=extra_idx,
+        extra_topk_length=extra_topk_length,
+        mid_out=None,
+        mid_lse=None,
+    )
+    return (output.unsqueeze(1), None)
+
+
 def flash_mla_with_kvcache_sm120(**kwargs):
     """SM120 FlashMLA sparse decode entry point.
 
@@ -221,6 +289,19 @@ def flash_mla_with_kvcache_sm120(**kwargs):
     extra_topk_length = kwargs.get("extra_topk_length")
 
     if _sm120_default_backend == "flashinfer":
+        if q.shape[0] > _SM120_DECODE_MAX_TOKENS:
+            return _flash_mla_sm120_prefill(
+                q,
+                k_cache,
+                indices,
+                topk_length,
+                attn_sink,
+                head_dim_v,
+                softmax_scale,
+                extra_k_cache,
+                extra_indices,
+                extra_topk_length,
+            )
         return _flash_mla_flashinfer(
             q,
             k_cache,

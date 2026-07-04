@@ -17,7 +17,11 @@ from sglang.jit_kernel.dsv4 import (
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
-from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
+from sglang.srt.layers.attention.dsv4.metadata import (
+    _CHUNKED_INDEXER,
+    _SM120_INDEXER_M_CHUNK,
+    PagedIndexerMetadata,
+)
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_hip
@@ -550,17 +554,6 @@ class C4IndexerBackendMixin:
         _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
         if _c4sl.dim() == 1 and not _use_tilelang and not _use_aiter:
             _c4sl = _c4sl.unsqueeze(-1)
-        logits = fn(
-            q,
-            c4_indexer_kv_cache,
-            weights,
-            _c4sl,
-            page_table,
-            indexer_metadata.deep_gemm_metadata,
-            indexer_metadata.max_c4_seq_len,
-            False,
-        )
-
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
             return
@@ -583,33 +576,61 @@ class C4IndexerBackendMixin:
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
-        if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
-            topk_transform_512_pytorch_vectorized(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
+        def _run_indexer_and_topk(sl, meta_c):
+            q_sl = (q[0][sl], q[1][sl]) if isinstance(q, tuple) else q[sl]
+            ri_sl = raw_indices[sl] if raw_indices is not None else None
+            logits = fn(
+                q_sl,
+                c4_indexer_kv_cache,
+                weights[sl],
+                _c4sl[sl],
+                page_table[sl],
+                meta_c,
+                indexer_metadata.max_c4_seq_len,
+                False,
             )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
-            topk_transform_512_v2(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                indexer_metadata.topk_metadata,
-            )
+            if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
+                topk_transform_512_pytorch_vectorized(
+                    logits,
+                    c4_seq_lens[sl],
+                    page_table[sl],
+                    c4_sparse_page_indices[sl],
+                    indexer_metadata.c4_page_size,
+                    ri_sl,
+                )
+            elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+                topk_transform_512_v2(
+                    logits,
+                    c4_seq_lens[sl],
+                    page_table[sl],
+                    c4_sparse_page_indices[sl],
+                    indexer_metadata.c4_page_size,
+                    indexer_metadata.topk_metadata,
+                )
+            else:
+                topk_transform_512(
+                    logits,
+                    c4_seq_lens[sl],
+                    page_table[sl],
+                    c4_sparse_page_indices[sl],
+                    indexer_metadata.c4_page_size,
+                    ri_sl,
+                )
+
+        _meta = indexer_metadata.deep_gemm_metadata
+        if _meta is _CHUNKED_INDEXER:
+            import deep_gemm as _dg
+            from deep_gemm import get_paged_mqa_logits_metadata as _get_meta
+
+            m_total = _c4sl.shape[0]
+            for _s in range(0, m_total, _SM120_INDEXER_M_CHUNK):
+                _e = min(_s + _SM120_INDEXER_M_CHUNK, m_total)
+                _meta_c = _get_meta(
+                    _c4sl[_s:_e], indexer_metadata.c4_page_size, _dg.get_num_sms()
+                )
+                _run_indexer_and_topk(slice(_s, _e), _meta_c)
         else:
-            topk_transform_512(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
+            _run_indexer_and_topk(slice(0, _c4sl.shape[0]), _meta)
         if hisparse_coordinator is not None:
             if hisparse_decode:
                 compress_layer_id = token_to_kv_pool.layer_mapping[

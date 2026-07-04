@@ -52,6 +52,9 @@ Some other notes:
 """
 _LARGE_INDEXER_QUERY_THRESHOLD = 11673
 
+_SM120_INDEXER_M_CHUNK = 16384
+_CHUNKED_INDEXER = object()
+
 
 def copy_metadata(
     *,
@@ -129,13 +132,16 @@ class PagedIndexerMetadata:
             _c4 = self.c4_seq_lens.to(torch.int32)
             if _c4.dim() == 1:
                 _c4 = _c4.unsqueeze(-1)
-            self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
-                _c4,
-                self.c4_page_size,
-                deep_gemm.get_num_sms(),
-            )
+            if _IS_SM120 and _c4.shape[0] > _SM120_INDEXER_M_CHUNK:
+                self.deep_gemm_metadata = _CHUNKED_INDEXER
+            else:
+                self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
+                    _c4,
+                    self.c4_page_size,
+                    deep_gemm.get_num_sms(),
+                )
 
-            assert isinstance(self.deep_gemm_metadata, torch.Tensor)
+            assert self.deep_gemm_metadata is not None
 
         from sglang.jit_kernel.dsv4 import plan_topk_v2
 
