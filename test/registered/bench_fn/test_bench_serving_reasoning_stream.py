@@ -16,15 +16,16 @@ import unittest
 from argparse import Namespace
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from sglang.bench_serving import (
+from sglang.benchmark.serving import (
     RequestFuncInput,
     async_request_openai_chat_completions,
+    calculate_metrics,
     set_global_args,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _free_port() -> int:
@@ -58,6 +59,24 @@ class _SSEHandler(BaseHTTPRequestHandler):
         return
 
 
+class _JSONHandler(BaseHTTPRequestHandler):
+    response_body: dict = {}
+    request_bodies: list = []
+
+    def do_POST(self):  # noqa: N802 (BaseHTTPRequestHandler interface)
+        length = int(self.headers.get("Content-Length", "0"))
+        if length:
+            self.request_bodies.append(json.loads(self.rfile.read(length)))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(self.response_body).encode())
+        self.wfile.flush()
+
+    def log_message(self, fmt, *args):
+        return
+
+
 def _make_chunk(content=None, reasoning_content=None, completion_tokens=None):
     delta = {}
     if content is not None:
@@ -68,6 +87,23 @@ def _make_chunk(content=None, reasoning_content=None, completion_tokens=None):
     if completion_tokens is not None:
         chunk["usage"] = {"completion_tokens": completion_tokens}
     return chunk
+
+
+def _make_response(content=None, reasoning_content=None, completion_tokens=1):
+    message = {"role": "assistant", "content": content}
+    if reasoning_content is not None:
+        message["reasoning_content"] = reasoning_content
+    return {
+        "choices": [{"index": 0, "message": message, "finish_reason": "length"}],
+        "usage": {"completion_tokens": completion_tokens},
+    }
+
+
+class _StrictStringTokenizer:
+    def encode(self, text, add_special_tokens=False):
+        if not isinstance(text, str):
+            raise ValueError("text input must be of type `str`")
+        return text.split()
 
 
 class TestBenchServingReasoningStream(CustomTestCase):
@@ -204,6 +240,94 @@ class TestBenchServingReasoningStream(CustomTestCase):
         self.assertTrue(out.success, msg=f"request failed: {out.error}")
         self.assertEqual(out.generated_text, "ok")
         self.assertGreater(out.ttft, 0.0)
+
+
+class TestBenchServingReasoningNonStream(CustomTestCase):
+    def _run(self, response_body):
+        set_global_args(
+            Namespace(
+                disable_stream=True,
+                disable_ignore_eos=False,
+                print_requests=False,
+                tokenizer="",
+                header=None,
+            )
+        )
+        port = _free_port()
+
+        class Handler(_JSONHandler):
+            pass
+
+        Handler.response_body = response_body
+        Handler.request_bodies = []
+        server = HTTPServer(("127.0.0.1", port), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            req = RequestFuncInput(
+                prompt="hello",
+                api_url=f"http://127.0.0.1:{port}/v1/chat/completions",
+                prompt_len=1,
+                output_len=64,
+                model="dummy-model",
+                lora_name="",
+                image_data=None,
+                extra_request_body={},
+            )
+            return (
+                asyncio.run(async_request_openai_chat_completions(req)),
+                Handler.request_bodies,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_reasoning_only_non_stream_metrics_retokenize_text(self):
+        out, request_bodies = self._run(
+            _make_response(
+                content=None,
+                reasoning_content="Let me think.",
+                completion_tokens=3,
+            )
+        )
+
+        self.assertTrue(out.success, msg=f"request failed: {out.error}")
+        self.assertEqual(out.generated_text, "Let me think.")
+        self.assertEqual(out.output_len, 3)
+        self.assertFalse(request_bodies[0]["stream"])
+
+        metrics, output_lens = calculate_metrics(
+            input_requests=None,
+            outputs=[out],
+            dur_s=1.0,
+            tokenizer=_StrictStringTokenizer(),
+            backend="sglang-oai-chat",
+        )
+        self.assertEqual(metrics.completed, 1)
+        self.assertEqual(output_lens, [3])
+        self.assertEqual(metrics.total_output_retokenized, 3)
+
+    def test_reasoning_then_content_non_stream_accounts_both(self):
+        out, _ = self._run(
+            _make_response(
+                content="answer",
+                reasoning_content="thought ",
+                completion_tokens=2,
+            )
+        )
+
+        self.assertTrue(out.success, msg=f"request failed: {out.error}")
+        self.assertEqual(out.generated_text, "thought answer")
+        self.assertGreater(out.ttft, 0.0)
+        self.assertEqual(out.output_len, 2)
+
+    def test_content_only_non_stream_unchanged(self):
+        out, _ = self._run(_make_response(content="answer", completion_tokens=1))
+
+        self.assertTrue(out.success, msg=f"request failed: {out.error}")
+        self.assertEqual(out.generated_text, "answer")
+        self.assertGreater(out.ttft, 0.0)
+        self.assertEqual(out.output_len, 1)
 
 
 if __name__ == "__main__":

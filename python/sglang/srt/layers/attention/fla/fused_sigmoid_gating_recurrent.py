@@ -258,7 +258,9 @@ def fused_sigmoid_gating_delta_rule_update(
     disable_state_update: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     intermediate_state_indices: Optional[torch.Tensor] = None,
-    cache_steps: Optional[int] = None,
+    cache_steps: Optional[
+        int
+    ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
 ):
     """
@@ -307,6 +309,14 @@ def fused_sigmoid_gating_delta_rule_update(
 
     grid = (NK, NV, N * HV)
 
+    # Per-req stride must match the buffer's allocated dim, not runtime steps
+    # (they can differ under --speculative-adaptive).
+    cache_stride_steps = (
+        intermediate_states_buffer.shape[1]
+        if intermediate_states_buffer is not None
+        else 0
+    )
+
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a,
@@ -323,7 +333,7 @@ def fused_sigmoid_gating_delta_rule_update(
         cu_seqlens=cu_seqlens,
         intermediate_states_buffer=intermediate_states_buffer,
         intermediate_state_indices=intermediate_state_indices,
-        cache_steps=0 if cache_steps is None else cache_steps,
+        cache_steps=cache_stride_steps,
         retrieve_parent_token_ptr=retrieve_parent_token,
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,

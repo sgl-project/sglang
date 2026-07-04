@@ -2,7 +2,8 @@
 
 Variants combine this base with `CustomTestCase` and override class
 attributes (`attention_backend`, plus optional `speculative_eagle_topk` /
-`speculative_num_draft_tokens` / `enable_spec_v2`) to select a backend
+`speculative_num_draft_tokens` / `disable_overlap` /
+`enable_deterministic_inference`) to select a backend, deterministic mode,
 and the V1 / V2 spec engine.
 
 Pure mixin (does NOT inherit `TestCase`), so unittest does not collect
@@ -36,18 +37,19 @@ class StandaloneServerBase:
 
     # Subclasses set these:
     attention_backend: str = ""
-    # V2 defaults; V1 subclasses override to (2, 7, False).
+    # Overlap defaults; synchronous subclasses override to (2, 7, True).
     speculative_num_steps: int = 4
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int = 5
-    enable_spec_v2: bool = True
+    disable_overlap: bool = False
+    enable_deterministic_inference: bool = False
 
     @classmethod
     def get_server_args(cls):
         assert cls.attention_backend, f"{cls.__name__} must set `attention_backend`"
-        return [
+        args = [
             "--trust-remote-code",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "8",
             "--speculative-algorithm",
             "STANDALONE",
@@ -64,6 +66,9 @@ class StandaloneServerBase:
             "--attention-backend",
             cls.attention_backend,
         ]
+        if cls.enable_deterministic_inference:
+            args.append("--enable-deterministic-inference")
+        return args
 
     @classmethod
     def setUpClass(cls):
@@ -71,20 +76,19 @@ class StandaloneServerBase:
         # please don't do this if you want to make your inference workload faster
         envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
         envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
-        if not cls.enable_spec_v2:
-            envs.SGLANG_ENABLE_SPEC_V2.set(False)
+        other_args = cls.get_server_args()
+        if cls.disable_overlap:
+            other_args = other_args + ["--disable-overlap-schedule"]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=cls.get_server_args(),
+            other_args=other_args,
         )
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-        if not cls.enable_spec_v2:
-            envs.SGLANG_ENABLE_SPEC_V2.clear()
 
     def test_gsm8k(self):
         requests.get(self.base_url + "/flush_cache")

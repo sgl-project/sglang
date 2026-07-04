@@ -1,16 +1,12 @@
 """MI35x Nightly performance benchmark for GLM-5.1.
 
-Tests GLM-5.1-FP8 with NSA attention backend using bench_one_batch
+Tests GLM-5.1-FP8 with DSA attention backend using bench_one_batch
 on 8 GPUs with TP=8, FP8 KV cache.
 
 Registry: nightly-perf-8-gpu-mi35x-glm51 suite
 """
 
 import os
-
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import unittest
 from typing import List
 
@@ -55,7 +51,7 @@ PROFILE_DIR = "performance_profiles_glm51_mi35x"
 class TestGLM51PerfMI35x(unittest.TestCase):
     """Nightly performance benchmark for GLM-5.1 on MI35x.
 
-    Tests GLM-5.1-FP8 with NSA attention backend on TP=8.
+    Tests GLM-5.1-FP8 with DSA attention backend on TP=8.
     """
 
     @classmethod
@@ -76,9 +72,9 @@ class TestGLM51PerfMI35x(unittest.TestCase):
                 "glm47",
                 "--tp",
                 "8",
-                "--nsa-prefill-backend",
+                "--dsa-prefill-backend",
                 "tilelang",
-                "--nsa-decode-backend",
+                "--dsa-decode-backend",
                 "tilelang",
                 "--kv-cache-dtype",
                 "fp8_e4m3",

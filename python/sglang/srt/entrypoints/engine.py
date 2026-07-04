@@ -27,6 +27,7 @@ import multiprocessing as mp
 import os
 import random
 import signal
+import tempfile
 import threading
 import time
 from typing import (
@@ -39,10 +40,8 @@ from typing import (
     Optional,
     Tuple,
     Union,
+    cast,
 )
-
-# Fix a bug of Python threading
-setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 import torch
 import uvloop
@@ -70,6 +69,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
     OpenSessionReqInput,
+    ProfileReq,
+    ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -79,8 +80,13 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    sock_recv,
+    sock_send,
 )
-from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
+from sglang.srt.managers.multi_tokenizer_mixin import (
+    MultiTokenizerRouter,
+    run_multi_detokenizer_router_process,
+)
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_detection import resolve_auto_parsers
 from sglang.srt.managers.template_manager import TemplateManager
@@ -90,6 +96,7 @@ from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    SerializedTensorPayload,
     assert_pkg_version,
     configure_logger,
     get_bool_env_var,
@@ -97,10 +104,12 @@ from sglang.srt.utils import (
     kill_process_tree,
     launch_dummy_health_check_server,
     maybe_reindex_device_id,
+    normalize_serialized_named_tensor_payloads,
     numa_utils,
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import get_zmq_socket, is_port_available
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
@@ -241,11 +250,6 @@ class Engine(EngineScoreMixin, EngineBase):
         if tokenizer_manager is not None:
             tokenizer_manager._subprocess_watchdog = subprocess_watchdog
         self.port_args = port_args
-        # Access transfer engine info if bootstrap server is started.
-        if scheduler_init_result.engine_info_bootstrap_server is not None:
-            self.remote_instance_transfer_engine_info = (
-                scheduler_init_result.engine_info_bootstrap_server.transfer_engine_info
-            )
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
@@ -258,7 +262,11 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Enable tracing
         if server_args.enable_trace:
-            process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+            process_tracing_init(
+                server_args.otlp_traces_endpoint,
+                "sglang",
+                trace_modules=server_args.trace_modules,
+            )
             thread_label = "Tokenizer"
             if server_args.disaggregation_mode == "prefill":
                 thread_label = "Prefill Tokenizer"
@@ -295,7 +303,7 @@ class Engine(EngineScoreMixin, EngineBase):
         if routed_dp_rank is not None:
             dp_size = self.server_args.dp_size
             if dp_size <= 1 and routed_dp_rank == 0:
-                logger.warning(
+                logger.debug(
                     f"routed_dp_rank={routed_dp_rank} is ignored because dp_size={dp_size}"
                 )
                 return None
@@ -325,12 +333,15 @@ class Engine(EngineScoreMixin, EngineBase):
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
+        # See GenerateReqInput.mm_hashes / async_generate for the contract.
+        mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
@@ -346,6 +357,7 @@ class Engine(EngineScoreMixin, EngineBase):
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -362,12 +374,14 @@ class Engine(EngineScoreMixin, EngineBase):
             image_data=image_data,
             audio_data=audio_data,
             video_data=video_data,
+            mm_hashes=mm_hashes,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
             custom_logit_processor=custom_logit_processor,
+            require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
             routed_experts_start_len=routed_experts_start_len,
@@ -379,6 +393,7 @@ class Engine(EngineScoreMixin, EngineBase):
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
             external_trace_header=external_trace_header,
             rid=rid,
+            session_id=session_id,
             session_params=session_params,
             priority=priority,
         )
@@ -417,12 +432,20 @@ class Engine(EngineScoreMixin, EngineBase):
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
+        # Optional per-image hashes the caller has already computed (hex strings,
+        # one per image in `image_data`). When supplied, each MultimodalDataItem's
+        # `hash` is initialised from this list and `set_pad_value` skips the
+        # internal `hash_feature()` recompute. Intended for external KV routers
+        # that compute their own per-image hash for routing decisions and need
+        # sglang's prefix-cache key to align. See GenerateReqInput.mm_hashes.
+        mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
@@ -438,6 +461,7 @@ class Engine(EngineScoreMixin, EngineBase):
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -454,11 +478,13 @@ class Engine(EngineScoreMixin, EngineBase):
             image_data=image_data,
             audio_data=audio_data,
             video_data=video_data,
+            mm_hashes=mm_hashes,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
+            require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
             routed_experts_start_len=routed_experts_start_len,
@@ -471,6 +497,7 @@ class Engine(EngineScoreMixin, EngineBase):
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
             external_trace_header=external_trace_header,
             rid=rid,
+            session_id=session_id,
             session_params=session_params,
             priority=priority,
         )
@@ -676,6 +703,63 @@ class Engine(EngineScoreMixin, EngineBase):
         )
 
     @classmethod
+    def _launch_detokenizer_subprocesses(
+        cls,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        run_detokenizer_process_func: Callable,
+    ) -> Tuple[List[mp.Process], List[str]]:
+        """Launch detokenizer worker(s).
+
+        - When ``detokenizer_worker_num == 1``: a single detokenizer process listens on
+          ``port_args.detokenizer_ipc_name`` (the original behavior).
+        - When ``detokenizer_worker_num > 1``: each detokenizer worker gets its own
+          private IPC socket, and a ``MultiDetokenizerRouter`` process owns the
+          original ``port_args.detokenizer_ipc_name`` and fans out to them.
+
+        Returns (processes, names) for SubprocessWatchdog.
+        """
+        processes: List[mp.Process] = []
+        names: List[str] = []
+
+        if server_args.detokenizer_worker_num <= 1:
+            proc = mp.Process(
+                target=run_detokenizer_process_func,
+                args=(server_args, port_args),
+            )
+            proc.start()
+            processes.append(proc)
+            names.append("detokenizer")
+            return processes, names
+
+        router_ipc_name = port_args.detokenizer_ipc_name
+        worker_ipc_names: List[str] = []
+        try:
+            for i in range(server_args.detokenizer_worker_num):
+                worker_ipc = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+                port_args.detokenizer_ipc_name = worker_ipc
+                proc = mp.Process(
+                    target=run_detokenizer_process_func,
+                    args=(server_args, port_args),
+                )
+                proc.start()
+                processes.append(proc)
+                names.append(f"detokenizer_{i}")
+                worker_ipc_names.append(worker_ipc)
+        finally:
+            port_args.detokenizer_ipc_name = router_ipc_name
+
+        router_proc = mp.Process(
+            target=run_multi_detokenizer_router_process,
+            args=(worker_ipc_names, server_args, port_args),
+        )
+        router_proc.start()
+        processes.append(router_proc)
+        names.append("detokenizer_router")
+
+        return processes, names
+
+    @classmethod
     def _launch_subprocesses(
         cls,
         server_args: ServerArgs,
@@ -776,16 +860,15 @@ class Engine(EngineScoreMixin, EngineBase):
                 None,
             )
 
-        # Launch detokenizer process
-        detoken_proc = mp.Process(
-            target=run_detokenizer_process_func,
-            args=(
-                server_args,
-                port_args,
-            ),
+        # Launch detokenizer process(es) — optionally fronted by a router when
+        # detokenizer_worker_num > 1.
+        detoken_procs, detoken_names = cls._launch_detokenizer_subprocesses(
+            server_args=server_args,
+            port_args=port_args,
+            run_detokenizer_process_func=run_detokenizer_process_func,
         )
-        detoken_proc.start()
-        scheduler_init_result.all_child_pids.append(detoken_proc.pid)
+        for p in detoken_procs:
+            scheduler_init_result.all_child_pids.append(p.pid)
 
         # Init tokenizer manager first, as the bootstrap server is initialized here
         if server_args.tokenizer_worker_num == 1:
@@ -809,8 +892,8 @@ class Engine(EngineScoreMixin, EngineBase):
         # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
         processes = list(scheduler_procs or [])
         names = [f"scheduler_{i}" for i in range(len(processes))]
-        processes.append(detoken_proc)
-        names.append("detokenizer")
+        processes.extend(detoken_procs)
+        names.extend(detoken_names)
         subprocess_watchdog = SubprocessWatchdog(
             processes=processes, process_names=names
         )
@@ -833,6 +916,12 @@ class Engine(EngineScoreMixin, EngineBase):
             and self.tokenizer_manager._subprocess_watchdog is not None
         ):
             self.tokenizer_manager._subprocess_watchdog.stop()
+
+        send_to_rpc = getattr(self, "send_to_rpc", None)
+        if send_to_rpc is not None:
+            send_to_rpc.close(linger=0)
+            self.send_to_rpc = None
+
         kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
 
     def __enter__(self):
@@ -885,7 +974,8 @@ class Engine(EngineScoreMixin, EngineBase):
         self.loop.run_until_complete(self.tokenizer_manager.close_session(obj, None))
 
     def start_profile(self, **kwargs):
-        self.loop.run_until_complete(self.tokenizer_manager.start_profile(**kwargs))
+        req = ProfileReq(req_type=ProfileReqType.START_PROFILE, **kwargs)
+        self.loop.run_until_complete(self.tokenizer_manager.start_profile(req))
 
     def stop_profile(self):
         self.loop.run_until_complete(self.tokenizer_manager.stop_profile())
@@ -909,12 +999,14 @@ class Engine(EngineScoreMixin, EngineBase):
         internal_states = self.loop.run_until_complete(
             self.tokenizer_manager.get_internal_state()
         )
-        return {
-            **dataclasses.asdict(self.tokenizer_manager.server_args),
-            **self._scheduler_init_result.scheduler_infos[0],
-            "internal_states": internal_states,
-            "version": __version__,
-        }
+        return msgspec_to_builtins(
+            {
+                **dataclasses.asdict(self.tokenizer_manager.server_args),
+                **self._scheduler_init_result.scheduler_infos[0],
+                "internal_states": internal_states,
+                "version": __version__,
+            }
+        )
 
     def init_weights_update_group(
         self,
@@ -974,14 +1066,19 @@ class Engine(EngineScoreMixin, EngineBase):
 
     def update_weights_from_tensor(
         self,
-        named_tensors: List[Tuple[str, torch.Tensor]],
+        named_tensors: Union[
+            List[Tuple[str, torch.Tensor]],
+            List[SerializedTensorPayload],
+        ],
         load_format: Optional[str] = None,
         flush_cache: bool = True,
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
         if load_format == "flattened_bucket":
-            serialized_named_tensors = named_tensors
+            serialized_named_tensors = normalize_serialized_named_tensor_payloads(
+                cast(List[SerializedTensorPayload], named_tensors)
+            )
         else:
             serialized_named_tensors = [
                 MultiprocessingSerializer.serialize(named_tensors)
@@ -1143,8 +1240,8 @@ class Engine(EngineScoreMixin, EngineBase):
 
     def collective_rpc(self, method: str, **kwargs):
         obj = RpcReqInput(method=method, parameters=kwargs)
-        self.send_to_rpc.send_pyobj(obj)
-        recv_req = self.send_to_rpc.recv_pyobj(zmq.BLOCKY)
+        sock_send(self.send_to_rpc, obj)
+        recv_req = sock_recv(self.send_to_rpc, flags=zmq.BLOCKY)
         assert isinstance(recv_req, RpcReqOutput)
         assert recv_req.success, recv_req.message
 
@@ -1169,6 +1266,11 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ["NCCL_NVLS_ENABLE"] = str(
             int(server_args.enable_nccl_nvls or server_args.enable_symm_mem)
         )
+    if "NCCL_GRAPH_MIXING_SUPPORT" not in os.environ or server_args.enable_symm_mem:
+        # Note(wh): NCCL_GRAPH_MIXING_SUPPORT=0 can help improve performance for symmetric kernels.
+        # details in https://github.com/NVIDIA/nccl-tests/issues/333#issuecomment-3103636985
+        if server_args.dcp_size > 1:
+            os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 
@@ -1201,7 +1303,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.8.post1",
+                "0.6.12",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -1209,7 +1311,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.2.post1",
+                "0.4.4",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 

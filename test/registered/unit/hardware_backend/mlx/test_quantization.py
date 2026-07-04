@@ -3,7 +3,7 @@
 Covers:
   - mlx_q4 / mlx_q8 quantize fp16 weights to QuantizedLinear in-place
   - active-memory drops after quantization
-  - smoke /generate still works post-quantize
+  - /generate still works post-quantize
   - pre-quantized HF repos still load (regression guard for mlx_lm passthrough)
   - mlx_q4 flag on an already-quantized model is a no-op (skip + log)
 
@@ -24,7 +24,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 # On non-Apple-Silicon CI runners the entire TestCase class skips via the
 # @skipUnless guard below, so this registration is the harmless "yes this
 # test exists" signal the registry requires.
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm64"
 _HAS_MLX = (

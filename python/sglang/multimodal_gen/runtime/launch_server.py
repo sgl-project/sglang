@@ -23,7 +23,7 @@ from sglang.multimodal_gen.runtime.server_args import (
 )
 from sglang.multimodal_gen.runtime.utils.common import is_port_available
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
-from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import init_diffusion_tracing
 
 
 def _find_available_port(
@@ -200,7 +200,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             http_server_process = mp.Process(
                 target=launch_http_server_only,
                 args=(server_args,),
-                name=f"sglang-diffusion-webui",
+                name="sglang-diffusion-webui",
                 daemon=True,
             )
             http_server_process.start()
@@ -318,6 +318,7 @@ def launch_pool_disagg_server(
                 "pool_result_endpoint": result_ep,
                 "num_gpus": num_role_gpus,
                 "warmup": role_type == RoleType.ENCODER,
+                "server_warmup": False,
                 "scheduler_port": find_port(port_cursor),
                 "master_port": find_port(port_cursor + 100),
                 # Per-role parallelism (None = auto-derive from num_gpus)
@@ -442,9 +443,7 @@ def _run_disagg_role_process(
 
 
 def launch_http_server_only(server_args):
-    if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
-        trace_set_thread_info("DiffHTTPServer")
+    init_diffusion_tracing(server_args, "DiffHTTPServer")
 
     # set for endpoints to access global_server_args
     set_global_server_args(server_args)
@@ -456,6 +455,7 @@ def launch_http_server_only(server_args):
         host=server_args.host,
         port=server_args.port,
         reload=False,
+        ws_per_message_deflate=False,
     )
 
 
@@ -590,6 +590,7 @@ def launch_disagg_role(server_args: ServerArgs):
         "pool_work_endpoint": work_endpoint,
         "pool_result_endpoint": result_endpoint,
         "warmup": role_type == RoleType.ENCODER,
+        "server_warmup": False,
         "scheduler_port": internal_scheduler_port,
         # Per-role parallelism (None = auto-derive from num_gpus)
         "tp_size": role_par["tp_size"],

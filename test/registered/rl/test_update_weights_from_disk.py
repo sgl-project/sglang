@@ -22,7 +22,7 @@ register_amd_ci(
     est_time=210, suite="stage-b-test-1-gpu-small-amd", disabled="see #14021"
 )
 register_cuda_ci(
-    est_time=210, stage="stage-b", runner_config="1-gpu-large", disabled="see #14021"
+    est_time=210, stage="base-b", runner_config="1-gpu-large", disabled="see #14021"
 )
 
 

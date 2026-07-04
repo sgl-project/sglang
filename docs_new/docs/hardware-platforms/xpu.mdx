@@ -53,8 +53,9 @@ conda create -n sgl-xpu python=3.12 -y
 conda activate sgl-xpu
 
 # Set PyTorch XPU as primary pip install channel to avoid installing the larger CUDA-enabled version and prevent potential runtime issues.
-pip3 install torch==2.11.0+xpu torchao torchvision torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
+pip3 install torch==2.12.0+xpu torchao==0.17.0+xpu torchvision==0.27.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
 pip3 install xgrammar --no-deps # xgrammar will introduce CUDA-enabled triton which might conflict with XPU
+pip3 install apache-tvm-ffi # xgrammar requires apache-tvm-ffi
 
 # Clone the SGLang code
 git clone https://github.com/sgl-project/sglang.git
@@ -88,6 +89,7 @@ docker run \
     --privileged \
     --ipc=host \
     --network=host \
+    --user root \
     --group-add $(getent group video | cut -d: -f3) \
     --device /dev/dri \
     -v /dev/dri/by-path:/dev/dri/by-path \
@@ -138,3 +140,181 @@ python -m sglang.bench_serving -h
 Additionally, the requests can be formed with
 [OpenAI Completions API](../basic_usage/openai_api_completions)
 and sent via the command line (e.g. using `curl`) or via your own script.
+
+## XPU Graph [Experimental]
+
+SGLang enables XPU graph capture to reduce per-step kernel-launch overhead.
+
+| Phase | Backend | Mechanism | Default |
+|---|---|---|---|
+| Decode | `full` | One `torch.xpu.XPUGraph` per batch size, captured on startup | **Off** (opt-in) |
+| Prefill | `tc_piecewise` | `torch.compile` + XPU graph, one graph segment per token-length bucket | **Off** (opt-in) |
+
+### Enable Decode Graph
+
+Decode graph capture is **opt-in** on XPU. Enable it explicitly:
+
+```bash
+python -m sglang.launch_server --model-path <MODEL> --device xpu \
+    --cuda-graph-backend-decode full
+```
+
+### Enable Prefill Graph
+
+Prefill graph capture is **opt-in** on XPU and requires `torch.compile`
+and must be enabled explicitly:
+
+```bash
+python -m sglang.launch_server --model-path <MODEL> --device xpu \
+    --cuda-graph-backend-prefill tc_piecewise
+```
+
+By default the prefill subgraphs are compiled with `eager` mode. Switch to
+`inductor` for higher-quality generated code at the cost of longer startup:
+
+```bash
+python -m sglang.launch_server --model-path <MODEL> --device xpu \
+    --cuda-graph-backend-prefill tc_piecewise \
+    --cuda-graph-tc-compiler inductor
+```
+
+You can also configure both phases together with a single `--cuda-graph-config` JSON argument:
+
+```bash
+python -m sglang.launch_server --model-path <MODEL> --device xpu \
+    --cuda-graph-config '{"decode":{"backend":"full"},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}'
+```
+
+### Enable torch.compile for Decode
+
+`--enable-torch-compile` adds a `torch.compile` pass on top of the decode
+XPU graph: the model forward is compiled first, and the compiled forward is
+then captured as an `XPUGraph`. This can reduce per-kernel overhead further
+but increases startup time.
+
+```bash
+python -m sglang.launch_server --model-path <MODEL> --device xpu \
+    --enable-torch-compile
+```
+
+> **Note:** `--enable-torch-compile` is mutually exclusive with the prefill
+> `tc_piecewise` graph (the compatibility rules auto-disable it). Use them
+> separately or lock the prefill backend explicitly via `--cuda-graph-config`
+> if you need both.
+
+### Disable XPU Graph
+
+Both phases are disabled by default. To explicitly disable them anyway:
+
+```bash
+# Disable decode graph (already off by default; explicit form)
+python -m sglang.launch_server --model-path <MODEL> --device xpu \
+    --cuda-graph-backend-decode=disabled
+
+# Disable prefill graph (already off by default; explicit form)
+python -m sglang.launch_server --model-path <MODEL> --device xpu \
+    --cuda-graph-backend-prefill=disabled
+
+# Disable both phases
+python -m sglang.launch_server --model-path <MODEL> --device xpu \
+    --cuda-graph-backend-decode=disabled \
+    --cuda-graph-backend-prefill=disabled
+```
+
+### Customize Capture Buckets
+
+By default, prefill capture sizes are derived from `--chunked-prefill-size`.
+To specify explicit token-length buckets:
+
+```bash
+python -m sglang.launch_server \
+    --model-path <MODEL> --device xpu \
+    --cuda-graph-backend-prefill tc_piecewise \
+    --cuda-graph-bs-prefill 64 128 256 512
+```
+
+To specify explicit decode graph batch sizes:
+
+```bash
+python -m sglang.launch_server \
+    --model-path <MODEL> --device xpu \
+    --cuda-graph-bs-decode 1 2 4 8
+```
+
+### Server Args
+
+| Argument | XPU allowed values | Default | Description |
+|---|---|---|---|
+| `--cuda-graph-backend-decode` | `full`, `disabled` | `disabled` | Backend for the decode phase. Only `full` is supported on XPU. Set to `full` to enable. |
+| `--cuda-graph-backend-prefill` | `tc_piecewise`, `disabled` | `disabled`* | Backend for the prefill phase. Must be set to `tc_piecewise` explicitly to enable. |
+| `--cuda-graph-tc-compiler` | `eager`, `inductor` | `eager` | Compiler for `tc_piecewise` prefill subgraphs. `inductor` produces more optimized code but has longer startup. |
+| `--cuda-graph-bs-prefill` | list of ints | auto | Explicit token-length buckets to capture for prefill. |
+| `--cuda-graph-bs-decode` | list of ints | auto | Explicit batch sizes to capture for decode. |
+| `--cuda-graph-config` | JSON string | — | One-shot JSON config for both phases, e.g. `'{"decode":{"backend":"full"},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}'`. Overrides all per-phase flags. |
+| `--disable-decode-cuda-graph` | — | `False` | Shorthand for `--cuda-graph-backend-decode=disabled`. |
+| `--disable-prefill-cuda-graph` | — | `False` | Shorthand for `--cuda-graph-backend-prefill=disabled`. |
+| `--enable-torch-compile` | — | `False` | Apply `torch.compile` on top of the decode XPU graph for further kernel optimization. |
+| `--torch-compile-max-bs` | int | `32` | Maximum batch size compiled by `torch.compile` when `--enable-torch-compile` is set. |
+
+\* Prefill graph is auto-disabled on XPU unless you lock the backend explicitly
+via `--cuda-graph-backend-prefill` or `--cuda-graph-config`.
+
+### Limitations
+
+| Feature | Status |
+|---|---|
+| Memory saver (`--enable-memory-saver`) | Not yet supported |
+| Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported |
+| Breakable CUDA graph | Not yet supported |
+| Speculative decoding | Not yet implemented |
+
+## Prefill-Decode (P/D) Disaggregation on Intel XPU [Experimental]
+
+SGLang supports prefill-decode disaggregation on Intel XPU using the [NIXL](https://github.com/ai-dynamo/nixl) KV-transfer backend.
+
+**Tested models:**
+
+| Model | Notes |
+|:---:|:---:|
+| [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | Used in integration tests; verified on Intel XPU with homogeneous P/D (XPU prefill + XPU decode) |
+| [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Verified on Intel XPU with homogeneous P/D (XPU prefill + XPU decode) |
+
+**Prerequisites:** `pip install nixl sglang-router`
+
+**Start the prefill server (GPU 0):**
+
+```bash
+ZE_AFFINITY_MASK=0 UCX_POSIX_USE_PROC_LINK=n python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-0.6B --trust-remote-code --device xpu \
+    --disaggregation-mode prefill --disaggregation-transfer-backend nixl \
+    --disaggregation-bootstrap-port 12335 --host 0.0.0.0 --port 30000
+```
+
+**Start the decode server (GPU 1):**
+
+```bash
+ZE_AFFINITY_MASK=1 UCX_POSIX_USE_PROC_LINK=n python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-0.6B --trust-remote-code --device xpu \
+    --disaggregation-mode decode --disaggregation-transfer-backend nixl \
+    --disaggregation-bootstrap-port 12335 --host 0.0.0.0 --port 30001
+```
+
+**Start the router:**
+
+```bash
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --prefill http://127.0.0.1:30000 \
+    --decode  http://127.0.0.1:30001 \
+    --host 0.0.0.0 --port 8000
+```
+
+**Send a request:**
+
+```bash
+curl http://127.0.0.1:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model": "Qwen/Qwen3-0.6B", "prompt": "The capital of France is", "max_tokens": 32}'
+```
+
+> **Note:** `UCX_POSIX_USE_PROC_LINK=n` is required on Intel XPU to avoid UCX shared-memory transport issues.

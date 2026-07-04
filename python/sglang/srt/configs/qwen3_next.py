@@ -68,6 +68,8 @@ class Qwen3NextConfig(PretrainedConfig):
             paper](https://arxiv.org/pdf/2305.13245.pdf). If it is not specified, will default to `32`.
         hidden_act (`str`, *optional*, defaults to `"silu"`):
             The non-linear activation function in the decoder.
+        output_gate_type (`str`, *optional*, defaults to `None`):
+            The gate activation function used by the linear attention output norm.
         max_position_embeddings (`int`, *optional*, defaults to 32768):
             The maximum sequence length that this model might ever be used with.
         initializer_range (`float`, *optional*, defaults to 0.02):
@@ -186,6 +188,7 @@ class Qwen3NextConfig(PretrainedConfig):
         num_attention_heads=16,
         num_key_value_heads=2,
         hidden_act="silu",
+        output_gate_type=None,
         max_position_embeddings=32768,
         initializer_range=0.02,
         rms_norm_eps=1e-6,
@@ -223,6 +226,7 @@ class Qwen3NextConfig(PretrainedConfig):
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.hidden_act = hidden_act
+        self.output_gate_type = output_gate_type
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache

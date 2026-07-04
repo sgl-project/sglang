@@ -18,12 +18,14 @@ import requests
 import tabulate
 
 from sglang.profiler import run_profile
+from sglang.srt.utils.network import resolve_base_url
 
 
 @dataclasses.dataclass
 class BenchArgs:
     host: str = "localhost"
     port: int = 30000
+    base_url: str = ""
     batch_size: int = 1
     different_prompts: bool = False
     random_input_len: Optional[int] = None
@@ -51,6 +53,12 @@ class BenchArgs:
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--host", type=str, default=BenchArgs.host)
         parser.add_argument("--port", type=int, default=BenchArgs.port)
+        parser.add_argument(
+            "--base-url",
+            type=str,
+            default=BenchArgs.base_url,
+            help="Server base url. Overrides --host/--port when set.",
+        )
         parser.add_argument("--batch-size", type=int, default=BenchArgs.batch_size)
         parser.add_argument(
             "--different-prompts",
@@ -105,8 +113,12 @@ class BenchArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
 
-def send_one_prompt(args: BenchArgs):
-    base_url = f"http://{args.host}:{args.port}"
+def send_one_prompt(
+    args: BenchArgs,
+    label: Optional[str] = None,
+    print_output: bool = True,
+):
+    base_url = resolve_base_url(args.base_url, args.host, args.port)
 
     # Construct the input
     if args.random_input_len is not None:
@@ -235,10 +247,12 @@ def send_one_prompt(args: BenchArgs):
     speed = ret["meta_info"]["completion_tokens"] / latency
     tokens = ret["meta_info"]["completion_tokens"]
 
-    if not args.stream:
+    if not args.stream and print_output:
         print(ret["text"])
 
     print()
+    if label is not None:
+        print(label)
     headers = ["Latency (s)", "Tokens", "Acc Length", "Speed (token/s)"]
     rows = [[f"{latency:.3f}", f"{tokens}", f"{acc_length:.3f}", f"{speed:.2f}"]]
     msg = tabulate.tabulate(rows, headers=headers, tablefmt="pretty")

@@ -68,19 +68,22 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/sglang/!(multimodal_gen)/**"
+              - ".github/workflows/pr-test-musa.yml"
               - "python/pyproject_other.toml"
+              - "python/sglang/!(multimodal_gen)/**"
+              - "python/sglang/srt/hardware_backend/musa/**"
               - "scripts/ci/musa/*"
               - "scripts/ci/utils/*"
-              - "test/**"
-              - ".github/workflows/pr-test-musa.yml"
             multimodal_gen:
-              - "python/sglang/multimodal_gen/**"
-              - "python/sglang/cli/**"
               - "python/pyproject_other.toml"
+              - "python/sglang/multimodal_gen/runtime/platforms/musa.py"
+              - "python/sglang/multimodal_gen/test/unit/musa/layers/test_musa_rmsnorm.py"
+              - "python/sglang/multimodal_gen/test/unit/musa/layers/test_musa_silu_and_mul.py"
+              - "python/sglang/multimodal_gen/test/server/musa/run_suite.py"
+              - "python/sglang/multimodal_gen/test/server/musa/**"
             sgl_kernel:
-              - "sgl-kernel/**"
               - ".github/workflows/pr-test-musa.yml"
+              - "sgl-kernel/csrc/musa/**"
 
   # ==================== PR Gate ==================== #
   pr-gate:
@@ -100,10 +103,12 @@ jobs:
     runs-on: s5000-1-gpu-runner
     timeout-minutes: 240
     env:
-      USE_MODELSCOPE: true
+      SGLANG_USE_MODELSCOPE: false
       SGLANG_IS_IN_CI: true
       TORCHADA_ENABLE_CPP_OPS: 1
+      HF_HOME: /hf-cache
       HF_HUB_CACHE: /hf-cache/hub
+      HF_HUB_OFFLINE: 1
     steps:
       - name: Checkout code
         timeout-minutes: 10
@@ -112,6 +117,7 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
+        timeout-minutes: 15
         run: |
           bash scripts/ci/musa/musa_install_dependency.sh
 
@@ -121,7 +127,7 @@ jobs:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
         run: |
           cd python
-          python3 sglang/multimodal_gen/test/run_suite_musa.py \
+          python3 sglang/multimodal_gen/test/server/musa/run_suite.py \
             --suite 1-gpu-musa \
             --partition-id ${{ matrix.part }} \
             --total-partitions 2
@@ -132,10 +138,12 @@ jobs:
     runs-on: s5000-2-gpu-runner
     timeout-minutes: 240
     env:
-      USE_MODELSCOPE: true
+      SGLANG_USE_MODELSCOPE: false
       SGLANG_IS_IN_CI: true
       TORCHADA_ENABLE_CPP_OPS: 1
+      HF_HOME: /hf-cache
       HF_HUB_CACHE: /hf-cache/hub
+      HF_HUB_OFFLINE: 1
     steps:
       - name: Checkout code
         timeout-minutes: 10
@@ -144,6 +152,7 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
+        timeout-minutes: 15
         run: |
           bash scripts/ci/musa/musa_install_dependency.sh
 
@@ -153,7 +162,7 @@ jobs:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
         run: |
           cd python
-          python3 sglang/multimodal_gen/test/run_suite_musa.py \
+          python3 sglang/multimodal_gen/test/server/musa/run_suite.py \
             --suite 2-gpu-musa
 
   multimodal-gen-layer-unit-test-musa:
@@ -162,24 +171,27 @@ jobs:
     runs-on: s5000-1-gpu-runner
     timeout-minutes: 240
     env:
-      USE_MODELSCOPE: true
+      SGLANG_USE_MODELSCOPE: false
       SGLANG_IS_IN_CI: true
       TORCHADA_ENABLE_CPP_OPS: 1
+      HF_HOME: /hf-cache
       HF_HUB_CACHE: /hf-cache/hub
+      HF_HUB_OFFLINE: 1
     steps:
       - name: Checkout code
         timeout-minutes: 10
         uses: actions/checkout@v4
 
       - name: Install dependencies
+        timeout-minutes: 15
         run: |
           bash scripts/ci/musa/musa_install_dependency.sh
 
       - name: Run multimodal gen layer unit test
         timeout-minutes: 30
         run: |
-          pytest python/sglang/multimodal_gen/test/layers/test_musa_rmsnorm.py
-          pytest python/sglang/multimodal_gen/test/layers/test_musa_silu_and_mul.py
+          pytest python/sglang/multimodal_gen/test/unit/musa/layers/test_musa_rmsnorm.py
+          pytest python/sglang/multimodal_gen/test/unit/musa/layers/test_musa_silu_and_mul.py
 
 # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-musa:
@@ -198,6 +210,7 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
+        timeout-minutes: 15
         run: |
           bash scripts/ci/musa/musa_install_dependency.sh
 

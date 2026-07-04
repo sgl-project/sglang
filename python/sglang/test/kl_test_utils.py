@@ -133,7 +133,7 @@ def _generate(
     max_new_tokens,
     return_logprob=False,
     logprob_start_len=-1,
-    temperature=1,
+    temperature=0.0,
 ):
     """Send generate request and return results."""
     json_data = {
@@ -156,7 +156,7 @@ def _generate(
     return response.json()
 
 
-def _get_input_logprobs(base_url, new_input_ids, output_logprobs, temperature=1):
+def _get_input_logprobs(base_url, new_input_ids, output_logprobs, temperature=0.0):
     """Run prefill to get input logprobs matching output logprobs."""
     _flush_cache(base_url)
     results = _generate(
@@ -253,9 +253,10 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
         new_input_ids.append(input_ids[i] + result["output_ids"])
         output_logprobs.append(_extract_output_logprobs(result))
 
-    assert len(new_input_ids) > 0.5 * len(
-        input_ids
-    ), f"Too few prefill cache hits: {len(new_input_ids)}/{len(input_ids)}"
+    if not os.environ.get("SGLANG_TEST_SKIP_CACHE_HIT_ASSERT"):
+        assert len(new_input_ids) > 0.5 * len(
+            input_ids
+        ), f"Too few prefill cache hits: {len(new_input_ids)}/{len(input_ids)}"
 
     print("Flush Cache and run prefill to get input logprobs ...")
     input_logprobs = _get_input_logprobs(base_url, new_input_ids, output_logprobs)
@@ -321,9 +322,10 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
         new_input_ids.append(second_turn_input_ids[i] + result["output_ids"])
         output_logprobs.append(_extract_output_logprobs(result))
 
-    assert len(new_input_ids) > 0.5 * len(
-        second_turn_input_ids
-    ), f"Too few decode cache hits: {len(new_input_ids)}/{len(second_turn_input_ids)}"
+    if not os.environ.get("SGLANG_TEST_SKIP_CACHE_HIT_ASSERT"):
+        assert len(new_input_ids) > 0.5 * len(
+            second_turn_input_ids
+        ), f"Too few decode cache hits: {len(new_input_ids)}/{len(second_turn_input_ids)}"
 
     print("Flush Cache and run prefill to get input logprobs ...")
     input_logprobs = _get_input_logprobs(base_url, new_input_ids, output_logprobs)

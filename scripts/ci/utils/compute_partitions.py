@@ -2,7 +2,7 @@
 keyed by suite name. Consumed by pr-test.yml stage jobs as
 `fromJson(needs.check-changes.outputs.partitions)['<suite>']`.
 
-    partitions={"stage-b-test-1-gpu-small": {"size": 8, "arr": [0,...,7], "max_parallel": 2}, ...}
+    partitions={"base-b-test-1-gpu-small": {"size": 8, "arr": [0,...,7], "max_parallel": 2}, ...}
 """
 
 import argparse
@@ -12,6 +12,7 @@ import json
 import math
 import os
 from collections import defaultdict
+from datetime import datetime, timedelta
 
 import yaml  # PyYAML; preinstalled on ubuntu-latest GHA runners.
 
@@ -34,11 +35,11 @@ HWBackend = _ci_register.HWBackend
 # pr-test-amd.yml / pr-test-npu.yml have their own dispatch.
 _TARGET_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
 
-# stage-a is the critical-path entry gate; pin its fanout to smoke-coverage
+# base-a is the critical-path entry gate; pin its fanout to sanity-coverage
 # defaults instead of est_time. max_parallel = size (no throttle).
-_STAGE_A_OVERRIDES = {
-    "stage-a-test-cpu": 4,
-    "stage-a-test-1-gpu-small": 1,
+_BASE_A_OVERRIDES = {
+    "base-a-test-cpu": 8,
+    "base-a-test-1-gpu-small": 1,
 }
 
 _REUSABLE_STAGE_USES = "./.github/workflows/_pr-test-stage.yml"
@@ -47,7 +48,7 @@ _REUSABLE_STAGE_USES = "./.github/workflows/_pr-test-stage.yml"
 def load_run_timeouts(pr_test_yml_path: str) -> dict:
     """Map `self_name -> run_timeout_minutes` from one pr-test*.yml. The input
     is required in `_pr-test-stage.yml` -- KeyError surfaces missing.
-    Inline stage-a-test-cpu is skipped (uses `_STAGE_A_OVERRIDES`)."""
+    Inline base-a-test-cpu is skipped (uses `_BASE_A_OVERRIDES`)."""
     with open(pr_test_yml_path) as f:
         wf = yaml.safe_load(f)
     timeouts = {}
@@ -122,7 +123,7 @@ def compute_partitions(
     """
     # Allowlist: stages pr-test.yml dispatches. Stress / weekly /
     # nightly-* live in test/registered/ but pr-test doesn't run them.
-    dispatched_suites = set(run_timeouts) | set(_STAGE_A_OVERRIDES)
+    dispatched_suites = set(run_timeouts) | set(_BASE_A_OVERRIDES)
     suite_tests = defaultdict(list)
     for t in tests:
         if t.backend not in _TARGET_BACKENDS:
@@ -149,8 +150,8 @@ def compute_partitions(
         bias = fit.get("bias", 0.0)
 
         # Each shard pays `bias` once, so size >= coeff*total / (target-bias).
-        if suite in _STAGE_A_OVERRIDES:
-            size = _STAGE_A_OVERRIDES[suite]
+        if suite in _BASE_A_OVERRIDES:
+            size = _BASE_A_OVERRIDES[suite]
             max_parallel = size
         else:
             target = per_shard_target_seconds(suite, run_timeouts)
@@ -177,6 +178,21 @@ def compute_partitions(
             "max_parallel": max_parallel,
         }
     return result
+
+
+def format_fit_window(model: dict) -> str:
+    """Render the model's fit window as `[start, end)` for the step summary.
+
+    Surfacing the whole span keeps the lower-bound date from reading as a
+    staleness marker (it trails today by fit_window_days)."""
+    start = model.get("fit_window_start")
+    days = model.get("fit_window_days")
+    if not start or not isinstance(days, int):
+        return f"fit_window_start={start}"
+    end = (datetime.strptime(start[:10], "%Y-%m-%d") + timedelta(days=days)).strftime(
+        "%Y-%m-%d"
+    )
+    return f"fit over [{start[:10]}, {end}) ({days}d window)"
 
 
 def main():
@@ -234,7 +250,7 @@ def main():
                 src_note = "no live model -- static est_time + (coeff=1, bias=0)"
             else:
                 src_note = (
-                    f"live model `data_as_of={partition_model.get('data_as_of')}`, "
+                    f"live model: {format_fit_window(partition_model)}, "
                     f"`n_runs={partition_model.get('n_runs')}`"
                 )
             f.write(

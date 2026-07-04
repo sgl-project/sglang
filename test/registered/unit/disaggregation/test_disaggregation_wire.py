@@ -3,14 +3,16 @@ import unittest
 import numpy as np
 
 from sglang.srt.disaggregation.common.utils import (
+    group_concurrent_contiguous,
     pack_int_lists,
     pack_list_of_buffers,
     unpack_int_lists,
     unpack_list_of_buffers,
 )
+from sglang.srt.disaggregation.utils import get_dsv4_c128_state_indices
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
@@ -43,6 +45,76 @@ class TestDisaggregationWire(unittest.TestCase):
     def test_list_of_buffers_roundtrip(self):
         bufs = [b"abc", b"", b"de", b"x" * 17]
         self.assertEqual(unpack_list_of_buffers(pack_list_of_buffers(bufs)), bufs)
+
+
+class TestGroupConcurrentContiguous(unittest.TestCase):
+    @staticmethod
+    def _arr(values):
+        return np.array(values, dtype=np.int32)
+
+    def test_single_contiguous_group(self):
+        src = self._arr([10, 11, 12])
+        dst = self._arr([5, 6, 7])
+        self.assertEqual(
+            group_concurrent_contiguous(src, dst),
+            ([[10, 11, 12]], [[5, 6, 7]]),
+        )
+
+    def test_splits_on_discontiguous_indices(self):
+        src = self._arr([10, 11, 20])
+        dst = self._arr([5, 6, 7])
+        self.assertEqual(
+            group_concurrent_contiguous(src, dst),
+            ([[10, 11], [20]], [[5, 6], [7]]),
+        )
+
+    def test_both_empty(self):
+        self.assertEqual(
+            group_concurrent_contiguous(self._arr([]), self._arr([])), ([], [])
+        )
+
+    def test_empty_src_nonempty_dst(self):
+        self.assertEqual(
+            group_concurrent_contiguous(self._arr([]), self._arr([1, 2])), ([], [])
+        )
+
+    def test_nonempty_src_empty_dst(self):
+        # Regression: a non-empty source paired with an empty destination must not
+        # raise a NumPy broadcast error (observed transferring DSA sparse-attention
+        # state on a disaggregated GLM deployment when decode registered zero dst indices).
+        self.assertEqual(
+            group_concurrent_contiguous(self._arr([1, 2]), self._arr([])), ([], [])
+        )
+
+    def test_mismatched_nonempty_lengths_raise(self):
+        with self.assertRaises(ValueError):
+            group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
+
+
+class TestDSV4C128StateIndices(unittest.TestCase):
+    def test_online_aligned_boundary_has_no_partial_state(self):
+        np.testing.assert_array_equal(
+            get_dsv4_c128_state_indices(7, 256, online=True, ring_size=1),
+            np.empty((0,), dtype=np.int32),
+        )
+
+    def test_online_partial_boundary_uses_request_slot(self):
+        np.testing.assert_array_equal(
+            get_dsv4_c128_state_indices(7, 257, online=True, ring_size=1),
+            np.array([7], dtype=np.int32),
+        )
+
+    def test_offline_aligned_boundary_has_no_partial_state(self):
+        np.testing.assert_array_equal(
+            get_dsv4_c128_state_indices(7, 256, online=False, ring_size=128),
+            np.empty((0,), dtype=np.int32),
+        )
+
+    def test_offline_partial_boundary_uses_request_local_page(self):
+        np.testing.assert_array_equal(
+            get_dsv4_c128_state_indices(7, 129, online=False, ring_size=256),
+            np.array([15], dtype=np.int32),
+        )
 
 
 if __name__ == "__main__":

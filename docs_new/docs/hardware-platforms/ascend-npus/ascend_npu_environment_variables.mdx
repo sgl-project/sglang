@@ -29,7 +29,7 @@ This document provides a list of commonly used environment variables and aims to
     </tr>
     <tr>
       <td><code>SGLANG_NPU_USE_MULTI_STREAM</code></td>
-      <td>Enable dual-stream computation of shared experts <br/> and routing experts in DeepSeek models.<br/> Enable dual-stream computation in DeepSeek NSA Indexer.</td>
+      <td>Enable dual-stream computation of shared experts <br/> and routing experts in DeepSeek models.<br/> Enable dual-stream computation in DeepSeek DSA Indexer.</td>
       <td><code>false</code></td>
     </tr>
     <tr>
@@ -58,17 +58,17 @@ This document provides a list of commonly used environment variables and aims to
   <tbody>
     <tr>
       <td><code>DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS</code></td>
-      <td>Enable ant-moving function in dispatch stage. Indicates <br/> the number of tokens transmitted per round on each rank.</td>
+      <td>Enable long-sequence token pipelining in dispatch stage. Indicates <br/> the number of tokens transmitted per round on each rank.</td>
       <td><code>8192</code></td>
     </tr>
     <tr>
       <td><code>DEEPEP_NORMAL_LONG_SEQ_ROUND</code></td>
-      <td>Enable ant-moving function in dispatch stage. Indicates <br/> the number of rounds transmitted on each rank.</td>
+      <td>Enable long-sequence token pipelining in dispatch stage. Indicates <br/> the number of rounds transmitted on each rank.</td>
       <td><code>1</code></td>
     </tr>
     <tr>
       <td><code>DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ</code></td>
-      <td>Enable ant-moving function in combine stage. <br/> The value <code>0</code> means disabled.</td>
+      <td>Enable long-sequence token pipelining in combine stage. <br/> The value <code>0</code> means disabled.</td>
       <td><code>0</code></td>
     </tr>
     <tr>
@@ -78,7 +78,14 @@ This document provides a list of commonly used environment variables and aims to
     </tr>
     <tr>
       <td><code>DEEP_NORMAL_MODE_USE_INT8_QUANT</code></td>
-      <td>Quantizes x to int8 and returns (tensor, scales) in dispatch operator.</td>
+      <td>
+        <strong>Deprecated — will be removed in a future release.</strong>
+        <br/>
+        When set to <code>1</code>, quantizes intermediate activations to INT8 in
+        <br/>the DeepEP dispatch operator during normal mode, reducing communication
+        <br/>volume for W8A8-quantized MoE models. This variable will become a no-op;
+        <br/>the quantization behavior will be inferred automatically.
+      </td>
       <td><code>0</code></td>
     </tr>
   </tbody>
