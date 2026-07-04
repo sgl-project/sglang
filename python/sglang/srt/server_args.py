@@ -1597,6 +1597,7 @@ class ServerArgs:
         Arg(
             help="Choose the runner backend for MoE in speculative decoding.",
             choices=MOE_RUNNER_BACKEND_CHOICES,
+            resolvable=True,
         ),
     ] = None
     speculative_moe_a2a_backend: A[
@@ -1604,6 +1605,7 @@ class ServerArgs:
         Arg(
             help="Choose the backend for MoE A2A in speculative decoding",
             choices=MOE_A2A_BACKEND_CHOICES,
+            resolvable=True,
         ),
     ] = None
     speculative_draft_model_quantization: A[
@@ -3897,35 +3899,15 @@ class ServerArgs:
                         "Enable Aiter AllReduce Fusion for DeepseekV3ForCausalLM"
                     )
 
-                if (
-                    self.quantization == "modelopt_fp4"
-                    and self.speculative_algorithm == "EAGLE"
-                    and (
-                        self.speculative_moe_runner_backend is None
-                        or self.speculative_moe_a2a_backend is None
-                    )
-                ):
-                    if envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get():
-                        self.speculative_moe_runner_backend = "deep_gemm"
-                        self.speculative_moe_a2a_backend = "deepep"
-                        logger.info(
-                            "Use deep_gemm moe runner and deepep a2a backend for bf16 nextn layer in deepseek fp4 checkpoint."
-                        )
-                        # Validate usage of ep
-                        if self.ep_size == 1:
-                            raise ValueError(
-                                "Invalid configuration: 'deep_gemm' speculative MoE runner backend with "
-                                "'deepep' a2a backend requires expert parallelism (ep_size > 1). "
-                                f"Current ep_size is {self.ep_size}. "
-                                "Please set --ep-size > 1 (e.g., --ep-size 8) to use this configuration, "
-                                "or change --speculative-moe-a2a-backend to 'none' if expert parallelism is not available."
-                            )
-                    else:
-                        self.speculative_moe_runner_backend = "triton"
-                        self.speculative_moe_a2a_backend = "none"
-                        logger.info(
-                            "Use triton fused moe by default for bf16 nextn layer in deepseek fp4 checkpoint."
-                        )
+                # The fp4-checkpoint draft spec-MoE resolution moved to the
+                # resolution pipeline (arg_groups/overrides.py:
+                # _deepseek_spec_moe_resolution), invoked here at its legacy
+                # slot.
+                from sglang.srt.arg_groups.overrides import (
+                    _deepseek_spec_moe_resolution,
+                )
+
+                run_post_process_pass(self, _deepseek_spec_moe_resolution)
 
         elif model_arch in [
             "DeepseekV4ForCausalLM",

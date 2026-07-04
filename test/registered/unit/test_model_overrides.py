@@ -81,6 +81,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "disable_overlap_schedule",
                     "uses_mamba_radix_cache",
                     "mamba_radix_cache_strategy",
+                    "speculative_moe_runner_backend",
+                    "speculative_moe_a2a_backend",
                 }
             ),
         )
@@ -981,6 +983,102 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _nemotron_h_overrides(_args(None, hf, moe_runner_backend="triton"), hf),
                 {},
             )
+
+    def test_speculative_moe_runner_default_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _speculative_moe_runner_default,
+        )
+
+        self.assertEqual(
+            _speculative_moe_runner_default(
+                ResolvedView(
+                    SimpleNamespace(
+                        speculative_moe_runner_backend=None, moe_runner_backend="triton"
+                    )
+                )
+            ),
+            {"speculative_moe_runner_backend": "triton"},
+        )
+        # user-set draft backend survives
+        self.assertEqual(
+            _speculative_moe_runner_default(
+                ResolvedView(
+                    SimpleNamespace(
+                        speculative_moe_runner_backend="deep_gemm",
+                        moe_runner_backend="auto",
+                    )
+                )
+            ),
+            {},
+        )
+
+    def test_deepseek_spec_moe_resolution_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deepseek_spec_moe_resolution,
+        )
+        from sglang.srt.environ import envs
+
+        def _view(**kw):
+            hf = SimpleNamespace(architectures=["DeepseekV3ForCausalLM"])
+            defaults = dict(
+                quantization="modelopt_fp4",
+                speculative_algorithm="EAGLE",
+                speculative_moe_runner_backend=None,
+                speculative_moe_a2a_backend=None,
+                ep_size=8,
+            )
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(
+                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+                )
+            )
+
+        with patch.object(overrides_module, "is_hip", return_value=True):
+            with patch.object(
+                envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE, "get", return_value=False
+            ):
+                self.assertEqual(
+                    _deepseek_spec_moe_resolution(_view()),
+                    {
+                        "speculative_moe_runner_backend": "triton",
+                        "speculative_moe_a2a_backend": "none",
+                    },
+                )
+                # guards: quantization / algorithm / both fields user-set
+                self.assertEqual(
+                    _deepseek_spec_moe_resolution(_view(quantization="fp8")), {}
+                )
+                self.assertEqual(
+                    _deepseek_spec_moe_resolution(_view(speculative_algorithm=None)),
+                    {},
+                )
+                self.assertEqual(
+                    _deepseek_spec_moe_resolution(
+                        _view(
+                            speculative_moe_runner_backend="triton",
+                            speculative_moe_a2a_backend="none",
+                        )
+                    ),
+                    {},
+                )
+            with patch.object(
+                envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE, "get", return_value=True
+            ):
+                self.assertEqual(
+                    _deepseek_spec_moe_resolution(_view()),
+                    {
+                        "speculative_moe_runner_backend": "deep_gemm",
+                        "speculative_moe_a2a_backend": "deepep",
+                    },
+                )
+                with self.assertRaises(ValueError):
+                    _deepseek_spec_moe_resolution(_view(ep_size=1))
+        # the arm is HIP-only
+        with patch.object(overrides_module, "is_hip", return_value=False):
+            self.assertEqual(_deepseek_spec_moe_resolution(_view()), {})
 
     def test_mamba_radix_cache_resolution_pass(self):
         from sglang.srt.arg_groups.overrides import (

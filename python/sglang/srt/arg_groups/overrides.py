@@ -177,7 +177,15 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
         )
     if declared:
         entry = (fn.__qualname__, dict(declared))
-        server_args._resolved_overrides.append(entry)
+        stash = getattr(server_args, "_resolved_overrides", None)
+        if stash is None:
+            # Handlers hosting pass slots may be invoked directly on fixtures
+            # that never ran the monolith dispatch (which owns the stash);
+            # create it lazily. Real publishes always pass through the
+            # dispatch first — the dispatch ASSIGNS the stash, so pass slots
+            # must sit at or after it in __post_init__ order.
+            stash = server_args._resolved_overrides = []
+        stash.append(entry)
         apply_declarations_to_server_args(server_args, [entry])
 
 
@@ -1028,6 +1036,55 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
 
 
 @register_post_process
+def _deepseek_spec_moe_resolution(view: Any) -> dict:
+    """Slot pass at the DeepSeek branch's HIP arm: draft (nextn) spec-MoE
+    backends for the DeepSeek fp4 checkpoint. Reads the mid-resolution
+    quantization (after _deepseek_moe_quant_resolution) and the pre-a2a
+    ep_size, exactly like the legacy in-branch writes."""
+    from sglang.srt.environ import envs
+
+    hf_config = view.get_model_config().hf_config
+    model_arch = hf_config.architectures[0]
+    if model_arch not in _DEEPSEEK_FAMILY_ARCHS:
+        return {}
+    if not is_hip():
+        return {}
+    if not (
+        view.quantization == "modelopt_fp4"
+        and view.speculative_algorithm == "EAGLE"
+        and (
+            view.speculative_moe_runner_backend is None
+            or view.speculative_moe_a2a_backend is None
+        )
+    ):
+        return {}
+    if envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get():
+        logger.info(
+            "Use deep_gemm moe runner and deepep a2a backend for bf16 nextn layer in deepseek fp4 checkpoint."
+        )
+        # Validate usage of ep
+        if view.ep_size == 1:
+            raise ValueError(
+                "Invalid configuration: 'deep_gemm' speculative MoE runner backend with "
+                "'deepep' a2a backend requires expert parallelism (ep_size > 1). "
+                f"Current ep_size is {view.ep_size}. "
+                "Please set --ep-size > 1 (e.g., --ep-size 8) to use this configuration, "
+                "or change --speculative-moe-a2a-backend to 'none' if expert parallelism is not available."
+            )
+        return {
+            "speculative_moe_runner_backend": "deep_gemm",
+            "speculative_moe_a2a_backend": "deepep",
+        }
+    logger.info(
+        "Use triton fused moe by default for bf16 nextn layer in deepseek fp4 checkpoint."
+    )
+    return {
+        "speculative_moe_runner_backend": "triton",
+        "speculative_moe_a2a_backend": "none",
+    }
+
+
+@register_post_process
 def _deepseek_v4_sm120_moe(view: Any) -> dict:
     """Slot pass in the DeepSeek V4 validation branch: SM120 lacks
     tcgen05/TMEM, fall back to the marlin MoE runner (reads the
@@ -1445,6 +1502,16 @@ def _pipeline_parallel_overlap_disable(view: Any) -> dict:
     if view.pp_size > 1:
         logger.warning("Pipeline parallelism is incompatible with overlap schedule.")
         return {"disable_overlap_schedule": True}
+    return {}
+
+
+@register_post_process
+def _speculative_moe_runner_default(view: Any) -> dict:
+    """Default the speculative (draft) MoE runner backend to the resolved
+    target-model backend. Invoked at the head of the speculative-decoding
+    hook, after the MoE kernel chain has resolved."""
+    if view.speculative_moe_runner_backend is None:
+        return {"speculative_moe_runner_backend": view.moe_runner_backend}
     return {}
 
 

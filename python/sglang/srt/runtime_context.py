@@ -328,6 +328,8 @@ class Flags(_StaticFlags):
     disable_overlap_schedule: bool = False
     uses_mamba_radix_cache: bool = False
     mamba_radix_cache_strategy: str = "auto"
+    speculative_moe_runner_backend: str | None = None
+    speculative_moe_a2a_backend: str | None = None
     # Parallel-request fields: flat transitional home, to be re-homed by the
     # Parallel Parameters Clarification module.
     enable_dp_attention: bool = False
