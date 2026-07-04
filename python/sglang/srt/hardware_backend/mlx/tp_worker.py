@@ -124,9 +124,29 @@ class MlxTpModelWorker(TpModelWorker):
         else:
             self._mlx_active_rids |= current_rids
 
+    def _note_committed_lens(self, batch: ScheduleBatch) -> None:
+        """Tell the runner how far the scheduler has written req_to_token.
+
+        Runs on every scheduler-built forward (prefill, extend, decode).
+        Chained decode steps bypass this on purpose: they advance MLX cache
+        offsets without allocator bookkeeping, and the decode-KV pool sync
+        must stay clamped to the scheduler-committed bound (issue #30093).
+        """
+        seq_lens = batch.seq_lens.cpu().tolist()
+        for req, seq_len in zip(batch.reqs, seq_lens):
+            self._mlx_runner.note_committed_len(req.rid, seq_len)
+
     def prepare_for_kv_cache_release(self, req) -> None:
-        """Snapshot MLX auxiliary state at the scheduler's radix insert point."""
+        """Snapshot MLX auxiliary state at the scheduler's radix insert point.
+
+        Also flush this request's committed decode KV to the pool before the
+        caller runs ``release_kv_cache``: that frees the ``req_to_token`` row for
+        reuse, and a later sync would otherwise read the new owner's slot ids
+        (issue #30093).
+        """
         if self._mlx_runner.has_request(req.rid):
+            # Flush while the request still owns its row (see #30093).
+            self._mlx_runner.flush_request_decode_kv(req.rid)
             self._mlx_runner.store_auxiliary_state_for_request(req.rid)
             # Prefer the just-snapshotted live auxiliary state for the final
             # insert. Any older tracked slot is released during component cleanup.
@@ -155,6 +175,7 @@ class MlxTpModelWorker(TpModelWorker):
             # Ensure pool is up-to-date before pool-backed attention reads it
             # for prefix-cached prefills.  Only runs on extend batches.
             self._mlx_runner.flush_all_decode_kv()
+            self._note_committed_lens(batch)
             input_ids_cpu = batch.input_ids.cpu().tolist()
             out_cache_loc_cpu = batch.out_cache_loc.cpu().tolist()
             extend_seq_lens = batch.extend_lens
@@ -216,6 +237,7 @@ class MlxTpModelWorker(TpModelWorker):
                     next_token_ids_list.append(prefill_map[req.rid])
 
         elif forward_mode.is_decode():
+            self._note_committed_lens(batch)
             req_ids = [req.rid for req in reqs]
             next_token_ids_list = self._mlx_runner.decode_batch(req_ids)
 
@@ -272,6 +294,7 @@ class MlxTpModelWorker(TpModelWorker):
         self._cleanup_stale_rids(forward_mode, {req.rid for req in reqs})
 
         if forward_mode.is_decode():
+            self._note_committed_lens(batch)
             req_ids = [req.rid for req in reqs]
             pending_decode = self._mlx_runner.decode_batch_start(req_ids)
             mx.async_eval(pending_decode.lazy_tokens)
@@ -297,6 +320,7 @@ class MlxTpModelWorker(TpModelWorker):
     ]:
         """Launch each request in an EXTEND batch lazily and kick GPU work."""
         reqs = batch.reqs
+        self._note_committed_lens(batch)
         input_ids_cpu = batch.input_ids.cpu().tolist()
         out_cache_loc_cpu = batch.out_cache_loc.cpu().tolist()
         extend_seq_lens = batch.extend_lens

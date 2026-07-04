@@ -176,6 +176,12 @@ class MlxModelRunner:
         self._req_to_token_pool: ReqToTokenPool | None = None
         self._req_pool_idx: dict[str, int] = {}
         self._req_synced_offset: dict[str, int] = {}
+        # Scheduler-committed row length per request: how many leading
+        # req_to_token positions the scheduler has allocated and written.
+        # Chained decode steps advance the MLX cache offsets without
+        # advancing this bound, so the decode-KV pool sync must never read
+        # req_to_token past it (issue #30093).
+        self._req_committed_len: dict[str, int] = {}
 
         self._pool_size = self._compute_pool_size(pool_size)
         self._aot_kernels = self._build_aot_kernels()
@@ -669,6 +675,16 @@ class MlxModelRunner:
         )
         self._attention_kv_pool.set_kv_all_layers(slot_ids_mx, k_all, v_all)
 
+    def note_committed_len(self, req_id: str, committed_len: int) -> None:
+        """Record how many req_to_token positions the scheduler has written.
+
+        Called by the TP worker on every scheduler-built forward (prefill,
+        extend, decode). Chained decode steps deliberately never call it:
+        they produce tokens without allocator bookkeeping, so the decode-KV
+        pool sync stays clamped to the last scheduler-committed bound.
+        """
+        self._req_committed_len[req_id] = committed_len
+
     def _sync_decode_kv_to_pool(self, req_id: str) -> None:
         """Sync un-flushed decode KV for *req_id* to the shared pool."""
         if self._attention_kv_pool is None or self._req_to_token_pool is None:
@@ -678,6 +694,15 @@ class MlxModelRunner:
             return
         current_offset = self._first_attention_cache(cache).offset
         synced_offset = self._req_synced_offset.get(req_id, 0)
+        # Clamp to the scheduler-committed bound: cache offsets advanced by
+        # chained decode steps have no allocated req_to_token positions, and
+        # rows past the bound hold zeros (fresh row) or a previous request's
+        # slot ids (reused row) that must not be treated as slots. Positions
+        # clamped here are re-checked on the next sync once the scheduler
+        # commits further, so post-chain decode KV still reaches the pool.
+        current_offset = min(
+            current_offset, self._req_committed_len.get(req_id, synced_offset)
+        )
         if current_offset <= synced_offset:
             return
         req_pool_idx = self._req_pool_idx.get(req_id)
@@ -700,6 +725,22 @@ class MlxModelRunner:
             return
         for req_id in list(self._req_caches.keys()):
             self._sync_decode_kv_to_pool(req_id)
+
+    def flush_request_decode_kv(self, req_id: str) -> None:
+        """Flush one request's committed decode KV while it still owns its row.
+
+        Called from the TP worker at the scheduler's radix-insert point
+        (``prepare_for_kv_cache_release``), before ``release_kv_cache`` frees the
+        request's ``req_to_token`` row. Once the scheduler frees the row it can
+        be reallocated to another request; a later sync (e.g. from
+        ``remove_request`` on the next forward's stale-rid cleanup) would then
+        read the new owner's slot ids out of ``req_to_token`` and overwrite its
+        live pool slots. Advancing the synced bound here closes that window
+        (issue #30093).
+        """
+        if self.disable_radix_cache:
+            return
+        self._sync_decode_kv_to_pool(req_id)
 
     def decode_batch(
         self,
@@ -1261,6 +1302,7 @@ class MlxModelRunner:
             self._release_cache(cache)
         self._req_pool_idx.pop(req_id, None)
         self._req_synced_offset.pop(req_id, None)
+        self._req_committed_len.pop(req_id, None)
 
     def clear(self):
         """Clear all request states."""
@@ -1270,5 +1312,6 @@ class MlxModelRunner:
         self._req_caches.clear()
         self._req_pool_idx.clear()
         self._req_synced_offset.clear()
+        self._req_committed_len.clear()
         if self._attention_kv_pool is not None:
             self._attention_kv_pool.clear()
