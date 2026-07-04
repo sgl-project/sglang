@@ -205,6 +205,10 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             [False, True] * 2,
         )
         self.assertEqual([req.save_output for req in reqs], [False] * 4)
+        self.assertIsNot(reqs[0].sampling_params, reqs[1].sampling_params)
+        self.assertEqual(reqs[1].sampling_params.num_inference_steps, 2)
+        reqs[1].sampling_params.num_inference_steps = 123
+        self.assertEqual(reqs[0].sampling_params.num_inference_steps, 2)
 
     def test_lightweight_warmup_result_ignores_control_requests(self):
         scheduler = _make_bare_scheduler(enable_cfg_parallel=False)

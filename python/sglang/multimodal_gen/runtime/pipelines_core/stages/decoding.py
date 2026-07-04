@@ -37,6 +37,9 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_precision,
     temporary_module_dtype,
 )
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    ActiveTargetCompiledCallable,
+)
 from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
@@ -108,7 +111,7 @@ class DecodingStage(PipelineStage):
         self.vae: ParallelTiledVAE = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
         self.component_name = component_name
-        self._torch_compiled_vae_decode_by_id = {}
+        self._compiled_vae_decode = ActiveTargetCompiledCallable()
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -163,11 +166,6 @@ class DecodingStage(PipelineStage):
         if not server_args.enable_torch_compile or not isinstance(vae, nn.Module):
             return vae.decode
 
-        vae_id = id(vae)
-        decode_fn = self._torch_compiled_vae_decode_by_id.get(vae_id)
-        if decode_fn is not None:
-            return decode_fn
-
         compile_kwargs: dict[str, object] = {"fullgraph": False, "dynamic": None}
         if current_platform.is_npu():
             compile_kwargs["backend"] = get_compiler_backend()
@@ -182,9 +180,9 @@ class DecodingStage(PipelineStage):
             compile_kwargs["mode"] = mode
             logger.info("Compiling VAE decode with mode: %s", mode)
 
-        decode_fn = torch.compile(vae.decode, **compile_kwargs)
-        self._torch_compiled_vae_decode_by_id[vae_id] = decode_fn
-        return decode_fn
+        return self._compiled_vae_decode.get_or_compile(
+            vae, vae.decode, compile_kwargs=compile_kwargs
+        )
 
     @torch.no_grad()
     def decode(

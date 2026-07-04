@@ -369,6 +369,7 @@ def build_warmup_reqs(
         for prompt_idx, prompt in enumerate(prompts):
             prompt_req_kwargs = req_kwargs.copy()
             prompt_req_kwargs["prompt"] = prompt
+            prompt_req_kwargs["sampling_params"] = copy(req_kwargs["sampling_params"])
             req = Req(**prompt_req_kwargs)
             if not run_real_path_prewarm or prompt_idx == 0:
                 req.set_as_warmup(warmup_steps)
