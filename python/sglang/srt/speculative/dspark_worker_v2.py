@@ -1343,6 +1343,31 @@ class DSparkWorkerV2(BaseSpecWorker):
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
 
+        device = (
+            next_token_ids.device
+            if next_token_ids is not None
+            else model_worker_batch.seq_lens.device
+        )
+        local_extend_tokens = int(getattr(model_worker_batch, "extend_num_tokens", 0))
+        if local_extend_tokens == 0 and model_worker_batch.input_ids is not None:
+            local_extend_tokens = int(model_worker_batch.input_ids.numel())
+        if local_extend_tokens == 0:
+            if next_token_ids is None:
+                next_token_ids = torch.empty(
+                    (0,), dtype=torch.int64, device=model_worker_batch.seq_lens.device
+                )
+            if logits_output.hidden_states is not None:
+                logits_output.hidden_states = None
+            batch_output.next_draft_input = self._make_next_draft_input_prefill(
+                bonus_tokens=next_token_ids,
+                seq_lens=model_worker_batch.seq_lens,
+                cur_allocated_seq_lens_cpu=model_worker_batch.seq_lens_cpu,
+            )
+            verify_done = torch.get_device_module(device).Event()
+            verify_done.record()
+            batch_output.next_draft_input.verify_done = verify_done
+            return batch_output
+
         if logits_output.hidden_states is None:
             raise RuntimeError(
                 "DSpark requires target aux hidden capture for prefill, but got None. "
@@ -1351,7 +1376,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         if model_worker_batch.out_cache_loc is None:
             raise RuntimeError("DSpark prefill expected out_cache_loc, but got None.")
 
-        device = next_token_ids.device
         extend_lens = model_worker_batch.extend_lens
         prefix_lens = model_worker_batch.prefix_lens
         if extend_lens is None or prefix_lens is None:
