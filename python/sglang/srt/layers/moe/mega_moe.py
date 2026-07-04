@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -74,12 +75,6 @@ def _apply_mega_moe_symm_mem_backend() -> None:
         return
 
     backend = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_SYMM_MEM_BACKEND.get().strip().upper()
-    if not backend and torch.cuda.is_available():
-        try:
-            if torch.cuda.get_device_capability()[0] >= 10:
-                backend = "NCCL"
-        except RuntimeError:
-            pass
 
     if backend:
         if backend not in ("NCCL", "NVSHMEM"):
@@ -452,30 +447,19 @@ def forward_mega_moe(
         moe.alt_stream.wait_stream(current_stream)
         shared_output = moe._forward_shared_experts(hidden_states)
         mega_stream_ctx = torch.cuda.stream(moe.alt_stream)
-        with mega_stream_ctx:
-            y = _run_mega_routed(
-                moe, hidden_states, forward_batch, input_ids_global, num_tokens
-            )
-        current_stream.wait_stream(moe.alt_stream)
     else:
+        shared_output = moe._forward_shared_experts(hidden_states)
+        mega_stream_ctx = nullcontext()
+
+    with mega_stream_ctx:
         y = _run_mega_routed(
             moe, hidden_states, forward_batch, input_ids_global, num_tokens
         )
-        shared_output = moe._forward_shared_experts(hidden_states)
 
-    if shared_output is not None and not getattr(moe, "_shared_expert_tp1", False):
-        y.add_(shared_output)
-    if moe.tp_size > 1:
-        from sglang.srt.distributed import tensor_model_parallel_all_reduce
-        from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
+    if sbo_overlap_flag:
+        current_stream.wait_stream(moe.alt_stream)
 
-        if not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
-        ):
-            y = tensor_model_parallel_all_reduce(y)
-    if shared_output is not None and getattr(moe, "_shared_expert_tp1", False):
+    if shared_output is not None:
         y.add_(shared_output)
     return y
 
@@ -551,6 +535,11 @@ def _run_mega_routed(
             topk_output = moe.topk.forward_without_deepep_waterfill(
                 hidden_states,
                 router_logits,
+                num_token_non_padded=(
+                    forward_batch.num_token_non_padded
+                    if forward_batch is not None
+                    else None
+                ),
                 expert_location_dispatch_info=dispatch_info,
                 **topk_kwargs,
             )
@@ -578,6 +567,11 @@ def _run_mega_routed(
             topk_output = moe.topk(
                 hidden_states,
                 router_logits,
+                num_token_non_padded=(
+                    forward_batch.num_token_non_padded
+                    if forward_batch is not None
+                    else None
+                ),
                 expert_location_dispatch_info=dispatch_info,
                 **topk_kwargs,
             )

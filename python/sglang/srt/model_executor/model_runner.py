@@ -990,10 +990,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if override:
             return override == "1"
 
-        try:
-            return torch.cuda.get_device_capability()[0] >= 10
-        except RuntimeError:
-            return False
+        return False
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:
