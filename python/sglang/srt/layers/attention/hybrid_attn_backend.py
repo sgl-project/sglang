@@ -59,6 +59,10 @@ class HybridAttnBackend(AttentionBackend):
         backend = self._select_backend(forward_batch.forward_mode)
         backend.init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
 
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        backend = self._select_backend(forward_batch.forward_mode)
+        backend.init_forward_metadata_in_graph(forward_batch)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         backend = self._select_backend(forward_batch.forward_mode)
         backend.init_forward_metadata(forward_batch)
