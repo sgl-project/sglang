@@ -816,8 +816,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             entry["i_buf"], entry["inext_buf"],
             scale, HV=HV, HK=HK, Dk=Dk, Dv=Dv, CS=C, QR=16, num_warps=8,
         )
-        # Swap width buffers: this step's inext becomes next step's i (no copy, no sync).
-        entry["i_buf"], entry["inext_buf"] = entry["inext_buf"], entry["i_buf"]
+        # Roll the width forward for the next step: i_buf <- inext_buf. An in-place device copy_
+        # (not a python reference swap) so this is cuda-graph-capturable -- a captured graph bakes
+        # in tensor pointers, so swapping python names would replay with the wrong buffer. The
+        # kernel reads i_buf (read-only) and unconditionally overwrites inext_buf every launch, so
+        # inext_buf's pre-launch content is irrelevant: this is bit-identical to the swap.
+        entry["i_buf"].copy_(entry["inext_buf"])
         return entry["out"][0]
 
     def _gdn_chunk_replay_decode(
