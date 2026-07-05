@@ -12,7 +12,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
@@ -289,7 +289,7 @@ def get_deepep_v2_output_dtype(self) -> DeepEPv2OutputDtype:
     3. Triton consumes BF16 activation without dispatcher-provided scales.
     """
 
-    server_args = get_global_server_args()
+    server_args = get_server_args()
     if server_args and server_args.deepep_v2_dispatcher_output_dtype != "auto":
         return DeepEPv2OutputDtype(server_args.deepep_v2_dispatcher_output_dtype)
 

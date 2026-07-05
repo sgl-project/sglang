@@ -115,9 +115,9 @@ def _ensure_fp8_quant_available() -> None:
 
 def _get_allow_hybrid_mode() -> bool:
     try:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        server_args = get_global_server_args()
+        server_args = get_server_args()
     except ValueError:
         # Synthetic/unit tests can instantiate the dispatcher without ServerArgs.
         return envs.SGLANG_DEEPEP_V2_ALLOW_HYBRID_MODE.get()
