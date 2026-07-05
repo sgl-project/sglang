@@ -1115,25 +1115,29 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # token even when all inputs (current token + cached columns) are bit-identical.
             # mixed_qkv is [B, dim] (one decode token); conv_states is [slots, dim, state_len]
             # holding the state_len (=width-1) preceding raw pre-conv columns, oldest first.
+            #
+            # Fixed-shape / capture-safe: operate on ALL B rows, indexing conv_states directly by
+            # cache_indices. PAD slots (cache_indices == -1) index the mamba pool's reserved pad row
+            # (the pool allocates size+1, so index -1 is the dummy last row); their conv output is
+            # garbage but unused downstream (GDN zeroes PAD output rows in-kernel). This avoids the
+            # boolean-mask gather/scatter (cache_indices[valid]) whose data-dependent shape forces a
+            # GPU->CPU sync illegal under cuda-graph capture. Valid rows are bit-identical to the
+            # masked path (same idx -> same conv_states row -> same window/conv).
             state_len = conv_states.shape[-1]
-            valid = cache_indices != PAD_SLOT_ID
-            idx = cache_indices[valid]
-            x_new = mixed_qkv[valid]  # [Bv, dim]
-            prev = conv_states[idx]  # [Bv, dim, state_len], oldest first
-            window = torch.cat([prev, x_new.unsqueeze(-1)], dim=-1)  # [Bv, dim, width]
+            prev = conv_states[cache_indices]  # [B, dim, state_len], oldest first
+            window = torch.cat([prev, mixed_qkv.unsqueeze(-1)], dim=-1)  # [B, dim, width]
             conv_out = _causal_depthwise_conv1d(
                 window.float(),
                 layer.conv_weights.unsqueeze(1).float(),
                 layer.bias.float() if layer.bias is not None else None,
-            )  # [Bv, dim, width]; last column is the current token's conv output
+            )  # [B, dim, width]; last column is the current token's conv output
             act = conv_out[..., -1]
             if layer.activation in ("silu", "swish"):
                 act = F.silu(act)
-            out = mixed_qkv.clone()
-            out[valid] = act.to(mixed_qkv.dtype)
-            mixed_qkv = out
-            # Roll conv_states left: drop oldest, append the current raw pre-conv column.
-            conv_states[idx] = window[:, :, -state_len:].to(conv_states.dtype)
+            mixed_qkv = act.to(mixed_qkv.dtype)  # [B, dim]; PAD rows garbage, zeroed by GDN
+            # Roll conv_states left: drop oldest, append the current raw pre-conv column. PAD rows
+            # write the reserved pad row (index -1); duplicate pad writes are harmless scratch.
+            conv_states[cache_indices] = window[:, :, -state_len:].to(conv_states.dtype)
         else:
             mixed_qkv = causal_conv1d_update(
                 mixed_qkv,
