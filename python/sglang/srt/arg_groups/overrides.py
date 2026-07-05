@@ -1699,6 +1699,18 @@ def _data_parallelism_defaults(view: Any) -> dict:
 
 
 @register_post_process
+def _dp_lm_head_validation(view: Any) -> dict:
+    """Read-only validation pass: dp-attention is a prerequisite for the
+    dp LM head. Reads the mid-resolution values through the view (the field
+    is dual-apply-retired)."""
+    if view.enable_dp_lm_head:
+        assert (
+            view.enable_dp_attention
+        ), "Please enable dp attention when setting enable_dp_lm_head. "
+    return {}
+
+
+@register_post_process
 def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     """The quantization-driven moe_runner_backend resolutions at the head of
     _handle_moe_kernel_config. The backend-compatibility asserts and the

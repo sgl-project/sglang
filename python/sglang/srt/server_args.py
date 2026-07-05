@@ -4852,10 +4852,12 @@ class ServerArgs:
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
             )
 
-        if self.enable_dp_lm_head:
-            assert (
-                self.enable_dp_attention
-            ), "Please enable dp attention when setting enable_dp_lm_head. "
+        # The dp-lm-head validation moved to the resolution pipeline
+        # (arg_groups/overrides.py: _dp_lm_head_validation), invoked here at
+        # its legacy slot.
+        from sglang.srt.arg_groups.overrides import _dp_lm_head_validation
+
+        run_post_process_pass(self, _dp_lm_head_validation)
 
     def _handle_moe_kernel_config(self):
         # The quantization-driven runner resolutions moved to the pipeline

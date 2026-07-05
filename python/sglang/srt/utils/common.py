@@ -3451,12 +3451,18 @@ def require_mlp_tp_gather(server_args: ServerArgs):
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     if server_args.enable_dp_attention:
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        # Callable pre-publish (Scheduler.init_moe_gemm_config computes
+        # require_mlp_sync before the model worker publishes the flags
+        # tier): read the resolved value through the view.
+        view = resolved_view(server_args)
         assert server_args.dp_size > 1, "dp_size must be greater than 1"
         if (
             server_args.moe_dense_tp_size is None
         ):  # TODO(ch-wan): some MoE models do not have dense layers
             return True
-        elif not server_args.enable_dp_lm_head:
+        elif not view.enable_dp_lm_head:
             return True
         elif get_moe_a2a_backend().is_none():
             return True
