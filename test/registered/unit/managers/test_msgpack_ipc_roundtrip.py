@@ -198,6 +198,30 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
         self.assertEqual(as_dict["per_gpu_checksum"], "cafef00d")
         self.assertIn("tp_rank", as_dict["parallelism_info"])
 
+    def test_check_weights_producer_conversion(self):
+        # Mirrors weight_updater.check_weights: WeightChecker returns
+        # ChecksumInfo.model_dump() (a dict), converted to the msgspec struct via
+        # msgspec.convert, and the result round-trips as the payload.
+        pydantic_checksum = PydanticChecksumInfo(
+            checksums={"model.layers.0": "deadbeef"},
+            per_gpu_checksum="cafef00d",
+            parallelism_info=PydanticParallelismInfo(
+                tp_rank=0,
+                tp_size=2,
+                dp_rank=0,
+                dp_size=1,
+                pp_rank=0,
+                pp_size=1,
+                rank=0,
+                size=2,
+            ),
+        )
+        converted = msgspec.convert(pydantic_checksum.model_dump(), ChecksumInfo)
+        self.assertEqual(converted.per_gpu_checksum, "cafef00d")
+        self.assertEqual(converted.parallelism_info.tp_rank, 0)
+        output = CheckWeightsReqOutput(success=True, message="ok", payload=[converted])
+        self.assertEqual(_round_trip(output), output)
+
     def test_get_internal_state_sanitizes_dataclass_and_enum(self):
         # A live vars() dump can hold a dataclass (CudaGraphConfig) and an enum
         # (DisaggregationMode). The producer sanitizes via msgspec_to_builtins so
