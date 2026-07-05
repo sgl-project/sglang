@@ -119,7 +119,7 @@ class CausalSelfAttentionKVCache:
             current_chunk_start: the global position of the start of the chunk
             cache_head_start: first cache head for key/value when they only
                 carry a local slice of the cache heads; other heads are left untouched
-            recent_window_tokens: dynamic attention sampling window. ``None``
+            recent_window_tokens: recent-window attention size. ``None``
                 returns the full visible attention window. ``0`` keeps only sink
                 tokens plus the current chunk. A positive value keeps sink tokens,
                 up to that many tokens before the current chunk, and the current
@@ -310,8 +310,24 @@ class CausalSelfAttentionKVCache:
         recent_window_tokens: int | None,
         cache_head_slice: slice | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # None disables dynamic sampling. Zero is a valid setting and means
-        # sink tokens plus the current chunk only.
+        """Return the visible KV slice for the current attention call.
+
+        When ``recent_window_tokens`` is ``None``, the returned token range is
+        the standard sliding window::
+
+            [attn_start_index, updated_local_end)
+
+        When recent-window selection is enabled, ``recent_window_tokens`` must be
+        non-negative and the returned token ranges are::
+
+            sink_end = min(self.sink_tokens, updated_local_end)
+            recent_start = max(sink_end, local_start_index - recent_window_tokens)
+            [0, sink_end) + [recent_start, updated_local_end)
+
+        Thus ``0`` keeps only sink tokens plus the current chunk.
+        ``cache_head_slice`` applies the same token ranges to a subset of KV
+        heads.
+        """
         if recent_window_tokens is None:
             if cache_head_slice is None:
                 return (
