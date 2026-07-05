@@ -934,7 +934,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         _dsv4_be._DSPARK_BLOCK_FULL_ATTN = int(self.block_size)
         self._last_draft_block_ids_debug = [
             int(x)
-            for x in block_ids[: min(int(block_ids.numel()), 8)]
+            for x in block_ids.reshape(-1)[: min(int(block_ids.numel()), 8)]
             .detach()
             .cpu()
             .tolist()
