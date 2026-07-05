@@ -70,6 +70,12 @@ class Sampler(nn.Module):
         )
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = true_on_policy.enabled
+        # Eager decode returns bf16 logits under force_bfloat16_lm_head; cuda-graph decode force-copies
+        # them into a preallocated fp32 next_token_logits_buffer (cuda_graph_runner.py), so the eager
+        # sampler would run log_softmax on fp32 under graph vs bf16 eager (~5e-4 logprob divergence).
+        # Cast back to bf16 to match the eager path bit-for-bit (the fp32 buffer holds float(bf16), so
+        # the round trip is lossless), keeping rollout logprobs identical whether or not graphs run.
+        self.force_bfloat16_lm_head = true_on_policy.force_bfloat16_lm_head
         self.use_ascend_backend = get_global_server_args().sampling_backend == "ascend"
 
     def _preprocess_logits(
@@ -115,6 +121,12 @@ class Sampler(nn.Module):
                 to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
+
+        # Match the eager decode dtype: cuda-graph decode upcasts bf16 lm-head logits into an fp32
+        # buffer, which would change the log_softmax accumulation vs eager bf16. Cast back to bf16 so
+        # rollout logprobs are graph/eager invariant (lossless: the fp32 buffer holds float(bf16)).
+        if self.force_bfloat16_lm_head and logits.dtype != torch.bfloat16:
+            logits = logits.to(torch.bfloat16)
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
