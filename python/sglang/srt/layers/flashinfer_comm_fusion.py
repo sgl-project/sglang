@@ -665,8 +665,13 @@ def ensure_workspace_initialized(
     token_num = token_num or max_token_num
     group_key = (device_group, cpu_group)
     effective_dtype = dtype or torch.bfloat16
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    # The auto-enable declaration lives on the declaration stash / flags
+    # tier; the retired server_args field stays pristine (None), so the
+    # backend must be resolved through the view.
     server_args = get_global_server_args()
-    backend = resolve_flashinfer_allreduce_fusion_backend(server_args)
+    backend = resolve_flashinfer_allreduce_fusion_backend(resolved_view(server_args))
     if backend is None:
         return False
 

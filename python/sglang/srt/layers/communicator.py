@@ -70,7 +70,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -169,7 +169,7 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and batch_size > 0
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
         and not is_dp_attention_enabled()
-        and get_global_server_args().flashinfer_allreduce_fusion_backend is not None
+        and get_flags().flashinfer_allreduce_fusion_backend is not None
         and not is_flashinfer_allreduce_unavailable()
     )
 
@@ -429,7 +429,7 @@ class LayerScatterModes:
 
 
 def enable_moe_dense_fully_dp():
-    return get_global_server_args().moe_dense_tp_size == 1
+    return get_flags().moe_dense_tp_size == 1
 
 
 class LayerCommunicator:

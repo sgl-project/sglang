@@ -3459,7 +3459,7 @@ def require_mlp_tp_gather(server_args: ServerArgs):
         view = resolved_view(server_args)
         assert server_args.dp_size > 1, "dp_size must be greater than 1"
         if (
-            server_args.moe_dense_tp_size is None
+            view.moe_dense_tp_size is None
         ):  # TODO(ch-wan): some MoE models do not have dense layers
             return True
         elif not view.enable_dp_lm_head:
@@ -3467,10 +3467,7 @@ def require_mlp_tp_gather(server_args: ServerArgs):
         elif get_moe_a2a_backend().is_none():
             return True
         else:
-            return (
-                server_args.moe_dense_tp_size
-                > server_args.tp_size // server_args.dp_size
-            )
+            return view.moe_dense_tp_size > server_args.tp_size // server_args.dp_size
     else:
         return False
 
@@ -3486,9 +3483,13 @@ def require_attn_tp_gather(server_args: ServerArgs):
     if server_args.disable_attn_tp_gather:
         return False
 
+    from sglang.srt.arg_groups.overrides import resolved_view
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size is not None:
+    if (
+        not get_moe_a2a_backend().is_none()
+        or resolved_view(server_args).moe_dense_tp_size is not None
+    ):
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:

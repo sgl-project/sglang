@@ -239,7 +239,7 @@ class BaseRunner(ABC):
         with custom_all_reduce.register_graph_buffers).
         """
         mr = self.model_runner
-        if mr.server_args.flashinfer_allreduce_fusion_backend is None:
+        if get_flags().flashinfer_allreduce_fusion_backend is None:
             return
 
         from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE

@@ -33,6 +33,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.common import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
@@ -300,7 +301,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             self._swa_layers_num > 0
         ), "Hybrid SWA model must have at least one SWA layer"
 
-        self._swa_full_tokens_ratio = mr.server_args.swa_full_tokens_ratio
+        self._swa_full_tokens_ratio = get_flags().swa_full_tokens_ratio
 
         # Full layer per-token memory (bytes)
         self._full_per_token = (
@@ -533,7 +534,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
         self.swa_page_size = cfg.window_size
-        self.swa_ratio = mr.server_args.swa_full_tokens_ratio
+        self.swa_ratio = get_flags().swa_full_tokens_ratio
         self.is_speculative = mr.server_args.speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = (
             mr.server_args.max_speculative_num_draft_tokens or 0

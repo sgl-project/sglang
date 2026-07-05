@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
@@ -288,7 +289,7 @@ def initialize_dp_attention(
     )
     enable_dp_attention = server_args.enable_dp_attention
     dp_size = server_args.dp_size
-    moe_dense_tp_size = server_args.moe_dense_tp_size
+    moe_dense_tp_size = get_flags().moe_dense_tp_size
     attn_cp_size = server_args.attn_cp_size
 
     _ENABLE_DP_ATTENTION_FLAG = enable_dp_attention

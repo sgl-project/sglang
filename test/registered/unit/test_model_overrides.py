@@ -491,8 +491,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             config_extra=config_extra,
             enable_hierarchical_cache=True,
         )
-        # dual-apply == legacy writes
-        self.assertEqual(sa.swa_full_tokens_ratio, 1.0)
+        # dual-apply retired: the field stays pristine
+        self.assertEqual(sa.swa_full_tokens_ratio, 0.8)
         self.assertTrue(sa.disable_hybrid_swa_memory)
         flags = self._publish(sa)
         self.assertEqual(flags.swa_full_tokens_ratio, 1.0)
@@ -838,6 +838,32 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             assert_flag_parity(flags, args, {"page_size"})  # no raise
         with self.assertRaises(AssertionError):
             assert_flag_parity(flags, args, {"page_size"})
+
+    def test_initialize_moe_config_reads_resolving_state_prepublish(self):
+        # Scheduler.init_moe_gemm_config runs before the model worker
+        # publishes the flags tier: initialize_moe_config must read the
+        # declaration stash through the view, not the (still default)
+        # process-global flags.
+        import sglang.srt.layers.moe.utils as moe_utils
+        from sglang.srt.runtime_context import reset_context
+
+        sa = self._construct("LlamaForCausalLM", "llama")
+        sa._resolved_overrides.append(
+            ("test.declared", {"speculative_moe_runner_backend": "triton"})
+        )
+        reset_context()  # no publish: global flags stay default
+        try:
+            moe_utils.initialize_moe_config(sa)
+            self.assertEqual(
+                moe_utils.SPECULATIVE_MOE_RUNNER_BACKEND,
+                moe_utils.MoeRunnerBackend("triton"),
+            )
+        finally:
+            reset_context()
+            moe_utils.SPECULATIVE_MOE_RUNNER_BACKEND = None
+            moe_utils.MOE_A2A_BACKEND = None
+            moe_utils.MOE_RUNNER_BACKEND = None
+            moe_utils.SPECULATIVE_MOE_A2A_BACKEND = None
 
     def test_overlap_disable_passes(self):
         from sglang.srt.arg_groups.overrides import (

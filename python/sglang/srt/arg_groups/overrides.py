@@ -1994,6 +1994,18 @@ DUAL_APPLY_RETIRED: frozenset = frozenset(
         # Sampler construction, the deterministic force and the token-oracle
         # gate all read the tier; the hpu/cpu early writers stay imperative.
         "sampling_backend",
+        # Pool configurator reads the tier; the range check in
+        # _handle_cache_compatibility validates the pristine user input.
+        "swa_full_tokens_ratio",
+        # Communicator and capture-time runner read the tier; the
+        # deprecated-alias fill runs pre-declaration on pristine input.
+        "flashinfer_allreduce_fusion_backend",
+        # initialize_moe_config reads the tier for the draft MoE fields.
+        "speculative_moe_runner_backend",
+        "speculative_moe_a2a_backend",
+        # TBO / communicator / dp-attention init / the require_* helpers read
+        # the tier; check_server_args validates the pristine user input.
+        "moe_dense_tp_size",
     }
 )
 
