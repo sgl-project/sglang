@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -258,16 +259,16 @@ class ModelRunnerKVCacheMixin:
         # since it is not compatible for trtllm and other mla attn backend due to the different
         # kv cache layout.
         if (
-            self.server_args.dsa_prefill_backend == "trtllm"
-            or self.server_args.dsa_decode_backend == "trtllm"
+            get_flags().dsa_prefill_backend == "trtllm"
+            or get_flags().dsa_decode_backend == "trtllm"
         ):
             return kv_cache_dim
 
         # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
         # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
         if _is_hip and (
-            self.server_args.dsa_prefill_backend in ("tilelang", "aiter")
-            or self.server_args.dsa_decode_backend in ("tilelang", "aiter")
+            get_flags().dsa_prefill_backend in ("tilelang", "aiter")
+            or get_flags().dsa_decode_backend in ("tilelang", "aiter")
         ):
             return kv_cache_dim
 

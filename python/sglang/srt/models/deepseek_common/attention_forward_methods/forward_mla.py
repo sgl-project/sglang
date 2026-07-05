@@ -64,6 +64,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
@@ -985,8 +986,8 @@ class DeepseekMLAForwardMixin:
         """
         if self.current_attention_backend in ("dsa", "nsa"):
             return (
-                get_global_server_args().dsa_decode_backend == "trtllm"
-                or get_global_server_args().dsa_prefill_backend == "trtllm"
+                get_flags().dsa_decode_backend == "trtllm"
+                or get_flags().dsa_prefill_backend == "trtllm"
             ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
 
         return (
@@ -1008,8 +1009,8 @@ class DeepseekMLAForwardMixin:
             _use_aiter_gfx95
             and self.current_attention_backend in ("dsa", "nsa")
             and (
-                server_args.dsa_decode_backend == "tilelang"
-                or server_args.dsa_prefill_backend == "tilelang"
+                get_flags().dsa_decode_backend == "tilelang"
+                or get_flags().dsa_prefill_backend == "tilelang"
             )
         )
 

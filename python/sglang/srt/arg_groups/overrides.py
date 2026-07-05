@@ -1544,6 +1544,51 @@ def _mla_backend_page_constraints(view: Any) -> dict:
 
 
 @register_post_process
+def _mla_kv_cache_dtype_checks(view: Any) -> dict:
+    """Read-only validation pass in the attention-backend compatibility
+    handler: the TRT-LLM and tokenspeed MLA backends constrain the resolved
+    kv-cache dtype (the field is dual-apply-retired, so the checks must read
+    the view)."""
+    if (
+        view.attention_backend == "trtllm_mla"
+        or view.decode_attention_backend == "trtllm_mla"
+    ):
+        if not is_blackwell_supported():
+            raise ValueError(
+                "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
+            )
+        if view.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "bf16", "auto"]:
+            raise ValueError(
+                "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, fp4_e2m1, bf16, or auto."
+            )
+    if (
+        view.attention_backend == "tokenspeed_mla"
+        or view.decode_attention_backend == "tokenspeed_mla"
+    ):
+        if not is_blackwell_supported():
+            raise ValueError(
+                "tokenspeed_mla backend is only supported on Blackwell GPUs (SM100/SM12x)."
+            )
+        if view.kv_cache_dtype not in ["fp8_e4m3"]:
+            raise ValueError(
+                "tokenspeed_mla backend requires kv-cache-dtype=fp8_e4m3, "
+                f"got {view.kv_cache_dtype}."
+            )
+    return {}
+
+
+@register_post_process
+def _hisparse_validation(view: Any) -> dict:
+    """Read-only validation pass: --enable-hisparse constraints (model class,
+    radix cache, kv dtype, DSA backends) read the resolved values through the
+    view."""
+    from sglang.srt.arg_groups.hisparse_hook import validate_hisparse
+
+    validate_hisparse(view)
+    return {}
+
+
+@register_post_process
 def _cutedsl_prefill_backend_fill(view: Any) -> dict:
     """Slot pass in the attention-backend compatibility handler: CuteDSL MLA
     is decode-only, so validate the combination and default the prefill side
@@ -2006,6 +2051,15 @@ DUAL_APPLY_RETIRED: frozenset = frozenset(
         # TBO / communicator / dp-attention init / the require_* helpers read
         # the tier; check_server_args validates the pristine user input.
         "moe_dense_tp_size",
+        # Attention backends / disagg handshake / configure_kv_cache_dtype /
+        # model init read the tier; the MLA and hisparse validations are
+        # view-reading passes; the kv4/prefill-only gates key on values no
+        # declaration produces.
+        "kv_cache_dtype",
+        # DSA backend init, the kv-cache mixin and the DeepSeek forward
+        # methods read the tier; hisparse validation reads the view.
+        "dsa_prefill_backend",
+        "dsa_decode_backend",
     }
 )
 

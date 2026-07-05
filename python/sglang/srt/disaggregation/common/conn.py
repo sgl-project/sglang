@@ -39,6 +39,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
 )
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -265,11 +266,11 @@ class CommonKVManager(BaseKVManager):
 
         if (
             info.kv_cache_dtype is not None
-            and info.kv_cache_dtype != self.server_args.kv_cache_dtype
+            and info.kv_cache_dtype != get_flags().kv_cache_dtype
         ):
             raise RuntimeError(
                 f"KV cache dtype mismatch: prefill server has kv_cache_dtype={info.kv_cache_dtype}, "
-                f"but decode server has kv_cache_dtype={self.server_args.kv_cache_dtype}. "
+                f"but decode server has kv_cache_dtype={get_flags().kv_cache_dtype}. "
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
@@ -418,7 +419,7 @@ class CommonKVManager(BaseKVManager):
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
-            "kv_cache_dtype": self.server_args.kv_cache_dtype,
+            "kv_cache_dtype": get_flags().kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
         }
 

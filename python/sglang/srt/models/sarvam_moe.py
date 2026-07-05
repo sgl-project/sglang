@@ -464,7 +464,7 @@ class SarvamMoEMLAAttention(nn.Module):
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.kv_cache_dtype = get_global_server_args().kv_cache_dtype
+        self.kv_cache_dtype = get_flags().kv_cache_dtype
 
         self._server_args = None
         self.current_attention_backend = None

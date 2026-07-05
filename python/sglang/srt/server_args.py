@@ -69,7 +69,6 @@ from sglang.srt.utils.common import (
     get_int_env_var,
     get_quantization_config,
     human_readable_int,
-    is_blackwell_supported,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
@@ -4340,33 +4339,12 @@ class ServerArgs:
         # fallback stay below.
         run_post_process_pass(self, _mla_backend_page_constraints)
 
-        if (
-            self.attention_backend == "trtllm_mla"
-            or self.decode_attention_backend == "trtllm_mla"
-        ):
-            if not is_blackwell_supported():
-                raise ValueError(
-                    "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
-                )
+        # The TRT-LLM / tokenspeed MLA kv-dtype validations moved to the
+        # resolution pipeline (arg_groups/overrides.py:
+        # _mla_kv_cache_dtype_checks), invoked here at their legacy slot.
+        from sglang.srt.arg_groups.overrides import _mla_kv_cache_dtype_checks
 
-            if self.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "bf16", "auto"]:
-                raise ValueError(
-                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, fp4_e2m1, bf16, or auto."
-                )
-
-        if (
-            self.attention_backend == "tokenspeed_mla"
-            or self.decode_attention_backend == "tokenspeed_mla"
-        ):
-            if not is_blackwell_supported():
-                raise ValueError(
-                    "tokenspeed_mla backend is only supported on Blackwell GPUs (SM100/SM12x)."
-                )
-            if self.kv_cache_dtype not in ["fp8_e4m3"]:
-                raise ValueError(
-                    "tokenspeed_mla backend requires kv-cache-dtype=fp8_e4m3, "
-                    f"got {self.kv_cache_dtype}."
-                )
+        run_post_process_pass(self, _mla_kv_cache_dtype_checks)
 
         # The CuteDSL MLA validation + prefill fill moved to the resolution
         # pipeline (arg_groups/overrides.py: _cutedsl_prefill_backend_fill),
@@ -6591,9 +6569,14 @@ class ServerArgs:
                 )
 
         # Check hisparse
-        from sglang.srt.arg_groups.hisparse_hook import validate_hisparse
+        # Moved to the resolution pipeline (arg_groups/overrides.py:
+        # _hisparse_validation), invoked here at its legacy slot.
+        from sglang.srt.arg_groups.overrides import (
+            _hisparse_validation,
+            run_post_process_pass,
+        )
 
-        validate_hisparse(self)
+        run_post_process_pass(self, _hisparse_validation)
 
         assert (
             self.schedule_conservativeness >= 0

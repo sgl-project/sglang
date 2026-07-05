@@ -15,7 +15,7 @@ from typing import (
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
@@ -366,10 +366,8 @@ class DeepseekSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        self.dsa_prefill_impl: _DSA_IMPL_T = (
-            model_runner.server_args.dsa_prefill_backend
-        )
-        self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
+        self.dsa_prefill_impl: _DSA_IMPL_T = get_flags().dsa_prefill_backend
+        self.dsa_decode_impl: _DSA_IMPL_T = get_flags().dsa_decode_backend
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
