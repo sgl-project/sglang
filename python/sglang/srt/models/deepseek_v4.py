@@ -1147,11 +1147,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         compress_ratio_override: Optional[int] = None,
+        moe_layer_id: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
+        self.moe_layer_id = layer_id if moe_layer_id is None else moe_layer_id
         self.self_attn = MQALayer(
             config=config,
             layer_id=layer_id,
@@ -1172,7 +1174,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             config=config,
             quant_config=moe_quant_config_override or quant_config,
             prefix=add_prefix("mlp", prefix),
-            layer_id=self.layer_id,
+            layer_id=self.moe_layer_id,
             alt_stream=moe_alt_stream,
             is_nextn=is_nextn,
             is_deepseek_v4=True,

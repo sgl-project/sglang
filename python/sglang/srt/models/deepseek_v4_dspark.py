@@ -121,6 +121,7 @@ class DeepseekV4DSparkModel(nn.Module):
                     prefix=add_prefix(f"layers.{layer_id}", prefix),
                     alt_streams=None,
                     compress_ratio_override=COMPRESS_RATIO_DSPARK_LAYER,
+                    moe_layer_id=config.num_hidden_layers + layer_id,
                 )
                 for layer_id in range(num_dspark_layers)
             ]
