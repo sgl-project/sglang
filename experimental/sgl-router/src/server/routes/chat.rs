@@ -4,11 +4,12 @@
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
+use crate::proxy::sse::StreamEnd;
 use crate::proxy::AbortReason;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    MetricsRegistry, RequestLogContext, StaleRequestOutcome, WorkerModeLabel,
+    MetricsRegistry, RequestLogContext, StaleRequestOutcome, StreamOutcome, WorkerModeLabel,
 };
 
 /// Narrow the pre-drop abort reason on the pre-headers / unary guard from
@@ -403,6 +404,30 @@ async fn chat_completions_inner(
         start,
     };
 
+    // Builds the stream-end hook the SSE pump fires when a 2xx streaming
+    // response finishes, recording `sgl_router_stream_outcome_total` — the
+    // end-of-stream truth that every headers-time counter is blind to. An
+    // in-band error wins over the other classifications: it's the specific
+    // signal (engine said no under a committed 200) even if the transport
+    // also broke or the client bailed afterwards.
+    let make_stream_end_hook = |url: &str| -> Box<dyn FnOnce(StreamEnd) + Send + 'static> {
+        let metrics = Arc::clone(&ctx.metrics);
+        let model = metrics_model.clone();
+        let worker_url = url.to_string();
+        Box::new(move |end: StreamEnd| {
+            let outcome = if end.saw_inband_error {
+                StreamOutcome::InbandError
+            } else if !end.transport_ok {
+                StreamOutcome::UpstreamError
+            } else if end.client_disconnect {
+                StreamOutcome::ClientDisconnect
+            } else {
+                StreamOutcome::Ok
+            };
+            metrics.record_stream_outcome(&worker_url, &model, outcome);
+        })
+    };
+
     // Forward the router-computed tokens to the engine as `input_ids` so it
     // skips re-tokenizing the same prompt — but only when they are
     // engine-equivalent (chat-encoder path) AND the request contains nothing
@@ -601,6 +626,7 @@ async fn chat_completions_inner(
                 // `None` in PD mode (request_id is None): decode abort is out
                 // of scope here — see the request_id comment above.
                 request_id.as_deref(),
+                Some(make_stream_end_hook(&decode_worker.url)),
             );
             tokio::select! {
                 biased;
@@ -656,6 +682,7 @@ async fn chat_completions_inner(
             // finishes streaming. The SSE pump (which owns the guard) fires
             // it; here we only supply the rid the engine knows this request by.
             request_id.as_deref(),
+            Some(make_stream_end_hook(&metrics_worker_url)),
         );
         // Bias `fetch` over the cancellation branch: a successful
         // response that completes in the same poll as the token firing
@@ -1170,15 +1197,16 @@ mod tests {
                 AbortReason::UpstreamTimeout,
             ),
             (
-                ApiError::StaleRequestExpired {
-                    model: "m".into(),
-                },
+                ApiError::StaleRequestExpired { model: "m".into() },
                 AbortReason::StaleRequestExpired,
             ),
             // Every other variant falls through to `TransportError`. Each
             // row is a decision — do not silently accept a default without
             // considering whether a distinct label would be more useful.
-            (ApiError::BadRequest("x".into()), AbortReason::TransportError),
+            (
+                ApiError::BadRequest("x".into()),
+                AbortReason::TransportError,
+            ),
             (
                 ApiError::ModelNotFound("m".into()),
                 AbortReason::TransportError,
@@ -1229,7 +1257,10 @@ mod tests {
                 ApiError::ServiceOverloaded { model: "m".into() },
                 AbortReason::TransportError,
             ),
-            (ApiError::Internal(anyhow!("boom")), AbortReason::TransportError),
+            (
+                ApiError::Internal(anyhow!("boom")),
+                AbortReason::TransportError,
+            ),
         ];
         for (err, expected) in cases.iter() {
             let got = abort_reason_from_api_error(err);

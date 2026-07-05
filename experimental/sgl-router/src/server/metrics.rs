@@ -20,6 +20,7 @@
 //! |---|---|---|
 //! | `sgl_router_requests_total` | Counter | `route`, `method` |
 //! | `sgl_router_worker_requests_total` | Counter | `worker_url`, `model_id`, `mode`, `outcome` |
+//! | `sgl_router_stream_outcome_total` | Counter | `worker_url`, `model_id`, `outcome` |
 //! | `sgl_router_request_duration_seconds` | Histogram | `model_id` |
 //! | `sgl_router_ttft_seconds` | Histogram | `model_id` |
 //! | `sgl_router_responses_total` | Counter | `route`, `method`, `status_code` |
@@ -118,6 +119,34 @@ impl RequestOutcome {
             Self::Success => "success",
             Self::Error => "error",
             Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// True outcome of a 2xx-committed SSE stream, observed at stream END —
+/// unlike the headers-time edge/dispatch counters, which cannot see past the
+/// committed `200 OK`. This is what separates a real completed generation
+/// from an engine that accepted the request and then failed in-band.
+#[derive(Debug, Clone, Copy)]
+pub enum StreamOutcome {
+    /// Stream ended cleanly with no in-band error — a real success.
+    Ok,
+    /// A well-formed `data: {"error"...}` SSE event rode the stream — the
+    /// engine reported failure under an already-committed 200.
+    InbandError,
+    /// The byte stream itself broke (connection reset, truncated body).
+    UpstreamError,
+    /// The client dropped the response body before the stream finished.
+    ClientDisconnect,
+}
+
+impl StreamOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::InbandError => "inband_error",
+            Self::UpstreamError => "upstream_error",
+            Self::ClientDisconnect => "client_disconnect",
         }
     }
 }
@@ -261,6 +290,10 @@ pub struct MetricsRegistry {
     // Per-worker dispatch outcomes. Recorded after a worker is picked, so blind
     // to pre-dispatch drops (see `requests_total`).
     worker_requests_total: Mutex<HashMap<RequestKey, Arc<AtomicU64>>>,
+    // End-of-stream outcomes for 2xx-committed streaming responses. Recorded
+    // by the SSE pump's completion hook, so it sees what the headers-time
+    // counters can't: in-band errors, mid-stream drops, client disconnects.
+    stream_outcome_total: Mutex<HashMap<StreamOutcomeKey, Arc<AtomicU64>>>,
     // Keyed by `model_id` only: a model's pool is either all-plain or all-PD
     // (the registry rejects mixed pools), so the worker `mode` would be a pure
     // function of `model_id` here — a redundant label. Per-worker `mode` lives
@@ -313,6 +346,7 @@ impl Default for MetricsRegistry {
         Self {
             requests_total: Default::default(),
             worker_requests_total: Default::default(),
+            stream_outcome_total: Default::default(),
             request_duration: Default::default(),
             ttft_seconds: Default::default(),
             responses_total: Default::default(),
@@ -335,6 +369,17 @@ struct RequestKey {
     worker_url: String,
     model_id: String,
     mode: &'static str,
+    outcome: &'static str,
+}
+
+/// Labels for `sgl_router_stream_outcome_total`. Per-worker (not just
+/// per-model) because the point of the metric is spotting a SINGLE engine
+/// pod stuck in an accept-then-in-band-reject loop that headers-time
+/// metrics report as healthy.
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct StreamOutcomeKey {
+    worker_url: String,
+    model_id: String,
     outcome: &'static str,
 }
 
@@ -445,6 +490,25 @@ impl MetricsRegistry {
             outcome: outcome.as_str(),
         };
         let mut guard = self.worker_requests_total.lock();
+        let counter = guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_stream_outcome_total{worker_url,model_id,outcome}`.
+    /// Recorded at SSE-pump completion for 2xx-committed streaming responses
+    /// only — the counter's whole purpose is classifying what happened AFTER
+    /// the 200 was already on the wire.
+    pub fn record_stream_outcome(&self, worker_url: &str, model_id: &str, outcome: StreamOutcome) {
+        let key = StreamOutcomeKey {
+            worker_url: worker_url.to_owned(),
+            model_id: model_id.to_owned(),
+            outcome: outcome.as_str(),
+        };
+        let mut guard = self.stream_outcome_total.lock();
         let counter = guard
             .entry(key)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
@@ -744,6 +808,34 @@ impl MetricsRegistry {
                 escape_label(&key.worker_url),
                 escape_label(&key.model_id),
                 key.mode,
+                key.outcome,
+                value,
+            ));
+        }
+        drop(guard);
+
+        // stream_outcome_total — end-of-stream truth for 2xx streaming responses
+        out.push_str(
+            "# HELP sgl_router_stream_outcome_total End-of-stream outcome of 2xx streaming responses: ok, inband_error (engine reported failure via an in-band SSE error event after committing 200), upstream_error (transport broke mid-stream), or client_disconnect.\n",
+        );
+        out.push_str("# TYPE sgl_router_stream_outcome_total counter\n");
+        let guard = self.stream_outcome_total.lock();
+        let mut entries: Vec<(&StreamOutcomeKey, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| {
+            (&a.0.worker_url, &a.0.model_id, a.0.outcome).cmp(&(
+                &b.0.worker_url,
+                &b.0.model_id,
+                b.0.outcome,
+            ))
+        });
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_stream_outcome_total{{worker_url=\"{}\",model_id=\"{}\",outcome=\"{}\"}} {}\n",
+                escape_label(&key.worker_url),
+                escape_label(&key.model_id),
                 key.outcome,
                 value,
             ));
@@ -1138,9 +1230,7 @@ mod tests {
         // scrape window where no aborts fired.
         assert!(out.contains("# TYPE sgl_router_engine_aborts_total counter"));
         assert!(out.contains(r#"sgl_router_engine_aborts_total{reason="stream_client_gone"} 0"#));
-        assert!(
-            out.contains(r#"sgl_router_engine_aborts_total{reason="stale_request_expired"} 0"#)
-        );
+        assert!(out.contains(r#"sgl_router_engine_aborts_total{reason="stale_request_expired"} 0"#));
         // Pool-size series exist (at 0) for all three modes even with no
         // workers, so dashboards have a stable series to graph.
         assert!(out.contains(r#"sgl_router_workers{mode="plain"} 0"#));
@@ -1199,9 +1289,7 @@ mod tests {
         reg.record_engine_abort(AbortReason::StaleRequestExpired);
         let out = reg.render();
         assert!(out.contains(r#"sgl_router_engine_aborts_total{reason="stream_client_gone"} 2"#));
-        assert!(
-            out.contains(r#"sgl_router_engine_aborts_total{reason="stale_request_expired"} 1"#)
-        );
+        assert!(out.contains(r#"sgl_router_engine_aborts_total{reason="stale_request_expired"} 1"#));
         // Every other reason must remain at 0 — a fixed-size counter array
         // with a zero-init default guarantees this, but pin it in a test so
         // a future refactor to a dynamic map doesn't silently lose the
@@ -1427,6 +1515,40 @@ mod tests {
         assert!(
             out.contains(r#"sgl_router_worker_requests_total{worker_url="http://worker-a:30000",model_id="tiny",mode="prefill",outcome="success"} 2"#),
             "render did not include the expected counter line; got:\n{out}",
+        );
+    }
+
+    #[test]
+    fn record_stream_outcome_emits_labelled_counter_lines() {
+        let reg = MetricsRegistry::new();
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::Ok);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::Ok);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::InbandError);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::UpstreamError);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::ClientDisconnect);
+        let out = reg.render();
+        assert!(out.contains(
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="ok"} 2"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="inband_error"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="upstream_error"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="client_disconnect"} 1"#
+        ));
+    }
+
+    #[test]
+    fn stream_outcome_absent_until_recorded() {
+        let reg = MetricsRegistry::new();
+        let out = reg.render();
+        assert!(out.contains("# TYPE sgl_router_stream_outcome_total counter"));
+        assert!(
+            !out.contains("sgl_router_stream_outcome_total{"),
+            "no series until an outcome is recorded; got:\n{out}",
         );
     }
 

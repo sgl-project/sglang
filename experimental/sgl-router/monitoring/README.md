@@ -20,10 +20,12 @@ The dashboard graphs every family the router emits:
 
 | Metric | Type | What it shows |
 |---|---|---|
-| `sgl_router_worker_requests_total` | Counter | Dispatches by `worker_url`, `model_id`, `mode`, `outcome` |
+| `sgl_router_requests_total` | Counter | **Edge intake** — every request received at the router HTTP boundary, by `route`, `method`, counted before worker dispatch (true intake) |
+| `sgl_router_responses_total` | Counter | **Edge responses** — every response returned, by `route`, `method`, `status_code` (incl. early-exit 400/413/503). `requests_total - responses_total` = received-but-not-answered |
+| `sgl_router_worker_requests_total` | Counter | Per-worker **dispatches** by `worker_url`, `model_id`, `mode`, `outcome` (recorded after dispatch; blind to pre-dispatch drops) |
+| `sgl_router_stream_outcome_total` | Counter | **End-of-stream truth** for 2xx streaming responses by `worker_url`, `model_id`, `outcome` (`ok` / `inband_error` / `upstream_error` / `client_disconnect`). Headers-time counters record a committed 200 as success even when the engine later fails in-band; this is where that failure shows up |
 | `sgl_router_request_duration_seconds` | Histogram | End-to-end request latency by `model_id` |
 | `sgl_router_ttft_seconds` | Histogram | Time to first token (streaming) by `model_id` |
-| `sgl_router_responses_total` | Counter | Client-visible HTTP `status_code` |
 | `sgl_router_overlap_blocks` | Histogram | Cache-aware-zmq overlap blocks by `model_id` |
 | `sgl_router_active_load` | Gauge | Per-worker prefill-token / decode-block load |
 | `sgl_router_workers` | Gauge | Registered worker count by `mode` |

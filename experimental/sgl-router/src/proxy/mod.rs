@@ -709,8 +709,18 @@ impl Proxy {
     /// abort: if the SSE pump is torn down before the engine finishes (client
     /// disconnect / non-draining stall), the engine is told to stop generating
     /// this rid. `None` disables it (e.g. callers that don't track a rid).
+    ///
+    /// `on_stream_end` — when `Some`, fires exactly once when the SSE pump
+    /// finishes, with the pump's [`sse::StreamEnd`] verdict. Installed ONLY
+    /// for 2xx upstream responses (a non-2xx error body draining is not a
+    /// stream outcome worth classifying — the edge status metric already
+    /// covers it). Callers use this to record
+    /// `sgl_router_stream_outcome_total`, which is what distinguishes a real
+    /// completed generation from an engine that committed `200 OK` and then
+    /// reported failure via an in-band `data: {"error"...}` event — the two
+    /// are identical to every headers-time metric.
     // Each parameter is a distinct, required input to a single upstream
-    // forward (target, protocol, breaker, path, headers, body, plus the two
+    // forward (target, protocol, breaker, path, headers, body, plus the
     // streaming-lifetime callbacks). Bundling them into a struct purely to
     // satisfy the arg-count heuristic would add indirection without clarity.
     #[allow(clippy::too_many_arguments)]
@@ -725,6 +735,7 @@ impl Proxy {
         stream_guards: Option<Box<dyn Send + 'static>>,
         on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
         abort_rid: Option<&str>,
+        on_stream_end: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>>,
     ) -> Result<Response<Body>, ApiError> {
         if !breaker.allow() {
             return Err(ApiError::BreakerOpen {
@@ -808,7 +819,17 @@ impl Proxy {
         // skip the hook: a busy-but-healthy engine's queue-full responses can't
         // open the breaker, but a half-open probe answered with 503 is still
         // resolved rather than wedged (see `breaker_outcome` / `record_backpressure`).
-        let on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>> =
+        //
+        // The breaker judges TRANSPORT health only: a clean in-band
+        // `data: {"error"...}` event does not trip it (an application-level
+        // verdict — visible via `on_stream_end` / the stream-outcome metric,
+        // deliberately kept out of routing decisions for now).
+        let stream_end_hook = if status.is_success() {
+            on_stream_end
+        } else {
+            None
+        };
+        let on_complete: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>> =
             match breaker_outcome(status) {
                 BreakerOutcome::Failure => {
                     breaker.record_failure();
@@ -820,11 +841,14 @@ impl Proxy {
                 }
                 BreakerOutcome::Success => {
                     let breaker_for_hook = Arc::clone(breaker);
-                    Some(Box::new(move |ok| {
-                        if ok {
+                    Some(Box::new(move |end: sse::StreamEnd| {
+                        if end.transport_ok {
                             breaker_for_hook.record_success();
                         } else {
                             breaker_for_hook.record_failure();
+                        }
+                        if let Some(hook) = stream_end_hook {
+                            hook(end);
                         }
                     }))
                 }
@@ -1175,6 +1199,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("streaming dispatch should reach the worker");
@@ -1384,8 +1409,12 @@ mod tests {
             spawn_hanging_worker_with_abort_capture(Duration::from_secs(10)).await;
         let client = Client::new();
         {
-            let _guard =
-                AbortOnDrop::for_unary(client, format!("{url}/abort_request"), "test-rid-1".into(), None);
+            let _guard = AbortOnDrop::for_unary(
+                client,
+                format!("{url}/abort_request"),
+                "test-rid-1".into(),
+                None,
+            );
         }
         wait_for_abort(&abort_log, Duration::from_secs(2)).await;
         let log = abort_log.lock().unwrap();
@@ -1410,8 +1439,12 @@ mod tests {
             spawn_hanging_worker_with_abort_capture(Duration::from_secs(10)).await;
         let client = Client::new();
         {
-            let mut guard =
-                AbortOnDrop::for_unary(client, format!("{url}/abort_request"), "test-rid-2".into(), None);
+            let mut guard = AbortOnDrop::for_unary(
+                client,
+                format!("{url}/abort_request"),
+                "test-rid-2".into(),
+                None,
+            );
             guard.disarm();
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1628,6 +1661,7 @@ mod tests {
                 None,
                 None,
                 Some("stream-rid-1"),
+                None,
             )
             .await
             .expect("streaming dispatch should reach the worker");
@@ -1676,6 +1710,7 @@ mod tests {
                 None,
                 None,
                 Some("stream-rid-2"),
+                None,
             )
             .await
             .expect("streaming dispatch should reach the worker");
@@ -1709,6 +1744,7 @@ mod tests {
                 None,
                 None,
                 Some("stream-rid-3"),
+                None,
             )
             .await
             .expect("streaming dispatch should reach the worker");
@@ -1761,6 +1797,7 @@ mod tests {
                 None,
                 None,
                 Some("headers-timeout-rid"),
+                None,
             )
             .await;
 
@@ -1860,6 +1897,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("headers arrive well within the timeout");
@@ -1928,6 +1966,7 @@ mod tests {
                     None,
                     None,
                     Some(&format!("breaker-test-rid-{i}")),
+                    None,
                 )
                 .await
                 .unwrap_or_else(|e| {
