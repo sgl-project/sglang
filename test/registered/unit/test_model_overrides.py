@@ -446,7 +446,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")
-        self.assertTrue(sa.enable_tf32_matmul)  # dual-apply == legacy write
+        self.assertFalse(sa.enable_tf32_matmul)  # dual-apply retired: pristine
         self.assertIn(
             ("_minimax_m2_overrides", {"enable_tf32_matmul": True}),
             sa._resolved_overrides,

@@ -42,8 +42,8 @@ class TestDeepseekV4SharedExpertFusionPolicy(unittest.TestCase):
 
         self.assertEqual(model.num_fused_shared_experts, 0)
         self.assertTrue(get_flags().disable_shared_experts_fusion)
-        # dual-apply transition: the published config carries the value too
-        self.assertTrue(server_args.disable_shared_experts_fusion)
+        # dual-apply retired: the published config keeps the pristine input
+        self.assertFalse(server_args.disable_shared_experts_fusion)
 
     def test_enables_shared_fusion_when_enforced(self):
         server_args = self._publish(enforce=True)

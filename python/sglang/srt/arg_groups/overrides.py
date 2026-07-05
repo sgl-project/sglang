@@ -1985,6 +1985,12 @@ DUAL_APPLY_RETIRED: frozenset = frozenset(
         # the dp-attention prerequisite check is a view-reading validation
         # pass.
         "enable_dp_lm_head",
+        # Sole production reader is the ModelRunner tf32 toggle, on the tier.
+        "enable_tf32_matmul",
+        # Model-file readers and the routed-experts capturer read the tier;
+        # the remaining __post_init__ writers are earlier imperative writes,
+        # captured by publish-time materialization.
+        "disable_shared_experts_fusion",
     }
 )
 

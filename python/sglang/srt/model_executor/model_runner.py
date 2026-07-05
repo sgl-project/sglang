@@ -997,7 +997,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # would overwrite the target's process-global one.
             return
 
-        if not self.server_args.disable_shared_experts_fusion and hasattr(
+        if not get_flags().disable_shared_experts_fusion and hasattr(
             self.model, "num_fused_shared_experts"
         ):
             num_fused_shared_experts = self.model.num_fused_shared_experts
