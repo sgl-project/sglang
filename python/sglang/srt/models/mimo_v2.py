@@ -1291,6 +1291,27 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 if name.startswith("audio_encoder."):
                     name = name[len("audio_encoder.") :]
                 name = self.remap_audio_weight_name(name)
+                # AudioEncoderAttention now uses VisionAttention internally:
+                #   self_attn.{q,k,v}_proj -> self_attn.attn.qkv_proj (stacked)
+                #   self_attn.out_proj     -> self_attn.attn.proj
+                name = name.replace("self_attn.out_proj", "self_attn.attn.proj")
+                audio_stacked = False
+                for param_name, weight_name, shard_id in [
+                    ("self_attn.attn.qkv_proj", "self_attn.q_proj", "q"),
+                    ("self_attn.attn.qkv_proj", "self_attn.k_proj", "k"),
+                    ("self_attn.attn.qkv_proj", "self_attn.v_proj", "v"),
+                ]:
+                    if weight_name in name:
+                        name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
+                            break
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(param, loaded_weight, shard_id)
+                        audio_stacked = True
+                        break
+                if audio_stacked:
+                    continue
                 if name not in params_dict:
                     logger.warning(
                         f"Audio param {name} not found in params_dict, skipping"

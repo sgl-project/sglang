@@ -24,18 +24,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda
 
-if is_cuda():
-    from sglang.srt.layers.attention.triton_ops.prefill_attention import (
-        context_attention_fwd as _triton_context_attention_fwd,
-    )
-
-    try:
-        from sgl_kernel.flash_attn import flash_attn_varlen_func
-    except ImportError:
-        flash_attn_varlen_func = None
-else:
-    flash_attn_varlen_func = None
-    _triton_context_attention_fwd = None
+from sglang.srt.layers.attention.vision import VisionAttention
 
 
 logger = logging.getLogger(__name__)
@@ -483,6 +472,22 @@ def get_position_ids(lengths):
 LAYER_NORM = {"LayerNorm": nn.LayerNorm}
 
 
+def _audio_rope_applier(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """RoPE applier for audio encoder attention, compatible with VisionAttention."""
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    x1_q, x2_q = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2 :]
+    x1_k, x2_k = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
+    q_embed = q * cos + torch.cat((-x2_q, x1_q), dim=-1) * sin
+    k_embed = k * cos + torch.cat((-x2_k, x1_k), dim=-1) * sin
+    return q_embed, k_embed
+
+
 class AudioEncoderAttention(nn.Module):
     def __init__(
         self,
@@ -498,10 +503,18 @@ class AudioEncoderAttention(nn.Module):
         self.window_size = window_size
         self.causal = causal
 
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=True)
+        self.attn = VisionAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            projection_size=embed_dim,
+            use_qkv_parallel=True,
+            qkv_bias=True,
+            proj_bias=True,
+            flatten_batch=True,
+            window_size=window_size,
+            customized_position_embedding_applier=_audio_rope_applier,
+            prefix="attn",
+        )
 
     def forward(
         self,
@@ -510,65 +523,12 @@ class AudioEncoderAttention(nn.Module):
         max_seqlen: int,
         rope_position_embeddings=None,
     ):
-        bsz, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states).view(
-            bsz, self.num_heads, self.head_dim
+        return self.attn(
+            hidden_states,
+            cu_seqlens=cu_seqlens,
+            position_embeddings=rope_position_embeddings,
+            max_seqlen=max_seqlen,
         )
-        key_states = self.k_proj(hidden_states).view(bsz, self.num_heads, self.head_dim)
-        value_states = self.v_proj(hidden_states).view(
-            bsz, self.num_heads, self.head_dim
-        )
-
-        if rope_position_embeddings is not None:
-            cos, sin = rope_position_embeddings
-            query_states, key_states = self.apply_rotary_pos_emb(
-                query_states, key_states, cos, sin
-            )
-
-        if flash_attn_varlen_func is not None:
-            attn_output = flash_attn_varlen_func(
-                query_states,
-                key_states,
-                value_states,
-                cu_seqlens,
-                cu_seqlens,
-                max_seqlen,
-                max_seqlen,
-                causal=self.causal,
-                window_size=self.window_size,
-            )
-        else:
-            attn_output = torch.empty_like(query_states)
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            _triton_context_attention_fwd(
-                query_states,
-                key_states,
-                value_states,
-                attn_output,
-                cu_seqlens[:-1],
-                seq_lens,
-                max_seqlen,
-                is_causal=self.causal,
-            )
-
-        attn_output = attn_output.reshape(bsz, self.embed_dim)
-        attn_output = self.out_proj(attn_output)
-        return attn_output
-
-    @staticmethod
-    def _rotate_half(x):
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-
-    @classmethod
-    def apply_rotary_pos_emb(cls, q, k, cos, sin, unsqueeze_dim=1):
-        cos = cos.unsqueeze(unsqueeze_dim)
-        sin = sin.unsqueeze(unsqueeze_dim)
-        q_embed = (q * cos) + (cls._rotate_half(q) * sin)
-        k_embed = (k * cos) + (cls._rotate_half(k) * sin)
-        return q_embed, k_embed
 
 
 class AudioEncoderTransformerLayer(nn.Module):
