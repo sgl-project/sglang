@@ -14,6 +14,12 @@ from torch import nn
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
+from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import (
+    PrefixContext,
+    VLAPrefixCacheKey,
+    VLAPrefixCacheManager,
+)
+from sglang.multimodal_gen.runtime.distributed.vla import get_vla_split_group
 from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
     skip_init_modules,
@@ -21,24 +27,18 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
-from sglang.multimodal_gen.runtime.models.pi05.distributed import get_pi05_split_group
-from sglang.multimodal_gen.runtime.models.pi05.graph_runner import (
-    Pi05DenoiseGraphRunner,
-    Pi05DenoiseShapeBucket,
-)
-from sglang.multimodal_gen.runtime.models.pi05.prefix_cache import (
-    Pi05PrefixCacheKey,
-    Pi05PrefixCacheManager,
-    PrefixContext,
-)
-from sglang.multimodal_gen.runtime.models.pi05.preprocess import (
-    Pi05ObservationBatch,
-    stable_tensor_sha256,
-)
 from sglang.multimodal_gen.runtime.models.pi05.torch_model import Pi05TorchModel
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.vla_denoise_graph import (
+    VLADenoiseGraphRunner,
+    VLADenoiseShapeBucket,
+)
+from sglang.multimodal_gen.runtime.utils.vla_observation import (
+    VLAObservationBatch,
+    stable_tensor_sha256,
+)
 from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
 logger = init_logger(__name__)
@@ -130,7 +130,7 @@ class Pi05PolicyModel(nn.Module):
         if self.runtime_role != "all":
             logger.info("Pi05 split runtime role on rank: %s", self.runtime_role)
         self.action_expert = Pi05ActionExpert(config, self.core_model)
-        self.graph_runner = Pi05DenoiseGraphRunner(
+        self.graph_runner = VLADenoiseGraphRunner(
             enabled=config.enable_action_cuda_graph
         )
 
@@ -333,7 +333,7 @@ class Pi05PolicyModel(nn.Module):
 
     @staticmethod
     def _resolve_runtime_role() -> str:
-        split = get_pi05_split_group()
+        split = get_vla_split_group()
         if split is None:
             return "all"
         if split.is_prefix_rank:
@@ -666,9 +666,9 @@ class Pi05PolicyModel(nn.Module):
 
     def build_prefix_cache_key(
         self,
-        observation: Pi05ObservationBatch,
+        observation: VLAObservationBatch,
         options: dict[str, Any],
-    ) -> Pi05PrefixCacheKey:
+    ) -> VLAPrefixCacheKey:
         state_digest = None
         if observation.state is not None:
             state_digest = stable_tensor_sha256(observation.state)
@@ -677,7 +677,7 @@ class Pi05PolicyModel(nn.Module):
             name: bool(mask.item()) for name, mask in observation.image_masks.items()
         }
         model_revision = os.path.basename(os.path.normpath(self.model_path))
-        return Pi05PrefixCacheManager.make_key(
+        return VLAPrefixCacheManager.make_key(
             model_revision=model_revision,
             tokenizer_id=f"{self.config.paligemma_variant}:{self.config.max_token_len}",
             normalization_config=options.get("normalization_config"),
@@ -692,9 +692,10 @@ class Pi05PolicyModel(nn.Module):
             dtype=str(self.dtype).replace("torch.", ""),
             adapter=options.get("adapter"),
             parallel_layout_version=self.config.parallel_layout_version,
+            cache_namespace="pi05",
         )
 
-    def encode_prefix(self, observation: Pi05ObservationBatch) -> PrefixContext:
+    def encode_prefix(self, observation: VLAObservationBatch) -> PrefixContext:
         camera_order = tuple(observation.metadata.get("camera_order", ()))
         images = [
             observation.images[name].to(self.device, dtype=torch.float32)
@@ -767,7 +768,7 @@ class Pi05PolicyModel(nn.Module):
             use_cuda_graph = False
         if not use_cuda_graph:
             return self.action_expert(prefix_context, x_t, timestep)
-        bucket = Pi05DenoiseShapeBucket(
+        bucket = VLADenoiseShapeBucket(
             batch_size=x_t.shape[0],
             prefix_len=prefix_context.prefix_len,
             action_horizon=x_t.shape[1],
@@ -785,7 +786,7 @@ class Pi05PolicyModel(nn.Module):
 
     def sample_actions(
         self,
-        observation: Pi05ObservationBatch,
+        observation: VLAObservationBatch,
         prefix_context: PrefixContext,
         *,
         noise: torch.Tensor | None,

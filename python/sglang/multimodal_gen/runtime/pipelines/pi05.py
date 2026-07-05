@@ -6,13 +6,12 @@ import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
+from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import VLAPrefixCacheManager
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.models.pi05 import (
-    Pi05ParallelTopology,
-    Pi05PolicyModel,
-    Pi05PrefixCacheManager,
-    Pi05Preprocessor,
+from sglang.multimodal_gen.runtime.distributed.vla_topology import (
+    VLAParallelTopology,
 )
+from sglang.multimodal_gen.runtime.models.pi05 import Pi05PolicyModel
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -21,6 +20,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.p
     Pi05PostprocessStage,
     Pi05PrefixStage,
     Pi05PreprocessStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.pi05_preprocess import (
+    Pi05Preprocessor,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -81,13 +83,13 @@ class Pi05Pipeline(ComposedPipelineBase):
             self.model_path,
             pipeline_config,
         )
-        parallel_topology = Pi05ParallelTopology.from_config(pipeline_config)
+        parallel_topology = VLAParallelTopology.from_config(pipeline_config)
         parallel_topology.validate()
         return {
             "parallel_topology": parallel_topology,
             "policy_model": policy_model,
             "preprocessor": Pi05Preprocessor(pipeline_config),
-            "prefix_cache": Pi05PrefixCacheManager(
+            "prefix_cache": VLAPrefixCacheManager(
                 max_entries=pipeline_config.prefix_cache_max_entries
             ),
         }

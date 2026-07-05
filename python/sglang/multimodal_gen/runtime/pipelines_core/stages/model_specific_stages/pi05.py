@@ -8,25 +8,31 @@ from typing import Any
 import numpy as np
 import torch
 
+from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import (
+    VLAPrefixCacheManager,
+    slice_prefix_context,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.models.pi05 import (
-    Pi05PolicyModel,
-    Pi05PrefixCacheManager,
-    Pi05Preprocessor,
+from sglang.multimodal_gen.runtime.distributed.vla import (
     broadcast_metadata,
     broadcast_optional_tensor,
     broadcast_prefix_context,
     broadcast_timing,
-    collate_pi05_observation_batches,
-    get_pi05_split_group,
-    slice_prefix_context,
+    get_vla_split_group,
 )
+from sglang.multimodal_gen.runtime.models.pi05 import Pi05PolicyModel
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.pi05_preprocess import (
+    Pi05Preprocessor,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.vla_observation import (
+    collate_vla_observation_batches,
+)
 
 
 def _timings(batch: Req) -> dict[str, float]:
@@ -78,7 +84,7 @@ def _effective_prefix_cache_enabled(batch: Req, server_args: ServerArgs) -> bool
 def _grouped_fingerprint(batch: Req, server_args: ServerArgs) -> tuple[Any, ...]:
     if (
         batch.is_warmup
-        or get_pi05_split_group() is not None
+        or get_vla_split_group() is not None
         or _effective_prefix_cache_enabled(batch, server_args)
         or batch.generator is not None
     ):
@@ -132,7 +138,7 @@ class Pi05PrefixStage(PipelineStage):
     def __init__(
         self,
         policy_model: Pi05PolicyModel,
-        prefix_cache: Pi05PrefixCacheManager,
+        prefix_cache: VLAPrefixCacheManager,
     ):
         super().__init__()
         self.policy_model = policy_model
@@ -161,7 +167,7 @@ class Pi05PrefixStage(PipelineStage):
             observations = [
                 batch.extra["pi05_observation_batch"] for batch in group_batches
             ]
-            grouped_observation = collate_pi05_observation_batches(observations)
+            grouped_observation = collate_vla_observation_batches(observations)
             prefix_context = self.policy_model.encode_prefix(grouped_observation)
             prefix_ms = (time.perf_counter() - prefix_start) * 1000
 
@@ -200,7 +206,7 @@ class Pi05PrefixStage(PipelineStage):
             batch.extra["pi05_cache"] = {"hit": False, "warmup": True}
             return batch
 
-        split = get_pi05_split_group()
+        split = get_vla_split_group()
         if split is not None and not split.is_prefix_rank:
             prefix_context = broadcast_prefix_context(
                 None,
@@ -360,7 +366,7 @@ class Pi05ActionDenoisingStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         start = time.perf_counter()
         observation = batch.extra.get("pi05_observation_batch")
-        split = get_pi05_split_group()
+        split = get_vla_split_group()
         should_run_action = split is None or split.is_action_rank
         if batch.is_warmup:
             actions = (

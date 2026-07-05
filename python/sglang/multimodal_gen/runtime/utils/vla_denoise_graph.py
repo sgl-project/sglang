@@ -8,13 +8,16 @@ from typing import Any, Callable
 
 import torch
 
-from sglang.multimodal_gen.runtime.models.pi05.prefix_cache import PrefixContext
+from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import PrefixContext
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    enable_tc_piecewise_cuda_graph,
+)
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class Pi05DenoiseShapeBucket:
+class VLADenoiseShapeBucket:
     batch_size: int
     prefix_len: int
     action_horizon: int
@@ -72,20 +75,19 @@ def _copy_prefix_context_(dst: PrefixContext, src: PrefixContext) -> None:
     dst.cache_key_digest = src.cache_key_digest
 
 
-class Pi05DenoiseGraphRunner:
+class VLADenoiseGraphRunner:
     """Shape-bucketed action denoise runner.
 
-    This class is the Pi0.5-facing seam for reusing SRT's piecewise CUDA graph
-    machinery. It deliberately targets one action-expert denoise step, not VLM
+    This runner deliberately targets one action-expert denoise step, not VLM
     prefix prefill and not token decode.
     """
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
-        self._captured: dict[Pi05DenoiseShapeBucket, Any] = {}
-        self._disabled_buckets: set[Pi05DenoiseShapeBucket] = set()
+        self._captured: dict[VLADenoiseShapeBucket, Any] = {}
+        self._disabled_buckets: set[VLADenoiseShapeBucket] = set()
 
-    def can_replay(self, bucket: Pi05DenoiseShapeBucket) -> bool:
+    def can_replay(self, bucket: VLADenoiseShapeBucket) -> bool:
         return self.enabled and bucket in self._captured
 
     def _sync_context_if_needed(
@@ -101,7 +103,7 @@ class Pi05DenoiseGraphRunner:
 
     def _capture(
         self,
-        bucket: Pi05DenoiseShapeBucket,
+        bucket: VLADenoiseShapeBucket,
         step_fn: Callable[..., Any],
         prefix_context: PrefixContext,
         x_t: torch.Tensor,
@@ -122,7 +124,11 @@ class Pi05DenoiseGraphRunner:
         torch.cuda.current_stream(device=x_t.device).wait_stream(stream)
 
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph), torch.inference_mode():
+        with (
+            enable_tc_piecewise_cuda_graph(),
+            torch.cuda.graph(graph),
+            torch.inference_mode(),
+        ):
             static_output = step_fn(
                 static_prefix_context,
                 static_x_t,
@@ -142,7 +148,7 @@ class Pi05DenoiseGraphRunner:
 
     def capture_or_run(
         self,
-        bucket: Pi05DenoiseShapeBucket,
+        bucket: VLADenoiseShapeBucket,
         step_fn: Callable[..., Any],
         *args,
         **kwargs,
@@ -163,18 +169,20 @@ class Pi05DenoiseGraphRunner:
         try:
             if captured is None:
                 captured = self._capture(bucket, step_fn, prefix_context, x_t, timestep)
-                captured.graph.replay()
+                with enable_tc_piecewise_cuda_graph():
+                    captured.graph.replay()
             else:
                 self._sync_context_if_needed(captured, prefix_context)
                 captured.static_x_t.copy_(x_t)
                 captured.static_timestep.copy_(timestep)
-                captured.graph.replay()
+                with enable_tc_piecewise_cuda_graph():
+                    captured.graph.replay()
             return captured.static_output
         except Exception:
             self._disabled_buckets.add(bucket)
             self._captured.pop(bucket, None)
             logger.warning(
-                "Pi05 denoise CUDA graph disabled for bucket %s",
+                "VLA denoise CUDA graph disabled for bucket %s",
                 bucket,
                 exc_info=True,
             )

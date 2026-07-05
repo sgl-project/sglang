@@ -9,18 +9,18 @@ import torch
 import torch.distributed as dist
 from transformers.cache_utils import DynamicCache
 
+from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import PrefixContext
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_rank
-from sglang.multimodal_gen.runtime.models.pi05.prefix_cache import PrefixContext
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 
 
 @dataclass(frozen=True)
-class Pi05SplitGroup:
+class VLASplitGroup:
     group: GroupCoordinator
     prefix_root: int
     action_root: int
@@ -39,7 +39,7 @@ class Pi05SplitGroup:
         return self.rank == self.action_root
 
 
-def get_pi05_split_group() -> Pi05SplitGroup | None:
+def get_vla_split_group() -> VLASplitGroup | None:
     if not dist.is_available() or not dist.is_initialized():
         return None
     if not model_parallel_is_initialized():
@@ -47,7 +47,7 @@ def get_pi05_split_group() -> Pi05SplitGroup | None:
     group = get_sp_group()
     if group.world_size <= 1:
         return None
-    return Pi05SplitGroup(
+    return VLASplitGroup(
         group=group,
         prefix_root=group.ranks[0],
         action_root=group.ranks[-1],
@@ -74,7 +74,7 @@ def _metadata_for_tensor(tensor: torch.Tensor) -> dict[str, Any]:
     }
 
 
-def _broadcast_object(obj: Any, split: Pi05SplitGroup, src: int) -> Any:
+def _broadcast_object(obj: Any, split: VLASplitGroup, src: int) -> Any:
     payload = [obj] if split.rank == src else []
     return broadcast_pyobj(
         payload,
@@ -87,7 +87,7 @@ def _broadcast_object(obj: Any, split: Pi05SplitGroup, src: int) -> Any:
 def _broadcast_tensor(
     tensor: torch.Tensor | None,
     metadata: dict[str, Any],
-    split: Pi05SplitGroup,
+    split: VLASplitGroup,
     *,
     src: int,
     device: torch.device,
@@ -140,7 +140,7 @@ def _prefix_context_metadata(context: PrefixContext | None) -> dict[str, Any]:
 
 def broadcast_prefix_context(
     context: PrefixContext | None,
-    split: Pi05SplitGroup,
+    split: VLASplitGroup,
     *,
     src: int,
     device: torch.device,
@@ -211,7 +211,7 @@ def broadcast_prefix_context(
 
 def broadcast_optional_tensor(
     tensor: torch.Tensor | None,
-    split: Pi05SplitGroup,
+    split: VLASplitGroup,
     *,
     src: int,
     device: torch.device,
@@ -228,7 +228,7 @@ def broadcast_optional_tensor(
 
 def broadcast_metadata(
     metadata: dict[str, Any] | None,
-    split: Pi05SplitGroup,
+    split: VLASplitGroup,
     *,
     src: int,
 ) -> dict[str, Any]:
@@ -237,7 +237,7 @@ def broadcast_metadata(
 
 def broadcast_timing(
     timings: dict[str, float] | None,
-    split: Pi05SplitGroup,
+    split: VLASplitGroup,
     *,
     src: int,
 ) -> dict[str, float]:

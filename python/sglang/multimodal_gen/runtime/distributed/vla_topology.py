@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-
-from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
+from typing import Any
 
 
 @dataclass(frozen=True)
-class Pi05ParallelTopology:
+class VLAParallelTopology:
     prefix_strategy: str
     action_strategy: str
     layout_version: str
 
     @classmethod
-    def from_config(cls, config: Pi05PipelineConfig) -> Pi05ParallelTopology:
+    def from_config(cls, config: Any) -> VLAParallelTopology:
         return cls(
             prefix_strategy=config.prefix_parallel_strategy,
             action_strategy=config.action_parallel_strategy,
@@ -32,7 +31,7 @@ class Pi05ParallelTopology:
     def validate(self) -> None:
         if self.prefix_strategy == self.action_strategy == "tp":
             raise ValueError(
-                "Pi05 action expert should not share the prefix TP layout. "
+                "VLA action expert should not share the prefix TP layout. "
                 "Use SP, Ulysses, Ring, DP, or monolithic fallback for the "
                 "action path."
             )

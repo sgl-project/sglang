@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 
 
 @dataclass(frozen=True)
-class Pi05PrefixCacheKey:
+class VLAPrefixCacheKey:
     digest: str
     radix_key: RadixKey
     full_prefix_len: int
@@ -25,7 +25,7 @@ class Pi05PrefixCacheKey:
 
 @dataclass
 class PrefixContext:
-    """Request-local prefix state reused by all Pi0.5 denoise steps."""
+    """Request-local prefix state reused by all VLA denoise steps."""
 
     past_key_values: Any
     prefix_pad_masks: torch.Tensor
@@ -65,7 +65,7 @@ def slice_prefix_context(context: PrefixContext, index: int) -> PrefixContext:
 
 
 @dataclass
-class Pi05PrefixCacheLookup:
+class VLAPrefixCacheLookup:
     hit: bool
     context: PrefixContext | None
     match_len: int
@@ -87,12 +87,12 @@ def _digest_to_radix_units(digest: str) -> array:
     return units
 
 
-class Pi05PrefixCacheManager:
-    """Exact full-prefix cache for Pi0.5 PrefixContext objects.
+class VLAPrefixCacheManager:
+    """Exact full-prefix cache for VLA PrefixContext objects.
 
     The underlying SRT RadixCache is used only for key matching semantics here.
-    Pi0.5 does not accept partial-prefix reuse because the visual/language/state
-    prefix is full-attention rather than causal-prefix compatible.
+    Partial-prefix reuse is rejected because VLA prefix blocks can mix visual,
+    language, and state tokens under full attention.
     """
 
     def __init__(self, max_entries: int = 128):
@@ -120,8 +120,10 @@ class Pi05PrefixCacheManager:
         dtype: str,
         adapter: str | None,
         parallel_layout_version: str,
-    ) -> Pi05PrefixCacheKey:
+        cache_namespace: str = "vla",
+    ) -> VLAPrefixCacheKey:
         payload = {
+            "cache_namespace": cache_namespace,
             "model_revision": model_revision,
             "tokenizer_id": tokenizer_id,
             "normalization_config": normalization_config,
@@ -139,18 +141,18 @@ class Pi05PrefixCacheManager:
         }
         digest = hashlib.sha256(_json_dumps_stable(payload).encode("utf-8")).hexdigest()
         namespace = (
-            f"pi05:{model_revision}:{tokenizer_id}:"
+            f"{cache_namespace}:{model_revision}:{tokenizer_id}:"
             f"{parallel_layout_version}:{dtype}:{adapter or 'base'}"
         )
         radix_key = RadixKey(_digest_to_radix_units(digest), extra_key=namespace)
-        return Pi05PrefixCacheKey(
+        return VLAPrefixCacheKey(
             digest=digest,
             radix_key=radix_key,
             full_prefix_len=len(radix_key),
             debug_payload=payload,
         )
 
-    def get(self, key: Pi05PrefixCacheKey) -> Pi05PrefixCacheLookup:
+    def get(self, key: VLAPrefixCacheKey) -> VLAPrefixCacheLookup:
         self.lookups += 1
         match = self.radix.match_prefix(MatchPrefixParams(key=key.radix_key))
         match_len = int(match.device_indices.numel())
@@ -158,7 +160,7 @@ class Pi05PrefixCacheManager:
             partial_rejected = match_len > 0
             if partial_rejected:
                 self.partial_rejections += 1
-            return Pi05PrefixCacheLookup(
+            return VLAPrefixCacheLookup(
                 hit=False,
                 context=None,
                 match_len=match_len,
@@ -168,7 +170,7 @@ class Pi05PrefixCacheManager:
 
         context = self._contexts.get(key.digest)
         if context is None:
-            return Pi05PrefixCacheLookup(
+            return VLAPrefixCacheLookup(
                 hit=False,
                 context=None,
                 match_len=match_len,
@@ -177,14 +179,14 @@ class Pi05PrefixCacheManager:
 
         self.hits += 1
         self._contexts.move_to_end(key.digest)
-        return Pi05PrefixCacheLookup(
+        return VLAPrefixCacheLookup(
             hit=True,
             context=context.pin_for_request(),
             match_len=match_len,
             full_prefix_len=key.full_prefix_len,
         )
 
-    def put(self, key: Pi05PrefixCacheKey, context: PrefixContext) -> None:
+    def put(self, key: VLAPrefixCacheKey, context: PrefixContext) -> None:
         if self.max_entries == 0:
             return
         if len(self._contexts) >= self.max_entries and key.digest not in self._contexts:

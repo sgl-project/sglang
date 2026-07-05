@@ -4,17 +4,17 @@ from array import array
 
 import torch
 
-from sglang.multimodal_gen.runtime.models.pi05.prefix_cache import (
-    Pi05PrefixCacheKey,
-    Pi05PrefixCacheManager,
+from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import (
     PrefixContext,
+    VLAPrefixCacheKey,
+    VLAPrefixCacheManager,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 
 
-def _key(values: list[int], digest: str) -> Pi05PrefixCacheKey:
+def _key(values: list[int], digest: str) -> VLAPrefixCacheKey:
     radix_key = RadixKey(array("q", values), extra_key="pi05-test")
-    return Pi05PrefixCacheKey(
+    return VLAPrefixCacheKey(
         digest=digest,
         radix_key=radix_key,
         full_prefix_len=len(radix_key),
@@ -33,7 +33,7 @@ def _context() -> PrefixContext:
 
 
 def test_pi05_prefix_cache_full_hit_returns_context():
-    manager = Pi05PrefixCacheManager(max_entries=4)
+    manager = VLAPrefixCacheManager(max_entries=4)
     key = _key([1, 2, 3], "a")
     context = _context()
 
@@ -46,7 +46,7 @@ def test_pi05_prefix_cache_full_hit_returns_context():
 
 
 def test_pi05_prefix_cache_rejects_partial_hit():
-    manager = Pi05PrefixCacheManager(max_entries=4)
+    manager = VLAPrefixCacheManager(max_entries=4)
     manager.put(_key([1, 2, 3], "a"), _context())
 
     lookup = manager.get(_key([1, 2, 4], "b"))
@@ -58,7 +58,7 @@ def test_pi05_prefix_cache_rejects_partial_hit():
 
 
 def test_pi05_prefix_cache_different_key_does_not_collide():
-    manager = Pi05PrefixCacheManager(max_entries=4)
+    manager = VLAPrefixCacheManager(max_entries=4)
     manager.put(_key([1, 2, 3], "a"), _context())
 
     lookup = manager.get(_key([9, 9, 9], "b"))
