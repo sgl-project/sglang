@@ -466,15 +466,39 @@ def torch_chunk_gated_delta_rule(
         x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
     ]
 
-    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    # Unpack the batch=1 packed row into a padded [N, num_heads, L, D] batch delimited by
+    # query_start_loc. SGLang prefills N prompts as one concatenated row (query.view(1, T, ...)
+    # in forward_extend), but each sequence must run the delta-rule recurrence independently
+    # from its own ssm_states slot. Right-padding every sequence with zeros to a common multiple
+    # of chunk_size is EXACT, not an approximation: a zero chunk is a recurrent-state no-op
+    # (g=0 => decay exp(0)=1 so the state passes through unchanged; k=v=beta=0 => zero update)
+    # and yields zero output rows that are sliced off. This is the same mechanism the trailing
+    # partial-chunk pad already relies on, extended to whole trailing chunks of shorter sequences.
+    # N==1 degenerates to the previous single-sequence padding, so it stays bit-identical.
+    num_heads = key.shape[1]
+    k_head_dim = key.shape[-1]
     v_head_dim = value.shape[-1]
-    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
-    query = F.pad(query, (0, 0, 0, pad_size))
-    key = F.pad(key, (0, 0, 0, pad_size))
-    value = F.pad(value, (0, 0, 0, pad_size))
-    beta = F.pad(beta, (0, pad_size))
-    g = F.pad(g, (0, pad_size))
-    total_sequence_length = sequence_length + pad_size
+    seq_starts = query_start_loc.tolist()
+    n_seq = len(seq_starts) - 1
+    seq_lens = [seq_starts[i + 1] - seq_starts[i] for i in range(n_seq)]
+    max_chunks = max((sl + chunk_size - 1) // chunk_size for sl in seq_lens)
+    sequence_length = max_chunks * chunk_size
+
+    def _pack_to_batch(x: torch.Tensor) -> torch.Tensor:
+        # [1, num_heads, T, ...] packed row -> [n_seq, num_heads, sequence_length, ...] padded batch
+        out = x.new_zeros(n_seq, num_heads, sequence_length, *x.shape[3:])
+        for i in range(n_seq):
+            s, e = seq_starts[i], seq_starts[i + 1]
+            out[i, :, : e - s] = x[0, :, s:e]
+        return out
+
+    query = _pack_to_batch(query)
+    key = _pack_to_batch(key)
+    value = _pack_to_batch(value)
+    beta = _pack_to_batch(beta)
+    g = _pack_to_batch(g)
+    batch_size = n_seq
+    total_sequence_length = sequence_length  # already a multiple of chunk_size
     scale = 1 / (query.shape[-1] ** 0.5)
     query = query * scale
 
@@ -521,8 +545,10 @@ def torch_chunk_gated_delta_rule(
     # State entering the final (possibly partial) chunk: the recurrent state after folding all
     # COMPLETE 64-chunks. Captured right after the (num_complete_chunks-1)-th fold so it is
     # correct both for aligned prompts (equals last_recurrent_state) and misaligned prompts
-    # (the seed decode replays the trailing partial-chunk tokens from).
-    num_complete_chunks = sequence_length // chunk_size
+    # (the seed decode replays the trailing partial-chunk tokens from). boundary_state is only
+    # consumed by _seed_gdn_replay_cache, which always passes a single sequence.
+    assert not (return_boundary_state and n_seq > 1), "boundary_state only supported for n_seq==1"
+    num_complete_chunks = seq_lens[0] // chunk_size
     boundary_state = last_recurrent_state  # correct when num_complete_chunks == 0
 
     for i in range(0, total_sequence_length // chunk_size):
@@ -539,11 +565,17 @@ def torch_chunk_gated_delta_rule(
         if return_boundary_state and (i + 1) == num_complete_chunks:
             boundary_state = last_recurrent_state
 
-    core_attn_out = core_attn_out.reshape(
-        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
-    )
-    core_attn_out = core_attn_out[:, :, :sequence_length]
-    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    # Repack the padded [n_seq, num_heads, padded_len, v_head_dim] batch back into the
+    # [1, total_tokens, num_heads, v_head_dim] packed row the caller expects. Padded tail rows
+    # (beyond each sequence's real length) are dropped. For n_seq==1 this equals the previous
+    # single-sequence slice, keeping the output bit-identical.
+    core_attn_out = core_attn_out.reshape(n_seq, num_heads, -1, v_head_dim)
+    total_tokens = seq_starts[-1]
+    packed_out = core_attn_out.new_zeros(1, num_heads, total_tokens, v_head_dim)
+    for i in range(n_seq):
+        s, e = seq_starts[i], seq_starts[i + 1]
+        packed_out[0, :, s:e] = core_attn_out[i, :, : e - s]
+    core_attn_out = packed_out.transpose(1, 2).contiguous().to(initial_dtype)
     if return_boundary_state:
         return core_attn_out, last_recurrent_state, boundary_state
     return core_attn_out, last_recurrent_state, None
@@ -1276,21 +1308,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
             if is_batch_invariant_mode_enabled():
                 dim, total_len = mixed_qkv.shape
-                x = mixed_qkv.unsqueeze(0).float().contiguous()
                 weight = layer.conv_weights.unsqueeze(1).float()
                 bias = layer.bias.float() if layer.bias is not None else None
-                conv_out = _causal_depthwise_conv1d(x, weight, bias)
-                # Persist conv state. The fused causal_conv1d_fn kernel (non-BI path
-                # below) updates conv_states in place with the last state_len=width-1
-                # raw pre-conv input columns of each sequence; decode reads these as its
-                # initial conv window. The BI path skips the kernel, so without this the
-                # first width-1 decode tokens see stale conv_states (layer 0 post_conv_qkv
-                # diverged by ~23 at decode token 1, decaying to bit-exact by token 4).
-                # `mixed_qkv` is [dim, total_len] raw pre-conv input (pre-transpose above).
-                state_len = conv_states.shape[-1]
+                # `mixed_qkv` is [dim, total_len] raw pre-conv input (pre-transpose above), a
+                # packed row of N sequences delimited by query_start_loc. The causal conv must NOT
+                # bleed across sequence boundaries: each sequence's first width-1 outputs see only
+                # its own history (zeros for a fresh prefill, or its prefix conv_states window when
+                # resuming), never the previous sequence's tail. Run the conv per sequence with the
+                # right left-context. For a single fresh-prefill sequence (production: N==1 under
+                # disable_radix_cache) this is bit-identical to convolving the whole row.
+                state_len = conv_states.shape[-1]  # width - 1
                 qsl_cpu = query_start_loc.tolist()
                 cidx_cpu = cache_indices.tolist()
                 has_init_cpu = has_initial_states.tolist()
+                conv_out = mixed_qkv.new_zeros(1, dim, total_len, dtype=torch.float32)
                 for i in range(len(qsl_cpu) - 1):
                     c = cidx_cpu[i]
                     if c == PAD_SLOT_ID:
@@ -1299,7 +1330,26 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     seqlen_i = end - start
                     if seqlen_i <= 0:
                         continue
-                    seg = mixed_qkv[:, start:end]  # [dim, seqlen_i] raw pre-conv input
+                    seg = mixed_qkv[:, start:end]  # [dim, seqlen_i] raw pre-conv input (bf16)
+                    seg_f = seg.float()
+                    if has_init_cpu[i]:
+                        # Prepend this sequence's prefix conv window; slice it back off after conv
+                        # so output[t] uses seg's real history. _causal_depthwise_conv1d then
+                        # left-pads state_len zeros, which fall entirely on the prepended context.
+                        ctx = conv_states[c].float()  # [dim, state_len]
+                        x_i = torch.cat([ctx, seg_f], dim=-1).unsqueeze(0).contiguous()
+                        conv_out[:, :, start:end] = _causal_depthwise_conv1d(x_i, weight, bias)[
+                            :, :, state_len:
+                        ]
+                    else:
+                        x_i = seg_f.unsqueeze(0).contiguous()
+                        conv_out[:, :, start:end] = _causal_depthwise_conv1d(x_i, weight, bias)
+                    # Persist conv state. The fused causal_conv1d_fn kernel (non-BI path below)
+                    # updates conv_states in place with the last state_len raw pre-conv input
+                    # columns of each sequence; decode reads these as its initial conv window. The
+                    # BI path skips the kernel, so without this the first width-1 decode tokens see
+                    # stale conv_states (layer 0 post_conv_qkv diverged by ~23 at decode token 1,
+                    # decaying to bit-exact by token 4).
                     if seqlen_i >= state_len:
                         conv_states[c] = seg[:, -state_len:]
                     elif has_init_cpu[i]:
