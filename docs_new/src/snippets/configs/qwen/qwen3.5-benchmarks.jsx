@@ -17,7 +17,7 @@ export const benchmarks = [
     notes: "GSM8K via benchmark/gsm8k/bench_sglang.py (200 questions); MMMU via benchmark/mmmu/bench_sglang.py (91-sample val subset).",
   },
 
-  // MI300X Qwen3.5-4B (BF16, TP=1) — measured on tw023 (8×MI300X).
+  // MI300X Qwen3.5-4B (BF16, TP=1) — measured on 8×MI300X.
   // Server: sglang v0.5.13.post1, --attention-backend triton.
   // Low-latency cell uses EAGLE speculative decoding (built-in head).
   // Workload: random ISL=1024, OSL=1024, --warmup-requests 64.
