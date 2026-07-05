@@ -548,7 +548,10 @@ class DeepseekV2MoE(nn.Module):
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
-        _fusion_disabled = get_global_server_args().disable_shared_experts_fusion
+        _fusion_disabled = (
+            get_global_server_args().disable_shared_experts_fusion
+            or get_moe_runner_backend().is_ifmoe()
+        )
 
         # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
         # mlp.shared_experts → mlp.experts.256 when > 0.
@@ -683,6 +686,11 @@ class DeepseekV2MoE(nn.Module):
                     ),
                 )
             self.topk = TopK(**topk_kwargs)
+
+        self.experts.correction_bias = self.gate.e_score_correction_bias
+        self.experts.local_expert_offset = (
+            self.experts.moe_ep_rank * self.experts.num_local_experts
+        )
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
@@ -2724,6 +2732,15 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         server_args = get_global_server_args()
 
         if server_args.disable_shared_experts_fusion:
+            return
+
+        # IFMOE kernel hard-codes 256 routed experts (TOPK=8); shared-expert
+        # fusion would remap mlp.shared_experts -> mlp.experts.256 in the
+        # weight loader, but the IFMOE per-layer block builds only 256 slots
+        # and a separate self.shared_experts MLP. Without this guard, shared
+        # expert weights are silently dropped (params_dict miss) and the
+        # model produces garbage text.
+        if get_moe_runner_backend().is_ifmoe():
             return
 
         disable_reason = None

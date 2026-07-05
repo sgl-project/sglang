@@ -296,6 +296,20 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
 
 void moe_sum(torch::Tensor& input, torch::Tensor& output);
 
+torch::Tensor ifmoe_kernel(
+    const torch::Tensor& routing_logits,
+    const torch::Tensor& routing_bias,
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& hidden_states_scale,
+    const torch::Tensor& gemm1_weights,
+    const torch::Tensor& gemm1_weights_scale,
+    const torch::Tensor& gemm2_weights,
+    const torch::Tensor& gemm2_weights_scale,
+    int64_t local_expert_offset,
+    double routed_scaling_factor,
+    const torch::Tensor& ext_topk_ids,
+    const torch::Tensor& ext_topk_weights);
+
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
     at::Tensor& bias,
