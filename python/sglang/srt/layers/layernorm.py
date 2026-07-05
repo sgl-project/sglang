@@ -31,7 +31,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -271,7 +271,7 @@ class RMSNorm(MultiPlatformOp):
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
-                or get_global_server_args().rl_on_policy_target == "fsdp"
+                or get_server_args().rl_on_policy_target == "fsdp"
             ):
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
@@ -367,6 +367,22 @@ class RMSNorm(MultiPlatformOp):
             x = x.contiguous().reshape(-1, original_shape[-1])
         elif not x.is_contiguous():
             x = x.contiguous()
+        if is_batch_invariant_mode_enabled():
+            if (
+                residual is not None
+                or self.cast_x_before_out_mul
+                or get_server_args().rl_on_policy_target == "fsdp"
+                or (self._fused_pad_kernel is not None and self.x_pad_to_multiple > 0)
+            ):
+                return self.forward_native(x, residual, post_residual_addition)
+            out = rms_norm_batch_invariant(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )
+            if needs_reshape:
+                out = out.reshape(original_shape)
+            return out
         # Fused (add +) rmsnorm + zero-pad path. Triggered when caller
         # constructed RMSNorm with x_pad_to_multiple > 0. Output last
         # dim is padded up; residual_out stays at original width. Used
@@ -411,6 +427,19 @@ class RMSNorm(MultiPlatformOp):
         # Fallback to native implementation if vllm is not available
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
+
+        if is_batch_invariant_mode_enabled():
+            if (
+                residual is not None
+                or self.cast_x_before_out_mul
+                or get_server_args().rl_on_policy_target == "fsdp"
+            ):
+                return self.forward_native(x, residual, post_residual_addition)
+            return rms_norm_batch_invariant(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )
 
         if not x.is_contiguous():
             # NOTE: Remove this if aiter kernel supports discontinuous input
@@ -530,10 +559,7 @@ class RMSNorm(MultiPlatformOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
-            if (
-                residual is not None
-                or get_global_server_args().rl_on_policy_target == "fsdp"
-            ):
+            if residual is not None or get_server_args().rl_on_policy_target == "fsdp":
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
                 x,
