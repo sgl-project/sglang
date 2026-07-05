@@ -162,7 +162,7 @@ if _HAVE_TRITON:
     def _gdn_step_kernel(
         q_ptr, k_ptr, v_ptr, a_ptr, b_ptr, Alog_ptr, dtb_ptr,  # new token: q/k [B,HK,Dk], v [B,HV,Dv], a/b [B,HV]
         qn_ptr, kn_ptr, kb_ptr, vb_ptr, g_ptr, gcum_ptr, A_ptr, T_ptr,
-        vnew_ptr, S_ptr, out_ptr, i_ptr, inext_ptr,
+        vnew_ptr, S_ptr, out_ptr, i_ptr, inext_ptr, row_ptr,
         scale, HV: tl.constexpr, HK: tl.constexpr, Dk: tl.constexpr, Dv: tl.constexpr,
         CS: tl.constexpr, QR: tl.constexpr,
     ):
@@ -188,9 +188,10 @@ if _HAVE_TRITON:
             tl.dot solve/A/attn matmuls (fixed accumulation order), and the qr/row-selecting tl.sum
             collapses (a single nonzero lane). So nw=8 is safe. QR-tile broadcasts row i so tl.dot M>=16."""
         pid = tl.program_id(0)
-        bt = pid // HV
+        bt = pid // HV  # batch row (indexes the per-step IO tensors q/k/v/a/b/out)
         h = pid % HV
-        i = tl.load(i_ptr + bt)
+        ar = tl.load(row_ptr + bt)  # arena row for this slot (indexes the persistent state buffers)
+        i = tl.load(i_ptr + ar)
         W = i + 1
         rep: tl.constexpr = HV // HK
         hk = h // rep
@@ -199,7 +200,7 @@ if _HAVE_TRITON:
         dv = tl.arange(0, Dv)
         qr = tl.arange(0, QR)
         valid = r < W
-        base = (bt * HV + h) * CS
+        base = (ar * HV + h) * CS
         row_i = r[:, None] == i  # [CS,1] mask selecting row i
         # --- prep row i (shared l2norm reduction, GQA repeat, scale, gating) ---
         q = tl.load(q_ptr + (bt * HK + hk) * Dk + dk).to(tl.float32)
@@ -215,10 +216,10 @@ if _HAVE_TRITON:
         v = tl.load(v_ptr + (bt * HV + h) * Dv + dv).to(tl.float32)
         kb_i = kn_i * beta  # [Dk]
         vb_i = v * beta  # [Dv]
-        tl.store(qn_ptr + ((bt * CS + i) * HV + h) * Dk + dk, qn_i)
-        tl.store(kn_ptr + ((bt * CS + i) * HV + h) * Dk + dk, kn_i)
-        tl.store(kb_ptr + ((bt * CS + i) * HV + h) * Dk + dk, kb_i)
-        tl.store(vb_ptr + ((bt * CS + i) * HV + h) * Dv + dv, vb_i)
+        tl.store(qn_ptr + ((ar * CS + i) * HV + h) * Dk + dk, qn_i)
+        tl.store(kn_ptr + ((ar * CS + i) * HV + h) * Dk + dk, kn_i)
+        tl.store(kb_ptr + ((ar * CS + i) * HV + h) * Dk + dk, kb_i)
+        tl.store(vb_ptr + ((ar * CS + i) * HV + h) * Dv + dv, vb_i)
         tl.store(g_ptr + base + i, g)
         # gcum[i]=gcum[i-1]+g[i]; reload g_r (rounded fp32) to insert the rounding barrier (see note 1).
         g_r = tl.load(g_ptr + base + i)
@@ -231,9 +232,9 @@ if _HAVE_TRITON:
         # same fp32 tile the separate a_row/incr kernels did, keeping the fused step bit-identical to the
         # prior 2-launch path (register overlay drifted ~3e-3 through the attn/v_new matmuls).
         tl.debug_barrier()
-        kn = tl.load(kn_ptr + ((bt * CS + r[:, None]) * HV + h) * Dk + dk[None, :], mask=valid[:, None], other=0.0)
-        kb = tl.load(kb_ptr + ((bt * CS + r[:, None]) * HV + h) * Dk + dk[None, :], mask=valid[:, None], other=0.0)
-        vb = tl.load(vb_ptr + ((bt * CS + r[:, None]) * HV + h) * Dv + dv[None, :], mask=valid[:, None], other=0.0)
+        kn = tl.load(kn_ptr + ((ar * CS + r[:, None]) * HV + h) * Dk + dk[None, :], mask=valid[:, None], other=0.0)
+        kb = tl.load(kb_ptr + ((ar * CS + r[:, None]) * HV + h) * Dk + dk[None, :], mask=valid[:, None], other=0.0)
+        vb = tl.load(vb_ptr + ((ar * CS + r[:, None]) * HV + h) * Dv + dv[None, :], mask=valid[:, None], other=0.0)
         gcum = tl.load(gcum_ptr + base + r, mask=valid, other=0.0)
         # --- A row i = -(kb[i] @ kn^T) * exp(gcum[i]-gcum[j]) for j<i (strictly-lower) ---
         kbr = kb_i[None, :] + qr[:, None] * 0.0  # [QR,Dk] all rows kb[i]
@@ -255,7 +256,7 @@ if _HAVE_TRITON:
         # --- core row i = attn_inter[i] + attn2[i,:] @ v_new, caching v_new[i] and optional Snew ---
         # Reload the just-stored T row i and qn row i from global (after the barrier above) so the core
         # matmuls consume the same fp32 tiles the separate incr kernel did (bit-identical to prior path).
-        S = tl.load(S_ptr + (bt * HV + h) * Dk * Dv + dk[:, None] * Dv + dv[None, :])
+        S = tl.load(S_ptr + (ar * HV + h) * Dk * Dv + dk[:, None] * Dv + dv[None, :])
         Trow = tl.load(T_ptr + (base + i) * CS + r)
         Trow = Trow + tl.where(r == i, 1.0, 0.0)  # + eye row i
         Ttile = tl.where(qr[:, None] == 0, Trow[None, :], 0.0)  # [QR,CS]
@@ -267,7 +268,7 @@ if _HAVE_TRITON:
         vnew_row = tl.sum(tl.where(qr[:, None] == 0, vnew_tile, 0.0), 0)  # [Dv]
         vn_cached = tl.load(vnew_ptr + (base + r[:, None]) * Dv + dv[None, :], mask=(r < i)[:, None], other=0.0)
         vnew_full = tl.where(row_i, vnew_row[None, :], vn_cached)  # [CS,Dv]
-        qn = tl.load(qn_ptr + ((bt * CS + i) * HV + h) * Dk + dk[None, :] + qr[:, None] * 0, mask=(qr[:, None] == 0), other=0.0)
+        qn = tl.load(qn_ptr + ((ar * CS + i) * HV + h) * Dk + dk[None, :] + qr[:, None] * 0, mask=(qr[:, None] == 0), other=0.0)
         ge = tl.where(qr == 0, gi, 0.0)
         dlast = tl.where((i >= r) & valid, libdevice.exp(gi - gcum), 0.0)  # decay[i,:] incl diag
         attn2 = tl.dot(qn, tl.trans(kn), input_precision="ieee") * dlast[None, :]
@@ -276,23 +277,23 @@ if _HAVE_TRITON:
         intra = tl.where(qr[:, None] == 0, tl.dot(attn2, vnew_full, input_precision="ieee"), 0.0)
         core = attn_inter + intra
         core_row = tl.sum(tl.where(qr[:, None] == 0, core, 0.0), 0)
-        tl.store(out_ptr + (bt * HV + h) * Dv + dv, core_row)
+        tl.store(out_ptr + (bt * HV + h) * Dv + dv, core_row)  # out is batch-indexed (bt), not arena
         tl.store(vnew_ptr + (base + i) * Dv + dv, vnew_row)
         # In-kernel width advance + boundary fold (was python-side, blocking cuda-graph capture).
         # On the 64th token fold Snew straight into the boundary S (S already read into registers
         # above, so overwriting S_ptr here is safe) and restart the partial chunk at width 0; else
         # advance to width W. inext_ptr is a separate buffer from i_ptr so this store never races the
-        # in-flight reads of i_ptr this launch (python swaps the two buffers between launches). All HV
-        # programs for this slot write the SAME next width, so the concurrent stores are a benign tie.
+        # in-flight reads of i_ptr this launch (python rolls i_buf<-inext_buf between launches). All
+        # HV programs for this arena row write the SAME next width, so the concurrent stores tie.
         if W == CS:
             glast = tl.sum(tl.where(r == (CS - 1), gcum, 0.0), 0)
             kdec = kn * libdevice.exp(glast - gcum)[:, None]
             upd = tl.where(dk[:, None] >= 0, tl.dot(tl.trans(kdec), vnew_full, input_precision="ieee"), 0.0)
             Snew = S * libdevice.exp(glast) + upd
-            tl.store(S_ptr + (bt * HV + h) * Dk * Dv + dk[:, None] * Dv + dv[None, :], Snew)
-            tl.store(inext_ptr + bt, 0)
+            tl.store(S_ptr + (ar * HV + h) * Dk * Dv + dk[:, None] * Dv + dv[None, :], Snew)
+            tl.store(inext_ptr + ar, 0)
         else:
-            tl.store(inext_ptr + bt, W)
+            tl.store(inext_ptr + ar, W)
 
 
 def _solve_fwd_sub(attn: torch.Tensor) -> torch.Tensor:
@@ -755,14 +756,45 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
-        # Batch-invariant decode chunk-replay cache, keyed by (layer_id, slot). Each entry holds
-        # the recurrent state entering the current partial 64-chunk (boundary) plus the raw
-        # post-conv q/k/v and pre-gating a/b for every token since that boundary. Decode replays
-        # torch_chunk_gated_delta_rule over the growing partial chunk to reproduce Megatron's
-        # full-sequence per-token output bit-for-bit. Populated at prefill (trailing partial
-        # chunk) and advanced each decode step; the 64th token folds a new boundary and clears
-        # the token buffer. Only allocated for active slots (scales with batch, not pool size).
-        self.gdn_replay_cache = {}
+        # Batch-invariant decode chunk-replay slot arena. Replaces the old python dict keyed by
+        # (layer_id, slot) with fixed-size GPU tensors indexed by an arena row, so the decode step
+        # composes with cuda-graph capture (no python-driven per-slot dict lookup / tolist / loop).
+        # Each arena holds, for R rows, the recurrent state entering the current partial 64-chunk
+        # (boundary) plus the cached prep buffers / solved T rows / cached v_new rows for the tokens
+        # since that boundary. Decode replays torch_chunk_gated_delta_rule over the growing partial
+        # chunk to reproduce Megatron's full-sequence per-token output bit-for-bit.
+        #
+        # R = cuda_graph_max_bs + 1 (last row is the PAD dummy). The mamba pool has ~1400 slots, far
+        # too many to preallocate per-slot state for (per-row state is ~HV*C*(4*Dk+2*Dv)+... fp32),
+        # but at most cuda_graph_max_bs slots decode concurrently, so an arena sized by the max
+        # decode batch matches the true worst case. A host slot->row map (rebuilt each step from the
+        # batch's mamba_cache_indices) gathers each batch element to its persistent row. Rows are
+        # reclaimed lazily: a slot absent from a decode batch cannot resume without re-prefilling
+        # (retraction re-extends; disable_radix_cache => no state resume), and _seed overwrites the
+        # row unconditionally, so a reused slot inheriting a stale row is harmless.
+        cg_max_bs = getattr(model_runner.server_args, "cuda_graph_max_bs", None) or 0
+        max_running = getattr(model_runner.server_args, "max_running_requests", None) or 0
+        # Size for the largest decode batch that can actually run (eager can exceed cuda_graph_max_bs
+        # if max_running_requests is larger); assert in decode so an overflow fails loudly.
+        self.gdn_arena_max_bs = max(cg_max_bs, max_running, 1)
+        self.gdn_arena_rows = self.gdn_arena_max_bs + 1  # +1 pad row
+        self.gdn_pad_row = self.gdn_arena_rows - 1
+        self.gdn_arena = {}  # layer_id -> dict of [R, ...] state tensors (lazily allocated)
+        self.gdn_slot_to_row = {}  # slot (int) -> arena row (int), across layers (shared batch)
+        self.gdn_free_rows = list(range(self.gdn_arena_max_bs))  # rows [0, max_bs), pad row excluded
+        # Persistent GPU batch->row map + validity mask (written each step from pinned host memory,
+        # so they are stable-pointer graph inputs). Filled by _gdn_write_row_map once per decode step.
+        dev = model_runner.device
+        self._gdn_row_map = torch.zeros(self.gdn_arena_max_bs, dtype=torch.int32, device=dev)
+        self._gdn_row_map_host = torch.zeros(
+            self.gdn_arena_max_bs, dtype=torch.int32, device="cpu"
+        ).pin_memory()
+        self._gdn_valid = torch.zeros(self.gdn_arena_max_bs, dtype=torch.float32, device=dev)
+        self._gdn_valid_host = torch.zeros(
+            self.gdn_arena_max_bs, dtype=torch.float32, device="cpu"
+        ).pin_memory()
+        self._gdn_cur_row_map = None  # [B] view set per decode step
+        self._gdn_cur_valid = None    # [B] view set per decode step
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -775,54 +807,103 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+        # Build the decode arena batch->row map ONCE per step here (host-side, before the layers
+        # run and before any cuda-graph replay), shared by all GDN layers. Only the batch-invariant
+        # decode path uses the arena; other modes leave the stashed views untouched.
+        if (
+            is_batch_invariant_mode_enabled()
+            and forward_batch.forward_mode.is_decode()
+        ):
+            self._gdn_write_row_map(self.forward_metadata.mamba_cache_indices.tolist())
 
-    def _alloc_gdn_slot_buffers(self, layer, device):
-        """Preallocate the per-(layer,slot) incremental replay state. Replaces the old python
-        lists + per-step torch.stack. Only active slots allocate (scales with batch, not pool)."""
+    def _alloc_gdn_arena(self, layer):
+        """Allocate a layer's [R, ...] decode replay arena (R = cuda_graph_max_bs + 1, last row is
+        the PAD dummy). Persistent fixed-pointer tensors so the decode step can be cuda-graph
+        captured. Indexed by arena row (via the host-maintained slot->row map), not by slot."""
         C = FLA_CHUNK_SIZE
+        R = self.gdn_arena_rows
         HV, Dk, Dv = layer.num_v_heads, layer.head_k_dim, layer.head_v_dim
-        z = lambda *s: torch.zeros(*s, device=device, dtype=torch.float32)
+        dev = self.device
+        z = lambda *s: torch.zeros(R, *s, device=dev, dtype=torch.float32)
         return {
-            "boundary": z(1, HV, Dk, Dv),
+            "boundary": z(HV, Dk, Dv),  # [R,HV,Dk,Dv] recurrent state entering the partial chunk
             "qn": z(C, HV, Dk), "kn": z(C, HV, Dk), "kb": z(C, HV, Dk), "vb": z(C, HV, Dv),
             "g": z(HV, C), "gcum": z(HV, C), "A_row": z(HV, C),
             "T": z(HV, C, C), "vnew": z(HV, C, Dv),
-            "out": z(1, HV, Dv),
-            # GPU-resident width double-buffer: kernel reads i_buf, writes the next width to inext_buf;
-            # python swaps the two references between launches (no GPU sync, no cuda-graph break).
-            "i_buf": torch.zeros(1, device=device, dtype=torch.int32),
-            "inext_buf": torch.zeros(1, device=device, dtype=torch.int32),
+            "out": z(HV, Dv),  # fp32 core scratch, indexed by BATCH row (bt), reused each layer
+            # GPU-resident per-row width double-buffer: kernel reads i_buf[ar], writes next width to
+            # inext_buf[ar]; python rolls i_buf<-inext_buf between launches (in-place, capturable).
+            "i_buf": torch.zeros(R, device=dev, dtype=torch.int32),
+            "inext_buf": torch.zeros(R, device=dev, dtype=torch.int32),
         }
 
-    def _gdn_incr_advance(self, entry, layer, q_tok, k_tok, v_tok, a_tok, b_tok):
-        """Advance one slot's partial chunk by one token (O(1) new rows), reproducing row w-1 of
-        torch_chunk_gated_delta_rule bit-for-bit. Prep the new token, extend gcum, append the A/T
-        row, compute v_new[i] + core[i], and (on the 64th token) fold the boundary. Returns the
-        core row [HV, Dv] fp32. q/k_tok [HK,Dk], v_tok [HV,Dv], a/b_tok [HV], all contiguous."""
+    def _gdn_arena_for(self, layer):
+        arena = self.gdn_arena.get(layer.layer_id)
+        if arena is None:
+            arena = self._alloc_gdn_arena(layer)
+            self.gdn_arena[layer.layer_id] = arena
+        return arena
+
+    def _gdn_get_row(self, slot, active_slots):
+        """Return the arena row for `slot`, assigning one if new. Lazily reclaims a row from a slot
+        absent from `active_slots` when the free list is empty (that slot cannot resume decoding
+        without a re-prefill, which overwrites the row, so inheriting its stale state is harmless)."""
+        r = self.gdn_slot_to_row.get(slot)
+        if r is not None:
+            return r
+        if self.gdn_free_rows:
+            r = self.gdn_free_rows.pop()
+        else:
+            for s, rr in list(self.gdn_slot_to_row.items()):
+                if s not in active_slots:
+                    del self.gdn_slot_to_row[s]
+                    r = rr
+                    break
+            assert r is not None, "GDN arena overflow: no reclaimable row"
+        self.gdn_slot_to_row[slot] = r
+        return r
+
+    def _gdn_write_row_map(self, cidx_cpu):
+        """Build the batch->arena-row map + validity mask for one decode step from the batch's
+        cache_indices (a single host pass per step, shared by all layers -- not per layer). Writes
+        the persistent GPU row-map/valid tensors via pinned copies and stashes the [B] views for the
+        layer hot path. PAD slots map to the pad row and get masked to zero in the output."""
+        B = len(cidx_cpu)
+        assert B <= self.gdn_arena_max_bs, (
+            f"GDN decode batch {B} exceeds arena size {self.gdn_arena_max_bs}"
+        )
+        active = {s for s in cidx_cpu if s != PAD_SLOT_ID}
+        rm_host, va_host = self._gdn_row_map_host, self._gdn_valid_host
+        for j, slot in enumerate(cidx_cpu):
+            if slot == PAD_SLOT_ID:
+                rm_host[j], va_host[j] = self.gdn_pad_row, 0.0
+            else:
+                rm_host[j], va_host[j] = self._gdn_get_row(slot, active), 1.0
+        self._gdn_row_map[:B].copy_(rm_host[:B], non_blocking=True)
+        self._gdn_valid[:B].copy_(va_host[:B], non_blocking=True)
+        self._gdn_cur_row_map = self._gdn_row_map[:B]
+        self._gdn_cur_valid = self._gdn_valid[:B]
+
+    def _gdn_launch_step(self, arena, layer, q_tok, k_tok, v_tok, a_tok, b_tok, row_map, B):
+        """Advance `B` slots by one token in ONE launch over a (B*HV,) grid, indexing the arena via
+        row_map (batch->arena row). Bit-for-bit reproduces row w-1 of torch_chunk_gated_delta_rule
+        per slot (only indexing differs from the old per-slot launch). q/k_tok [B,HK,Dk], v_tok
+        [B,HV,Dv], a/b_tok [B,HV]. Writes fp32 core rows to arena['out'][:B] (batch-indexed)."""
         C = FLA_CHUNK_SIZE
         HV, HK = layer.num_v_heads, layer.num_k_heads
         Dk, Dv = layer.head_k_dim, layer.head_v_dim
         scale = 1.0 / (Dk ** 0.5)
-        # Whole decode step in one launch: prep + gcum append + A row + T-row append + core/v_new +
-        # in-kernel width advance + boundary fold. gcum[i]=gcum[i-1]+g[i] is in-kernel (bit-identical
-        # to the shared serial scan). Width is GPU-resident (i_buf); the kernel writes the next width
-        # to inext_buf and, on the 64th token, folds Snew straight into boundary and restarts at 0.
-        # No python-side GPU->CPU sync, so this composes with cuda-graph capture. Stale T/vnew/g rows
-        # after a fold are never read (all downstream loads mask on r<i / r<W), so no reset needed.
-        _gdn_step_kernel[(HV,)](
+        _gdn_step_kernel[(B * HV,)](
             q_tok, k_tok, v_tok, a_tok, b_tok, layer.A_log, layer.dt_bias,
-            entry["qn"], entry["kn"], entry["kb"], entry["vb"], entry["g"], entry["gcum"],
-            entry["A_row"], entry["T"], entry["vnew"], entry["boundary"], entry["out"],
-            entry["i_buf"], entry["inext_buf"],
+            arena["qn"], arena["kn"], arena["kb"], arena["vb"], arena["g"], arena["gcum"],
+            arena["A_row"], arena["T"], arena["vnew"], arena["boundary"], arena["out"],
+            arena["i_buf"], arena["inext_buf"], row_map,
             scale, HV=HV, HK=HK, Dk=Dk, Dv=Dv, CS=C, QR=16, num_warps=8,
         )
-        # Roll the width forward for the next step: i_buf <- inext_buf. An in-place device copy_
-        # (not a python reference swap) so this is cuda-graph-capturable -- a captured graph bakes
-        # in tensor pointers, so swapping python names would replay with the wrong buffer. The
-        # kernel reads i_buf (read-only) and unconditionally overwrites inext_buf every launch, so
-        # inext_buf's pre-launch content is irrelevant: this is bit-identical to the swap.
-        entry["i_buf"].copy_(entry["inext_buf"])
-        return entry["out"][0]
+        # Roll width forward for the next step: i_buf <- inext_buf (in-place, capturable). Whole-arena
+        # copy is safe: an inactive row already has i_buf == inext_buf (its last active step's roll
+        # left them equal and no launch touched it since), so the copy is idempotent for those rows.
+        arena["i_buf"].copy_(arena["inext_buf"])
 
     def _gdn_chunk_replay_decode(
         self,
@@ -832,14 +913,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         cache_indices: torch.Tensor,
     ) -> torch.Tensor:
-        """Incremental (O(1)-row/step) chunk-replay decode (batch-invariant path).
+        """Incremental (O(1)-row/step) chunk-replay decode (batch-invariant path), one launch/layer.
 
         Reproduces Megatron's full-sequence torch_chunk_gated_delta_rule output for each decode
-        token bit-for-bit. Each active slot keeps a preallocated partial-chunk cache (boundary
-        state + cached prep buffers + solved T rows + cached v_new rows). A step appends one token:
-        only row w-1 of A/T/v_new is new (leading blocks are stable across steps), so the per-step
-        work is O(w) rows for the A-row/append reductions and O(1) matmul rows, not the full O(w^2)
-        chunk recompute. On the 64th token a fresh boundary is folded and the state reset.
+        token bit-for-bit. Each active slot owns a persistent arena row (boundary state + cached prep
+        buffers + solved T rows + cached v_new rows). A step appends one token: only row w-1 of
+        A/T/v_new is new (leading blocks are stable across steps), so per-step work is O(w) rows for
+        the A-row/append reductions and O(1) matmul rows, not the full O(w^2) chunk recompute. On the
+        64th token the kernel folds a fresh boundary. All B slots advance in a single (B*HV,) launch
+        indexed through the row map -- no python per-slot loop, dict lookup, or cache_indices.tolist
+        in the layer hot path (the map is built once per step in _gdn_write_row_map).
 
         mixed_qkv: [B, q_dim+k_dim+v_dim] post-conv, one decode token per row.
         a, b: [B, HV] pre-gating inputs. Returns [1, B, HV, head_v_dim].
@@ -848,30 +931,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         q_flat, k_flat, v_flat = torch.split(
             mixed_qkv, [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
         )
-        q_tok = q_flat.view(B, layer.num_k_heads, layer.head_k_dim)
-        k_tok = k_flat.view(B, layer.num_k_heads, layer.head_k_dim)
-        v_tok = v_flat.view(B, layer.num_v_heads, layer.head_v_dim)
-        cidx_cpu = cache_indices.tolist()
-        outputs = mixed_qkv.new_empty(B, layer.num_v_heads, layer.head_v_dim)
-
-        for j in range(B):
-            slot = cidx_cpu[j]
-            if slot == PAD_SLOT_ID:
-                outputs[j].zero_()
-                continue
-            entry = self.gdn_replay_cache.get((layer.layer_id, slot))
-            if entry is None:
-                # No prefill-seeded partial chunk (aligned prompt or missing): start empty at a
-                # zero-fold boundary. The prefill path seeds this for the common misaligned case.
-                entry = self._alloc_gdn_slot_buffers(layer, mixed_qkv.device)
-                self.gdn_replay_cache[(layer.layer_id, slot)] = entry
-            core = self._gdn_incr_advance(
-                entry, layer,
-                q_tok[j].contiguous(), k_tok[j].contiguous(), v_tok[j].contiguous(),
-                a[j].contiguous(), b[j].contiguous(),
-            )
-            outputs[j] = core.to(outputs.dtype)
-
+        q_tok = q_flat.view(B, layer.num_k_heads, layer.head_k_dim).contiguous()
+        k_tok = k_flat.view(B, layer.num_k_heads, layer.head_k_dim).contiguous()
+        v_tok = v_flat.view(B, layer.num_v_heads, layer.head_v_dim).contiguous()
+        a = a.contiguous()
+        b = b.contiguous()
+        arena = self._gdn_arena_for(layer)
+        row_map, valid = self._gdn_cur_row_map, self._gdn_cur_valid
+        self._gdn_launch_step(arena, layer, q_tok, k_tok, v_tok, a, b, row_map, B)
+        # Cast fp32 core to the io dtype and zero PAD rows via the validity mask (no per-row branch).
+        outputs = (arena["out"][:B] * valid[:, None, None]).to(mixed_qkv.dtype)
         return outputs.unsqueeze(0)
 
     def _seed_gdn_replay_cache(
@@ -904,6 +973,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cidx_cpu = cache_indices.tolist()
         zero_cidx = torch.zeros(1, dtype=torch.long, device=mixed_qkv.device)
         C = FLA_CHUNK_SIZE
+        arena = self._gdn_arena_for(layer)
+        active = {s for s in cidx_cpu if s != PAD_SLOT_ID}
         for i in range(len(qsl_cpu) - 1):
             slot = cidx_cpu[i]
             if slot == PAD_SLOT_ID:
@@ -911,7 +982,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             start, end = qsl_cpu[i], qsl_cpu[i + 1]
             seqlen = end - start
             if seqlen <= 0:
-                self.gdn_replay_cache.pop((layer.layer_id, slot), None)
+                # Empty sequence: release this slot's arena row so it can be reclaimed.
+                r = self.gdn_slot_to_row.pop(slot, None)
+                if r is not None:
+                    self.gdn_free_rows.append(r)
                 continue
             comp = (seqlen // C) * C  # tokens in complete chunks
             # Boundary state = state entering the trailing partial chunk. Fold the complete-chunk
@@ -948,20 +1022,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     1, layer.num_v_heads, layer.head_k_dim, layer.head_v_dim,
                     device=mixed_qkv.device, dtype=torch.float32,
                 )
-            # Preallocate the slot's incremental state, seed the boundary, then advance the trailing
-            # partial-chunk tokens through the SAME per-token step decode uses. This builds the
-            # cached prep buffers + solved T rows + cached v_new rows so decode token 0 (the next
-            # advance) reproduces Megatron's row at position seqlen. seqlen % 64 < 64 so no commit
-            # fires during seeding.
-            entry = self._alloc_gdn_slot_buffers(layer, mixed_qkv.device)
-            entry["boundary"].copy_(boundary)
+            # Assign this slot an arena row, seed its boundary + reset its width, then advance the
+            # trailing partial-chunk tokens through the SAME per-token step decode uses. This builds
+            # the cached prep buffers + solved T rows + cached v_new rows so decode token 0 (the next
+            # advance) reproduces Megatron's row at position seqlen. seqlen % 64 < 64 so no fold fires
+            # during seeding. Runs eager during prefill so a per-slot single-row launch is fine.
+            ar = self._gdn_get_row(slot, active)
+            arena["boundary"][ar].copy_(boundary[0])
+            arena["i_buf"][ar].zero_()
+            arena["inext_buf"][ar].zero_()
+            row_map = torch.tensor([ar], dtype=torch.int32, device=mixed_qkv.device)
             for t in range(start + comp, end):
-                self._gdn_incr_advance(
-                    entry, layer,
-                    q_all[t].contiguous(), k_all[t].contiguous(), v_all[t].contiguous(),
-                    a[t].contiguous(), b[t].contiguous(),
+                self._gdn_launch_step(
+                    arena, layer,
+                    q_all[t : t + 1].contiguous(), k_all[t : t + 1].contiguous(),
+                    v_all[t : t + 1].contiguous(), a[t : t + 1].contiguous(),
+                    b[t : t + 1].contiguous(), row_map, 1,
                 )
-            self.gdn_replay_cache[(layer.layer_id, slot)] = entry
 
     def forward_decode(
         self,

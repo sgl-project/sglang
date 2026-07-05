@@ -46,9 +46,22 @@ class TestGDNChunkReplayDecode(unittest.TestCase):
     inference-only so the fused path carries no autograd.
     """
 
-    def _make_backend(self):
+    def _make_backend(self, max_bs=8):
+        # Bypass __init__ (needs a ModelRunner); set up just the arena state the replay path uses.
         be = GDNAttnBackend.__new__(GDNAttnBackend)
-        be.gdn_replay_cache = {}
+        be.device = torch.device("cuda")
+        be.gdn_arena_max_bs = max_bs
+        be.gdn_arena_rows = max_bs + 1
+        be.gdn_pad_row = max_bs
+        be.gdn_arena = {}
+        be.gdn_slot_to_row = {}
+        be.gdn_free_rows = list(range(max_bs))
+        be._gdn_row_map = torch.zeros(max_bs, dtype=torch.int32, device="cuda")
+        be._gdn_row_map_host = torch.zeros(max_bs, dtype=torch.int32, device="cpu").pin_memory()
+        be._gdn_valid = torch.zeros(max_bs, dtype=torch.float32, device="cuda")
+        be._gdn_valid_host = torch.zeros(max_bs, dtype=torch.float32, device="cpu").pin_memory()
+        be._gdn_cur_row_map = None
+        be._gdn_cur_valid = None
         return be
 
     def _full_ref(self, mixed_all, a_all, b_all, layer):
@@ -101,6 +114,7 @@ class TestGDNChunkReplayDecode(unittest.TestCase):
                         None,
                     )
                     for p in range(pl, T):
+                        be._gdn_write_row_map(cidx.tolist())
                         out = be._gdn_chunk_replay_decode(
                             layer, mixed[p : p + 1], a[p : p + 1], b[p : p + 1], cidx
                         )
@@ -154,6 +168,7 @@ class TestGDNChunkReplayDecode(unittest.TestCase):
                 mixed_row = torch.stack([seqs[j][1][pls[j] + t] for j in range(len(pls))], dim=0)
                 a_row = torch.stack([seqs[j][2][pls[j] + t] for j in range(len(pls))], dim=0)
                 b_row = torch.stack([seqs[j][3][pls[j] + t] for j in range(len(pls))], dim=0)
+                be._gdn_write_row_map(cidx.tolist())
                 out = be._gdn_chunk_replay_decode(layer, mixed_row, a_row, b_row, cidx)
                 for j in range(len(pls)):
                     if slots[j] == PAD_SLOT_ID:
@@ -191,15 +206,21 @@ class TestGDNChunkReplayDecode(unittest.TestCase):
                 S = torch.randn(1, HV, K, V, device="cuda", dtype=torch.float32) * 0.2
 
                 be = self._make_backend()
-                entry = be._alloc_gdn_slot_buffers(layer, torch.device("cuda"))
-                entry["boundary"].copy_(S)
+                arena = be._gdn_arena_for(layer)
+                ar = 3  # arbitrary non-zero arena row to exercise row indexing
+                arena["boundary"][ar].copy_(S[0])
+                arena["i_buf"][ar].zero_()
+                arena["inext_buf"][ar].zero_()
+                row_map = torch.tensor([ar], dtype=torch.int32, device="cuda")
                 for w in range(1, C + 1):
                     i = w - 1
-                    core = be._gdn_incr_advance(
-                        entry, layer,
-                        qh[i].contiguous(), kh[i].contiguous(), vh[i].contiguous(),
-                        a[i].contiguous(), b[i].contiguous(),
-                    ).clone()
+                    be._gdn_launch_step(
+                        arena, layer,
+                        qh[i : i + 1].contiguous(), kh[i : i + 1].contiguous(),
+                        vh[i : i + 1].contiguous(), a[i : i + 1].contiguous(),
+                        b[i : i + 1].contiguous(), row_map, 1,
+                    )
+                    core = arena["out"][0].clone()
                     commit = w == C
 
                     # bf16 vs torch_chunk public output at this width
@@ -228,9 +249,9 @@ class TestGDNChunkReplayDecode(unittest.TestCase):
                         msg=f"HV={HV} w={w} incremental replay not FP32-identical to torch_chunk",
                     )
                     if commit:
-                        # the commit folded Snew into boundary
+                        # the commit folded Snew into the arena boundary row
                         self.assertTrue(
-                            torch.equal(entry["boundary"][0], snew_fp32),
+                            torch.equal(arena["boundary"][ar], snew_fp32),
                             msg=f"HV={HV} w={w} incremental boundary Snew not FP32-identical",
                         )
 
@@ -300,15 +321,18 @@ class TestGDNChunkReplayDecode(unittest.TestCase):
             )
             dim = layer.q_dim + layer.k_dim + layer.v_dim
             be = self._make_backend()
+            cidx = torch.tensor([PAD_SLOT_ID], dtype=torch.long, device="cuda")
+            be._gdn_write_row_map(cidx.tolist())
             out = be._gdn_chunk_replay_decode(
                 layer,
                 torch.randn(1, dim, device="cuda", dtype=torch.bfloat16),
                 torch.randn(1, HV, device="cuda", dtype=torch.bfloat16),
                 torch.randn(1, HV, device="cuda", dtype=torch.bfloat16),
-                torch.tensor([PAD_SLOT_ID], dtype=torch.long, device="cuda"),
+                cidx,
             )
             self.assertTrue(bool((out == 0).all()))
-            self.assertEqual(len(be.gdn_replay_cache), 0)
+            # PAD slot claimed no arena row.
+            self.assertEqual(len(be.gdn_slot_to_row), 0)
 
 
 if __name__ == "__main__":
