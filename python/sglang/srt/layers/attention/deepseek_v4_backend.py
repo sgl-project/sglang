@@ -689,9 +689,13 @@ class DeepseekV4AttnBackend(
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor] = None,
         out_cache_loc: Optional[torch.Tensor] = None,
+        num_draft_tokens: Optional[int] = None,
         use_prefill_cuda_graph: bool = False,
         online_c128_state_slot_offset: int = 0,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
+        if num_draft_tokens is None:
+            num_draft_tokens = self.speculative_num_draft_tokens
+        num_draft_tokens = int(num_draft_tokens)
         is_dspark_draft_worker = (
             self.model_runner.spec_algorithm.is_dspark()
             and self.model_runner.is_draft_worker
@@ -705,9 +709,19 @@ class DeepseekV4AttnBackend(
             )
             if not hasattr(self, "extend_seq_lens_buffer"):
                 self.extend_seq_lens_buffer = torch.tensor(
-                    [self.speculative_num_draft_tokens] * 1025, device=self.device
+                    [num_draft_tokens] * 1025, device=self.device
                 )
             extend_seq_lens = self.extend_seq_lens_buffer[: len(seq_lens)]
+            if (
+                extend_seq_lens.numel() > 0
+                and int(extend_seq_lens[0]) != num_draft_tokens
+            ):
+                extend_seq_lens = torch.full(
+                    (len(seq_lens),),
+                    num_draft_tokens,
+                    dtype=extend_seq_lens.dtype,
+                    device=extend_seq_lens.device,
+                )
 
             return DSV4RawVerifyMetadata(
                 req_pool_indices=req_pool_indices,
@@ -736,6 +750,7 @@ class DeepseekV4AttnBackend(
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=out_cache_loc,
+                num_draft_tokens=num_draft_tokens,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
             )
@@ -747,19 +762,23 @@ class DeepseekV4AttnBackend(
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[List[int]] = None,
         out_cache_loc: Optional[torch.Tensor] = None,
+        num_draft_tokens: Optional[int] = None,
         use_prefill_cuda_graph: bool = False,
         online_c128_state_slot_offset: int = 0,
     ) -> DSV4Metadata:
+        if num_draft_tokens is None:
+            num_draft_tokens = self.speculative_num_draft_tokens
+        num_draft_tokens = int(num_draft_tokens)
         is_dspark_draft_worker = (
             self.model_runner.spec_algorithm.is_dspark()
             and self.model_runner.is_draft_worker
         )
         batch_size = len(seq_lens)
-        seq_lens = seq_lens + self.speculative_num_draft_tokens
-        seq_lens_cpu = [x + self.speculative_num_draft_tokens for x in seq_lens_cpu]
-        extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+        seq_lens = seq_lens + num_draft_tokens
+        seq_lens_cpu = [x + num_draft_tokens for x in seq_lens_cpu]
+        extend_seq_lens_cpu = [num_draft_tokens] * batch_size
         extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
-        num_tokens = self.speculative_num_draft_tokens * batch_size
+        num_tokens = num_draft_tokens * batch_size
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
         return self.init_forward_metadata_prefill(
@@ -786,10 +805,14 @@ class DeepseekV4AttnBackend(
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
 
-        bs, num_draft_tokens = len(seq_lens), self.speculative_num_draft_tokens
-        seq_lens = seq_lens + self.speculative_num_draft_tokens
+        bs = len(seq_lens)
         extend_seq_lens = raw_metadata.extend_seq_lens
         assert extend_seq_lens is not None
+        if extend_seq_lens.numel() == 0:
+            num_draft_tokens = self.speculative_num_draft_tokens
+        else:
+            num_draft_tokens = int(extend_seq_lens[0].item())
+        seq_lens = seq_lens + num_draft_tokens
 
         seq_lens_casual, req_pool_indices_repeated = (
             self.expand_extend_with_same_length(
@@ -1158,12 +1181,16 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=out_cache_loc,
             )
         elif logical_forward_mode.is_target_verify():
+            spec_num_draft_tokens = getattr(
+                getattr(forward_batch, "spec_info", None), "draft_token_num", None
+            )
             metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=forward_batch.out_cache_loc,
+                num_draft_tokens=spec_num_draft_tokens,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
             )
         elif logical_forward_mode.is_prefill(include_draft_extend_v2=True):
