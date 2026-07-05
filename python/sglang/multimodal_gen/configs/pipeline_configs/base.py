@@ -222,9 +222,6 @@ class PipelineConfig:
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
     text_encoder_extra_args: list[dict] = field(default_factory=lambda: [{}])
 
-    def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig()
-
     def postprocess_image(self, image):
         return image.last_hidden_state
 
@@ -288,9 +285,6 @@ class PipelineConfig:
         return image.resize(
             (target_width, target_height), PIL.Image.Resampling.LANCZOS
         ), (target_width, target_height)
-
-    def preprocess_realtime_condition_image(self, batch, _vae_image_processor) -> bool:
-        return False
 
     def prepare_calculated_size(self, image):
         return self.calculate_condition_image_size(image, image.width, image.height)
