@@ -25,7 +25,7 @@ _SRT_ROOT = Path(next(iter(sglang.srt.__path__)))
 # Baselines counted over python/sglang/srt/**/*.py, including each function's
 # own def line. Ratchet: decrease-only.
 _RATCHETS = [
-    ("get_global_server_args", r"\bget_global_server_args\s*\(", 346),
+    ("get_global_server_args", r"\bget_global_server_args\s*\(", 278),
     (
         "set_global_server_args_for_*",
         r"\bset_global_server_args_for_(?:scheduler|tokenizer)\s*\(",
