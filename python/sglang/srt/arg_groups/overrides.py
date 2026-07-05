@@ -1991,6 +1991,9 @@ DUAL_APPLY_RETIRED: frozenset = frozenset(
         # the remaining __post_init__ writers are earlier imperative writes,
         # captured by publish-time materialization.
         "disable_shared_experts_fusion",
+        # Sampler construction, the deterministic force and the token-oracle
+        # gate all read the tier; the hpu/cpu early writers stay imperative.
+        "sampling_backend",
     }
 )
 

@@ -15,7 +15,9 @@ def install_token_oracle_from_env(
 ) -> Optional[TokenOracleManager]:
     # Must be called before create_sampler() so the factory is present when the
     # Sampler is first constructed.
-    if server_args.sampling_backend != "token_oracle":
+    from sglang.srt.runtime_context import get_flags
+
+    if get_flags().sampling_backend != "token_oracle":
         return None
 
     oracle = HashOracle(vocab_size=vocab_size)

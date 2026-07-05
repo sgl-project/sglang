@@ -461,8 +461,7 @@ def register_sampler_backend(backend: str, factory: Callable[[], "Sampler"]) -> 
 def create_sampler(backend: Optional[str] = None) -> "Sampler":
     """Create a sampler honoring custom backend registrations."""
 
-    server_args = get_global_server_args()
-    backend = backend or (server_args.sampling_backend if server_args else None)
+    backend = backend or get_flags().sampling_backend
 
     if backend in _CUSTOM_SAMPLER_FACTORIES:
         sampler = _CUSTOM_SAMPLER_FACTORIES[backend]()

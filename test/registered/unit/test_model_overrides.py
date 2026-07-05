@@ -569,7 +569,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         sa = self._construct("LlamaForCausalLM", "llama")
         expected = "flashinfer" if is_flashinfer_available() else "pytorch"
-        self.assertEqual(sa.sampling_backend, expected)
+        self.assertIsNone(sa.sampling_backend)  # dual-apply retired: pristine
         self.assertIn(
             ("_sampling_backend_default", {"sampling_backend": expected}),
             sa._resolved_overrides,
@@ -587,8 +587,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "LlamaForCausalLM", "llama", enable_deterministic_inference=True
         )
         # two pass writers chain: default fill, then the deterministic force —
-        # last writer wins on the flags leaf and parity holds end-to-end.
-        self.assertEqual(sa.sampling_backend, "pytorch")
+        # last writer wins on the flags leaf; the server_args field stays
+        # pristine (dual-apply retired).
+        self.assertIsNone(sa.sampling_backend)
         flags = self._publish(sa)
         self.assertEqual(flags.sampling_backend, "pytorch")
         # the deterministic attention fill declared a compatible backend and
