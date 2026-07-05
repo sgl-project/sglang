@@ -163,6 +163,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.confidence_threshold = float(
             server_args.speculative_dspark_confidence_threshold
         )
+        # vLLM's DSpark inference path does not wire confidence_head into
+        # acceptance yet. Keep computing it for diagnostics, but do not let an
+        # incompatible or uncalibrated confidence head truncate valid matches
+        # unless explicitly requested.
+        self._use_confidence_gate = _env_flag(
+            "SGLANG_DSPARK_USE_CONFIDENCE_GATE", False
+        )
 
         self._block_pos_offsets = torch.arange(
             self.block_size, device=self.device, dtype=torch.int64
@@ -216,13 +223,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             logger.info(
                 "Initialized DSpark draft runner. model=%s, block_size=%s, "
                 "num_dspark_layers=%s, noise_token_id=%s, markov_rank=%s, "
-                "confidence_threshold=%s",
+                "confidence_threshold=%s, use_confidence_gate=%s",
                 self.draft_model.__class__.__name__,
                 self.block_size,
                 self.num_dspark_layers,
                 self.noise_token_id,
                 self.markov_rank,
                 self.confidence_threshold,
+                self._use_confidence_gate,
             )
 
     def _is_tp0(self) -> bool:
@@ -1318,6 +1326,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         return candidates[:output_bs], confidence[:output_bs]
 
     def _confident_prefix(self, confidence: torch.Tensor) -> torch.Tensor:
+        if not self._use_confidence_gate:
+            return torch.full(
+                (confidence.shape[0],),
+                int(confidence.shape[1]),
+                dtype=torch.int32,
+                device=confidence.device,
+            )
         keep = torch.sigmoid(confidence) >= self.confidence_threshold
         return keep.to(torch.int32).cumprod(dim=1).sum(dim=1)
 
