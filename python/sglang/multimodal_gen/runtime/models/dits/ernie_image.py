@@ -37,6 +37,134 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+_ERNIE_FUSED_ADALN_DISABLED = False
+_ERNIE_RESIDUAL_GATE_ADD_DISABLED = False
+
+
+def _ernie_can_use_fused_adaln(
+    x: torch.Tensor,
+    norm: RMSNorm,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+) -> bool:
+    return (
+        x.is_cuda
+        and x.dim() == 3
+        and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and norm.weight is not None
+        and norm.weight.is_cuda
+        and norm.weight.dtype == x.dtype
+        and shift.is_cuda
+        and scale.is_cuda
+        and shift.dtype == x.dtype
+        and scale.dtype == x.dtype
+        and x.shape[-1] % 256 == 0
+        and x.shape[-1] <= 8192
+    )
+
+
+def _ernie_norm_scale_shift(
+    x: torch.Tensor,
+    norm: RMSNorm,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    global _ERNIE_FUSED_ADALN_DISABLED
+
+    if not _ERNIE_FUSED_ADALN_DISABLED and _ernie_can_use_fused_adaln(
+        x, norm, shift, scale
+    ):
+        try:
+            from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+                fused_norm_scale_shift,
+            )
+
+            return fused_norm_scale_shift(
+                x.contiguous(),
+                norm.weight.contiguous(),
+                None,
+                scale.contiguous(),
+                shift.contiguous(),
+                "rms",
+                norm.variance_epsilon,
+            )
+        except Exception as exc:
+            if torch.compiler.is_compiling():
+                raise
+            logger.warning_once(f"Disabling ERNIE fused AdaLN fast path: {exc}")
+            _ERNIE_FUSED_ADALN_DISABLED = True
+
+    return norm(x) * (1 + scale) + shift
+
+
+def _ernie_scale_residual_norm_scale_shift(
+    residual: torch.Tensor,
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    norm: RMSNorm,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    global _ERNIE_FUSED_ADALN_DISABLED
+
+    if not _ERNIE_FUSED_ADALN_DISABLED and _ernie_can_use_fused_adaln(
+        x, norm, shift, scale
+    ):
+        try:
+            from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+                fused_scale_residual_norm_scale_shift,
+            )
+
+            return fused_scale_residual_norm_scale_shift(
+                residual.contiguous(),
+                x.contiguous(),
+                gate.contiguous(),
+                norm.weight.contiguous(),
+                None,
+                scale.contiguous(),
+                shift.contiguous(),
+                "rms",
+                norm.variance_epsilon,
+            )
+        except Exception as exc:
+            if torch.compiler.is_compiling():
+                raise
+            logger.warning_once(
+                f"Disabling ERNIE fused residual AdaLN fast path: {exc}"
+            )
+            _ERNIE_FUSED_ADALN_DISABLED = True
+
+    residual = residual + gate * x
+    return norm(residual) * (1 + scale) + shift, residual
+
+
+def _ernie_residual_gate_add(
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    gate: torch.Tensor,
+) -> torch.Tensor:
+    global _ERNIE_RESIDUAL_GATE_ADD_DISABLED
+
+    if not _ERNIE_RESIDUAL_GATE_ADD_DISABLED:
+        try:
+            from sglang.jit_kernel.diffusion.residual_gate_add import (
+                can_use_residual_gate_add_cuda,
+                residual_gate_add_cuda,
+            )
+
+            if can_use_residual_gate_add_cuda(residual, update, gate):
+                return residual_gate_add_cuda(residual, update, gate)
+        except Exception as exc:
+            if torch.compiler.is_compiling():
+                raise
+            logger.warning_once(f"Disabling ERNIE residual-gate CUDA fast path: {exc}")
+            _ERNIE_RESIDUAL_GATE_ADD_DISABLED = True
+
+    return residual + update * gate
 
 
 def _rope(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
@@ -246,12 +374,18 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
         gate_mlp: torch.Tensor,
     ) -> torch.Tensor:
         residual = x
-        x = self.adaLN_sa_ln(x) * (1 + scale_msa) + shift_msa
-        x = residual + gate_msa * self.self_attention(x, rotary_pos_emb)
+        x = _ernie_norm_scale_shift(x, self.adaLN_sa_ln, shift_msa, scale_msa)
+        attention_output = self.self_attention(x, rotary_pos_emb)
 
-        residual = x
-        x = self.adaLN_mlp_ln(x) * (1 + scale_mlp) + shift_mlp
-        x = residual + gate_mlp * self.mlp(x)
+        x, residual = _ernie_scale_residual_norm_scale_shift(
+            residual,
+            attention_output,
+            gate_msa,
+            self.adaLN_mlp_ln,
+            shift_mlp,
+            scale_mlp,
+        )
+        x = _ernie_residual_gate_add(residual, self.mlp(x), gate_mlp)
 
         return x
 
