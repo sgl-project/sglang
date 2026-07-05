@@ -1649,11 +1649,11 @@ class MHATokenToKVPool(KVCache):
         return self._post_capture_owner.backed_bytes if self._post_capture_owner else 0
 
     def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
         if self._post_capture_owner is not None:
             self._post_capture_owner.close()
             self._post_capture_owner = None
-        del self.k_buffer
-        del self.v_buffer
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
