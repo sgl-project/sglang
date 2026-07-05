@@ -104,6 +104,7 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
 from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
+from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -402,6 +403,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
+    from sglang.srt.entrypoints.http_request_decompression import (
+        RequestDecompressionMiddleware,
+    )
+
+    app.add_middleware(RequestDecompressionMiddleware)
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -781,6 +789,8 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 )
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+    if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
+        apply_header_overrides(obj, request.headers)
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -1507,7 +1517,11 @@ async def parse_function_call_request(
     A native API endpoint to parse function calls from a text.
     """
     # 1) Initialize the parser based on the request body
-    parser = FunctionCallParser(tools=obj.tools, tool_call_parser=obj.tool_call_parser)
+    parser = FunctionCallParser(
+        tools=obj.tools,
+        tool_call_parser=obj.tool_call_parser,
+        tokenizer=get_global_state().tokenizer_manager.tokenizer,
+    )
 
     # 2) Call the non-stream parsing method (non-stream)
     normal_text, calls = parser.parse_non_stream(obj.text)
@@ -1531,7 +1545,11 @@ async def separate_reasoning_request(
     A native API endpoint to separate reasoning from a text.
     """
     # 1) Initialize the parser based on the request body
-    parser = ReasoningParser(model_type=obj.reasoning_parser, request=request)
+    parser = ReasoningParser(
+        model_type=obj.reasoning_parser,
+        request=request,
+        tokenizer=get_global_state().tokenizer_manager.tokenizer,
+    )
 
     # 2) Call the non-stream parsing method (non-stream)
     if obj.return_blocks:

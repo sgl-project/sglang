@@ -37,7 +37,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="7d604afe5fa7efba63c0dce323b95d9daf2db112"
+ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -47,7 +47,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="7d604afe5fa7efba63c0dce323b95d9daf2db112"
+ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
 
 # ===============================
 # Base image 950 and args
@@ -57,7 +57,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="7d604afe5fa7efba63c0dce323b95d9daf2db112"
+ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -67,7 +67,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="7d604afe5fa7efba63c0dce323b95d9daf2db112"
+ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
 
 # ===============================
 # Chosen arch and args
@@ -97,7 +97,7 @@ ARG LLVM_BRANCH="MainOpSelV2"
 ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
 
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="b6a841dc78c707ec655a563453277d969fb8f38d"
+ARG MOONCAKE_COMMIT="01d1eb2a7ec37fd5e20a88573e9b4956e7846e9a"
 
 ARG TILELANG_REPO="https://github.com/tile-ai/tilelang.git"
 ARG TILELANG_COMMIT="a55a82302bf7f3c5af635b5c9146f728185cc900"
@@ -264,7 +264,7 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
      rm go1.22.2.linux-amd64.tar.gz && \
      mkdir -p build && \
      cd build && \
-     cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON && \
+     cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON -DENABLE_MULTI_PROTOCOL=ON -DWITH_STORE=ON -DBUILD_UNIT_TESTS=OFF && \
      make -j "$(nproc)" && make install; \
     fi
 
@@ -621,6 +621,36 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
      && pip install -e . \
      && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
     fi
+
+# -----------------------
+# Hot patch: transformers dynamic_module_utils symlink bug (v5.12.1).
+# _compute_local_source_files_hash calls Path(...).resolve() on custom-code
+# module files, following the HF-cache snapshots/<hash>/x.py -> blobs/<blob>
+# symlink. trust_remote_code models whose custom code uses relative imports
+# (e.g. Kimi-K2.6's kimi_k25_vision_processing.py: `from .media_utils import`)
+# then crash with FileNotFoundError: .../blobs/<name>.py at processor init.
+# Mirrors upstream transformers PR #46618 (merged, not yet released): drop the
+# .resolve() on the module file and its relative-import sources so the snapshot
+# .py names (not the blob targets) are used. Self-skips once transformers ships
+# the fix; fails the build loudly if the pattern is present but unpatched.
+RUN python3 - <<'PY'
+import pathlib
+import transformers.dynamic_module_utils as m
+
+MARKS = ["Path(resolved_module_file).resolve()", "Path(source_file).resolve()"]
+path = pathlib.Path(m.__file__)
+src = path.read_text()
+if not any(mark in src for mark in MARKS):
+    print("transformers dynamic_module_utils already fixed; no patch needed")
+else:
+    patched = (
+        src.replace("Path(resolved_module_file).resolve()", "Path(resolved_module_file)")
+           .replace("Path(source_file).resolve()", "Path(source_file)")
+    )
+    assert patched != src, "FATAL: transformers symlink patch matched nothing"
+    path.write_text(patched)
+    print("patched transformers dynamic_module_utils.py (symlink hash fix)")
+PY
 
 # -----------------------
 # Performance environment variable.

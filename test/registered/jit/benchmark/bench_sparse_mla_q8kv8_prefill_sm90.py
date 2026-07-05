@@ -20,7 +20,9 @@ except ImportError:
     flash_mla_sparse_fwd = None
     HAS_Q16_FLASHMLA = False
 
-register_cuda_ci(est_time=120, suite="base-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(
+    est_time=120, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
 
 IS_CI = is_in_ci()
 DTYPE_FP8 = torch.float8_e4m3fn
@@ -124,16 +126,22 @@ def bench_sparse_mla_q8kv8_prefill_sm90(
                 "sgl_kernel.flash_mla.flash_mla_sparse_fwd is not available"
             )
         q, kv, indices, sm_scale = _make_q16_inputs(s_q, s_kv, h_q, d_qk, topk)
-        fn = lambda: flash_mla_sparse_fwd(q, kv, indices, sm_scale, D_V)
+
+        def fn():
+            return flash_mla_sparse_fwd(q, kv, indices, sm_scale, D_V)
+
     elif provider == "q8_fp8_jit":
         if not _sm90_available():
             raise RuntimeError("Q8KV8 sparse prefill benchmark requires SM90 CUDA")
         q, kv, indices, sm_scale, q_scale, kv_scale = _make_q8_inputs(
             s_q, s_kv, h_q, d_qk, topk
         )
-        fn = lambda: sparse_mla_q8kv8_prefill_fwd(
-            q, kv, indices, sm_scale, q_scale, kv_scale, D_V
-        )
+
+        def fn():
+            return sparse_mla_q8kv8_prefill_fwd(
+                q, kv, indices, sm_scale, q_scale, kv_scale, D_V
+            )
+
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
