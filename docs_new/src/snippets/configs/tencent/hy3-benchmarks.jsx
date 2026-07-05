@@ -1,9 +1,11 @@
 // Hy3 per-cell benchmark numbers, keyed by the same `match` tuple as hy3.jsx cells.
 // See _deployment.jsx for the speed/accuracy schema.
-// Day-0: numbers pending — verified cells have a GSM8K sanity only (§4.1 on the page).
+// H200 low-latency + balanced verified on 8×H200 BF16 (sgl-eval, single-shot, temp=0).
+// high-throughput cell not yet verified — DeepEP num_max=2048 trips the <=1024 assert
+// (deepep.py) and DP-attention=8 hits a HunyuanV3 rotary/attn reshape error.
 export const benchmarks = [
-  { match: { hw: "h200",  variant: "bf16", quant: "bf16", strategy: "low-latency",     nodes: "single" } },
-  { match: { hw: "h200",  variant: "bf16", quant: "bf16", strategy: "balanced",        nodes: "single" } },
+  { match: { hw: "h200",  variant: "bf16", quant: "bf16", strategy: "low-latency",     nodes: "single" }, gsm8k_pct: 95.75 },
+  { match: { hw: "h200",  variant: "bf16", quant: "bf16", strategy: "balanced",        nodes: "single" }, gsm8k_pct: 95.83 },
   { match: { hw: "h200",  variant: "bf16", quant: "bf16", strategy: "high-throughput", nodes: "single" } },
   { match: { hw: "b200",  variant: "bf16", quant: "bf16", strategy: "low-latency",     nodes: "single" } },
   { match: { hw: "b200",  variant: "bf16", quant: "bf16", strategy: "balanced",        nodes: "single" } },

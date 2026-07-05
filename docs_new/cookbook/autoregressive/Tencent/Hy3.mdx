@@ -20,25 +20,22 @@ For all methods and hardware platforms, see the [official SGLang installation gu
 pip install -U uv
 uv venv --python 3.12 && source .venv/bin/activate
 
-# Hunyuan 3 ships in SGLang PR #29920, not yet in a tagged release — install
-# from the PR head (or latest main). The suffix-aware `hunyuan` parser and the
-# HYV3 model code are both in the base runtime:
+# Install from source (main carries the suffix-aware `hunyuan` parser + the
+# HYV3 model code). Once a tagged release picks it up, `uv pip install sglang`
+# is enough.
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
-git fetch origin pull/29920/head && git checkout FETCH_HEAD
 uv pip install -e python
 ```
 
-Run the **Python** output of the command panel below in that environment. Once [PR #29920](https://github.com/sgl-project/sglang/pull/29920) is merged and released, `uv pip install sglang` will pull Hunyuan 3 support directly.
+Run the **Python** output of the command panel below in that environment.
 
 </Tab>
 
 <Tab title="Docker">
 
 ```bash Command
-# PR #29920 (suffix-aware hunyuan parser) is on `main` but not in a tagged
-# release yet — use the rolling dev image. Switch to `:latest` once a release
-# picks it up.
+# The image bundles the HYV3 model code and the suffix-aware `hunyuan` parser.
 docker pull lmsysorg/sglang:dev
 ```
 
@@ -339,7 +336,7 @@ Tool[0] get_weather({"city": "Beijing", "unit": "fahrenheit"})
 - Hardware: 8× NVIDIA H200 (141GB)
 - Model: `tencent/Hy3-BF16-Testing` (BF16)
 - Tensor Parallelism: 8
-- SGLang version: PR #29920 head (`lmsysorg/sglang:dev`)
+- SGLang version: `lmsysorg/sglang:dev` (main)
 
 <Accordion title="GSM8K (sgl-eval, 1-shot)">
 
@@ -351,7 +348,11 @@ sgl-eval run gsm8k \
 ```
 
 ```text Output
-TODO — replace with real GSM8K accuracy after benchmark run on Hy3 (BF16).
+== gsm8k ==
+1319 examples x 1 repeat  |  327s  |  640 tok/s output
+
+* pass@1  =  95.75%   (8× H200, BF16, TP=8, EAGLE MTP 3-1-4, hunyuan parser)
+  stop_rate = 100.0%    error_rate = 0.0%
 ```
 
 </Accordion>

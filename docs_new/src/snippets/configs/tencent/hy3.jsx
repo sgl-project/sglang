@@ -5,8 +5,7 @@
 // (e.g. <tool_calls:TAG>); SGLang's `hunyuan` reasoning/tool-call parsers
 // resolve the real token strings from the vocab at runtime (PR #29920), so the
 // same recipe serves both the preview (suffix-less) and the shipping (suffixed)
-// tokenizer. That PR is on `main` but not yet in a tagged release, so the
-// Docker images below point at `lmsysorg/sglang:dev` rather than `:latest`.
+// tokenizer — no per-model hard-coding.
 //
 // BF16 weights are ~552GB, so single-node serving requires 8 GPUs (H200/B200)
 // or 4 GPUs on B300/GB300 (272GB). H100/A100 80GB need multi-node TP=16+.
@@ -93,9 +92,8 @@ sgl-eval run aime26 \\
   },
 
   dockerImages: {
-    // PR #29920 (hunyuan suffix-aware parser) is on `main` but not in a tagged
-    // release yet — use the rolling dev image. Switch to `:latest` once a
-    // release picks it up.
+    // The dev image bundles the HYV3 model code + the suffix-aware `hunyuan`
+    // parser. Switch to `:latest` once a tagged release picks it up.
     h200:  "lmsysorg/sglang:dev",
     b200:  "lmsysorg/sglang:dev",
     b300:  "lmsysorg/sglang:dev",
@@ -163,8 +161,8 @@ sgl-eval run aime26 \\
     // ----- Card 3: "Parsers" -----
     parsers: {
       items: [
-        { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser hunyuan" },
-        { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser hunyuan" },
+        { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser auto" },
+        { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser auto" },
       ],
     },
 
@@ -248,42 +246,41 @@ sgl-eval run aime26 \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser hunyuan",
-        "--tool-call-parser hunyuan",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 8",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
         "--chunked-prefill-size 8192",
-        "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
       match: { hw: "h200", variant: "bf16", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser hunyuan",
-        "--tool-call-parser hunyuan",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 8",
         "--chunked-prefill-size 32768",
-        "--mem-fraction-static 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
       match: { hw: "h200", variant: "bf16", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=2048"],
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser hunyuan",
-        "--tool-call-parser hunyuan",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
@@ -302,8 +299,8 @@ sgl-eval run aime26 \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser hunyuan",
-        "--tool-call-parser hunyuan",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 8",
         "--attention-backend trtllm_mha",
         "--speculative-algorithm EAGLE",
@@ -311,7 +308,6 @@ sgl-eval run aime26 \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
         "--chunked-prefill-size 8192",
-        "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -322,24 +318,23 @@ sgl-eval run aime26 \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser hunyuan",
-        "--tool-call-parser hunyuan",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 8",
         "--attention-backend trtllm_mha",
         "--chunked-prefill-size 32768",
-        "--mem-fraction-static 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
       match: { hw: "b200", variant: "bf16", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=2048"],
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser hunyuan",
-        "--tool-call-parser hunyuan",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
@@ -359,8 +354,8 @@ sgl-eval run aime26 \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser hunyuan",
-        "--tool-call-parser hunyuan",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 4",
         "--attention-backend trtllm_mha",
         "--speculative-algorithm EAGLE",
@@ -368,7 +363,6 @@ sgl-eval run aime26 \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
         "--chunked-prefill-size 8192",
-        "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -379,12 +373,11 @@ sgl-eval run aime26 \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser hunyuan",
-        "--tool-call-parser hunyuan",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 4",
         "--attention-backend trtllm_mha",
         "--chunked-prefill-size 32768",
-        "--mem-fraction-static 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -395,8 +388,8 @@ sgl-eval run aime26 \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser hunyuan",
-        "--tool-call-parser hunyuan",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 4",
         "--dp 4",
         "--enable-dp-attention",
@@ -416,8 +409,8 @@ sgl-eval run aime26 \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser hunyuan",
-        "--tool-call-parser hunyuan",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 4",
         "--attention-backend trtllm_mha",
         "--speculative-algorithm EAGLE",
@@ -425,7 +418,6 @@ sgl-eval run aime26 \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
         "--chunked-prefill-size 8192",
-        "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -436,12 +428,11 @@ sgl-eval run aime26 \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser hunyuan",
-        "--tool-call-parser hunyuan",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 4",
         "--attention-backend trtllm_mha",
         "--chunked-prefill-size 32768",
-        "--mem-fraction-static 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -452,8 +443,8 @@ sgl-eval run aime26 \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser hunyuan",
-        "--tool-call-parser hunyuan",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 4",
         "--dp 4",
         "--enable-dp-attention",
@@ -473,8 +464,8 @@ sgl-eval run aime26 \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser hunyuan",
-        "--tool-call-parser hunyuan",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 4",
         "--attention-backend trtllm_mha",
         "--speculative-algorithm EAGLE",
@@ -482,7 +473,6 @@ sgl-eval run aime26 \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
         "--chunked-prefill-size 8192",
-        "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -493,12 +483,11 @@ sgl-eval run aime26 \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser hunyuan",
-        "--tool-call-parser hunyuan",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 4",
         "--attention-backend trtllm_mha",
         "--chunked-prefill-size 32768",
-        "--mem-fraction-static 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -509,8 +498,8 @@ sgl-eval run aime26 \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser hunyuan",
-        "--tool-call-parser hunyuan",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 4",
         "--dp 4",
         "--enable-dp-attention",
