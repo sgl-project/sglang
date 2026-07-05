@@ -3658,6 +3658,7 @@ class ServerArgs:
 
         if model_arch in [
             "DeepseekV3ForCausalLM",
+            "GFusionModelLM",
             "DeepseekV32ForCausalLM",
             "KimiK25ForConditionalGeneration",
             "MistralLarge3ForCausalLM",
@@ -3846,7 +3847,10 @@ class ServerArgs:
                     # models that share the same architecture class (e.g.
                     # Moonlight-16B-A3B) are purely BF16.  Check the actual
                     # safetensors header instead of assuming FP8 by arch name.
-                    if quant_method is None and model_arch in ["DeepseekV3ForCausalLM"]:
+                    if quant_method is None and model_arch in [
+                        "DeepseekV3ForCausalLM",
+                        "GFusionModelLM",
+                    ]:
                         if has_fp8_weights_in_checkpoint(self.model_path):
                             self.quantization = "fp8"
                             logger.info(
@@ -4450,6 +4454,7 @@ class ServerArgs:
             and model_arch
             in [
                 "DeepseekV3ForCausalLM",
+                "GFusionModelLM",
                 "DeepseekV32ForCausalLM",
                 "GptOssForCausalLM",
                 "GlmMoeDsaForCausalLM",
@@ -6239,6 +6244,7 @@ class ServerArgs:
                     is_deepseek_model = model_arch in [
                         "DeepseekV2ForCausalLM",
                         "DeepseekV3ForCausalLM",
+                        "GFusionModelLM",
                         "DeepseekV32ForCausalLM",
                         "MistralLarge3ForCausalLM",
                         "PixtralForConditionalGeneration",
@@ -6339,6 +6345,11 @@ class ServerArgs:
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
+        if self.speculative_algorithm is not None:
+            raise ValueError(
+                "Diffusion LLM inference does not support speculative decoding. "
+                "--dllm-algorithm cannot be used together with --speculative-algorithm."
+            )
         # On AMD/HIP, disable cuda graph for DLLM and use triton backend
         if is_hip():
             if (
@@ -6362,11 +6373,29 @@ class ServerArgs:
                 )
                 self.attention_backend = "ascend"
         elif self.cuda_graph_config.decode.backend != Backend.DISABLED:
-            if self.attention_backend != "flashinfer":
+            if self.attention_backend not in ["flashinfer", "fa3", "triton"]:
                 logger.warning(
                     "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
                 )
                 self.attention_backend = "flashinfer"
+
+        # FlashAttention3 (fa3) supports dLLM only with page_size=1 and does not
+        # use the block-aligned dLLM radix cache; force page_size=1 and disable
+        # radix cache before the radix-cache handling below.
+        if self.attention_backend == "fa3":
+            if self.page_size != 1:
+                logger.warning(
+                    "FlashAttention3 only supports page_size=1 for diffusion LLM "
+                    f"inference currently. Changing page_size from {self.page_size} to 1."
+                )
+                self.page_size = 1
+            if not self.disable_radix_cache:
+                logger.warning(
+                    "Radix cache is disabled for diffusion LLM inference on the fa3 "
+                    "attention backend (fa3 requires page_size=1)."
+                )
+                self.disable_radix_cache = True
+
         if not self.disable_overlap_schedule:
             logger.warning(
                 "Overlap schedule is disabled because of using diffusion LLM inference"

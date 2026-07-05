@@ -113,6 +113,11 @@ def handle_attention_flashinfer(attn, forward_batch):
 
 
 def handle_attention_fa3(attn, forward_batch):
+    # dLLM decoding runs bidirectional attention over each block; use absorbed
+    # MLA so the fa3 dLLM-extend metadata (per-block cu_seqlens) is honored
+    # instead of the causal MHA chunked-prefix path.
+    if forward_batch.forward_mode.is_dllm_extend():
+        return _dispatch_mla_subtype(attn, forward_batch)
     # when deterministic inference is enabled, use MLA
     if get_global_server_args().enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
@@ -179,6 +184,12 @@ def handle_attention_dsa(attn, forward_batch):
 
 
 def handle_attention_triton(attn, forward_batch):
+    # dLLM decodes a fixed-size bidirectional block via absorbed MLA. Route it
+    # explicitly before the extend/prefix checks below, which read
+    # extend_prefix_lens_cpu (None during dLLM cuda-graph capture).
+    if forward_batch.forward_mode.is_dllm_extend():
+        return _dispatch_mla_subtype(attn, forward_batch)
+
     if is_in_tc_piecewise_cuda_graph():
         return AttnForwardMethod.MLA
 
