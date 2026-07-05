@@ -28,6 +28,7 @@ from sglang.multimodal_gen.test.run_suite import (
     partition_items_by_lpt,
     run_pytest,
 )
+from sglang.multimodal_gen.test.runner.pytest_runner import collect_test_items
 
 logger = init_logger(__name__)
 

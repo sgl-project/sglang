@@ -47,7 +47,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import (
     is_cpu,
@@ -267,7 +267,7 @@ class LogitsProcessor(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
-        self.use_attn_tp_group = get_global_server_args().enable_dp_lm_head
+        self.use_attn_tp_group = get_flags().enable_dp_lm_head
         self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
@@ -981,14 +981,19 @@ class LogitsProcessor(nn.Module):
         self, logits: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> torch.Tensor:
         logits_buffer = logits_metadata.next_token_logits_buffer
-        # The shared logits buffer is keyed by vocab width; skip it when this
-        # model's vocab doesn't match (e.g. hot-vocab draft vs full-vocab target).
-        if logits_buffer is not None and logits_buffer.shape[-1] == self.vocab_size:
+        if logits.shape[-1] > self.vocab_size:
+            logits = logits[:, : self.vocab_size]
+        logits_width = logits.shape[-1]
+        # The shared logits buffer is keyed by vocab width and rows; skip it
+        # when this batch has a different logits shape than the graph buffer.
+        if logits_buffer is not None and tuple(logits_buffer.shape) == tuple(
+            logits.shape
+        ):
             assert logits_buffer.dtype == torch.float
-            logits_buffer.copy_(logits[:, : self.vocab_size])
+            logits_buffer.copy_(logits)
             logits = logits_buffer
         else:
-            logits = logits[:, : self.vocab_size].float()
+            logits = logits.float()
         return logits
 
     def _get_dllm_logits(
