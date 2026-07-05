@@ -76,16 +76,14 @@ class EncoderConfig(ModelConfig):
     quant_config: QuantizationConfig | None = None
     lora_config: Any | None = None
 
-    # Static opt-in: TP-fold this encoder across the idle DiT replica during the
-    # encoding stage (the whole replica is otherwise unused then). Measured a win
-    # only for wide encoders (T5-XXL: ~-22% encode latency); small encoders
+    # Parallel folding: during the encoding stage the whole DiT replica is idle,
+    # so TP-shard the encoder across those otherwise-unused GPUs instead of running it on a single rank.
+    # Measured a win only for wide encoders (T5-XXL: ~-22% encode latency); small encoders
     # (CLIP-L, Qwen3) lose to per-layer all_reduce, so it is off by default and
-    # enabled per encoder that benefits. Read only by adjust_pipeline_config.
+    # enabled per encoder that benefits
     parallel_folding: bool = False
-    # Runtime state, set by ServerArgs.adjust_pipeline_config once parallelism is
-    # known and read by the loader/model: None = not folded this run; otherwise
-    # the group to fold over, "sp" | "ulysses" | "ring" | "world" ("world" = the
-    # full single-replica DiT, used for any tp/sp/cfg combo).
+    # Which group to fold over: "sp" | "ulysses" | "ring" | "world"
+    # ("world" = the full single-replica DiT, used for any parallelism combo).
     parallel_folding_mode: str | None = None
 
 
