@@ -34,6 +34,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.low_precision_linear import (
+    te_nvfp4_linear_enabled,
+)
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -66,6 +69,22 @@ from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
+_WAN_TE_NVFP4_VIDEO_FFN_TARGET = "wan.video_ffn"
+
+
+def _wan_te_nvfp4_video_ffn_target(
+    dim: int, ffn_dim: int, output_dim: int | None = None
+) -> str | None:
+    output_dim = dim if output_dim is None else output_dim
+    if (
+        te_nvfp4_linear_enabled()
+        and dim == 5120
+        and ffn_dim == 13824
+        and output_dim == 5120
+    ):
+        return _WAN_TE_NVFP4_VIDEO_FFN_TARGET
+    return None
+
 
 if _use_aiter:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
@@ -480,6 +499,7 @@ class WanTransformerBlock(nn.Module):
             act_type="gelu_pytorch_tanh",
             prefix=add_prefix("ffn", prefix),
             quant_config=quant_config,
+            te_nvfp4_target=_wan_te_nvfp4_video_ffn_target(dim, ffn_dim),
         )
         self.mlp_residual = MulAdd()
 
@@ -575,9 +595,10 @@ class WanTransformerBlock(nn.Module):
             query = q_sbhd.view(query_shape)
             key = k_sbhd.view(key_shape)
         else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+            query, key = (
+                _apply_rotary_emb(query, cos, sin, is_neox_style=False),
+                _apply_rotary_emb(key, cos, sin, is_neox_style=False),
+            )
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -589,9 +610,10 @@ class WanTransformerBlock(nn.Module):
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 2. Cross-attention
         attn_output = self.attn2(
@@ -600,9 +622,10 @@ class WanTransformerBlock(nn.Module):
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
@@ -822,9 +845,10 @@ class WanTransformerBlock_VSA(nn.Module):
             query = q_sbhd.view(query_shape)
             key = k_sbhd.view(key_shape)
         else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+            query, key = (
+                _apply_rotary_emb(query, cos, sin, is_neox_style=False),
+                _apply_rotary_emb(key, cos, sin, is_neox_style=False),
+            )
 
         attn_output = self.attn1(query, key, value, gate_compress=gate_compress)
         attn_output = attn_output.flatten(2)
@@ -835,9 +859,10 @@ class WanTransformerBlock_VSA(nn.Module):
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 2. Cross-attention
         attn_output = self.attn2(
@@ -846,9 +871,10 @@ class WanTransformerBlock_VSA(nn.Module):
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
@@ -939,7 +965,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             config.out_channels * math.prod(config.patch_size),
             bias=True,
             gather_output=True,
-            prefix=f"proj_out",
+            prefix="proj_out",
             quant_config=quant_config,
         )
         self.scale_shift_table = nn.Parameter(

@@ -167,6 +167,7 @@ class TeNvfp4LinearRunner:
             self._cache[cache_key] = te_layer
             self._weight_cache_ready.discard(cache_key)
             cached = te_layer
+            logger.info_once(f"Using TE NVFP4 linear runtime path for {self.target}")
         else:
             cached.train(training)
 

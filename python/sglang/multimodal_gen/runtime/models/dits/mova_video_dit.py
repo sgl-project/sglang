@@ -29,6 +29,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.low_precision_linear import (
+    te_nvfp4_linear_enabled,
+)
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -41,6 +44,21 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+_MOVA_TE_NVFP4_VIDEO_FFN_TARGET = "mova.video_ffn"
+
+
+def _mova_te_nvfp4_video_ffn_target(
+    dim: int, ffn_dim: int, output_dim: int | None = None
+) -> str | None:
+    output_dim = dim if output_dim is None else output_dim
+    if (
+        te_nvfp4_linear_enabled()
+        and dim == 5120
+        and ffn_dim == 13824
+        and output_dim == 5120
+    ):
+        return _MOVA_TE_NVFP4_VIDEO_FFN_TARGET
+    return None
 
 
 # @torch.compile(fullgraph=True)
@@ -322,6 +340,7 @@ class DiTBlock(nn.Module):
             output_dim=dim,
             act_type="gelu_pytorch_tanh",
             quant_config=quant_config,
+            te_nvfp4_target=_mova_te_nvfp4_video_ffn_target(dim, ffn_dim, dim),
         )
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.mlp_residual = MulAdd()

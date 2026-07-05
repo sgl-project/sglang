@@ -19,6 +19,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.low_precision_linear import (
+    TeNvfp4LinearRunner,
+    maybe_get_te_nvfp4_linear_runner,
+)
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.srt.utils import add_prefix
 
@@ -38,8 +42,10 @@ class MLP(nn.Module):
         dtype: torch.dtype | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig = None,
+        te_nvfp4_target: str | None = None,
     ):
         super().__init__()
+        del dtype
         self.fc_in = ColumnParallelLinear(
             input_dim,
             mlp_hidden_dim,
@@ -60,10 +66,34 @@ class MLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("fc_out", prefix),
         )
+        self._te_nvfp4_linear: TeNvfp4LinearRunner | None = (
+            maybe_get_te_nvfp4_linear_runner(te_nvfp4_target)
+            if te_nvfp4_target is not None
+            else None
+        )
+
+    def _try_te_nvfp4_linear(
+        self, cache_key: str, layer: nn.Module, x: torch.Tensor
+    ) -> torch.Tensor | None:
+        if self._te_nvfp4_linear is None:
+            return None
+        return self._te_nvfp4_linear.try_apply(
+            cache_key,
+            layer,
+            x,
+            training=self.training,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x, _ = self.fc_in(x)
+        te_fc_in = self._try_te_nvfp4_linear("fc_in", self.fc_in, x)
+        if te_fc_in is not None:
+            x = te_fc_in
+        else:
+            x, _ = self.fc_in(x)
         x = self.act(x)
+        te_fc_out = self._try_te_nvfp4_linear("fc_out", self.fc_out, x)
+        if te_fc_out is not None:
+            return te_fc_out
         x, _ = self.fc_out(x)
         return x
 
