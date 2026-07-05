@@ -187,7 +187,7 @@ class ModelOptFp8Config(ModelOptQuantConfig):
         return 89
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "ModelOptFp8Config":
+    def from_config(cls, config: Dict[str, Any]) -> ModelOptFp8Config:
         quant_method = config.get("quant_algo")
         exclude_modules = config.get("ignore")
         if quant_method is None:

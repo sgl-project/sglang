@@ -67,7 +67,8 @@ def _make_wrapper(tup: Tuple[str, str]) -> str:
     return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
 
 
-_LOCAL_INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"', re.MULTILINE)
+_QUOTED_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
+_ANGLE_INCLUDE_RE = re.compile(r"^\s*#\s*include\s*<(sgl_kernel/[^>]+)>", re.MULTILINE)
 
 
 def _local_jit_source_hash(source_files: List[str]) -> str:
@@ -75,6 +76,7 @@ def _local_jit_source_hash(source_files: List[str]) -> str:
     digest = hashlib.sha256()
     seen: set[pathlib.Path] = set()
     stack = [pathlib.Path(path).resolve() for path in source_files]
+    include_dir = KERNEL_PATH / "include"
 
     while stack:
         path = stack.pop()
@@ -95,8 +97,12 @@ def _local_jit_source_hash(source_files: List[str]) -> str:
         digest.update(b"\0")
 
         text = data.decode("utf-8", errors="ignore")
-        for include in _LOCAL_INCLUDE_RE.findall(text):
+        for include in _QUOTED_INCLUDE_RE.findall(text):
             include_path = (path.parent / include).resolve()
+            if include_path.is_file():
+                stack.append(include_path)
+        for include in _ANGLE_INCLUDE_RE.findall(text):
+            include_path = (include_dir / include).resolve()
             if include_path.is_file():
                 stack.append(include_path)
 
@@ -464,6 +470,53 @@ def get_flashinfer_include_paths() -> List[str]:
             )
         include_paths.append(str(path))
     return include_paths
+
+
+def get_mathdx_root() -> Optional[pathlib.Path]:
+    """Locate the NVIDIA Math-DX install (cuBLASDx headers).
+
+    Searches in order:
+      1. ``$MATHDX_HOME`` env var (extracted Math-DX archive root).
+      2. The ``nvidia-mathdx`` PyPI package, if installed.
+    """
+    env_home = os.environ.get("MATHDX_HOME")
+    if env_home:
+        candidate = pathlib.Path(env_home).expanduser().resolve()
+        if (candidate / "include").exists():
+            return candidate
+
+    # The ``nvidia-mathdx`` wheel installs as the namespace package
+    # ``nvidia.mathdx`` (no __init__, so spec.origin is None); resolve it via
+    # submodule_search_locations rather than _find_package_root, which only
+    # handles regular packages.
+    spec = importlib.util.find_spec("nvidia.mathdx")
+    if spec is not None:
+        roots = list(spec.submodule_search_locations or [])
+        if spec.origin is not None:
+            roots.append(str(pathlib.Path(spec.origin).parent))
+        for root in roots:
+            candidate = pathlib.Path(root).resolve()
+            if (candidate / "include").exists():
+                return candidate
+
+    return None
+
+
+@register_dependency("mathdx")
+def get_mathdx_include_paths() -> List[str]:
+    root = get_mathdx_root()
+    if root is None:
+        raise RuntimeError(
+            "Cannot find NVIDIA Math-DX (cuBLASDx) headers. "
+            "Install the `nvidia-mathdx` package "
+            "(`pip install nvidia-mathdx`) or set MATHDX_HOME to an "
+            "extracted Math-DX archive root."
+        )
+    candidates = [root / "include"]
+    cutlass = root / "external" / "cutlass" / "include"
+    if cutlass.exists():
+        candidates.append(cutlass)
+    return [str(p) for p in candidates]
 
 
 @register_dependency("cutlass")

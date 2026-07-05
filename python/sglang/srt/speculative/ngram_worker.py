@@ -12,11 +12,15 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
+from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
+    commit_mamba_states_after_verify,
     generate_token_bitmask,
     move_accept_tokens_to_target_kvcache,
+    prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
@@ -30,7 +34,15 @@ logger = logging.getLogger(__name__)
 USE_FULL_MASK = True
 
 
-class NGRAMWorker:
+class NGRAMWorker(BaseSpecWorker):
+    def alloc_memory_pool(self, **kwargs):
+        # The target memory pool does not exist yet when __init__ runs.
+        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
+            self._target_worker.get_memory_pool()
+        )
+        self.max_batch_size = self.model_runner.max_running_requests
+        self._init_preallocated_tensors()
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -45,7 +57,7 @@ class NGRAMWorker:
     ):
         self.server_args = server_args
         self.enable_overlap = not server_args.disable_overlap_schedule
-        self.target_worker = target_worker
+        self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.tp_rank = tp_rank
         self.page_size = server_args.page_size
@@ -54,14 +66,9 @@ class NGRAMWorker:
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
-
-        self.max_batch_size = target_worker.max_running_requests
+        # req_to_token_pool / token_to_kv_pool_allocator are set in
+        # alloc_memory_pool(), after the target pools are allocated.
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
-
-        self._init_preallocated_tensors()
 
         self.adaptive_controller = None
         # rids of the last decode batch; used to erase corpus match state for
@@ -98,6 +105,15 @@ class NGRAMWorker:
                 corpus_path,
                 loaded,
             )
+
+    @property
+    def target_worker(self) -> TpModelWorker:
+        return self._target_worker
+
+    @property
+    def draft_worker(self) -> Optional[EagleDraftWorkerBase]:
+        # NGRAM has no draft model; drafts come from the CPU-side corpus.
+        return None
 
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
@@ -314,6 +330,9 @@ class NGRAMWorker:
             draft_token_num=self.draft_token_num,
             device=self.device,
         )
+
+        prepare_mamba_track_for_verify(batch)
+
         batch.spec_info = NgramVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
@@ -414,8 +433,15 @@ class NGRAMWorker:
                 predict,
                 accept_lens,
                 accept_index,
-            ) = verify_input.sample(batch, logits_output, vocab_mask)
+            ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
             new_seq_lens = batch.seq_lens + accept_lens
+            commit_mamba_states_after_verify(
+                self.target_worker,
+                batch,
+                accept_lens,
+                accept_index,
+                self.draft_token_num,
+            )
             accept_tokens = predict[accept_index].flatten()
             next_token_ids = accept_tokens
 

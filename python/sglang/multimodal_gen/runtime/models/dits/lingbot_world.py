@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
+    get_tp_rank,
     get_tp_world_size,
     sequence_model_parallel_all_gather,
 )
@@ -78,6 +79,13 @@ from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanTransformer3DModel,
 )
 from sglang.multimodal_gen.runtime.models.utils import _use_aiter
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.constants import (
+    LINGBOT_C2WS_PLUCKER_EMB_CACHE,
+    LINGBOT_CAM_CONDITIONER_CACHE,
+    LINGBOT_ROPE_CACHE,
+    LINGBOT_SEQUENCE_SHARD_ROPE_CACHE,
+    LINGBOT_TIME_EMBEDDINGS_CACHE,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -281,10 +289,28 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             )
             roped_query, roped_key, v = qkv.chunk(3, dim=-1)
 
+        if (
+            not sequence_shard_enabled
+            and not update_cache_only
+            and kv_cache.can_direct_current_attention(roped_key.shape[1])
+        ):
+            return self.attn(roped_query, roped_key, v)
+
+        cache_head_start = (
+            get_tp_rank() * roped_key.shape[2]
+            if sequence_shard_enabled
+            else self.head_start
+        )
         cache_view = kv_cache.update_and_get_attention_kv(
             key=roped_key,
             value=v,
             current_chunk_start=current_start,
+            cache_head_start=cache_head_start,
+            recent_window_tokens=(
+                None
+                if update_cache_only
+                else getattr(forward_batch, "realtime_causal_kv_sample_tokens", None)
+            ),
             debug_name="LingBot KV cache",
         )
         if update_cache_only:
@@ -862,15 +888,20 @@ class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
 
 class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
+    _use_megatron_tp = True
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        head_start = self.attn1.head_start
         self.attn1 = LingBotWorldCausalSelfAttention(
             dim=self.hidden_dim,
-            num_heads=self.num_attention_heads,
+            num_heads=self.local_num_heads,
             local_attn_size=self.local_attn_size,
             sink_size=self.attn1.sink_size,
             qk_norm=self.attn1.qk_norm,
             eps=self.attn1.eps,
+            head_dim=self.dim_head,
+            head_start=head_start,
         )
         self.cam_conditioner = LingBotWorldCamConditioner(self.hidden_dim)
         self._fused_qkv_weight = None
@@ -979,7 +1010,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             return self.cam_conditioner.compute_scale_shift(c2ws_plucker_emb)
 
         cache = CausalLingBotWorldTransformer3DModel._get_request_cache(
-            forward_batch, "lingbot_cam_conditioner"
+            forward_batch, LINGBOT_CAM_CONDITIONER_CACHE
         )
         if cache is None:
             return self.cam_conditioner.compute_scale_shift(c2ws_plucker_emb)
@@ -1042,11 +1073,15 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             .to(orig_dtype)
         )
         query, key, value = self._project_qkv(norm_hidden_states)
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-        query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-        key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-        value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+        if self.tp_rmsnorm:
+            query = tensor_parallel_rms_norm(query, self.norm_q)
+            key = tensor_parallel_rms_norm(key, self.norm_k)
+        else:
+            query = self.norm_q(query)
+            key = self.norm_k(key)
+        query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+        key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+        value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
 
         attn_output = self.attn1(
             query,
@@ -1188,7 +1223,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
     ) -> torch.Tensor | None:
         if c2ws_plucker_emb is None:
             return None
-        cache = self._get_request_cache(forward_batch, "lingbot_c2ws_plucker_emb")
+        cache = self._get_request_cache(forward_batch, LINGBOT_C2WS_PLUCKER_EMB_CACHE)
         cache_key = (
             c2ws_plucker_emb.data_ptr(),
             tuple(c2ws_plucker_emb.shape),
@@ -1251,7 +1286,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         start_frame: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, ...]:
-        cache = self._get_request_cache(forward_batch, "lingbot_rope")
+        cache = self._get_request_cache(forward_batch, LINGBOT_ROPE_CACHE)
         cache_key = (
             post_patch_num_frames,
             post_patch_height,
@@ -1304,7 +1339,9 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         post_patch_width: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, ...]:
-        cache = self._get_request_cache(forward_batch, "lingbot_sequence_shard_rope")
+        cache = self._get_request_cache(
+            forward_batch, LINGBOT_SEQUENCE_SHARD_ROPE_CACHE
+        )
         cache_key = (
             local_seq_len,
             token_start,
@@ -1370,7 +1407,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         timestep: torch.LongTensor,
         forward_batch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cache = self._get_request_cache(forward_batch, "lingbot_time_embeddings")
+        cache = self._get_request_cache(forward_batch, LINGBOT_TIME_EMBEDDINGS_CACHE)
         current_timestep = get_forward_context().current_timestep
         cache_key = (
             current_timestep,
@@ -1403,7 +1440,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         if not self._should_cache_cam_conditioner(forward_batch):
             return None
 
-        cache = self._get_request_cache(forward_batch, "lingbot_cam_conditioner")
+        cache = self._get_request_cache(forward_batch, LINGBOT_CAM_CONDITIONER_CACHE)
         if cache is None:
             return None
 

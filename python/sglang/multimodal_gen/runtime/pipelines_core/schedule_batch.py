@@ -197,7 +197,7 @@ class Req:
     VSA_sparsity: float = 0.0
 
     # stage logging
-    metrics: Optional["RequestMetrics"] = None
+    metrics: Optional[RequestMetrics] = None
 
     # tracing context (TraceReqContext or TraceNullContext)
     trace_ctx: Union[TraceReqContext, TraceNullContext] = field(
@@ -215,6 +215,7 @@ class Req:
     realtime_output_pacing: bool = False
     realtime_causal_sink_size: int | None = None
     realtime_causal_kv_cache_num_frames: int | None = None
+    realtime_causal_kv_sample_tokens: int | None = None
     # return websocket-friendly raw RGB frame bytes instead of rwa tensors
     return_raw_frames: bool = False
 
@@ -323,10 +324,11 @@ class Req:
         self.is_warmup = True
         self.save_output = False
         self.suppress_logs = True
+        self.metrics.suppress_stage_breakdown = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
         self.num_inference_steps = warmup_steps
 
-    def copy_as_warmup(self, warmup_steps: int = 1) -> "Req":
+    def copy_as_warmup(self, warmup_steps: int = 1) -> Req:
         req = deepcopy(self)
         req.set_as_warmup(warmup_steps)
         return req
@@ -421,8 +423,8 @@ class OutputBatch:
     output_file_paths: list[str] | None = None
 
     # logged metrics info, directly from Req.timings
-    metrics: Optional["RequestMetrics"] = None
-    metrics_list: Optional[list[Optional["RequestMetrics"]]] = None
+    metrics: Optional[RequestMetrics] = None
+    metrics_list: Optional[list[Optional[RequestMetrics]]] = None
 
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None

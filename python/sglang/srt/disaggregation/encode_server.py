@@ -11,9 +11,10 @@ import pickle
 import threading
 import time
 import traceback
+import uuid
 from collections import defaultdict
 from http import HTTPStatus
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Annotated, Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
 import numpy as np
@@ -22,7 +23,7 @@ import torch
 import uvicorn
 import zmq
 import zmq.asyncio
-from fastapi import FastAPI
+from fastapi import Body, FastAPI
 from fastapi.responses import ORJSONResponse, Response
 from transformers import AutoProcessor
 
@@ -43,11 +44,23 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
-from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileReqType
+from sglang.srt.managers.io_struct import (
+    ProfileReq,
+    ProfileReqType,
+    async_sock_recv,
+    async_sock_send,
+    sock_send,
+    wrap_as_pickle,
+)
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_loader import get_model
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
+from sglang.srt.observability.req_time_stats import EncoderReqTimeStats
+from sglang.srt.observability.trace import (
+    process_tracing_init,
+    trace_set_thread_info,
+)
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -901,8 +914,9 @@ class MMEncoder:
                 mm_feature, mm_inputs, missing_indices, modality, get_feature_fn
             )
 
-        # Step 3: Rank 0 prefetches cache-hit embeddings from global cache.
-        prefetch_status = torch.tensor([1], dtype=torch.int32)
+        # Step 3: Rank 0 prefetches cache-hit embeddings and builds fallback_mask.
+        fallback_mask = torch.zeros(num_items, dtype=torch.int32)
+        cached_slices = []
 
         if self.rank == 0:
             if hit_indices:
@@ -919,32 +933,46 @@ class MMEncoder:
                             await asyncio.sleep(0.005)
 
                     await asyncio.wait_for(_wait_prefetch(), timeout=60.0)
+
+                    # Prefetch IO completed; check which items actually loaded.
+                    cached_slices = self.mm_global_cache.get_embeddings(hit_hashes)
+                    for i, idx in enumerate(hit_indices):
+                        if cached_slices[i] is None:
+                            fallback_mask[idx] = 1
+                    num_partial_fail = int(fallback_mask.sum().item())
+                    if num_partial_fail > 0:
+                        logger.warning(
+                            f"Req {req_id}: {num_partial_fail}/{len(hit_indices)} "
+                            f"cache-hit items failed to load (pool full), "
+                            f"falling back to ViT"
+                        )
                 except (asyncio.TimeoutError, Exception) as e:
                     logger.error(
                         f"Prefetch failed for req {req_id}: {e}. "
                         f"Falling back to ViT for {len(hit_indices)} hit items."
                     )
-                    prefetch_status[0] = 0
+                    for idx in hit_indices:
+                        fallback_mask[idx] = 1
 
-        # Step 4: Broadcast prefetch result to all ranks so they stay in sync.
+        # Step 4: Broadcast fallback_mask to all ranks so they stay in sync.
         if self.server_args.tp_size > 1:
             torch.distributed.broadcast(
-                prefetch_status,
+                fallback_mask,
                 src=0,
                 group=self.mm_global_cache.prefetch_tp_group,
             )
 
-        # Step 5: If prefetch failed, all ranks fallback to ViT for the hit mm items.
-        if prefetch_status.item() == 0 and hit_indices:
+        # Step 5: All ranks run ViT for items that need fallback recomputation.
+        fallback_indices = [i for i in range(num_items) if fallback_mask[i].item() == 1]
+        fallback_slices = None
+        if fallback_indices:
             logger.info(
-                f"Req {req_id}: Prefetch failed, all ranks running ViT fallback "
-                f"for {len(hit_indices)} mm items."
+                f"Req {req_id}: All ranks running ViT fallback "
+                f"for {len(fallback_indices)} items."
             )
             fallback_slices = self._encode_missing(
-                mm_feature, mm_inputs, hit_indices, modality, get_feature_fn
+                mm_feature, mm_inputs, fallback_indices, modality, get_feature_fn
             )
-        else:
-            fallback_slices = None
 
         # Step 6: Rank 0 assembles final embedding and prepares for sending.
         if self.rank == 0:
@@ -953,25 +981,37 @@ class MMEncoder:
             for i, idx in enumerate(missing_indices):
                 final_slices[idx] = new_slices[i]
 
-            # Fill in cache-hit embeddings (from prefetch or fallback)
-            if prefetch_status.item() == 1 and hit_indices:
-                cached_slices = self.mm_global_cache.get_embeddings(
-                    [str_mm_hashes[i] for i in hit_indices]
-                )
+            # Fill in successfully loaded cache-hit embeddings
+            if cached_slices:
                 for i, idx in enumerate(hit_indices):
-                    final_slices[idx] = cached_slices[i]
-            elif fallback_slices is not None:
-                for i, idx in enumerate(hit_indices):
+                    if cached_slices[i] is not None:
+                        final_slices[idx] = cached_slices[i]
+
+            # Fill in ViT fallback results for failed items
+            if fallback_slices is not None:
+                for i, idx in enumerate(fallback_indices):
                     final_slices[idx] = fallback_slices[i]
 
             mm_embedding = torch.cat(final_slices, dim=0)
+
+            # Release embedding cache references now that torch.cat has
+            # copied the data into a new tensor.  This allows the cache
+            # entries to be evicted under memory pressure.
+            if cached_slices:
+                loaded_hashes = [
+                    str_mm_hashes[idx]
+                    for idx in hit_indices
+                    if fallback_mask[idx].item() == 0
+                ]
+                if loaded_hashes:
+                    self.mm_global_cache.release_embeddings(loaded_hashes)
 
             # Background insert: store newly computed embeddings into global cache.
             # Includes both original misses and fallback-recomputed hits.
             all_new_hashes = [str_mm_hashes[i] for i in missing_indices]
             all_new_slices = list(new_slices)
             if fallback_slices is not None:
-                all_new_hashes += [str_mm_hashes[i] for i in hit_indices]
+                all_new_hashes += [str_mm_hashes[i] for i in fallback_indices]
                 all_new_slices += list(fallback_slices)
 
             if all_new_hashes:
@@ -1044,6 +1084,7 @@ class MMEncoder:
                     )
                 else:
                     mm_hashes = hashes
+                str_mm_hashes = [str(h) for h in mm_hashes]
 
             # All ranks: launch background task for cache check + VIT forward.
             # Do NOT use run_in_executor: get_feature_fn relies on a session
@@ -1055,7 +1096,7 @@ class MMEncoder:
                     # Step 1: Rank 0 checks cache, broadcast mask if TP > 1
                     if self.rank == 0:
                         exist_mask = await self.mm_global_cache.batch_is_exist(
-                            mm_hashes
+                            str_mm_hashes
                         )
                         mask_tensor = torch.tensor(
                             [1 if e else 0 for e in exist_mask],
@@ -1089,14 +1130,13 @@ class MMEncoder:
                             grid_thw,
                             keep_on_gpu=True,
                         )
-                        if self.rank == 0:
-                            for i, idx in enumerate(missing_indices):
-                                final_slices[idx] = new_slices[i]
 
-                    # Step 3: Rank 0 prefetches cache-hit embeddings
-                    prefetch_status = torch.tensor([1], dtype=torch.int32)
+                    # Step 3: Rank 0 prefetches cache-hit embeddings and builds fallback_mask.
+                    fallback_mask = torch.zeros(num_items, dtype=torch.int32)
+                    cached_slices = []
+
                     if self.rank == 0 and hit_indices:
-                        hit_hashes = [mm_hashes[i] for i in hit_indices]
+                        hit_hashes = [str_mm_hashes[i] for i in hit_indices]
                         hit_tokens = [
                             self.get_num_tokens(grid_thw[i], modality)
                             for i in hit_indices
@@ -1113,46 +1153,83 @@ class MMEncoder:
                                     await asyncio.sleep(0.005)
 
                             await asyncio.wait_for(_wait_prefetch(), timeout=60.0)
+
                             cached_slices = self.mm_global_cache.get_embeddings(
                                 hit_hashes
                             )
                             for i, idx in enumerate(hit_indices):
-                                final_slices[idx] = cached_slices[i]
+                                if cached_slices[i] is None:
+                                    fallback_mask[idx] = 1
+                            num_partial_fail = int(fallback_mask.sum().item())
+                            if num_partial_fail > 0:
+                                logger.warning(
+                                    f"Req {req_id}: {num_partial_fail}/{len(hit_indices)} "
+                                    f"cache-hit items failed to load (pool full), "
+                                    f"falling back to ViT"
+                                )
                         except (asyncio.TimeoutError, Exception) as e:
                             logger.error(
                                 f"Prefetch failed for {req_id}: {e}. "
                                 f"Falling back to ViT for "
                                 f"{len(hit_indices)} hit items."
                             )
-                            prefetch_status[0] = 0
+                            for idx in hit_indices:
+                                fallback_mask[idx] = 1
 
-                    # Broadcast prefetch result if TP > 1
+                    # Step 4: Broadcast fallback_mask to all ranks so they stay in sync.
                     if self.server_args.tp_size > 1:
                         torch.distributed.broadcast(
-                            prefetch_status,
+                            fallback_mask,
                             src=0,
                             group=self.mm_global_cache.prefetch_tp_group,
                         )
 
-                    # Step 4: All ranks fallback VIT for failed prefetch
-                    # (runs in event loop to preserve session context)
+                    # Step 5: All ranks run ViT for items that need fallback recomputation.
+                    fallback_indices = [
+                        i for i in range(num_items) if fallback_mask[i].item() == 1
+                    ]
                     fallback_slices = None
-                    if prefetch_status.item() == 0 and hit_indices:
+                    if fallback_indices:
+                        logger.info(
+                            f"Req {req_id}: All ranks running ViT fallback "
+                            f"for {len(fallback_indices)} items."
+                        )
                         fallback_slices = self._encode_missing(
                             mm_feature,
                             mm_inputs,
-                            hit_indices,
+                            fallback_indices,
                             modality,
                             get_feature_fn,
                             grid_thw,
                             keep_on_gpu=True,
                         )
-                        if self.rank == 0:
+
+                    # Step 6: Rank 0 assembles final embedding.
+                    if self.rank == 0:
+                        for i, idx in enumerate(missing_indices):
+                            final_slices[idx] = new_slices[i]
+
+                        # Fill in successfully loaded cache-hit embeddings
+                        if cached_slices:
                             for i, idx in enumerate(hit_indices):
+                                if cached_slices[i] is not None:
+                                    final_slices[idx] = cached_slices[i]
+
+                        # Fill in ViT fallback results for failed items
+                        if fallback_slices is not None:
+                            for i, idx in enumerate(fallback_indices):
                                 final_slices[idx] = fallback_slices[i]
 
-                    # Step 5: Rank 0 assembles and stores result
-                    if self.rank == 0:
+                        # Move cached CPU slices to GPU and match model dtype
+                        device = torch.device(f"cuda:{self.gpu_id}")
+                        final_slices = [
+                            (
+                                s.to(device=device, dtype=self._embedding_dtype)
+                                if s.device.type == "cpu"
+                                else s
+                            )
+                            for s in final_slices
+                        ]
                         mm_embedding = torch.cat(final_slices, dim=0)
                         # Wait for any pending VIT / cat kernels to finish
                         # before publishing to /send: mooncake transfer_sync
@@ -1160,11 +1237,24 @@ class MMEncoder:
                         # and would otherwise race with in-flight kernels.
                         torch.cuda.current_stream(mm_embedding.device).synchronize()
 
-                        # Background insert new embeddings into cache
-                        all_new_hashes = [mm_hashes[i] for i in missing_indices]
+                        # Release cache refs after data is copied to GPU
+                        if cached_slices:
+                            loaded_hashes = [
+                                str_mm_hashes[idx]
+                                for idx in hit_indices
+                                if fallback_mask[idx].item() == 0
+                            ]
+                            if loaded_hashes:
+                                self.mm_global_cache.release_embeddings(loaded_hashes)
+
+                        # Background insert: store newly computed embeddings into global cache.
+                        # Includes both original misses and fallback-recomputed hits.
+                        all_new_hashes = [str_mm_hashes[i] for i in missing_indices]
                         all_new_slices = list(new_slices)
                         if fallback_slices is not None:
-                            all_new_hashes += [mm_hashes[i] for i in hit_indices]
+                            all_new_hashes += [
+                                str_mm_hashes[i] for i in fallback_indices
+                            ]
                             all_new_slices += list(fallback_slices)
                         if all_new_hashes:
 
@@ -1639,7 +1729,7 @@ class MMEncoder:
                 else:
                     sock.send_multipart([serialized_data], copy=False)
             finally:
-                sock.close()
+                sock.close(linger=5000)
 
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
 
@@ -2187,7 +2277,7 @@ class EncoderScheduler:
         self.send_sockets = send_sockets
         self.max_batch_size = max(1, int(max_batch_size))
         self.request_timeout = max(1.0, float(request_timeout))
-        self.pending_queue: "asyncio.Queue[PendingRequest]" = asyncio.Queue()
+        self.pending_queue: asyncio.Queue[PendingRequest] = asyncio.Queue()
         self._worker_task: Optional[asyncio.Task] = None
 
     def start(self) -> None:
@@ -2307,13 +2397,16 @@ class EncoderScheduler:
         requests = [p.request for p in group]
         start = time.time()
         for sock in self.send_sockets:
-            sock.send_pyobj(
-                {
-                    "type": "batch_encode",
-                    "modality": modality.name,
-                    "requests": requests,
-                    "enter_time": start,
-                }
+            sock_send(
+                sock,
+                wrap_as_pickle(
+                    {
+                        "type": "batch_encode",
+                        "modality": modality.name,
+                        "requests": requests,
+                        "enter_time": start,
+                    }
+                ),
             )
 
         logger.info(f"Dispatching batch of {len(group)} {modality.name} requests")
@@ -2359,7 +2452,7 @@ class EncoderScheduler:
             req = p.request
             try:
                 for sock in self.send_sockets:
-                    sock.send_pyobj(req)
+                    sock_send(sock, wrap_as_pickle(req))
                 result = await self.encoder.encode_request(req, modality)
                 if not p.future.done():
                     p.future.set_result(result)
@@ -2420,6 +2513,10 @@ async def _dp_worker_encode_and_send(
     # Mooncake returns metadata for main to forward; zmq inlines the send.
     # Soft errors raise MMError so the dispatcher route maps them to HTTP.
     req_id = request["req_id"]
+    time_stats_json = request.pop("time_stats_json", None)
+    time_stats = EncoderReqTimeStats()
+    if time_stats_json:
+        time_stats.decode_json(time_stats_json)
     request["enter_time"] = time.time()
     modality = Modality.from_str(request["modality"])
     backend = enc.server_args.encoder_transfer_backend
@@ -2434,14 +2531,20 @@ async def _dp_worker_encode_and_send(
             code=HTTPStatus.BAD_REQUEST,
         )
 
+    time_stats.set_mm_encode_start_time()
     encode_coro = (
         sched.submit(request)
         if sched is not None and modality in _BATCHABLE_MODALITIES
         else enc.encode_request(request, modality)
     )
-    nbytes, embedding_len, embedding_dim, error_msg, error_code = await encode_coro
+    try:
+        nbytes, embedding_len, embedding_dim, error_msg, error_code = await encode_coro
+    except asyncio.TimeoutError:
+        time_stats.trace_ctx.abort(abort_info={"reason": "encoder batch timed out"})
+        raise
 
     if error_msg:
+        time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
         # zmq backends still forward an error EmbeddingData to P so it
         # doesn't block; send failures here are swallowed.
         try:
@@ -2462,6 +2565,8 @@ async def _dp_worker_encode_and_send(
         else:
             enc.embedding_to_send.pop(req_id, None)
         raise MMError(error_msg, code=error_code or HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    time_stats.set_mm_encode_end_time()
 
     if backend == "mooncake":
         request.pop("mm_items", None)
@@ -2506,7 +2611,8 @@ async def _dp_worker_health_encode(enc: MMEncoder) -> None:
         # No processor → can't functionally probe; liveness alone is healthy.
         return None
 
-    req_id = f"{HEALTH_CHECK_RID_PREFIX}_{time.time()}"
+    # uuid keeps rids unique across workers; a bare time.time() can collide.
+    req_id = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
     try:
         _, _, _, error_msg, error_code = await enc.encode(
             mm_items=mm_items,
@@ -2635,7 +2741,7 @@ class DPDispatcher:
         )
 
         try:
-            await self.dispatch_sockets[rank].send_pyobj(request)
+            await async_sock_send(self.dispatch_sockets[rank], wrap_as_pickle(request))
             # An alive-but-stuck worker (NCCL deadlock etc.) wouldn't trip
             # the watchdog, so bound the wait explicitly.
             return await asyncio.wait_for(future, timeout=ENCODER_REQ_TIMEOUT)
@@ -2684,7 +2790,7 @@ class DPDispatcher:
             f"dp_rank={rank}, pending={self.pending_counts}"
         )
         try:
-            await self.dispatch_sockets[rank].send_pyobj(request)
+            await async_sock_send(self.dispatch_sockets[rank], wrap_as_pickle(request))
             return await asyncio.wait_for(future, timeout=ENCODER_REQ_TIMEOUT)
         except asyncio.TimeoutError:
             self.pending_futures[rank].pop(key, None)
@@ -2725,7 +2831,9 @@ class DPDispatcher:
                 self.req_id_to_rank[req_id] = rank
                 rank_keys.append((rank, req_id))
                 request_copy = {**request, "req_id": req_id}
-                await self.dispatch_sockets[rank].send_pyobj(request_copy)
+                await async_sock_send(
+                    self.dispatch_sockets[rank], wrap_as_pickle(request_copy)
+                )
                 futures.append(future)
             # Concurrent wait → total bounded by eff_timeout, not
             # dp_size × eff_timeout.
@@ -2805,7 +2913,7 @@ class DPDispatcher:
         consecutive_errors = 0
         while True:
             try:
-                msg = await self.result_socket.recv_pyobj()
+                msg = await async_sock_recv(self.result_socket)
                 consecutive_errors = 0
             except asyncio.CancelledError:
                 raise
@@ -2877,13 +2985,8 @@ async def _dp_worker_handle_profile(
 ) -> dict:
     prefix = f"dp_rank={dp_rank}: "
     if dp_type == "start_profile":
-        obj = request.get("profile_req")
-        # `is None` (not `if not obj`) so empty dict still raises.
-        req = (
-            ProfileReq(**obj)
-            if obj is not None
-            else ProfileReq(ProfileReqType.START_PROFILE)
-        )
+        req = request.get("profile_req") or ProfileReq()
+        req.req_type = ProfileReqType.START_PROFILE
         if enc.profiler is None:
             enc.profiler = EncoderProfiler(dp_rank)
         ok, msg = enc.profiler.start(req)
@@ -2955,10 +3058,10 @@ async def _dp_worker_handle_request(
             "_error_code": err_code,
         }
 
-    # pyzmq async send_pyobj isn't safe for concurrent senders.
+    # pyzmq async send isn't safe for concurrent senders.
     try:
         async with send_lock:
-            await send_sock.send_pyobj(envelope)
+            await async_sock_send(send_sock, wrap_as_pickle(envelope))
     except Exception:
         logger.error(
             f"DP worker {dp_rank} failed to send envelope for "
@@ -3017,7 +3120,7 @@ async def run_dp_worker(
             spawned = False
             try:
                 try:
-                    request = await recv_sock.recv_pyobj()
+                    request = await async_sock_recv(recv_sock)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -3101,23 +3204,38 @@ async def run_encoder(
 ):
     encoder = MMEncoder(server_args, schedule_path, dist_init_method, rank)
     while True:
-        request = await encoder.schedule_socket.recv_pyobj()
-        if isinstance(request, ProfileReq):
-            if request.type == ProfileReqType.START_PROFILE:
-                if encoder.profiler is None:
-                    encoder.profiler = EncoderProfiler(encoder.rank)
-                encoder.profiler.start(request)
-            else:
-                encoder.profiler.stop()
-        elif isinstance(request, dict) and request.get("type") == "batch_encode":
-            await encoder.batch_encode(
-                request["requests"],
-                Modality.from_str(request["modality"]),
-            )
+        request = await async_sock_recv(encoder.schedule_socket)
+        await _handle_encoder_worker_request(encoder, request)
+
+
+async def _handle_encoder_worker_request(encoder: MMEncoder, request):
+    if isinstance(request, ProfileReq):
+        if request.req_type == ProfileReqType.START_PROFILE:
+            if encoder.profiler is None:
+                encoder.profiler = EncoderProfiler(encoder.rank)
+            encoder.profiler.start(request)
         else:
-            await encoder.encode_request(
-                request, Modality.from_str(request["modality"])
-            )
+            encoder.profiler.stop()
+    elif isinstance(request, dict) and request.get("type") == "batch_encode":
+        await encoder.batch_encode(
+            request["requests"],
+            Modality.from_str(request["modality"]),
+        )
+    elif (
+        isinstance(request, dict)
+        and isinstance(request.get("req_id"), str)
+        and request["req_id"].startswith(HEALTH_CHECK_RID_PREFIX)
+    ):
+        await encoder.encode(
+            mm_items=request["mm_items"],
+            modality=Modality.from_str(request["modality"]),
+            req_id=request["req_id"],
+            num_parts=request["num_parts"],
+            part_idx=request["part_idx"],
+            hashes=request.get("hashes"),
+        )
+    else:
+        await encoder.encode_request(request, Modality.from_str(request["modality"]))
 
 
 def launch_encoder(server_args, schedule_path, dist_init_method, rank):
@@ -3248,6 +3366,13 @@ def launch_server(server_args: ServerArgs):
         dist_init_method = NetworkAddress(
             server_args.host or "127.0.0.1", port_args.nccl_port
         ).to_tcp()
+    if server_args.enable_trace:
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            trace_modules=server_args.trace_modules,
+        )
+        trace_set_thread_info("Encoder")
     for rank in range(1, server_args.tp_size):
         schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
         send_sockets.append(
@@ -3387,7 +3512,12 @@ async def get_condition(rid):
 async def handle_encode_request(request: dict):
     req_id = request["req_id"]
     start_time = time.monotonic()
+    time_stats_json = request.pop("time_stats_json", None)
+    time_stats = EncoderReqTimeStats()
     if dp_dispatcher is not None:
+        if time_stats_json:
+            request = dict(request)
+            request["time_stats_json"] = time_stats_json
         try:
             result = await dp_dispatcher.dispatch(request)
         except MMError as e:
@@ -3470,12 +3600,19 @@ async def handle_encode_request(request: dict):
         async with encoder.encode_dispatch_lock:
             request.update({"enter_time": time.time()})
             modality = Modality.from_str(request["modality"])
+            if time_stats_json:
+                time_stats.decode_json(time_stats_json)
+
+            time_stats.set_mm_encode_start_time()
             if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
                 try:
                     nbytes, embedding_len, embedding_dim, error_msg, error_code = (
                         await encoder_scheduler.submit(request)
                     )
                 except asyncio.TimeoutError:
+                    time_stats.trace_ctx.abort(
+                        abort_info={"reason": "encoder batch timed out"}
+                    )
                     return ORJSONResponse(
                         status_code=HTTPStatus.GATEWAY_TIMEOUT,
                         content={
@@ -3486,10 +3623,15 @@ async def handle_encode_request(request: dict):
                     )
             else:
                 for socket in send_sockets:
-                    socket.send_pyobj(request)
+                    sock_send(socket, wrap_as_pickle(request))
                 nbytes, embedding_len, embedding_dim, error_msg, error_code = (
                     await encoder.encode_request(request, modality)
                 )
+
+        if error_msg:
+            time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+        else:
+            time_stats.set_mm_encode_end_time()
 
         if error_msg:
             if encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
@@ -3689,7 +3831,8 @@ async def health_generate():
         return Response(status_code=200)
 
     try:
-        req_id = f"{HEALTH_CHECK_RID_PREFIX}_{time.time()}"
+        # uuid keeps rids unique across workers; a bare time.time() can collide.
+        req_id = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
 
         dummy_request = {
             "mm_items": mm_items,
@@ -3701,7 +3844,7 @@ async def health_generate():
 
         # Broadcast to other TP ranks so distributed ops stay in sync
         for socket in send_sockets:
-            socket.send_pyobj(dummy_request)
+            sock_send(socket, wrap_as_pickle(dummy_request))
 
         # Run encode on rank 0 with timeout
         _, _, _, error_msg, _ = await asyncio.wait_for(
@@ -3733,53 +3876,23 @@ async def health_generate():
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
-async def start_profile_async(obj: Optional[ProfileReqInput] = None):
+async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = None):
     if dp_dispatcher is not None:
-        profile_req = None
         if obj is not None:
-            profile_req = {
-                "type": ProfileReqType.START_PROFILE,
-                "output_dir": obj.output_dir,
-                "start_step": obj.start_step,
-                "num_steps": obj.num_steps,
-                "activities": obj.activities,
-                "with_stack": obj.with_stack,
-                "record_shapes": obj.record_shapes,
-                "profile_by_stage": obj.profile_by_stage,
-                "profile_id": str(time.time()),
-                "merge_profiles": obj.merge_profiles,
-                "profile_prefix": obj.profile_prefix,
-                "profile_stages": obj.profile_stages,
-            }
+            obj.req_type = ProfileReqType.START_PROFILE
         try:
             results = await dp_dispatcher.broadcast(
-                {"_dp_type": "start_profile", "profile_req": profile_req}
+                {"_dp_type": "start_profile", "profile_req": obj}
             )
         except MMError as e:
             return Response(content=f"{e}\n", status_code=int(e.code))
         return _summarise_dp_broadcast(results)
     if encoder is None:
         return Response(content="encoder not ready\n", status_code=503)
-    req = None
-    if obj is None:
-        req = ProfileReq(ProfileReqType.START_PROFILE)
-    else:
-        req = ProfileReq(
-            type=ProfileReqType.START_PROFILE,
-            output_dir=obj.output_dir,
-            start_step=obj.start_step,
-            num_steps=obj.num_steps,
-            activities=obj.activities,
-            with_stack=obj.with_stack,
-            record_shapes=obj.record_shapes,
-            profile_by_stage=obj.profile_by_stage,
-            profile_id=str(time.time()),
-            merge_profiles=obj.merge_profiles,
-            profile_prefix=obj.profile_prefix,
-            profile_stages=obj.profile_stages,
-        )
+    req = obj or ProfileReq()
+    req.req_type = ProfileReqType.START_PROFILE
     for socket in send_sockets:
-        socket.send_pyobj(req)
+        sock_send(socket, req)
     if encoder.profiler is None:
         encoder.profiler = EncoderProfiler(encoder.rank)
     ok, msg = encoder.profiler.start(req)
@@ -3808,9 +3921,9 @@ async def stop_profile_async():
         return Response(
             content="profiling not initialized\n", status_code=HTTPStatus.BAD_REQUEST
         )
-    req = ProfileReq(ProfileReqType.STOP_PROFILE)
+    req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
     for socket in send_sockets:
-        socket.send_pyobj(req)
+        sock_send(socket, req)
     ok, msg = encoder.profiler.stop()
     if ok:
         return Response(content="Stop profiling.\n", status_code=200)

@@ -1,17 +1,39 @@
+"""Benchmark fused TP QKNorm (push-mode custom-AR + RMSNorm) vs the serial
+baseline (RMS sum-sq -> pull-mode all-reduce -> RMS apply).
+
+Usage::
+
+    # Benchmark on every supported world size (2..8 GPUs):
+    python benchmark/bench_tp_qknorm.py
+    # Specific world sizes:
+    python benchmark/bench_tp_qknorm.py --num-gpu 4
+    python benchmark/bench_tp_qknorm.py --num-gpu 2,4,8
+"""
+
 from __future__ import annotations
 
-import argparse
+import atexit
+import logging
+import multiprocessing
 import os
+from multiprocessing.context import SpawnProcess
+from typing import List
 
 import torch
 import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.jit_kernel.all_reduce import (
+    _jit_custom_all_reduce_pull_module,
+    _jit_custom_all_reduce_push_module,
+    _jit_fused_parallel_qknorm_module,
     fused_parallel_qknorm,
     get_fused_parallel_qknorm_max_occupancy,
 )
-from sglang.jit_kernel.utils import get_ci_test_range
+from sglang.jit_kernel.benchmark import marker
+from sglang.jit_kernel.benchmark.utils import multigpu_bench_main
+from sglang.jit_kernel.mp import register_comm_cleanup
+from sglang.jit_kernel.utils import cache_once, get_ci_test_range
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
@@ -19,84 +41,136 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=120,
-    suite="base-b-kernel-benchmark-1-gpu-large",
+    stage="base-b-kernel-benchmark",
+    runner_config="1-gpu-large",
     disabled="requires multi-GPU, self-skips in CI",
 )
 
-Q_K_DIMS = [(6144, 1024)]
+
+# ---------------------------------------------------------------------------
+# Sweep parameters
+# ---------------------------------------------------------------------------
+
 DTYPE = torch.bfloat16
 EPS = 1e-6
+Q_K_DIMS = [(6144, 1024)]
 BATCH_SIZES = get_ci_test_range([2**i for i in range(15)], [1, 64, 1024])
-NUM_LAYERS = 8
+MAX_PUSH_SIZE = 8 * max(BATCH_SIZES)
+PROVIDERS = ["fused", "baseline"]
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--iters", type=int, default=100)
-    return parser.parse_args()
+# ---------------------------------------------------------------------------
+# Parallel JIT precompile (outer process, before any torchrun child starts)
+# ---------------------------------------------------------------------------
 
 
-def init_distributed():
+def _compile_one(world_size: int) -> None:
+    """Compile every kernel this bench touches for a single world_size.
+
+    Top-level so it survives ``spawn`` pickling. Compiled artifacts are
+    cached on disk by ``tvm_ffi``; torchrun children will reuse them.
+    """
+    # baseline path: sum-sq -> pull-mode all-reduce -> apply
+    _jit_custom_all_reduce_pull_module(DTYPE, world_size)
+    # fused path: push-mode all-reduce
+    _jit_custom_all_reduce_push_module(DTYPE, world_size)
+    # fused path: fused QKNorm kernel (one per (dtype, world_size, q_dim, k_dim))
+    for q_dim, k_dim in Q_K_DIMS:
+        _jit_fused_parallel_qknorm_module(DTYPE, world_size, q_dim, k_dim)
+
+
+def _precompile_kernels(num_gpus: List[int]) -> None:
+    ctx = multiprocessing.get_context("spawn")
+    procs: list[tuple[int, SpawnProcess]] = []
+    for world_size in num_gpus:
+        p = ctx.Process(target=_compile_one, args=(world_size,))
+        p.start()
+        procs.append((world_size, p))
+    for world_size, p in procs:
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(
+                f"TP QKNorm precompile failed for {world_size=} " f"(exit {p.exitcode})"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Per-rank distributed init (run once per torchrun worker)
+# ---------------------------------------------------------------------------
+
+
+@cache_once
+def _init_cpu_group() -> dist.ProcessGroup:
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    rank = local_rank
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-
+    torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="gloo")
     ps._WORLD = coord = ps.init_world_group(
         ranks=list(range(world_size)),
         local_rank=local_rank,
         backend="nccl",
     )
+    atexit.register(dist.destroy_process_group)
+    logging.disable(logging.INFO)
+    torch.cuda.set_stream(torch.cuda.Stream())
+    return coord.cpu_group
 
-    cpu_group = coord.cpu_group
+
+@cache_once
+def _init_gpu_group() -> dist.ProcessGroup:
+    _init_cpu_group()
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    gpu_group = dist.new_group(backend="nccl", device_id=device)
+    assert isinstance(gpu_group, dist.ProcessGroup)
+    atexit.register(lambda: dist.destroy_process_group(gpu_group))
+    return gpu_group
+
+
+@cache_once
+def _init_fused_comm() -> CustomAllReduceV2:
+    """Push-mode workspace sized for the fused-QKNorm bench."""
+    cpu_group = _init_cpu_group()
+    world_size = dist.get_world_size(cpu_group)
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    q_dim, k_dim = Q_K_DIMS[0]
     max_occupancy = get_fused_parallel_qknorm_max_occupancy(
-        DTYPE, world_size, Q_K_DIMS[0][0], Q_K_DIMS[0][1]
+        DTYPE, world_size, q_dim, k_dim
     )
-    if rank == 0:
+    if dist.get_rank(cpu_group) == 0:
         print(f"Max occupancy for fused_parallel_qknorm: {max_occupancy} blocks/SM")
-
     props = torch.cuda.get_device_properties(device)
     comm = CustomAllReduceV2(
         cpu_group,
         device,
         max_pull_size=0,
-        max_push_size=8 * max(BATCH_SIZES),
+        max_push_size=MAX_PUSH_SIZE,
         max_push_blocks=props.multi_processor_count * max_occupancy,
     )
-    comm_ = CustomAllReduceV2(cpu_group, device)
-    if comm.disabled or comm_.disabled:
+    if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
-    return rank, world_size, device, cpu_group, comm, comm_
+    register_comm_cleanup(comm)
+    return comm
 
 
-@torch.inference_mode()
-def bench_one(fn, warmup: int, iters: int) -> float:
-    for _ in range(warmup):
-        fn(0)
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        for i in range(NUM_LAYERS):
-            fn(i)
-
-    graph.replay()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    graph.replay()
-    start.record()
-    for i in range(iters):
-        graph.replay()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) * 1000.0 / (iters * NUM_LAYERS)
+@cache_once
+def _init_baseline_comm() -> CustomAllReduceV2:
+    """Default (pull-mode) workspace for the serial baseline."""
+    cpu_group = _init_cpu_group()
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    comm = CustomAllReduceV2(cpu_group, device)
+    if comm.disabled:
+        raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
+    register_comm_cleanup(comm)
+    return comm
 
 
-def rmsnorm_baseline(
-    comm_,
+# ---------------------------------------------------------------------------
+# Implementations
+# ---------------------------------------------------------------------------
+
+
+def _rmsnorm_baseline(
+    comm: CustomAllReduceV2,
     q: torch.Tensor,
     k: torch.Tensor,
     q_weight: torch.Tensor,
@@ -106,65 +180,56 @@ def rmsnorm_baseline(
     from sglang.srt.models.minimax_m2 import rms_apply_serial, rms_sumsq_serial
 
     sum_sq = rms_sumsq_serial(q, k)
-    sum_sq = comm_.custom_all_reduce(sum_sq)
+    sum_sq = comm.custom_all_reduce(sum_sq)
     rms_apply_serial(q, k, q_weight, k_weight, sum_sq, world_size, EPS)
 
 
-def main():
-    args = parse_args()
-    rank, world_size, device, _, comm, comm_ = init_distributed()
-    torch.cuda.set_stream(torch.cuda.Stream())
+# ---------------------------------------------------------------------------
+# Benchmark
+# ---------------------------------------------------------------------------
 
-    if rank == 0:
-        print(
-            f"{'q_dim':>8} {'k_dim':>8} {'batch':>8} {'fused_us':>12} {'baseline_us':>12}"
-        )
 
-    for q_dim, k_dim in Q_K_DIMS:
-        local_q_dim = q_dim // world_size
-        local_k_dim = k_dim // world_size
-        for batch_size in BATCH_SIZES:
-            q = torch.randn(
-                NUM_LAYERS, batch_size, local_q_dim, device=device, dtype=DTYPE
-            )
-            k = torch.randn(
-                NUM_LAYERS, batch_size, local_k_dim, device=device, dtype=DTYPE
-            )
-            q_weight = torch.randn(NUM_LAYERS, local_q_dim, device=device, dtype=DTYPE)
-            k_weight = torch.randn(NUM_LAYERS, local_k_dim, device=device, dtype=DTYPE)
+@marker.parametrize("q_dim,k_dim", Q_K_DIMS)
+@marker.parametrize("batch_size", BATCH_SIZES)
+@marker.benchmark("provider", PROVIDERS)
+def benchmark(q_dim: int, k_dim: int, batch_size: int, provider: str):
+    cpu_group = _init_cpu_group()
+    gpu_group = _init_gpu_group()
+    world_size = dist.get_world_size(cpu_group)
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    local_q_dim = q_dim // world_size
+    local_k_dim = k_dim // world_size
 
-            def run_fused(i: int):
-                fused_parallel_qknorm(
-                    comm.obj,
-                    q[i],
-                    k[i],
-                    q_weight[i],
-                    k_weight[i],
-                    EPS,
-                )
+    q = torch.randn(batch_size, local_q_dim, device=device, dtype=DTYPE)
+    k = torch.randn(batch_size, local_k_dim, device=device, dtype=DTYPE)
+    q_weight = torch.randn(local_q_dim, device=device, dtype=DTYPE)
+    k_weight = torch.randn(local_k_dim, device=device, dtype=DTYPE)
 
-            def run_baseline(i: int):
-                rmsnorm_baseline(
-                    comm_,
-                    q[i],
-                    k[i],
-                    q_weight[i],
-                    k_weight[i],
-                    world_size,
-                )
+    if provider == "fused":
+        comm = _init_fused_comm()
 
-            fused_us = bench_one(run_fused, args.warmup, args.iters)
-            baseline_us = bench_one(run_baseline, args.warmup, args.iters)
+        def fn(q, k, q_weight, k_weight):
+            fused_parallel_qknorm(comm.obj, q, k, q_weight, k_weight, EPS)
 
-            if rank == 0:
-                print(
-                    f"{q_dim:8d} {k_dim:8d} {batch_size:8d} "
-                    f"{fused_us:12.1f} {baseline_us:12.1f}"
-                )
+    else:
+        comm = _init_baseline_comm()
 
-    comm.close()
-    dist.destroy_process_group()
+        def fn(q, k, q_weight, k_weight):
+            _rmsnorm_baseline(comm, q, k, q_weight, k_weight, world_size)
+
+    return marker.do_bench(
+        fn,
+        input_args=(q, k, q_weight, k_weight),
+        sync_multigpu_fn=lambda: dist.barrier(gpu_group),
+        memory_output=(q, k),  # NOTE: In-place updates on q, k;
+    )
 
 
 if __name__ == "__main__":
-    main()
+    multigpu_bench_main(
+        name=__name__,
+        file=__file__,
+        num_gpus=[2, 4, 8],  # NOTE: don't support other world size now
+        main_fn=benchmark.run,
+        pre_launch_fn=_precompile_kernels,
+    )

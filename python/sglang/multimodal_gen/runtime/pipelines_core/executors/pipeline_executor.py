@@ -71,9 +71,6 @@ class PipelineExecutor(ABC):
             stage, stage_index, batch, server_args
         )
 
-    def after_stage(self, stage_index: int) -> None:
-        self.component_residency_manager.after_stage(stage_index)
-
     def finish_component_residency_request(self) -> None:
         self.component_residency_manager.finish_request()
 
@@ -118,7 +115,6 @@ class PipelineExecutor(ABC):
             payload = self.run_stage_with_context(
                 stage, payload, server_args, run_stage
             )
-        self.after_stage(stage_index)
         return payload
 
     @staticmethod

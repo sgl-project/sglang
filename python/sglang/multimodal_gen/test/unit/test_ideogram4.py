@@ -34,8 +34,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     FP8_WEIGHT_DTYPE,
+    W8A8_FP8_GEMM_ENV,
     WeightOnlyFP8ColumnParallelLinear,
     WeightOnlyFP8Linear,
+    WeightOnlyFP8RowParallelLinear,
     dequantize_rowwise_fp8_weight,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
@@ -51,6 +53,7 @@ from sglang.multimodal_gen.runtime.loader.fsdp_load import (
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.ideogram import (
+    Ideogram4RowParallelLinear,
     Ideogram4Transformer2DModel,
 )
 from sglang.multimodal_gen.runtime.models.encoders.ideogram import (
@@ -761,7 +764,7 @@ class TestIdeogram4(unittest.TestCase):
             (1,),
         )
 
-    def test_ideogram_dit_tp_nvfp4_uses_column_parallel_quant_linears(self):
+    def test_ideogram_dit_tp_nvfp4_uses_megatron_parallel_quant_linears(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
 
         fake_tp_group = SimpleNamespace(world_size=2, rank_in_group=1)
@@ -801,7 +804,7 @@ class TestIdeogram4(unittest.TestCase):
         finally:
             set_global_server_args(prev_args)
 
-        self.assertTrue(model.layers[0].attention.qkv.gather_output)
+        self.assertFalse(model.layers[0].attention.qkv.gather_output)
         self.assertEqual(
             tuple(model.layers[0].attention.qkv.weight.shape), (6912, 2304)
         )
@@ -809,6 +812,14 @@ class TestIdeogram4(unittest.TestCase):
             model.layers[0].attention.qkv.quant_method,
             ModelOptFp4LinearMethod,
         )
+        self.assertIsInstance(model.layers[0].attention.o, Ideogram4RowParallelLinear)
+        self.assertTrue(model.layers[0].attention.o.input_is_parallel)
+        self.assertFalse(model.layers[0].feed_forward.w1.gather_output)
+        self.assertFalse(model.layers[0].feed_forward.w3.gather_output)
+        self.assertIsInstance(
+            model.layers[0].feed_forward.w2, Ideogram4RowParallelLinear
+        )
+        self.assertTrue(model.layers[0].feed_forward.w2.input_is_parallel)
 
     def test_bitsandbytes_tp_quant_state_uses_local_output_shard(self):
         param = torch.nn.Parameter(
@@ -909,6 +920,24 @@ class TestIdeogram4(unittest.TestCase):
         self.assertEqual(model.weight.dtype, FP8_WEIGHT_DTYPE)
         self.assertEqual(model.weight_scale.dtype, torch.float32)
 
+    def test_weight_only_fp8_w8a8_gemm_defaults_to_off(self):
+        with patch.dict(os.environ, {W8A8_FP8_GEMM_ENV: "0"}):
+            model = WeightOnlyFP8Linear(3, 2, bias=False)
+
+        self.assertFalse(model.enable_fused_w8a8)
+
+    def test_weight_only_fp8_w8a8_gemm_env_opt_in(self):
+        with patch.dict(os.environ, {W8A8_FP8_GEMM_ENV: "1"}):
+            model = WeightOnlyFP8Linear(3, 2, bias=False)
+
+        self.assertTrue(model.enable_fused_w8a8)
+
+    def test_weight_only_fp8_w8a8_gemm_explicit_flag_overrides_env(self):
+        with patch.dict(os.environ, {W8A8_FP8_GEMM_ENV: "1"}):
+            model = WeightOnlyFP8Linear(3, 2, bias=False, enable_fused_w8a8=False)
+
+        self.assertFalse(model.enable_fused_w8a8)
+
     def test_ideogram_text_encoder_post_config_hook_preserves_local_arch(self):
         config = Ideogram4TextEncoderConfig()
         config.arch_config.architectures = ["RemoteQwen3VLTextModel"]
@@ -961,18 +990,25 @@ class TestIdeogram4(unittest.TestCase):
             set_global_server_args(
                 SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
             )
-            with torch.device("meta"):
+            with (
+                patch.dict(os.environ, {W8A8_FP8_GEMM_ENV: "1"}),
+                torch.device("meta"),
+            ):
                 encoder = IdeogramQwen3VLTextEncoder(config)
         finally:
             set_global_server_args(prev_args)
-        self.assertTrue(
-            any(isinstance(module, WeightOnlyFP8Linear) for module in encoder.modules())
-        )
+        fp8_linears = [
+            module
+            for module in encoder.modules()
+            if isinstance(module, WeightOnlyFP8Linear)
+        ]
+        self.assertTrue(fp8_linears)
+        self.assertTrue(all(not module.enable_fused_w8a8 for module in fp8_linears))
         self.assertFalse(
             any(isinstance(module, torch.nn.Linear) for module in encoder.modules())
         )
 
-    def test_ideogram_text_encoder_tp_fp8_uses_column_parallel_linears(self):
+    def test_ideogram_text_encoder_tp_fp8_uses_megatron_parallel_linears(self):
         config = Ideogram4TextEncoderConfig()
         config.post_diffusers_config_update()
         config.arch_config.text_config = Qwen3VLTextConfig(
@@ -1018,12 +1054,18 @@ class TestIdeogram4(unittest.TestCase):
         self.assertEqual(layer.self_attn.num_key_value_heads, 2)
         self.assertIsInstance(layer.self_attn.q_proj, WeightOnlyFP8ColumnParallelLinear)
         self.assertFalse(layer.self_attn.q_proj.gather_output)
-        self.assertTrue(layer.self_attn.o_proj.gather_output)
+        self.assertIsInstance(layer.self_attn.o_proj, WeightOnlyFP8RowParallelLinear)
+        self.assertTrue(layer.self_attn.o_proj.input_is_parallel)
+        self.assertTrue(layer.self_attn.o_proj.reduce_results)
         self.assertIsInstance(layer.mlp.gate_proj, WeightOnlyFP8ColumnParallelLinear)
         self.assertFalse(layer.mlp.gate_proj.gather_output)
-        self.assertTrue(layer.mlp.down_proj.gather_output)
+        self.assertIsInstance(layer.mlp.up_proj, WeightOnlyFP8ColumnParallelLinear)
+        self.assertFalse(layer.mlp.up_proj.gather_output)
+        self.assertIsInstance(layer.mlp.down_proj, WeightOnlyFP8RowParallelLinear)
+        self.assertTrue(layer.mlp.down_proj.input_is_parallel)
+        self.assertTrue(layer.mlp.down_proj.reduce_results)
 
-    def test_denoise_and_decode_shape_smoke(self):
+    def test_denoise_and_decode_shape_check(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
 
         cfg = Ideogram4PipelineConfig()

@@ -8,12 +8,14 @@ from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
     PhaseConfig,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
+from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -21,7 +23,7 @@ from sglang.test.test_utils import (
 )
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cpu_ci(est_time=12, suite="base-b-test-cpu")
+register_cpu_ci(est_time=12, suite="base-c-test-cpu")
 
 # Mock get_device() so all tests run on CPU-only CI runners
 _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
@@ -43,6 +45,66 @@ class TestPrepareServerArgs(CustomTestCase):
             json.loads(server_args.json_model_override_args),
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
+
+    def test_config_nested_dict_args_are_json(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("mm-process-config:\n  image:\n    resize: 128\n")
+            config_file = f.name
+
+        try:
+            parser = server_args_module.argparse.ArgumentParser()
+            ServerArgs.add_cli_args(parser)
+            merged = ConfigArgumentMerger(parser).merge_config_with_args(
+                [
+                    "--config",
+                    config_file,
+                    "--model-path",
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                ]
+            )
+            value = merged[merged.index("--mm-process-config") + 1]
+            parsed = parser.parse_args(merged)
+
+            self.assertEqual(json.loads(value), {"image": {"resize": 128}})
+            self.assertEqual(parsed.mm_process_config, {"image": {"resize": 128}})
+        finally:
+            os.unlink(config_file)
+
+
+class TestMambaCacheStochasticRounding(unittest.TestCase):
+    def test_rejects_fp32_ssm_cache(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="float32",
+            enable_mamba_cache_stochastic_rounding=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "--mamba-ssm-dtype float16"):
+            server_args._handle_mamba_backend()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_rejects_non_cuda(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="float16",
+            enable_mamba_cache_stochastic_rounding=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "NVIDIA CUDA"):
+            server_args._handle_mamba_backend()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    def test_rejects_triton_without_sm100(self, _mock_sm100, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="float16",
+            mamba_backend="triton",
+            enable_mamba_cache_stochastic_rounding=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires SM100"):
+            server_args._handle_mamba_backend()
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
@@ -84,7 +146,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertFalse(server_args.disable_radix_cache)
 
-    def test_pd_decode_radix_cache_rejects_unknown_backend(self):
+    def test_pd_decode_radix_cache_rejects_fake_backend(self):
         with self.assertRaises(ValueError) as context:
             ServerArgs(
                 model_path="dummy",
@@ -93,8 +155,365 @@ class TestLoadBalanceMethod(unittest.TestCase):
                 disaggregation_transfer_backend="fake",
             )
 
-        self.assertIn("('nixl', 'mooncake')", str(context.exception))
-        self.assertIn("'fake'", str(context.exception))
+        self.assertIn(
+            "--disaggregation-decode-enable-radix-cache is incompatible "
+            "with --disaggregation-transfer-backend fake",
+            str(context.exception),
+        )
+
+    def test_pd_decode_radix_cache_allows_ascend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="ascend",
+        )
+
+        self.assertFalse(server_args.disable_radix_cache)
+
+    def test_pd_decode_radix_cache_allows_mooncake_tcp(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="mooncake_tcp",
+        )
+
+        self.assertFalse(server_args.disable_radix_cache)
+        self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
+
+
+class TestHiSparseDsaBackendPolicy(unittest.TestCase):
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_hisparse_defaults_to_flashmla_sparse_on_cuda_bfloat16(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+
+        server_args._set_default_dsa_backends(kv_cache_dtype="bfloat16", major=9)
+
+        self.assertEqual(server_args.dsa_prefill_backend, "flashmla_sparse")
+        self.assertEqual(server_args.dsa_decode_backend, "flashmla_sparse")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_hisparse_defaults_to_flashmla_kv_on_cuda_fp8(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+
+        server_args._set_default_dsa_backends(kv_cache_dtype="fp8_e4m3", major=9)
+
+        self.assertEqual(server_args.dsa_prefill_backend, "flashmla_kv")
+        self.assertEqual(server_args.dsa_decode_backend, "flashmla_kv")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_defaults_to_tilelang_on_rocm(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+
+        server_args._set_default_dsa_backends(kv_cache_dtype="bfloat16", major=9)
+
+        self.assertEqual(server_args.dsa_prefill_backend, "tilelang")
+        self.assertEqual(server_args.dsa_decode_backend, "tilelang")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_preserves_rocm_user_backend_and_defaults_missing_side(
+        self, _mock_is_hip
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            dsa_prefill_backend="tilelang",
+        )
+
+        server_args._set_default_dsa_backends(kv_cache_dtype="bfloat16", major=9)
+
+        self.assertEqual(server_args.dsa_prefill_backend, "tilelang")
+        self.assertEqual(server_args.dsa_decode_backend, "tilelang")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_accepts_aiter_backend_on_rocm(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="bfloat16",
+            dsa_prefill_backend="aiter",
+            dsa_decode_backend="aiter",
+        )
+
+        server_args._validate_hisparse_dsa_backend("dsa_prefill_backend", "prefill")
+        server_args._validate_hisparse_dsa_backend("dsa_decode_backend", "decode")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_rejects_cuda_backend_on_rocm(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="bfloat16",
+            dsa_prefill_backend="flashmla_sparse",
+        )
+
+        with self.assertRaisesRegex(ValueError, "tilelang"):
+            server_args._validate_hisparse_dsa_backend("dsa_prefill_backend", "prefill")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_hisparse_rejects_rocm_backend_on_cuda(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="bfloat16",
+            dsa_decode_backend="tilelang",
+        )
+
+        with self.assertRaisesRegex(ValueError, "flashmla_sparse"):
+            server_args._validate_hisparse_dsa_backend("dsa_decode_backend", "decode")
+
+    def test_hisparse_accepts_bfloat16_kv_cache_dtype(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="bfloat16",
+        )
+
+        server_args._validate_hisparse_kv_cache_dtype()
+
+    def test_hisparse_accepts_fp8_e4m3_kv_cache_dtype(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="fp8_e4m3",
+        )
+
+        server_args._validate_hisparse_kv_cache_dtype()
+
+    def test_hisparse_rejects_unsupported_kv_cache_dtype(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="float16",
+        )
+
+        with self.assertRaisesRegex(ValueError, r"fp8_e4m3"):
+            server_args._validate_hisparse_kv_cache_dtype()
+
+
+class TestFa4PageSizeAutoForce(CustomTestCase):
+    """FA4 requires page_size 128 for non-MLA models on SM100. The auto-force
+    must trigger for `--attention-backend fa4` (combined) too, not only for the
+    explicit `--prefill-attention-backend fa4` path."""
+
+    def _make_args(self, attention_backend, prefill=None, decode=None, page_size=1):
+        args = ServerArgs(model_path="dummy")
+        args.attention_backend = attention_backend
+        args.prefill_attention_backend = prefill
+        args.decode_attention_backend = decode
+        args.page_size = page_size
+        # Short-circuit get_model_config(): the fa4 page_size branch only needs
+        # use_mla_backend() (mocked) and is_sm100_supported() (mocked), not a
+        # real model_config. Pre-set the attribute so get_model_config returns
+        # early without touching ModelConfig.from_server_args.
+        args.model_config = MagicMock()
+        args.model_config.hf_config.dual_chunk_attention_config = None
+        return args
+
+    @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
+    def test_combined_attention_backend_fa4_forces_page_size_128(
+        self, _mock_mla, _mock_sm100
+    ):
+        # `--attention-backend fa4` (combined): prefill/decode fields stay None.
+        args = self._make_args(attention_backend="fa4")
+
+        args._handle_attention_backend_compatibility()
+
+        self.assertEqual(args.page_size, 128)
+
+    @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
+    def test_explicit_prefill_fa4_forces_page_size_128(self, _mock_mla, _mock_sm100):
+        # `--prefill-attention-backend fa4`: the previously-covered path.
+        args = self._make_args(attention_backend=None, prefill="fa4", page_size=1)
+
+        args._handle_attention_backend_compatibility()
+
+        self.assertEqual(args.page_size, 128)
+
+
+class TestContextParallelServerArgs(CustomTestCase):
+    def setUp(self):
+        self.parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(self.parser)
+
+    def _new_cp_args(self, **overrides):
+        server_args = object.__new__(ServerArgs)
+        defaults = dict(
+            enable_prefill_context_parallel=False,
+            enable_dsa_prefill_context_parallel=False,
+            enable_prefill_cp=False,
+            cp_strategy=None,
+            model_path="instance://127.0.0.1:8000/dummy",
+            dsa_prefill_cp_mode="round-robin-split",
+            prefill_cp_mode="in-seq-split",
+            attn_cp_size=1,
+            tp_size=1,
+            dp_size=1,
+            moe_dp_size=1,
+            ep_size=1,
+            pp_size=1,
+            enable_aiter_allreduce_fusion=False,
+        )
+        defaults.update(overrides)
+        for key, value in defaults.items():
+            setattr(server_args, key, value)
+        return server_args
+
+    def test_canonical_prefill_cp_cli_sets_unified_fields(self):
+        args = self.parser.parse_args(
+            ["--model", "dummy", "--enable-prefill-cp", "--cp-strategy", "interleave"]
+        )
+
+        self.assertTrue(args.enable_prefill_cp)
+        self.assertEqual(args.cp_strategy, "interleave")
+
+    def test_canonical_prefill_cp_requires_strategy(self):
+        args = self.parser.parse_args(["--model", "dummy", "--enable-prefill-cp"])
+
+        self.assertTrue(args.enable_prefill_cp)
+        self.assertIsNone(args.cp_strategy)
+
+        server_args = self._new_cp_args(
+            enable_prefill_cp=args.enable_prefill_cp,
+            cp_strategy=args.cp_strategy,
+        )
+        with self.assertRaisesRegex(ValueError, "--cp-strategy"):
+            server_args._handle_context_parallelism()
+
+    def test_deprecated_dsa_cp_mode_maps_to_unified_strategy(self):
+        args = self.parser.parse_args(
+            [
+                "--model",
+                "dummy",
+                "--enable-dsa-prefill-context-parallel",
+                "--dsa-prefill-cp-mode",
+                "round-robin-split",
+            ]
+        )
+        server_args = self._new_cp_args(
+            enable_dsa_prefill_context_parallel=(
+                args.enable_dsa_prefill_context_parallel
+            ),
+            dsa_prefill_cp_mode=args.dsa_prefill_cp_mode,
+        )
+
+        server_args._handle_legacy_cp_arguments()
+
+        self.assertTrue(server_args.enable_prefill_cp)
+        self.assertEqual(server_args.cp_strategy, "interleave")
+        self.assertEqual(server_args.dsa_prefill_cp_mode, "round-robin-split")
+
+    def test_canonical_interleave_cp_mirrors_to_dsa_runtime_aliases(self):
+        server_args = self._new_cp_args(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            attention_backend="dsa",
+        )
+
+        server_args._handle_legacy_cp_arguments()
+        server_args._handle_context_parallelism()
+
+        self.assertTrue(server_args.enable_dsa_prefill_context_parallel)
+        self.assertFalse(server_args.enable_prefill_context_parallel)
+        self.assertEqual(server_args.dsa_prefill_cp_mode, "round-robin-split")
+        self.assertEqual(server_args.prefill_cp_mode, "round-robin-split")
+
+    def test_context_parallel_handler_initializes_cp_strategy(self):
+        server_args = self._new_cp_args(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            attn_cp_size=2,
+            tp_size=2,
+        )
+
+        server_args._handle_context_parallelism()
+
+        self.assertTrue(is_cp_enabled())
+        self.assertTrue(is_interleave())
+
+    def test_registered_cp_legacy_args_map_to_unified_strategy(self):
+        cases = [
+            (
+                "deepseek_v3_mla_cp",
+                dict(enable_prefill_context_parallel=True),
+                "zigzag",
+                "in-seq-split",
+                False,
+                True,
+            ),
+            (
+                "qwen3_gqa_cp",
+                dict(
+                    enable_prefill_context_parallel=True,
+                    tp_size=4,
+                    attn_cp_size=2,
+                ),
+                "zigzag",
+                "in-seq-split",
+                False,
+                True,
+            ),
+            (
+                "deepseek_v32_dsa_in_seq_split",
+                dict(
+                    enable_dsa_prefill_context_parallel=True,
+                    dsa_prefill_cp_mode="in-seq-split",
+                    tp_size=8,
+                    dp_size=2,
+                    attn_cp_size=4,
+                ),
+                "zigzag",
+                "in-seq-split",
+                True,
+                False,
+            ),
+            (
+                "deepseek_v32_dsa_round_robin_split",
+                dict(
+                    enable_dsa_prefill_context_parallel=True,
+                    tp_size=8,
+                    attn_cp_size=8,
+                ),
+                "interleave",
+                "round-robin-split",
+                True,
+                False,
+            ),
+            (
+                "deepseek_v4_flash_fp4_b200_dsa_round_robin_split",
+                dict(
+                    enable_dsa_prefill_context_parallel=True,
+                    dsa_prefill_cp_mode="round-robin-split",
+                    tp_size=4,
+                    attn_cp_size=4,
+                ),
+                "interleave",
+                "round-robin-split",
+                True,
+                False,
+            ),
+        ]
+
+        for name, overrides, strategy, mode, expect_dsa, expect_generic in cases:
+            with self.subTest(name=name):
+                server_args = self._new_cp_args(**overrides)
+
+                server_args._handle_legacy_cp_arguments()
+                server_args._handle_context_parallelism()
+
+                self.assertTrue(server_args.enable_prefill_cp)
+                self.assertEqual(server_args.cp_strategy, strategy)
+                self.assertEqual(server_args.dsa_prefill_cp_mode, mode)
+                self.assertEqual(server_args.prefill_cp_mode, mode)
+                self.assertEqual(
+                    server_args.enable_dsa_prefill_context_parallel, expect_dsa
+                )
+                self.assertEqual(
+                    server_args.enable_prefill_context_parallel, expect_generic
+                )
 
 
 class TestPortArgs(unittest.TestCase):
@@ -134,6 +553,52 @@ class TestPortArgs(unittest.TestCase):
         self.assertTrue(port_args.scheduler_input_ipc_name.startswith("ipc://"))
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("ipc://"))
         self.assertIsInstance(port_args.nccl_port, int)
+
+    @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
+    def test_init_new_builds_decoupled_spec_ipc_config(self, mock_temp_file):
+        mock_temp_file.return_value.name = "temp_file"
+
+        server_args = ServerArgs(model_path="dummy")
+        server_args.nccl_port = None
+        server_args.enable_dp_attention = False
+        server_args.decoupled_spec_role = "verifier"
+        server_args.decoupled_spec_bind_endpoint = "ipc:///tmp/v"
+        server_args.decoupled_spec_connect_endpoints = ["ipc:///tmp/d"]
+        server_args.decoupled_spec_rank = 0
+
+        port_args = PortArgs.init_new(server_args)
+
+        self.assertIsNotNone(port_args.decoupled_spec_ipc_config)
+        self.assertEqual(port_args.decoupled_spec_ipc_config.rank, 0)
+        self.assertEqual(
+            port_args.decoupled_spec_ipc_config.bind_endpoint, "ipc:///tmp/v"
+        )
+        self.assertEqual(
+            port_args.decoupled_spec_ipc_config.connect_endpoints, ("ipc:///tmp/d",)
+        )
+
+    @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
+    def test_init_new_no_decoupled_config_when_role_null(self, mock_temp_file):
+        mock_temp_file.return_value.name = "temp_file"
+
+        server_args = ServerArgs(model_path="dummy")
+        server_args.nccl_port = None
+        server_args.enable_dp_attention = False
+        # decoupled_spec_role defaults to "null"
+
+        port_args = PortArgs.init_new(server_args)
+
+        self.assertIsNone(port_args.decoupled_spec_ipc_config)
+
+    def test_init_new_decoupled_role_requires_endpoints(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.nccl_port = None
+        server_args.enable_dp_attention = False
+        server_args.decoupled_spec_role = "drafter"
+        # endpoints intentionally left as their None defaults
+
+        with self.assertRaises(ValueError):
+            PortArgs.init_new(server_args)
 
     def test_init_new_with_single_node_dp_attention(self):
 
@@ -404,6 +869,14 @@ class TestHiCacheArgs(unittest.TestCase):
     def test_hicache_io_backend_and_mem_layout_compatibility(self):
         cases = [
             {
+                "name": "default_kernel_page_first",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+            {
                 "name": "kernel_with_page_first_direct",
                 "overrides": {
                     "enable_hierarchical_cache": True,
@@ -443,8 +916,9 @@ class TestHiCacheArgs(unittest.TestCase):
                     "attention_backend": "triton",
                     "decode_attention_backend": "fa3",
                 },
-                "expected_io_backend": "direct",
-                "expected_mem_layout": "page_first_direct",
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+                "expected_decode_backend": "fa3",
             },
         ]
 
@@ -456,13 +930,10 @@ class TestHiCacheArgs(unittest.TestCase):
                     args,
                     expected_io_backend=case["expected_io_backend"],
                     expected_mem_layout=case["expected_mem_layout"],
+                    expected_decode_backend=case.get("expected_decode_backend"),
                 )
 
-    @patch.object(ServerArgs, "use_mla_backend", return_value=False)
-    @patch("sglang.srt.server_args.is_flashinfer_available", return_value=False)
-    def test_decode_attention_backend_with_implicit_fa3(
-        self, _mock_flashinfer, _mock_use_mla_backend
-    ):
+    def test_hicache_kernel_keeps_implicit_fa3_decode_backend(self):
         args = self._make_args(
             enable_hierarchical_cache=True,
             hicache_io_backend="kernel",
@@ -472,7 +943,9 @@ class TestHiCacheArgs(unittest.TestCase):
 
         args._handle_hicache()
 
-        self.assertEqual(args.decode_attention_backend, "triton")
+        self.assertEqual(args.hicache_io_backend, "kernel")
+        self.assertEqual(args.hicache_mem_layout, "page_first")
+        self.assertIsNone(args.decode_attention_backend)
 
 
 class TestNgramExternalSamArgs(CustomTestCase):
@@ -526,6 +999,86 @@ class TestNgramExternalSamArgs(CustomTestCase):
         with self.assertRaises(ValueError) as context:
             handle_speculative_decoding(args)
         self.assertIn("external-corpus-max-tokens", str(context.exception))
+
+
+class TestDecoupledSpecArgs(CustomTestCase):
+    """Decoupled speculative-decoding CLI flags.
+
+    These flags are auto-derived from the ``A[...]`` field metadata on
+    ``ServerArgs``; a bare annotation is silently skipped by
+    ``add_cli_args_from_dataclass``. This guards against the regression where
+    the flags went missing (e.g. after rebasing onto the auto-gen
+    ``add_cli_args``), which the direct-attribute ``PortArgs`` tests cannot
+    catch because they never exercise the CLI.
+    """
+
+    def test_decoupled_spec_cli_flags_round_trip(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--decoupled-spec-role",
+                "verifier",
+                "--decoupled-spec-bind-endpoint",
+                "ipc:///tmp/v",
+                "--decoupled-spec-connect-endpoints",
+                '["ipc:///tmp/d"]',
+                "--decoupled-spec-rank",
+                "0",
+                "--spec-trace-dir",
+                "/tmp/tr",
+            ]
+        )
+        self.assertEqual(server_args.decoupled_spec_role, "verifier")
+        self.assertEqual(server_args.decoupled_spec_bind_endpoint, "ipc:///tmp/v")
+        self.assertEqual(server_args.decoupled_spec_connect_endpoints, ["ipc:///tmp/d"])
+        self.assertEqual(server_args.decoupled_spec_rank, 0)
+        self.assertEqual(server_args.spec_trace_dir, "/tmp/tr")
+
+    def test_decoupled_spec_role_defaults_to_null(self):
+        server_args = prepare_server_args(["--model-path", "dummy"])
+        self.assertEqual(server_args.decoupled_spec_role, "null")
+        self.assertIsNone(server_args.decoupled_spec_bind_endpoint)
+        self.assertIsNone(server_args.decoupled_spec_connect_endpoints)
+        self.assertIsNone(server_args.decoupled_spec_rank)
+
+    def test_decoupled_spec_role_rejects_invalid_choice(self):
+        with self.assertRaises(SystemExit):
+            prepare_server_args(
+                ["--model-path", "dummy", "--decoupled-spec-role", "bogus"]
+            )
+
+
+class TestAdaptiveSpecArgs(CustomTestCase):
+    def test_adaptive_defaults_to_config_step_when_spec_params_omitted(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "1": {"candidate_steps": [1, 3, 5]},
+                    "8": {"candidate_steps": [1]},
+                },
+                f,
+            )
+            f.flush()
+
+            args = ServerArgs(model_path="dummy")
+            args.speculative_algorithm = "EAGLE"
+            args.speculative_adaptive = True
+            args.speculative_adaptive_config = f.name
+            args.device = "cuda"
+            args.get_model_config = lambda: SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["LlamaForCausalLM"],
+                    get_text_config=lambda: SimpleNamespace(),
+                )
+            )
+
+            handle_speculative_decoding(args)
+
+        self.assertTrue(args.speculative_adaptive)
+        self.assertEqual(args.speculative_eagle_topk, 1)
+        self.assertEqual(args.speculative_num_steps, 3)
+        self.assertEqual(args.speculative_num_draft_tokens, 4)
 
 
 class TestDeepEPWaterfillArgs(CustomTestCase):
@@ -615,7 +1168,7 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             ServerArgs(**self._base_kwargs(attn_cp_size=2, tp_size=2))
 
     def test_rejects_prefill_context_parallel(self):
-        with self.assertRaisesRegex(ValueError, "--enable-prefill-context-parallel"):
+        with self.assertRaisesRegex(ValueError, "--enable-prefill-cp"):
             ServerArgs(**self._base_kwargs(enable_prefill_context_parallel=True))
 
     def test_rejects_hisparse(self):
@@ -627,20 +1180,17 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             ServerArgs(**self._base_kwargs(kv_cache_dtype="fp4_e2m1"))
 
 
+class TestSessionRadixCacheServerArgs(unittest.TestCase):
+    def test_requires_priority_radix_eviction_policy(self):
+        with self.assertRaisesRegex(ValueError, "--radix-eviction-policy priority"):
+            ServerArgs(
+                model_path="dummy",
+                enable_session_radix_cache=True,
+                radix_eviction_policy="lru",
+            )
+
+
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):
-    def test_overlap_force_cpu_seq_lens_with_tc_piecewise_prefill(self):
-        from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
-
-        server_args = SimpleNamespace(
-            enable_two_batch_overlap=False,
-            cuda_graph_config=CudaGraphConfig(
-                prefill=PhaseConfig(backend=Backend.TC_PIECEWISE)
-            ),
-        )
-        attn_backend = SimpleNamespace(needs_cpu_seq_lens=False)
-
-        self.assertTrue(decide_needs_cpu_seq_lens(server_args, [attn_backend]))
-
     @patch(
         "sglang.srt.model_executor.runner_backend."
         "tc_piecewise_cuda_graph_backend.get_moe_a2a_backend"

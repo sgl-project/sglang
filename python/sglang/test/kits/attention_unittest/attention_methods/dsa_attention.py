@@ -6,7 +6,6 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
-from sglang.srt.layers.attention.dsa import utils as _dsa_utils
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -17,6 +16,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 
 from ..mock_server_args import make_mock_server_args
@@ -37,8 +37,8 @@ from .dense_attention import (
 
 # Unit tests run without distributed initialization. DSA context-parallel probes
 # should see the single-rank default.
-_dsa_utils.get_attention_cp_size = lambda: 1
-_dsa_utils.get_attention_cp_rank = lambda: 0
+_parallel_override = get_parallel().override(attn_cp_size=1, attn_cp_rank=0)
+_parallel_override.__enter__()
 
 DSA_PAGE_SIZE = 64
 DSA_INDEX_HEAD_DIM = 128
@@ -242,6 +242,7 @@ class TinyDSAModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = False
         self.attention_chunk_size = None
         self.sliding_window_size = None
@@ -294,8 +295,9 @@ class DSAMockModelRunner(ModelRunner):
         # `kAlignedBatchSize=0U`, which fails to compile. We auto-derive
         # the draft-token count from `case.extend_lens` so the
         # speculative paths produce a non-empty `seqlens_expanded`.
-        if case.forward_mode.is_target_verify() or case.forward_mode.is_draft_extend(
-            include_v2=True
+        if (
+            case.forward_mode.is_target_verify()
+            or case.forward_mode.is_draft_extend_v2()
         ):
             spec_num_draft_tokens = max(case.extend_lens) if case.extend_lens else 1
         else:
@@ -305,6 +307,7 @@ class DSAMockModelRunner(ModelRunner):
         self.page_size = case.page_size
         self.model_config = model_config
         self.tp_size = 1
+        self._kernel_warmed_up = True
         self.dp_size = 1
         self.pp_size = 1
         self.server_args = make_mock_server_args(
@@ -1463,7 +1466,7 @@ def run_dsa_sparse_speculative_forward_mode_case(
 ) -> None:
     """Run a sparse case with a speculative forward mode (TARGET_VERIFY,
     DRAFT_EXTEND, or DRAFT_EXTEND_V2). DSA dispatches both
-    `is_target_verify()` and `is_draft_extend(include_v2=True)` through
+    `is_target_verify()` and `is_draft_extend_v2()` through
     `dsa_decode_impl` (`dsa_backend.py:1352-1358`), so the kernel
     selection matches plain DECODE but `seqlens_expanded` is computed
     differently per forward mode (`dsa_backend.py:469-529`).
@@ -1472,8 +1475,7 @@ def run_dsa_sparse_speculative_forward_mode_case(
     speculative modes so deep_gemm's `paged_mqa_logits_metadata` JIT
     compiles with a non-zero `kAlignedBatchSize`."""
     if not (
-        case.forward_mode.is_target_verify()
-        or case.forward_mode.is_draft_extend(include_v2=True)
+        case.forward_mode.is_target_verify() or case.forward_mode.is_draft_extend_v2()
     ):
         raise ValueError(
             "run_dsa_sparse_speculative_forward_mode_case expects a "
