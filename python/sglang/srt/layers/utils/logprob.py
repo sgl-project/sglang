@@ -114,6 +114,11 @@ def get_token_ids_logprobs_raw(
                 vals.append([])
                 idxs.append([])
                 continue
+            if token_ids is None:
+                vals.append([])
+                idxs.append([])
+                pt += pruned_len
+                continue
             token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
                 logprobs.device, non_blocking=True
             )
