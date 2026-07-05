@@ -143,7 +143,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         model_block_size = int(
             getattr(self.draft_model, "block_size", requested_block_size)
         )
-        if model_block_size != requested_block_size:
+        if self._is_tp0() and model_block_size != requested_block_size:
             logger.warning(
                 "DSpark block size mismatch: using speculative_num_draft_tokens=%s "
                 "but draft model block_size=%s.",
@@ -212,7 +212,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._stacked_wqkv_out_sizes: list[int] = []
         self._init_fp8_wqkv_stack()
 
-        if self.tp_rank == 0:
+        if self._is_tp0():
             logger.info(
                 "Initialized DSpark draft runner. model=%s, block_size=%s, "
                 "num_dspark_layers=%s, noise_token_id=%s, markov_rank=%s, "
@@ -224,6 +224,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self.markov_rank,
                 self.confidence_threshold,
             )
+
+    def _is_tp0(self) -> bool:
+        return self.tp_rank == 0
 
     def _init_fp8_wqkv_stack(self) -> None:
         if not envs.SGLANG_DSPARK_FP8_WQKV_STACK.get():
@@ -335,7 +338,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._stacked_wqkv_kv_offsets = kv_offsets
         self._stacked_wqkv_out_sizes = out_sizes
 
-        if self.tp_rank == 0:
+        if self._is_tp0():
             logger.info(
                 "Enabled DSpark FP8 wqkv stack. layers=%s, weight_shape=%s, "
                 "scale_shape=%s, scale_name=%s, kv_offsets=%s, "
@@ -348,7 +351,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
     def _log_fp8_wqkv_stack_disabled(self, reason: str) -> None:
-        if self.tp_rank == 0:
+        if self._is_tp0():
             logger.warning("DSpark FP8 wqkv stack disabled: %s", reason)
 
     @staticmethod
@@ -588,11 +591,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 projected=projected,
             )
         except Exception as e:
-            logger.warning(
-                "DSpark draft compressor materialization failed; "
-                "skip compressor materialization for this call: %s",
-                e,
-            )
+            if self._is_tp0():
+                logger.warning(
+                    "DSpark draft compressor materialization failed; "
+                    "skip compressor materialization for this call: %s",
+                    e,
+                )
         if kv_main_hidden is None:
             kv_main_hidden = main_hidden
         self._materialize_main_hidden_to_draft_kv(
@@ -745,6 +749,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         if hidden.dim() != 2:
             return
         if hidden.shape[0] != bs:
+            if not self._is_tp0():
+                return
             logger.warning(
                 "Skip DSpark PD hidden bootstrap due to shape mismatch: "
                 "hidden_shape=%s bs=%s",
@@ -754,6 +760,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
         expected_hidden_size = self._get_target_aux_hidden_size()
         if expected_hidden_size and hidden.shape[-1] != expected_hidden_size:
+            if not self._is_tp0():
+                return
             logger.warning(
                 "Skip DSpark PD hidden bootstrap due to hidden size mismatch: "
                 "hidden_size=%s expected=%s",
@@ -1726,6 +1734,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             ):
                 self._accept_anomaly_dumped.add(key)
                 self._accept_anomaly_dump_count += 1
+                if not self._is_tp0():
+                    continue
                 kv_debug = self._build_accept_anomaly_kv_debug(
                     req_pool_idx=int(req_pool_idx),
                     prefix_len=int(seq_lens[i]),
@@ -1863,7 +1873,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
-            and self.tp_rank == 0
+            and self._is_tp0()
             and not getattr(self, "_warned_sampling", False)
         ):
             self._warned_sampling = True
@@ -1949,17 +1959,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._accept_anomaly_enabled and not torch.equal(
             draft_seq_lens, prefix_lens_tensor
         ):
-            logger.warning(
-                "DSpark prefill materialize prefix mismatch: prefix_lens=%s "
-                "seq_lens_minus_extend=%s extend_lens=%s seq_lens=%s",
-                [int(x) for x in prefix_lens_tensor.detach().cpu().tolist()],
-                [int(x) for x in draft_seq_lens.detach().cpu().tolist()],
-                [int(x) for x in ctx_lens.detach().cpu().tolist()],
-                [
-                    int(x)
-                    for x in model_worker_batch.seq_lens.detach().cpu().tolist()
-                ],
-            )
+            if self._is_tp0():
+                logger.warning(
+                    "DSpark prefill materialize prefix mismatch: prefix_lens=%s "
+                    "seq_lens_minus_extend=%s extend_lens=%s seq_lens=%s",
+                    [int(x) for x in prefix_lens_tensor.detach().cpu().tolist()],
+                    [int(x) for x in draft_seq_lens.detach().cpu().tolist()],
+                    [int(x) for x in ctx_lens.detach().cpu().tolist()],
+                    [
+                        int(x)
+                        for x in model_worker_batch.seq_lens.detach().cpu().tolist()
+                    ],
+                )
         positions, _ = compute_position(
             self.model_runner.server_args.attention_backend,
             draft_seq_lens,
@@ -2161,10 +2172,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             except Exception as e:
                 self._use_triton_accept_bonus = False
-                logger.warning(
-                    "DSPARK Triton accept/bonus failed; falling back to eager path: %s",
-                    e,
-                )
+                if self._is_tp0():
+                    logger.warning(
+                        "DSPARK Triton accept/bonus failed; "
+                        "falling back to eager path: %s",
+                        e,
+                    )
                 commit_lens, bonus_tokens, out_tokens = self._compute_accept_bonus_eager(
                     candidates=candidates,
                     target_predict=target_predict,
