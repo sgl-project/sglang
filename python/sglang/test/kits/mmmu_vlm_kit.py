@@ -7,8 +7,8 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
-from sglang.srt.utils.common import temp_set_env
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.common import temp_set_env
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
