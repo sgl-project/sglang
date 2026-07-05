@@ -1046,6 +1046,7 @@ class QwenImageTransformerBlock(nn.Module):
         index: Optional[torch.Tensor] = None,
         gate_x: Optional[torch.Tensor] = None,
         residual_x: Optional[torch.Tensor] = None,
+        use_bcg_helpers: bool = False,
     ) -> Union[
         Tuple[torch.Tensor, torch.Tensor],
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -1107,19 +1108,31 @@ class QwenImageTransformerBlock(nn.Module):
             scale_result = scale.unsqueeze(1)
             gate_result = gate.unsqueeze(1)
         if is_scale_residual:
-            modulated, residual_out = self._scale_residual_norm_scale_shift(
-                norm_module,
-                residual=residual_x,
-                x=x,
-                gate=gate_x,
-                shift=shift_result,
-                scale=scale_result,
-            )
+            if use_bcg_helpers:
+                modulated, residual_out = self._scale_residual_norm_scale_shift(
+                    norm_module,
+                    residual=residual_x,
+                    x=x,
+                    gate=gate_x,
+                    shift=shift_result,
+                    scale=scale_result,
+                )
+            else:
+                modulated, residual_out = norm_module(
+                    residual=residual_x,
+                    x=x,
+                    gate=gate_x,
+                    shift=shift_result,
+                    scale=scale_result,
+                )
             return modulated, residual_out, gate_result
         else:
-            modulated = self._norm_scale_shift(
-                norm_module, x=x, shift=shift_result, scale=scale_result
-            )
+            if use_bcg_helpers:
+                modulated = self._norm_scale_shift(
+                    norm_module, x=x, shift=shift_result, scale=scale_result
+                )
+            else:
+                modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
             return modulated, gate_result
 
     def forward(
@@ -1158,16 +1171,29 @@ class QwenImageTransformerBlock(nn.Module):
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
+        use_bcg_helpers = is_in_breakable_cuda_graph()
 
         # Process image stream - norm1 + modulation
         img_modulated, img_gate1 = self._modulate(
-            hidden_states, img_mod1, self.img_norm1, modulate_index
+            hidden_states,
+            img_mod1,
+            self.img_norm1,
+            modulate_index,
+            use_bcg_helpers=use_bcg_helpers,
         )
         # Process text stream - norm1 + modulation
         txt_shift1, txt_scale1, txt_gate1_raw = txt_mod1.chunk(3, dim=-1)
-        txt_modulated = self._norm_scale_shift(
-            self.txt_norm1, encoder_hidden_states, shift=txt_shift1, scale=txt_scale1
-        )
+        if use_bcg_helpers:
+            txt_modulated = self._norm_scale_shift(
+                self.txt_norm1,
+                encoder_hidden_states,
+                shift=txt_shift1,
+                scale=txt_scale1,
+            )
+        else:
+            txt_modulated = self.txt_norm1(
+                encoder_hidden_states, shift=txt_shift1, scale=txt_scale1
+            )
         txt_gate1 = txt_gate1_raw.unsqueeze(1)
 
         # Use QwenAttnProcessor2_0 for joint attention computation
@@ -1197,31 +1223,52 @@ class QwenImageTransformerBlock(nn.Module):
             modulate_index,
             gate_x=img_gate1,
             residual_x=hidden_states,
+            use_bcg_helpers=use_bcg_helpers,
         )
         img_mlp_output = self.img_mlp(img_modulated2)
 
         if img_mlp_output.dim() == 2:
             img_mlp_output = img_mlp_output.unsqueeze(0)
-        hidden_states = self._mul_add(img_mlp_output, img_gate2, hidden_states)
+        if use_bcg_helpers:
+            hidden_states = self._mul_add(img_mlp_output, img_gate2, hidden_states)
+        else:
+            hidden_states = self.fuse_mul_add(img_mlp_output, img_gate2, hidden_states)
 
         # Process text stream - norm2 + MLP
         txt_shift2, txt_scale2, txt_gate2_raw = txt_mod2.chunk(3, dim=-1)
-        txt_modulated2, encoder_hidden_states = self._scale_residual_norm_scale_shift(
-            self.txt_norm2,
-            residual=encoder_hidden_states,
-            x=txt_attn_output,
-            gate=txt_gate1,
-            shift=txt_shift2,
-            scale=txt_scale2,
-        )
+        if use_bcg_helpers:
+            (
+                txt_modulated2,
+                encoder_hidden_states,
+            ) = self._scale_residual_norm_scale_shift(
+                self.txt_norm2,
+                residual=encoder_hidden_states,
+                x=txt_attn_output,
+                gate=txt_gate1,
+                shift=txt_shift2,
+                scale=txt_scale2,
+            )
+        else:
+            txt_modulated2, encoder_hidden_states = self.txt_norm2(
+                residual=encoder_hidden_states,
+                x=txt_attn_output,
+                gate=txt_gate1,
+                shift=txt_shift2,
+                scale=txt_scale2,
+            )
         txt_gate2 = txt_gate2_raw.unsqueeze(1)
         txt_mlp_output = self.txt_mlp(txt_modulated2)
 
         if txt_mlp_output.dim() == 2:
             txt_mlp_output = txt_mlp_output.unsqueeze(0)
-        encoder_hidden_states = self._mul_add(
-            txt_mlp_output, txt_gate2, encoder_hidden_states
-        )
+        if use_bcg_helpers:
+            encoder_hidden_states = self._mul_add(
+                txt_mlp_output, txt_gate2, encoder_hidden_states
+            )
+        else:
+            encoder_hidden_states = self.fuse_mul_add(
+                txt_mlp_output, txt_gate2, encoder_hidden_states
+            )
 
         # Clip to prevent overflow for fp16
         if encoder_hidden_states.dtype == torch.float16:
