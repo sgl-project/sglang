@@ -28,6 +28,9 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
+from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    maybe_flashinfer_autotune_speculative_draft,
+)
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -220,12 +223,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             else:
                 vocab_size = self.model_runner.model_config.vocab_size
 
-            next_token_logits_buffer = torch.zeros(
-                (
-                    self.max_bs * self.num_tokens_per_bs,
-                    vocab_size,
-                ),
-                dtype=torch.float,
+            next_token_logits_buffer = (
+                self.model_runner.graph_shared_output.get_logits_buffer(
+                    vocab_size, rows=self.max_bs * self.num_tokens_per_bs
+                )
             )
 
         seq_lens_cpu = torch.full(
@@ -384,6 +385,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
 
         def run_once():
+            self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)
+
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
@@ -432,15 +435,22 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
             with canary_ctx:
                 shape_key = self._make_graph_key(bs)
+                post_warmup_hook = getattr(
+                    self.draft_extend_attn_backend,
+                    "on_after_cuda_graph_warmup",
+                    None,
+                )
+                maybe_flashinfer_autotune_speculative_draft(
+                    self,
+                    run_once,
+                    post_warmup_hook=post_warmup_hook,
+                    skip_logits=False,
+                )
                 self.backend.capture_one(
                     shape_key,
                     run_once,
                     dummies=None,
-                    post_warmup_hook=getattr(
-                        self.draft_extend_attn_backend,
-                        "on_after_cuda_graph_warmup",
-                        None,
-                    ),
+                    post_warmup_hook=post_warmup_hook,
                 )
 
     def execute(self, forward_batch: ForwardBatch):
