@@ -1703,6 +1703,7 @@ class ServerArgs:
         "Directory to write decoupled speculative decoding trace files.",
     ] = None
 
+    # -------------------------------------------------------------------------
     # Speculative decoding (ngram)
     # -------------------------------------------------------------------------
     speculative_ngram_min_bfs_breadth: A[
@@ -2614,6 +2615,25 @@ class ServerArgs:
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
+
+        Dispatcher style principles:
+        1. Keep this method as an ordered dispatcher. Each step should be a
+           named self._handle_* call; put imports, conditionals, mutations, and
+           raises inside helpers instead of inline here.
+        2. Keep the dummy-model boundary as early as correctness allows. Only
+           model-independent bootstrap, API/network/protocol validation, and
+           errors that should fire for dummy models should run before it.
+        3. Order handlers by dependency domains, not by historical insertion:
+           internal/bootstrap, API/network/protocol, model source/path
+           resolution, hardware/platform, model-specific adjustment,
+           parallelism, kernel/attention backend, cuda graph, memory/cache,
+           and advanced/debug features.
+        4. Hide narrow integrations behind general handler names. The
+           dispatcher should say what phase is being handled, not expose a
+           vendor-, hook-, or feature-specific implementation detail.
+        5. Give each handler one clear contract: what state it expects, what it
+           may mutate, and whether it validates only. Long ordering comments
+           belong in the helper or signal that the helper should be split.
         """
 
         # Declaration stash for the override/post-process passes. Set before any
