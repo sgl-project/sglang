@@ -175,7 +175,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.reasoning_parser:
             try:
                 rp = ReasoningParser(
-                    model_type=self.reasoning_parser, stream_reasoning=True
+                    model_type=self.reasoning_parser,
+                    stream_reasoning=True,
+                    tokenizer=self.tokenizer_manager.tokenizer,
                 )
                 self._reasoning_detector = rp.detector
             except ValueError as e:
@@ -668,7 +670,11 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 tools = [item.model_dump() for item in request.tools]
             if self.tool_call_parser:
-                parser = FunctionCallParser(request.tools, self.tool_call_parser)
+                parser = FunctionCallParser(
+                    request.tools,
+                    self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                )
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
@@ -1327,6 +1333,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         stream_reasoning=False,
                         force_reasoning=force_reasoning,
                         request=request,
+                        tokenizer=self.tokenizer_manager.tokenizer,
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
@@ -1510,7 +1517,9 @@ class OpenAIServingChat(OpenAIServingBase):
         # For required/named: only use parser when structural_tag was used
         # as constraint (mirrors the streaming path). For auto: always try.
         if self.tool_call_parser:
-            parser = FunctionCallParser(tools, self.tool_call_parser)
+            parser = FunctionCallParser(
+                tools, self.tool_call_parser, tokenizer=self.tokenizer_manager.tokenizer
+            )
             should_try_parser = (
                 not is_required or parser.detector.supports_structural_tag()
             )
@@ -1623,6 +1632,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.stream_reasoning,
                 is_force_reasoning,
                 request,
+                tokenizer=self.tokenizer_manager.tokenizer,
             )
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
@@ -1867,6 +1877,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     probe = FunctionCallParser(
                         tools=request.tools,
                         tool_call_parser=self.tool_call_parser,
+                        tokenizer=self.tokenizer_manager.tokenizer,
                     )
                     use_native_parser = probe.detector.supports_structural_tag()
                 if use_native_parser:
@@ -1877,6 +1888,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 parser_dict[index] = FunctionCallParser(
                     tools=request.tools,
                     tool_call_parser=self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
                 )
 
         parser = parser_dict[index]
