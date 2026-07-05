@@ -256,6 +256,7 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
 
         quant_name_getter = getattr(type(quant_config), "get_name", None)
         quant_name = quant_name_getter() if callable(quant_name_getter) else None
+
         if quant_name != "modelopt_fp8":
             return
 
