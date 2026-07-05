@@ -1158,6 +1158,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
         )
+        # Prefill breakable CUDA graph requires every DP rank to run the same
+        # captured shape. Under SUM_LEN each rank pads to its own local token
+        # count and can select a different capture bucket, so the in-graph DP
+        # collectives (all_gather / reduce_scatter) mismatch across ranks and
+        # corrupt the output. Force MAX_LEN so every rank pads to the global
+        # max and picks the same bucket (mirrors the decode cuda graph
+        # contract, which always runs MAX_LEN).
+        #
+        # Only force MAX_LEN when the batch fits a captured breakable prefill
+        # graph; larger prefills fall back to eager and keep the
+        # memory-efficient SUM_LEN. global_num_tokens is identical across ranks
+        # (all-gathered), so the decision is consistent cluster-wide.
+        prefill_cg = model_runner.server_args.cuda_graph_config.prefill
+        if (
+            self.can_run_dp_breakable_cuda_graph
+            and self.is_extend_in_batch
+            and prefill_cg.bs
+            and max(global_num_tokens) <= max(prefill_cg.bs)
+        ):
+            dp_padding_mode = DpPaddingMode.MAX_LEN
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
@@ -1214,7 +1234,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
-                if hybrid_ssm:
+                # Fabricate a single dummy request covering num_tokens for an
+                # empty (idle) rank. Hybrid-SSM families always take this path;
+                # non-hybrid ranks reach it once MAX_LEN is forced for the
+                # prefill breakable CUDA graph (idle + prefill), which needs
+                # every DP rank to run the same captured shape. The `else`
+                # branch handles decode rows padded to a 1-token extend.
+                if hybrid_ssm or self.seq_lens.shape[0] == 0:
                     dev = self.seq_lens.device
                     assert (
                         self.seq_lens.shape[0] == 0
@@ -1232,6 +1258,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.seq_lens = torch.tensor(
                         [num_tokens], dtype=self.seq_lens.dtype, device=dev
                     )
+                    # orig_seq_lens is not padded by _pad_inputs_to_size, so
+                    # fabricate it to match the dummy request (the breakable
+                    # prefill CUDA graph runner reads it).
+                    self.orig_seq_lens = torch.tensor(
+                        [num_tokens], dtype=self.orig_seq_lens.dtype, device=dev
+                    )
                     self.seq_lens_sum = int(num_tokens)
                     if self.seq_lens_cpu is not None:
                         self.seq_lens_cpu = torch.tensor(
@@ -1241,6 +1273,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.extend_seq_lens_cpu = [int(num_tokens)]
                     self.extend_logprob_start_lens_cpu = [0]
                     bs = self.batch_size = 1
+                    # Count the dummy tokens as real, else MoE topk/all-to-all
+                    # treats this rank as empty and starves later layers.
+                    # (num_token_non_padded is None unless moe_ep_size > 1.)
+                    if self.num_token_non_padded is not None:
+                        self.num_token_non_padded.fill_(num_tokens)
+                    self.num_token_non_padded_cpu = num_tokens
                 else:
                     self.extend_num_tokens = bs
                     self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
