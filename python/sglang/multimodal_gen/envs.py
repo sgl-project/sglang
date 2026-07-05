@@ -59,7 +59,7 @@ if TYPE_CHECKING:
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
-    SGLANG_DIFFUSION_TE_NVFP4_LINEAR_TARGETS: str | None = None
+    SGLANG_DIFFUSION_ENABLE_TE_NVFP4_LINEAR: bool = False
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
     SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU: bool = False
     SGLANG_USE_ROCM_VAE: bool = False
@@ -312,10 +312,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM": _lazy_bool(
         "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM"
     ),
-    # Experimental opt-in targets for runtime TE NVFP4 Linear GEMMs.
-    # Supported values are comma-separated target names, or "all".
-    "SGLANG_DIFFUSION_TE_NVFP4_LINEAR_TARGETS": _lazy_str(
-        "SGLANG_DIFFUSION_TE_NVFP4_LINEAR_TARGETS"
+    # Experimental opt-in for runtime TransformerEngine NVFP4 Linear GEMMs.
+    "SGLANG_DIFFUSION_ENABLE_TE_NVFP4_LINEAR": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_TE_NVFP4_LINEAR"
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),

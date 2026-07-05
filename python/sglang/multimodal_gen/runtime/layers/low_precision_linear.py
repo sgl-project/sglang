@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-import os
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-TE_NVFP4_LINEAR_TARGETS_ENV = "SGLANG_DIFFUSION_TE_NVFP4_LINEAR_TARGETS"
+TE_NVFP4_LINEAR_ENABLED_ENV = "SGLANG_DIFFUSION_ENABLE_TE_NVFP4_LINEAR"
 
 _TE_NVFP4_RECIPE = None
 _TE_NVFP4_LINEAR_CLS = None
@@ -20,20 +19,8 @@ _TE_NVFP4_IMPORT_FAILED = False
 _TE_NVFP4_RUNTIME_DISABLED = False
 
 
-def _target_tokens(value: str | None) -> set[str]:
-    if not value:
-        return set()
-    return {
-        token.strip().lower()
-        for token in value.replace(";", ",").split(",")
-        if token.strip()
-    }
-
-
-def te_nvfp4_linear_target_enabled(target: str) -> bool:
-    tokens = _target_tokens(os.getenv(TE_NVFP4_LINEAR_TARGETS_ENV))
-    normalized_target = target.strip().lower()
-    return "*" in tokens or "all" in tokens or normalized_target in tokens
+def te_nvfp4_linear_enabled() -> bool:
+    return get_bool_env_var(TE_NVFP4_LINEAR_ENABLED_ENV)
 
 
 def maybe_get_te_nvfp4_linear_runner(
@@ -41,7 +28,7 @@ def maybe_get_te_nvfp4_linear_runner(
     *,
     pad_m_to: int = 16,
 ) -> TeNvfp4LinearRunner | None:
-    if not te_nvfp4_linear_target_enabled(target):
+    if not te_nvfp4_linear_enabled():
         return None
     return TeNvfp4LinearRunner(target=target, pad_m_to=pad_m_to)
 

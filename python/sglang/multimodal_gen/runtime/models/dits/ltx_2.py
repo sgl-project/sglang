@@ -31,7 +31,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.low_precision_linear import (
     TeNvfp4LinearRunner,
     maybe_get_te_nvfp4_linear_runner,
-    te_nvfp4_linear_target_enabled,
+    te_nvfp4_linear_enabled,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -59,7 +59,7 @@ _LTX2_FUSED_ADA_VALUES_RUNTIME_DISABLED = False
 
 
 def _ltx2_te_nvfp4_video_ffn_target() -> str | None:
-    if te_nvfp4_linear_target_enabled(_LTX2_TE_NVFP4_VIDEO_FFN_TARGET):
+    if te_nvfp4_linear_enabled():
         return _LTX2_TE_NVFP4_VIDEO_FFN_TARGET
     return None
 

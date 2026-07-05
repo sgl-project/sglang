@@ -7,10 +7,10 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.layers import low_precision_linear as lpl
 from sglang.multimodal_gen.runtime.layers.low_precision_linear import (
-    TE_NVFP4_LINEAR_TARGETS_ENV,
+    TE_NVFP4_LINEAR_ENABLED_ENV,
     TeNvfp4LinearRunner,
     maybe_get_te_nvfp4_linear_runner,
-    te_nvfp4_linear_target_enabled,
+    te_nvfp4_linear_enabled,
 )
 from sglang.multimodal_gen.runtime.models.dits import ltx_2
 
@@ -62,36 +62,35 @@ def fake_fp8_autocast(*, enabled, fp8_recipe):
     yield
 
 
-class TestTeNvfp4LinearTargetPolicy(unittest.TestCase):
+class TestTeNvfp4LinearEnablePolicy(unittest.TestCase):
     def setUp(self):
         FakeTeLinear.instances.clear()
 
-    def test_targets_default_disabled(self):
+    def test_default_disabled(self):
         with patch.dict("os.environ", {}, clear=True):
-            self.assertFalse(te_nvfp4_linear_target_enabled("ltx2.video_ffn"))
+            self.assertFalse(te_nvfp4_linear_enabled())
             self.assertIsNone(maybe_get_te_nvfp4_linear_runner("ltx2.video_ffn"))
 
-    def test_specific_target_enabled(self):
+    def test_bool_env_enabled(self):
         with patch.dict(
             "os.environ",
-            {TE_NVFP4_LINEAR_TARGETS_ENV: "qwen_image.ffn, ltx2.video_ffn"},
+            {TE_NVFP4_LINEAR_ENABLED_ENV: "1"},
             clear=True,
         ):
-            self.assertTrue(te_nvfp4_linear_target_enabled("ltx2.video_ffn"))
-            self.assertFalse(te_nvfp4_linear_target_enabled("wan.video_ffn"))
+            self.assertTrue(te_nvfp4_linear_enabled())
 
             runner = maybe_get_te_nvfp4_linear_runner("ltx2.video_ffn")
             self.assertIsInstance(runner, TeNvfp4LinearRunner)
             self.assertEqual(runner.target, "ltx2.video_ffn")
 
-    def test_all_target_enabled(self):
+    def test_false_bool_env_disabled(self):
         with patch.dict(
             "os.environ",
-            {TE_NVFP4_LINEAR_TARGETS_ENV: "all"},
+            {TE_NVFP4_LINEAR_ENABLED_ENV: "0"},
             clear=True,
         ):
-            self.assertTrue(te_nvfp4_linear_target_enabled("ltx2.video_ffn"))
-            self.assertTrue(te_nvfp4_linear_target_enabled("wan.video_ffn"))
+            self.assertFalse(te_nvfp4_linear_enabled())
+            self.assertIsNone(maybe_get_te_nvfp4_linear_runner("ltx2.video_ffn"))
 
     def test_ltx2_video_ffn_target_default_disabled(self):
         with patch.dict("os.environ", {}, clear=True):
@@ -100,7 +99,7 @@ class TestTeNvfp4LinearTargetPolicy(unittest.TestCase):
     def test_ltx2_video_ffn_target_requires_env(self):
         with patch.dict(
             "os.environ",
-            {TE_NVFP4_LINEAR_TARGETS_ENV: "ltx2.video_ffn"},
+            {TE_NVFP4_LINEAR_ENABLED_ENV: "true"},
             clear=True,
         ):
             self.assertEqual(
