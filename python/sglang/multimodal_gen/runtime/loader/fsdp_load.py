@@ -329,8 +329,6 @@ def maybe_load_fsdp_model(
             if _is_npu:
                 torch.npu.empty_cache()
     model.post_load_weights()
-    if defer_cpu_offload:
-        model.to("cpu")
 
     for n, p in chain(model.named_parameters(), model.named_buffers()):
         if p.is_meta:
@@ -338,6 +336,11 @@ def maybe_load_fsdp_model(
         # Avoid unintended computation graph accumulation during inference
         if isinstance(p, torch.nn.Parameter):
             p.requires_grad = False
+
+    # 4. deferred cpu offload
+    if defer_cpu_offload:
+        model.to("cpu")
+
     return model
 
 
