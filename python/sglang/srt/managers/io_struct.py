@@ -53,7 +53,7 @@ from pydantic import PlainValidator
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.schedule_batch import Modality, ReturnHiddenStatesMode
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
@@ -219,7 +219,9 @@ class GenerateReqInput:
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
     # Whether to return hidden states
-    return_hidden_states: Union[List[bool], bool] = False
+    return_hidden_states: Union[
+        List[ReturnHiddenStatesMode], ReturnHiddenStatesMode
+    ] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
     # Absolute start position for returned routings; response covers
@@ -838,7 +840,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     return_flat_raw_top_logprobs: bool = False
 
     # Whether to return hidden states
-    return_hidden_states: bool = False
+    return_hidden_states: ReturnHiddenStatesMode = False
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
