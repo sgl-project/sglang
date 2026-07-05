@@ -1703,12 +1703,13 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
             moe_runner_backend = "flashinfer_trtllm"
         elif moe_runner_backend not in [
             "cutlass",
+            "deep_gemm",
             "flashinfer_trtllm",
             "flashinfer_trtllm_routed",
         ]:
             logger.warning(
-                "mxfp8 quantization supports only cutlass, flashinfer_trtllm, "
-                "or flashinfer_trtllm_routed backends. "
+                "mxfp8 quantization supports only cutlass, deep_gemm, "
+                "flashinfer_trtllm, or flashinfer_trtllm_routed backends. "
                 f"Overriding {moe_runner_backend!r}."
             )
             moe_runner_backend = "flashinfer_trtllm"
