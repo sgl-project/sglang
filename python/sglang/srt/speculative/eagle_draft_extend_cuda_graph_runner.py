@@ -233,15 +233,16 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64, device="cpu"
         )
 
-        if self.eagle_worker.seed_dsa_topk_from_draft_extend:
-            dsa_seed_topk_capture = torch.full(
+        dsa_seed_topk_capture = (
+            torch.full(
                 (self.max_num_token, self.eagle_worker.dsa_index_topk),
                 -1,
                 dtype=torch.int32,
                 device=model_runner.device,
             )
-        else:
-            dsa_seed_topk_capture = None
+            if self.eagle_worker.seed_dsa_topk_from_draft_extend
+            else None
+        )
 
         self.buffers = EagleDraftExtendInputBuffers(
             input_ids=input_ids,
