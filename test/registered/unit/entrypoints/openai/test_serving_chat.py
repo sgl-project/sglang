@@ -21,6 +21,7 @@ from fastapi import Request
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    LogProbs,
     MessageProcessingResult,
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
@@ -1943,6 +1944,26 @@ class ServingChatTestCase(unittest.TestCase):
             joined,
             "I am a large language model.",
             f"Streaming deltas produced broken text: {deltas!r}",
+        )
+
+    def test_streaming_logprobs_uses_per_token_top_logprobs(self):
+        logprobs = LogProbs(
+            tokens=["A", "B", "C"],
+            token_logprobs=[-0.1, -0.2, -0.3],
+            top_logprobs=[
+                {"A_alt": -1.1},
+                {"B_alt": -2.2},
+                {"C_alt": -3.3},
+            ],
+        )
+
+        token_logprobs = self.chat._process_logprobs_tokens(
+            logprobs, use_token_index=False
+        )
+
+        self.assertEqual(
+            [entry.top_logprobs[0].token for entry in token_logprobs],
+            ["A_alt", "B_alt", "C_alt"],
         )
 
     # ------------- X-Data-Parallel-Rank header tests -------------

@@ -50,7 +50,10 @@ class ServingCompletionTestCase(unittest.TestCase):
         tm.tokenizer.bos_token_id = 1
 
         tm.model_config = Mock(is_multimodal=False)
-        tm.server_args = Mock(enable_cache_report=False)
+        tm.server_args = Mock(
+            enable_cache_report=False,
+            incremental_streaming_output=False,
+        )
 
         tm.generate_request = AsyncMock()
         tm.create_abort_task = Mock()
@@ -272,6 +275,63 @@ class ServingCompletionTestCase(unittest.TestCase):
         # Check that there is an error chunk and a DONE chunk, and possibly a role chunk
         self.assertGreaterEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
+
+    def test_incremental_streaming_output_delta(self):
+        self.sc.tokenizer_manager.server_args.incremental_streaming_output = True
+
+        incremental_chunks = [
+            ("Hello", None),
+            (" World", None),
+            (" Foo", {"type": "stop", "matched": None}),
+        ]
+
+        async def _mock_generate_incremental(*args, **kwargs):
+            for text, finish_reason in incremental_chunks:
+                yield {
+                    "text": text,
+                    "meta_info": {
+                        "id": "cmpl-incr-test",
+                        "prompt_tokens": 10,
+                        "completion_tokens": 5,
+                        "cached_tokens": 0,
+                        "finish_reason": finish_reason,
+                        "output_token_logprobs": None,
+                        "output_top_logprobs": None,
+                    },
+                    "index": 0,
+                }
+
+        self.sc.tokenizer_manager.generate_request = _mock_generate_incremental
+
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello world",
+            max_tokens=100,
+            stream=True,
+        )
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+
+        async def run_stream():
+            chunks = []
+            async for chunk in self.sc._generate_completion_stream(
+                adapted_request, req, self.fastapi_request
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        chunks = get_or_create_event_loop().run_until_complete(run_stream())
+
+        deltas = []
+        for chunk in chunks:
+            if not chunk.startswith("data: ") or chunk.strip() == "data: [DONE]":
+                continue
+            data = json.loads(chunk[len("data: ") :])
+            if data.get("choices"):
+                text = data["choices"][0].get("text")
+                if text:
+                    deltas.append(text)
+
+        self.assertEqual("".join(deltas), "Hello World Foo")
 
     def test_non_streaming_cached_tokens_details_emits_sglext(self):
         """Test that non-streaming completion responses emit cached token details in sglext."""
