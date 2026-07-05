@@ -1220,6 +1220,10 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_batch_result_prebuilt(new_prebuilt_batch)
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
+                # The decode worker never ran prefill for these requests, so the
+                # n-gram embedding token table has no rows for them; rebuild it
+                # from the original prompt tokens before the first forward.
+                self._maybe_prepare_ngram_embedding(new_prebuilt_batch)
                 if self.running_batch.is_empty():
                     self.running_batch = new_prebuilt_batch
                     if self.enable_hisparse:
@@ -1237,6 +1241,7 @@ class SchedulerDisaggregationDecodeMixin:
             ret = self.running_batch if not self.running_batch.is_empty() else None
 
         ret = self.maybe_prepare_mlp_sync_batch(ret)
+        ret = self._maybe_prepare_ngram_embedding(ret)
         if ret:
             set_schedule_time_batch(ret)
         return ret

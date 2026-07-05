@@ -374,6 +374,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         batch = self.get_new_batch_prefill()
         batch = self.maybe_prepare_mlp_sync_batch(batch)
+        batch = self._maybe_prepare_ngram_embedding(batch)
 
         if batch:
             set_schedule_time_batch(batch)
