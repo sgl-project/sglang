@@ -205,6 +205,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._accept_anomaly_dumped: set[tuple[int, object]] = set()
         self._accept_anomaly_dump_count = 0
         self._last_draft_block_metadata_debug: Optional[dict] = None
+        self._last_draft_block_ids_debug: Optional[list[int]] = None
+        self._last_context_kv_path_debug: Optional[str] = None
         self._stacked_wqkv_fp8_proj = None
         self._stacked_wqkv_kv_offsets: list[tuple[int, int]] = []
         self._stacked_wqkv_out_sizes: list[int] = []
@@ -496,20 +498,22 @@ class DSparkWorkerV2(BaseSpecWorker):
                 else self.draft_model.project_main_hidden(main_hidden)
             )
             if self._stacked_wqkv_fp8_proj is None:
+                self._last_context_kv_path_debug = "per_layer_kv_from_hidden"
                 for layer in self._draft_inner.layers:
                     layer.self_attn.kv_from_hidden(
                         ctx_x, positions, cache_loc, attn_backend
                     )
             else:
+                self._last_context_kv_path_debug = "stacked_fp8_wqkv"
+                stacked_out = self._stacked_wqkv_fp8_proj.quant_method.apply(
+                    self._stacked_wqkv_fp8_proj,
+                    ctx_x,
+                    self._stacked_wqkv_fp8_proj.bias,
+                )
+                layer_outputs = torch.split(
+                    stacked_out, self._stacked_wqkv_out_sizes, dim=-1
+                )
                 for layer_idx, layer in enumerate(self._draft_inner.layers):
-                    stacked_out = self._stacked_wqkv_fp8_proj.quant_method.apply(
-                        self._stacked_wqkv_fp8_proj,
-                        ctx_x,
-                        self._stacked_wqkv_fp8_proj.bias,
-                    )
-                    layer_outputs = torch.split(
-                        stacked_out, self._stacked_wqkv_out_sizes, dim=-1
-                    )
                     kv_start, kv_end = self._stacked_wqkv_kv_offsets[layer_idx]
                     self._write_draft_kv_from_projected_kv(
                         attn=layer.self_attn,
@@ -920,6 +924,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         from sglang.srt.layers.attention import deepseek_v4_backend as _dsv4_be
 
         _dsv4_be._DSPARK_BLOCK_FULL_ATTN = int(self.block_size)
+        self._last_draft_block_ids_debug = [
+            int(x)
+            for x in block_ids[: min(int(block_ids.numel()), 8)]
+            .detach()
+            .cpu()
+            .tolist()
+        ]
         try:
             with torch.inference_mode():
                 if os.getenv("SGLANG_DSPARK_DISABLE_DRAFT_CUDA_GRAPH", "0") == "1":
@@ -1006,6 +1017,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         return {
             "draft_can_run_graph": can_run_graph,
             "draft_forward_mode": str(getattr(draft_forward_batch, "forward_mode", None)),
+            "draft_block_ids_first": self._last_draft_block_ids_debug,
+            "draft_context_kv_path": getattr(
+                self, "_last_context_kv_path_debug", None
+            ),
+            "draft_unified_kv": bool(
+                getattr(
+                    getattr(
+                        self.draft_model_runner.attn_backend,
+                        "token_to_kv_pool",
+                        None,
+                    ),
+                    "_unified_kv",
+                    False,
+                )
+            ),
             "draft_seq_lens_casual_first_last": first_last_rows(
                 getattr(core, "seq_lens_casual", None)
             ),
