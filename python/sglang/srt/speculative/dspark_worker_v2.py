@@ -193,6 +193,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._markov_refine_buffer_cap: int = 0
         self._markov_candidates_buf: Optional[torch.Tensor] = None
         self._markov_embeds_buf: Optional[torch.Tensor] = None
+        self._vocab_shard_mapping_cache: dict[
+            tuple[int, int, torch.device], torch.Tensor
+        ] = {}
         self._last_markov_refine_debug: Optional[dict] = None
         self.draft_attn_backend = None
         self.draft_extend_attn_backend = None
@@ -1231,19 +1234,35 @@ class DSparkWorkerV2(BaseSpecWorker):
         vocab_size = int(self._draft_inner.vocab_size)
 
         def _gather_full_vocab(logits_shard: torch.Tensor, head) -> torch.Tensor:
+            def _reindex_sharded_vocab(logits: torch.Tensor) -> torch.Tensor:
+                mapping_fn = getattr(head, "get_sharded_to_full_mapping", None)
+                if mapping_fn is None:
+                    return logits[..., :vocab_size]
+                mapping = mapping_fn()
+                if mapping is None:
+                    return logits[..., :vocab_size]
+                cache_key = (id(head), int(logits.shape[-1]), logits.device)
+                mapping_tensor = self._vocab_shard_mapping_cache.get(cache_key)
+                if mapping_tensor is None or mapping_tensor.numel() != len(mapping):
+                    mapping_tensor = torch.tensor(
+                        mapping, dtype=torch.long, device=logits.device
+                    )
+                    self._vocab_shard_mapping_cache[cache_key] = mapping_tensor
+                return logits.index_select(-1, mapping_tensor)[..., :vocab_size]
+
             if logits_shard.shape[-1] >= vocab_size:
-                return logits_shard[..., :vocab_size]
+                return _reindex_sharded_vocab(logits_shard)
             if getattr(head, "use_attn_tp_group", False):
                 group = get_attn_tp_group()
                 if group.world_size == 1:
-                    return logits_shard
-                return group.all_gather(logits_shard, dim=-1)[..., :vocab_size]
+                    return logits_shard[..., :vocab_size]
+                logits = group.all_gather(logits_shard, dim=-1)
+                return _reindex_sharded_vocab(logits)
             tp_size = get_tensor_model_parallel_world_size()
             if tp_size == 1:
-                return logits_shard
-            return tensor_model_parallel_all_gather(logits_shard, dim=-1)[
-                ..., :vocab_size
-            ]
+                return logits_shard[..., :vocab_size]
+            logits = tensor_model_parallel_all_gather(logits_shard, dim=-1)
+            return _reindex_sharded_vocab(logits)
 
         def _compute_full_vocab_logits(
             hidden_states: torch.Tensor,
