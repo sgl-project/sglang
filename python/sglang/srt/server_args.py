@@ -1775,9 +1775,12 @@ class ServerArgs:
         Optional[str],
         "The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices (e.g., --mooncake-ib-device mlx5_0,mlx5_1). Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
     ] = None
-    enable_deepep_waterfill: A[
+    enable_waterfill: A[
         bool,
-        "Enable DeepEP Waterfill: dispatch the shared expert as the 9th routed expert to the least-loaded EP rank. Automatically sets --moe-a2a-backend deepep, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency. Use auto or low_latency for production decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
+        Arg(
+            help="Enable Waterfill: dispatch the fused shared expert as an extra routed expert slot to the least-loaded EP rank. Supports DeepEP and MegaMOE MoE A2A backends, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency when used with DeepEP. Use auto or low_latency for production DeepEP decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
+            aliases=["--enable-deepep-waterfill"],
+        ),
     ] = False
     elastic_ep_rejoin: A[
         bool,
@@ -1789,7 +1792,7 @@ class ServerArgs:
     ] = False
     disable_shared_experts_fusion: A[
         bool,
-        "Disable the built-in shared experts fusion optimization for DeepSeek V3/R1. Note: DeepEP Waterfill (--enable-deepep-waterfill) still routes shared expert through DeepEP as an extra MoE slot, so shared expert is not separated from the MoE path when Waterfill is enabled.",
+        "Disable the built-in shared experts fusion optimization for DeepSeek V3/R1. Note: Waterfill (--enable-waterfill) routes the shared expert as an extra MoE slot, so the shared expert is not separated from the MoE path when Waterfill is enabled.",
     ] = False
     enforce_shared_experts_fusion: A[
         bool,
@@ -5596,23 +5599,26 @@ class ServerArgs:
                 "auto-configuring --moe-a2a-backend megamoe."
             )
 
-        if self.enable_deepep_waterfill and self.moe_a2a_backend not in (
+        if self.enable_waterfill and self.moe_a2a_backend not in (
             "deepep",
             "megamoe",
         ):
             logger.warning(
-                "moe_a2a_backend is overridden to 'deepep' because DeepEP "
-                "Waterfill requires the DeepEP backend."
+                "moe_a2a_backend is overridden to 'deepep' because Waterfill "
+                "requires the DeepEP or MegaMOE backend."
             )
             self.moe_a2a_backend = "deepep"
 
-        if self.enable_deepep_waterfill:
+        if self.enable_waterfill:
             if self.disable_shared_experts_fusion:
                 logger.warning(
-                    "disable_shared_experts_fusion is overridden to False because DeepEP Waterfill requires shared expert fusion."
+                    "disable_shared_experts_fusion is overridden to False because Waterfill requires shared expert fusion."
                 )
                 self.disable_shared_experts_fusion = False
             self.enforce_shared_experts_fusion = True
+            logger.info(
+                f"Waterfill is enabled with moe_a2a_backend='{self.moe_a2a_backend}'."
+            )
 
         if self.moe_a2a_backend == "megamoe":
             self.ep_size = self.tp_size
@@ -5632,11 +5638,6 @@ class ServerArgs:
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
-            if self.enable_deepep_waterfill:
-                logger.info(
-                    "DeepEP Waterfill is enabled. Shared expert will be dispatched through DeepEP for load balancing."
-                )
-
         if self.moe_a2a_backend == "mooncake":
             self.ep_size = self.tp_size
             logger.warning(

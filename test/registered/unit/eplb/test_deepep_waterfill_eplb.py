@@ -1,4 +1,4 @@
-"""Unit tests for DeepEP Waterfill and EPLB updater compatibility."""
+"""Unit tests for Waterfill and EPLB updater compatibility."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 

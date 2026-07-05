@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""DeepEP Waterfill: shared expert as 9th routed expert, dispatched to least-loaded rank."""
+"""Waterfill: shared expert as 9th routed expert, dispatched to least-loaded rank."""
 
 from typing import NamedTuple, Optional, Tuple
 
@@ -29,7 +29,7 @@ _LOCAL_PREF_DENOM = 10
 
 
 class WaterfillDispatchPlan(NamedTuple):
-    """Inputs needed by the fused DeepEP Waterfill expansion path."""
+    """Inputs needed by the fused Waterfill expansion path."""
 
     # Effective rank load consumed by the fused kernel.
     rank_load: Tensor
