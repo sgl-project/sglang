@@ -156,6 +156,12 @@ class MlxTpModelWorker(TpModelWorker):
             prefill_rids: list[tuple[str, int]] = []
             extend_rids: list[tuple[str, int]] = []
             decode_rids: list[str] = []
+            # Genuine decode steps mixed into this extend batch (mixed-style
+            # chunked prefill).  Everything else we have already seen is a
+            # chunked-prefill continuation.  Route by this set, not by seq_len:
+            # a final continuation chunk can be exactly one token, and must
+            # still be an extend rather than a decode.
+            decoding_rids = {r.rid for r in (batch.decoding_reqs or [])}
 
             for i, req in enumerate(reqs):
                 seq_len = extend_seq_lens[i]
@@ -165,15 +171,16 @@ class MlxTpModelWorker(TpModelWorker):
                 slot_offset += seq_len
 
                 if self._mlx_runner.has_request(req.rid):
-                    if seq_len > 1:
-                        # Chunked prefill continuation
+                    if req.rid in decoding_rids:
+                        # Genuine single-token decode step mixed into this batch.
+                        decode_rids.append(req.rid)
+                    else:
+                        # Chunked prefill continuation (possibly a single-token
+                        # final chunk, which must still be an extend).
                         next_token = self._mlx_runner.extend(
                             req.rid, req_token_ids, req_new_slots
                         )
                         extend_rids.append((req.rid, next_token))
-                    else:
-                        # MIXED mode: single-token decode
-                        decode_rids.append(req.rid)
                 else:
                     # New prefill
                     prefix_slot_ids = req.prefix_indices.tolist()
@@ -297,6 +304,9 @@ class MlxTpModelWorker(TpModelWorker):
         pending_prefills: list[MlxPendingPrefill] = []
         pending_extends: list[MlxPendingExtend] = []
         mixed_decode_rids: list[str] = []
+        # See _forward_batch_generation_mlx: route by the mixed-in decode set,
+        # not seq_len, so a single-token continuation chunk stays an extend.
+        decoding_rids = {r.rid for r in (batch.decoding_reqs or [])}
 
         for i, req in enumerate(reqs):
             seq_len = extend_seq_lens[i]
@@ -306,8 +316,12 @@ class MlxTpModelWorker(TpModelWorker):
             slot_offset += seq_len
 
             if self._mlx_runner.has_request(req.rid):
-                if seq_len > 1:
-                    # Chunked prefill continuation
+                if req.rid in decoding_rids:
+                    # Genuine single-token decode step mixed into this batch.
+                    mixed_decode_rids.append(req.rid)
+                else:
+                    # Chunked prefill continuation (possibly a single-token
+                    # final chunk, which must still be an extend).
                     pending_extends.append(
                         self._mlx_runner.extend_start(
                             req_id=req.rid,
@@ -315,9 +329,6 @@ class MlxTpModelWorker(TpModelWorker):
                             new_slot_ids=req_new_slots,
                         )
                     )
-                else:
-                    # MIXED mode: single-token decode
-                    mixed_decode_rids.append(req.rid)
             else:
                 # New prefill
                 prefix_slot_ids = req.prefix_indices.tolist()
