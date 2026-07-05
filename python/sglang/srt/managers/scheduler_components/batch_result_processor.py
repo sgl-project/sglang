@@ -27,6 +27,10 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    get_required_capture_hidden_mode,
+)
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
@@ -214,6 +218,7 @@ class SchedulerBatchResultProcessor:
             self._validate_pp_skip_output_comm(batch, result)
 
             hidden_state_offset = 0
+            prefill_hidden_capture_mode = self._get_prefill_hidden_capture_mode(batch)
 
             # Check finish conditions
             logprob_pt = 0
@@ -263,13 +268,14 @@ class SchedulerBatchResultProcessor:
                         self.add_sampling_mask_return_values(i, req, logits_output)
 
                     if (
-                        req.return_hidden_states
+                        batch.return_hidden_states
                         and logits_output.hidden_states is not None
                     ):
                         hidden_state_offset = self._append_prefill_hidden_states(
                             req=req,
                             logits_output=logits_output,
                             hidden_state_offset=hidden_state_offset,
+                            capture_hidden_mode=prefill_hidden_capture_mode,
                         )
 
                     if req.grammar is not None:
@@ -476,19 +482,36 @@ class SchedulerBatchResultProcessor:
         req: Req,
         logits_output: LogitsProcessorOutput,
         hidden_state_offset: int,
+        capture_hidden_mode: CaptureHiddenMode,
     ) -> int:
-        req.hidden_states.append(
-            logits_output.hidden_states[
+        if capture_hidden_mode.is_full():
+            req_hidden_states = logits_output.hidden_states[
                 hidden_state_offset : (
                     hidden_state_offset := hidden_state_offset
                     + len(req.origin_input_ids)
                 )
             ]
-            .cpu()
-            .clone()
-            .tolist()
-        )
+            if req.return_hidden_states is True:
+                req.hidden_states.append(req_hidden_states.cpu().clone().tolist())
+            elif req.return_hidden_states == "last":
+                req.hidden_states.append(req_hidden_states[-1].cpu().tolist())
+        elif capture_hidden_mode.is_last():
+            req_hidden_states = logits_output.hidden_states[hidden_state_offset]
+            hidden_state_offset += 1
+            if req.return_hidden_states:
+                req.hidden_states.append(req_hidden_states.cpu().tolist())
+        else:
+            raise ValueError(
+                f"Unexpected hidden states capture mode: {capture_hidden_mode}"
+            )
         return hidden_state_offset
+
+    @staticmethod
+    def _get_prefill_hidden_capture_mode(batch: ScheduleBatch) -> CaptureHiddenMode:
+        return get_required_capture_hidden_mode(
+            batch.return_hidden_states_mode,
+            batch.spec_info,
+        )
 
     def _apply_prefill_grammar(
         self, *, req: Req, next_token_id: int, already_advanced: bool = False

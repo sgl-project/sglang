@@ -218,6 +218,16 @@ class CaptureHiddenMode(IntEnum):
         return self.value < other.value
 
 
+def get_required_capture_hidden_mode(
+    capture_hidden_mode: CaptureHiddenMode,
+    spec_info: Optional[SpecInput],
+) -> CaptureHiddenMode:
+    spec_capture_hidden_mode = (
+        getattr(spec_info, "capture_hidden_mode", None) or CaptureHiddenMode.NULL
+    )
+    return max(capture_hidden_mode, spec_capture_hidden_mode)
+
+
 def _attn_tp_local_shard_bounds(num_tokens_per_dp: int) -> Tuple[int, int]:
     """(tokens_per_rank, rank_offset) of this attn-TP rank's contiguous shard."""
     parallel = get_parallel()
@@ -674,13 +684,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # SB.return_hidden_states / spec_info.capture_hidden_mode.
         if capture_hidden_mode is None:
             if batch.return_hidden_states:
-                capture_hidden_mode = CaptureHiddenMode.FULL
-            elif batch.spec_info is not None:
-                capture_hidden_mode = getattr(
-                    batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+                capture_hidden_mode = get_required_capture_hidden_mode(
+                    batch.return_hidden_states_mode,
+                    batch.spec_info,
                 )
             else:
-                capture_hidden_mode = CaptureHiddenMode.NULL
+                capture_hidden_mode = get_required_capture_hidden_mode(
+                    CaptureHiddenMode.NULL,
+                    batch.spec_info,
+                )
 
         # extend-mode-only fields are None on decode/idle
         if batch.forward_mode.is_decode_or_idle():

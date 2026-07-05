@@ -522,7 +522,10 @@ class _GenerationStreamAccumulator:
                 hs = req.hidden_states
                 if req.finished_len is not None:
                     hs = hs[: req.finished_len]
-                self.output_hidden_states.append(hs)
+                if req.return_hidden_states == "last":
+                    self.output_hidden_states.append(hs[-1] if hs else None)
+                else:
+                    self.output_hidden_states.append(hs)
             else:
                 self.output_hidden_states.append(None)
         if self.return_routed_experts:

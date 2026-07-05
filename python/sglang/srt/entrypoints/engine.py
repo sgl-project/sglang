@@ -73,6 +73,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    ReturnHiddenStatesMode,
     RpcReqInput,
     RpcReqOutput,
     UnloadLoRAAdapterReqInput,
@@ -342,7 +343,9 @@ class Engine(EngineScoreMixin, EngineBase):
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         require_reasoning: bool = False,
-        return_hidden_states: bool = False,
+        return_hidden_states: Union[
+            ReturnHiddenStatesMode, List[ReturnHiddenStatesMode]
+        ] = False,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
         stream: bool = False,
@@ -446,7 +449,9 @@ class Engine(EngineScoreMixin, EngineBase):
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         require_reasoning: bool = False,
-        return_hidden_states: bool = False,
+        return_hidden_states: Union[
+            ReturnHiddenStatesMode, List[ReturnHiddenStatesMode]
+        ] = False,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
         stream: bool = False,

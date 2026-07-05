@@ -62,6 +62,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
+    get_required_capture_hidden_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -556,19 +557,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else True
         )
 
-        requested_capture_hidden_mode = max(
-            forward_batch.capture_hidden_mode,
-            (
-                forward_batch.spec_info.capture_hidden_mode
-                if getattr(forward_batch.spec_info, "capture_hidden_mode", None)
-                is not None
-                else CaptureHiddenMode.NULL
-            ),
-        )
-        capture_hidden_mode_matches = (
-            requested_capture_hidden_mode == CaptureHiddenMode.NULL
-            or requested_capture_hidden_mode == self.capture_hidden_mode
-        )
         is_tbo_supported = (
             forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
@@ -586,7 +574,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
-            and capture_hidden_mode_matches
             and is_ngram_supported
         )
 
@@ -750,10 +737,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             global_dp_buffer_len = None
 
         spec_info = self.get_spec_info(num_tokens)
-        if self.capture_hidden_mode != CaptureHiddenMode.FULL:
-            self.capture_hidden_mode = (
-                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
-            )
+        self.capture_hidden_mode = get_required_capture_hidden_mode(
+            self.capture_hidden_mode,
+            spec_info,
+        )
 
         if self.model_runner.server_args.enable_lora:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
@@ -1022,34 +1009,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                 )
 
-    def recapture_if_needed(self, forward_batch: ForwardBatch):
-
-        # If the required capture_hidden_mode changes, we need to recapture the graph
-
-        # These are the different factors that can influence the capture_hidden_mode
-        capture_hidden_mode_required_by_forward_batch = (
-            forward_batch.capture_hidden_mode
-        )
-        capture_hidden_mode_required_by_spec_info = (
-            getattr(forward_batch.spec_info, "capture_hidden_mode", None)
-            or CaptureHiddenMode.NULL
-        )
-        capture_hidden_mode_required_for_returning_hidden_states = (
-            CaptureHiddenMode.FULL
-            if self.enable_return_hidden_states
-            else CaptureHiddenMode.NULL
+    def recapture_if_needed(self, forward_batch: ForwardBatch) -> None:
+        required_capture_hidden_mode = get_required_capture_hidden_mode(
+            forward_batch.capture_hidden_mode,
+            forward_batch.spec_info,
         )
 
-        # Determine the highest capture_hidden_mode required
-        # (If we have FULL, we can emulate LAST or NULL)
-        # (If we have LAST, we can emulate NULL)
-        required_capture_hidden_mode = max(
-            capture_hidden_mode_required_by_forward_batch,
-            capture_hidden_mode_required_by_spec_info,
-            capture_hidden_mode_required_for_returning_hidden_states,
-        )
-
-        # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
         if self.capture_hidden_mode != required_capture_hidden_mode:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.backend.cleanup()

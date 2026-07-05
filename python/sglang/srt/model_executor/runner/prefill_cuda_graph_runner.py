@@ -68,6 +68,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
+    get_required_capture_hidden_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -690,8 +691,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if forward_batch.forward_mode.is_target_verify():
             return False
-        if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
-            return False
         # BCG-with-captured-metadata under DP attention: every rank must
         # have local tokens, and the batch must declare itself replayable.
         # These gates are no-ops for non-DP / non-opt-in paths because
@@ -1225,9 +1224,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             "PPProxyTensors is not supported in PrefillCudaGraphRunner yet."
         )
 
+    def recapture_if_needed(self, forward_batch: ForwardBatch) -> None:
+        required_capture_hidden_mode = get_required_capture_hidden_mode(
+            forward_batch.capture_hidden_mode,
+            forward_batch.spec_info,
+        )
+        if self.capture_hidden_mode != required_capture_hidden_mode:
+            self.capture_hidden_mode = required_capture_hidden_mode
+            self.backend.cleanup()
+            self.capture()
+
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+        self.recapture_if_needed(forward_batch)
         with self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
