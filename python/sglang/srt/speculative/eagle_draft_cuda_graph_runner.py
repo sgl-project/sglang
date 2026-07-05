@@ -225,7 +225,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64, device="cpu"
         )
 
-        if self.eagle_worker.seed_dsa_topk_from_extend:
+        if self.eagle_worker.seed_dsa_topk_from_draft_extend:
             dsa_seed_topk = torch.zeros(
                 (self.max_bs, self.eagle_worker.dsa_index_topk),
                 dtype=torch.int32,

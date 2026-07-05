@@ -277,8 +277,6 @@ class EagleDraftInput(SpecInput):
         )
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
-        # Carried IndexShare seed is per-request; concat when both sides have it,
-        # else drop (next draft step recomputes topk — correctness preserved).
         if self.dsa_topk_indices is not None and spec_info.dsa_topk_indices is not None:
             self.dsa_topk_indices = torch.cat(
                 [self.dsa_topk_indices, spec_info.dsa_topk_indices]

@@ -269,7 +269,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
         # (last verified token), not draft-decode step 0.
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
-        self.seed_dsa_topk_from_extend = (
+        self.seed_dsa_topk_from_draft_extend = (
             self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
         )
 
@@ -625,7 +625,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             forward_batch.reuse_dsa_topk_indices = True
             # Keep the draft-extend seed so step 0 reuses it; else recompute it.
             if not (
-                self.seed_dsa_topk_from_extend
+                self.seed_dsa_topk_from_draft_extend
                 and spec_info.dsa_topk_indices is not None
             ):
                 spec_info.dsa_topk_indices = None
@@ -796,7 +796,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # position. Gather last-per-req before the copy (prefill can be long).
         # Skipped under context-parallel prefill (token layout wouldn't match).
         seed_from_extend = (
-            self.seed_dsa_topk_from_extend
+            self.seed_dsa_topk_from_draft_extend
             and not forward_batch.forward_mode.is_idle()
             and not dsa_use_prefill_cp(forward_batch)
         )
@@ -917,7 +917,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Eager path publishes the indexer top-k into a worker buffer (the graph
         # path uses the runner's static buffer). Gathered at select_index below.
-        if self.seed_dsa_topk_from_extend and not can_cuda_graph:
+        if self.seed_dsa_topk_from_draft_extend and not can_cuda_graph:
             forward_batch.spec_info.dsa_seed_topk_capture = (
                 self._get_dsa_extend_topk_buf(forward_batch.input_ids.shape[0])
             )
@@ -955,7 +955,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Gather the per-request last-position indexer top-k as the next loop's
         # seed (select_index already picks the last accepted position per req).
         dsa_seed_topk_indices = None
-        if self.seed_dsa_topk_from_extend:
+        if self.seed_dsa_topk_from_draft_extend:
             if can_cuda_graph:
                 dsa_extend_topk_capture = (
                     self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
@@ -1014,7 +1014,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         if self.server_args.speculative_use_rejection_sampling:
             next_draft_input.draft_probs = ret_draft_probs
-        if self.seed_dsa_topk_from_extend:
+        if self.seed_dsa_topk_from_draft_extend:
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
 
 
