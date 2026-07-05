@@ -198,6 +198,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_extend_attn_backend = None
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
         self._accept_anomaly_enabled = _env_flag("SGLANG_DSPARK_DEBUG_ACCEPT", True)
+        self._accept_anomaly_topk_enabled = _env_flag(
+            "SGLANG_DSPARK_DEBUG_ACCEPT_TOPK", True
+        )
         self._accept_anomaly_threshold = max(
             1, _env_int("SGLANG_DSPARK_DEBUG_ACCEPT_THRESHOLD", 8)
         )
@@ -1262,6 +1265,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             base_logits = _compute_full_vocab_logits(block_hidden_for_logits, lm_head)
             debug_enabled = bool(self._accept_anomaly_enabled)
             if debug_enabled:
+                debug_topk_k = (
+                    min(5, int(base_logits.shape[-1]))
+                    if self._accept_anomaly_topk_enabled
+                    else 0
+                )
+                if debug_topk_k > 0:
+                    base_topk_values, base_topk_ids = torch.topk(
+                        base_logits, k=debug_topk_k, dim=-1
+                    )
+                else:
+                    base_topk_ids = None
+                    base_topk_values = None
                 base_top1 = torch.argmax(base_logits, dim=-1)
                 base_top1_logit = torch.gather(
                     base_logits, dim=-1, index=base_top1.unsqueeze(-1)
@@ -1278,14 +1293,33 @@ class DSparkWorkerV2(BaseSpecWorker):
                 markov_top1 = torch.empty(
                     (bs, block_size), dtype=torch.int64, device=block_hidden.device
                 )
+                if debug_topk_k > 0:
+                    final_topk_ids = torch.empty(
+                        (bs, block_size, debug_topk_k),
+                        dtype=torch.int64,
+                        device=block_hidden.device,
+                    )
+                    final_topk_values = torch.empty(
+                        (bs, block_size, debug_topk_k),
+                        dtype=base_logits.dtype,
+                        device=block_hidden.device,
+                    )
+                else:
+                    final_topk_ids = None
+                    final_topk_values = None
                 prev_token_debug = torch.empty_like(markov_top1)
             else:
+                debug_topk_k = 0
+                base_topk_ids = None
+                base_topk_values = None
                 base_top1 = None
                 base_top1_logit = None
                 hidden_norm = None
                 hidden_abs_mean = None
                 hidden_cos_adjacent = None
                 markov_top1 = None
+                final_topk_ids = None
+                final_topk_values = None
                 prev_token_debug = None
             prev_tokens = candidates[:, 0]
             for i in range(block_size):
@@ -1299,6 +1333,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 next_tokens = torch.argmax(bias, dim=-1)
                 if debug_enabled:
                     assert markov_top1 is not None
+                    if debug_topk_k > 0:
+                        assert final_topk_ids is not None
+                        assert final_topk_values is not None
+                        step_topk_values, step_topk_ids = torch.topk(
+                            bias, k=debug_topk_k, dim=-1
+                        )
+                        final_topk_ids[:, i].copy_(step_topk_ids)
+                        final_topk_values[:, i].copy_(step_topk_values)
                     markov_top1[:, i].copy_(next_tokens)
                 candidates[:, i + 1].copy_(next_tokens)
                 prev_tokens = next_tokens
@@ -1313,12 +1355,32 @@ class DSparkWorkerV2(BaseSpecWorker):
                 assert markov_top1 is not None
                 assert prev_token_debug is not None
                 self._last_markov_refine_debug = {
+                    "base_topk_ids": (
+                        base_topk_ids[:output_bs].detach()
+                        if base_topk_ids is not None
+                        else None
+                    ),
+                    "base_topk_values": (
+                        base_topk_values[:output_bs].detach()
+                        if base_topk_values is not None
+                        else None
+                    ),
                     "base_top1": base_top1[:output_bs].detach(),
                     "base_top1_logit": base_top1_logit[:output_bs].detach(),
                     "hidden_norm": hidden_norm[:output_bs].detach(),
                     "hidden_abs_mean": hidden_abs_mean[:output_bs].detach(),
                     "hidden_cos_adjacent": hidden_cos_adjacent[:output_bs].detach(),
                     "markov_top1": markov_top1[:output_bs].detach(),
+                    "final_topk_ids": (
+                        final_topk_ids[:output_bs].detach()
+                        if final_topk_ids is not None
+                        else None
+                    ),
+                    "final_topk_values": (
+                        final_topk_values[:output_bs].detach()
+                        if final_topk_values is not None
+                        else None
+                    ),
                     "prev_tokens": prev_token_debug[:output_bs].detach(),
                 }
             else:
@@ -1440,12 +1502,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             debug = self._last_markov_refine_debug
             if not debug:
                 return None
+            base_topk_ids = debug.get("base_topk_ids")
+            base_topk_values = debug.get("base_topk_values")
             base_top1 = debug.get("base_top1")
             base_top1_logit = debug.get("base_top1_logit")
             hidden_norm = debug.get("hidden_norm")
             hidden_abs_mean = debug.get("hidden_abs_mean")
             hidden_cos_adjacent = debug.get("hidden_cos_adjacent")
             markov_top1 = debug.get("markov_top1")
+            final_topk_ids = debug.get("final_topk_ids")
+            final_topk_values = debug.get("final_topk_values")
             prev_tokens = debug.get("prev_tokens")
             if (
                 base_top1 is None
@@ -1466,6 +1532,30 @@ class DSparkWorkerV2(BaseSpecWorker):
             candidate_row = candidates[row_idx]
             target_row = target_predict[row_idx]
             confidence_row = confidence[row_idx]
+            has_topk_debug = (
+                base_topk_ids is not None
+                and base_topk_values is not None
+                and final_topk_ids is not None
+                and final_topk_values is not None
+            )
+            if has_topk_debug:
+                row_base_topk_ids = (
+                    base_topk_ids[row_idx, :draft_limit].detach().cpu()
+                )
+                row_base_topk_values = (
+                    base_topk_values[row_idx, :draft_limit].detach().cpu()
+                )
+                row_final_topk_ids = (
+                    final_topk_ids[row_idx, :draft_limit].detach().cpu()
+                )
+                row_final_topk_values = (
+                    final_topk_values[row_idx, :draft_limit].detach().cpu()
+                )
+            else:
+                row_base_topk_ids = None
+                row_base_topk_values = None
+                row_final_topk_ids = None
+                row_final_topk_values = None
             row_base = base_top1[row_idx, :draft_limit].detach().cpu()
             row_base_top1_logit = base_top1_logit[
                 row_idx, :draft_limit
@@ -1496,6 +1586,54 @@ class DSparkWorkerV2(BaseSpecWorker):
                         ],
                     }
                 )
+
+            topk_debug = []
+            if has_topk_debug:
+                assert row_base_topk_ids is not None
+                assert row_base_topk_values is not None
+                assert row_final_topk_ids is not None
+                assert row_final_topk_values is not None
+                for step in range(draft_limit):
+                    target_token = (
+                        int(target_row[step])
+                        if step < int(target_row.numel())
+                        else None
+                    )
+                    candidate_token = (
+                        int(candidate_row[step + 1])
+                        if step + 1 < int(candidate_row.numel())
+                        else None
+                    )
+                    base_ids = [int(x) for x in row_base_topk_ids[step].tolist()]
+                    base_values = [
+                        float(x) for x in row_base_topk_values[step].tolist()
+                    ]
+                    final_ids = [int(x) for x in row_final_topk_ids[step].tolist()]
+                    final_values = [
+                        float(x) for x in row_final_topk_values[step].tolist()
+                    ]
+                    topk_debug.append(
+                        {
+                            "step": int(step),
+                            "prev_token": int(row_prev[step]),
+                            "candidate": candidate_token,
+                            "target": target_token,
+                            "base_top_ids": base_ids,
+                            "base_top_logits": base_values,
+                            "base_target_rank_in_top": (
+                                base_ids.index(target_token)
+                                if target_token in base_ids
+                                else None
+                            ),
+                            "final_top_ids": final_ids,
+                            "final_top_logits": final_values,
+                            "final_target_rank_in_top": (
+                                final_ids.index(target_token)
+                                if target_token in final_ids
+                                else None
+                            ),
+                        }
+                    )
             payload = {
                 "layout": (
                     "candidate0 is verify anchor; markov_top1[i] is sampled from "
@@ -1522,6 +1660,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ],
                 "target_first": [int(x) for x in target_row[:candidate_limit].tolist()],
                 "candidate_target_hits": candidate_target_hits,
+                "logits_topk_first": topk_debug,
                 "confidence_first": [
                     float(x) for x in confidence_row[:draft_limit].tolist()
                 ],
@@ -1599,6 +1738,30 @@ class DSparkWorkerV2(BaseSpecWorker):
             and draft_input.future_indices.numel() == bs
             else None
         )
+        sampling_info = getattr(model_worker_batch, "sampling_info", None)
+        sampling_is_all_greedy = (
+            bool(getattr(sampling_info, "is_all_greedy"))
+            if sampling_info is not None
+            and hasattr(sampling_info, "is_all_greedy")
+            else None
+        )
+
+        def _sampling_param_cpu(name: str):
+            value = (
+                getattr(sampling_info, name, None)
+                if sampling_info is not None
+                else None
+            )
+            if value is None:
+                return None
+            try:
+                return value.detach().cpu().view(-1).tolist()
+            except Exception:
+                return None
+
+        temperatures = _sampling_param_cpu("temperatures")
+        top_ks = _sampling_param_cpu("top_ks")
+        top_ps = _sampling_param_cpu("top_ps")
         verify_cache = verify_out_cache_loc.detach().cpu().view(bs, block_size)
         position_rows = positions.detach().cpu().view(bs, block_size)
         req_to_token = self.model_runner.req_to_token_pool.req_to_token
@@ -1660,6 +1823,22 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                     "seq_len": int(seq_lens[i]),
                     "new_seq_len": int(next_seq_lens[i]),
+                    "is_all_greedy": sampling_is_all_greedy,
+                    "temperature": (
+                        float(temperatures[i])
+                        if temperatures is not None and i < len(temperatures)
+                        else None
+                    ),
+                    "top_k": (
+                        int(top_ks[i])
+                        if top_ks is not None and i < len(top_ks)
+                        else None
+                    ),
+                    "top_p": (
+                        float(top_ps[i])
+                        if top_ps is not None and i < len(top_ps)
+                        else None
+                    ),
                     "kv_committed": (
                         int(getattr(req, "kv_committed_len"))
                         if req is not None and hasattr(req, "kv_committed_len")
