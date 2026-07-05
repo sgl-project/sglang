@@ -23,6 +23,16 @@ whole tree first. For a new model, follow the request path:
 That is the dependency direction. Avoid making a model PR that requires readers
 to jump between folders in a different order.
 
+`runtime/models/` is for modeling code: checkpoint-defined neural modules,
+architecture wrappers, and weight-loading or forward-path details that are
+intrinsic to one model family. It is not the home for reusable serving
+infrastructure. If a new task family needs cache managers, graph runners,
+process-group transport, request utilities, or common action-policy helpers,
+put those pieces in SGLang-Diffusion runtime folders such as `runtime/cache/`,
+`runtime/distributed/`, `runtime/utils/`, or shared pipeline stages. A model
+package can call those helpers, but it should not own them unless they are truly
+architecture-specific.
+
 ## Start With the Smallest Change
 
 Before adding files, decide which path fits the model.
@@ -49,6 +59,8 @@ optimization, but a new model PR should usually have a small touch surface.
 | Pipeline config | Denoising, decoding, precision, position encoding, or CFG hooks differ | `configs/pipeline_configs/{model}.py` |
 | Pipeline wiring | The model needs a new stage layout or module list | `runtime/pipelines/{model}.py` |
 | DiT/UNet module | The denoising network is new | `runtime/models/dits/{model}.py` |
+| dVLA or policy module | The checkpoint defines a new action-policy architecture | `runtime/models/{family}/modeling_*.py` or a task-specific model subfolder |
+| Shared runtime infrastructure | Cache, CUDA graph, distributed transfer, request utilities, or action-policy helpers can be reused by future models | `runtime/cache/`, `runtime/distributed/`, `runtime/utils/`, `runtime/pipelines_core/stages/` |
 | Model component config | A model component has static architecture config | `configs/models/dits/{model}.py`, `configs/models/vaes/{model}.py` |
 | Model-specific stage | Pre-processing is too custom for the standard stages | `runtime/pipelines_core/stages/model_specific_stages/{model}.py` |
 | Encoder, VAE, scheduler | No existing implementation can be reused | `runtime/models/encoders/`, `runtime/models/vaes/`, `runtime/models/schedulers/` |
@@ -62,6 +74,13 @@ For a new native architecture, the common minimum is:
 5. `runtime/models/dits/{model}.py`
 
 Everything else should be justified by model behavior, not by habit.
+
+For dVLA or other non-image diffusion policies, keep the same ownership rule.
+The policy network, VLM/action expert modules, checkpoint mapping, and
+model-specific forward code belong under `runtime/models/`. Prefix caches,
+request-local contexts, denoising graph runners, OpenPI-compatible transport,
+and prefix/action process-group utilities should be shared SGLang-Diffusion
+runtime infrastructure when they are useful beyond the first model.
 
 ## Read the Reference First
 
