@@ -212,6 +212,8 @@ def maybe_load_fsdp_model(
     """
     # NOTE(will): cast_forward_inputs=True shouldn't be needed as we are
     # manually casting the inputs to the model
+
+    # 1. prepare for loading
     default_torch_dtype = param_dtype if param_dtype else torch.bfloat16
     mp_policy = MixedPrecisionPolicy(
         default_torch_dtype, reduce_dtype, output_dtype, cast_forward_inputs=False
@@ -279,6 +281,8 @@ def maybe_load_fsdp_model(
         )
 
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
+
+    # 2. load model from disk
     weight_iterator = safetensors_weights_iterator(weight_dir_list)
     preprocess_loaded_state_dict = getattr(model, "preprocess_loaded_state_dict", None)
     if preprocess_loaded_state_dict is not None:
@@ -307,7 +311,9 @@ def maybe_load_fsdp_model(
             dict(model.named_parameters()), bnb_quant_states
         )
 
+    # 3. postprocessing
     if weight_postprocess_device is not None:
+        # move to device to perform postprocessing
         model.to(weight_postprocess_device)
 
     for _, module in model.named_modules():

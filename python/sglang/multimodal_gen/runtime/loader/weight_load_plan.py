@@ -22,6 +22,7 @@ class WeightLoadPlan:
         needs_device_weight_postprocess: bool,
         component_cpu_offload: bool,
     ) -> "WeightLoadPlan":
+        # if on-device weight postprocessing is required, load directly to device to speedup loading
         weight_postprocess_device = (
             checkpoint_load_device if needs_device_weight_postprocess else None
         )
