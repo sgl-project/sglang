@@ -145,37 +145,15 @@ def pad_text_embeddings_with_mask(
 
 
 def shard_rotary_emb_for_sp(emb):
-    """
-    Shard rotary embeddings [S, D] along sequence for SP.
-    If S is not divisible by SP degree, pad by repeating the last row.
-    """
-    # Sequence Parallelism: slice image RoPE to local shard if enabled
+    """Shard rotary embeddings [S, D] along the sequence for SP; non-divisible
+    lengths pad by repeating the last row (position labels, never attention
+    K/V, so the pad value only needs to stay finite)."""
     try:
-        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-            get_sp_parallel_rank,
-            get_sp_world_size,
-        )
+        from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import shard_seq
 
-        sp_world_size = get_sp_world_size()
+        return shard_seq(emb, dim=0, pad_mode="repeat_last")[0]
     except Exception:
-        sp_world_size = 1
-    seq_len = emb.shape[0]
-    if seq_len % sp_world_size != 0:
-        pad_len = sp_world_size - (seq_len % sp_world_size)
-        pad = emb[-1:].repeat(pad_len, 1)
-        emb = torch.cat([emb, pad], dim=0)
-    if sp_world_size > 1:
-        try:
-            rank = get_sp_parallel_rank()
-        except Exception:
-            rank = 0
-        seq_len = emb.shape[0]
-        local_len = seq_len // sp_world_size
-        start = rank * local_len
-        end = start + local_len
-        emb = emb[start:end]
-        return emb
-    else:
+        # Distributed state not initialized (single-process utilities).
         return emb
 
 
@@ -543,18 +521,15 @@ class PipelineConfig:
             return latents, False
         time_dim = latents.shape[2]
 
-        # Pad to next multiple of SP degree if needed
+        # Zero-padding a non-divisible time dim would enter self-attention
+        # unmasked (video models pass no attn_mask) and corrupt real tokens;
+        # keep such shapes unsharded until models consume the sp_shard meta.
         if time_dim > 0 and time_dim % sp_world_size != 0:
-            logger.debug(
-                "Padding latents to next multiple of SP degree, performance is sub-optimal"
+            logger.warning_once(
+                f"Latent time dim {time_dim} is not divisible by SP degree "
+                f"{sp_world_size}; skipping sequence shard for correctness."
             )
-            pad_len = sp_world_size - (time_dim % sp_world_size)
-            pad = torch.zeros(
-                (*latents.shape[:2], pad_len, *latents.shape[3:]),
-                dtype=latents.dtype,
-                device=latents.device,
-            )
-            latents = torch.cat([latents, pad], dim=2)
+            return latents, False
 
         assert latents.shape[2] % sp_world_size == 0
         sharded_tensor = rearrange(
