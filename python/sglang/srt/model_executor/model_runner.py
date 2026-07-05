@@ -1661,11 +1661,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         "Waterfill requires model config n_routed_experts."
                     )
             if balancer_cls is None:
-                from sglang.srt.layers.moe.deepep_waterfill import (
-                    DeepEPWaterfillBalancer,
-                )
+                from sglang.srt.layers.moe.deepep_waterfill import WaterfillBalancer
 
-                balancer_cls = DeepEPWaterfillBalancer
+                balancer_cls = WaterfillBalancer
             # Static EPLB remaps TopK ids to physical expert ids before Waterfill.
             # Redundant experts therefore need to be included in the per-rank
             # expert count used for Waterfill's shared-expert slot remapping.
