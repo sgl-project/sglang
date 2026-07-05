@@ -1703,7 +1703,6 @@ class ServerArgs:
         "Directory to write decoupled speculative decoding trace files.",
     ] = None
 
-    # -------------------------------------------------------------------------
     # Speculative decoding (ngram)
     # -------------------------------------------------------------------------
     speculative_ngram_min_bfs_breadth: A[
@@ -2642,38 +2641,17 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
-        self._maybe_download_model_for_runai()
-
-        # Normalize load balancing defaults early (before dummy-model short-circuit).
-        self._handle_load_balance_method()
-
-        # Validate mm_process_config before dummy-model early return.
-        self._handle_multimodal()
-        # Validate SSL arguments early (before dummy-model short-circuit).
-        self._handle_ssl_validation()
-        # Validate transcription/ASR-specific server args (model-independent).
-        self._handle_asr_validation()
-
-        # Validate PD disaggregation flags early (before dummy-model short-circuit).
-        from sglang.srt.arg_groups.pd_disaggregation_hook import (
-            handle_pd_disaggregation,
-        )
-
-        handle_pd_disaggregation(self)
-        if self.enable_session_radix_cache and self.radix_eviction_policy != "priority":
-            raise ValueError(
-                "--enable-session-radix-cache requires --radix-eviction-policy priority"
-            )
-
-        # Normalize deprecated CP aliases before validations or model-specific
-        # defaults inspect enable_prefill_cp/cp_strategy.
-        self._handle_legacy_cp_arguments()
-        self._validate_prefill_only_disable_kv_cache_args()
-        self._handle_dcp_validation()
-
         if self.model_path.lower() in ["none", "dummy"]:
-            # Skip for dummy models
             return
+
+        self._handle_model_source_paths()
+
+        # Validate mm_process_config.
+        self._handle_multimodal()
+        # Validate SSL arguments early.
+        self._handle_ssl_validation()
+        # Validate transcription/ASR-specific server args.
+        self._handle_asr_validation()
 
         # Handle deprecated arguments.
         self._handle_deprecated_args()
@@ -2681,18 +2659,17 @@ class ServerArgs:
         # Handle deprecated environment variables for prefill delayer.
         self._handle_prefill_delayer_env_compat()
 
-        # Resolve --quantization unquant: explicitly opt out of quantization.
-        # Convert to None now (before model config validation), but record
-        # the intent so auto-detection in _handle_model_specific_adjustments
-        # does not override it.
-        if self.quantization == "unquant":
-            self.quantization = None
-            self._quantization_explicitly_unset = True
-        else:
-            self._quantization_explicitly_unset = False
-
         # Set missing default values.
         self._handle_missing_default_values()
+
+        # Validate PD disaggregation flags before CUDA graph config.
+        self._handle_pd_disaggregation()
+
+        # Normalize deprecated CP aliases before validations or model-specific
+        # defaults inspect enable_prefill_cp/cp_strategy.
+        self._handle_legacy_cp_arguments()
+        self._validate_prefill_only_disable_kv_cache_args()
+        self._handle_dcp_validation()
 
         self._handle_cuda_graph_config()
 
@@ -2711,12 +2688,6 @@ class ServerArgs:
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
-
-        # enforce_disable_flashinfer_allreduce_fusion must be set before
-        # _handle_model_specific_adjustments, which auto-enables the fusion
-        # for several SM90/SM100 MoE arches.
-        if self.enable_deterministic_inference:
-            self.enforce_disable_flashinfer_allreduce_fusion = True
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
@@ -2755,6 +2726,9 @@ class ServerArgs:
 
         # Handle data parallelism.
         self._handle_data_parallelism()
+
+        # Normalize load balancing defaults.
+        self._handle_load_balance_method()
 
         # Re-apply after model-specific defaults resolve attention_backend so
         # canonical CP mirrors to the right legacy runtime aliases.
@@ -2812,7 +2786,8 @@ class ServerArgs:
         # Handle any other necessary validations.
         self._handle_other_validations()
 
-    def _maybe_download_model_for_runai(self):
+    def _handle_model_source_paths(self):
+        """Resolve model/tokenizer paths backed by remote object stores."""
         if is_runai_obj_uri(self.model_path):
             ObjectStorageModel.download_and_get_path(self.model_path)
 
@@ -2822,6 +2797,13 @@ class ServerArgs:
             and self.tokenizer_path != self.model_path
         ):
             ObjectStorageModel.download_and_get_path(self.tokenizer_path)
+
+    def _handle_pd_disaggregation(self):
+        from sglang.srt.arg_groups.pd_disaggregation_hook import (
+            handle_pd_disaggregation,
+        )
+
+        handle_pd_disaggregation(self)
 
     def _handle_dcp_validation(self):
         # Decode context parallel (DCP) is currently implemented and validated
@@ -3026,7 +3008,16 @@ class ServerArgs:
         # - Otherwise, the draft model defaults to the same quantization as the target model.
         if self.speculative_draft_model_quantization is None:
             self.speculative_draft_model_quantization = self.quantization
-        elif self.speculative_draft_model_quantization == "unquant":
+
+        # Resolve --quantization unquant before model config validation. Record
+        # the explicit opt-out so later auto-detection does not re-enable
+        # quantization.
+        if self.quantization == "unquant":
+            self.quantization = None
+            self._quantization_explicitly_unset = True
+        else:
+            self._quantization_explicitly_unset = False
+        if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
 
     def _handle_modelscope_paths(self):
@@ -3748,6 +3739,9 @@ class ServerArgs:
             get_mimo_v2_fused_qkv_expected_tp_size,
             is_deepseek_dsa,
         )
+
+        if self.enable_deterministic_inference:
+            self.enforce_disable_flashinfer_allreduce_fusion = True
 
         self.uses_mamba_radix_cache = False
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
@@ -5197,8 +5191,7 @@ class ServerArgs:
     def _validate_prefill_only_disable_kv_cache_args(self):
         """Validate --prefill-only-disable-kv-cache flag/precondition constraints.
 
-        Runs before the dummy-model short-circuit so misuse is rejected even
-        for dummy models. Backend resolution is checked separately by
+        Backend resolution is checked separately by
         _handle_prefill_only_disable_kv_cache after backends settle.
         """
         if not self.prefill_only_disable_kv_cache:
@@ -5715,6 +5708,11 @@ class ServerArgs:
             envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
+        if self.enable_session_radix_cache and self.radix_eviction_policy != "priority":
+            raise ValueError(
+                "--enable-session-radix-cache requires --radix-eviction-policy priority"
+            )
+
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
