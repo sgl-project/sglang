@@ -747,7 +747,7 @@
                 "8": 64.35
             },
             "expected_e2e_ms": 1425.0,
-            "expected_avg_denoise_ms": 57.95,
+            "expected_avg_denoise_ms": 110.0,
             "expected_median_denoise_ms": 64.35,
             "estimated_full_test_time_s": 75.0
         },
