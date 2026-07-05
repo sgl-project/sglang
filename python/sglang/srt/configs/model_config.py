@@ -453,8 +453,6 @@ class ModelConfig:
         # Verify quantization
         self._verify_quantization()
 
-        self._verify_transformers_version()
-
         # Verify dual-chunk attention config
         self._verify_dual_chunk_attention_config()
 
@@ -485,6 +483,7 @@ class ModelConfig:
         model_path: str = None,
         model_revision: str = None,
         is_draft_model: bool = False,
+        context_length: Optional[int] = None,
         **kwargs,
     ):
         quantization = (
@@ -501,7 +500,11 @@ class ModelConfig:
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=model_revision or server_args.revision,
-            context_length=server_args.context_length,
+            context_length=(
+                context_length
+                if context_length is not None
+                else server_args.context_length
+            ),
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
             enable_multimodal=server_args.enable_multimodal,
@@ -915,19 +918,6 @@ class ModelConfig:
         if "IQuestLoopCoderForCausalLM" in self.hf_config.architectures:
             loop_num = getattr(self.hf_text_config, "loop_num", 1)
             self.num_attention_layers = int(self.num_hidden_layers * int(loop_num))
-        if "HrmTextForCausalLM" in self.hf_config.architectures:
-            # Compute KV slot count explicitly: native 5.9.0 configs inflate
-            # num_hidden_layers to this in __post_init__, but non-native ones
-            # may carry the raw per-stack count.
-            H_cycles = self.hf_text_config.H_cycles
-            L_cycles = self.hf_text_config.L_cycles
-            num_layers_per_stack = (
-                getattr(self.hf_text_config, "num_layers_per_stack", None)
-                or self.num_hidden_layers
-            )
-            self.num_attention_layers = (
-                int(num_layers_per_stack) * H_cycles * (L_cycles + 1)
-            )
         if "WhisperForConditionalGeneration" in self.hf_config.architectures:
             # Whisper has unique layer ID scheme:
             # - Encoder self-attention: 0 to encoder_layers-1 (no KV cache)
@@ -1449,46 +1439,6 @@ class ModelConfig:
                 self.hf_config.dual_chunk_attention_config[
                     "sparse_attention_enabled"
                 ] = True
-
-    def _verify_transformers_version(self):
-        import transformers
-        from packaging import version
-
-        tf_version_str = getattr(transformers, "__version__", None)
-        if tf_version_str is None:
-            return
-
-        vision_config = getattr(self.hf_config, "vision_config", None)
-        is_glm_46vmoe = "glm-4.6v" in self.model_path.lower() or (
-            vision_config is not None
-            and getattr(vision_config, "model_type", None) == "glm4v_moe_vision"
-            # The vision config model type for GLM-4.5v is 'glm4v_moe',
-            # while for GLM-4.6v, it is 'glm4v_moe_vision'.
-        )
-        needs_tf_v5 = is_glm_46vmoe
-        # Older transformers lacks the native hrm_text config, so it silently
-        # falls back to TransformersForCausalLM and loads fused weights as junk.
-        architectures = getattr(self.hf_config, "architectures", []) or []
-        is_hrm_text = getattr(self.hf_config, "model_type", None) == "hrm_text" or (
-            "HrmTextForCausalLM" in architectures
-        )
-        if is_hrm_text and version.parse(tf_version_str) < version.parse("5.9.0"):
-            raise ValueError(
-                f"HRM-Text (model type {self.hf_config.model_type!r}) requires "
-                f"transformers >= 5.9.0, but {tf_version_str} is installed. "
-                "Please upgrade transformers."
-            )
-
-        tf_version = version.parse(tf_version_str)
-        required_version = version.parse("5.0.0dev0")
-
-        if tf_version < required_version:
-            if needs_tf_v5:
-                raise ValueError(
-                    f"Transformers version {tf_version_str} is not supported for model {self.model_path} "
-                    f"or model type {self.hf_config.model_type}. "
-                    "Please upgrade transformers to >= 5.0.0."
-                )
 
     def _get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
