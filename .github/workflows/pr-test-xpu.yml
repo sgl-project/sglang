@@ -92,6 +92,15 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Ensure XPU runner clean
+        # Reject runners where a previous job left a Level-Zero device-lost
+        # state or a leaked /dev/dri holder — the root cause of the
+        # ~40% silent-stall failures we see on this pool. Fails fast so
+        # the runner label operator can pull the box out of rotation
+        # instead of the next 15 jobs all failing on it.
+        timeout-minutes: 5
+        run: bash scripts/ci/xpu/ensure_xpu_ready.sh
+
       - name: Start CI container
         run: |
           export HF_TOKEN="$(cat ~/huggingface_token.txt)"
@@ -112,8 +121,16 @@ jobs:
 
       - name: Run stage-a tests
         timeout-minutes: 30
+        # Progress watchdog kills the test run if stdout goes silent for
+        # 180s — a Level-Zero deadlock during model weight-load otherwise
+        # burns the full 30m timeout with no diagnostic output.
         run: |
-          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu"
+          python3 scripts/ci/xpu/run_with_progress_watchdog.py --stall-secs 180 -- \
+            docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu"
+
+      - name: Dump XPU diagnostics on failure
+        if: failure()
+        run: bash scripts/ci/xpu/dump_xpu_diagnostics.sh
 
       - name: Cleanup container
         if: always()
@@ -168,6 +185,10 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Ensure XPU runner clean
+        timeout-minutes: 5
+        run: bash scripts/ci/xpu/ensure_xpu_ready.sh
+
       - name: Start CI container
         run: |
           export HF_TOKEN="$(cat ~/huggingface_token.txt)"
@@ -188,8 +209,17 @@ jobs:
 
       - name: Run stage-b tests
         timeout-minutes: 60
+        # Stage B loads real model weights (Llama-3.2-1B). If Level-Zero
+        # deadlocks during weight load the process prints nothing for
+        # ~9 minutes then hits the outer TimeoutError; watchdog cuts
+        # that window down to STALL_SECS and captures diagnostics.
         run: |
-          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-b-test-1-gpu-xpu"
+          python3 scripts/ci/xpu/run_with_progress_watchdog.py --stall-secs 180 -- \
+            docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-b-test-1-gpu-xpu"
+
+      - name: Dump XPU diagnostics on failure
+        if: failure()
+        run: bash scripts/ci/xpu/dump_xpu_diagnostics.sh
 
       - name: Cleanup container
         if: always()
