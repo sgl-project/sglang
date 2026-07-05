@@ -241,7 +241,7 @@ __launch_bounds__(TPB) __global__ void moeTopKFast(
         // The inputs_after_softmax is modified in-place to avoid unnecessary loops for finding the top k-1 value.
         // 1.f represents the minimum value.
         inputs_after_softmax[thread_read_offset + expert] = -1.f;
-        int idx = k * block_row + k_idx * 2 + i;
+        int64_t idx = static_cast<int64_t>(k) * block_row + k_idx * 2 + i;
         output[idx] = result.value;
         indices[idx] = should_process_row ? (expert - start_expert) : num_experts;
         assert(indices[idx] >= 0);
@@ -254,7 +254,7 @@ __launch_bounds__(TPB) __global__ void moeTopKFast(
   if (renormalize && threadIdx.x == 0) {
     float row_sum_for_renormalize_inv = 1.f / row_sum_for_renormalize;
     for (int k_idx = 0; k_idx < k; ++k_idx) {
-      const int idx = k * block_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * block_row + k_idx;
       output[idx] = output[idx] * row_sum_for_renormalize_inv;
     }
   }
@@ -302,7 +302,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
       const bool node_uses_expert = expert >= start_expert && expert < end_expert;
       const bool should_process_row = row_is_active && node_uses_expert;
 
-      const int idx = k * block_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * block_row + k_idx;
       output[idx] = result_kvp.value;
       indices[idx] = should_process_row ? (expert - start_expert) : num_experts;
       assert(indices[idx] >= 0);
@@ -317,7 +317,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
   if (renormalize && threadIdx.x == 0) {
     float row_sum_for_renormalize_inv = 1.f / row_sum_for_renormalize;
     for (int k_idx = 0; k_idx < k; ++k_idx) {
-      const int idx = k * block_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * block_row + k_idx;
       output[idx] = output[idx] * row_sum_for_renormalize_inv;
     }
   }
@@ -557,7 +557,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
 
       // The lead thread from each sub-group will write out the final results to global memory. (This will be a
       // single) thread per row of the input/output matrices.
-      const int idx = k * thread_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * thread_row + k_idx;
       output[idx] = max_val;
       indices[idx] = should_process_row ? (expert - start_expert) : NUM_EXPERTS;
       row_sum_for_renormalize += max_val;
@@ -582,7 +582,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
     float row_sum_for_renormalize_inv = 1.f / row_sum_for_renormalize;
 #pragma unroll
     for (int k_idx = 0; k_idx < k; ++k_idx) {
-      const int idx = k * thread_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * thread_row + k_idx;
       output[idx] = output[idx] * row_sum_for_renormalize_inv;
     }
   }

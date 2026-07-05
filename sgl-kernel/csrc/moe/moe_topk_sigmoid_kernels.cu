@@ -133,7 +133,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
       inp_kvp.value = inputs_after_sigmoid[idx];
 
       for (int prior_k = 0; prior_k < k_idx; ++prior_k) {
-        const int prior_winning_expert = indices[k * block_row + prior_k];
+        const int prior_winning_expert = indices[static_cast<int64_t>(k) * block_row + prior_k];
 
         if (prior_winning_expert == expert) {
           inp_kvp = thread_kvp;
@@ -150,7 +150,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
       const bool node_uses_expert = expert >= start_expert && expert < end_expert;
       const bool should_process_row = row_is_active && node_uses_expert;
 
-      const int idx = k * block_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * block_row + k_idx;
       float val = result_kvp.value;
       if (correction_bias != nullptr) {
         val -= correction_bias[expert];
@@ -166,7 +166,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
   if (renormalize && threadIdx.x == 0) {
     float row_sum_for_renormalize_inv = 1.f / row_sum_for_renormalize;
     for (int k_idx = 0; k_idx < k; ++k_idx) {
-      const int idx = k * block_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * block_row + k_idx;
       output[idx] = output[idx] * row_sum_for_renormalize_inv;
     }
   }
@@ -342,7 +342,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSigmoid(
 
       // The lead thread from each sub-group will write out the final results to global memory. (This will be a
       // single) thread per row of the input/output matrices.
-      const int idx = k * thread_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * thread_row + k_idx;
       if (correction_bias != nullptr) {
         max_val -= correction_bias[expert];
       }
@@ -370,7 +370,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSigmoid(
     float row_sum_for_renormalize_inv = 1.f / row_sum_for_renormalize;
 #pragma unroll
     for (int k_idx = 0; k_idx < k; ++k_idx) {
-      const int idx = k * thread_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * thread_row + k_idx;
       output[idx] = output[idx] * row_sum_for_renormalize_inv;
     }
   }

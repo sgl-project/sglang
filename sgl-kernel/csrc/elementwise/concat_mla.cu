@@ -23,7 +23,7 @@ __global__ void concat_mla_k_kernel(
     const int64_t k_nope_stride_0,
     const int k_nope_stride_1,
     const int64_t k_rope_stride_0) {
-  const int64_t flat_warp_id = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
+  const int flat_warp_id = static_cast<int>((static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / 32);
   const int token_id = flat_warp_id / NUM_HEAD_CHUNKS;
   const int head_chunk_id = flat_warp_id % NUM_HEAD_CHUNKS;
   const int lane_id = get_lane_id();
@@ -132,7 +132,7 @@ __global__ void concat_mla_absorb_q_kernel(
     const int b_stride_1,
     const int64_t out_stride_0,
     const int out_stride_1) {
-  const int64_t flat_warp_id = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
+  const int flat_warp_id = static_cast<int>((static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / 32);
   const int lane_id = get_lane_id();
 
   const int idx_0 = flat_warp_id / dim_1;
