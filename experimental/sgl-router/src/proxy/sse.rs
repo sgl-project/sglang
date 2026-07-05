@@ -887,6 +887,63 @@ mod tests {
         assert!(end.client_disconnect, "client disconnect must be reported");
     }
 
+    #[test]
+    fn inband_scanner_detects_error_when_newline_opens_next_chunk() {
+        // Chunk 1 carries the COMPLETE error line with no newline; chunk 2
+        // begins with the `\n` at index 0 — the empty-extend path of the
+        // carry branch, the boundary an off-by-one in `rest[i + 1..]` breaks.
+        let mut s = InbandErrorScanner::default();
+        s.feed(b"data: {\"error\": {\"code\": 503}}");
+        assert!(!s.found, "no newline yet — line is incomplete");
+        s.feed(b"\ndata: [DONE]\n");
+        assert!(s.found, "line completed by a chunk-leading newline");
+    }
+
+    #[test]
+    fn inband_scanner_detects_error_as_later_line_in_one_chunk() {
+        // The in-place while-loop must advance PAST a non-error line and
+        // match a later one within the same chunk.
+        let mut s = InbandErrorScanner::default();
+        s.feed(
+            b"data: {\"choices\": []}\n\ndata: {\"error\": {\"code\": 500}}\n\ndata: [DONE]\n\n",
+        );
+        assert!(s.found, "error on a non-first line of a chunk must match");
+    }
+
+    #[tokio::test]
+    async fn on_complete_reports_inband_error_and_transport_failure_together() {
+        // The engine emits a well-formed in-band error, then the connection
+        // breaks. BOTH flags must be reported — the chat handler's precedence
+        // mapping (inband_error wins) depends on neither masking the other.
+        use std::sync::Mutex as StdMutex;
+        let seen: Arc<StdMutex<Option<StreamEnd>>> = Arc::new(StdMutex::new(None));
+        let seen_c = Arc::clone(&seen);
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"error\": {\"message\": \"aborted\", \"code\": 503}}\n\n",
+            )),
+            Err(std::io::Error::other("connection reset")),
+        ];
+        let body = bytes_stream_to_body(
+            stream::iter(chunks),
+            None,
+            Some(Box::new(move |end| {
+                *seen_c.lock().unwrap() = Some(end);
+            })),
+            None,
+        );
+        let _ = body.collect().await;
+        for _ in 0..50 {
+            if seen.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let end = seen.lock().unwrap().expect("on_complete must fire");
+        assert!(end.saw_inband_error, "in-band error must be reported");
+        assert!(!end.transport_ok, "transport failure must also be reported");
+    }
+
     #[tokio::test]
     async fn on_complete_reports_upstream_error() {
         use std::sync::Mutex as StdMutex;

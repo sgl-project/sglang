@@ -418,3 +418,80 @@ async fn pd_mode_disconnect_does_not_abort_either_worker() {
         "PD mode must not inject a rid into the prefill body"
     );
 }
+
+/// PD-mode STREAMING: the stream-outcome hook must be installed on the
+/// decode arm (the client-facing stream) and labelled with the DECODE
+/// worker's URL — the label is load-bearing, since the metric exists to
+/// finger the specific engine pod that accepted-then-in-band-rejected.
+#[tokio::test]
+async fn pd_mode_streaming_inband_error_labels_decode_worker() {
+    use http_body_util::BodyExt;
+
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode_chunks: Vec<&'static str> = vec![
+        "data: {\"error\": {\"message\": \"The request queue is full.\", \"code\": 503}}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let decode = crate::common::mock_worker::MockWorker::start(decode_chunks).await;
+    let ctx = build_ctx(vec![
+        WorkerSpec {
+            id: WorkerId("p1".into()),
+            url: prefill.url.clone(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: Some(8997),
+        },
+        WorkerSpec {
+            id: WorkerId("d1".into()),
+            url: decode.url.clone(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        },
+    ]);
+    let app = build_router(ctx.clone());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+
+    // The metric records from the SSE pump's spawned task — poll briefly.
+    let expected = format!(
+        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="inband_error"}} 1"#,
+        decode.url,
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let m = loop {
+        let m = ctx.metrics.render();
+        if m.contains(&expected) || std::time::Instant::now() > deadline {
+            break m;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(
+        m.contains(&expected),
+        "PD streaming in-band error must be labelled with the decode worker; got:\n{m}",
+    );
+    // The prefill worker must NOT appear in the stream-outcome family — its
+    // spawned side-request is a buffered JSON forward, not a client stream.
+    assert!(
+        !m.contains(&format!(
+            r#"sgl_router_stream_outcome_total{{worker_url="{}""#,
+            prefill.url,
+        )),
+        "prefill side must not record a stream outcome; got:\n{m}",
+    );
+}

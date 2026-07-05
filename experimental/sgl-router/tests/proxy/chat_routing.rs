@@ -68,6 +68,39 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
 }
 
+/// A standard `stream: true` chat request against the "tiny" model.
+fn streaming_chat_request() -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+/// Poll the metrics rendering until it contains `needle` or a 2 s deadline
+/// passes, returning the final rendering either way (the caller asserts, so
+/// a miss produces a useful diff). Streaming metrics are recorded from the
+/// SSE pump's spawned task, which may not have completed when the client
+/// finishes draining the body — a fixed sleep is flaky under CI load.
+async fn await_metrics_containing(ctx: &Arc<AppContext>, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let m = ctx.metrics.render();
+        if m.contains(needle) || std::time::Instant::now() > deadline {
+            return m;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn non_streaming_returns_200() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
@@ -271,44 +304,38 @@ async fn streaming_inband_error_records_stream_outcome_without_tripping_breaker(
     let ctx = build_ctx_with_worker(&worker.url);
     let app = build_router(ctx.clone());
 
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/chat/completions")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({
-                "model": "tiny",
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": true
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let res = app.oneshot(req).await.unwrap();
-    // The 200 was committed before the in-band error existed — wire truth.
-    assert_eq!(res.status(), StatusCode::OK);
-    let _ = res.into_body().collect().await.unwrap().to_bytes();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Run THREE in-band-error streams — the default breaker threshold. If a
+    // regression ever counted an in-band error as a breaker failure, three
+    // consecutive ones would trip it; a single request could never (one
+    // failure < threshold), making the breaker assertion below vacuous.
+    for _ in 0..3 {
+        let res = app.clone().oneshot(streaming_chat_request()).await.unwrap();
+        // The 200 was committed before the in-band error existed — wire truth.
+        assert_eq!(res.status(), StatusCode::OK);
+        let _ = res.into_body().collect().await.unwrap().to_bytes();
+    }
 
-    let m = ctx.metrics.render();
     let expected = format!(
-        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="inband_error"}} 1"#,
+        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="inband_error"}} 3"#,
         worker.url,
     );
+    let m = await_metrics_containing(&ctx, &expected).await;
     assert!(
         m.contains(&expected),
-        "in-band error must be classified at stream end; got:\n{m}",
+        "in-band errors must be classified at stream end; got:\n{m}",
     );
     // Headers-time counters still (correctly) say 200/success — the new
     // metric is the only place the in-band failure is visible.
     assert!(m.contains(
-        r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="200"} 1"#
+        r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="200"} 3"#
     ));
-    // Transport was clean: the breaker must still admit requests.
+    // Transport was clean: threshold-many in-band errors must NOT trip the
+    // breaker (they record success, an application-level verdict is kept out
+    // of routing).
     for w in ctx.registry.all() {
         assert!(
             w.breaker.would_allow(),
-            "in-band error must not trip the circuit breaker",
+            "in-band errors must not trip the circuit breaker",
         );
     }
 }
@@ -325,36 +352,92 @@ async fn streaming_clean_completion_records_stream_outcome_ok() {
     let ctx = build_ctx_with_worker(&worker.url);
     let app = build_router(ctx.clone());
 
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/chat/completions")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({
-                "model": "tiny",
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": true
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let res = app.oneshot(req).await.unwrap();
+    let res = app.oneshot(streaming_chat_request()).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let _ = res.into_body().collect().await.unwrap().to_bytes();
-    tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let m = ctx.metrics.render();
     let expected = format!(
         r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="ok"}} 1"#,
         worker.url,
     );
+    let m = await_metrics_containing(&ctx, &expected).await;
     assert!(
         m.contains(&expected),
         "clean stream must record outcome=ok; got:\n{m}",
     );
+    for absent in [
+        r#"outcome="inband_error""#,
+        r#"outcome="upstream_error""#,
+        r#"outcome="client_disconnect""#,
+    ] {
+        assert!(
+            !m.contains(absent),
+            "clean stream must record ONLY outcome=ok, found {absent}; got:\n{m}",
+        );
+    }
+}
+
+/// A worker that commits 200 and then breaks the byte stream mid-flight must
+/// classify as `upstream_error` — exercising the COMPOSED completion hook
+/// (breaker record_failure AND the stream-end metric firing from the same
+/// closure), which the proxy-level mid-stream-drop test can't see (it passes
+/// no on_stream_end hook).
+#[tokio::test]
+async fn streaming_mid_stream_drop_records_stream_outcome_upstream_error() {
+    let worker = crate::common::mock_worker::MockWorker::start_returning_partial_body(
+        StatusCode::OK,
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx.clone());
+
+    let res = app.oneshot(streaming_chat_request()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    // Drain — the pump sees the mid-flight drop and surfaces an error chunk.
+    let _ = res.into_body().collect().await;
+
+    let expected = format!(
+        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="upstream_error"}} 1"#,
+        worker.url,
+    );
+    let m = await_metrics_containing(&ctx, &expected).await;
     assert!(
-        !m.contains(r#"outcome="inband_error""#),
-        "no in-band error on a clean stream; got:\n{m}",
+        m.contains(&expected),
+        "mid-stream transport drop must classify as upstream_error; got:\n{m}",
+    );
+}
+
+/// Precedence: an in-band error event followed by a transport break must
+/// classify as `inband_error`, not `upstream_error` — the in-band event is
+/// the specific signal (the engine's own verdict); the subsequent drop is
+/// its side effect. Pins the branch ORDER in chat.rs's outcome mapping.
+#[tokio::test]
+async fn streaming_inband_error_wins_over_subsequent_transport_drop() {
+    let worker = crate::common::mock_worker::MockWorker::start_returning_partial_body(
+        StatusCode::OK,
+        b"data: {\"error\": {\"message\": \"aborted\", \"code\": 503}}\n\n",
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx.clone());
+
+    let res = app.oneshot(streaming_chat_request()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = res.into_body().collect().await;
+
+    let expected = format!(
+        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="inband_error"}} 1"#,
+        worker.url,
+    );
+    let m = await_metrics_containing(&ctx, &expected).await;
+    assert!(
+        m.contains(&expected),
+        "in-band error must win over the transport drop that follows it; got:\n{m}",
+    );
+    assert!(
+        !m.contains(r#"outcome="upstream_error""#),
+        "the same stream must not double-classify; got:\n{m}",
     );
 }
 
@@ -404,6 +487,13 @@ async fn streaming_5xx_request_records_duration_and_status_but_not_ttft() {
     assert!(
         m.contains(r#"sgl_router_request_duration_seconds_count{model_id="tiny"} 1"#),
         "request_duration must be recorded even for a failed streaming request; got:\n{m}",
+    );
+    // The stream-outcome metric is gated to 2xx-committed streams — a 5xx
+    // error body draining is not a stream outcome (it would pollute the
+    // metric's ok-ratio with error-body drains classified as `ok`).
+    assert!(
+        !m.contains("sgl_router_stream_outcome_total{"),
+        "stream outcome must NOT be recorded for a non-2xx streaming response; got:\n{m}",
     );
 }
 
