@@ -361,9 +361,8 @@ class Envs:
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
 
     # Scheduler: others:
-    SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(
-        -1
-    )  # in seconds. Set if you observe high memory accumulation over a long serving period.
+    # in seconds. Set if you observe high memory accumulation over a long serving period.
+    SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
     # Force-enable the WAR (write-after-read) barrier for the overlap scheduler
     # even when is_cuda() is False (e.g. AMD/ROCm). On CUDA the barrier is
@@ -786,9 +785,9 @@ class Envs:
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
 
     # Warmup
-    SGLANG_WARMUP_TIMEOUT = EnvFloat(
-        -1
-    )  # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging. Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
+    # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging.
+    # Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
+    SGLANG_WARMUP_TIMEOUT = EnvFloat(-1)
 
     # HTTP Server
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
