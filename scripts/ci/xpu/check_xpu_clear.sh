@@ -20,16 +20,18 @@ check_xpu_clear() {
     # memory state — degrade to fd-only and warn loudly.
     local mem_ok=0
     if _have xpu-smi; then
-        # `xpu-smi discovery` lists devices; empty output means the driver
-        # didn't come up (device-lost from the previous job). The row
-        # format is `NN | ...` where NN is the numeric device id.
+        # `xpu-smi discovery` prints a boxed table:
+        #   | 0         | Device Name: Intel(R) Arc(TM) B580 Graphics
+        #   |           | PCI BDF Address: 0000:18:00.0
+        # Row starts with `|`, then whitespace, then the id, then `|`.
+        # Extract that id column and dedupe (each device spans multiple lines).
         local discovery
         discovery=$(timeout 15 xpu-smi discovery 2>/dev/null || true)
-        # Extract every device id the driver enumerated. Works on both
-        # single-BMG hosts (id 0) and multi-XPU hosts (Xeon Max, PVC).
         local dev_ids
         dev_ids=$(echo "$discovery" \
-            | awk -F'|' '/^\s*[0-9]+\s*\|/ {gsub(/ /,"",$1); print $1}' \
+            | awk -F'|' '$2 ~ /^[[:space:]]*[0-9]+[[:space:]]*$/ {
+                gsub(/[[:space:]]/,"",$2); print $2
+              }' \
             | sort -un)
         if [ -z "$dev_ids" ]; then
             echo "ERROR: xpu-smi enumerated 0 devices — driver likely wedged." >&2

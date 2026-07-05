@@ -25,7 +25,9 @@ if command -v xpu-smi >/dev/null 2>&1; then
     # iGPU+dGPU hosts the dGPU is often id 1; on multi-XPU hosts we want
     # all of them in the crash report.
     xpu_ids=$(timeout 15 xpu-smi discovery 2>/dev/null \
-        | awk -F'|' '/^\s*[0-9]+\s*\|/ {gsub(/ /,"",$1); print $1}' \
+        | awk -F'|' '$2 ~ /^[[:space:]]*[0-9]+[[:space:]]*$/ {
+              gsub(/[[:space:]]/,"",$2); print $2
+          }' \
         | sort -un)
     if [ -z "$xpu_ids" ]; then
         echo "(xpu-smi discovery returned no devices — driver likely wedged)"
