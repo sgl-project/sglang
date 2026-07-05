@@ -220,9 +220,9 @@ class MlxAOTKernelContext:
         req_ids: list[str],
         req_pool_idx: dict[str, int],
         req_to_token_pool: Any | None,
-        # Only .offset is read here (absolute on both cache kinds); windowed
-        # caches never reach the pool-scatter path (kv_pool is None without
-        # the radix pool).
+        # Only .offset is read here (absolute on both cache kinds). The
+        # slot lookup is layer-agnostic; the wrapper gates the fused pool
+        # scatter to full-attention layers (windowed KV stays per-request).
         layer_caches: list[list[ContiguousAttentionKVCache | WindowedAttentionKVCache]],
     ) -> MlxAOTKernelContext:
         """Build optional AOT context for one batched decode step."""

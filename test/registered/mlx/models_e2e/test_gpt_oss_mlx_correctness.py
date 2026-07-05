@@ -5,8 +5,9 @@ uses per-head attention sinks, so it exercises the MLX backend's
 sliding-window path end to end. Two guards:
 
 1. ``TestGptOssMlxCorrectness`` — black-box serving smoke against a running
-   server, including a >128-token prompt so the sliding window actually
-   engages.
+   server with the radix cache enabled (the default KV path), including a
+   >128-token prompt so the sliding window actually engages and a repeated
+   prompt so a radix prefix hit must reproduce the cold greedy output.
 2. ``TestGptOssMlxReferenceCorrectness`` — token-for-token equivalence of
    ``MlxModelRunner`` greedy decoding against raw, unpatched mlx_lm greedy
    generation. SGLang keeps full KV and applies banded masks /
@@ -112,10 +113,14 @@ class TestGptOssMlxCorrectness(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
+                # Radix cache stays enabled (the default): sliding-window
+                # layers keep windowed per-request KV, the shared pool holds
+                # full-attention layers, and prefix hits recompute the
+                # prefix, so serving must stay correct without
+                # --disable-radix-cache.
                 "--trust-remote-code",
                 "--tp-size",
                 "1",
-                "--disable-radix-cache",
                 "--disable-cuda-graph",
                 "--mem-fraction-static",
                 MEM_FRACTION_STATIC,
@@ -183,6 +188,24 @@ class TestGptOssMlxCorrectness(CustomTestCase):
             ],
         )
         self.assertIn("BLUEBERRY", text.upper())
+
+    def test_radix_prefix_hit_reproduces_greedy_output(self):
+        # The server runs with the radix cache enabled. Sending the same
+        # >128-token prompt twice makes the second request hit the cached
+        # prefix; on sliding-window models the runner recomputes the prefix
+        # (windowed KV keeps no pool history), and greedy output must be
+        # identical to the cold request.
+        messages = [
+            {"role": "system", "content": "You are a concise assistant."},
+            {
+                "role": "user",
+                "content": _NUMBER_LIST
+                + ". Which number comes right after 41? Answer briefly.",
+            },
+        ]
+        cold = self._chat(messages, max_tokens=48)
+        hit = self._chat(messages, max_tokens=48)
+        self.assertEqual(cold, hit)
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)

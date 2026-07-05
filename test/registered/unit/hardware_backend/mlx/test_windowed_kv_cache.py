@@ -2,8 +2,9 @@
 
 ``WindowedAttentionKVCache`` keeps only the trailing ``window`` tokens of a
 sliding-window layer instead of the full sequence (PR #30050 stored full
-history and windowed at read time; this is the promised follow-up for the
-``disable_radix_cache`` per-request path).  Correctness rests on three
+history and windowed at read time; this landed first on the
+``disable_radix_cache`` per-request path and now serves the radix/pool
+path too, see test_swa_radix_pool.py).  Correctness rests on three
 claims, each pinned here against the full-history path:
 
 1. Cache level: the arrays returned by ``update_and_fetch``/``get_kv`` are
@@ -467,8 +468,8 @@ class TestModelRunnerCacheWiring(CustomTestCase):
         self.assertEqual(cache[0].window, TINY_WINDOW)
 
     def test_all_contiguous_when_window_map_empty(self):
-        # Radix/pool path: MlxModelRunner.__init__ leaves the map empty, so
-        # pool-backed conversions keep absolute slicing intact.
+        # Models without container windows have an empty map, so every
+        # attention layer keeps a contiguous full-history cache.
         runner = self._stub_runner({})
         cache = runner._new_native_cache()
         for c in cache:

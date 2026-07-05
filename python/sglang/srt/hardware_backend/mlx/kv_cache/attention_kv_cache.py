@@ -167,17 +167,26 @@ class WindowedAttentionKVCache:
     Only correct for layers whose attention is genuinely windowed with
     ``window_size <= window``; requesting a full-context mask after history
     has been dropped raises.
+
+    ``offset`` may be seeded at construction for pool-path prefix
+    restoration: a cache that starts empty at absolute position ``offset``
+    keeps RoPE offsets and decode bookkeeping aligned across layers while
+    the window content is refilled from elsewhere (e.g. a future shared
+    SWA pool gather).
     """
 
     __slots__ = ("keys", "values", "offset", "window", "_local")
 
-    def __init__(self, window: int):
+    def __init__(self, window: int, offset: int = 0):
         if window < 1:
             raise ValueError(f"window must be >= 1, got {window}")
+        if offset < 0:
+            raise ValueError(f"offset must be >= 0, got {offset}")
         self.window = window
         self.keys: mx.array | None = None
         self.values: mx.array | None = None
-        self.offset = 0  # absolute position: count of all tokens ever written
+        # Absolute position: seeded start plus all tokens ever written.
+        self.offset = offset
         self._local = 0  # valid tokens currently held in the buffer
 
     @property
