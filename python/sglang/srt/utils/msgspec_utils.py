@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import dataclasses
+import enum
 from typing import Any
 
 import msgspec
@@ -35,12 +37,21 @@ class Base64Bytes:
 
 
 def msgspec_to_builtins(obj: Any) -> Any:
-    """Recursively convert msgspec structs to dict/list Python builtins."""
+    """Recursively convert msgspec structs, dataclasses, and enums to builtins."""
     if isinstance(obj, msgspec.Struct):
         return {
             field.name: msgspec_to_builtins(getattr(obj, field.name))
             for field in msgspec.structs.fields(type(obj))
         }
+
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return {
+            f.name: msgspec_to_builtins(getattr(obj, f.name))
+            for f in dataclasses.fields(obj)
+        }
+
+    if isinstance(obj, enum.Enum):
+        return obj.value
 
     if isinstance(obj, dict):
         return {key: msgspec_to_builtins(value) for key, value in obj.items()}

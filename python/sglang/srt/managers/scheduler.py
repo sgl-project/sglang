@@ -3778,8 +3778,10 @@ class Scheduler(
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
 
-        # This field is not serializable.
+        # These fields are not msgpack-serializable (a config object and a bound
+        # signal handler); no reader consumes them.
         ret.pop("model_config", None)
+        ret.pop("custom_sigquit_handler", None)
 
         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
 
@@ -3825,13 +3827,7 @@ class Scheduler(
                 setattr(get_global_server_args(), k, v)
             logger.info(f"Global server args updated! {get_global_server_args()=}")
 
-        server_args = dict(vars(get_global_server_args()))
-        # This field is not serializable.
-        server_args.pop("model_config", None)
-        return SetInternalStateReqOutput(
-            updated=if_success,
-            server_args=msgspec_to_builtins(server_args),
-        )
+        return SetInternalStateReqOutput(updated=if_success)
 
     def save_remote_model(self, **kwargs):
         self.weight_updater.save_remote_model(kwargs)
