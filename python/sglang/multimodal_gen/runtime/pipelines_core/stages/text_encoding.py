@@ -16,7 +16,10 @@ import torch
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_world_group,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -35,6 +38,68 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def _data_parallel_text_encode(forward_fn, forward_kwargs: dict, group):
+    """Data-parallel text encoding across a replicated encoder's ranks.
+
+    When the text encoder is replicated (every rank redundantly encodes the
+    whole prompt batch), split the batch so each rank encodes only its
+    1/world_size slice, then all-gather so every rank ends up with the full
+    batch output. Each rank still runs the full, unsharded encoder on its
+    slice, so the result is bit-identical to the replicated forward (no
+    sharding FP-reorder) while cutting per-rank encode compute ~world_size.
+
+    The batch is padded to a multiple of world_size (padding rows are dropped
+    after the gather). All output tensors are batch-major (dim 0), and the
+    tokenized sequence length is uniform across ranks (the full batch is
+    tokenized identically on every rank), so the gather is a plain concat.
+    """
+    world = group.world_size
+    rank = group.rank_in_group
+    input_ids = forward_kwargs["input_ids"]
+    bs = input_ids.shape[0]
+    # The whole group must enter this path in lockstep with the same batch size
+    # (all ranks process the same request; the caller gates identically). Verify
+    # cheaply so a desync fails fast here instead of hanging in the all-gather.
+    bs_sum = int(
+        group.all_reduce(
+            torch.tensor([bs], device=input_ids.device, dtype=torch.int64)
+        ).item()
+    )
+    assert bs_sum == bs * world, (
+        f"data-parallel text-encode batch size desynced across ranks "
+        f"(rank {rank} bs={bs}, group sum={bs_sum} != {bs * world})"
+    )
+    chunk = (bs + world - 1) // world
+    pad = chunk * world - bs
+
+    def _shard(t):
+        if not torch.is_tensor(t) or t.shape[0] != bs:
+            return t
+        if pad:
+            t = torch.cat([t, t[:1].expand(pad, *t.shape[1:])], dim=0)
+        return t[rank * chunk : (rank + 1) * chunk]
+
+    local_out: BaseEncoderOutput = forward_fn(
+        {k: _shard(v) for k, v in forward_kwargs.items()}
+    )
+
+    def _gather(t):
+        if t is None:
+            return None
+        return group.all_gather(t.contiguous(), dim=0)[:bs]
+
+    def _gather_seq(seq):
+        return tuple(_gather(t) for t in seq) if seq is not None else None
+
+    return BaseEncoderOutput(
+        last_hidden_state=_gather(local_out.last_hidden_state),
+        pooler_output=_gather(local_out.pooler_output),
+        hidden_states=_gather_seq(local_out.hidden_states),
+        attentions=_gather_seq(local_out.attentions),
+        attention_mask=_gather(local_out.attention_mask),
+    )
 
 
 @lru_cache(maxsize=1)
@@ -123,6 +188,12 @@ class TextEncodingStage(ConditionEncodingStage):
 
         this is a one-slot cache for the model-default negative prompt:
         most requests don't override the negative prompt, the cache hit rate is considerably high
+
+        Rank-sync invariant: hit/miss must be identical across every rank of the
+        DiT replica, because a miss runs encode_text which now contains collective
+        ops (folded encoders all_reduce; data-parallel encoding all_gathers) -- a
+        split hit/miss would deadlock. The key is deterministic and requests are
+        processed in lockstep, so this holds; keep any future eviction rank-global.
         """
         negative_cache_key = self._build_negative_text_cache_key(
             batch, server_args, all_indices
@@ -449,6 +520,25 @@ class TextEncodingStage(ConditionEncodingStage):
         with set_forward_context(current_timestep=0, attn_metadata=None):
             return text_encoder(**encoder_forward_kwargs)
 
+    def _text_encode_dp_group(self, server_args, encoder_config, batch_size):
+        """Group to data-parallel a batched text-encode over, or None.
+
+        Only worth it when the encoder is *replicated* across a multi-rank
+        single replica (tp==1, dp==1, not folded), so every rank would
+        otherwise redundantly encode the whole batch. A folded encoder is
+        already model-parallel, and tp>1 already shards it; dp>1 would need the
+        per-replica group instead of the world group, so skip those here.
+        """
+        if (
+            batch_size <= 1
+            or (server_args.tp_size or 1) != 1
+            or (server_args.dp_size or 1) != 1
+            or getattr(encoder_config, "parallel_folding", False)
+        ):
+            return None
+        group = get_world_group()
+        return group if group.world_size > 1 else None
+
     @torch.no_grad()
     def encode_text(
         self,
@@ -593,9 +683,19 @@ class TextEncodingStage(ConditionEncodingStage):
             if "use_cache" in inspect.signature(text_encoder.forward).parameters:
                 encoder_forward_kwargs["use_cache"] = False
             self._manage_text_encoder_use(i)
-            outputs: BaseEncoderOutput = self._forward_text_encoder(
-                text_encoder, encoder_forward_kwargs
+            dp_group = self._text_encode_dp_group(
+                server_args, encoder_config, input_ids.shape[0]
             )
+            if dp_group is not None:
+                outputs = _data_parallel_text_encode(
+                    lambda kw: self._forward_text_encoder(text_encoder, kw),
+                    encoder_forward_kwargs,
+                    dp_group,
+                )
+            else:
+                outputs = self._forward_text_encoder(
+                    text_encoder, encoder_forward_kwargs
+                )
             postprocess_sig = inspect.signature(postprocess_func)
 
             postprocess_kwargs = {}
