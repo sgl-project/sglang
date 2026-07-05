@@ -127,7 +127,10 @@ class KvVmmArena:
             # Align the base to granularity so base + (granularity-aligned cursor) is
             # always a valid cuMemMap address for per-buffer commit_range().
             self.base = int(
-                drv.cuMemAddressReserve(self.reserved, self.granularity, 0, 0)[1]
+                _check(
+                    drv.cuMemAddressReserve(self.reserved, self.granularity, 0, 0),
+                    "cuMemAddressReserve",
+                )
             )
             # commit_range bookkeeping: mapped VA -> (size, handle); committed bytes per offset.
             self._ranges = {}
