@@ -218,8 +218,6 @@ class FutureMap:
                 device=self.device,
             )
 
-        # MTP IndexShare seed: per-req indexer top-k carried across iters. Like the
-        # other extras it must be pool-indexed so it tracks filter/merge of the batch.
         self.dsa_topk_indices_buf = None
         if payload.dsa_topk_indices is not None:
             seed0 = payload.dsa_topk_indices[0]

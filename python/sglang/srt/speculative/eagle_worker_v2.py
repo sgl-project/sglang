@@ -190,24 +190,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
-        # Reuse the first draft step's NSA/DSA indexer topk across the rest;
-        # topk == 1 only (select_top_k_tokens reorders rows, desyncing indices).
-        self.index_share_for_mtp_iteration = (
-            getattr(
-                self.draft_runner.model_config.hf_config,
-                "index_share_for_mtp_iteration",
-                False,
-            )
-            and self.topk == 1
-        )
-        # GLM-5.2 MTP IndexShare: anchor the reused indexer top-k on the
-        # draft-extend step (last verified token) instead of draft-decode step 0.
-        self.dsa_index_topk = getattr(
-            self.draft_runner.model_config.hf_config, "index_topk", None
-        )
-        self.seed_dsa_topk_from_extend = (
-            self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
-        )
+        self._init_dsa_index_share_state()
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
         self.draft_tp_context = (
@@ -272,6 +255,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         if (c := self.draft_runner.canary_manager) is not None:
             c.mark_init_finished()
+
+    def _init_dsa_index_share_state(self) -> None:
+        # Populate DSA index-share fields from the draft runner's hf_config.
+        # Reused by the attention unit-test harnesses, which skip __init__.
+        hf_config = self.draft_runner.model_config.hf_config
+        # Reuse the first draft step's DSA indexer topk across the rest;
+        # topk == 1 only (select_top_k_tokens reorders rows, desyncing indices).
+        self.index_share_for_mtp_iteration = (
+            getattr(hf_config, "index_share_for_mtp_iteration", False)
+            and self.topk == 1
+        )
+        # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
+        # (last verified token), not draft-decode step 0.
+        self.dsa_index_topk = getattr(hf_config, "index_topk", None)
+        self.seed_dsa_topk_from_extend = (
+            self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+        )
 
     def _rebuild_topk1_chain_buffers(self) -> None:
         # For topk=1 the draft tree degenerates to a chain, so parent_list and

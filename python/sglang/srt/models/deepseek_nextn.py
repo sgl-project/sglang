@@ -245,9 +245,8 @@ class DeepseekModelNextN(nn.Module):
                 if forward_batch.reuse_dsa_topk_indices:
                     forward_batch.spec_info.dsa_topk_indices = topk_indices
 
-                # MTP IndexShare: during draft-extend (spec_info is always an
-                # EagleDraftExtendInput here), publish the indexer topk (optionally
-                # only the selected rows) to seed the next draft-decode loop.
+                # MTP IndexShare: on draft-extend, publish the last-token DSA
+                # indexer top-k to seed (avoid recomputing in) the draft-decode loop.
                 if forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
                     seed_buf = forward_batch.spec_info.dsa_seed_topk_capture
                     if seed_buf is not None and topk_indices is not None:

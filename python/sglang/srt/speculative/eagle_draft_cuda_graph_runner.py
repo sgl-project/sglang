@@ -65,7 +65,6 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     hidden_states: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
-    # MTP IndexShare: draft-extend indexer top-k seed reused by every step.
     dsa_seed_topk: Optional[torch.Tensor] = None
 
 
@@ -226,11 +225,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64, device="cpu"
         )
 
-        # MTP IndexShare: static seed buffer (one indexer-topk row per request)
-        # reused by every captured draft-decode step.
         if self.eagle_worker.seed_dsa_topk_from_extend:
-            # Init to 0 (a valid index): capture reads this before any real seed
-            # exists, and all-(-1) "attend to nothing" rows could NaN at capture.
             dsa_seed_topk = torch.zeros(
                 (self.max_bs, self.eagle_worker.dsa_index_topk),
                 dtype=torch.int32,
@@ -384,8 +379,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             hidden_states=hidden_states,
             capture_hidden_mode=capture_mode,
         )
-        # MTP IndexShare: capture the reuse path (step 0 reads the seed buffer,
-        # not the indexer); execute() fills the buffer before replay.
         if self.buffers.dsa_seed_topk is not None:
             spec_info.dsa_topk_indices = self.buffers.dsa_seed_topk[:num_seqs]
 
@@ -514,7 +507,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             if buffers.hidden_states is not None:
                 buffers.hidden_states.zero_()
             if buffers.dsa_seed_topk is not None:
-                # Padded rows use index 0 (valid), not stale seed indices.
                 buffers.dsa_seed_topk.zero_()
             buffers.req_pool_indices.zero_()
 
@@ -575,8 +567,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             and forward_batch.spec_info.hidden_states is not None
         ):
             buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
-        # MTP IndexShare: copy the carried seed into the static buffer the graph
-        # reuses; a missing seed (e.g. first draft) falls back to index 0.
         if buffers.dsa_seed_topk is not None:
             seed = forward_batch.spec_info.dsa_topk_indices
             if seed is not None:

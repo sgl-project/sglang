@@ -65,7 +65,6 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     next_token_logits_buffer: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
-    # MTP IndexShare: draft model publishes its indexer top-k here for the worker.
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
 
 
@@ -234,8 +233,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64, device="cpu"
         )
 
-        # MTP IndexShare: static buffer the draft model writes its indexer top-k
-        # into; the worker gathers the per-request last-position seed after replay.
         if self.eagle_worker.seed_dsa_topk_from_extend:
             dsa_seed_topk_capture = torch.full(
                 (self.max_num_token, self.eagle_worker.dsa_index_topk),
@@ -398,7 +395,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             padded_static_len=self.padded_static_len,
         )
 
-        # MTP IndexShare: route the indexer top-k into the static capture buffer.
         if self.buffers.dsa_seed_topk_capture is not None:
             spec_info.dsa_seed_topk_capture = self.buffers.dsa_seed_topk_capture[
                 :num_tokens

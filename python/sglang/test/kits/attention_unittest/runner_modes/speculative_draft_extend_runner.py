@@ -20,6 +20,7 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import fast_topk
 
@@ -496,20 +497,7 @@ class _EagleDraftExtendV2WorkerHarness:
         self.eagle_use_aux_hidden_state = False
         self.hot_token_id = None
         self.draft_runner.model = model_forward
-        self.index_share_for_mtp_iteration = (
-            getattr(
-                self.model_config.hf_config,
-                "index_share_for_mtp_iteration",
-                False,
-            )
-            and self.topk == 1
-        )
-        self.dsa_index_topk = getattr(
-            self.draft_runner.model_config.hf_config, "index_topk", None
-        )
-        self.seed_dsa_topk_from_extend = (
-            self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
-        )
+        EagleDraftWorker._init_dsa_index_share_state(self)
 
 
 def _build_eagle_draft_extend_fixture(

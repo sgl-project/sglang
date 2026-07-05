@@ -330,8 +330,6 @@ class EagleDraftExtendInput(SpecInput):
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = 1
 
-    # MTP IndexShare: draft model publishes its indexer topk into this buffer
-    # (optionally gathered at dsa_seed_topk_select rows) to seed the next loop.
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
     dsa_seed_topk_select: Optional[torch.Tensor] = None
 
