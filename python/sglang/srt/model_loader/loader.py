@@ -91,7 +91,8 @@ from sglang.srt.utils.common import is_cuda_alike
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
     0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
 )
-from sglang.srt.environ import envs, temp_set_env
+from sglang.srt.environ import envs
+from sglang.srt.utils.common import temp_set_env
 from sglang.srt.model_loader.weight_utils import (
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
