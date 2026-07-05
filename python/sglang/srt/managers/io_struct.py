@@ -300,6 +300,8 @@ class GenerateReqInput:
 
     # For Unlimited-OCR
     images_config: Optional[dict] = None
+    # vLLM-compatible per-request multimodal processor kwargs (e.g. Gemma4 max_soft_tokens)
+    mm_processor_kwargs: Optional[dict] = None
 
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].

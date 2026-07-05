@@ -741,6 +741,8 @@ class ChatCompletionRequest(BaseModel):
     use_audio_in_video: bool = False
 
     images_config: Optional[Dict] = None
+    # vLLM-compatible per-request multimodal processor kwargs, e.g. {"max_soft_tokens": 1120}
+    mm_processor_kwargs: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None

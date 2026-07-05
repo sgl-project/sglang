@@ -127,6 +127,52 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
             input_text, images=images, videos=videos, audios=audios, **kwargs
         )
 
+    _SUPPORTED_SOFT_TOKENS = (70, 140, 280, 560, 1120)
+
+    @staticmethod
+    def _resolve_image_processor_kwargs(request_obj) -> dict:
+        """Per-request Gemma4 image budget (``max_soft_tokens``), which controls the
+        effective image resolution. Accepts the SGLang-native ``images_config`` and the
+        vLLM-compatible ``mm_processor_kwargs`` (``images_config`` wins if both are set).
+        Returns ``{}`` when unset, leaving the model/processor default in place.
+        """
+        if request_obj is None:
+            return {}
+        for src in (
+            getattr(request_obj, "images_config", None),
+            getattr(request_obj, "mm_processor_kwargs", None),
+        ):
+            if isinstance(src, dict) and src.get("max_soft_tokens") is not None:
+                mst = src["max_soft_tokens"]
+                if mst not in Gemma4SGLangProcessor._SUPPORTED_SOFT_TOKENS:
+                    raise ValueError(
+                        f"max_soft_tokens={mst!r} is not supported; expected one of "
+                        f"{Gemma4SGLangProcessor._SUPPORTED_SOFT_TOKENS}"
+                    )
+                return {"max_soft_tokens": mst}
+        return {}
+
+    @staticmethod
+    def _mix_config_into_hash(mm_items, processor_kwargs) -> None:
+        """Mix per-request processor kwargs into mm-item hashes so different budgets do
+        not collide in the radix / embedding cache. Mirrors UnlimitedOCRProcessor."""
+        import hashlib
+
+        from sglang.srt.managers.mm_utils import hash_feature
+
+        config_bytes = str(sorted(processor_kwargs.items())).encode()
+        for item in mm_items:
+            if item.feature is not None:
+                base_hash = hash_feature(item.feature)
+            elif item.precomputed_embeddings is not None:
+                base_hash = hash_feature(item.precomputed_embeddings)
+            else:
+                continue
+            combined = hashlib.sha256(
+                base_hash.to_bytes(8, byteorder="big") + config_bytes
+            ).digest()[:8]
+            item.hash = int.from_bytes(combined, byteorder="big", signed=False)
+
     async def process_mm_data_async(
         self,
         image_data: Optional[List[Union[str, bytes, Dict]]] = None,
@@ -137,6 +183,9 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         **kwargs,
     ):
         """Process multimodal data including images, video, and audio."""
+        # Per-request image resolution budget (Gemma4 max_soft_tokens), if provided.
+        image_processor_kwargs = self._resolve_image_processor_kwargs(request_obj)
+
         base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
@@ -146,8 +195,10 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         )
 
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
+            base_output, self.mm_tokens, **image_processor_kwargs
         )
+        if image_processor_kwargs:
+            self._mix_config_into_hash(mm_items, image_processor_kwargs)
 
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),
