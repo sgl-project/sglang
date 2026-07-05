@@ -21,6 +21,7 @@ register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
 
 class TestAscendW4A4(GSM8KAscendMixin, CustomTestCase):
+
     model = ECO_TECH_QWEN3_32B_W4A4_LAOS_WEIGHTS_PATH
     other_args = [
         "--trust-remote-code",
@@ -45,7 +46,7 @@ class TestAscendW4A4(GSM8KAscendMixin, CustomTestCase):
     accuracy = 0.80  # GSM8K accuracy ≥0.80
     num_questions = 1319
     gsm8k_num_shots = 5
-    output_throughput = 850  # GSM8K output throughput >= 850 tokens/s
+    output_throughput = 1000  # GSM8K output throughput ≥1000 tokens/s
     gsm8k_parallel = 64
 
     def run_decode(self, max_new_tokens):

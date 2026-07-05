@@ -1234,9 +1234,7 @@ def _remote_file_exists(url: str) -> bool | None:
 
 def _load_remote_gt_image(url: str) -> np.ndarray:
     last_error: Exception | None = None
-    backoff = 1.0
-    attempts = 5
-    for attempt in range(attempts):
+    for _ in range(3):
         try:
             resp = requests.get(url, timeout=60)
             try:
@@ -1244,15 +1242,12 @@ def _load_remote_gt_image(url: str) -> np.ndarray:
                     image = Image.open(io.BytesIO(resp.content)).convert("RGB")
                     return np.array(image)
                 last_error = FileNotFoundError(f"GT image not found: {url}")
+                if resp.status_code not in (403, 429) and resp.status_code < 500:
+                    break
             finally:
                 resp.close()
         except requests.RequestException as exc:
             last_error = exc
-        if attempt < attempts - 1:
-            # Raw GitHub can briefly serve a stale 404 even after the
-            # existence probe saw the newly-pinned ci-data object.
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 8.0)
     raise FileNotFoundError(f"GT image not found: {url}") from last_error
 
 

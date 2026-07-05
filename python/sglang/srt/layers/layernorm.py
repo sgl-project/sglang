@@ -31,7 +31,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -271,7 +271,7 @@ class RMSNorm(MultiPlatformOp):
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
-                or get_server_args().rl_on_policy_target == "fsdp"
+                or get_global_server_args().rl_on_policy_target == "fsdp"
             ):
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
@@ -371,7 +371,7 @@ class RMSNorm(MultiPlatformOp):
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
-                or get_server_args().rl_on_policy_target == "fsdp"
+                or get_global_server_args().rl_on_policy_target == "fsdp"
                 or (self._fused_pad_kernel is not None and self.x_pad_to_multiple > 0)
             ):
                 return self.forward_native(x, residual, post_residual_addition)
@@ -432,7 +432,7 @@ class RMSNorm(MultiPlatformOp):
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
-                or get_server_args().rl_on_policy_target == "fsdp"
+                or get_global_server_args().rl_on_policy_target == "fsdp"
             ):
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
@@ -559,7 +559,10 @@ class RMSNorm(MultiPlatformOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
-            if residual is not None or get_server_args().rl_on_policy_target == "fsdp":
+            if (
+                residual is not None
+                or get_global_server_args().rl_on_policy_target == "fsdp"
+            ):
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
                 x,

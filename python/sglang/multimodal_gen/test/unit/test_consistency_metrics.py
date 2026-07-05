@@ -1,9 +1,7 @@
-import io
 import math
 
 import numpy as np
 import pytest
-from PIL import Image
 
 from sglang.multimodal_gen.test import test_utils
 from sglang.multimodal_gen.test.test_utils import (
@@ -19,12 +17,6 @@ from sglang.multimodal_gen.test.test_utils import (
 
 def _solid_image(value: int, size: int = 32) -> np.ndarray:
     return np.full((size, size, 3), value, dtype=np.uint8)
-
-
-def _encoded_png(image: np.ndarray) -> bytes:
-    buffer = io.BytesIO()
-    Image.fromarray(image).save(buffer, format="PNG")
-    return buffer.getvalue()
 
 
 def _set_official_gt_outputs(monkeypatch, outputs_by_case):
@@ -58,28 +50,6 @@ def test_remote_file_exists_returns_false_for_definitive_404(monkeypatch):
     monkeypatch.setattr(test_utils.requests, "head", lambda *args, **kwargs: Response())
 
     assert test_utils._remote_file_exists("https://example.com/missing.png") is False
-
-
-def test_load_remote_gt_image_retries_transient_404(monkeypatch):
-    class Response:
-        def __init__(self, status_code, content=b""):
-            self.status_code = status_code
-            self.content = content
-
-        def close(self):
-            pass
-
-    expected = _solid_image(17)
-    responses = [Response(404), Response(200, _encoded_png(expected))]
-    monkeypatch.setattr(
-        test_utils.requests, "get", lambda *args, **kwargs: responses.pop(0)
-    )
-    monkeypatch.setattr(test_utils.time, "sleep", lambda *args, **kwargs: None)
-
-    image = test_utils._load_remote_gt_image("https://example.com/gt.png")
-
-    assert np.array_equal(image, expected)
-    assert responses == []
 
 
 def test_remote_video_gt_candidates_survive_inconclusive_probe(monkeypatch):

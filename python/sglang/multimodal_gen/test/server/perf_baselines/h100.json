@@ -732,7 +732,7 @@
                 "TextEncodingStage": 256.67,
                 "LatentPreparationStage": 0.14,
                 "TimestepPreparationStage": 36.44,
-                "DenoisingStage": 900.0,
+                "DenoisingStage": 525.39,
                 "DecodingStage": 10.18
             },
             "denoise_step_ms": {
@@ -747,7 +747,7 @@
                 "8": 64.35
             },
             "expected_e2e_ms": 1425.0,
-            "expected_avg_denoise_ms": 110.0,
+            "expected_avg_denoise_ms": 57.95,
             "expected_median_denoise_ms": 64.35,
             "estimated_full_test_time_s": 75.0
         },

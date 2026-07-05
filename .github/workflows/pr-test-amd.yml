@@ -718,8 +718,6 @@ jobs:
           # - HF_HUB_ENABLE_HF_TRANSFER=1: Use faster hf_transfer for downloads (if available)
           # - HF_HUB_DISABLE_SYMLINKS_WARNING=1: Suppress symlink warnings
           docker exec \
-            -e SGLANG_IS_IN_CI=1 \
-            -e SGLANG_IS_IN_CI_AMD=1 \
             -e SGLANG_E2E_TOLERANCE=0.3 \
             -e SGLANG_STAGE_TIME_TOLERANCE=0.2 \
             -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
@@ -859,8 +857,6 @@ jobs:
           # - HF_HUB_ENABLE_HF_TRANSFER=1: Use faster hf_transfer for downloads (if available)
           # - HF_HUB_DISABLE_SYMLINKS_WARNING=1: Suppress symlink warnings
           docker exec \
-            -e SGLANG_IS_IN_CI=1 \
-            -e SGLANG_IS_IN_CI_AMD=1 \
             -e SGLANG_E2E_TOLERANCE=0.3 \
             -e SGLANG_STAGE_TIME_TOLERANCE=0.2 \
             -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
