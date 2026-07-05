@@ -61,11 +61,8 @@ class TestGDNChunkReplayDecode(unittest.TestCase):
         be.gdn_max_batch = max_bs + 4
         be._gdn_row_map = torch.zeros(be.gdn_max_batch, dtype=torch.int32, device="cuda")
         be._gdn_row_map_host = torch.zeros(be.gdn_max_batch, dtype=torch.int32, device="cpu").pin_memory()
-        be._gdn_valid = torch.zeros(be.gdn_max_batch, dtype=torch.float32, device="cuda")
-        be._gdn_valid_host = torch.zeros(be.gdn_max_batch, dtype=torch.float32, device="cpu").pin_memory()
         be._gdn_out = None
         be._gdn_cur_row_map = None
-        be._gdn_cur_valid = None
         return be
 
     def _full_ref(self, mixed_all, a_all, b_all, layer):

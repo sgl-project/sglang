@@ -795,8 +795,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.gdn_free_rows = list(range(self.gdn_arena_max_bs))  # rows [0, max_bs), pad row excluded
         # Largest decode batch the runner can dispatch (full req/mamba pool). Sizes the batch buffers.
         self.gdn_max_batch = int(self.req_to_token_pool.size)
-        # Persistent GPU batch->row map + validity mask (written each step from pinned host memory,
-        # so they are stable-pointer graph inputs). Filled by _gdn_write_row_map once per decode step.
+        # Persistent GPU batch->row map (written each step from pinned host memory, so it is a
+        # stable-pointer graph input). Filled by _gdn_write_row_map once per decode step.
         dev = model_runner.device
         self._gdn_row_map = torch.zeros(self.gdn_max_batch, dtype=torch.int32, device=dev)
         self._gdn_row_map_host = torch.zeros(
