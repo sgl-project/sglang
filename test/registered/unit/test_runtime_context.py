@@ -415,6 +415,20 @@ class TestRuntimeResolutionStages(_IsolatedServerArgs):
         finally:
             reset_context()
 
+    def test_retired_field_stays_pristine_through_publish(self):
+        # enable_dp_lm_head is dual-apply-retired: a declaration reaches the
+        # flag leaf while the server_args field keeps the user input.
+        @dataclasses.dataclass
+        class _Args:
+            enable_dp_lm_head: A[bool, Arg(help="d", resolvable=True)] = True
+            _resolved_overrides: list = dataclasses.field(default_factory=list)
+
+        args = _Args()
+        args._resolved_overrides = [("dp", {"enable_dp_lm_head": False})]
+        get_context().set_server_args(args)
+        self.assertTrue(args.enable_dp_lm_head)  # pristine, not dual-applied
+        self.assertFalse(get_flags().enable_dp_lm_head)  # resolved leaf
+
     def test_bare_dataclass_publish_skips_materialization(self):
         # object.__new__(ServerArgs) fixtures (no __init__, no field values)
         # must publish without touching the flags tier — dataclass defaults

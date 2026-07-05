@@ -1978,7 +1978,15 @@ def apply_model_overrides(
 # (mid-resolution reads), so declarations no longer mutate server_args and
 # the field stays pristine user input. Grown per field as reader sweeps
 # complete; the publish parity assert skips these fields.
-DUAL_APPLY_RETIRED: frozenset = frozenset()
+DUAL_APPLY_RETIRED: frozenset = frozenset(
+    {
+        # All readers flipped: model LM-head constructions + the logits
+        # processor read get_flags(); require_mlp_tp_gather reads the leaf;
+        # the dp-attention prerequisite check is a view-reading validation
+        # pass.
+        "enable_dp_lm_head",
+    }
+)
 
 
 def apply_declarations_to_server_args(
