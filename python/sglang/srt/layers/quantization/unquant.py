@@ -449,11 +449,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
+        shared_state: Optional[torch.Tensor] = None,
     ) -> CombineInput:
-        return self.forward(
-            layer=layer,
-            dispatch_output=dispatch_output,
-        )
+        if _is_npu:
+            return self.forward(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                shared_state=shared_state,
+            )
+        else:
+            return self.forward(
+                layer=layer,
+                dispatch_output=dispatch_output,
+            )
 
     def forward_cuda(
         self,
@@ -654,6 +662,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self,
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
+        shared_state: Optional[torch.Tensor] = None,
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -740,7 +749,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
             hidden_states,
-            skip1=None,
+            skip1=shared_state,
             skip2=None,
             bias=None,
             scales=topk_weights,
