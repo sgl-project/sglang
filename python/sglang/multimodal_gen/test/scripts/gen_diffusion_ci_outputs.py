@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -21,15 +22,55 @@ from sglang.multimodal_gen.test.run_suite import (
     SUITES,
     PartitionItem,
     _maybe_pin_update_weights_model_pair,
-    collect_test_items,
     get_case_est_time,
     get_suite_files_rel,
     parse_partition_plan,
     partition_items_by_lpt,
     run_pytest,
 )
+from sglang.multimodal_gen.test.runner.pytest_runner import collect_test_items
 
 logger = init_logger(__name__)
+
+
+def collect_test_items(files: list[str], filter_expr: str | None = None) -> list[str]:
+    """Collect test node IDs from the given files using pytest --collect-only."""
+    cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q"]
+    if filter_expr:
+        cmd.extend(["-k", filter_expr])
+    cmd.extend(files)
+
+    filter_note = f" with filter: {filter_expr}" if filter_expr else ""
+    print(f"Collecting tests from {len(files)} file(s){filter_note}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode not in (0, 5):
+        error_msg = (
+            f"pytest --collect-only failed with exit code {result.returncode}\n"
+            f"Command: {' '.join(cmd)}\n"
+        )
+        if result.stderr:
+            error_msg += f"stderr:\n{result.stderr}\n"
+        if result.stdout:
+            error_msg += f"stdout:\n{result.stdout}\n"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
+
+    if result.returncode == 5:
+        print(
+            "No tests were collected (exit code 5). This may be expected with filters."
+        )
+
+    test_items = []
+    for line in result.stdout.strip().split("\n"):
+        line = line.strip()
+        if line and "::" in line and not line.startswith(("=", "-", " ")):
+            test_id = line.split()[0] if " " in line else line
+            if "::" in test_id:
+                test_items.append(test_id)
+
+    print(f"Collected {len(test_items)} test items")
+    return test_items
 
 
 def main():
