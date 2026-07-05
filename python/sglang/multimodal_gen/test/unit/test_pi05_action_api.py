@@ -8,6 +8,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConf
 from sglang.multimodal_gen.runtime.entrypoints.action_utils import (
     action_generation_response,
     action_metadata,
+    action_raw_response,
     build_action_sampling_params,
     pack_msgpack,
     unpack_msgpack,
@@ -123,6 +124,8 @@ def test_action_metadata_reports_policy_shape_and_capabilities():
     assert metadata["output"]["action_horizon"] == 10
     assert metadata["output"]["action_dim"] == 7
     assert metadata["output"]["padded_action_dim"] == 32
+    assert metadata["runtime"]["materialize_dtype"] == "bf16"
+    assert metadata["runtime"]["enable_autocast"] is True
     assert metadata["defaults"]["prefix_cache"] is False
     assert metadata["capabilities"]["realtime_websocket"]
     assert metadata["capabilities"]["openpi_websocket"]
@@ -147,6 +150,27 @@ def test_action_generation_response_uses_actual_output_parameters():
     assert response["usage"]["prefix_cache_hit"] is True
     assert response["timings"] == output["timings"]
     assert response["cache"] == output["cache"]
+
+
+def test_action_raw_response_preserves_policy_payload_shape():
+    actions = np.arange(6, dtype=np.float32).reshape(2, 3)
+    output = {
+        "actions": actions,
+        "timings": {"preprocess_ms": 1.5},
+    }
+
+    response = action_raw_response(output)
+
+    assert response["actions"] == actions.tolist()
+    assert response["timings"] == output["timings"]
+
+
+def test_action_raw_response_can_preserve_numpy_for_msgpack():
+    actions = np.arange(6, dtype=np.float32).reshape(2, 3)
+
+    response = action_raw_response({"actions": actions}, preserve_numpy=True)
+
+    assert response["actions"] is actions
 
 
 def test_msgpack_roundtrip_preserves_string_keys_and_numpy_payloads():

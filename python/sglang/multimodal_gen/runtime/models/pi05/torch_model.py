@@ -10,6 +10,7 @@ from typing import Literal
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
@@ -114,6 +115,34 @@ def prepare_optional_full_attention_mask(
         return None
     masks_4d = att_2d_masks[:, None, :, :]
     return torch.where(masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
+
+
+def siglip_vision_forward_with_openpi_dtype(
+    self,
+    pixel_values,
+    interpolate_pos_encoding: bool | None = False,
+    **kwargs,
+) -> BaseModelOutputWithPooling:
+    hidden_states = self.embeddings(
+        pixel_values,
+        interpolate_pos_encoding=interpolate_pos_encoding,
+    )
+    if (
+        len(self.encoder.layers) > 0
+        and self.encoder.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16
+    ):
+        hidden_states = hidden_states.to(torch.bfloat16)
+
+    encoder_outputs = self.encoder(inputs_embeds=hidden_states, **kwargs)
+    last_hidden_state = encoder_outputs.last_hidden_state
+    last_hidden_state = self.post_layernorm(last_hidden_state)
+    pooler_output = self.head(last_hidden_state) if self.use_head else None
+    return BaseModelOutputWithPooling(
+        last_hidden_state=last_hidden_state,
+        pooler_output=pooler_output,
+        hidden_states=encoder_outputs.hidden_states,
+        attentions=encoder_outputs.attentions,
+    )
 
 
 class ReadOnlyPrefixCache:
@@ -266,6 +295,12 @@ class PaliGemmaWithExpertModel(nn.Module):
             self.paligemma = PaliGemmaForConditionalGenerationWithPiGemma(
                 config=vlm_config_hf
             )
+            vision_tower = self.paligemma.model.vision_tower
+            vision_model = getattr(vision_tower, "vision_model", vision_tower)
+            vision_model.forward = siglip_vision_forward_with_openpi_dtype.__get__(
+                vision_model,
+                type(vision_model),
+            )
             self.paligemma.lm_head = None
 
         if runtime_role in ("all", "action"):
@@ -299,8 +334,12 @@ class PaliGemmaWithExpertModel(nn.Module):
             raise ValueError(f"Invalid Pi05 precision: {precision}")
         self.to(dtype=torch.bfloat16)
         keep_fp32 = [
-            "vision_tower",
-            "multi_modal_projector",
+            "vision_tower.embeddings.patch_embedding.weight",
+            "vision_tower.embeddings.patch_embedding.bias",
+            "vision_tower.embeddings.position_embedding.weight",
+            "vision_tower.vision_model.embeddings.patch_embedding.weight",
+            "vision_tower.vision_model.embeddings.patch_embedding.bias",
+            "vision_tower.vision_model.embeddings.position_embedding.weight",
             "input_layernorm",
             "post_attention_layernorm",
             "model.norm",
@@ -459,6 +498,14 @@ class Pi05TorchModel(nn.Module):
             self.action_out_proj = nn.Linear(action_config.width, config.action_dim)
             self.time_mlp_in = nn.Linear(action_config.width, action_config.width)
             self.time_mlp_out = nn.Linear(action_config.width, action_config.width)
+            if precision == "bfloat16":
+                for module in (
+                    self.action_in_proj,
+                    self.action_out_proj,
+                    self.time_mlp_in,
+                    self.time_mlp_out,
+                ):
+                    module.to(dtype=torch.float32)
         else:
             self.action_in_proj = None
             self.action_out_proj = None

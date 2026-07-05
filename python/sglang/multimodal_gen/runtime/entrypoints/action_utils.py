@@ -157,6 +157,10 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
             "padded_action_dim": pipeline_config.action_dim,
             "dtype": "float32",
         },
+        "runtime": {
+            "materialize_dtype": pipeline_config.materialize_dtype,
+            "enable_autocast": pipeline_config.enable_autocast,
+        },
         "defaults": {
             "num_inference_steps": pipeline_config.default_num_inference_steps,
             "prefix_cache": (
@@ -343,4 +347,16 @@ def action_generation_response(
         response["timings"] = output["timings"]
     if "cache" in output:
         response["cache"] = output["cache"]
+    return response
+
+
+def action_raw_response(
+    output: dict[str, Any],
+    *,
+    preserve_numpy: bool = False,
+) -> dict[str, Any]:
+    response = dict(output)
+    actions = response.get("actions")
+    if isinstance(actions, np.ndarray) and not preserve_numpy:
+        response["actions"] = actions.tolist()
     return response

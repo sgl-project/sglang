@@ -74,6 +74,11 @@ def _materialize_action_batch(
     return actions_out
 
 
+def _synchronize_action_tensor(actions: torch.Tensor | None) -> None:
+    if actions is not None and actions.device.type == "cuda":
+        torch.cuda.synchronize(actions.device)
+
+
 def _effective_prefix_cache_enabled(batch: Req, server_args: ServerArgs) -> bool:
     options = _options(batch)
     return bool(options.get("enable_prefix_cache", True)) and bool(
@@ -348,6 +353,7 @@ class Pi05ActionDenoisingStage(PipelineStage):
                 use_cuda_graph=bool(options.get("enable_cuda_graph", True)),
                 generator=None,
             )
+            _synchronize_action_tensor(actions)
             actions_out = _materialize_action_batch(
                 actions,
                 server_args.pipeline_config.output_action_dim,
@@ -388,6 +394,7 @@ class Pi05ActionDenoisingStage(PipelineStage):
                 use_cuda_graph=bool(options.get("enable_cuda_graph", True)),
                 generator=batch.generator,
             )
+            _synchronize_action_tensor(actions)
         else:
             actions = None
 

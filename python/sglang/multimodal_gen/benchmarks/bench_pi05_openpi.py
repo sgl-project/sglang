@@ -82,6 +82,102 @@ def _stats_ms(samples: list[float]) -> dict[str, float]:
     }
 
 
+def _inc(mapping: dict[str, int], key: object, value: int) -> None:
+    key_str = str(key)
+    mapping[key_str] = mapping.get(key_str, 0) + value
+
+
+def _summarize_torch_module(module) -> dict[str, Any]:
+    param_dtypes: dict[str, int] = {}
+    param_dtype_examples: dict[str, list[str]] = {}
+    buffer_dtypes: dict[str, int] = {}
+    buffer_dtype_examples: dict[str, list[str]] = {}
+    devices: dict[str, int] = {}
+    param_count = 0
+    buffer_count = 0
+    trainable_param_count = 0
+    for name, param in module.named_parameters(recurse=True):
+        numel = int(param.numel())
+        param_count += numel
+        if param.requires_grad:
+            trainable_param_count += numel
+        _inc(param_dtypes, param.dtype, numel)
+        _inc(devices, param.device, numel)
+        examples = param_dtype_examples.setdefault(str(param.dtype), [])
+        if len(examples) < 16:
+            examples.append(name)
+    for name, buffer in module.named_buffers(recurse=True):
+        numel = int(buffer.numel())
+        buffer_count += numel
+        _inc(buffer_dtypes, buffer.dtype, numel)
+        _inc(devices, buffer.device, numel)
+        examples = buffer_dtype_examples.setdefault(str(buffer.dtype), [])
+        if len(examples) < 16:
+            examples.append(name)
+    return {
+        "class": module.__class__.__name__,
+        "param_dtypes": param_dtypes,
+        "param_dtype_examples": param_dtype_examples,
+        "buffer_dtypes": buffer_dtypes,
+        "buffer_dtype_examples": buffer_dtype_examples,
+        "devices": devices,
+        "param_count": param_count,
+        "trainable_param_count": trainable_param_count,
+        "buffer_count": buffer_count,
+    }
+
+
+def _torch_autocast_dtype(torch_module, device: str) -> str:
+    get_autocast_dtype = getattr(torch_module, "get_autocast_dtype", None)
+    if get_autocast_dtype is not None:
+        return str(get_autocast_dtype(device))
+    if device == "cuda":
+        return str(torch_module.get_autocast_gpu_dtype())
+    return str(torch_module.get_autocast_cpu_dtype())
+
+
+def openpi_precision_metadata(policy) -> dict[str, Any]:
+    import torch
+
+    metadata: dict[str, Any] = {
+        "policy_class": policy.__class__.__name__,
+        "is_pytorch_model": bool(getattr(policy, "_is_pytorch_model", False)),
+        "pytorch_device": str(getattr(policy, "_pytorch_device", "")),
+        "torch_default_dtype": str(torch.get_default_dtype()),
+        "torch_autocast_cpu_dtype": _torch_autocast_dtype(torch, "cpu"),
+    }
+    if torch.cuda.is_available():
+        metadata["torch_autocast_cuda_dtype"] = _torch_autocast_dtype(torch, "cuda")
+
+    modules = {}
+    for name, value in vars(policy).items():
+        if isinstance(value, torch.nn.Module):
+            modules[name] = _summarize_torch_module(value)
+    metadata["torch_modules"] = modules
+    return metadata
+
+
+def sglang_precision_metadata(pipeline) -> dict[str, Any]:
+    import torch
+
+    metadata: dict[str, Any] = {
+        "torch_default_dtype": str(torch.get_default_dtype()),
+        "torch_autocast_cpu_dtype": _torch_autocast_dtype(torch, "cpu"),
+    }
+    if torch.cuda.is_available():
+        metadata["torch_autocast_cuda_dtype"] = _torch_autocast_dtype(torch, "cuda")
+
+    modules = {}
+    policy_model = pipeline.get_module("policy_model")
+    if isinstance(policy_model, torch.nn.Module):
+        modules["policy_model"] = _summarize_torch_module(policy_model)
+        core_model = getattr(policy_model, "core_model", None)
+        if isinstance(core_model, torch.nn.Module):
+            modules["core_model"] = _summarize_torch_module(core_model)
+    metadata["torch_modules"] = modules
+    return metadata
+
+
 def _image(rng: np.random.Generator, *, chw: bool = False) -> np.ndarray:
     image = rng.integers(0, 256, size=(224, 224, 3), dtype=np.uint8)
     if chw:
@@ -227,6 +323,7 @@ def build_sglang_payload(
     prefix_cache: bool,
     cuda_graph: bool,
     noise: np.ndarray | None,
+    response_format: str = "envelope",
 ) -> dict[str, Any]:
     encoded_images = {
         key: _json_tensor(np.asarray(value))
@@ -251,6 +348,7 @@ def build_sglang_payload(
             "return_timing": True,
             "prefix_cache": prefix_cache,
             "cuda_graph": cuda_graph,
+            "response_format": response_format,
         },
     }
 
@@ -263,6 +361,7 @@ def build_sglang_python_payload(
     prefix_cache: bool,
     cuda_graph: bool,
     noise: np.ndarray | None,
+    response_format: str = "envelope",
 ) -> dict[str, Any]:
     encoded_observation = {
         "images": {
@@ -286,6 +385,7 @@ def build_sglang_python_payload(
             "prefix_cache": prefix_cache,
             "cuda_graph": cuda_graph,
             "output_format": "numpy",
+            "response_format": response_format,
         },
     }
 
@@ -344,6 +444,15 @@ def _post_action_msgpack(
     return unpack_msgpack(response.content)
 
 
+def _get_action_metadata(session: requests.Session, url: str, timeout_s: float):
+    response = session.get(
+        url.rstrip("/") + "/v1/actions/metadata",
+        timeout=timeout_s,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 def run_sglang_http(
     url: str,
     payloads: list[dict[str, Any]],
@@ -361,6 +470,7 @@ def run_sglang_http(
     single_outputs = []
     batch_latencies = []
     with requests.Session() as session:
+        metadata = _get_action_metadata(session, url, timeout_s)
         for idx in range(min(warmup, len(payloads))):
             post_action(session, endpoint, payloads[idx], timeout_s)
 
@@ -413,6 +523,7 @@ def run_sglang_http(
         },
         "first_output": single_outputs[0] if single_outputs else None,
         "batch_mode": "concurrent_http_msgpack" if msgpack else "concurrent_http_json",
+        "metadata": metadata,
     }
 
 
@@ -444,7 +555,7 @@ async def _run_sglang_openpi_ws_async(
 
     endpoint = _action_ws_url(url)
     async with websockets.connect(endpoint, max_size=None) as websocket:
-        await websocket.recv()
+        metadata = unpack_msgpack(await websocket.recv())
         for idx in range(min(warmup, len(payloads))):
             await _ws_send_recv(websocket, payloads[idx])
 
@@ -515,6 +626,7 @@ async def _run_sglang_openpi_ws_async(
         },
         "first_output": single_outputs[0] if single_outputs else None,
         "batch_mode": "persistent_openpi_websocket",
+        "metadata": metadata,
     }
 
 
@@ -618,6 +730,10 @@ def run_sglang_python(
         model_path,
         pipeline_config_path=pipeline_config_path,
     )
+    from sglang.multimodal_gen.runtime.entrypoints.action_utils import action_metadata
+
+    metadata = action_metadata(server_args)
+    metadata["precision"] = sglang_precision_metadata(pipeline)
     for idx in range(min(warmup, len(payloads))):
         _run_sglang_python_once(pipeline, server_args, payloads[idx])
 
@@ -681,6 +797,7 @@ def run_sglang_python(
         },
         "first_output": single_outputs[0] if single_outputs else None,
         "batch_mode": f"python_policy_{batch_mode}",
+        "metadata": metadata,
     }
 
 
@@ -843,6 +960,12 @@ def run_openpi_policy(
         for key, value in output.get("policy_timing", {}).items():
             policy_timings.setdefault(key, []).append(float(value))
 
+    precision = openpi_precision_metadata(policy)
+    first_actions = _openpi_actions(single_outputs[0]) if single_outputs else None
+    if first_actions is not None:
+        precision["output_action_dtype"] = str(first_actions.dtype)
+        precision["output_action_shape"] = list(first_actions.shape)
+
     return {
         "single": _stats_ms(single_latencies),
         "batch": _stats_ms(batch_latencies),
@@ -852,6 +975,7 @@ def run_openpi_policy(
         },
         "first_output": single_outputs[0] if single_outputs else None,
         "batch_mode": batch_mode,
+        "precision": precision,
     }
 
 
@@ -931,6 +1055,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sglang-model", default=None)
     parser.add_argument("--sglang-pipeline-config-path", default=None)
+    parser.add_argument(
+        "--sglang-http-response-format",
+        choices=("envelope", "raw"),
+        default="envelope",
+    )
     parser.add_argument(
         "--sglang-python-batch-mode",
         choices=("loop", "grouped"),
@@ -1023,6 +1152,7 @@ def main() -> None:
                 prefix_cache=not args.disable_prefix_cache,
                 cuda_graph=not args.disable_cuda_graph,
                 noise=noise,
+                response_format=args.sglang_http_response_format,
             )
             for observation in sglang_observations
         ]
@@ -1047,6 +1177,7 @@ def main() -> None:
                 prefix_cache=not args.disable_prefix_cache,
                 cuda_graph=not args.disable_cuda_graph,
                 noise=noise,
+                response_format=args.sglang_http_response_format,
             )
             for observation in sglang_observations
         ]
@@ -1113,6 +1244,7 @@ def main() -> None:
         "sglang_model": profile.sglang_model,
         "sglang_api": args.sglang_api,
         "sglang_pipeline_config_path": args.sglang_pipeline_config_path,
+        "sglang_http_response_format": args.sglang_http_response_format,
         "sglang_python_batch_mode": args.sglang_python_batch_mode,
         "openpi_config": openpi_config,
         "openpi_checkpoint": openpi_checkpoint,

@@ -29,6 +29,7 @@ async def openpi_policy_ws(websocket: WebSocket):
         try:
             start_time = time.monotonic()
             observation = unpack_msgpack(await websocket.receive_bytes())
+            observation.setdefault("output_format", "numpy")
             infer_start = time.monotonic()
             action = await infer_action(observation, server_args)
             infer_ms = (time.monotonic() - infer_start) * 1000
