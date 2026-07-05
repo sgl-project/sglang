@@ -566,6 +566,17 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         # LogitsProcessor, so this wrapper's forward needs no change.
         self.thinker.set_eagle3_layers_to_capture(layer_ids)
 
+    # --- DFlash support (same delegation pattern as qwen2_audio.py) ---
+    def get_input_embeddings(self):
+        return self.thinker.get_input_embeddings()
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        self.thinker.set_dflash_layers_to_capture(layer_ids)
+
+    @property
+    def lm_head(self):
+        return self.thinker.lm_head
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
