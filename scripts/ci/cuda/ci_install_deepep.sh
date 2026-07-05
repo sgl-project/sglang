@@ -181,6 +181,17 @@ else
     else
         CHOSEN_TORCH_CUDA_ARCH_LIST='9.0'
     fi
+    # DeepEP d4f41e4's NCCL backend (csrc/kernels/backend/nccl.cu) uses NCCL's
+    # GIN / symmetric-memory API (ncclCommQueryProperties, NCCL_GIN_*), which
+    # requires NCCL >= 2.30 at build AND run time; older wheels (e.g. 2.28.x)
+    # fail the build with "identifier ncclCommProperties is undefined". The
+    # official pip wheels ship the full dev headers and DeepEP's setup.py
+    # auto-detects the pip package, so upgrading the wheel is sufficient (NCCL
+    # is backward compatible, so the rest of the job runs unchanged).
+    CUDA_MAJOR="${CUDA_VERSION%%.*}"
+    if [ "$CUDA_MAJOR" = "12" ] || [ "$CUDA_MAJOR" = "13" ]; then
+        ${PIP_CMD:-pip} install --no-deps "nvidia-nccl-cu${CUDA_MAJOR}>=2.30.3" ${PIP_INSTALL_SUFFIX:-}
+    fi
     TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" python3 setup.py install
 fi
 
@@ -189,6 +200,10 @@ fi
 # import as well. Importing `ElasticBuffer` also exercises the NCCL symmetric-memory
 # API (nccl::NCCLSymmetricMemoryContext) that deepep_v2 links, so a clean import
 # confirms the build found an NCCL shipping the symmetric-memory headers.
+# The check must run outside ${DEEPEP_DIR}: the source tree contains a deep_ep/
+# package directory without the built _C extension, which would shadow the
+# installed package via sys.path[0] and fail the import spuriously.
+cd /
 if [ "$GRACE_BLACKWELL" = "1" ]; then
     python3 -c "from deep_ep import Buffer; print('DeepEP install verified: v1 Buffer imports')"
 else
