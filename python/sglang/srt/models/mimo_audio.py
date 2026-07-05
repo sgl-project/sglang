@@ -25,11 +25,17 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda
 
 if is_cuda():
-    from sgl_kernel.flash_attn import flash_attn_varlen_func
-else:
+    from sglang.srt.layers.attention.triton_ops.prefill_attention import (
+        context_attention_fwd as _triton_context_attention_fwd,
+    )
 
-    def flash_attn_varlen_func(*args, **kwargs):
-        raise RuntimeError("MiMoAudioTokenizer requires CUDA to run.")
+    try:
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+    except ImportError:
+        flash_attn_varlen_func = None
+else:
+    flash_attn_varlen_func = None
+    _triton_context_attention_fwd = None
 
 
 logger = logging.getLogger(__name__)
@@ -520,17 +526,31 @@ class AudioEncoderAttention(nn.Module):
                 query_states, key_states, cos, sin
             )
 
-        attn_output = flash_attn_varlen_func(
-            query_states,
-            key_states,
-            value_states,
-            cu_seqlens,
-            cu_seqlens,
-            max_seqlen,
-            max_seqlen,
-            causal=self.causal,
-            window_size=self.window_size,
-        )
+        if flash_attn_varlen_func is not None:
+            attn_output = flash_attn_varlen_func(
+                query_states,
+                key_states,
+                value_states,
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+                causal=self.causal,
+                window_size=self.window_size,
+            )
+        else:
+            attn_output = torch.empty_like(query_states)
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            _triton_context_attention_fwd(
+                query_states,
+                key_states,
+                value_states,
+                attn_output,
+                cu_seqlens[:-1],
+                seq_lens,
+                max_seqlen,
+                is_causal=self.causal,
+            )
 
         attn_output = attn_output.reshape(bsz, self.embed_dim)
         attn_output = self.out_proj(attn_output)

@@ -372,10 +372,25 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
 # Keep in sync with MIMO_V2_MODEL_ARCHS (server_args.py / configs/hf_config.py).
 @_register_for("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
 def _mimo_v2_overrides(server_args: Any, hf_config: Any) -> dict:
+    overrides: Dict[str, Any] = {}
+    # MiMo-V2 uses head_dim=192 (QK) which trtllm_mha does not support.
+    if server_args.is_attention_backend_not_set():
+        if is_blackwell_supported():
+            logger.info(
+                "Auto-select fa4 attention backend for MiMoV2 on Blackwell "
+                "(trtllm_mha lacks headDimQk=192 kernel)."
+            )
+            overrides["attention_backend"] = "fa4"
+        elif is_sm90_supported():
+            logger.info(
+                "Auto-select flashinfer attention backend for MiMoV2 on Hopper "
+                "(trtllm_mha lacks headDimQk=192 kernel)."
+            )
+            overrides["attention_backend"] = "flashinfer"
     if server_args.speculative_algorithm == "EAGLE":
         logger.info("Enable multi-layer EAGLE speculative decoding for MiMoV2 model.")
-        return {"enable_multi_layer_eagle": True}
-    return {}
+        overrides["enable_multi_layer_eagle"] = True
+    return overrides
 
 
 @_register_for("MiniMaxM2ForCausalLM")
