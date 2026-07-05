@@ -980,13 +980,20 @@ class LogitsProcessor(nn.Module):
     def _copy_logits_to_buffer(
         self, logits: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> torch.Tensor:
-        if logits_metadata.next_token_logits_buffer is not None:
-            logits_buffer = logits_metadata.next_token_logits_buffer
+        logits_buffer = logits_metadata.next_token_logits_buffer
+        if logits.shape[-1] > self.vocab_size:
+            logits = logits[:, : self.vocab_size]
+        logits_width = logits.shape[-1]
+        # The shared logits buffer is keyed by vocab width and rows; skip it
+        # when this batch has a different logits shape than the graph buffer.
+        if logits_buffer is not None and tuple(logits_buffer.shape) == tuple(
+            logits.shape
+        ):
             assert logits_buffer.dtype == torch.float
-            logits_buffer.copy_(logits[:, : self.vocab_size])
+            logits_buffer.copy_(logits)
             logits = logits_buffer
         else:
-            logits = logits[:, : self.vocab_size].float()
+            logits = logits.float()
         return logits
 
     def _get_dllm_logits(

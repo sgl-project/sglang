@@ -1203,121 +1203,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.post_attention_layernorm.weight.data.bfloat16().contiguous()
         )
 
-    def prewarm_mhc_token_counts(
-        self, token_counts: Tuple[int, ...], device: torch.device
-    ) -> None:
-        paths = (
-            (
-                "attn",
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                self.input_layernorm,
-            ),
-            (
-                "ffn",
-                self.hc_ffn_fn,
-                self.hc_ffn_scale,
-                self.hc_ffn_base,
-                self.post_attention_layernorm,
-            ),
-        )
-
-        with torch.inference_mode():
-            for num_tokens in token_counts:
-                for path_name, hc_fn, hc_scale, hc_base, norm in paths:
-                    tic = time.perf_counter()
-                    residual = torch.empty(
-                        (num_tokens, self.hc_mult, self.hidden_size),
-                        dtype=torch.bfloat16,
-                        device=device,
-                    )
-                    y, post, comb, _ = self.hc_pre(
-                        residual,
-                        hc_fn,
-                        hc_scale,
-                        hc_base,
-                        norm=norm,
-                    )
-                    del residual, y, post, comb
-                    torch.cuda.synchronize()
-                    logger.info(
-                        "DeepSeek V4 MHC prewarm path=%s num_tokens=%s completed in %.3fs",
-                        path_name,
-                        num_tokens,
-                        time.perf_counter() - tic,
-                    )
-
-            if self.use_fused_mhc_post_pre:
-                for num_tokens in token_counts:
-                    for path_name, hc_fn, hc_scale, hc_base, norm in paths:
-                        tic = time.perf_counter()
-                        # Dummy inputs matching the fused kernel's expected shapes.
-                        x = torch.empty(
-                            (num_tokens, self.hidden_size),
-                            dtype=torch.bfloat16,
-                            device=device,
-                        )
-                        residual = torch.empty(
-                            (num_tokens, self.hc_mult, self.hidden_size),
-                            dtype=torch.bfloat16,
-                            device=device,
-                        )
-                        post_mix = torch.empty(
-                            (num_tokens, self.hc_mult, 1),
-                            dtype=torch.float32,
-                            device=device,
-                        )
-                        comb_mix = torch.empty(
-                            (num_tokens, self.hc_mult, self.hc_mult),
-                            dtype=torch.float32,
-                            device=device,
-                        )
-                        norm_weight = norm.weight.data.bfloat16().contiguous()
-                        mhc_fused_post_pre(
-                            x,
-                            residual,
-                            post_mix,
-                            comb_mix,
-                            hc_fn,
-                            hc_scale,
-                            hc_base,
-                            self.rms_norm_eps,
-                            self.hc_eps,
-                            self.hc_eps,
-                            _MHC_POST_MULT_VALUE,
-                            self.hc_sinkhorn_iters,
-                            norm_weight=norm_weight,
-                            norm_eps=norm.variance_epsilon,
-                        )
-                        del x, residual, post_mix, comb_mix, norm_weight
-                        torch.cuda.synchronize()
-                        logger.info(
-                            "DeepSeek V4 MHC fused prewarm path=%s num_tokens=%s completed in %.3fs",
-                            path_name,
-                            num_tokens,
-                            time.perf_counter() - tic,
-                        )
-
-    def prewarm_mhc_token_count_buckets(
-        self, max_num_tokens: int, device: torch.device
-    ) -> Tuple[int, ...]:
-        from sglang.srt.layers.mhc import get_mhc_pre_token_count_representatives
-
-        token_counts = get_mhc_pre_token_count_representatives(
-            max_num_tokens, self.hc_mult * self.hidden_size
-        )
-        if not token_counts:
-            return token_counts
-
-        logger.info(
-            "DeepSeek V4 MHC prewarm max_num_tokens=%s representative token counts: %s",
-            max_num_tokens,
-            token_counts,
-        )
-        self.prewarm_mhc_token_counts(token_counts, device)
-        return token_counts
-
     def hc_pre(
         self,
         x: torch.Tensor,
@@ -2317,6 +2202,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.cp_rank = get_parallel().attn_cp_rank
             self.cp_size = get_parallel().attn_cp_size
 
+        # update_weights_from_disk/_tensor/_distributed re-enter load_weights
+        # mid-serving (RL refit sends many partial batches); the prewarm and
+        # its barrier must only run on the first (startup) load.
+        self._mhc_prewarmed_at_load = False
+
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
@@ -2326,28 +2216,25 @@ class DeepseekV4ForCausalLM(nn.Module):
         if get_global_server_args().disable_shared_experts_fusion:
             return
 
-        # Waterfill needs shared-experts fusion so it can dispatch shared
-        # expert tokens to least-loaded EP ranks.
-        if get_global_server_args().enable_deepep_waterfill:
+        disable_reason = None
+        if get_global_server_args().enforce_shared_experts_fusion:
             if self.config.n_shared_experts != 1:
                 raise ValueError(
-                    "DeepEP Waterfill for DeepSeek V4 expects exactly one shared "
+                    "DeepSeek V4 shared-experts fusion expects exactly one shared "
                     f"expert, but got n_shared_experts={self.config.n_shared_experts}."
                 )
-            self.num_fused_shared_experts = self.config.n_shared_experts
+        else:
+            disable_reason = "Config does not support fused shared expert(s)."
+
+        if disable_reason is not None:
+            get_global_server_args().disable_shared_experts_fusion = True
             log_info_on_rank0(
                 logger,
-                "DeepSeek V4: --enable-deepep-waterfill set; KEEP shared-experts "
-                "fusion enabled so waterfill can rebalance shared expert dispatch.",
+                f"{disable_reason} Shared experts fusion optimization is disabled.",
             )
             return
 
-        get_global_server_args().disable_shared_experts_fusion = True
-        log_info_on_rank0(
-            logger,
-            "DeepSeek V4 requires different clamping for shared and routed experts. "
-            "Shared experts fusion optimization is disabled.",
-        )
+        self.num_fused_shared_experts = self.config.n_shared_experts
 
     @torch.no_grad()
     def forward(
@@ -2508,6 +2395,62 @@ class DeepseekV4ForCausalLM(nn.Module):
             name = name.removesuffix(".scale") + ".weight_scale_inv"
 
         return name
+
+    def _prewarm_mhc_pre_kernels(self) -> None:
+        """One-shot mhc_pre() JIT prewarm at load time, synced across ranks.
+
+        Runs before any forward so the compile burst stays off the serving
+        path; the barrier keeps ranks from proceeding while a peer is still
+        compiling. The early returns below must stay rank-uniform.
+        """
+        if self._mhc_prewarmed_at_load:
+            return
+        self._mhc_prewarmed_at_load = True
+        if _is_npu or not (
+            envs.SGLANG_DSV4_MHC_PREWARM.get()
+            and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+        ):
+            return
+        layer = next(
+            (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),
+            None,
+        )
+        if layer is None:
+            return
+
+        from sglang.srt.layers.mhc import prewarm_mhc_pre
+
+        tic = time.perf_counter()
+        prewarm_mhc_pre(
+            # Template carrying dtype/device; buckets allocate their own sizes.
+            residual=torch.zeros(
+                (1, layer.hc_mult, layer.hidden_size),
+                dtype=torch.bfloat16,
+                device=layer.hc_attn_fn.device,
+            ),
+            fn=layer.hc_attn_fn,
+            hc_scale=layer.hc_attn_scale,
+            hc_base=layer.hc_attn_base,
+            rms_eps=layer.rms_norm_eps,
+            hc_pre_eps=layer.hc_eps,
+            hc_sinkhorn_eps=layer.hc_eps,
+            hc_post_mult_value=_MHC_POST_MULT_VALUE,
+            sinkhorn_repeat=layer.hc_sinkhorn_iters,
+            n_splits=1,
+            n_splits_pre=32,
+            norm_weight=layer.input_layernorm.weight.data,
+            norm_eps=layer.input_layernorm.variance_epsilon,
+        )
+        torch.cuda.synchronize()
+        compile_secs = time.perf_counter() - tic
+        # Runs before init_memory_pool(); don't let transients skew pool sizing.
+        torch.cuda.empty_cache()
+        get_tp_group().barrier()
+        logger.info(
+            "DeepSeek V4 MHC prenorm prewarm at load: compile %.1fs, rank sync +%.1fs",
+            compile_secs,
+            time.perf_counter() - tic - compile_secs,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         params_dict = dict(self.named_parameters())
@@ -2843,6 +2786,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+
+        if not is_nextn:
+            self._prewarm_mhc_pre_kernels()
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

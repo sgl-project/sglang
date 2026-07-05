@@ -254,5 +254,219 @@ def test_moe_fused_gate_shapes_and_dtypes() -> None:
     )
 
 
+def _reference_softmax(
+    gating: torch.Tensor, topk: int, renormalize: bool
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Plain-softmax topk reference (the AOT ``topk_softmax`` semantics)."""
+    num_experts = gating.size(1)
+    probs = torch.softmax(gating.float(), dim=-1)
+    work = gating.float().clone()
+    arange = torch.arange(num_experts, device=gating.device).unsqueeze(0)
+    M = gating.size(0)
+    idx = torch.empty(M, topk, dtype=torch.int32, device=gating.device)
+    wgt = torch.empty(M, topk, dtype=torch.float32, device=gating.device)
+    for k in range(topk):
+        vals, _ = work.max(dim=1, keepdim=True)
+        lane = torch.where(work == vals, arange, num_experts + 1)
+        winner = lane.min(dim=1).values.to(torch.int32)
+        idx[:, k] = winner
+        wgt[:, k] = probs.gather(1, winner.long().unsqueeze(1)).squeeze(1)
+        work.scatter_(1, winner.long().unsqueeze(1), float("-inf"))
+    if renormalize:
+        wgt = wgt / wgt.sum(dim=1, keepdim=True)
+    return wgt, idx
+
+
+@pytest.mark.parametrize("M", [1, 200, 1024])
+@pytest.mark.parametrize("num_experts,topk", [(128, 4), (256, 8), (512, 6)])
+@pytest.mark.parametrize("renormalize", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_moe_fused_gate_softmax_matches_aot(
+    M: int, num_experts: int, topk: int, renormalize: bool, dtype: torch.dtype
+) -> None:
+    """Triton softmax path matches the AOT ``topk_softmax`` it replaces in fused_topk."""
+    sgl_kernel = pytest.importorskip("sgl_kernel")
+    torch.manual_seed(num_experts * 13 + topk)
+    gating = torch.randn(M, num_experts, dtype=dtype, device=DEVICE) * 2.0
+    zero_bias = torch.zeros(num_experts, dtype=torch.float32, device=DEVICE)
+
+    tri_w, tri_i = moe_fused_gate(
+        gating, zero_bias, topk=topk, scoring_func="softmax", renormalize=renormalize
+    )
+    ref_w, ref_i = _reference_softmax(gating, topk, renormalize)
+
+    aot_w = torch.empty(M, topk, dtype=torch.float32, device=DEVICE)
+    aot_i = torch.empty(M, topk, dtype=torch.int32, device=DEVICE)
+    sgl_kernel.topk_softmax(aot_w, aot_i, gating, renormalize)
+    torch.cuda.synchronize()
+
+    dense_tri = _scatter_by_expert(tri_w, tri_i, num_experts)
+    torch.testing.assert_close(
+        dense_tri, _scatter_by_expert(ref_w, ref_i, num_experts), rtol=1e-3, atol=1e-3
+    )
+    torch.testing.assert_close(
+        dense_tri, _scatter_by_expert(aot_w, aot_i, num_experts), rtol=1e-3, atol=1e-3
+    )
+
+
+@pytest.mark.parametrize("M", [1, 200, 1024])
+@pytest.mark.parametrize("num_experts,topk", [(128, 4), (256, 8)])
+@pytest.mark.parametrize("renormalize", [True, False])
+@pytest.mark.parametrize("with_bias", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_moe_fused_gate_sigmoid_matches_aot(
+    M: int,
+    num_experts: int,
+    topk: int,
+    renormalize: bool,
+    with_bias: bool,
+    dtype: torch.dtype,
+) -> None:
+    """Triton sigmoid path matches the AOT ``topk_sigmoid`` it replaces in fused_topk."""
+    sgl_kernel = pytest.importorskip("sgl_kernel")
+    torch.manual_seed(num_experts * 17 + topk)
+    gating = torch.randn(M, num_experts, dtype=dtype, device=DEVICE) * 2.0
+    bias = (
+        torch.randn(num_experts, dtype=torch.float32, device=DEVICE) * 0.5
+        if with_bias
+        else torch.zeros(num_experts, dtype=torch.float32, device=DEVICE)
+    )
+
+    tri_w, tri_i = moe_fused_gate(
+        gating, bias, topk=topk, scoring_func="sigmoid", renormalize=renormalize
+    )
+    aot_w = torch.empty(M, topk, dtype=torch.float32, device=DEVICE)
+    aot_i = torch.empty(M, topk, dtype=torch.int32, device=DEVICE)
+    sgl_kernel.topk_sigmoid(
+        aot_w, aot_i, gating, renormalize, bias if with_bias else None
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        _scatter_by_expert(tri_w, tri_i, num_experts),
+        _scatter_by_expert(aot_w, aot_i, num_experts),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+@pytest.mark.parametrize(
+    "num_experts,num_expert_group,topk_group,topk",
+    [
+        (256, 8, 4, 8),  # DeepSeek-V3
+        (128, 8, 4, 6),
+        (256, 4, 2, 8),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_moe_fused_gate_grouped_matches_production_impl(
+    num_experts: int,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    dtype: torch.dtype,
+) -> None:
+    """Grouped Triton routing must match the definitional biased_grouped_topk_impl.
+
+    The kernel adds DeepSeek-V3 grouped routing (per-group top-2-sum group scores,
+    keep topk_group groups, then top-k within). biased_grouped_topk_impl is the
+    eager reference the production grouped path is defined against.
+    """
+    M = 256
+    torch.manual_seed(num_experts * 7 + num_expert_group * 13 + topk)
+    gating = torch.randn(M, num_experts, dtype=dtype, device=DEVICE) * 2.0
+    bias = torch.randn(num_experts, dtype=torch.float32, device=DEVICE) * 0.5
+    hidden = torch.randn(M, 16, dtype=dtype, device=DEVICE)
+
+    tri_w, tri_i = moe_fused_gate(
+        gating,
+        bias,
+        topk=topk,
+        scoring_func="sigmoid",
+        renormalize=True,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+    )
+    ref_w, ref_i = biased_grouped_topk_impl(
+        hidden,
+        gating,
+        bias,
+        topk,
+        True,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=1.0,
+        apply_routed_scaling_factor_on_output=False,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        _scatter_by_expert(tri_w, tri_i, num_experts),
+        _scatter_by_expert(ref_w, ref_i, num_experts),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+@pytest.mark.parametrize(
+    "num_experts,num_expert_group,topk_group,topk,num_fused_shared_experts",
+    [
+        (256, 8, 4, 8, 0),  # DeepSeek-V3
+        (256, 8, 4, 9, 1),  # DeepSeek-V3 + one fused shared expert
+    ],
+)
+def test_grouped_dispatch_flag_matches_default(
+    num_experts: int,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    num_fused_shared_experts: int,
+) -> None:
+    """The opt-in SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK dispatch must match the
+    default grouped path (flashinfer/AOT) that biased_grouped_topk_gpu selects when
+    the flag is off. This covers the wiring, not just the raw kernel — validated
+    bit-exact on DeepSeek-V3.2 e2e; here we assert parity against the default path.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.topk import biased_grouped_topk_gpu
+
+    M = 256
+    torch.manual_seed(num_experts * 3 + num_expert_group * 5 + topk)
+    # fp32 gating: both the default (flashinfer upcasts to fp32) and the Triton
+    # dispatch (also upcasts) operate on the same fp32 scores, so no bf16
+    # borderline-expert divergence is expected.
+    gating = torch.randn(M, num_experts, dtype=torch.float32, device=DEVICE) * 2.0
+    bias = torch.randn(num_experts, dtype=torch.float32, device=DEVICE) * 0.5
+    hidden = torch.randn(M, 16, dtype=torch.float32, device=DEVICE)
+
+    kwargs = dict(
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        num_fused_shared_experts=num_fused_shared_experts,
+        routed_scaling_factor=2.5,
+        apply_routed_scaling_factor_on_output=False,
+    )
+    with envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(False):
+        def_w, def_i = biased_grouped_topk_gpu(
+            hidden, gating, bias, topk, True, **kwargs
+        )
+    with envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(True):
+        jit_w, jit_i = biased_grouped_topk_gpu(
+            hidden, gating, bias, topk, True, **kwargs
+        )
+    torch.cuda.synchronize()
+
+    # Compare routed experts only (shared-expert slot ids are placeholders the
+    # downstream fusion overwrites; the routed selection + weights are what matter).
+    topk_routed = topk - num_fused_shared_experts
+    torch.testing.assert_close(
+        _scatter_by_expert(def_w[:, :topk_routed], def_i[:, :topk_routed], num_experts),
+        _scatter_by_expert(jit_w[:, :topk_routed], jit_i[:, :topk_routed], num_experts),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
