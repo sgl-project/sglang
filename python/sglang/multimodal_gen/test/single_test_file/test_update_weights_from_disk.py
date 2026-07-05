@@ -182,6 +182,10 @@ _UPDATE_TIMEOUT_SECONDS = 900
 _CHECKSUM_TIMEOUT_SECONDS = 600
 
 
+def _download_diffusers_model(model_path: str) -> str:
+    return maybe_download_model(model_path, force_diffusers_model=True)
+
+
 def _resolve_active_model_pairs() -> list[tuple[str, str]]:
     if not is_in_ci():
         return _ALL_MODEL_PAIRS
@@ -215,7 +219,7 @@ def _compute_checksum_from_disk(model_path: str, module_name: str) -> str:
     Results are cached (keyed on model_path and module_name) because the
     same disk checksum is requested multiple times across tests.
     """
-    local_path = maybe_download_model(model_path)
+    local_path = _download_diffusers_model(model_path)
     weights_dir = os.path.join(local_path, module_name)
     assert os.path.exists(
         weights_dir
@@ -364,8 +368,8 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
         )
 
         # Ensure models are local before spawning threads that need the paths.
-        local_default = maybe_download_model(default_model)
-        local_source = maybe_download_model(source_model)
+        local_default = _download_diffusers_model(default_model)
+        local_source = _download_diffusers_model(source_model)
 
         perturbed_vae_model_dir = tempfile.mkdtemp(prefix="sglang_perturbed_vae_")
         corrupted_vae_model_dir = tempfile.mkdtemp(prefix="sglang_corrupted_")
@@ -600,7 +604,7 @@ class TestUpdateWeightsFromDiskWithOffload(_UpdateWeightsApiMixin):
         port = get_dynamic_server_port()
         wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "600"))
 
-        local_source = maybe_download_model(source_model)
+        local_source = _download_diffusers_model(source_model)
         perturbed_vae_model_dir = tempfile.mkdtemp(prefix="sglang_perturbed_vae_")
 
         clone_thread = threading.Thread(
