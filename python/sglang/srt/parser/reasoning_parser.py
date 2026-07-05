@@ -1,6 +1,8 @@
+import inspect
 from typing import Dict, List, Optional, Tuple, Type
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
 from sglang.srt.parser.harmony_parser import HarmonyParser
 
 
@@ -594,13 +596,19 @@ class HunyuanDetector(BaseReasoningFormatDetector):
         force_reasoning: bool = False,
         continue_final_message: bool = False,
         previous_content: str = "",
+        tokenizer=None,
     ):
+        t = resolve_hunyuan_tokens(tokenizer)
+        think_open = t["think"]
+        think_close = (
+            "</" + think_open[1:] if think_open.startswith("<") else think_open
+        )
         super().__init__(
-            "<think>",
-            "</think>",
+            think_open,
+            think_close,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
-            tool_start_token="<tool_calls>",
+            tool_start_token=t["tool_calls"],
             continue_final_message=continue_final_message,
             previous_content=previous_content,
         )
@@ -1150,6 +1158,7 @@ class ReasoningParser:
         stream_reasoning: bool = True,
         force_reasoning: Optional[bool] = None,
         request: ChatCompletionRequest = None,
+        tokenizer=None,
     ):
         if not model_type:
             raise ValueError("Model type must be specified")
@@ -1189,6 +1198,11 @@ class ReasoningParser:
 
         if chat_template_kwargs.get("force_nonempty_content") is True:
             kwargs["force_nonempty_content"] = True
+
+        if tokenizer is not None:
+            sig = inspect.signature(detector_class)
+            if "tokenizer" in sig.parameters:
+                kwargs["tokenizer"] = tokenizer
 
         self.detector = detector_class(**kwargs)
 

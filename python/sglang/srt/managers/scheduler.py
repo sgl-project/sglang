@@ -553,6 +553,14 @@ class Scheduler(
 
         self.init_batch_result_processor()
 
+        # The config-resolution lifecycle of this scheduler process ends
+        # here: every load-time stage has run (target and draft model init,
+        # weight-resolved kv-cache dtype), so lock the static flag groups.
+        # flags.capture stays writable; late resolution writes now raise.
+        from sglang.srt.runtime_context import get_context
+
+        get_context().freeze_flags()
+
         self.is_initializing = False
 
     def init_zbal_on_npu(self):
@@ -718,7 +726,9 @@ class Scheduler(
         # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
         if self.server_args.reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(
-                model_type=self.server_args.reasoning_parser, stream_reasoning=False
+                model_type=self.server_args.reasoning_parser,
+                stream_reasoning=False,
+                tokenizer=self.tokenizer,
             )
             self.model_config.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
