@@ -33,9 +33,6 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             max_num_tokens % max_bs == 0
         ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
         draft_token_num = max_num_tokens // max_bs
-        self.mamba_track_indices_buf = torch.zeros(
-            (max_bs,), dtype=torch.int64, device=self.device
-        )
         for i in range(max_bs):
             self.state_indices_list.append(
                 torch.full(
@@ -153,10 +150,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         track_buf = None
         if mamba_track_indices is not None:
-            track_buf = self.mamba_track_indices_buf
-            track_buf[: len(mamba_track_indices)].copy_(
-                self._translate_mamba_indices(mamba_track_indices)
-            )
+            track_buf = mamba_track_indices
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
