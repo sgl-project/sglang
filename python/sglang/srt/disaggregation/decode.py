@@ -725,7 +725,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
                 logger.error(error_msg)
                 for decode_req in reqs:
-                    decode_req.kv_receiver.abort()
+                    if decode_req.kv_receiver is not None:
+                        decode_req.kv_receiver.abort()
+                    else:
+                        # Receiver already cleared by another abort path
+                        # (e.g., handshake failure in _update_handshake_waiters).
+                        # Ensure the request is still marked as aborted.
+                        if not isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                            prepare_abort(
+                                decode_req.req,
+                                error_msg,
+                                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                            )
                 del self._ensure_retry_count[bootstrap_addr]
                 del self._ensure_last_attempt_time[bootstrap_addr]
             else:
@@ -1113,6 +1124,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+
+        # Synchronize pending_reqs: remove any requests that were aborted above
+        # to prevent stale references from causing AttributeError in
+        # _ensure_prefill_info when it later tries to call kv_receiver.abort()
+        # on an already-cleared receiver. See: sgl-project/sglang#21680
+        if failed_reqs:
+            aborted_rids = {dr.req.rid for dr in failed_reqs}
+            self.pending_reqs = [
+                r for r in self.pending_reqs if r.req.rid not in aborted_rids
+            ]
 
         return preallocated_reqs, failed_reqs
 
