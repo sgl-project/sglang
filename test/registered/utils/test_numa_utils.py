@@ -11,6 +11,7 @@ from sglang.srt.utils.numa_utils import (
     _numactl_cpu_mem_args,
     _probe_numactl_args,
     _query_numa_node_for_gpu,
+    _strip_memory_args,
     configure_subprocess,
     get_numa_node_if_available,
     numa_bind_to_node,
@@ -383,14 +384,14 @@ class TestProbeNumactlArgs(unittest.TestCase):
     (--membind -> --preferred -> CPU-only) when the kernel rejects the binding.
 
     subprocess.run is mocked and orchestrated by returncode; no real numactl or
-    GPU is required."""
+    GPU is required. Returns ``(args, last_stderr)``."""
 
     @patch("sglang.srt.utils.numa_utils.subprocess.run")
     def test_membind_probe_succeeds_returns_original(self, mock_run):
         # The requested binding works on the first probe.
         mock_run.side_effect = [_run_result(0)]
         args = "--cpunodebind=0 --membind=0"
-        self.assertEqual(_probe_numactl_args(args), args)
+        self.assertEqual(_probe_numactl_args(args), (args, ""))
         self.assertEqual(mock_run.call_count, 1)
 
     @patch("sglang.srt.utils.numa_utils.subprocess.run")
@@ -399,7 +400,7 @@ class TestProbeNumactlArgs(unittest.TestCase):
         mock_run.side_effect = [_run_result(1), _run_result(0)]
         with self.assertLogs("sglang.srt.utils.numa_utils", level="WARNING") as cm:
             result = _probe_numactl_args("--cpunodebind=0 --membind=0")
-        self.assertEqual(result, "--cpunodebind=0 --preferred=0")
+        self.assertEqual(result, ("--cpunodebind=0 --preferred=0", ""))
         self.assertTrue(any("preferred" in msg for msg in cm.output))
         # Second probe must have used the --preferred form.
         second_call_argv = mock_run.call_args_list[1].args[0]
@@ -412,24 +413,44 @@ class TestProbeNumactlArgs(unittest.TestCase):
         mock_run.side_effect = [_run_result(1), _run_result(1), _run_result(0)]
         with self.assertLogs("sglang.srt.utils.numa_utils", level="WARNING") as cm:
             result = _probe_numactl_args("--physcpubind=0,21,22 --membind=0")
-        self.assertEqual(result, "--physcpubind=0,21,22")
+        self.assertEqual(result, ("--physcpubind=0,21,22", ""))
         self.assertTrue(any("CPU-only" in msg for msg in cm.output))
         third_call_argv = mock_run.call_args_list[2].args[0]
         self.assertNotIn("--membind=0", third_call_argv)
         self.assertNotIn("--preferred=0", third_call_argv)
 
     @patch("sglang.srt.utils.numa_utils.subprocess.run")
-    def test_all_probes_fail_returns_none(self, mock_run):
-        # Every binding, down to CPU-only, is rejected.
-        mock_run.side_effect = [_run_result(1), _run_result(1), _run_result(1)]
-        self.assertIsNone(_probe_numactl_args("--cpunodebind=0 --membind=0"))
+    def test_all_probes_fail_returns_none_with_last_stderr(self, mock_run):
+        # Every binding, down to CPU-only, is rejected; the returned stderr is the
+        # CPU-only (last / strongest-attempted) rejection reason.
+        mock_run.side_effect = [
+            _run_result(1, stderr=b"numactl: setting membind: Invalid argument"),
+            _run_result(1, stderr=b"numactl: setting preferred: Invalid argument"),
+            _run_result(1, stderr=b"numactl: cpunodebind: Operation not permitted"),
+        ]
+        args, err = _probe_numactl_args("--cpunodebind=0 --membind=0")
+        self.assertIsNone(args)
+        self.assertIn("cpunodebind", err)
         self.assertEqual(mock_run.call_count, 3)
+
+    @patch("sglang.srt.utils.numa_utils.subprocess.run")
+    def test_cpu_only_input_failure_returns_none(self, mock_run):
+        # No --membind in the input: the requested args are already CPU-only, so
+        # step 1 is the only probe and on failure we skip --preferred / strip.
+        mock_run.side_effect = [
+            _run_result(1, stderr=b"numactl: cpunodebind: Operation not permitted")
+        ]
+        args, err = _probe_numactl_args("--cpunodebind=0")
+        self.assertIsNone(args)
+        self.assertIn("cpunodebind", err)
+        self.assertEqual(mock_run.call_count, 1)
 
     @patch("sglang.srt.utils.numa_utils.subprocess.run")
     def test_numactl_missing_returns_none(self, mock_run):
         # numactl not installed / raises: probe must not propagate, returns None.
         mock_run.side_effect = FileNotFoundError("numactl")
-        self.assertIsNone(_probe_numactl_args("--cpunodebind=0 --membind=0"))
+        args, _err = _probe_numactl_args("--cpunodebind=0 --membind=0")
+        self.assertIsNone(args)
 
     @patch("sglang.srt.utils.numa_utils.subprocess.run")
     def test_rejection_stderr_surfaces_in_fallback_warning(self, mock_run):
@@ -442,11 +463,28 @@ class TestProbeNumactlArgs(unittest.TestCase):
         ]
         with self.assertLogs("sglang.srt.utils.numa_utils", level="WARNING") as cm:
             result = _probe_numactl_args("--cpunodebind=0 --membind=0")
-        self.assertEqual(result, "--cpunodebind=0 --preferred=0")
+        self.assertEqual(result, ("--cpunodebind=0 --preferred=0", ""))
         self.assertTrue(
             any("Invalid argument" in msg for msg in cm.output),
             f"expected numactl stderr in warning, got {cm.output}",
         )
+
+
+class TestStripMemoryArgs(unittest.TestCase):
+    """Direct tests for _strip_memory_args: drop --membind, keep CPU binding."""
+
+    def test_strips_membind_keeps_cpu(self):
+        self.assertEqual(
+            _strip_memory_args("--cpunodebind=0 --membind=0"),
+            "--cpunodebind=0",
+        )
+        self.assertEqual(
+            _strip_memory_args("--physcpubind=0,21,22 --membind=0"),
+            "--physcpubind=0,21,22",
+        )
+
+    def test_no_membind_returns_unchanged(self):
+        self.assertEqual(_strip_memory_args("--cpunodebind=0"), "--cpunodebind=0")
 
 
 class TestConfigureSubprocessProbeFailure(unittest.TestCase):
@@ -471,7 +509,10 @@ class TestConfigureSubprocessProbeFailure(unittest.TestCase):
             ),
             patch(
                 "sglang.srt.utils.numa_utils._probe_numactl_args",
-                return_value=None,
+                return_value=(
+                    None,
+                    "numactl: setting membind: Invalid argument",
+                ),
             ),
             patch("sglang.srt.utils.numa_utils._create_numactl_executable"),
             patch("sglang.srt.utils.numa_utils._mp_set_executable"),
@@ -490,10 +531,15 @@ class TestConfigureSubprocessProbeFailure(unittest.TestCase):
                 with configure_subprocess(server_args, 0):
                     pass  # worker would start unbound here
             # The probe-failure path reuses #26983's failure helper (warn) and
-            # must NOT install a numactl executable.
+            # must NOT install a numactl executable. The captured numactl stderr
+            # is threaded into the warning so operators can see the rejection cause.
             self.assertTrue(
                 any("could not apply NUMA binding" in msg for msg in cm.output),
                 f"expected probe-failure warning, got {cm.output}",
+            )
+            self.assertTrue(
+                any("Invalid argument" in msg for msg in cm.output),
+                f"expected numactl stderr in warning, got {cm.output}",
             )
             mock_create.assert_not_called()
             mock_mp.assert_not_called()
@@ -512,7 +558,10 @@ class TestConfigureSubprocessProbeFailure(unittest.TestCase):
                     self.fail(
                         "contextmanager must not yield when crash-on-failure is set"
                     )
+            # The RuntimeError carries the captured stderr so crash logs show the
+            # rejection cause, not just the failure category.
             self.assertIn("could not apply NUMA binding", str(cm.exception))
+            self.assertIn("Invalid argument", str(cm.exception))
             mock_create.assert_not_called()
             mock_mp.assert_not_called()
 
