@@ -491,3 +491,7 @@ class TestModelRunnerCacheWiring(CustomTestCase):
         self.assertEqual(reused[0]._local, 0)
         out, _ = reused[0].update_and_fetch(k, k)
         self.assertEqual(out.shape[2], 10)
+
+
+if __name__ == "__main__":
+    unittest.main()
