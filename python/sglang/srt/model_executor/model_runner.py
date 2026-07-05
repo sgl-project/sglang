@@ -1406,6 +1406,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # If weight cache is enabled, override load format to IPC_CACHE
         if self.server_args.weight_cache_mode != "off":
+            self.load_config.fallback_load_format = self.load_config.load_format
             self.load_config.load_format = LoadFormat.IPC_CACHE
             # Compute socket path using global rank (tp_size * pp_rank + tp_rank)
             # so each daemon has a unique socket even across PP stages and nodes.

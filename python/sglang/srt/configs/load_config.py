@@ -108,6 +108,7 @@ class LoadConfig:
     # Weight cache daemon options
     weight_cache_mode: str = "off"  # "off", "daemon", "client"
     weight_cache_socket: Optional[str] = None  # Path to daemon socket (for client mode)
+    fallback_load_format: Union[str, "LoadFormat"] = LoadFormat.AUTO
 
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}

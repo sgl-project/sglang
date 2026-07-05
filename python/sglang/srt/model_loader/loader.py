@@ -3302,15 +3302,27 @@ def get_model_loader(
         from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
         from sglang.srt.weight_cache.protocol import get_socket_path
 
-        socket_path = (
-            load_config.weight_cache_socket
-            if load_config.weight_cache_socket
-            else get_socket_path(global_rank=load_config.tp_rank or 0)
-        )
+        if load_config.weight_cache_socket:
+            socket_path = load_config.weight_cache_socket
+        else:
+            from sglang.srt.distributed import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+            from sglang.srt.distributed.parallel_state import (
+                get_pipeline_model_parallel_rank,
+            )
+
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            pp_rank = get_pipeline_model_parallel_rank()
+            global_rank = tp_size * pp_rank + tp_rank
+            socket_path = get_socket_path(global_rank=global_rank)
         return IpcModelLoader(
             load_config=load_config,
             socket_path=socket_path,
             weight_cache_mode=load_config.weight_cache_mode,
+            fallback_load_format=load_config.fallback_load_format,
         )
 
     return DefaultModelLoader(load_config)

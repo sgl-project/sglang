@@ -336,8 +336,11 @@ class WeightCacheDaemon:
             os.unlink(self.socket_path)
 
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.bind(self.socket_path)
-        os.chmod(self.socket_path, 0o600)
+        old_umask = os.umask(0o177)
+        try:
+            sock.bind(self.socket_path)
+        finally:
+            os.umask(old_umask)
         sock.listen(8)
         sock.settimeout(1.0)  # Allow periodic shutdown check
 
@@ -577,6 +580,14 @@ def launch_weight_cache_daemons(
     python_path = sys.executable
     daemon_module = "sglang.srt.weight_cache.daemon"
 
+    # Validate and clean up stale .ready/.sock files from prior runs.
+    from .protocol import cleanup_stale_daemon_files
+
+    for pp_rank in pp_rank_range:
+        for tp_rank in tp_rank_range:
+            global_rank = tp_size * pp_rank + tp_rank
+            cleanup_stale_daemon_files(global_rank)
+
     procs = []
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
@@ -629,15 +640,14 @@ def launch_weight_cache_daemons(
     # Wait for all daemons on this node to become ready
     num_daemons = len(procs)
     check_interval = 2
-    elapsed = 0
+    start_time = time.time()
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
             global_rank = tp_size * pp_rank + tp_rank
             ready_path = get_ready_path(global_rank)
             while not os.path.exists(ready_path):
                 time.sleep(check_interval)
-                elapsed += check_interval
-                if elapsed > timeout:
+                if time.time() - start_time > timeout:
                     logger.error(
                         f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} "
                         f"did not become ready within {timeout}s"

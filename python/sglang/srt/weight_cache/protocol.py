@@ -7,6 +7,7 @@ Defines CacheConfig for validation and socket message protocol helpers.
 import hashlib
 import json
 import logging
+import os
 import pickle
 import struct
 from typing import Any, Dict, Optional
@@ -57,7 +58,12 @@ class CacheConfig(msgspec.Struct):
 
 
 def hash_quant_config(quant_config: Any) -> str:
-    """Compute a stable hash of the quantization config."""
+    """Compute a stable hash of the quantization config.
+
+    Avoids str()/repr() on arbitrary objects because those embed memory
+    addresses (e.g. "at 0x7f..."), producing different hashes across
+    processes and causing permanent config mismatch.
+    """
     if quant_config is None:
         return ""
     try:
@@ -65,11 +71,28 @@ def hash_quant_config(quant_config: Any) -> str:
             config_str = json.dumps(quant_config.to_dict(), sort_keys=True)
         elif isinstance(quant_config, dict):
             config_str = json.dumps(quant_config, sort_keys=True)
+        elif hasattr(quant_config, "__dict__"):
+            config_str = (
+                type(quant_config).__name__
+                + ":"
+                + json.dumps(
+                    {
+                        k: v
+                        for k, v in sorted(quant_config.__dict__.items())
+                        if not k.startswith("_")
+                        and isinstance(
+                            v, (str, int, float, bool, type(None), list, dict)
+                        )
+                    },
+                    sort_keys=True,
+                )
+            )
         else:
-            config_str = str(quant_config)
+            config_str = type(quant_config).__name__
         return hashlib.sha256(config_str.encode()).hexdigest()[:16]
     except Exception:
-        return hashlib.sha256(repr(quant_config).encode()).hexdigest()[:16]
+        config_str = type(quant_config).__name__
+        return hashlib.sha256(config_str.encode()).hexdigest()[:16]
 
 
 def get_quant_method_name(quant_config: Any) -> str:
@@ -90,6 +113,9 @@ def get_quant_method_name(quant_config: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
+MAX_MSG_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB sanity cap
+
+
 def send_msg(sock, obj: Any) -> None:
     """Send a length-prefixed pickled message over a socket."""
     data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
@@ -103,6 +129,8 @@ def recv_msg(sock) -> Any:
     if header is None:
         raise ConnectionError("Connection closed while reading message header")
     length = struct.unpack("!I", header)[0]
+    if length > MAX_MSG_SIZE:
+        raise ValueError(f"Message size {length} exceeds {MAX_MSG_SIZE} byte cap")
     data = _recv_exact(sock, length)
     if data is None:
         raise ConnectionError("Connection closed while reading message body")
@@ -134,3 +162,55 @@ def get_ready_path(global_rank: int) -> str:
     global_rank = tp_size * pp_rank + tp_rank
     """
     return WEIGHT_CACHE_READY_TEMPLATE.format(global_rank=global_rank)
+
+
+def _read_ready_pid(ready_path: str) -> Optional[int]:
+    """Read the daemon PID from a .ready file. Returns None if unreadable."""
+    try:
+        with open(ready_path) as f:
+            for line in f:
+                if line.startswith("pid="):
+                    return int(line.strip().split("=", 1)[1])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Check whether a process is still running."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def cleanup_stale_daemon_files(global_rank: int) -> None:
+    """Validate and clean up .ready/.sock files for a daemon rank.
+
+    If the .ready file exists and the recorded PID is still alive, the daemon
+    is still running — raise RuntimeError so the caller doesn't clobber it.
+    If the PID is dead (or unreadable), the files are stale leftovers from a
+    crashed/killed daemon and are safe to remove.
+    """
+    ready_path = get_ready_path(global_rank)
+    socket_path = get_socket_path(global_rank)
+
+    if not os.path.exists(ready_path) and not os.path.exists(socket_path):
+        return
+
+    pid = _read_ready_pid(ready_path) if os.path.exists(ready_path) else None
+
+    if pid is not None and _is_pid_alive(pid):
+        raise RuntimeError(
+            f"Weight cache daemon for rank {global_rank} is already running "
+            f"(pid={pid}, ready={ready_path}). Stop the existing daemon before "
+            f"launching a new one."
+        )
+
+    for path in (ready_path, socket_path):
+        if os.path.exists(path):
+            os.unlink(path)
+            logger.info(f"Removed stale daemon file: {path}")

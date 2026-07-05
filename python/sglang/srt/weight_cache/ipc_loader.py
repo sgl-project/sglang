@@ -49,11 +49,13 @@ class IpcModelLoader(BaseModelLoader):
         socket_path: str,
         fallback_loader_cls=None,
         weight_cache_mode: str = "client",
+        fallback_load_format: str = "auto",
     ):
         super().__init__(load_config)
         self.socket_path = socket_path
         self.weight_cache_mode = weight_cache_mode
         self._fallback_loader_cls = fallback_loader_cls
+        self._fallback_load_format = fallback_load_format
 
     def load_model(
         self,
@@ -234,7 +236,7 @@ class IpcModelLoader(BaseModelLoader):
 
         imported_refs = []
         imported_count = 0
-        skipped_count = 0
+        mismatched = []
         new_params_count = 0
         missing_in_entries = []
         map_tic = time.perf_counter()
@@ -256,13 +258,11 @@ class IpcModelLoader(BaseModelLoader):
                     imported_tensor.shape != ref_param.shape
                     or imported_tensor.dtype != ref_param.dtype
                 ):
-                    logger.warning(
-                        f"[IpcModelLoader] Shape/dtype mismatch for {name}: "
-                        f"IPC={imported_tensor.shape}/{imported_tensor.dtype} "
+                    mismatched.append(
+                        f"  {name}: IPC={imported_tensor.shape}/{imported_tensor.dtype} "
                         f"vs model={ref_param.shape}/{ref_param.dtype}"
                     )
                     del imported_tensor
-                    skipped_count += 1
                     continue
 
             # Replace or register the tensor in the model
@@ -272,6 +272,14 @@ class IpcModelLoader(BaseModelLoader):
 
             if name not in existing_names:
                 new_params_count += 1
+
+        if mismatched:
+            raise RuntimeError(
+                f"[IpcModelLoader] {len(mismatched)} tensor(s) have shape/dtype "
+                f"mismatch between IPC daemon and model. This means the daemon's "
+                f"weight fingerprint is incomplete — refusing to serve potentially "
+                f"uninitialized weights:\n" + "\n".join(mismatched)
+            )
 
         # Handle model params/buffers that are NOT in daemon entries.
         # These are typically non-persistent buffers (e.g. rotary embedding
@@ -328,7 +336,7 @@ class IpcModelLoader(BaseModelLoader):
 
         logger.info(
             f"[IpcModelLoader] Zero-copy: mapped {imported_count} tensors "
-            f"({new_params_count} new post-quant), skipped {skipped_count}, "
+            f"({new_params_count} new post-quant), "
             f"missing {len(missing_in_entries)}, time={map_elapsed:.3f}s"
         )
 
@@ -344,7 +352,12 @@ class IpcModelLoader(BaseModelLoader):
         return model
 
     def _fetch_from_cache(self, model_config) -> Optional[dict]:
-        """Connect to daemon, validate config, fetch IPC handles."""
+        """Connect to daemon, validate config, fetch IPC handles.
+
+        Returns the daemon response dict on success, None if the daemon is
+        genuinely absent (socket file doesn't exist). Raises on all other
+        failures so they are never silently swallowed as a disk-load fallback.
+        """
         import socket as socket_mod
 
         sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
@@ -360,18 +373,17 @@ class IpcModelLoader(BaseModelLoader):
             return None
         except ConnectionRefusedError:
             sock.close()
-            logger.info(
-                f"[IpcModelLoader] Daemon not accepting connections at "
-                f"{self.socket_path}. It may still be loading."
+            raise RuntimeError(
+                f"[IpcModelLoader] Daemon socket exists at {self.socket_path} but "
+                f"refused the connection. The daemon may have crashed after "
+                f"creating the socket. Check daemon logs."
             )
-            return None
         except Exception as e:
             sock.close()
-            logger.warning(
-                f"[IpcModelLoader] Error connecting to daemon at "
+            raise RuntimeError(
+                f"[IpcModelLoader] Failed to connect to daemon at "
                 f"{self.socket_path}: {e}"
-            )
-            return None
+            ) from e
 
         try:
             # Build engine's config fingerprint
@@ -385,31 +397,17 @@ class IpcModelLoader(BaseModelLoader):
                 get_pipeline_model_parallel_world_size,
             )
 
-            try:
-                tp_size = get_tensor_model_parallel_world_size()
-                tp_rank = get_tensor_model_parallel_rank()
-            except Exception:
-                tp_size = 1
-                tp_rank = 0
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
 
-            try:
-                pp_size = get_pipeline_model_parallel_world_size()
-                pp_rank = get_pipeline_model_parallel_rank()
-            except Exception:
-                pp_size = 1
-                pp_rank = 0
+            pp_size = get_pipeline_model_parallel_world_size()
+            pp_rank = get_pipeline_model_parallel_rank()
 
-            try:
-                ep_size = get_moe_expert_parallel_world_size()
-            except Exception:
-                ep_size = 1
+            ep_size = get_moe_expert_parallel_world_size()
 
-            try:
-                from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.server_args import get_global_server_args
 
-                dp_size = get_global_server_args().dp_size
-            except Exception:
-                dp_size = 1
+            dp_size = get_global_server_args().dp_size
 
             quant_config = getattr(model_config, "hf_config", None)
             if quant_config is not None:
@@ -453,33 +451,31 @@ class IpcModelLoader(BaseModelLoader):
 
             if result.get("status") != "ok":
                 daemon_config = result.get("daemon_config", {})
-                logger.warning(
+                raise RuntimeError(
                     f"[IpcModelLoader] Daemon config mismatch!\n"
                     f"  Engine config: {engine_config.to_dict()}\n"
                     f"  Daemon config: {daemon_config}"
                 )
-                return None
 
             return result
 
+        except RuntimeError:
+            raise
         except Exception as e:
-            logger.warning(
-                f"[IpcModelLoader] Error fetching from daemon: {e}",
-                exc_info=True,
-            )
-            return None
+            raise RuntimeError(
+                f"[IpcModelLoader] Error communicating with daemon at "
+                f"{self.socket_path}: {e}"
+            ) from e
         finally:
             sock.close()
 
     def _fallback_load(self, model_config, device_config) -> nn.Module:
         """Fall back to DefaultModelLoader for disk-based loading."""
-        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+        from sglang.srt.configs.load_config import LoadConfig
         from sglang.srt.model_loader.loader import DefaultModelLoader
 
-        # Build a new LoadConfig with the original load_format (not IPC_CACHE),
-        # since DefaultModelLoader doesn't know how to handle IPC_CACHE.
         fallback_config = LoadConfig(
-            load_format=LoadFormat.AUTO,
+            load_format=self._fallback_load_format,
             download_dir=self.load_config.download_dir,
             model_loader_extra_config=self.load_config.model_loader_extra_config,
             tp_rank=self.load_config.tp_rank,

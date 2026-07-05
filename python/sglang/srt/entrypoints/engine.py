@@ -632,6 +632,15 @@ class Engine(EngineScoreMixin, EngineBase):
             f"dist_init_method={dist_init_method}"
         )
 
+        # Validate and clean up stale .ready/.sock files from prior runs.
+        # If a daemon is still alive at this rank, raise instead of clobbering.
+        from sglang.srt.weight_cache.protocol import cleanup_stale_daemon_files
+
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                global_rank = tp_size * pp_rank + tp_rank
+                cleanup_stale_daemon_files(global_rank)
+
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
                 gpu_id = (
@@ -687,15 +696,14 @@ class Engine(EngineScoreMixin, EngineBase):
         # Wait for all daemons to be ready (ready file exists)
         timeout = server_args.weight_cache_timeout
         check_interval = 2
-        elapsed = 0
+        start_time = time.time()
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
                 global_rank = tp_size * pp_rank + tp_rank
                 ready_path = get_ready_path(global_rank)
                 while not os.path.exists(ready_path):
                     time.sleep(check_interval)
-                    elapsed += check_interval
-                    if elapsed > timeout:
+                    if time.time() - start_time > timeout:
                         raise TimeoutError(
                             f"Weight cache daemon for pp_rank={pp_rank} "
                             f"tp_rank={tp_rank} did not become ready "
