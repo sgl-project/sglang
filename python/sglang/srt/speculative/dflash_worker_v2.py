@@ -731,7 +731,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 end = min(num_tokens, start + fast_chunk_size)
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
-                    if hasattr(lm_head, 'quant_method') and not isinstance(lm_head.quant_method, UnquantizedEmbeddingMethod):
+                    if hasattr(lm_head, 'quant_method') and lm_head.quant_method is not None and not isinstance(lm_head.quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)):
                         target_dtype = self.target_worker.model_runner.model_config.dtype
                         full_logits = lm_head.quant_method.apply(lm_head, hidden_states[start:end].to(target_dtype), None)
                         base_logits = full_logits[:, :num_org]
