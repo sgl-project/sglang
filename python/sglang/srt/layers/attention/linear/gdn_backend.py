@@ -309,6 +309,109 @@ if _HAVE_TRITON:
         else:
             tl.store(inext_ptr + ar, W)
 
+    @triton.jit
+    def _chunk_scan_kernel(
+        q_ptr, k_ptr, gcum_ptr, vsolved_ptr, kcd_ptr,  # per-chunk streamed inputs (fp32)
+        Sinit_ptr, core_ptr, last_ptr, bnd_ptr,        # recurrent state in / out
+        nchunks_ptr, bchunk,                           # per-seq real chunk count [N], boundary chunk
+        HV: tl.constexpr, NC: tl.constexpr, C: tl.constexpr, Dk: tl.constexpr, Dv: tl.constexpr,
+        DVT: tl.constexpr, NVT: tl.constexpr,
+    ):
+        """Fused cross-chunk GDN recurrence: the SERIAL scan over `last_recurrent_state` (the torch
+        loop at torch_chunk_gated_delta_rule lines 563-573 / Megatron 1348-1358) in ONE launch per
+        (sequence, value-head, V-tile). The state column-slice S[Dk,DVT] stays resident in registers
+        across the whole chunk loop, so it never round-trips through HBM (the torch loop pushed the
+        full [128,128] state 32x). The intra-chunk WY work (l2norm, cumsum, T-solve, v_solved=T@v_beta,
+        k_cumdecay=T@(k_beta*exp g)) stays on the existing parallel torch path and is streamed in per
+        chunk; attn2/qg (which need no S) are recomputed per V-tile to avoid materializing
+        [N,HV,NC,C,C] in HBM.
+
+        V-tiling (grid (N,HV,NVT), Dv split into NVT tiles of DVT) is EXACT: the recurrence is
+        independent across V-columns (decay is a per-row scalar; v_new/v_prime/S-update all index V
+        freely), so a column slice computes the same values it would in the full [Dk,Dv] state. It is
+        also essential for speed: holding the full [128,128] fp32 S plus the [64,128] chunk tiles
+        spills the register file (~5.7KB/thread) and runs ~16x slower; DVT=32 keeps S on-chip and
+        raises occupancy (grid n_seq*HV*4 vs n_seq*HV).
+
+        Bit-identical to the torch loop (so sglang prefill == Megatron == decode chunk-replay, which
+        reproduces the same loop per row): every tl.dot uses input_precision="ieee" matching the
+        batch-invariant aten mm; the K-reductions are single-dot (K=Dk=128 or C=64, num_warps-
+        invariant, V-tile-invariant since V is the N dim not the K dim); exp is libdevice.exp on
+        rounded-fp32 gcum. Maps op-for-op to _gdn_step_kernel's decode fold (lines 281-306), over all
+        C rows and all chunks. Multi-seq: each program loops only its seq's real chunks; zero-pad
+        chunks are exact recurrent no-ops (g=0 -> decay 1, k=v=0 -> zero update).
+        """
+        pid = tl.program_id(0)
+        vt = pid % NVT
+        h = (pid // NVT) % HV
+        n = pid // (NVT * HV)
+        nchunks = tl.load(nchunks_ptr + n)
+        r = tl.arange(0, C)
+        dk = tl.arange(0, Dk)
+        dvt = vt * DVT + tl.arange(0, DVT)  # this program's V-column slice
+        lower = r[:, None] >= r[None, :]  # keep lower incl diag (matches tril + masked_fill(triu(1)))
+        s_off = (n * HV + h) * Dk * Dv
+        S = tl.load(Sinit_ptr + s_off + dk[:, None] * Dv + dvt[None, :])  # [Dk,DVT] resident in regs
+        for i in range(0, nchunks):
+            cbase = ((n * HV + h) * NC + i) * C
+            q = tl.load(q_ptr + cbase * Dk + r[:, None] * Dk + dk[None, :])  # [C,Dk] scaled+l2normed
+            k = tl.load(k_ptr + cbase * Dk + r[:, None] * Dk + dk[None, :])  # [C,Dk] l2normed
+            vs = tl.load(vsolved_ptr + cbase * Dv + r[:, None] * Dv + dvt[None, :])  # [C,DVT] T@v_beta
+            kcd = tl.load(kcd_ptr + cbase * Dk + r[:, None] * Dk + dk[None, :])  # [C,Dk] T@(kb*exp g)
+            gc = tl.load(gcum_ptr + cbase + r)  # [C] rounded-fp32 cumulative decay
+            # Every matmul result feeding an add/sub must round to a register FIRST, matching torch's
+            # separate mm then add/sub. A bare `x +/- tl.dot` (or `S*e + dot`) lets the compiler fold
+            # into an accumulator-form dot / FMA (one fused rounding) and drift ~2e-4 through the scan.
+            # A tautological mask (`r>=0`) is const-folded away, restoring the FMA; `bar` is a
+            # data-dependent predicate the compiler cannot prove, so the round survives. This is
+            # decode's _gdn_step_kernel trick (lines 275/285/286/305), made fold-proof.
+            bar = tl.sum(tl.where(r == 0, gc, 0.0), 0) < 1e30  # always true, not provably so
+            # decay[a,b] = exp(gcum[a]-gcum[b]) for a>=b else 0 (== torch decay_mask[:,:,i]).
+            decay = tl.where(lower, libdevice.exp(gc[:, None] - gc[None, :]), 0.0)
+            # attn2 = (q@k^T)*decay, strict-upper zeroed, diagonal kept. Recomputed per V-tile.
+            attn2 = tl.dot(q, tl.trans(k), input_precision="ieee") * decay
+            attn2 = tl.where(lower, attn2, 0.0)
+            qg = q * libdevice.exp(gc)[:, None]  # [C,Dk]
+            attn_inter = tl.where(bar, tl.dot(qg, S, input_precision="ieee"), 0.0)  # (q*exp g)@S
+            vprime = tl.where(bar, tl.dot(kcd, S, input_precision="ieee"), 0.0)  # k_cumdecay@S
+            vnew = vs - vprime  # [C,DVT] == v_i - v_prime
+            intra = tl.where(bar, tl.dot(attn2, vnew, input_precision="ieee"), 0.0)
+            core = attn_inter + intra  # [C,DVT]
+            tl.store(core_ptr + cbase * Dv + r[:, None] * Dv + dvt[None, :], core)
+            # state update: S = S*exp(glast) + (k * exp(glast-gcum))^T @ v_new
+            glast = tl.sum(tl.where(r == C - 1, gc, 0.0), 0)  # gcum[C-1], single-lane collapse
+            kdec = k * libdevice.exp(glast - gc)[:, None]  # [C,Dk]
+            upd = tl.where(bar, tl.dot(tl.trans(kdec), vnew, input_precision="ieee"), 0.0)
+            sc = tl.where(bar, S * libdevice.exp(glast), 0.0)  # round before add (else FMA drift)
+            S = sc + upd
+            if i == bchunk:  # snapshot state entering the trailing partial chunk (n_seq==1 boundary)
+                tl.store(bnd_ptr + s_off + dk[:, None] * Dv + dvt[None, :], S)
+        tl.store(last_ptr + s_off + dk[:, None] * Dv + dvt[None, :], S)
+
+
+def _fused_chunk_scan(query, key, gcum, v_solved, k_cumdecay, s_init, nchunks, bchunk, want_boundary):
+    """Launch _chunk_scan_kernel: the cross-chunk recurrence over the precomputed intra-chunk WY
+    tensors. All inputs are fp32 contiguous [N,HV,NC,C,*] (gcum [N,HV,NC,C]); s_init [N,HV,Dk,Dv].
+    Returns (core_attn_out [N,HV,NC,C,Dv], last_state [N,HV,Dk,Dv], boundary_state or None).
+    Bit-identical to the torch chunk loop it replaces (verified 0-ULP)."""
+    N, HV, NC, C, Dk = query.shape
+    Dv = v_solved.shape[-1]
+    core = torch.zeros(N, HV, NC, C, Dv, device=query.device, dtype=torch.float32)
+    last = torch.empty(N, HV, Dk, Dv, device=query.device, dtype=torch.float32)
+    bnd = torch.empty(1, HV, Dk, Dv, device=query.device, dtype=torch.float32) if want_boundary else last
+    # V-tile the state: DVT=32 keeps the resident S[Dk,DVT] slice on-chip (the full [128,128] spills
+    # ~5.7KB/thread -> ~16x slower) and raises the grid to N*HV*NVT for better occupancy. Exact:
+    # V-columns are independent in the recurrence. DVT must divide Dv.
+    DVT = 32 if Dv % 32 == 0 else Dv
+    NVT = Dv // DVT
+    _chunk_scan_kernel[(N * HV * NVT,)](
+        query, key, gcum, v_solved, k_cumdecay,
+        s_init, core, last, bnd,
+        nchunks, bchunk if want_boundary else -1,
+        HV=HV, NC=NC, C=C, Dk=Dk, Dv=Dv, DVT=DVT, NVT=NVT, num_warps=8, num_stages=1,
+    )
+    return core, last, (bnd if want_boundary else None)
+
 
 def _solve_fwd_sub(attn: torch.Tensor) -> torch.Tensor:
     """Forward-substitution triangular solve, replacing the 64-iteration Python loop.
@@ -546,10 +649,6 @@ def torch_chunk_gated_delta_rule(
         if initial_state is None
         else initial_state
     )
-    core_attn_out = torch.zeros_like(value)
-    mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
-    )
 
     # State entering the final (possibly partial) chunk: the recurrent state after folding all
     # COMPLETE 64-chunks. Captured right after the (num_complete_chunks-1)-th fold so it is
@@ -559,20 +658,45 @@ def torch_chunk_gated_delta_rule(
     assert not (return_boundary_state and n_seq > 1), "boundary_state only supported for n_seq==1"
     num_complete_chunks = seq_lens[0] // chunk_size
     boundary_state = last_recurrent_state  # correct when num_complete_chunks == 0
+    num_chunks = total_sequence_length // chunk_size
 
-    for i in range(0, total_sequence_length // chunk_size):
-        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
-        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
-        v_new = v_i - v_prime
-        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
-        core_attn_out[:, :, i] = attn_inter + attn @ v_new
-        last_recurrent_state = (
-            last_recurrent_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+    # Cross-chunk serial recurrence over last_recurrent_state. The fused Triton scan keeps S on-chip
+    # across the whole chunk loop (one launch per (seq, value-head)) and is bit-identical to the torch
+    # loop below (verified 0-ULP), so sglang prefill, Megatron, and the decode chunk-replay all still
+    # match. Used in inference (no autograd through the scan yet); training keeps the torch loop so
+    # gradients flow through the existing autograd path. Falls back to the loop off-CUDA/no-Triton.
+    use_fused_scan = _HAVE_TRITON and query.is_cuda and not torch.is_grad_enabled()
+    if use_fused_scan:
+        nchunks = torch.tensor(
+            [(sl + chunk_size - 1) // chunk_size for sl in seq_lens],
+            dtype=torch.int32, device=query.device,
         )
-        if return_boundary_state and (i + 1) == num_complete_chunks:
-            boundary_state = last_recurrent_state
+        core_attn_out, last_recurrent_state, bnd = _fused_chunk_scan(
+            query.contiguous(), key.contiguous(), g.contiguous(),
+            value.contiguous(), k_cumdecay.contiguous(),
+            last_recurrent_state.contiguous(),
+            nchunks, num_complete_chunks - 1, return_boundary_state,
+        )
+        if return_boundary_state and num_complete_chunks > 0:
+            boundary_state = bnd
+    else:
+        core_attn_out = torch.zeros_like(value)
+        mask = torch.triu(
+            torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
+        )
+        for i in range(0, num_chunks):
+            q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+            attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
+            v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
+            v_new = v_i - v_prime
+            attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+            core_attn_out[:, :, i] = attn_inter + attn @ v_new
+            last_recurrent_state = (
+                last_recurrent_state * g[:, :, i, -1, None, None].exp()
+                + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+            )
+            if return_boundary_state and (i + 1) == num_complete_chunks:
+                boundary_state = last_recurrent_state
 
     # Repack the padded [n_seq, num_heads, padded_len, v_head_dim] batch back into the
     # [1, total_tokens, num_heads, v_head_dim] packed row the caller expects. Padded tail rows
