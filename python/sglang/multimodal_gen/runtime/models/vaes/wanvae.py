@@ -25,6 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.jit_kernel.diffusion.wan_rmsnorm_silu import apply_wan_rmsnorm_silu
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
     should_use_spatial_shard_parallel_decode,
@@ -353,8 +354,7 @@ def residual_block_forward(self, x):
     h = self.conv_shortcut(x)
 
     # First normalization and activation
-    x = self.norm1(x)
-    x = self.nonlinearity(x)
+    x = apply_wan_rmsnorm_silu(x, self.norm1, self.nonlinearity)
 
     _feat_cache = feat_cache.get()
     _feat_idx = feat_idx.get()
@@ -379,8 +379,7 @@ def residual_block_forward(self, x):
         x = self.conv1(x)
 
     # Second normalization and activation
-    x = self.norm2(x)
-    x = self.nonlinearity(x)
+    x = apply_wan_rmsnorm_silu(x, self.norm2, self.nonlinearity)
 
     # Dropout
     x = self.dropout(x)
@@ -720,7 +719,6 @@ class WanMidBlock(nn.Module):
 
 
 class WanResidualDownBlock(nn.Module):
-
     def __init__(
         self,
         in_dim,
@@ -988,8 +986,7 @@ class WanEncoder3d(nn.Module):
         x = self.mid_block(x)
 
         ## head
-        x = self.norm_out(x)
-        x = self.nonlinearity(x)
+        x = apply_wan_rmsnorm_silu(x, self.norm_out, self.nonlinearity)
 
         _feat_cache = feat_cache.get()
         _feat_idx = feat_idx.get()
@@ -1344,8 +1341,7 @@ class WanDecoder3d(nn.Module):
             x = up_block(x)
 
         ## head
-        x = self.norm_out(x)
-        x = self.nonlinearity(x)
+        x = apply_wan_rmsnorm_silu(x, self.norm_out, self.nonlinearity)
         _feat_cache = feat_cache.get()
         _feat_idx = feat_idx.get()
         if _feat_cache is not None:
@@ -1478,7 +1474,6 @@ class AutoencoderKLWan(ParallelTiledVAE):
         return should_run_spatial_shard_parallel_decode(self.config, z)
 
     def clear_cache(self) -> None:
-
         def _count_conv3d(model) -> int:
             count = 0
             for m in model.modules():
