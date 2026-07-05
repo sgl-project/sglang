@@ -13,9 +13,6 @@ The native op is ``torch.ops.aten._weight_int4pack_mm(A, B, group_size, qsz)``:
 The kernel dequantizes as ``W = (q - 8) * scale + zero``. Both GPTQ and AWQ use
 ``W = (q - zp) * scale``, so we fold the integer zero-point into a float
 ``zero = scale * (8 - zp)``.
-
-These conventions were verified on torch 2.12.0+xpu; see
-``kernel-plan/scratch/verify_int4pack.py``.
 """
 
 from __future__ import annotations

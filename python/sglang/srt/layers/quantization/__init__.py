@@ -19,7 +19,12 @@ class DummyConfig:
 CompressedTensorsConfig = DummyConfig
 
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
-from sglang.srt.layers.quantization.awq import AWQConfig, AWQCPUConfig, AWQMarlinConfig
+from sglang.srt.layers.quantization.awq import (
+    AWQConfig,
+    AWQCPUConfig,
+    AWQMarlinConfig,
+    AWQXPUConfig,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
@@ -123,6 +128,7 @@ if is_xpu():
     BASE_QUANTIZATION_METHODS.update(
         {
             "gptq": GPTQXPUConfig,
+            "awq": AWQXPUConfig,
         }
     )
 
