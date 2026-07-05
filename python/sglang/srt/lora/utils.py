@@ -263,6 +263,11 @@ def get_normalized_target_modules(
         "unembed_tokens": "lm_head",
         "q_a_proj": "fused_qkv_a_proj_with_mqa",
         "kv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
+        "in_proj_qkv": "in_proj_qkvz",
+        "in_proj_q": "in_proj_qkvz",
+        "in_proj_k": "in_proj_qkvz",
+        "in_proj_v": "in_proj_qkvz",
+        "in_proj_z": "in_proj_qkvz",
         # DSA indexer projections are qualified with their parent module name
         # because the bare leaf names collide with unrelated modules in other
         # models (e.g. DeepSeek-V4 attention `wq_b`, Pixtral vision `wk`).

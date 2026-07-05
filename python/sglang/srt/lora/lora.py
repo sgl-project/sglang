@@ -29,6 +29,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.srt.lora.utils import get_hidden_dim
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
@@ -310,18 +311,28 @@ class LoRAAdapter(nn.Module):
         """Normalize in_proj_qkvz weights for GDN (GatedDeltaNet) layers like
         Qwen3.5.
 
-        Two adapter formats are handled:
+        Three adapter formats are handled:
 
-        1. Split: ``in_proj_q + in_proj_k + in_proj_v + in_proj_z`` are present
-           as separate weights → concatenate them into ``in_proj_qkvz``.
+        1. 4-way split: ``in_proj_q + in_proj_k + in_proj_v + in_proj_z`` are
+           present as separate weights → concatenate them into
+           ``in_proj_qkvz``.
 
-        2. Already-merged: the adapter has a single ``in_proj_qkvz`` weight
+        2. 2-way split (native HF/PEFT layout): ``in_proj_qkv`` (fused q+k+v)
+           + ``in_proj_z``. The shared qkv ``lora_A`` covers the q, k, v slots
+           of the stacked buffer (repeat 3×) and z appends its own slot;
+           ``lora_B`` rows are concatenated following the fused q|k|v|z output
+           layout. If only one of the two modules is targeted, the other side
+           is synthesized as zeros (a no-op LoRA on those slots).
+
+        3. Already-merged: the adapter has a single ``in_proj_qkvz`` weight
            (PEFT trained against SGLang's fused Linear). The stacked buffer
            expects four per-slice ``A`` blocks, so repeat ``lora_A`` 4× along
            the rank dim. ``lora_B`` is already full-output-dim and matches
            the buffer directly.
         """
         for weight_name in list(weights.keys()):
+            if weight_name not in weights:
+                continue
             if "in_proj_q." in weight_name:
                 k_name = weight_name.replace("in_proj_q", "in_proj_k")
                 v_name = weight_name.replace("in_proj_q", "in_proj_v")
@@ -347,6 +358,60 @@ class LoRAAdapter(nn.Module):
                 weights.pop(k_name)
                 weights.pop(v_name)
                 weights.pop(z_name)
+            elif "in_proj_qkv." in weight_name:
+                # 2-way split: in_proj_qkv (+ optional in_proj_z).
+                z_name = weight_name.replace("in_proj_qkv", "in_proj_z")
+                qkvz_name = weight_name.replace("in_proj_qkv", "in_proj_qkvz")
+                qkv_weight = weights[weight_name]
+                cat_dim = qkv_weight.dim() - 2
+                if "lora_A" in weight_name:
+                    repeat_dims = [1] * qkv_weight.dim()
+                    repeat_dims[cat_dim] = 3
+                    z_weight = (
+                        weights[z_name]
+                        if z_name in weights
+                        else torch.zeros_like(qkv_weight)
+                    )
+                    weights[qkvz_name] = torch.cat(
+                        (qkv_weight.repeat(*repeat_dims), z_weight), cat_dim
+                    )
+                else:
+                    if z_name in weights:
+                        z_weight = weights[z_name]
+                    else:
+                        z_rows = (
+                            self._get_in_proj_qkvz_output_dim(weight_name)
+                            - qkv_weight.shape[cat_dim]
+                        )
+                        zeros_shape = list(qkv_weight.shape)
+                        zeros_shape[cat_dim] = z_rows
+                        z_weight = qkv_weight.new_zeros(zeros_shape)
+                    weights[qkvz_name] = torch.cat((qkv_weight, z_weight), cat_dim)
+                weights.pop(weight_name)
+                weights.pop(z_name, None)
+            elif "in_proj_z." in weight_name:
+                if (
+                    weight_name.replace("in_proj_z", "in_proj_qkv") in weights
+                    or weight_name.replace("in_proj_z", "in_proj_q") in weights
+                ):
+                    continue
+                qkvz_name = weight_name.replace("in_proj_z", "in_proj_qkvz")
+                z_weight = weights[weight_name]
+                cat_dim = z_weight.dim() - 2
+                if "lora_A" in weight_name:
+                    repeat_dims = [1] * z_weight.dim()
+                    repeat_dims[cat_dim] = 3
+                    qkv_weight = torch.zeros_like(z_weight).repeat(*repeat_dims)
+                else:
+                    qkv_rows = (
+                        self._get_in_proj_qkvz_output_dim(weight_name)
+                        - z_weight.shape[cat_dim]
+                    )
+                    zeros_shape = list(z_weight.shape)
+                    zeros_shape[cat_dim] = qkv_rows
+                    qkv_weight = z_weight.new_zeros(zeros_shape)
+                weights[qkvz_name] = torch.cat((qkv_weight, z_weight), cat_dim)
+                weights.pop(weight_name)
             elif "in_proj_qkvz" in weight_name and "lora_A" in weight_name:
                 # Already-merged adapter: replicate the shared A across the 4
                 # stacked slots the buffer expects (q, k, v, z).
@@ -355,6 +420,15 @@ class LoRAAdapter(nn.Module):
                 repeat_dims[ndim - 2] = 4
                 weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
             # else (in_proj_qkvz lora_B, or unrelated): no-op.
+
+    def _get_in_proj_qkvz_output_dim(self, weight_name: str) -> int:
+        _, output_dim = get_hidden_dim(
+            "in_proj_qkvz",
+            self.base_hf_config,
+            self.base_model,
+            get_layer_id(weight_name),
+        )
+        return output_dim
 
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
