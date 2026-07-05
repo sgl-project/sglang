@@ -492,11 +492,16 @@ def _needs_device_weight_postprocess(
 ) -> bool:
     """Return whether post-load weight processing needs CUDA/NPU tensors."""
     quant_name = _get_quant_config_name(quant_config)
-    if quant_name == "fp8":
-        return not getattr(quant_config, "is_checkpoint_fp8_serialized", False)
-    if quant_name == "mxfp4":
-        return not getattr(quant_config, "is_checkpoint_mxfp4_serialized", False)
-    return False
+    serialized_flag_by_quant_name = {
+        "fp8": "is_checkpoint_fp8_serialized",
+        "mxfp8": "is_checkpoint_fp8_serialized",
+        "mxfp4": "is_checkpoint_mxfp4_serialized",
+        "mxfp4_npu": "is_checkpoint_mxfp4_npu_serialized",
+    }
+    serialized_flag = serialized_flag_by_quant_name.get(quant_name)
+    if serialized_flag is None:
+        return False
+    return not getattr(quant_config, serialized_flag, False)
 
 
 def _build_transformer_quant_adapters(

@@ -82,6 +82,18 @@ class _FakeQuantConfig:
         return "modelopt_fp4"
 
 
+def _make_quant_config(name: str, **attrs):
+    cls = type(
+        f"_Fake{name.title().replace('_', '')}QuantConfig",
+        (),
+        {"get_name": classmethod(lambda cls: name)},
+    )
+    quant_config = cls()
+    for attr_name, attr_value in attrs.items():
+        setattr(quant_config, attr_name, attr_value)
+    return quant_config
+
+
 class TestTransformerQuantHelpers(unittest.TestCase):
     def _make_server_args(self, **overrides):
         defaults = dict(
@@ -203,6 +215,20 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertFalse(
             _needs_device_weight_postprocess(
                 Fp8Config(is_checkpoint_fp8_serialized=True)
+            )
+        )
+        self.assertTrue(_needs_device_weight_postprocess(_make_quant_config("mxfp8")))
+        self.assertFalse(
+            _needs_device_weight_postprocess(
+                _make_quant_config("mxfp8", is_checkpoint_fp8_serialized=True)
+            )
+        )
+        self.assertTrue(
+            _needs_device_weight_postprocess(_make_quant_config("mxfp4_npu"))
+        )
+        self.assertFalse(
+            _needs_device_weight_postprocess(
+                _make_quant_config("mxfp4_npu", is_checkpoint_mxfp4_npu_serialized=True)
             )
         )
 

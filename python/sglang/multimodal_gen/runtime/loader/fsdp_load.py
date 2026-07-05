@@ -247,10 +247,8 @@ def maybe_load_fsdp_model(
         defer_cpu_offload = False
     load_cpu_offload = bool(cpu_offload and not defer_cpu_offload)
     weight_postprocess_device = weight_load_plan.weight_postprocess_device
-    if use_fsdp and cpu_offload and weight_postprocess_device is not None:
-        logger.warning(
-            "Ignoring weight postprocess device override for FSDP CPU offload."
-        )
+    if use_fsdp and weight_postprocess_device is not None:
+        logger.warning("Ignoring weight postprocess device override for FSDP loading.")
         weight_postprocess_device = None
 
     if use_fsdp:
