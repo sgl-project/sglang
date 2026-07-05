@@ -48,6 +48,7 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
     set_context,
     uses_sliding_window_attention,
 )
+from sglang.srt.hardware_backend.mlx.norm_wrapper import patch_model_norms
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_server_args
 
@@ -148,6 +149,7 @@ class MlxModelRunner:
             logger.info(f"Wired memory limit set to {max_wired / (1024**3):.1f} GB")
 
         patch_model_attention(self.model)
+        patch_model_norms(self.model)
 
         layer_list, attn_attrs = find_attention_layers(self.model)
         self._cache_layout = MlxModelCacheLayout.from_attention_discovery(
