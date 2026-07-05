@@ -33,7 +33,6 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.dflash_utils import compute_dflash_correct_drafts_and_bonus
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.dspark_info import (
     DSparkDraftBlockInput,
@@ -140,16 +139,23 @@ class DSparkWorkerV2(BaseSpecWorker):
             self.target_worker.model_runner.model.lm_head.weight
         )
 
-        self.block_size = int(server_args.speculative_num_draft_tokens)
-        model_block_size = int(getattr(self.draft_model, "block_size", self.block_size))
-        if model_block_size != self.block_size:
+        requested_block_size = int(server_args.speculative_num_draft_tokens)
+        model_block_size = int(
+            getattr(self.draft_model, "block_size", requested_block_size)
+        )
+        if model_block_size != requested_block_size:
             logger.warning(
                 "DSpark block size mismatch: using speculative_num_draft_tokens=%s "
                 "but draft model block_size=%s.",
-                self.block_size,
+                requested_block_size,
                 model_block_size,
             )
-        self.speculative_num_draft_tokens = int(self.block_size)
+        # DeepSpec's block_size is the number of sampled draft tokens. SGLang's
+        # speculative stride includes the anchor/bonus slot, so DSpark verifies
+        # anchor + block_size sampled drafts.
+        self.block_size = int(model_block_size)
+        self.verify_stride = int(self.block_size) + 1
+        self.speculative_num_draft_tokens = int(self.verify_stride)
 
         self.noise_token_id = int(self._draft_inner.noise_token_id)
         self.markov_rank = int(self._draft_inner.markov_rank)
@@ -161,10 +167,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._block_pos_offsets = torch.arange(
             self.block_size, device=self.device, dtype=torch.int64
         )
+        self._verify_pos_offsets = torch.arange(
+            self.verify_stride, device=self.device, dtype=torch.int64
+        )
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        self._use_triton_accept_bonus = is_cuda() or is_hip()
+        # The current Triton kernel assumes candidates and confidence have the
+        # same width. DeepSpec DSpark has candidates=[anchor]+N drafts, while
+        # confidence has N draft rows, so use the eager verifier for now.
+        self._use_triton_accept_bonus = False
         self._accept_bonus_buffer_cap: int = 0
         self._accept_bonus_buffer_slot: int = 0
         self._commit_lens_bufs: List[torch.Tensor] = []
@@ -1129,7 +1141,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             else self.draft_model.lm_head.weight.dtype
         )
         self._markov_candidates_buf = torch.empty(
-            (new_cap, int(self.block_size)), dtype=torch.int64, device=device
+            (new_cap, int(self.verify_stride)), dtype=torch.int64, device=device
         )
         self._markov_embeds_buf = torch.empty(
             (new_cap, int(self.block_size), int(self.markov_rank)),
@@ -1148,9 +1160,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         bs = int(block_hidden.shape[0])
         output_bs = bs if output_bs is None else int(output_bs)
         block_size = int(self.block_size)
+        verify_stride = int(self.verify_stride)
         if bs == 0:
             empty_tokens = torch.empty(
-                (output_bs, block_size), dtype=torch.int64, device=block_hidden.device
+                (output_bs, verify_stride),
+                dtype=torch.int64,
+                device=block_hidden.device,
             )
             empty_confidence = torch.empty(
                 (output_bs, block_size), dtype=torch.float32, device=block_hidden.device
@@ -1242,8 +1257,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if debug_enabled:
                     assert markov_top1 is not None
                     markov_top1[:, i].copy_(next_tokens)
-                if i + 1 < block_size:
-                    candidates[:, i + 1].copy_(next_tokens)
+                candidates[:, i + 1].copy_(next_tokens)
                 prev_tokens = next_tokens
 
             confidence = confidence_head(block_hidden, markov_embeds)
@@ -1286,7 +1300,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             ),
         )
         device = self.device
-        block_size = int(self.block_size)
+        verify_stride = int(self.verify_stride)
         self._commit_lens_bufs = [
             torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
         ]
@@ -1294,7 +1308,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             torch.empty((new_cap,), dtype=torch.int64, device=device) for _ in range(2)
         ]
         self._out_tokens_bufs = [
-            torch.empty((new_cap, block_size), dtype=torch.int64, device=device)
+            torch.empty((new_cap, verify_stride), dtype=torch.int64, device=device)
             for _ in range(2)
         ]
         self._new_seq_lens_bufs = [
@@ -1325,11 +1339,25 @@ class DSparkWorkerV2(BaseSpecWorker):
         target_predict: torch.Tensor,
         confidence: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        bs, block_size = candidates.shape
-        correct_len, _ = compute_dflash_correct_drafts_and_bonus(
-            candidates=candidates,
-            target_predict=target_predict,
-        )
+        bs, verify_stride = candidates.shape
+        if target_predict.shape != candidates.shape:
+            raise ValueError(
+                "target_predict must match DSpark candidates shape. "
+                f"candidates.shape={tuple(candidates.shape)}, "
+                f"target_predict.shape={tuple(target_predict.shape)}"
+            )
+        draft_width = verify_stride - 1
+        if confidence.shape[0] != bs or confidence.shape[1] != draft_width:
+            raise ValueError(
+                "confidence must have one row per sampled DSpark draft token. "
+                f"confidence.shape={tuple(confidence.shape)}, "
+                f"candidates.shape={tuple(candidates.shape)}"
+            )
+        if draft_width > 0:
+            matches = candidates[:, 1:] == target_predict[:, :draft_width]
+            correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
+        else:
+            correct_len = torch.zeros((bs,), dtype=torch.int32, device=candidates.device)
         confident_prefix = self._confident_prefix(confidence)
         correct_len = torch.minimum(
             correct_len.to(torch.int64), confident_prefix.to(torch.int64)
@@ -1338,11 +1366,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         commit_lens = correct_len.to(torch.int32) + 1
 
         out_tokens = torch.empty(
-            (bs, block_size), dtype=torch.int64, device=candidates.device
+            (bs, verify_stride), dtype=torch.int64, device=candidates.device
         )
-        if block_size > 1:
-            out_tokens[:, : block_size - 1].copy_(candidates[:, 1:])
-        out_tokens[:, block_size - 1].fill_(0)
+        if draft_width > 0:
+            out_tokens[:, :draft_width].copy_(candidates[:, 1:])
+        out_tokens[:, draft_width].fill_(0)
         out_tokens.scatter_(
             1,
             correct_len.unsqueeze(1),
@@ -1381,24 +1409,32 @@ class DSparkWorkerV2(BaseSpecWorker):
                 return None
             if int(row_idx) >= int(markov_top1.shape[0]):
                 return None
-            block_size = int(candidates.shape[1])
-            limit = min(block_size, 8)
+            verify_stride = int(candidates.shape[1])
+            draft_width = int(markov_top1.shape[1])
+            candidate_limit = min(verify_stride, 8)
+            draft_limit = min(draft_width, 8)
             candidate_row = candidates[row_idx]
             target_row = target_predict[row_idx]
             confidence_row = confidence[row_idx]
-            row_base = base_top1[row_idx, :limit].detach().cpu()
-            row_base_top1_logit = base_top1_logit[row_idx, :limit].detach().cpu()
-            row_hidden_norm = hidden_norm[row_idx, :limit].detach().cpu()
-            row_hidden_abs_mean = hidden_abs_mean[row_idx, :limit].detach().cpu()
+            row_base = base_top1[row_idx, :draft_limit].detach().cpu()
+            row_base_top1_logit = base_top1_logit[
+                row_idx, :draft_limit
+            ].detach().cpu()
+            row_hidden_norm = hidden_norm[row_idx, :draft_limit].detach().cpu()
+            row_hidden_abs_mean = hidden_abs_mean[
+                row_idx, :draft_limit
+            ].detach().cpu()
             row_hidden_cos_adjacent = (
-                hidden_cos_adjacent[row_idx, : max(limit - 1, 0)].detach().cpu()
+                hidden_cos_adjacent[row_idx, : max(draft_limit - 1, 0)]
+                .detach()
+                .cpu()
             )
             row_markov = markov_top1[row_idx].detach().cpu()
-            row_prev = prev_tokens[row_idx, :limit].detach().cpu()
+            row_prev = prev_tokens[row_idx, :draft_limit].detach().cpu()
             candidate_target_hits = []
-            for cand_idx in range(1, min(block_size, 6)):
+            for cand_idx in range(1, min(verify_stride, 7)):
                 hits = torch.nonzero(
-                    target_row[:limit] == candidate_row[cand_idx],
+                    target_row[:candidate_limit] == candidate_row[cand_idx],
                     as_tuple=False,
                 ).view(-1)
                 candidate_target_hits.append(
@@ -1412,8 +1448,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             payload = {
                 "layout": (
-                    "candidate0 is verify anchor; markov_top1[i] is sampled "
-                    "from block_hidden[i] and maps to candidate[i+1] for i < block_size-1"
+                    "candidate0 is verify anchor; markov_top1[i] is sampled from "
+                    "block_hidden[i] and maps to candidate[i+1]; DeepSpec verify "
+                    "stride is anchor + draft_width"
                 ),
                 "base_top1_first": [int(x) for x in row_base.tolist()],
                 "base_top1_logit_first": [
@@ -1427,31 +1464,31 @@ class DSparkWorkerV2(BaseSpecWorker):
                     float(x) for x in row_hidden_cos_adjacent.tolist()
                 ],
                 "markov_top1_first": [
-                    int(x) for x in row_markov[:limit].tolist()
+                    int(x) for x in row_markov[:draft_limit].tolist()
                 ],
                 "prev_tokens_first": [int(x) for x in row_prev.tolist()],
                 "candidates_first": [
-                    int(x) for x in candidate_row[:limit].tolist()
+                    int(x) for x in candidate_row[:candidate_limit].tolist()
                 ],
-                "target_first": [int(x) for x in target_row[:limit].tolist()],
+                "target_first": [int(x) for x in target_row[:candidate_limit].tolist()],
                 "candidate_target_hits": candidate_target_hits,
                 "confidence_first": [
-                    float(x) for x in confidence_row[:limit].tolist()
+                    float(x) for x in confidence_row[:draft_limit].tolist()
                 ],
             }
-            if block_size > 0:
+            if draft_width > 0:
                 payload["markov0_eq_target0"] = bool(row_markov[0] == target_row[0])
                 payload["candidate1_eq_markov0"] = (
                     bool(candidate_row[1] == row_markov[0])
-                    if block_size > 1
+                    if verify_stride > 1
                     else None
                 )
-            if block_size > 1:
+            if draft_width > 1:
                 payload["markov1_eq_target0"] = bool(row_markov[1] == target_row[0])
                 payload["markov1_eq_target1"] = bool(row_markov[1] == target_row[1])
                 payload["candidate2_eq_markov1"] = (
                     bool(candidate_row[2] == row_markov[1])
-                    if block_size > 2
+                    if verify_stride > 2
                     else None
                 )
             return payload
@@ -1666,7 +1703,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 kv_debug = self._build_accept_anomaly_kv_debug(
                     req_pool_idx=int(req_pool_idx),
                     prefix_len=int(seq_lens[i]),
-                    block_size=int(block_size),
+                    block_size=int(self.block_size),
                 )
                 markov_debug = self._build_accept_anomaly_markov_debug(
                     row_idx=i,
@@ -1970,6 +2007,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         device = self.device
         bs = len(model_worker_batch.seq_lens)
         block_size = int(self.block_size)
+        verify_stride = int(self.verify_stride)
         prefix_lens = model_worker_batch.seq_lens
         req_pool_indices = model_worker_batch.req_pool_indices
 
@@ -1981,17 +2019,22 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         positions_2d = prefix_lens.unsqueeze(1) + self._block_pos_offsets
         positions = positions_2d.reshape(-1).to(torch.int64)
+        verify_positions_2d = prefix_lens.unsqueeze(1) + self._verify_pos_offsets
+        verify_positions = verify_positions_2d.reshape(-1).to(torch.int64)
 
-        end_offset = prefix_lens + block_size
+        end_offset = prefix_lens + verify_stride
         verify_out_cache_loc = assign_extend_cache_locs_func(
             req_pool_indices=req_pool_indices,
             req_to_token=self.model_runner.req_to_token_pool.req_to_token,
             start_offset=prefix_lens,
             end_offset=end_offset,
             batch_size=bs,
-            draft_token_num=block_size,
+            draft_token_num=verify_stride,
             device=device,
         )
+        draft_out_cache_loc = verify_out_cache_loc.view(bs, verify_stride)[
+            :, :block_size
+        ].reshape(-1)
         self._materialize_disagg_prefill_hidden_to_draft_state(
             draft_input=draft_input,
             batch=model_worker_batch,
@@ -2013,7 +2056,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 bs=bs,
                 block_ids=block_ids,
                 positions=positions,
-                verify_out_cache_loc=verify_out_cache_loc,
+                verify_out_cache_loc=draft_out_cache_loc,
                 dp_decode_global_num_tokens=dp_decode_global_num_tokens,
             )
 
@@ -2025,8 +2068,8 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         verify_input = DSparkVerifyInput(
             draft_token=candidates.reshape(-1),
-            positions=positions,
-            draft_token_num=block_size,
+            positions=verify_positions,
+            draft_token_num=verify_stride,
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
@@ -2061,14 +2104,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
         target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-            bs, block_size
+            bs, verify_stride
         )
 
         new_seq_lens = None
         if bs == 0:
             bonus_tokens = torch.empty((0,), dtype=torch.int64, device=device)
             commit_lens = torch.empty((0,), dtype=torch.int32, device=device)
-            out_tokens = torch.empty((0, block_size), dtype=torch.int64, device=device)
+            out_tokens = torch.empty(
+                (0, verify_stride), dtype=torch.int64, device=device
+            )
         elif self._use_triton_accept_bonus:
             try:
                 (
@@ -2141,7 +2186,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_out_cache_loc=verify_out_cache_loc,
             prefix_lens=prefix_lens,
             new_seq_lens=new_seq_lens,
-            positions=positions,
+            positions=verify_positions,
             ignore_mask=transfer_warmup_mask,
         )
         if on_publish is not None:
@@ -2153,18 +2198,18 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark verify requires target main_hidden states, but got None."
             )
         if bs > 0:
-            hidden = hidden.view(bs, block_size, -1)
+            hidden = hidden.view(bs, verify_stride, -1)
             hidden_flat = hidden.reshape(-1, hidden.shape[-1])
             main_x_flat = self.draft_model.project_main_hidden(hidden_flat)
             commit_mask_2d = (
-                self._block_pos_offsets.unsqueeze(0)
+                self._verify_pos_offsets.unsqueeze(0)
                 < commit_lens.unsqueeze(1).to(torch.int64)
             )
             commit_mask = commit_mask_2d.reshape(-1)
             self._materialize_main_hidden_to_draft_state(
                 main_hidden=main_x_flat,
                 cache_loc=verify_out_cache_loc[commit_mask],
-                positions=positions[commit_mask],
+                positions=verify_positions[commit_mask],
                 draft_forward_batch=draft_forward_batch,
                 kv_main_hidden=main_x_flat[commit_mask],
                 projected=True,
@@ -2194,7 +2239,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             accept_lens=commit_lens,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
-            speculative_num_draft_tokens=block_size,
+            speculative_num_draft_tokens=verify_stride,
             new_seq_lens=new_seq_lens,
         )
 
@@ -2216,6 +2261,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             accept_lens=empty_lens,
             next_draft_input=next_draft_input,
             can_run_cuda_graph=False,
-            speculative_num_draft_tokens=int(self.block_size),
+            speculative_num_draft_tokens=int(self.verify_stride),
             new_seq_lens=next_draft_input.new_seq_lens,
         )
