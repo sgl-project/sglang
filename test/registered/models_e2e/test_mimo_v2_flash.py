@@ -26,7 +26,7 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
         "fa3",
         "--max-running-requests",
         "128",
-        "--cuda-graph-max-bs",
+        "--cuda-graph-max-bs-decode",
         "64",
         "--page-size",
         "64",
@@ -47,9 +47,9 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
         "--hicache-ratio",
         "1.5",
         "--hicache-mem-layout",
-        "page_first",
+        "page_first_direct",
         "--hicache-io-backend",
-        "kernel",
+        "direct",
     ]
 
     bs_1_speed_thres = 170
