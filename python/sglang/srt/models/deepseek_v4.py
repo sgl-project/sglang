@@ -2175,13 +2175,21 @@ class DeepseekV4ForCausalLM(nn.Module):
                     if rest == "main_proj.scale":
                         rest = "main_proj.weight_scale_inv"
                     return "model." + rest
+                if rest.startswith("emb.tok_emb"):
+                    rest = rest.replace("emb.tok_emb", "embed_tokens")
+                    return "model." + rest
+                if rest.startswith("head."):
+                    return rest.replace("head.", "lm_head.", 1)
                 if rest.startswith(("markov_head", "confidence_head")):
                     return "model." + rest
                 if rest == "norm.weight":
                     return "model.shared_head.norm.weight"
                 if rest.startswith("hc_head_"):
                     return "model." + rest
-                name = f"layers.{stage}." + rest
+                if rest.startswith("layers."):
+                    name = rest
+                else:
+                    name = f"layers.{stage}." + rest
 
         if is_nextn and name.startswith("mtp."):
             parts = name.split(".", 2)
