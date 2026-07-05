@@ -1,10 +1,86 @@
-"""State-space / Mamba kernels (causal conv1d, gated delta rule, ...).
+"""State-space / Mamba kernels (causal conv1d)."""
 
-Reserved group in the ``sglang.kernels`` namespace (RFC #29630). No public
-wrappers are exposed here yet; the implementations still live under ``sgl_kernel.mamba``. These will be migrated into this group
-in later phases. Until then, import the underlying implementations from
-``sglang.jit_kernel`` / ``sgl_kernel`` / the relevant ``triton_ops`` module
-directly.
-"""
+from __future__ import annotations
 
-__all__ = []
+from typing import TYPE_CHECKING, Optional
+
+from sglang.kernels.registry import register_kernel
+from sglang.kernels.selector import get_kernel
+from sglang.kernels.spec import FormatSignature, KernelBackend, KernelSpec
+
+if TYPE_CHECKING:
+    import torch
+
+register_kernel(
+    KernelSpec(
+        op="mamba.causal_conv1d_fwd",
+        backend=KernelBackend.CUDA_AOT,
+        target="sgl_kernel.mamba:causal_conv1d_fwd",
+        format_signature=FormatSignature(
+            in_place=True, description="causal depthwise conv1d forward (prefill)"
+        ),
+        description="Causal conv1d forward (sgl_kernel wheel).",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="mamba.causal_conv1d_update",
+        backend=KernelBackend.CUDA_AOT,
+        target="sgl_kernel.mamba:causal_conv1d_update",
+        format_signature=FormatSignature(
+            in_place=True, description="causal depthwise conv1d update (decode)"
+        ),
+        description="Causal conv1d update (sgl_kernel wheel).",
+    )
+)
+
+
+def causal_conv1d_fwd(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias_: Optional[torch.Tensor],
+    conv_states: Optional[torch.Tensor],
+    query_start_loc: Optional[torch.Tensor],
+    cache_indices: Optional[torch.Tensor],
+    has_initial_state: Optional[torch.Tensor],
+    silu_activation: bool,
+    pad_slot_id: int,
+):
+    """Causal depthwise conv1d forward (prefill)."""
+    return get_kernel("mamba.causal_conv1d_fwd", KernelBackend.CUDA_AOT)(
+        x,
+        weight,
+        bias_,
+        conv_states,
+        query_start_loc,
+        cache_indices,
+        has_initial_state,
+        silu_activation,
+        pad_slot_id,
+    )
+
+
+def causal_conv1d_update(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias_: Optional[torch.Tensor],
+    silu_activation: bool,
+    cache_seqlens: Optional[torch.Tensor],
+    conv_state_indices: Optional[torch.Tensor],
+    pad_slot_id: int,
+):
+    """Causal depthwise conv1d update (decode)."""
+    return get_kernel("mamba.causal_conv1d_update", KernelBackend.CUDA_AOT)(
+        x,
+        conv_state,
+        weight,
+        bias_,
+        silu_activation,
+        cache_seqlens,
+        conv_state_indices,
+        pad_slot_id,
+    )
+
+
+__all__ = ["causal_conv1d_fwd", "causal_conv1d_update"]

@@ -86,3 +86,16 @@ def gelu_tanh_and_mul(
 
 
 __all__ = ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul"]
+
+
+# Triton kernel migrated into this group (from layers/triton_ops/softcap);
+# registered for inventory. Import it from its module.
+for _fn in ("softcap_out", "softcap_inplace_logits"):
+    register_kernel(
+        KernelSpec(
+            op=f"activation.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.activation.softcap:{_fn}",
+        )
+    )
+del _fn

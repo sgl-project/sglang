@@ -1,10 +1,43 @@
-"""Attention kernels (paged/flash/MLA attention, prefill/decode).
+"""Attention compute kernels (Triton): decode / extend / prefill / metadata.
 
-Reserved group in the ``sglang.kernels`` namespace (RFC #29630). No public
-wrappers are exposed here yet; the implementations still live under ``sgl_kernel`` and the attention ``triton_ops`` modules. These will be migrated into this group
-in later phases. Until then, import the underlying implementations from
-``sglang.jit_kernel`` / ``sgl_kernel`` / the relevant ``triton_ops`` module
-directly.
+The Triton kernels migrated here live in this package
+(``sglang.kernels.ops.attention.<module>``); import them from there. Their
+``KernelSpec`` metadata is registered below for inventory (backend = Triton).
+KV-cache index/write kernels went to the ``kvcache`` group instead.
 """
+
+from sglang.kernels.registry import register_kernel
+from sglang.kernels.spec import KernelBackend, KernelSpec
+
+# (module, public_fn) migrated from layers/attention/triton_ops + model_executor.
+_TRITON_KERNELS = [
+    ("decode_attention", "decode_attention_fwd"),
+    ("extend_attention", "extend_attention_fwd"),
+    ("extend_attention", "build_unified_kv_indices"),
+    ("prefill_attention", "context_attention_fwd"),
+    ("merge_state", "merge_state_triton"),
+    ("metadata", "get_num_kv_splits_triton"),
+    ("metadata", "prepare_swa_spec_page_table_triton"),
+    ("metadata", "normal_decode_set_metadata"),
+    ("dsa_metadata", "fused_dsa_decode_metadata"),
+    ("dsa_metadata", "fused_dsa_target_verify_metadata"),
+    ("dsa_metadata", "fused_dsa_draft_extend_metadata"),
+    ("rocm_mla_decode_rope", "decode_attention_fwd_grouped_rope"),
+    ("verify_splitkv", "verify_splitkv_fwd"),
+    ("pad", "pad_sequence_with_mask"),
+    ("pad", "pad_draft_extend_query"),
+    ("pad", "unpad_draft_extend_output"),
+    ("pad", "seqlens_expand_triton"),
+    ("position", "compute_position_triton"),
+]
+for _mod, _fn in _TRITON_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn
 
 __all__ = []

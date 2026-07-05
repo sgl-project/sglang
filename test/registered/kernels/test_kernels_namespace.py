@@ -14,9 +14,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-# Expected registered operators and the backends that provide them. Keep this
-# in sync with the ``sglang.kernels.ops.*`` group modules.
+# A must-contain subset of registered operators and their backends. The
+# registry holds many more entries (every migrated Triton kernel), so this is
+# checked as a subset, not an exact match.
 EXPECTED_OPS = {
+    # curated dual/single-backend wrapper ops
     "activation.silu_and_mul": {"cuda_aot", "cuda_jit"},
     "activation.gelu_and_mul": {"cuda_aot", "cuda_jit"},
     "activation.gelu_tanh_and_mul": {"cuda_aot", "cuda_jit"},
@@ -34,6 +36,22 @@ EXPECTED_OPS = {
     "quantization.sgl_per_token_group_quant_8bit": {"cuda_aot", "cuda_jit"},
     "quantization.sgl_per_token_group_quant_fp8": {"cuda_aot"},
     "quantization.sgl_per_token_group_quant_int8": {"cuda_aot"},
+    # deferred-group wrappers, now populated
+    "sampling.top_k_renorm_probs": {"cuda_aot"},
+    "sampling.top_p_renorm_probs": {"cuda_aot"},
+    "spatial.get_sm_available": {"cuda_aot"},
+    "spatial.create_greenctx_stream_by_value": {"cuda_aot"},
+    "mamba.causal_conv1d_fwd": {"cuda_aot"},
+    "mamba.causal_conv1d_update": {"cuda_aot"},
+    "diffusion.apply_group_norm_silu": {"cuda_jit"},
+    "diffusion.residual_gate_add": {"cuda_jit"},
+    "diffusion.fused_inplace_qknorm_rope": {"cuda_jit"},
+    # representative migrated Triton kernels (inventory)
+    "grammar.apply_token_bitmask_inplace_triton": {"triton"},
+    "memory.alloc_extend_kernel": {"triton"},
+    "attention.decode_attention_fwd": {"triton"},
+    "kvcache.create_flashinfer_kv_indices_triton": {"triton"},
+    "speculative.gather_spec_extras": {"triton"},
 }
 
 # Public wrapper callables that each populated group must expose.
@@ -62,6 +80,17 @@ EXPECTED_WRAPPERS = {
     ],
     "sglang.kernels.ops.moe": ["moe_align_block_size", "topk_softmax"],
     "sglang.kernels.ops.kvcache": ["reshape_and_cache_flash"],
+    "sglang.kernels.ops.sampling": ["top_k_renorm_probs", "top_p_renorm_probs"],
+    "sglang.kernels.ops.spatial": [
+        "get_sm_available",
+        "create_greenctx_stream_by_value",
+    ],
+    "sglang.kernels.ops.mamba": ["causal_conv1d_fwd", "causal_conv1d_update"],
+    "sglang.kernels.ops.diffusion": [
+        "apply_group_norm_silu",
+        "residual_gate_add",
+        "fused_inplace_qknorm_rope",
+    ],
 }
 
 # All operator groups from the RFC's proposed shape must import as packages.
@@ -114,10 +143,15 @@ class TestKernelsNamespace(unittest.TestCase):
 
     def test_registry_contents(self):
         registry = self.K.registry
-        self.assertEqual(set(registry.ops()), set(EXPECTED_OPS.keys()))
+        ops = set(registry.ops())
+        # EXPECTED_OPS is a must-contain subset (many more migrated kernels
+        # are also registered).
+        missing = set(EXPECTED_OPS) - ops
+        self.assertFalse(missing, f"missing registered ops: {sorted(missing)}")
         for op, backends in EXPECTED_OPS.items():
             got = {s.backend.value for s in registry.get(op)}
             self.assertEqual(got, backends, f"backend mismatch for {op}")
+        self.assertGreaterEqual(len(ops), 80, "registry unexpectedly small")
 
     def test_specs_are_well_formed(self):
         for spec in self.K.registry.all_specs():
