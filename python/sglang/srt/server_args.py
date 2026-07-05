@@ -100,14 +100,6 @@ logger = logging.getLogger(__name__)
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
-MIMO_V2_MODEL_ARCHS = (
-    "MiMoV2ForCausalLM",
-    "MiMoV2FlashForCausalLM",
-)
-LLAMA4_MODEL_ARCHS = (
-    "Llama4ForConditionalGeneration",
-    "Llama4ForCausalLM",
-)
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
@@ -520,37 +512,6 @@ class ServerArgs:
     ] = "{}"
 
     # -------------------------------------------------------------------------
-    # HTTP server
-    # -------------------------------------------------------------------------
-    host: A[str, "The host of the HTTP server."] = "127.0.0.1"
-    port: A[int, "The port of the HTTP server."] = 30000
-    fastapi_root_path: A[str, "App is behind a path based routing proxy."] = ""
-    grpc_mode: A[bool, "If set, use gRPC server instead of HTTP server."] = False
-    skip_server_warmup: A[bool, "If set, skip warmup."] = False
-    warmups: A[
-        Optional[str],
-        "Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
-    ] = None
-    enable_http2: A[
-        bool,
-        "Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. Requires 'pip install sglang[http2]'.",
-    ] = False
-
-    # -------------------------------------------------------------------------
-    # SSL/TLS
-    # -------------------------------------------------------------------------
-    ssl_keyfile: A[Optional[str], "The file path to the SSL key file."] = None
-    ssl_certfile: A[Optional[str], "The file path to the SSL certificate file."] = None
-    ssl_ca_certs: A[Optional[str], "The CA certificates file."] = None
-    ssl_keyfile_password: A[
-        Optional[str], "The password to decrypt the SSL keyfile."
-    ] = None
-    enable_ssl_refresh: A[
-        bool,
-        "Enable automatic SSL certificate hot-reloading when cert/key files change on disk. Requires --ssl-certfile and --ssl-keyfile.",
-    ] = False
-
-    # -------------------------------------------------------------------------
     # Quantization and data type
     # -------------------------------------------------------------------------
     dtype: A[
@@ -829,42 +790,6 @@ class ServerArgs:
     ] = False
 
     # -------------------------------------------------------------------------
-    # Device info and server timeout
-    # -------------------------------------------------------------------------
-    device: A[
-        Optional[str],
-        "The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu', 'musa'). Defaults to auto-detection if not specified.",
-    ] = None
-    base_gpu_id: A[
-        int,
-        "The base GPU ID to start allocating GPUs from. Useful when running multiple instances on the same machine.",
-    ] = 0
-    gpu_id_step: A[
-        int,
-        "The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,...",
-    ] = 1
-    random_seed: A[Optional[int], "The random seed."] = None
-    watchdog_timeout: A[
-        float,
-        "Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
-    ] = 300
-    soft_watchdog_timeout: A[
-        Optional[float],
-        "Set soft watchdog timeout in seconds. If a forward batch takes longer than this, the server will dump information for debugging.",
-    ] = None
-    sleep_on_idle: A[bool, "Reduce CPU usage when sglang is idle."] = False
-    use_ray: A[bool, "Use Ray actors for scheduler process management."] = False
-    custom_sigquit_handler: Optional[Callable] = None
-    numa_node: A[
-        Optional[List[int]],
-        "Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess. If unset, will be automatically detected on NUMA systems.",
-    ] = None
-    gc_threshold: A[
-        Optional[List[int]],
-        "Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers.",
-    ] = None
-
-    # -------------------------------------------------------------------------
     # Distributed topology and parallelism (TP, PP, DP, CP)
     # -------------------------------------------------------------------------
     nccl_port: A[
@@ -1007,6 +932,152 @@ class ServerArgs:
     ] = False
 
     # -------------------------------------------------------------------------
+    # Device info and server timeout
+    # -------------------------------------------------------------------------
+    device: A[
+        Optional[str],
+        "The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu', 'musa'). Defaults to auto-detection if not specified.",
+    ] = None
+    base_gpu_id: A[
+        int,
+        "The base GPU ID to start allocating GPUs from. Useful when running multiple instances on the same machine.",
+    ] = 0
+    gpu_id_step: A[
+        int,
+        "The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,...",
+    ] = 1
+    random_seed: A[Optional[int], "The random seed."] = None
+    watchdog_timeout: A[
+        float,
+        "Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
+    ] = 300
+    soft_watchdog_timeout: A[
+        Optional[float],
+        "Set soft watchdog timeout in seconds. If a forward batch takes longer than this, the server will dump information for debugging.",
+    ] = None
+    sleep_on_idle: A[bool, "Reduce CPU usage when sglang is idle."] = False
+    use_ray: A[bool, "Use Ray actors for scheduler process management."] = False
+    custom_sigquit_handler: Optional[Callable] = None
+    numa_node: A[
+        Optional[List[int]],
+        "Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess. If unset, will be automatically detected on NUMA systems.",
+    ] = None
+    gc_threshold: A[
+        Optional[List[int]],
+        "Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers.",
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # HTTP server
+    # -------------------------------------------------------------------------
+    host: A[str, "The host of the HTTP server."] = "127.0.0.1"
+    port: A[int, "The port of the HTTP server."] = 30000
+    fastapi_root_path: A[str, "App is behind a path based routing proxy."] = ""
+    grpc_mode: A[bool, "If set, use gRPC server instead of HTTP server."] = False
+    skip_server_warmup: A[bool, "If set, skip warmup."] = False
+    warmups: A[
+        Optional[str],
+        "Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
+    ] = None
+    enable_http2: A[
+        bool,
+        "Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. Requires 'pip install sglang[http2]'.",
+    ] = False
+
+    # -------------------------------------------------------------------------
+    # SSL/TLS
+    # -------------------------------------------------------------------------
+    ssl_keyfile: A[Optional[str], "The file path to the SSL key file."] = None
+    ssl_certfile: A[Optional[str], "The file path to the SSL certificate file."] = None
+    ssl_ca_certs: A[Optional[str], "The CA certificates file."] = None
+    ssl_keyfile_password: A[
+        Optional[str], "The password to decrypt the SSL keyfile."
+    ] = None
+    enable_ssl_refresh: A[
+        bool,
+        "Enable automatic SSL certificate hot-reloading when cert/key files change on disk. Requires --ssl-certfile and --ssl-keyfile.",
+    ] = False
+
+    # -------------------------------------------------------------------------
+    # API related
+    # -------------------------------------------------------------------------
+    api_key: A[
+        Optional[str],
+        "Set API key of the server. It is also used in the OpenAI API compatible server.",
+    ] = None
+    admin_api_key: A[
+        Optional[str],
+        "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). When set, admin endpoints require this key and do NOT accept --api-key.",
+    ] = None
+    served_model_name: A[
+        Optional[str],
+        "Override the model name returned by the v1/models endpoint in OpenAI API server.",
+    ] = None
+    weight_version: A[
+        str,
+        "Version identifier for the model weights. Defaults to 'default' if not specified.",
+    ] = "default"
+    chat_template: A[
+        Optional[str],
+        "The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
+    ] = None
+    hf_chat_template_name: A[
+        Optional[str],
+        "When the HuggingFace tokenizer has multiple chat templates (e.g., 'default', 'tool_use', 'rag'), specify which named template to use. If not set, the first available template is used.",
+    ] = None
+    completion_template: A[
+        Optional[str],
+        "The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently.",
+    ] = None
+    file_storage_path: A[str, "The path of the file storage in backend."] = (
+        "sglang_storage"
+    )
+    enable_cache_report: A[
+        bool,
+        "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+    ] = False
+    reasoning_parser: Optional[str] = None
+    strip_thinking_cache: A[
+        bool,
+        "Skip caching reasoning-model output (thinking + answer) in the radix tree on finish; keep only the prompt prefix. Opt-in: changes cache contents.",
+    ] = False
+    enable_strict_thinking: A[
+        bool,
+        "Enable strict token filtering during the thinking phase. Blocks model-specific excluded tokens (e.g., tool call markers) during reasoning. Requires a grammar backend that supports token filtering.",
+    ] = False
+    tool_call_parser: Optional[str] = None
+    tool_server: A[
+        Optional[str],
+        "Either 'demo' or a comma-separated list of tool server urls to use for the model. If not specified, no tool server will be used.",
+    ] = None
+    sampling_defaults: A[
+        str,
+        Arg(
+            help="Where to get default sampling parameters. 'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). 'model' uses the model's generation_config.json to get the recommended sampling parameters if available. Default is 'model'.",
+            choices=["openai", "model"],
+        ),
+    ] = "model"
+    asr_max_buffer_seconds: A[
+        int,
+        "Maximum seconds of PCM audio the streaming ASR WebSocket handler will accumulate before closing the session with a buffer_overflow error. Guards against OOM when a client streams audio faster than inference can consume it. Default 60s.",
+    ] = 60
+    asr_max_concurrent_sessions: A[
+        int,
+        "Maximum number of concurrent realtime ASR WebSocket sessions served by /v1/realtime. New connections beyond this cap are accepted, sent an error{code:too_many_sessions} frame, and closed. Default 32.",
+    ] = 32
+    preferred_sampling_params: A[
+        Optional[str],
+        Arg(
+            help="json-formatted sampling settings that will be returned in /get_model_info",
+            type_parser=json.loads,
+        ),
+    ] = None
+    allow_auto_truncate: A[
+        bool,
+        "Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
+    ] = False
+
+    # -------------------------------------------------------------------------
     # Streaming
     # -------------------------------------------------------------------------
     stream_interval: A[
@@ -1032,18 +1103,6 @@ class ServerArgs:
     enable_session_radix_cache: A[
         bool,
         "Hold per-session KV as ordinary evictable radix entries, tagged by session id and bulk-evicted on close. Requires --radix-eviction-policy priority.",
-    ] = False
-
-    # -------------------------------------------------------------------------
-    # Constrained decoding
-    # -------------------------------------------------------------------------
-    constrained_json_whitespace_pattern: A[
-        Optional[str],
-        "(outlines and llguidance backends only) Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
-    ] = None
-    constrained_json_disable_any_whitespace: A[
-        bool,
-        "(xgrammar and llguidance backends only) Enforce compact representation in JSON constrained output.",
     ] = False
 
     # -------------------------------------------------------------------------
@@ -1197,222 +1256,16 @@ class ServerArgs:
     stat_loggers: Optional[Dict[str, type]] = None
 
     # -------------------------------------------------------------------------
-    # API related
+    # Constrained decoding
     # -------------------------------------------------------------------------
-    api_key: A[
+    constrained_json_whitespace_pattern: A[
         Optional[str],
-        "Set API key of the server. It is also used in the OpenAI API compatible server.",
+        "(outlines and llguidance backends only) Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
     ] = None
-    admin_api_key: A[
-        Optional[str],
-        "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). When set, admin endpoints require this key and do NOT accept --api-key.",
-    ] = None
-    served_model_name: A[
-        Optional[str],
-        "Override the model name returned by the v1/models endpoint in OpenAI API server.",
-    ] = None
-    weight_version: A[
-        str,
-        "Version identifier for the model weights. Defaults to 'default' if not specified.",
-    ] = "default"
-    chat_template: A[
-        Optional[str],
-        "The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
-    ] = None
-    hf_chat_template_name: A[
-        Optional[str],
-        "When the HuggingFace tokenizer has multiple chat templates (e.g., 'default', 'tool_use', 'rag'), specify which named template to use. If not set, the first available template is used.",
-    ] = None
-    completion_template: A[
-        Optional[str],
-        "The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently.",
-    ] = None
-    file_storage_path: A[str, "The path of the file storage in backend."] = (
-        "sglang_storage"
-    )
-    enable_cache_report: A[
+    constrained_json_disable_any_whitespace: A[
         bool,
-        "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        "(xgrammar and llguidance backends only) Enforce compact representation in JSON constrained output.",
     ] = False
-    reasoning_parser: Optional[str] = None
-    strip_thinking_cache: A[
-        bool,
-        "Skip caching reasoning-model output (thinking + answer) in the radix tree on finish; keep only the prompt prefix. Opt-in: changes cache contents.",
-    ] = False
-    enable_strict_thinking: A[
-        bool,
-        "Enable strict token filtering during the thinking phase. Blocks model-specific excluded tokens (e.g., tool call markers) during reasoning. Requires a grammar backend that supports token filtering.",
-    ] = False
-    tool_call_parser: Optional[str] = None
-    tool_server: A[
-        Optional[str],
-        "Either 'demo' or a comma-separated list of tool server urls to use for the model. If not specified, no tool server will be used.",
-    ] = None
-    sampling_defaults: A[
-        str,
-        Arg(
-            help="Where to get default sampling parameters. 'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). 'model' uses the model's generation_config.json to get the recommended sampling parameters if available. Default is 'model'.",
-            choices=["openai", "model"],
-        ),
-    ] = "model"
-    asr_max_buffer_seconds: A[
-        int,
-        "Maximum seconds of PCM audio the streaming ASR WebSocket handler will accumulate before closing the session with a buffer_overflow error. Guards against OOM when a client streams audio faster than inference can consume it. Default 60s.",
-    ] = 60
-    asr_max_concurrent_sessions: A[
-        int,
-        "Maximum number of concurrent realtime ASR WebSocket sessions served by /v1/realtime. New connections beyond this cap are accepted, sent an error{code:too_many_sessions} frame, and closed. Default 32.",
-    ] = 32
-    preferred_sampling_params: A[
-        Optional[str],
-        Arg(
-            help="json-formatted sampling settings that will be returned in /get_model_info",
-            type_parser=json.loads,
-        ),
-    ] = None
-    allow_auto_truncate: A[
-        bool,
-        "Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
-    ] = False
-
-    # -------------------------------------------------------------------------
-    # Prefill delayer
-    # -------------------------------------------------------------------------
-    enable_prefill_delayer: A[
-        bool, "Enable prefill delayer for DP attention to reduce idle time."
-    ] = False
-    prefill_delayer_max_delay_passes: A[
-        int, "Maximum forward passes to delay prefill."
-    ] = 30
-    prefill_delayer_token_usage_low_watermark: A[
-        Optional[float], "Token usage low watermark for prefill delayer."
-    ] = None
-    prefill_delayer_forward_passes_buckets: A[
-        Optional[List[float]],
-        "Custom buckets for prefill delayer forward passes histogram. 0 and max_delay_passes-1 will be auto-added.",
-    ] = None
-    prefill_delayer_wait_seconds_buckets: A[
-        Optional[List[float]],
-        "Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added.",
-    ] = None
-    prefill_delayer_queue_min_ratio: A[
-        Optional[float],
-        (
-            "Opt-in to the adaptive queue-based delay trigger (independent of the "
-            "slot-based one). Delays prefill until the waiting queue reaches "
-            "min(running_req * ratio, max_prefill_bs) so small fragments batch "
-            "into a larger prefill. Unset (default) keeps the original slot-only "
-            "behavior. Typical: 0.1 ~ 0.5."
-        ),
-    ] = None
-    prefill_delayer_max_delay_ms: A[
-        Optional[float],
-        (
-            "Wall-clock cap (ms) on a single queue-trigger delay; once exceeded, "
-            "prefill is force-released to bound worst-case TTFT. Only consulted "
-            "when --prefill-delayer-queue-min-ratio is set. Typical: 1000 ~ "
-            "5000; defaults to 5000 if unset."
-        ),
-    ] = None
-
-    # -------------------------------------------------------------------------
-    # Min free slots delay (prefill refill batching)
-    # -------------------------------------------------------------------------
-    min_free_slots_delay: A[
-        Optional[int],
-        (
-            "Hold new prefills until at least N running-request slots have freed "
-            "up, so they are admitted in one batch instead of one at a time. "
-            "Useful when each admission is disproportionately expensive, e.g. "
-            "speculative decoding with a separate draft prefill pass. Capped to "
-            "the DFlash formula (disabled when max-running-requests < 8; "
-            "min(4, max(2, (max-run + 5) // 6))). DFlash workloads auto-enable "
-            "this with the formula when unset; other workloads stay disabled."
-        ),
-    ] = None
-
-    # -------------------------------------------------------------------------
-    # LoRA
-    # -------------------------------------------------------------------------
-    enable_lora: A[
-        Optional[bool],
-        "Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility.",
-    ] = None
-    enable_lora_overlap_loading: A[
-        Optional[bool],
-        "Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.",
-    ] = None
-    max_lora_rank: A[
-        Optional[int],
-        "The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
-    ] = None
-    lora_target_modules: A[
-        Optional[Union[set[str], List[str]]],
-        Arg(
-            help="The union set of all target modules where LoRA should be applied. If not specified, it will be automatically inferred from the adapters provided in --lora-paths. If 'all' is specified, all supported modules will be targeted.",
-            nargs="*",
-            choices=SUPPORTED_LORA_TARGET_MODULES + [LORA_TARGET_ALL_MODULES],
-        ),
-    ] = None
-    lora_paths: A[
-        Optional[Union[dict[str, str], List[dict[str, str]], List[str], List[LoRARef]]],
-        Arg(
-            help='The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: <PATH> | <NAME>=<PATH> | JSON with schema {"lora_name":str,"lora_path":str,"pinned":bool}',
-            action=LoRAPathAction,
-            action_kwargs={"type": str, "nargs": "*"},
-        ),
-    ] = None
-    max_loaded_loras: A[
-        Optional[int],
-        "If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`.",
-    ] = None
-    max_loras_per_batch: A[
-        int,
-        "Maximum number of adapters for a running batch, include base-only request.",
-    ] = 8
-    lora_eviction_policy: A[
-        str,
-        Arg(
-            help="LoRA adapter eviction policy when memory pool is full. 'lru': Least Recently Used (default, better cache efficiency). 'fifo': First-In-First-Out.",
-            choices=["lru", "fifo"],
-        ),
-    ] = "lru"
-    lora_backend: A[
-        str,
-        Arg(
-            help="Choose the kernel backend for multi-LoRA serving.",
-            choices=LORA_BACKEND_CHOICES,
-        ),
-    ] = "csgmv"
-    max_lora_chunk_size: A[
-        Optional[int],
-        Arg(
-            help="Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance.",
-            choices=[16, 32, 64, 128],
-        ),
-    ] = 16
-    experts_shared_outer_loras: A[
-        Optional[bool],
-        Arg(
-            help="Force shared outer LoRA mode for MoE models. When set, w1/w3 lora_A and w2 lora_B are shared across experts (expert_dim=1). Use --no-experts-shared-outer-loras to force disable. By default this is auto-detected from adapter weights.",
-            action=argparse.BooleanOptionalAction,
-        ),
-    ] = None
-    lora_use_virtual_experts: A[
-        bool,
-        "Enable virtual expert computation for MoE models. When set, the model will use virtual expert computation.",
-    ] = False
-    lora_strict_loading: A[
-        bool,
-        Arg(
-            help="Enable strict loading for LoRA adapters. When set, mismatched or missing keys in the adapter weights will raise an error.",
-            action=argparse.BooleanOptionalAction,
-        ),
-    ] = False
-    lora_drain_wait_threshold: A[
-        float,
-        "When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).",
-    ] = 0.0
 
     # -------------------------------------------------------------------------
     # Kernel backend
@@ -1524,6 +1377,186 @@ class ServerArgs:
             choices=MAMBA_BACKEND_CHOICES,
         ),
     ] = "triton"
+
+    # -------------------------------------------------------------------------
+    # Cuda graphs
+    # -------------------------------------------------------------------------
+    cuda_graph_config: A[
+        Optional[CudaGraphConfig],
+        Arg(
+            help='Per-phase CUDA graph settings as JSON, e.g. \'{"decode":{"backend":"full","max_bs":256},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}\'. Allowed backends per phase: full, breakable, tc_piecewise, disabled (full is decode-only). JSON wins over the per-phase --cuda-graph-* convenience flags and over legacy flags.',
+            type_parser=parse_cuda_graph_config_arg,
+        ),
+    ] = None
+    cuda_graph_backend_decode: A[
+        Optional[Literal["full", "breakable", "tc_piecewise", "disabled"]],
+        Arg(
+            help="Backend for the decode phase. Folds into cuda_graph_config[decode].backend.",
+            choices=Backend.ALL,
+        ),
+    ] = None
+    cuda_graph_backend_prefill: A[
+        Optional[Literal["breakable", "tc_piecewise", "disabled"]],
+        Arg(
+            help="Backend for the prefill phase. Folds into cuda_graph_config[prefill].backend.",
+            choices=Backend.ALL,
+        ),
+    ] = None
+    cuda_graph_max_bs_decode: A[
+        Optional[int],
+        "Maximum batch size captured for the decode cuda graph.",
+    ] = None
+    cuda_graph_max_bs_prefill: A[
+        Optional[int],
+        "Maximum batch size captured for the prefill cuda graph.",
+    ] = None
+    cuda_graph_bs_decode: A[
+        Optional[List[int]],
+        "Explicit list of batch sizes to capture for the decode cuda graph.",
+    ] = None
+    cuda_graph_bs_prefill: A[
+        Optional[List[int]],
+        "Explicit list of batch sizes to capture for the prefill cuda graph.",
+    ] = None
+    cuda_graph_tc_compiler: A[
+        Optional[Literal["eager", "inductor"]],
+        "Compiler used by the tc_piecewise backend (currently only the prefill phase consumes it).",
+    ] = None
+    disable_prefill_cuda_graph: A[
+        bool,
+        "Disable the prefill-phase CUDA graph. Convenience for --cuda-graph-backend-prefill=disabled.",
+    ] = False
+    disable_decode_cuda_graph: A[
+        bool,
+        "Disable the decode-phase CUDA graph. Convenience for --cuda-graph-backend-decode=disabled.",
+    ] = False
+    disable_cuda_graph: A[bool, Arg(no_cli=True)] = False
+    disable_cuda_graph_padding: A[
+        bool,
+        "Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
+    ] = False
+    enable_profile_cuda_graph: A[bool, "Enable profiling of cuda graph capture."] = (
+        False
+    )
+    enable_cudagraph_gc: A[
+        bool,
+        "Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
+    ] = False
+    debug_cuda_graph: A[
+        bool,
+        "Enable debug/eager mode for CUDA graph using breakable CUDA graph. When enabled, graph breaks are inserted so every operation runs eagerly while still going through the CUDA graph capture / replay path. Useful for debugging CUDA graph capture / replay issues.",
+    ] = False
+
+    # -------------------------------------------------------------------------
+    # Communication and kernels
+    # -------------------------------------------------------------------------
+    enable_layerwise_nvtx_marker: A[
+        bool,
+        "Enable layerwise NVTX profiling annotations for the model.",
+    ] = False
+    enable_nccl_nvls: A[
+        bool,
+        "Enable NCCL NVLS for prefill heavy requests when available.",
+    ] = False
+    enable_symm_mem: A[
+        bool,
+        "Enable NCCL symmetric memory for fast collectives.",
+    ] = False
+    triton_attention_reduce_in_fp32: A[
+        bool,
+        "Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16."
+        "This only affects Triton attention kernels.",
+    ] = False
+    triton_attention_num_kv_splits: A[
+        int,
+        "The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8.",
+    ] = 8
+    triton_attention_split_tile_size: A[
+        Optional[int],
+        "The size of split KV tile in flash decoding Triton kernel. Used for deterministic inference.",
+    ] = None
+    flashinfer_mla_disable_ragged: A[
+        bool,
+        "Not using ragged prefill wrapper when running flashinfer mla",
+    ] = False
+    enable_fused_qk_norm_rope: A[
+        bool,
+        "Enable fused qk normalization and rope rotary embedding.",
+    ] = False
+    enable_precise_embedding_interpolation: A[
+        bool,
+        "Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values.",
+    ] = False
+    enable_fused_moe_sum_all_reduce: A[
+        bool,
+        "Enable fused moe triton and sum all reduce.",
+    ] = False
+    enable_deepseek_v4_fp4_indexer: A[
+        bool,
+        "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
+    ] = False
+    disable_custom_all_reduce: A[
+        bool,
+        "Disable the custom all-reduce kernel and fall back to NCCL.",
+    ] = False
+    enable_mscclpp: A[
+        bool,
+        "Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
+    ] = False
+    enable_torch_symm_mem: A[
+        bool,
+        "Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8.",
+    ] = False
+    pre_warm_nccl: A[
+        bool,
+        "Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
+    ] = False
+    enable_quant_communications: A[
+        Optional[bool],
+        "Enable INT8 quantization of TP communications (limited support).",
+    ] = False
+    enable_flashinfer_allreduce_fusion: A[bool, Arg(no_cli=True)] = False
+    enforce_disable_flashinfer_allreduce_fusion: A[
+        bool,
+        "Enforce disable FlashInfer allreduce fusion.",
+    ] = False
+    flashinfer_allreduce_fusion_backend: A[
+        Optional[Literal["auto", "trtllm", "mnnvl"]],
+        Arg(
+            help=(
+                "Enable FlashInfer allreduce fusion and choose backend. "
+                "Requires SM90 or SM10X NVIDIA GPUs. "
+                "Defaults to auto. "
+                "'auto': choose mnnvl on Blackwell (SM100/SM103) systems "
+                "(single- and multi-node) and trtllm on SM90 single-node systems. "
+                "'trtllm': available on single-node systems only. "
+                "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
+                "single-node or multi-node systems via MNNVL fabric. "
+                "Fuses allreduce with Residual + RMSNorm for supported MoE models."
+            ),
+            resolvable=True,
+        ),
+    ] = None
+    enable_aiter_allreduce_fusion: A[bool, "Enable Aiter AllReduce Fusion."] = False
+
+    # -------------------------------------------------------------------------
+    # Torch compile and torchao
+    # -------------------------------------------------------------------------
+    enable_torch_compile: A[
+        bool,
+        "Optimize the model with torch.compile. Experimental feature.",
+    ] = False
+    enable_torch_compile_debug_mode: A[bool, "Enable debug mode for torch compile"] = (
+        False
+    )
+    torch_compile_max_bs: A[
+        int,
+        "Set the maximum batch size when using torch compile.",
+    ] = 32
+    torchao_config: A[
+        str,
+        "Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
+    ] = ""
 
     # -------------------------------------------------------------------------
     # Speculative decoding
@@ -2014,6 +2047,156 @@ class ServerArgs:
     ] = None
 
     # -------------------------------------------------------------------------
+    # Multi-modal optimization configs
+    # -------------------------------------------------------------------------
+    enable_broadcast_mm_inputs_process: A[
+        bool,
+        "Enable broadcast mm-inputs process in scheduler.",
+    ] = False
+    enable_prefix_mm_cache: A[
+        bool,
+        "Enable prefix multimodal cache. Currently only supports mm-only.",
+    ] = False
+    mm_enable_dp_encoder: A[
+        bool,
+        "Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
+    ] = False
+    mm_process_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
+            type_parser=json.loads,
+        ),
+    ] = None
+    limit_mm_data_per_request: A[
+        Optional[Union[str, Dict[str, int]]],
+        Arg(
+            help='Limit the number of multimodal inputs per request. e.g. \'{"image": 1, "video": 1, "audio": 1}\'',
+            type_parser=json.loads,
+        ),
+    ] = None
+    enable_mm_global_cache: A[
+        bool,
+        "Enable global multimodal embedding cache to skip redundant ViT inference.",
+    ] = False
+    disable_fast_image_processor: A[
+        bool,
+        "Adopt base image processor instead of fast image processor.",
+    ] = False
+    keep_mm_feature_on_device: A[
+        bool,
+        "Keep multimodal feature tensors on device after processing to save D2H copy.",
+    ] = False
+
+    # -------------------------------------------------------------------------
+    # LoRA
+    # -------------------------------------------------------------------------
+    enable_lora: A[
+        Optional[bool],
+        "Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility.",
+    ] = None
+    enable_lora_overlap_loading: A[
+        Optional[bool],
+        "Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.",
+    ] = None
+    max_lora_rank: A[
+        Optional[int],
+        "The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
+    ] = None
+    lora_target_modules: A[
+        Optional[Union[set[str], List[str]]],
+        Arg(
+            help="The union set of all target modules where LoRA should be applied. If not specified, it will be automatically inferred from the adapters provided in --lora-paths. If 'all' is specified, all supported modules will be targeted.",
+            nargs="*",
+            choices=SUPPORTED_LORA_TARGET_MODULES + [LORA_TARGET_ALL_MODULES],
+        ),
+    ] = None
+    lora_paths: A[
+        Optional[Union[dict[str, str], List[dict[str, str]], List[str], List[LoRARef]]],
+        Arg(
+            help='The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: <PATH> | <NAME>=<PATH> | JSON with schema {"lora_name":str,"lora_path":str,"pinned":bool}',
+            action=LoRAPathAction,
+            action_kwargs={"type": str, "nargs": "*"},
+        ),
+    ] = None
+    max_loaded_loras: A[
+        Optional[int],
+        "If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`.",
+    ] = None
+    max_loras_per_batch: A[
+        int,
+        "Maximum number of adapters for a running batch, include base-only request.",
+    ] = 8
+    lora_eviction_policy: A[
+        str,
+        Arg(
+            help="LoRA adapter eviction policy when memory pool is full. 'lru': Least Recently Used (default, better cache efficiency). 'fifo': First-In-First-Out.",
+            choices=["lru", "fifo"],
+        ),
+    ] = "lru"
+    lora_backend: A[
+        str,
+        Arg(
+            help="Choose the kernel backend for multi-LoRA serving.",
+            choices=LORA_BACKEND_CHOICES,
+        ),
+    ] = "csgmv"
+    max_lora_chunk_size: A[
+        Optional[int],
+        Arg(
+            help="Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance.",
+            choices=[16, 32, 64, 128],
+        ),
+    ] = 16
+    experts_shared_outer_loras: A[
+        Optional[bool],
+        Arg(
+            help="Force shared outer LoRA mode for MoE models. When set, w1/w3 lora_A and w2 lora_B are shared across experts (expert_dim=1). Use --no-experts-shared-outer-loras to force disable. By default this is auto-detected from adapter weights.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = None
+    lora_use_virtual_experts: A[
+        bool,
+        "Enable virtual expert computation for MoE models. When set, the model will use virtual expert computation.",
+    ] = False
+    lora_strict_loading: A[
+        bool,
+        Arg(
+            help="Enable strict loading for LoRA adapters. When set, mismatched or missing keys in the adapter weights will raise an error.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = False
+    lora_drain_wait_threshold: A[
+        float,
+        "When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).",
+    ] = 0.0
+
+    # -------------------------------------------------------------------------
+    # Two batch overlap
+    # -------------------------------------------------------------------------
+    enable_two_batch_overlap: A[bool, "Enabling two micro batches to overlap."] = False
+    enable_single_batch_overlap: A[
+        bool,
+        "Let computation and communication overlap within one micro batch.",
+    ] = False
+    tbo_token_distribution_threshold: A[
+        float,
+        "The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap.",
+    ] = 0.48
+
+    # -------------------------------------------------------------------------
+    # Offloading
+    # -------------------------------------------------------------------------
+    cpu_offload_gb: A[int, "How many GBs of RAM to reserve for CPU offloading."] = 0
+    offload_group_size: A[int, "Number of layers per group in offloading."] = -1
+    offload_num_in_group: A[
+        int,
+        "Number of layers to be offloaded within a group.",
+    ] = 1
+    offload_prefetch_step: A[int, "Steps to prefetch in offloading."] = 1
+    offload_mode: A[str, "Mode of offloading."] = "cpu"
+
+    # -------------------------------------------------------------------------
     # LMCache
     # -------------------------------------------------------------------------
     enable_lmcache: A[
@@ -2063,324 +2246,6 @@ class ServerArgs:
     dllm_algorithm_config: A[
         Optional[str],
         "The diffusion LLM algorithm configurations. Must be a YAML file.",
-    ] = None
-
-    # -------------------------------------------------------------------------
-    # Offloading
-    # -------------------------------------------------------------------------
-    cpu_offload_gb: A[int, "How many GBs of RAM to reserve for CPU offloading."] = 0
-    offload_group_size: A[int, "Number of layers per group in offloading."] = -1
-    offload_num_in_group: A[
-        int,
-        "Number of layers to be offloaded within a group.",
-    ] = 1
-    offload_prefetch_step: A[int, "Steps to prefetch in offloading."] = 1
-    offload_mode: A[str, "Mode of offloading."] = "cpu"
-
-    # -------------------------------------------------------------------------
-    # Cuda graphs
-    # -------------------------------------------------------------------------
-    cuda_graph_config: A[
-        Optional[CudaGraphConfig],
-        Arg(
-            help='Per-phase CUDA graph settings as JSON, e.g. \'{"decode":{"backend":"full","max_bs":256},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}\'. Allowed backends per phase: full, breakable, tc_piecewise, disabled (full is decode-only). JSON wins over the per-phase --cuda-graph-* convenience flags and over legacy flags.',
-            type_parser=parse_cuda_graph_config_arg,
-        ),
-    ] = None
-    cuda_graph_backend_decode: A[
-        Optional[Literal["full", "breakable", "tc_piecewise", "disabled"]],
-        Arg(
-            help="Backend for the decode phase. Folds into cuda_graph_config[decode].backend.",
-            choices=Backend.ALL,
-        ),
-    ] = None
-    cuda_graph_backend_prefill: A[
-        Optional[Literal["breakable", "tc_piecewise", "disabled"]],
-        Arg(
-            help="Backend for the prefill phase. Folds into cuda_graph_config[prefill].backend.",
-            choices=Backend.ALL,
-        ),
-    ] = None
-    cuda_graph_max_bs_decode: A[
-        Optional[int],
-        "Maximum batch size captured for the decode cuda graph.",
-    ] = None
-    cuda_graph_max_bs_prefill: A[
-        Optional[int],
-        "Maximum batch size captured for the prefill cuda graph.",
-    ] = None
-    cuda_graph_bs_decode: A[
-        Optional[List[int]],
-        "Explicit list of batch sizes to capture for the decode cuda graph.",
-    ] = None
-    cuda_graph_bs_prefill: A[
-        Optional[List[int]],
-        "Explicit list of batch sizes to capture for the prefill cuda graph.",
-    ] = None
-    cuda_graph_tc_compiler: A[
-        Optional[Literal["eager", "inductor"]],
-        "Compiler used by the tc_piecewise backend (currently only the prefill phase consumes it).",
-    ] = None
-    disable_prefill_cuda_graph: A[
-        bool,
-        "Disable the prefill-phase CUDA graph. Convenience for --cuda-graph-backend-prefill=disabled.",
-    ] = False
-    disable_decode_cuda_graph: A[
-        bool,
-        "Disable the decode-phase CUDA graph. Convenience for --cuda-graph-backend-decode=disabled.",
-    ] = False
-    disable_cuda_graph: A[bool, Arg(no_cli=True)] = False
-    disable_cuda_graph_padding: A[
-        bool,
-        "Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
-    ] = False
-    enable_profile_cuda_graph: A[bool, "Enable profiling of cuda graph capture."] = (
-        False
-    )
-    enable_cudagraph_gc: A[
-        bool,
-        "Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
-    ] = False
-    debug_cuda_graph: A[
-        bool,
-        "Enable debug/eager mode for CUDA graph using breakable CUDA graph. When enabled, graph breaks are inserted so every operation runs eagerly while still going through the CUDA graph capture / replay path. Useful for debugging CUDA graph capture / replay issues.",
-    ] = False
-
-    # -------------------------------------------------------------------------
-    # Communication and kernels
-    # -------------------------------------------------------------------------
-    enable_layerwise_nvtx_marker: A[
-        bool,
-        "Enable layerwise NVTX profiling annotations for the model.",
-    ] = False
-    enable_nccl_nvls: A[
-        bool,
-        "Enable NCCL NVLS for prefill heavy requests when available.",
-    ] = False
-    enable_symm_mem: A[
-        bool,
-        "Enable NCCL symmetric memory for fast collectives.",
-    ] = False
-    triton_attention_reduce_in_fp32: A[
-        bool,
-        "Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16."
-        "This only affects Triton attention kernels.",
-    ] = False
-    triton_attention_num_kv_splits: A[
-        int,
-        "The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8.",
-    ] = 8
-    triton_attention_split_tile_size: A[
-        Optional[int],
-        "The size of split KV tile in flash decoding Triton kernel. Used for deterministic inference.",
-    ] = None
-    flashinfer_mla_disable_ragged: A[
-        bool,
-        "Not using ragged prefill wrapper when running flashinfer mla",
-    ] = False
-    enable_fused_qk_norm_rope: A[
-        bool,
-        "Enable fused qk normalization and rope rotary embedding.",
-    ] = False
-    enable_precise_embedding_interpolation: A[
-        bool,
-        "Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values.",
-    ] = False
-    enable_fused_moe_sum_all_reduce: A[
-        bool,
-        "Enable fused moe triton and sum all reduce.",
-    ] = False
-    enable_deepseek_v4_fp4_indexer: A[
-        bool,
-        "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
-    ] = False
-    disable_custom_all_reduce: A[
-        bool,
-        "Disable the custom all-reduce kernel and fall back to NCCL.",
-    ] = False
-    enable_mscclpp: A[
-        bool,
-        "Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
-    ] = False
-    enable_torch_symm_mem: A[
-        bool,
-        "Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8.",
-    ] = False
-    pre_warm_nccl: A[
-        bool,
-        "Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
-    ] = False
-    enable_quant_communications: A[
-        Optional[bool],
-        "Enable INT8 quantization of TP communications (limited support).",
-    ] = False
-    enable_flashinfer_allreduce_fusion: A[bool, Arg(no_cli=True)] = False
-    enforce_disable_flashinfer_allreduce_fusion: A[
-        bool,
-        "Enforce disable FlashInfer allreduce fusion.",
-    ] = False
-    flashinfer_allreduce_fusion_backend: A[
-        Optional[Literal["auto", "trtllm", "mnnvl"]],
-        Arg(
-            help=(
-                "Enable FlashInfer allreduce fusion and choose backend. "
-                "Requires SM90 or SM10X NVIDIA GPUs. "
-                "Defaults to auto. "
-                "'auto': choose mnnvl on Blackwell (SM100/SM103) systems "
-                "(single- and multi-node) and trtllm on SM90 single-node systems. "
-                "'trtllm': available on single-node systems only. "
-                "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
-                "single-node or multi-node systems via MNNVL fabric. "
-                "Fuses allreduce with Residual + RMSNorm for supported MoE models."
-            ),
-            resolvable=True,
-        ),
-    ] = None
-    enable_aiter_allreduce_fusion: A[bool, "Enable Aiter AllReduce Fusion."] = False
-
-    # -------------------------------------------------------------------------
-    # Two batch overlap
-    # -------------------------------------------------------------------------
-    enable_two_batch_overlap: A[bool, "Enabling two micro batches to overlap."] = False
-    enable_single_batch_overlap: A[
-        bool,
-        "Let computation and communication overlap within one micro batch.",
-    ] = False
-    tbo_token_distribution_threshold: A[
-        float,
-        "The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap.",
-    ] = 0.48
-
-    # -------------------------------------------------------------------------
-    # Torch compile and torchao
-    # -------------------------------------------------------------------------
-    enable_torch_compile: A[
-        bool,
-        "Optimize the model with torch.compile. Experimental feature.",
-    ] = False
-    enable_torch_compile_debug_mode: A[bool, "Enable debug mode for torch compile"] = (
-        False
-    )
-    torch_compile_max_bs: A[
-        int,
-        "Set the maximum batch size when using torch compile.",
-    ] = 32
-    torchao_config: A[
-        str,
-        "Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
-    ] = ""
-
-    # -------------------------------------------------------------------------
-    # Misc runtime features
-    # -------------------------------------------------------------------------
-    enable_memory_saver: A[
-        bool,
-        "Allow saving memory using release_memory_occupation and resume_memory_occupation",
-    ] = False
-    enable_weights_cpu_backup: A[
-        bool,
-        "Save model weights (both main model and draft model, if any) to CPU memory during release_weights_occupation and resume_weights_occupation",
-    ] = False
-    enable_draft_weights_cpu_backup: A[
-        bool,
-        "Save draft model weights to CPU memory during release_weights_occupation and resume_weights_occupation",
-    ] = False
-    enable_custom_logit_processor: A[
-        bool,
-        "Enable users to pass custom logit processors to the server (disabled by default for security)",
-    ] = False
-    enable_return_hidden_states: A[
-        bool,
-        "Enable returning hidden states with responses.",
-    ] = False
-    enable_return_routed_experts: A[
-        bool,
-        "Enable returning routed experts of each layer with responses.",
-    ] = False
-    enable_return_indexer_topk: A[
-        bool,
-        "Enable returning indexer topk indices of layers with indexer with responses.",
-    ] = False
-    disable_outlines_disk_cache: A[
-        bool,
-        "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
-    ] = False
-    enable_mis: A[
-        bool,
-        "Enable Multi-Item Scoring optimization. Combines query and multiple items into a single sequence for efficient batch processing. Requires --attention-backend flashinfer; auto-disables CUDA graph, radix cache, and chunked prefill.",
-    ] = False
-
-    # -------------------------------------------------------------------------
-    # Deterministic inference
-    # -------------------------------------------------------------------------
-    enable_deterministic_inference: A[
-        bool,
-        "Enable deterministic inference mode with batch invariant ops.",
-    ] = False
-    rl_on_policy_target: A[
-        Optional[str],
-        Arg(
-            help="The training system that SGLang needs to match for true on-policy.",
-            choices=RL_ON_POLICY_TARGET_CHOICES,
-        ),
-    ] = None
-
-    # -------------------------------------------------------------------------
-    # KV canary
-    # -------------------------------------------------------------------------
-    kv_canary: A[
-        str,
-        Arg(
-            help="KV cache canary mode. 'none' disables the canary (default). 'log' prints them while the server keeps running (production-safe). 'raise' fails the server on the first detected mismatch (CI lane).",
-            choices=["none", "log", "raise"],
-        ),
-    ] = "none"
-    kv_canary_real_data: str = "none"
-    kv_canary_sweep_interval: A[
-        int,
-        "Every N forward steps, run a full-pool sweep.",
-    ] = 0
-
-    # -------------------------------------------------------------------------
-    # Dynamic batch tokenizer
-    # -------------------------------------------------------------------------
-    enable_dynamic_batch_tokenizer: A[
-        bool,
-        "Enable async dynamic batch tokenizer for improved performance when multiple requests arrive concurrently.",
-    ] = False
-    dynamic_batch_tokenizer_batch_size: A[
-        int,
-        "[Only used if --enable-dynamic-batch-tokenizer is set] Maximum batch size for dynamic batch tokenizer.",
-    ] = 32
-    dynamic_batch_tokenizer_batch_timeout: A[
-        float,
-        "[Only used if --enable-dynamic-batch-tokenizer is set] Timeout in seconds for batching tokenization requests.",
-    ] = 0.002
-    enable_tokenizer_batch_encode: A[
-        bool,
-        "Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
-    ] = False
-    disable_tokenizer_batch_decode: A[
-        bool,
-        "Disable batch decoding when decoding multiple completions.",
-    ] = False
-
-    # -------------------------------------------------------------------------
-    # Debug tensor dumps
-    # -------------------------------------------------------------------------
-    debug_tensor_dump_output_folder: A[
-        Optional[str],
-        "The output folder for dumping tensors. In Eagle mode, tensor outputs from draft and target models are stored in separate subdirectories ('draft' and 'target').",
-    ] = None
-    # None means dump all layers.
-    debug_tensor_dump_layers: A[
-        Optional[List[int]],
-        "The layer ids to dump. Dump all layers if not specified.",
-    ] = None
-    # TODO(guoyuhong): clean the old dumper code.
-    debug_tensor_dump_input_file: A[
-        Optional[str],
-        "The input filename for dumping tensors",
     ] = None
 
     # -------------------------------------------------------------------------
@@ -2563,45 +2428,172 @@ class ServerArgs:
     ] = False
 
     # -------------------------------------------------------------------------
-    # Multi-modal optimization configs
+    # Prefill delayer
     # -------------------------------------------------------------------------
-    enable_broadcast_mm_inputs_process: A[
-        bool,
-        "Enable broadcast mm-inputs process in scheduler.",
+    enable_prefill_delayer: A[
+        bool, "Enable prefill delayer for DP attention to reduce idle time."
     ] = False
-    enable_prefix_mm_cache: A[
-        bool,
-        "Enable prefix multimodal cache. Currently only supports mm-only.",
-    ] = False
-    mm_enable_dp_encoder: A[
-        bool,
-        "Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
-    ] = False
-    mm_process_config: A[
-        Optional[Dict[str, Any]],
-        Arg(
-            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
-            type_parser=json.loads,
+    prefill_delayer_max_delay_passes: A[
+        int, "Maximum forward passes to delay prefill."
+    ] = 30
+    prefill_delayer_token_usage_low_watermark: A[
+        Optional[float], "Token usage low watermark for prefill delayer."
+    ] = None
+    prefill_delayer_forward_passes_buckets: A[
+        Optional[List[float]],
+        "Custom buckets for prefill delayer forward passes histogram. 0 and max_delay_passes-1 will be auto-added.",
+    ] = None
+    prefill_delayer_wait_seconds_buckets: A[
+        Optional[List[float]],
+        "Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added.",
+    ] = None
+    prefill_delayer_queue_min_ratio: A[
+        Optional[float],
+        (
+            "Opt-in to the adaptive queue-based delay trigger (independent of the "
+            "slot-based one). Delays prefill until the waiting queue reaches "
+            "min(running_req * ratio, max_prefill_bs) so small fragments batch "
+            "into a larger prefill. Unset (default) keeps the original slot-only "
+            "behavior. Typical: 0.1 ~ 0.5."
         ),
     ] = None
-    limit_mm_data_per_request: A[
-        Optional[Union[str, Dict[str, int]]],
-        Arg(
-            help='Limit the number of multimodal inputs per request. e.g. \'{"image": 1, "video": 1, "audio": 1}\'',
-            type_parser=json.loads,
+    prefill_delayer_max_delay_ms: A[
+        Optional[float],
+        (
+            "Wall-clock cap (ms) on a single queue-trigger delay; once exceeded, "
+            "prefill is force-released to bound worst-case TTFT. Only consulted "
+            "when --prefill-delayer-queue-min-ratio is set. Typical: 1000 ~ "
+            "5000; defaults to 5000 if unset."
         ),
     ] = None
-    enable_mm_global_cache: A[
+
+    # -------------------------------------------------------------------------
+    # Min free slots delay (prefill refill batching)
+    # -------------------------------------------------------------------------
+    min_free_slots_delay: A[
+        Optional[int],
+        (
+            "Hold new prefills until at least N running-request slots have freed "
+            "up, so they are admitted in one batch instead of one at a time. "
+            "Useful when each admission is disproportionately expensive, e.g. "
+            "speculative decoding with a separate draft prefill pass. Capped to "
+            "the DFlash formula (disabled when max-running-requests < 8; "
+            "min(4, max(2, (max-run + 5) // 6))). DFlash workloads auto-enable "
+            "this with the formula when unset; other workloads stay disabled."
+        ),
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # Deterministic inference
+    # -------------------------------------------------------------------------
+    enable_deterministic_inference: A[
         bool,
-        "Enable global multimodal embedding cache to skip redundant ViT inference.",
+        "Enable deterministic inference mode with batch invariant ops.",
     ] = False
-    disable_fast_image_processor: A[
+    rl_on_policy_target: A[
+        Optional[str],
+        Arg(
+            help="The training system that SGLang needs to match for true on-policy.",
+            choices=RL_ON_POLICY_TARGET_CHOICES,
+        ),
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # KV canary
+    # -------------------------------------------------------------------------
+    kv_canary: A[
+        str,
+        Arg(
+            help="KV cache canary mode. 'none' disables the canary (default). 'log' prints them while the server keeps running (production-safe). 'raise' fails the server on the first detected mismatch (CI lane).",
+            choices=["none", "log", "raise"],
+        ),
+    ] = "none"
+    kv_canary_real_data: str = "none"
+    kv_canary_sweep_interval: A[
+        int,
+        "Every N forward steps, run a full-pool sweep.",
+    ] = 0
+
+    # -------------------------------------------------------------------------
+    # Dynamic batch tokenizer
+    # -------------------------------------------------------------------------
+    enable_dynamic_batch_tokenizer: A[
         bool,
-        "Adopt base image processor instead of fast image processor.",
+        "Enable async dynamic batch tokenizer for improved performance when multiple requests arrive concurrently.",
     ] = False
-    keep_mm_feature_on_device: A[
+    dynamic_batch_tokenizer_batch_size: A[
+        int,
+        "[Only used if --enable-dynamic-batch-tokenizer is set] Maximum batch size for dynamic batch tokenizer.",
+    ] = 32
+    dynamic_batch_tokenizer_batch_timeout: A[
+        float,
+        "[Only used if --enable-dynamic-batch-tokenizer is set] Timeout in seconds for batching tokenization requests.",
+    ] = 0.002
+    enable_tokenizer_batch_encode: A[
         bool,
-        "Keep multimodal feature tensors on device after processing to save D2H copy.",
+        "Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
+    ] = False
+    disable_tokenizer_batch_decode: A[
+        bool,
+        "Disable batch decoding when decoding multiple completions.",
+    ] = False
+
+    # -------------------------------------------------------------------------
+    # Debug tensor dumps
+    # -------------------------------------------------------------------------
+    debug_tensor_dump_output_folder: A[
+        Optional[str],
+        "The output folder for dumping tensors. In Eagle mode, tensor outputs from draft and target models are stored in separate subdirectories ('draft' and 'target').",
+    ] = None
+    # None means dump all layers.
+    debug_tensor_dump_layers: A[
+        Optional[List[int]],
+        "The layer ids to dump. Dump all layers if not specified.",
+    ] = None
+    # TODO(guoyuhong): clean the old dumper code.
+    debug_tensor_dump_input_file: A[
+        Optional[str],
+        "The input filename for dumping tensors",
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # Misc runtime features
+    # -------------------------------------------------------------------------
+    enable_memory_saver: A[
+        bool,
+        "Allow saving memory using release_memory_occupation and resume_memory_occupation",
+    ] = False
+    enable_weights_cpu_backup: A[
+        bool,
+        "Save model weights (both main model and draft model, if any) to CPU memory during release_weights_occupation and resume_weights_occupation",
+    ] = False
+    enable_draft_weights_cpu_backup: A[
+        bool,
+        "Save draft model weights to CPU memory during release_weights_occupation and resume_weights_occupation",
+    ] = False
+    enable_custom_logit_processor: A[
+        bool,
+        "Enable users to pass custom logit processors to the server (disabled by default for security)",
+    ] = False
+    enable_return_hidden_states: A[
+        bool,
+        "Enable returning hidden states with responses.",
+    ] = False
+    enable_return_routed_experts: A[
+        bool,
+        "Enable returning routed experts of each layer with responses.",
+    ] = False
+    enable_return_indexer_topk: A[
+        bool,
+        "Enable returning indexer topk indices of layers with indexer with responses.",
+    ] = False
+    disable_outlines_disk_cache: A[
+        bool,
+        "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
+    ] = False
+    enable_mis: A[
+        bool,
+        "Enable Multi-Item Scoring optimization. Combines query and multiple items into a single sequence for efficient batch processing. Requires --attention-backend flashinfer; auto-disables CUDA graph, radix cache, and chunked prefill.",
     ] = False
 
     # -------------------------------------------------------------------------
@@ -3970,7 +3962,7 @@ class ServerArgs:
                     self.ep_size == 1
                 ), "Triton kernel MoE is only supported when ep_size == 1"
 
-        elif model_arch in MIMO_V2_MODEL_ARCHS:
+        elif model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
             if model_arch == "MiMoV2ForCausalLM" and not self.encoder_only:
                 expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
                     hf_config
@@ -4019,7 +4011,10 @@ class ServerArgs:
             # hierarchical-cache SWA writes moved to the override registry
             # (arg_groups/overrides.py: _step3p_overrides).
             pass
-        elif model_arch in LLAMA4_MODEL_ARCHS and self.device != "cpu":
+        elif (
+            model_arch in ("Llama4ForConditionalGeneration", "Llama4ForCausalLM")
+            and self.device != "cpu"
+        ):
             # Attention backend auto-select moved to the override registry
             # (arg_groups/overrides.py: _llama4_overrides).
             assert self.attention_backend in {
