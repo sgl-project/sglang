@@ -104,7 +104,7 @@ class KvVmmArena:
 
     def __init__(self, device_id: int, reserve_bytes: int = _DEFAULT_RESERVE_BYTES):
         self.device_id = int(device_id)
-        self._sfx = str(KvVmmArena._instance_count)
+        self._sfx = f"{os.getpid()}_{KvVmmArena._instance_count}"
         KvVmmArena._instance_count += 1
         drv = _driver()
         with torch.cuda.device(self.device_id):
