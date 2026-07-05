@@ -407,6 +407,7 @@ class DSV4RawVerifyMetadata:
     seq_lens: torch.Tensor
     out_cache_loc: torch.Tensor
 
+    num_draft_tokens: int
     extend_seq_lens: Optional[torch.Tensor] = None
     seq_lens_cpu: Optional[List[int]] = None
     c128_compress_metadata: Optional[FusedCompressMetadata] = None
@@ -416,6 +417,7 @@ class DSV4RawVerifyMetadata:
         self.seq_lens.copy_(other.seq_lens)
         self.out_cache_loc.copy_(other.out_cache_loc)
 
+        self.num_draft_tokens = other.num_draft_tokens
         self.extend_seq_lens = other.extend_seq_lens
         self.seq_lens_cpu = other.seq_lens_cpu
         self.c128_compress_metadata = _copy_or_replace(
@@ -707,26 +709,18 @@ class DeepseekV4AttnBackend(
                 if seq_lens_cpu is None
                 else seq_lens_cpu.tolist()
             )
-            if not hasattr(self, "extend_seq_lens_buffer"):
-                self.extend_seq_lens_buffer = torch.tensor(
-                    [num_draft_tokens] * 1025, device=self.device
-                )
-            extend_seq_lens = self.extend_seq_lens_buffer[: len(seq_lens)]
-            if (
-                extend_seq_lens.numel() > 0
-                and int(extend_seq_lens[0]) != num_draft_tokens
-            ):
-                extend_seq_lens = torch.full(
-                    (len(seq_lens),),
-                    num_draft_tokens,
-                    dtype=extend_seq_lens.dtype,
-                    device=extend_seq_lens.device,
-                )
+            extend_seq_lens = torch.full(
+                (len(seq_lens),),
+                num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
 
             return DSV4RawVerifyMetadata(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc,
+                num_draft_tokens=num_draft_tokens,
                 extend_seq_lens=extend_seq_lens,
                 seq_lens_cpu=seq_lens_cpu_list,
                 c128_compress_metadata=(
@@ -808,10 +802,7 @@ class DeepseekV4AttnBackend(
         bs = len(seq_lens)
         extend_seq_lens = raw_metadata.extend_seq_lens
         assert extend_seq_lens is not None
-        if extend_seq_lens.numel() == 0:
-            num_draft_tokens = self.speculative_num_draft_tokens
-        else:
-            num_draft_tokens = int(extend_seq_lens[0].item())
+        num_draft_tokens = int(raw_metadata.num_draft_tokens)
         seq_lens = seq_lens + num_draft_tokens
 
         seq_lens_casual, req_pool_indices_repeated = (
