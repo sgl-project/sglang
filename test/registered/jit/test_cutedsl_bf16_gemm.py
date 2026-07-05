@@ -13,7 +13,7 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-from sglang.jit_kernel.cutedsl_tgv_gemm import tgv_bf16_gemm  # noqa: E402
+from sglang.jit_kernel.cutedsl_bf16_gemm import cutedsl_bf16_gemm  # noqa: E402
 
 N_VALUES = [1024, 2624, 6144]
 K_VALUES = [2048, 6144]
@@ -25,7 +25,7 @@ NUM_TOKENS = get_ci_test_range(list(range(1, 33)), [1, 15, 16, 32])
 @pytest.mark.parametrize("n", N_VALUES)
 @pytest.mark.parametrize("k", K_VALUES)
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
-def test_tgv_bf16_gemm(num_tokens, k, n, has_bias):
+def test_cutedsl_bf16_gemm(num_tokens, k, n, has_bias):
     if is_hip_runtime() or get_jit_cuda_arch().major != 10:
         pytest.skip("SM100/SM103 required")
 
@@ -34,7 +34,7 @@ def test_tgv_bf16_gemm(num_tokens, k, n, has_bias):
     weight = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
     bias = torch.randn(n, dtype=torch.bfloat16, device="cuda") if has_bias else None
 
-    out = tgv_bf16_gemm(x, weight, bias)
+    out = cutedsl_bf16_gemm(x, weight, bias)
     assert out.shape == (num_tokens, n)
     assert out.dtype == torch.bfloat16
 

@@ -1975,9 +1975,9 @@ class DeepseekV2AttentionMLA(
         # When the module is wrapped with LoRA, the fused GEMM fast-path would
         # bypass the adapter because it reads weight.T directly.
         lora_active = getattr(self.fused_qkv_a_proj_with_mqa, "set_lora", False)
-        tgv_backend = get_bf16_gemm_backend().is_tgv()
-        if tgv_backend:
-            from sglang.jit_kernel.cutedsl_tgv_gemm import use_tgv_bf16_gemm
+        cutedsl_backend = get_bf16_gemm_backend().is_cutedsl()
+        if cutedsl_backend:
+            from sglang.jit_kernel.cutedsl_bf16_gemm import use_cutedsl_bf16_gemm
         if (
             (not isinstance(hidden_states, tuple))
             and hidden_states.shape[0] >= 1
@@ -1985,8 +1985,8 @@ class DeepseekV2AttentionMLA(
             and self.use_min_latency_fused_a_gemm
             and not lora_active
             and not (
-                tgv_backend
-                and use_tgv_bf16_gemm(
+                cutedsl_backend
+                and use_cutedsl_bf16_gemm(
                     hidden_states.shape[0],
                     self.fused_qkv_a_proj_with_mqa.weight.shape[0],
                     self.fused_qkv_a_proj_with_mqa.weight.shape[1],

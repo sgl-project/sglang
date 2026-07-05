@@ -1294,7 +1294,7 @@ def _pick_tactic(m: int, n: int, k: int) -> int:
     return best
 
 
-def use_tgv_bf16_gemm(m: int, n: int, k: int) -> bool:
+def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     """TGV-vs-cuBLAS (``F.linear``) decision, CUPTI-measured on B300 under CUDA
     graph capture (cold L2). Conservative: ties and unmeasured regions fall
     back to cuBLAS."""
@@ -1326,7 +1326,7 @@ def _tgv_bf16_gemm_run(
     bias: Optional[torch.Tensor],
 ) -> torch.Tensor:
     if get_device_sm() not in (100, 103):
-        raise RuntimeError("tgv_bf16_gemm requires SM100/SM103 (Blackwell)")
+        raise RuntimeError("cutedsl_bf16_gemm requires SM100/SM103 (Blackwell)")
     assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
     assert x.stride(-1) == 1, "x must be K-major [M, K]"
     assert weight.stride(-1) == 1, "weight must be K-major [N, K]"
@@ -1360,7 +1360,7 @@ direct_register_custom_op(
 
 
 @debug_kernel_api
-def tgv_bf16_gemm(
+def cutedsl_bf16_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
