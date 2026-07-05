@@ -199,7 +199,11 @@ class DeepseekV4DSparkModel(nn.Module):
                 prev_post=prev_post,
                 prev_comb=prev_comb,
             )
-        if last_layer is not None and prev_residual is not None:
+        if (
+            last_layer is not None
+            and last_layer.use_fused_mhc_post_pre
+            and prev_residual is not None
+        ):
             hidden_states = last_layer.hc_post(
                 hidden_states, prev_residual, prev_post, prev_comb
             )
