@@ -486,6 +486,10 @@ class ServerArgs(DisaggServerArgsMixin):
         )
         enabled = []
         for encoder_config in encoder_configs:
+            # only fold encoders that opt in (measured beneficial); folding a
+            # small encoder is a net loss (per-layer all_reduce > sharded compute).
+            if not encoder_config.parallel_folding:
+                continue
             # only fold when both the attention heads and the MLP intermediate divide the group
             heads, inter = ServerArgs._encoder_shard_dims(encoder_config)
             if heads is None or inter is None:
@@ -493,7 +497,7 @@ class ServerArgs(DisaggServerArgsMixin):
             if heads % group_size != 0 or inter % group_size != 0:
                 # encoders whose dims we cannot introspect are left unfolded (safe)
                 continue
-            encoder_config.parallel_folding = True
+            # record the runtime group; mode stays None when not folded.
             encoder_config.parallel_folding_mode = mode
             enabled.append(type(encoder_config).__name__)
 

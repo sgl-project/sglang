@@ -387,7 +387,7 @@ class TextEncoderLoader(ComponentLoader):
         # idle DiT replica during the encoding stage) instead of the default TP
         # group, so every encoder folds without threading the group through each layer.
         fold_ctx = nullcontext()
-        if getattr(model_config, "parallel_folding", False):
+        if getattr(model_config, "parallel_folding_mode", None) is not None:
             folding_group = get_folding_tp_group(model_config)
             if (
                 isinstance(folding_group, GroupCoordinator)

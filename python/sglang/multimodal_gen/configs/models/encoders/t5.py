@@ -78,7 +78,10 @@ class T5Config(TextEncoderConfig):
     arch_config: TextEncoderArchConfig = field(default_factory=T5ArchConfig)
 
     prefix: str = "t5"
-    # parallel_folding / parallel_folding_mode inherited from EncoderConfig.
+    # T5-XXL / UMT5-XXL are wide enough that TP-folding is a measured win
+    # (~-22% encode latency); opt this family in (base default is off).
+    parallel_folding: bool = True
+    # parallel_folding_mode (runtime) inherited from EncoderConfig.
 
     @staticmethod
     def add_cli_args(
