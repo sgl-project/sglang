@@ -196,6 +196,7 @@ def maybe_load_fsdp_model(
     output_dtype: torch.dtype | None = None,
     pin_cpu_memory: bool = True,
     strict: bool = True,
+    defer_cpu_offload_until_after_weight_processing: bool = False,
 ) -> torch.nn.Module:
     """Load a model with optional FSDP (Fully Sharded Data Parallel) support.
 
@@ -206,6 +207,9 @@ def maybe_load_fsdp_model(
             - Weight loading and casting
         reduce_dtype: Data type for gradient reduction in FSDP mixed precision.
         strict: If True, enforce strict state dict loading (all keys must match).
+        defer_cpu_offload_until_after_weight_processing: If True, keep weights
+            on device until process_weights_after_loading completes, then apply
+            non-FSDP CPU offload.
     """
     # NOTE(will): cast_forward_inputs=True shouldn't be needed as we are
     # manually casting the inputs to the model
@@ -232,6 +236,17 @@ def maybe_load_fsdp_model(
         use_fsdp = False
         logger.info("Disabling FSDP for MPS platform as it's not compatible")
 
+    defer_cpu_offload = bool(
+        cpu_offload and defer_cpu_offload_until_after_weight_processing
+    )
+    if defer_cpu_offload and use_fsdp:
+        logger.warning(
+            "Ignoring deferred CPU offload for FSDP loading; keeping the existing "
+            "FSDP offload policy."
+        )
+        defer_cpu_offload = False
+    load_cpu_offload = cpu_offload and not defer_cpu_offload
+
     if use_fsdp:
         model._pre_fsdp_weight_loader_params = {
             n: p
@@ -251,7 +266,7 @@ def maybe_load_fsdp_model(
         )
         shard_model(
             model,
-            cpu_offload=cpu_offload,
+            cpu_offload=load_cpu_offload,
             reshard_after_forward=True,
             mp_policy=mp_policy,
             mesh=device_mesh,
@@ -280,7 +295,7 @@ def maybe_load_fsdp_model(
         device,
         param_dtype,
         strict=strict,
-        cpu_offload=cpu_offload,
+        cpu_offload=load_cpu_offload,
         param_names_mapping=param_names_mapping_fn,
     )
     if bnb_quant_states:
@@ -301,6 +316,8 @@ def maybe_load_fsdp_model(
             if _is_npu:
                 torch.npu.empty_cache()
     model.post_load_weights()
+    if defer_cpu_offload:
+        model.to("cpu")
 
     for n, p in chain(model.named_parameters(), model.named_buffers()):
         if p.is_meta:

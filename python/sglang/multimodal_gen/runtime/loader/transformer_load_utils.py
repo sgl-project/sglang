@@ -122,6 +122,7 @@ class TransformerQuantLoadSpec:
     quant_config: Optional[QuantizationConfig]
     nunchaku_config: Optional[NunchakuConfig]
     param_dtype: Optional[torch.dtype]
+    requires_device_weight_processing: bool = False
     post_load_hooks: list[PostLoadHook] = field(default_factory=list)
 
     @property
@@ -255,6 +256,7 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
 
         quant_name_getter = getattr(type(quant_config), "get_name", None)
         quant_name = quant_name_getter() if callable(quant_name_getter) else None
+
         if quant_name != "modelopt_fp8":
             return
 
@@ -480,8 +482,23 @@ def resolve_transformer_quant_load_spec(
         quant_config=quant_config,
         nunchaku_config=nunchaku_config,
         param_dtype=param_dtype,
+        requires_device_weight_processing=_requires_device_weight_processing(
+            quant_config
+        ),
         post_load_hooks=post_load_hooks,
     )
+
+
+def _requires_device_weight_processing(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Return whether post-load weight processing needs CUDA/NPU tensors."""
+    quant_name = _get_quant_config_name(quant_config)
+    if quant_name == "fp8":
+        return not getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+    if quant_name == "mxfp4":
+        return not getattr(quant_config, "is_checkpoint_mxfp4_serialized", False)
+    return False
 
 
 def _build_transformer_quant_adapters(
