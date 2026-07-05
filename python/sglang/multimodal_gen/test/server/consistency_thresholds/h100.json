@@ -61,6 +61,12 @@
             "psnr_threshold": 15.7,
             "mean_abs_diff_threshold": 17.2
         },
+        "qwen_image_t2i_2npu": {
+            "clip_threshold": 0.98,
+            "ssim_threshold": 0.78,
+            "psnr_threshold": 15.0,
+            "mean_abs_diff_threshold": 18.5
+        },
         "flux_2_image_t2i": {
             "clip_threshold": 0.98,
             "ssim_threshold": 0.95,
