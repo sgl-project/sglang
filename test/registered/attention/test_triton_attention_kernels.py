@@ -694,7 +694,9 @@ class TestTritonAttention(CustomTestCase):
         seq_len = 256
         total_tokens = B * seq_len
         sm_scale = 1.0 / (D**0.5)
-        num_kv_splits = torch.full((B,), max_kv_splits, dtype=torch.int32, device=device)
+        num_kv_splits = torch.full(
+            (B,), max_kv_splits, dtype=torch.int32, device=device
+        )
 
         q = torch.randn(B, H_Q, D, dtype=dtype, device=device)
         k_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=device)
