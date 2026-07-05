@@ -119,7 +119,7 @@ if _HAVE_TRITON:
                 tl.store(o_ptr + row * C + j, acc)
 
     @triton.jit
-    def _fwd_sub_kernel(A, C: tl.constexpr):
+    def _fwd_sub_kernel(A, C: tl.constexpr, QR: tl.constexpr = 16):
         # One program per (batch*head*chunk). A points at a [C, C] row-major fp32 matrix
         # holding the strictly-lower A_strict (zeros on/above the diagonal). The whole
         # matrix is loaded into a register tile M once; the substitution runs entirely
@@ -132,21 +132,30 @@ if _HAVE_TRITON:
         # FIXED regardless of the launch's num_warps (tl.sum's tree is num_warps-sensitive). This
         # lets the decode append reproduce this row inside a fused kernel launched at num_warps=8
         # while prefill runs at the default; the tl.dot path is exactly num_warps-invariant (0 ULP
-        # across nw=4/8) and ~9e-8 off the old tl.sum path (fp32 noise). Megatron prefill and SGLang
-        # both call this same kernel so they stay identical to each other; gradients still flow via
-        # _SolveFwdSub (backward depends only on the output T). Deterministic, length-invariant.
+        # across nw=1/4/8) and ~9e-8 off the old tl.sum path (fp32 noise). Megatron prefill and
+        # SGLang both call this same kernel so they stay identical to each other; gradients still
+        # flow via _SolveFwdSub (backward depends only on the output T). Deterministic, len-invariant.
+        #
+        # The lhs is a small [QR, C] tile (only row 0 = a_im, QR>=16 for tl.dot) instead of the full
+        # [C, C]. The K-dim (m) reduction is what fixes the fp32 order, and it is independent of the
+        # lhs M-tile height, so the QR tile is bit-identical to the old [C,C] lhs (verified 0 ULP
+        # across seeds/scales/num_warps) while doing 4x less dot work per step. This is the single
+        # dominant cost of batch-invariant prefill: on 8x2048 it drops the solve 58.7ms -> 0.9ms
+        # (68x), taking torch_chunk_gated_delta_rule from 66ms -> ~7ms. QR row 0 is used (not row i)
+        # so the extract mask is num_warps-invariant (single nonzero lane), same as the decode kernel.
         pid = tl.program_id(0)
         base = A + pid * C * C
         r = tl.arange(0, C)
+        qr = tl.arange(0, QR)
         M = tl.load(base + r[:, None] * C + r[None, :])  # [C, C] fp32 in registers
         for i in range(1, C):
             row_i = tl.sum(tl.where(r[:, None] == i, M, 0.0), 0)  # current M[i, :]
             a_im = tl.where(r < i, row_i, 0.0)  # [C] = M[i, m] for m<i, else 0
-            # acc[j] = sum_m a_im[m] * M[m, j], as a [C,C]@[C,C] matmul with only row i of the lhs
-            # nonzero; extract row i. tl.dot's reduction order is num_warps-invariant.
-            lhs = tl.where(r[:, None] == i, a_im[None, :], 0.0)  # [C,C], row i = a_im
-            accfull = tl.dot(lhs, M, input_precision="ieee")  # [C,C], row i = acc
-            acc = tl.sum(tl.where(r[:, None] == i, accfull, 0.0), 0)  # [C(j)]
+            # acc[j] = sum_m a_im[m] * M[m, j], as a [QR,C]@[C,C] matmul with only row 0 of the lhs
+            # nonzero; extract row 0. tl.dot's K-reduction order is num_warps- and QR-invariant.
+            lhs = tl.where(qr[:, None] == 0, a_im[None, :], 0.0)  # [QR,C], row 0 = a_im
+            accfull = tl.dot(lhs, M, input_precision="ieee")  # [QR,C], row 0 = acc
+            acc = tl.sum(tl.where(qr[:, None] == 0, accfull, 0.0), 0)  # [C(j)]
             new_row = tl.where(r < i, row_i + acc, row_i)  # update only cols < i
             M = tl.where(r[:, None] == i, new_row[None, :], M)
         tl.store(base + r[:, None] * C + r[None, :], M)
