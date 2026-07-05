@@ -547,6 +547,7 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
 
 
 @_register_for(
+    "GFusionForDiffusionLM",
     "DeepseekV3ForCausalLM",
     "DeepseekV32ForCausalLM",
     "KimiK25ForConditionalGeneration",
@@ -1660,6 +1661,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 # Keep in sync with the DeepSeek family list on _deepseek_family_overrides.
 _DEEPSEEK_FAMILY_ARCHS = frozenset(
     {
+        "GFusionForDiffusionLM",
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
         "KimiK25ForConditionalGeneration",
@@ -1706,7 +1708,10 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
             # models that share the same architecture class (e.g.
             # Moonlight-16B-A3B) are purely BF16.  Check the actual
             # safetensors header instead of assuming FP8 by arch name.
-            if quant_method is None and model_arch in ["DeepseekV3ForCausalLM"]:
+            if quant_method is None and model_arch in [
+                "DeepseekV3ForCausalLM",
+                "GFusionForDiffusionLM",
+            ]:
                 from sglang.srt.utils.common import has_fp8_weights_in_checkpoint
 
                 if has_fp8_weights_in_checkpoint(view.model_path):
@@ -1860,6 +1865,7 @@ def _sparse_head_overlap_disable(view: Any) -> dict:
 # sync with the model-side fusion implementations.
 _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
     {
+        "GFusionForDiffusionLM",
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
         "GptOssForCausalLM",
@@ -2516,6 +2522,33 @@ def _gguf_quantization(view: Any) -> dict:
 @register_post_process
 def _dllm_attention_backend(view: Any) -> dict:
     if view.dllm_algorithm is None:
+        return {}
+    model_arch = view.get_model_config().hf_config.architectures[0]
+    if model_arch == "GFusionForDiffusionLM":
+        if is_npu():
+            raise ValueError("GFusion does not support the ascend attention backend.")
+        supported_backends = {"triton"} if is_hip() else {"fa3", "triton"}
+        configured_backends = {
+            backend
+            for backend in (
+                view.attention_backend,
+                view.prefill_attention_backend,
+                view.decode_attention_backend,
+            )
+            if backend is not None
+        }
+        unsupported_backends = configured_backends - supported_backends
+        if unsupported_backends:
+            raise ValueError(
+                "GFusion only supports the following attention backends: "
+                f"{sorted(supported_backends)}; got {sorted(unsupported_backends)}."
+            )
+        if not configured_backends:
+            attention_backend = "triton" if is_hip() else "fa3"
+            logger.info(
+                f"Attention backend is set to {attention_backend} for GFusion."
+            )
+            return {"attention_backend": attention_backend}
         return {}
     if is_hip():
         if view.attention_backend not in ["triton", "aiter"]:

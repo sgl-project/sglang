@@ -5107,6 +5107,7 @@ class ServerArgs:
 
         if model_arch in [
             "DeepseekV3ForCausalLM",
+            "GFusionModelLM",
             "DeepseekV32ForCausalLM",
             "KimiK25ForConditionalGeneration",
             "MistralLarge3ForCausalLM",
@@ -7829,6 +7830,7 @@ class ServerArgs:
                     is_deepseek_model = model_arch in [
                         "DeepseekV2ForCausalLM",
                         "DeepseekV3ForCausalLM",
+                        "GFusionModelLM",
                         "DeepseekV32ForCausalLM",
                         "MistralLarge3ForCausalLM",
                         "PixtralForConditionalGeneration",
@@ -7999,9 +8001,13 @@ class ServerArgs:
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
-        # On AMD/HIP, disable cuda graph for DLLM (the attention_backend
-        # resolution moved to the pipeline: arg_groups/overrides.py
-        # _dllm_attention_backend, invoked below at its legacy slot).
+        if self.speculative_algorithm is not None:
+            raise ValueError(
+                "Diffusion LLM inference does not support speculative decoding. "
+                "--dllm-algorithm cannot be used together with --speculative-algorithm."
+            )
+        # On AMD/HIP, disable cuda graph for DLLM (the attention backend
+        # resolution moved to the pipeline in arg_groups/overrides.py).
         if is_hip():
             if (
                 self.cuda_graph_config.decode.backend != Backend.DISABLED
