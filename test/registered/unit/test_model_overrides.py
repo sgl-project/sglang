@@ -78,6 +78,18 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "ep_size",
                     "moe_dense_tp_size",
                     "attn_cp_size",
+                    "disable_overlap_schedule",
+                    "uses_mamba_radix_cache",
+                    "mamba_radix_cache_strategy",
+                    "speculative_moe_runner_backend",
+                    "speculative_moe_a2a_backend",
+                    "disable_shared_experts_fusion",
+                    "kv_cache_dtype",
+                    "dsa_prefill_backend",
+                    "dsa_decode_backend",
+                    "prefill_attention_backend",
+                    "decode_attention_backend",
+                    "flashinfer_allreduce_fusion_backend",
                 }
             ),
         )
@@ -789,6 +801,733 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(_dllm_page_size(_view(page_size=64)), {})  # aligned
         self.assertEqual(_dllm_page_size(_view(dllm_algorithm=None)), {})
         self.assertEqual(_dllm_page_size(_view(disable_radix_cache=True)), {})
+
+    def test_overlap_disable_passes(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _dllm_overlap_disable,
+            _pipeline_parallel_overlap_disable,
+            _sparse_head_overlap_disable,
+        )
+
+        # pipeline parallelism: declares only when pp_size > 1
+        self.assertEqual(
+            _pipeline_parallel_overlap_disable(
+                ResolvedView(SimpleNamespace(pp_size=1))
+            ),
+            {},
+        )
+        self.assertEqual(
+            _pipeline_parallel_overlap_disable(
+                ResolvedView(SimpleNamespace(pp_size=2))
+            ),
+            {"disable_overlap_schedule": True},
+        )
+
+        # dllm: guarded on the algorithm and the current value
+        def _view(**kw):
+            defaults = dict(
+                dllm_algorithm="LowConfidence", disable_overlap_schedule=False
+            )
+            defaults.update(kw)
+            return ResolvedView(SimpleNamespace(**defaults))
+
+        self.assertEqual(_dllm_overlap_disable(_view(dllm_algorithm=None)), {})
+        self.assertEqual(
+            _dllm_overlap_disable(_view(disable_overlap_schedule=True)), {}
+        )
+        self.assertEqual(
+            _dllm_overlap_disable(_view()), {"disable_overlap_schedule": True}
+        )
+
+        # embeddings sparse head: keyed on the env var being set
+        from sglang.srt.environ import envs
+
+        view = ResolvedView(SimpleNamespace())
+        with patch.object(
+            envs.SGLANG_EMBEDDINGS_SPARSE_HEAD, "is_set", return_value=False
+        ):
+            self.assertEqual(_sparse_head_overlap_disable(view), {})
+        with patch.object(
+            envs.SGLANG_EMBEDDINGS_SPARSE_HEAD, "is_set", return_value=True
+        ):
+            self.assertEqual(
+                _sparse_head_overlap_disable(view), {"disable_overlap_schedule": True}
+            )
+
+    def test_deepseek_v4_overrides_at_callable_level(self):
+        from sglang.srt.arg_groups.overrides import _deepseek_v4_overrides
+        from sglang.srt.server_args import ServerArgs
+
+        hf = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+
+        def _args(**kw):
+            defaults = dict(
+                device="cuda",
+                swa_full_tokens_ratio=ServerArgs.swa_full_tokens_ratio,
+                moe_runner_backend="auto",
+                get_model_config=lambda: SimpleNamespace(nvfp4_moe_meta=None),
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        self.assertEqual(
+            _deepseek_v4_overrides(_args(), hf),
+            {
+                "attention_backend": "dsv4",
+                "page_size": 256,
+                "swa_full_tokens_ratio": 0.1,
+            },
+        )
+        # NPU pool geometry
+        self.assertEqual(
+            _deepseek_v4_overrides(_args(device="npu"), hf)["page_size"], 128
+        )
+        # user-set window ratio survives
+        self.assertNotIn(
+            "swa_full_tokens_ratio",
+            _deepseek_v4_overrides(_args(swa_full_tokens_ratio=0.5), hf),
+        )
+        # nvfp4 hybrid checkpoint routes the MoE runner
+        self.assertEqual(
+            _deepseek_v4_overrides(
+                _args(
+                    get_model_config=lambda: SimpleNamespace(nvfp4_moe_meta=object())
+                ),
+                hf,
+            )["moe_runner_backend"],
+            "flashinfer_trtllm_routed",
+        )
+
+    def test_deepseek_v4_sm120_moe_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deepseek_v4_sm120_moe,
+        )
+
+        def _view(arch="DeepseekV4ForCausalLM", **kw):
+            hf = SimpleNamespace(architectures=[arch])
+            defaults = dict(moe_runner_backend="auto")
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(
+                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+                )
+            )
+
+        with patch.object(overrides_module, "is_sm120_supported", return_value=True):
+            self.assertEqual(
+                _deepseek_v4_sm120_moe(_view()), {"moe_runner_backend": "marlin"}
+            )
+            self.assertEqual(
+                _deepseek_v4_sm120_moe(_view(moe_runner_backend="triton")), {}
+            )
+            self.assertEqual(_deepseek_v4_sm120_moe(_view(arch="LlamaForCausalLM")), {})
+        with patch.object(overrides_module, "is_sm120_supported", return_value=False):
+            self.assertEqual(_deepseek_v4_sm120_moe(_view()), {})
+
+    def test_nemotron_h_overrides_at_callable_level(self):
+        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+
+        def _hf(quant_algo="NVFP4"):
+            return SimpleNamespace(
+                architectures=["NemotronHForCausalLM"],
+                mlp_hidden_act="relu2",
+                quantization_config={"quant_algo": quant_algo},
+            )
+
+        def _args(mc_quant, hf, **kw):
+            mc = SimpleNamespace(quantization=mc_quant, hf_config=hf)
+            defaults = dict(
+                quantization=None,
+                moe_runner_backend="auto",
+                moe_a2a_backend="none",
+                attention_backend=None,
+                get_model_config=lambda: mc,
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        hf = _hf()
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            # modelopt checkpoint: quant algo resolution + sm100 defaults
+            self.assertEqual(
+                _nemotron_h_overrides(_args("modelopt", hf), hf),
+                {
+                    "quantization": "modelopt_fp4",
+                    "moe_runner_backend": "flashinfer_trtllm",
+                    "attention_backend": "flashinfer",
+                },
+            )
+            hf_mixed = _hf("MIXED_PRECISION")
+            self.assertEqual(
+                _nemotron_h_overrides(_args("modelopt", hf_mixed), hf_mixed)[
+                    "quantization"
+                ],
+                "modelopt_mixed",
+            )
+        with (
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            patch.object(overrides_module, "is_cuda", return_value=True),
+            patch.object(
+                overrides_module, "get_device_capability", return_value=(9, 0)
+            ),
+        ):
+            # SM80-SM90 fp4: marlin
+            self.assertEqual(
+                _nemotron_h_overrides(_args("modelopt_fp4", hf), hf),
+                {"quantization": "modelopt_fp4", "moe_runner_backend": "marlin"},
+            )
+            # unquantized checkpoint: cutlass fallback, no quant declared
+            self.assertEqual(
+                _nemotron_h_overrides(_args(None, hf), hf),
+                {"moe_runner_backend": "flashinfer_cutlass"},
+            )
+            # non-modelopt quantized checkpoint: nothing declared
+            self.assertEqual(_nemotron_h_overrides(_args("fp8", hf), hf), {})
+            # user-set moe backend survives
+            self.assertEqual(
+                _nemotron_h_overrides(_args(None, hf, moe_runner_backend="triton"), hf),
+                {},
+            )
+
+    def test_speculative_moe_runner_default_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _speculative_moe_runner_default,
+        )
+
+        self.assertEqual(
+            _speculative_moe_runner_default(
+                ResolvedView(
+                    SimpleNamespace(
+                        speculative_moe_runner_backend=None, moe_runner_backend="triton"
+                    )
+                )
+            ),
+            {"speculative_moe_runner_backend": "triton"},
+        )
+        # user-set draft backend survives
+        self.assertEqual(
+            _speculative_moe_runner_default(
+                ResolvedView(
+                    SimpleNamespace(
+                        speculative_moe_runner_backend="deep_gemm",
+                        moe_runner_backend="auto",
+                    )
+                )
+            ),
+            {},
+        )
+
+    def test_dsa_split_backend_resolution_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _dsa_split_backend_resolution,
+        )
+
+        def _view(arch="DeepseekV32ForCausalLM", **kw):
+            hf = SimpleNamespace(architectures=[arch])
+            defaults = dict(
+                kv_cache_dtype="fp8_e4m3",
+                dsa_prefill_backend=None,
+                dsa_decode_backend=None,
+                enable_hisparse=False,
+            )
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(
+                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+                )
+            )
+
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch.object(overrides_module, "is_npu", return_value=False),
+            patch.object(overrides_module, "is_xpu", return_value=False),
+            patch.object(overrides_module, "is_hip", return_value=False),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            # Hopper FP8 -> flashmla_kv both
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view()),
+                {
+                    "dsa_prefill_backend": "flashmla_kv",
+                    "dsa_decode_backend": "flashmla_kv",
+                },
+            )
+            # Hopper bf16 -> flashmla_sparse / fa3
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(kv_cache_dtype="bfloat16")),
+                {
+                    "dsa_prefill_backend": "flashmla_sparse",
+                    "dsa_decode_backend": "fa3",
+                },
+            )
+            # user-set prefill survives; only decode defaulted
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(dsa_prefill_backend="trtllm")),
+                {"dsa_decode_backend": "flashmla_kv"},
+            )
+            # hisparse arm takes precedence (CUDA fp8 -> flashmla_kv)
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(enable_hisparse=True)),
+                {
+                    "dsa_prefill_backend": "flashmla_kv",
+                    "dsa_decode_backend": "flashmla_kv",
+                },
+            )
+            # non-family arch declares nothing
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(arch="LlamaForCausalLM")), {}
+            )
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch.object(overrides_module, "is_npu", return_value=False),
+            patch.object(overrides_module, "is_xpu", return_value=False),
+            patch.object(overrides_module, "is_hip", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=(9, 4)),
+        ):
+            # ROCm with both unset -> tilelang
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(kv_cache_dtype="bfloat16")),
+                {
+                    "dsa_prefill_backend": "tilelang",
+                    "dsa_decode_backend": "tilelang",
+                },
+            )
+
+    def test_flashinfer_allreduce_fusion_passes(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deterministic_allreduce_fusion_disable,
+            _enforce_disable_allreduce_fusion,
+            _flashinfer_allreduce_fusion_auto_enable,
+        )
+
+        def _view(arch="Qwen3MoeForCausalLM", **kw):
+            hf = SimpleNamespace(architectures=[arch])
+            defaults = dict(
+                flashinfer_allreduce_fusion_backend=None,
+                tp_size=2,
+                enable_dp_attention=False,
+                nnodes=1,
+                moe_a2a_backend="none",
+                enforce_disable_flashinfer_allreduce_fusion=False,
+                enable_deterministic_inference=False,
+            )
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(
+                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+                )
+            )
+
+        with (
+            patch.object(overrides_module, "is_sm90_supported", return_value=True),
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+        ):
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(_view()),
+                {"flashinfer_allreduce_fusion_backend": "auto"},
+            )
+            # guards: unsupported arch / tp==1 / dp attention / a2a backend
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(
+                    _view(arch="LlamaForCausalLM")
+                ),
+                {},
+            )
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(_view(tp_size=1)), {}
+            )
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(
+                    _view(enable_dp_attention=True)
+                ),
+                {},
+            )
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(
+                    _view(moe_a2a_backend="deepep")
+                ),
+                {},
+            )
+            # SM90 multi-node: blocked (nnodes>1 needs SM100)
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(_view(nnodes=2)), {}
+            )
+            # user-set backend survives
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(
+                    _view(flashinfer_allreduce_fusion_backend="trtllm")
+                ),
+                {},
+            )
+
+        # enforce-disable wins over everything
+        self.assertEqual(
+            _enforce_disable_allreduce_fusion(
+                _view(
+                    flashinfer_allreduce_fusion_backend="auto",
+                    enforce_disable_flashinfer_allreduce_fusion=True,
+                )
+            ),
+            {"flashinfer_allreduce_fusion_backend": None},
+        )
+        self.assertEqual(_enforce_disable_allreduce_fusion(_view()), {})
+
+        # deterministic inference disables an enabled fusion
+        self.assertEqual(
+            _deterministic_allreduce_fusion_disable(
+                _view(
+                    flashinfer_allreduce_fusion_backend="auto",
+                    enable_deterministic_inference=True,
+                )
+            ),
+            {"flashinfer_allreduce_fusion_backend": None},
+        )
+        self.assertEqual(
+            _deterministic_allreduce_fusion_disable(
+                _view(enable_deterministic_inference=True)
+            ),
+            {},
+        )
+
+    def test_cutedsl_prefill_backend_fill_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _cutedsl_prefill_backend_fill,
+        )
+
+        def _view(**kw):
+            defaults = dict(
+                attention_backend=None,
+                decode_attention_backend="cutedsl_mla",
+                prefill_attention_backend=None,
+                kv_cache_dtype="auto",
+            )
+            defaults.update(kw)
+            return ResolvedView(SimpleNamespace(**defaults))
+
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            # decode-only cutedsl: prefill defaults to trtllm_mla
+            self.assertEqual(
+                _cutedsl_prefill_backend_fill(_view()),
+                {"prefill_attention_backend": "trtllm_mla"},
+            )
+            # user-set prefill survives
+            self.assertEqual(
+                _cutedsl_prefill_backend_fill(_view(prefill_attention_backend="fa3")),
+                {},
+            )
+            # cutedsl on the prefill side is rejected
+            with self.assertRaises(AssertionError):
+                _cutedsl_prefill_backend_fill(
+                    _view(prefill_attention_backend="cutedsl_mla")
+                )
+            # unsupported kv dtype rejected
+            with self.assertRaises(ValueError):
+                _cutedsl_prefill_backend_fill(_view(kv_cache_dtype="fp8_e5m2"))
+            # not a cutedsl config: nothing declared
+            self.assertEqual(
+                _cutedsl_prefill_backend_fill(_view(decode_attention_backend=None)),
+                {},
+            )
+        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+            with self.assertRaises(ValueError):
+                _cutedsl_prefill_backend_fill(_view())
+
+    def test_moss_vl_overrides_at_callable_level(self):
+        from sglang.srt.arg_groups.overrides import _moss_vl_overrides
+
+        def _args(**kw):
+            defaults = dict(
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+            )
+            defaults.update(kw)
+            ns = SimpleNamespace(**defaults)
+            ns.is_attention_backend_not_set = lambda: (
+                ns.attention_backend is None
+                and ns.prefill_attention_backend is None
+                and ns.decode_attention_backend is None
+            )
+            ns.get_attention_backends = lambda: (
+                ns.prefill_attention_backend or ns.attention_backend,
+                ns.decode_attention_backend or ns.attention_backend,
+            )
+            return ns
+
+        # nothing set: prefill defaults to flashinfer
+        self.assertEqual(
+            _moss_vl_overrides(_args(), None),
+            {"prefill_attention_backend": "flashinfer"},
+        )
+        # compatible user choice passes with no declaration
+        self.assertEqual(
+            _moss_vl_overrides(_args(attention_backend="flashinfer"), None), {}
+        )
+        # incompatible user choice rejected
+        with self.assertRaises(AssertionError):
+            _moss_vl_overrides(_args(attention_backend="fa3"), None)
+
+    def test_dsa_kv_cache_dtype_default_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _dsa_kv_cache_dtype_default,
+        )
+
+        def _view(**kw):
+            hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
+            defaults = dict(
+                kv_cache_dtype="auto",
+                dsa_prefill_backend=None,
+                dsa_decode_backend=None,
+            )
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(
+                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+                )
+            )
+
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch.object(overrides_module, "is_npu", return_value=False),
+            patch.object(overrides_module, "is_xpu", return_value=False),
+        ):
+            with patch("torch.cuda.get_device_capability", return_value=(9, 0)):
+                # Hopper: auto -> bfloat16
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view()),
+                    {"kv_cache_dtype": "bfloat16"},
+                )
+                # alias normalization
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="bf16")),
+                    {"kv_cache_dtype": "bfloat16"},
+                )
+                # explicit value survives (no declaration)
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="fp8_e4m3")), {}
+                )
+                # unsupported dtype rejected
+                with self.assertRaises(AssertionError):
+                    _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="fp8_e5m2"))
+            with patch("torch.cuda.get_device_capability", return_value=(10, 0)):
+                # Blackwell: auto -> fp8
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view()),
+                    {"kv_cache_dtype": "fp8_e4m3"},
+                )
+
+    def test_deepseek_v4_kv_cache_dtype_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deepseek_v4_kv_cache_dtype,
+        )
+
+        def _view(arch="DeepseekV4ForCausalLM", **kw):
+            hf = SimpleNamespace(architectures=[arch])
+            defaults = dict(kv_cache_dtype="auto", device="cuda")
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(
+                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+                )
+            )
+
+        self.assertEqual(
+            _deepseek_v4_kv_cache_dtype(_view()), {"kv_cache_dtype": "fp8_e4m3"}
+        )
+        # NPU pins bfloat16 regardless of the auto default
+        self.assertEqual(
+            _deepseek_v4_kv_cache_dtype(_view(device="npu")),
+            {"kv_cache_dtype": "bfloat16"},
+        )
+        # explicit supported value survives
+        self.assertEqual(
+            _deepseek_v4_kv_cache_dtype(_view(kv_cache_dtype="bfloat16")), {}
+        )
+        with self.assertRaises(AssertionError):
+            _deepseek_v4_kv_cache_dtype(_view(kv_cache_dtype="fp8_e5m2"))
+        self.assertEqual(
+            _deepseek_v4_kv_cache_dtype(_view(arch="LlamaForCausalLM")), {}
+        )
+
+    def test_deepseek_spec_moe_resolution_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deepseek_spec_moe_resolution,
+        )
+        from sglang.srt.environ import envs
+
+        def _view(**kw):
+            hf = SimpleNamespace(architectures=["DeepseekV3ForCausalLM"])
+            defaults = dict(
+                quantization="modelopt_fp4",
+                speculative_algorithm="EAGLE",
+                speculative_moe_runner_backend=None,
+                speculative_moe_a2a_backend=None,
+                ep_size=8,
+            )
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(
+                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+                )
+            )
+
+        with patch.object(overrides_module, "is_hip", return_value=True):
+            with patch.object(
+                envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE, "get", return_value=False
+            ):
+                self.assertEqual(
+                    _deepseek_spec_moe_resolution(_view()),
+                    {
+                        "speculative_moe_runner_backend": "triton",
+                        "speculative_moe_a2a_backend": "none",
+                    },
+                )
+                # guards: quantization / algorithm / both fields user-set
+                self.assertEqual(
+                    _deepseek_spec_moe_resolution(_view(quantization="fp8")), {}
+                )
+                self.assertEqual(
+                    _deepseek_spec_moe_resolution(_view(speculative_algorithm=None)),
+                    {},
+                )
+                self.assertEqual(
+                    _deepseek_spec_moe_resolution(
+                        _view(
+                            speculative_moe_runner_backend="triton",
+                            speculative_moe_a2a_backend="none",
+                        )
+                    ),
+                    {},
+                )
+            with patch.object(
+                envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE, "get", return_value=True
+            ):
+                self.assertEqual(
+                    _deepseek_spec_moe_resolution(_view()),
+                    {
+                        "speculative_moe_runner_backend": "deep_gemm",
+                        "speculative_moe_a2a_backend": "deepep",
+                    },
+                )
+                with self.assertRaises(ValueError):
+                    _deepseek_spec_moe_resolution(_view(ep_size=1))
+        # the arm is HIP-only
+        with patch.object(overrides_module, "is_hip", return_value=False):
+            self.assertEqual(_deepseek_spec_moe_resolution(_view()), {})
+
+    def test_mamba_radix_cache_resolution_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _mamba_radix_cache_resolution,
+            supports_mamba_cache_extra_buffer,
+        )
+
+        def _view(arch, layer_types=None, **kw):
+            hf = SimpleNamespace(architectures=[arch])
+            if layer_types is not None:
+                hf.layer_types = layer_types
+            defaults = dict(
+                disable_radix_cache=False,
+                mamba_radix_cache_strategy="auto",
+                disable_overlap_schedule=False,
+                page_size=None,
+                linear_attn_backend="triton",
+            )
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(
+                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+                )
+            )
+
+        # arch guard: non-mamba arch declares nothing
+        self.assertEqual(_mamba_radix_cache_resolution(_view("LlamaForCausalLM")), {})
+        # radix cache disabled: nothing to resolve
+        self.assertEqual(
+            _mamba_radix_cache_resolution(
+                _view("Qwen3NextForCausalLM", disable_radix_cache=True)
+            ),
+            {},
+        )
+        # auto + overlap wanted + extra-buffer support -> extra_buffer
+        self.assertEqual(
+            _mamba_radix_cache_resolution(_view("Qwen3NextForCausalLM")),
+            {
+                "uses_mamba_radix_cache": True,
+                "mamba_radix_cache_strategy": "extra_buffer",
+            },
+        )
+        # auto + no extra-buffer support (Lfm2) -> no_buffer + overlap disable
+        self.assertEqual(
+            _mamba_radix_cache_resolution(_view("Lfm2ForCausalLM")),
+            {
+                "uses_mamba_radix_cache": True,
+                "mamba_radix_cache_strategy": "no_buffer",
+                "disable_overlap_schedule": True,
+            },
+        )
+        # neither overlap nor paging wanted -> no_buffer even when supported
+        declared = _mamba_radix_cache_resolution(
+            _view("Qwen3NextForCausalLM", disable_overlap_schedule=True, page_size=1)
+        )
+        self.assertEqual(declared["mamba_radix_cache_strategy"], "no_buffer")
+        self.assertIs(declared["disable_overlap_schedule"], True)
+        # paging alone wants the extra buffer
+        self.assertEqual(
+            _mamba_radix_cache_resolution(
+                _view(
+                    "Qwen3NextForCausalLM", disable_overlap_schedule=True, page_size=64
+                )
+            )["mamba_radix_cache_strategy"],
+            "extra_buffer",
+        )
+        # user-set strategy: only the routing marker is declared
+        self.assertEqual(
+            _mamba_radix_cache_resolution(
+                _view(
+                    "Qwen3NextForCausalLM",
+                    mamba_radix_cache_strategy="extra_buffer_lazy",
+                )
+            ),
+            {"uses_mamba_radix_cache": True},
+        )
+        # NemotronH routes through the pass (covered by the guard union,
+        # not the branch chain — its hook invokes the handler)
+        self.assertEqual(
+            _mamba_radix_cache_resolution(_view("NemotronHForCausalLM")),
+            {
+                "uses_mamba_radix_cache": True,
+                "mamba_radix_cache_strategy": "extra_buffer",
+            },
+        )
+        # GraniteMoeHybrid is guarded on mamba layer types
+        self.assertEqual(
+            _mamba_radix_cache_resolution(
+                _view("GraniteMoeHybridForCausalLM", layer_types=["attention"])
+            ),
+            {},
+        )
+        self.assertEqual(
+            _mamba_radix_cache_resolution(
+                _view("GraniteMoeHybridForCausalLM", layer_types=["mamba", "attention"])
+            )["mamba_radix_cache_strategy"],
+            "extra_buffer",
+        )
+        # extra-buffer support requires the triton linear-attn backend
+        self.assertFalse(
+            supports_mamba_cache_extra_buffer(
+                SimpleNamespace(linear_attn_backend="fla"), "Qwen3NextForCausalLM"
+            )
+        )
 
     def test_page_size_leaf_materializes_end_state(self):
         sa = self._construct("LlamaForCausalLM", "llama")
