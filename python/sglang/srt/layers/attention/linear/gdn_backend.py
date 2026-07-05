@@ -164,7 +164,7 @@ if _HAVE_TRITON:
         qn_ptr, kn_ptr, kb_ptr, vb_ptr, g_ptr, gcum_ptr, A_ptr, T_ptr,
         vnew_ptr, S_ptr, out_ptr, i_ptr, inext_ptr, row_ptr,
         scale, HV: tl.constexpr, HK: tl.constexpr, Dk: tl.constexpr, Dv: tl.constexpr,
-        CS: tl.constexpr, QR: tl.constexpr,
+        CS: tl.constexpr, QR: tl.constexpr, PAD_ROW: tl.constexpr,
     ):
         """Whole GDN decode step for the new token in ONE launch (was 5 kernels): prep + gcum append
         + A row + T-row append + core/v_new + boundary fold. One program per (slot, value-head).
@@ -277,7 +277,12 @@ if _HAVE_TRITON:
         intra = tl.where(qr[:, None] == 0, tl.dot(attn2, vnew_full, input_precision="ieee"), 0.0)
         core = attn_inter + intra
         core_row = tl.sum(tl.where(qr[:, None] == 0, core, 0.0), 0)
-        tl.store(out_ptr + (bt * HV + h) * Dv + dv, core_row)  # out is batch-indexed (bt), not arena
+        # Store the core row (PAD rows -> zeros) directly into out; tl.store casts fp32 core_row to
+        # the out buffer's dtype. Prod out is bf16 (was fp32 + a python .to(bf16)/valid-multiply);
+        # the bf16 store is bit-identical to the old python cast (same fp32 core_row). A test may
+        # pass an fp32 buffer to keep the pre-cast fp32 regression guard. out is batch-indexed (bt).
+        core_out = tl.where(ar == PAD_ROW, 0.0, core_row)
+        tl.store(out_ptr + (bt * HV + h) * Dv + dv, core_out)
         tl.store(vnew_ptr + (base + i) * Dv + dv, vnew_row)
         # In-kernel width advance + boundary fold (was python-side, blocking cuda-graph capture).
         # On the 64th token fold Snew straight into the boundary S (S already read into registers
@@ -797,13 +802,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._gdn_row_map_host = torch.zeros(
             self.gdn_max_batch, dtype=torch.int32, device="cpu"
         ).pin_memory()
-        self._gdn_valid = torch.zeros(self.gdn_max_batch, dtype=torch.float32, device=dev)
-        self._gdn_valid_host = torch.zeros(
-            self.gdn_max_batch, dtype=torch.float32, device="cpu"
-        ).pin_memory()
-        self._gdn_out = None  # [gdn_max_batch, HV, Dv] fp32 core scratch, shared across layers
+        self._gdn_out = None  # [gdn_max_batch, HV, Dv] bf16 core buffer, shared across layers
         self._gdn_cur_row_map = None  # [B] view set per decode step
-        self._gdn_cur_valid = None    # [B] view set per decode step
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -823,6 +823,26 @@ class GDNAttnBackend(MambaAttnBackendBase):
             is_batch_invariant_mode_enabled()
             and forward_batch.forward_mode.is_decode()
         ):
+            self._gdn_write_row_map(self.forward_metadata.mamba_cache_indices.tolist())
+
+    def init_forward_metadata_capture_cuda_graph(self, bs, num_tokens, req_pool_indices,
+                                                 seq_lens, encoder_lens, forward_mode, spec_info):
+        # The eager path builds the arena row map in init_forward_metadata, which cuda-graph
+        # decode SKIPS (it dispatches here + replay instead). Build it from the same batch->slot
+        # metadata so the fixed-pointer row-map buffer holds the right rows when the graph captures
+        # (and each replay refreshes it below). Kernel reads the row map indirectly (persistent
+        # buffer), so its data pointer is baked into the graph -- only the contents change per step.
+        super().init_forward_metadata_capture_cuda_graph(
+            bs, num_tokens, req_pool_indices, seq_lens, encoder_lens, forward_mode, spec_info)
+        if is_batch_invariant_mode_enabled() and forward_mode.is_decode():
+            self._gdn_write_row_map(self.forward_metadata.mamba_cache_indices.tolist())
+
+    def init_forward_metadata_replay_cuda_graph(self, bs, req_pool_indices, seq_lens, seq_lens_sum,
+                                                encoder_lens, forward_mode, spec_info, seq_lens_cpu):
+        super().init_forward_metadata_replay_cuda_graph(
+            bs, req_pool_indices, seq_lens, seq_lens_sum, encoder_lens, forward_mode, spec_info,
+            seq_lens_cpu)
+        if is_batch_invariant_mode_enabled() and forward_mode.is_decode():
             self._gdn_write_row_map(self.forward_metadata.mamba_cache_indices.tolist())
 
     def _alloc_gdn_arena(self, layer):
@@ -857,14 +877,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         return arena
 
     def _gdn_out_for(self, layer):
-        """Lazily allocate the shared [gdn_max_batch, HV, Dv] fp32 core-output scratch (batch-indexed
-        by the kernel, reused across all GDN layers within a step). Sized to the full pool so the
-        pool-size warmup dummy decode writes out[bt] in bounds for every bt."""
+        """Lazily allocate the shared [gdn_max_batch, HV, Dv] bf16 core-output buffer (batch-indexed
+        by the kernel, reused across all GDN layers within a step). The kernel writes bf16 directly
+        (PAD rows zeroed in-kernel), so decode returns this buffer with no python cast/mask. Sized to
+        the full pool so the pool-size warmup dummy decode writes out[bt] in bounds for every bt. A
+        fixed-pointer persistent buffer so the decode step is cuda-graph capturable."""
         if self._gdn_out is None:
             with torch.inference_mode(False):  # normal tensor: written in-place from any mode
                 self._gdn_out = torch.zeros(
                     self.gdn_max_batch, layer.num_v_heads, layer.head_v_dim,
-                    device=self.device, dtype=torch.float32,
+                    device=self.device, dtype=torch.bfloat16,
                 )
         return self._gdn_out
 
@@ -888,10 +910,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         return r
 
     def _gdn_write_row_map(self, cidx_cpu):
-        """Build the batch->arena-row map + validity mask for one decode step from the batch's
-        cache_indices (a single host pass per step, shared by all layers -- not per layer). Writes
-        the persistent GPU row-map/valid tensors via pinned copies and stashes the [B] views for the
-        layer hot path. PAD slots map to the pad row and get masked to zero in the output."""
+        """Build the batch->arena-row map for one decode step from the batch's cache_indices (a
+        single host pass per step, shared by all layers -- not per layer). Writes the persistent GPU
+        row-map tensor via a pinned copy and stashes the [B] view for the layer hot path. PAD slots
+        map to the pad row; the kernel zeroes those output rows in-kernel (ar == PAD_ROW)."""
         B = len(cidx_cpu)
         assert B <= self.gdn_max_batch, (
             f"GDN decode batch {B} exceeds pool size {self.gdn_max_batch}"
@@ -903,22 +925,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
         assert len(active) <= self.gdn_arena_max_bs, (
             f"GDN decode distinct slots {len(active)} exceed arena rows {self.gdn_arena_max_bs}"
         )
-        rm_host, va_host = self._gdn_row_map_host, self._gdn_valid_host
+        rm_host = self._gdn_row_map_host
         for j, slot in enumerate(cidx_cpu):
-            if slot == PAD_SLOT_ID:
-                rm_host[j], va_host[j] = self.gdn_pad_row, 0.0
-            else:
-                rm_host[j], va_host[j] = self._gdn_get_row(slot, active), 1.0
+            rm_host[j] = self.gdn_pad_row if slot == PAD_SLOT_ID else self._gdn_get_row(slot, active)
         self._gdn_row_map[:B].copy_(rm_host[:B], non_blocking=True)
-        self._gdn_valid[:B].copy_(va_host[:B], non_blocking=True)
         self._gdn_cur_row_map = self._gdn_row_map[:B]
-        self._gdn_cur_valid = self._gdn_valid[:B]
 
     def _gdn_launch_step(self, arena, layer, q_tok, k_tok, v_tok, a_tok, b_tok, row_map, B, out):
         """Advance `B` slots by one token in ONE launch over a (B*HV,) grid, indexing the arena via
         row_map (batch->arena row). Bit-for-bit reproduces row w-1 of torch_chunk_gated_delta_rule
         per slot (only indexing differs from the old per-slot launch). q/k_tok [B,HK,Dk], v_tok
-        [B,HV,Dv], a/b_tok [B,HV]. Writes fp32 core rows to out[:B] (batch-indexed)."""
+        [B,HV,Dv], a/b_tok [B,HV]. Writes bf16 core rows to out[:B] (batch-indexed), PAD rows
+        zeroed in-kernel."""
         C = FLA_CHUNK_SIZE
         HV, HK = layer.num_v_heads, layer.num_k_heads
         Dk, Dv = layer.head_k_dim, layer.head_v_dim
@@ -928,7 +946,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             arena["qn"], arena["kn"], arena["kb"], arena["vb"], arena["g"], arena["gcum"],
             arena["A_row"], arena["T"], arena["vnew"], arena["boundary"], out,
             arena["i_buf"], arena["inext_buf"], row_map,
-            scale, HV=HV, HK=HK, Dk=Dk, Dv=Dv, CS=C, QR=16, num_warps=8,
+            scale, HV=HV, HK=HK, Dk=Dk, Dv=Dv, CS=C, QR=16, PAD_ROW=self.gdn_pad_row,
+            num_warps=8,
         )
         # Roll width forward for the next step: i_buf <- inext_buf (in-place, capturable). Whole-arena
         # copy is safe: an inactive row already has i_buf == inext_buf (its last active step's roll
@@ -968,11 +987,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b = b.contiguous()
         arena = self._gdn_arena_for(layer)
         out = self._gdn_out_for(layer)
-        row_map, valid = self._gdn_cur_row_map, self._gdn_cur_valid
+        row_map = self._gdn_cur_row_map
         self._gdn_launch_step(arena, layer, q_tok, k_tok, v_tok, a, b, row_map, B, out)
-        # Cast fp32 core to the io dtype and zero PAD rows via the validity mask (no per-row branch).
-        outputs = (out[:B] * valid[:, None, None]).to(mixed_qkv.dtype)
-        return outputs.unsqueeze(0)
+        # Kernel writes bf16 directly with PAD rows zeroed in-kernel (via PAD_ROW), so no python
+        # cast or validity multiply. Returns [1, B, HV, Dv].
+        return out[:B].unsqueeze(0)
 
     def _seed_gdn_replay_cache(
         self,

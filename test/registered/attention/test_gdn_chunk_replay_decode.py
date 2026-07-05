@@ -211,7 +211,9 @@ class TestGDNChunkReplayDecode(unittest.TestCase):
 
                 be = self._make_backend()
                 arena = be._gdn_arena_for(layer)
-                out = be._gdn_out_for(layer)
+                # fp32 out buffer: the prod _gdn_out is bf16 (kernel writes bf16 directly), but this
+                # test asserts pre-bf16-cast fp32 identity, so it needs an fp32 out for the guard.
+                out = torch.zeros(1, HV, V, device="cuda", dtype=torch.float32)
                 ar = 3  # arbitrary non-zero arena row to exercise row indexing
                 arena["boundary"][ar].copy_(S[0])
                 arena["i_buf"][ar].zero_()
