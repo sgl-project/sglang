@@ -552,7 +552,6 @@ def _run_per_token_group_quant_8bit_kernel(
         and masked_m is None
         and x.dim() == 2
         and group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES
-        # V1 JIT kernel only implements column-major UE8M0; row-major must fall through to V2.
         and not (scale_ue8m0 and not column_major_scales)
     )
 
@@ -577,9 +576,7 @@ def _run_per_token_group_quant_8bit_kernel(
         return
 
     if enable_v2 and _is_musa:
-        # The JIT v2 .cuh uses CUDA-only inline PTX (ld/st.global.v4) and has no
-        # MUSA fallback, so keep MUSA on the AOT v2 op, which carries the
-        # USE_MUSA vector load/store fallbacks.
+        # JIT v2 .cuh is CUDA-only (no MUSA fallback); AOT v2 carries the USE_MUSA path.
         sgl_per_token_group_quant_8bit(
             x,
             x_q,
@@ -607,8 +604,7 @@ def _run_per_token_group_quant_8bit_kernel(
             masked_m=masked_m,
         )
     else:
-        # enable_v2=False only for group_size outside {16,32,64,128};
-        # JIT kernels static_assert on those, so keep the AOT v1 path.
+        # JIT kernels static_assert on group_size in {16,32,64,128}; keep AOT v1 otherwise.
         sgl_per_token_group_quant_8bit(
             x,
             x_q,

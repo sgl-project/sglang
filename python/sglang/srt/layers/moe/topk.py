@@ -864,8 +864,8 @@ def fused_topk(
             assert num_fused_shared_experts <= 1
             if routed_scaling_factor is None:
                 routed_scaling_factor = 1.0
-            # topk_sigmoid folds routed_scaling_factor into the weights itself, so a
-            # non-trivial factor must be acknowledged via apply_routed_scaling_factor_on_output.
+            # topk_sigmoid folds routed_scaling_factor into the weights, so a non-trivial
+            # factor requires apply_routed_scaling_factor_on_output.
             if (
                 routed_scaling_factor != 1.0
                 and not apply_routed_scaling_factor_on_output
