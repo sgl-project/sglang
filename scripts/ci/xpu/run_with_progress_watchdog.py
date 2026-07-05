@@ -56,7 +56,9 @@ def parse_args() -> argparse.Namespace:
     if not args.cmd:
         p.error("no command supplied")
     if args.diagnostic_script is None:
-        args.diagnostic_script = Path(__file__).resolve().parent / "dump_xpu_diagnostics.sh"
+        args.diagnostic_script = (
+            Path(__file__).resolve().parent / "dump_xpu_diagnostics.sh"
+        )
     return args
 
 

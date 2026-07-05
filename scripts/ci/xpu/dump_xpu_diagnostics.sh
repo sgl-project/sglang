@@ -19,17 +19,33 @@ else
     echo "(xpu-smi not installed on host)"
 fi
 
-echo "--- xpu-smi stats (device 0) ---------------------------------------"
+echo "--- xpu-smi stats (per device) -------------------------------------"
 if command -v xpu-smi >/dev/null 2>&1; then
-    timeout 20 xpu-smi stats -d 0 2>&1 || echo "(xpu-smi stats timed out)"
+    # Enumerate every device xpu-smi sees, not just device 0. On mixed
+    # iGPU+dGPU hosts the dGPU is often id 1; on multi-XPU hosts we want
+    # all of them in the crash report.
+    xpu_ids=$(timeout 15 xpu-smi discovery 2>/dev/null \
+        | awk -F'|' '/^\s*[0-9]+\s*\|/ {gsub(/ /,"",$1); print $1}' \
+        | sort -un)
+    if [ -z "$xpu_ids" ]; then
+        echo "(xpu-smi discovery returned no devices — driver likely wedged)"
+    else
+        for id in $xpu_ids; do
+            echo "== device $id =="
+            timeout 20 xpu-smi stats -d "$id" 2>&1 || echo "(xpu-smi stats -d $id timed out)"
+        done
+    fi
 fi
 
-echo "--- xpu-smi dump ---------------------------------------------------"
+echo "--- xpu-smi dump (per device) --------------------------------------"
 # xpu-smi dump captures the internal driver state — the equivalent of a
 # CUDA coredump for Intel GPUs. Directed at stdout so it lands in the
 # GitHub Actions log without needing artifact upload plumbing.
-if command -v xpu-smi >/dev/null 2>&1; then
-    timeout 30 xpu-smi dump -m 0,1,2,3,4,5 -n 1 2>&1 || echo "(xpu-smi dump failed)"
+if command -v xpu-smi >/dev/null 2>&1 && [ -n "${xpu_ids:-}" ]; then
+    for id in $xpu_ids; do
+        echo "== device $id =="
+        timeout 30 xpu-smi dump -d "$id" -m 0,1,2,3,4,5 -n 1 2>&1 || echo "(xpu-smi dump -d $id failed)"
+    done
 fi
 
 echo "--- /dev/dri holders (fuser) ---------------------------------------"

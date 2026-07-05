@@ -21,35 +21,43 @@ check_xpu_clear() {
     local mem_ok=0
     if _have xpu-smi; then
         # `xpu-smi discovery` lists devices; empty output means the driver
-        # didn't come up (device-lost from the previous job).
-        local devs
-        devs=$(timeout 15 xpu-smi discovery 2>/dev/null | grep -cE '^\s*[0-9]+\s*\|' || true)
-        if [ "${devs:-0}" -eq 0 ]; then
+        # didn't come up (device-lost from the previous job). The row
+        # format is `NN | ...` where NN is the numeric device id.
+        local discovery
+        discovery=$(timeout 15 xpu-smi discovery 2>/dev/null || true)
+        # Extract every device id the driver enumerated. Works on both
+        # single-BMG hosts (id 0) and multi-XPU hosts (Xeon Max, PVC).
+        local dev_ids
+        dev_ids=$(echo "$discovery" \
+            | awk -F'|' '/^\s*[0-9]+\s*\|/ {gsub(/ /,"",$1); print $1}' \
+            | sort -un)
+        if [ -z "$dev_ids" ]; then
             echo "ERROR: xpu-smi enumerated 0 devices — driver likely wedged." >&2
-            timeout 15 xpu-smi discovery 2>&1 | sed 's/^/  xpu-smi: /' >&2 || true
+            echo "$discovery" | sed 's/^/  xpu-smi: /' >&2
             return 1
         fi
-        echo "✓ xpu-smi sees ${devs} device(s)."
+        echo "✓ xpu-smi sees device(s): $(echo "$dev_ids" | tr '\n' ' ')"
 
-        # Memory check: xpu-smi stats prints per-device memory. Parse the
-        # "GPU Memory Used" percentage; fail if any device exceeds threshold.
-        local mem_report
-        mem_report=$(timeout 15 xpu-smi stats -d 0 2>/dev/null || true)
-        if [ -n "$mem_report" ]; then
-            # Match numeric percentages in the memory-utilization row.
-            local high
+        # Memory check: iterate EVERY discovered device. Hardcoding `-d 0`
+        # would miss dGPU on a mixed iGPU+dGPU host (dGPU is often id 1),
+        # and would silently pass on multi-XPU hosts where only device 1
+        # is contaminated.
+        local id mem_report high
+        for id in $dev_ids; do
+            mem_report=$(timeout 15 xpu-smi stats -d "$id" 2>/dev/null || true)
+            [ -z "$mem_report" ] && continue
             high=$(echo "$mem_report" \
                 | awk -v t="$XPU_MEM_THRESHOLD_PCT" \
                     'tolower($0) ~ /memory util/ {
                         for (i=1;i<=NF;i++) if ($i ~ /^[0-9.]+$/ && $i+0 > t) print $0
                     }')
             if [ -n "$high" ]; then
-                echo "ERROR: XPU memory utilization exceeds ${XPU_MEM_THRESHOLD_PCT}%:" >&2
+                echo "ERROR: device ${id} memory utilization exceeds ${XPU_MEM_THRESHOLD_PCT}%:" >&2
                 echo "$high" | sed 's/^/  /' >&2
                 return 1
             fi
             mem_ok=1
-        fi
+        done
     else
         echo "WARNING: xpu-smi not installed on host; skipping enumeration + memory check." >&2
     fi
