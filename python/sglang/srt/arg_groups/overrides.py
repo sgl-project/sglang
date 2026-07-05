@@ -383,10 +383,10 @@ def _mimo_v2_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["attention_backend"] = "fa4"
         elif is_sm90_supported():
             logger.info(
-                "Auto-select flashinfer attention backend for MiMoV2 on Hopper "
+                "Auto-select fa3 attention backend for MiMoV2 on Hopper "
                 "(trtllm_mha lacks headDimQk=192 kernel)."
             )
-            overrides["attention_backend"] = "flashinfer"
+            overrides["attention_backend"] = "fa3"
     if server_args.speculative_algorithm == "EAGLE":
         logger.info("Enable multi-layer EAGLE speculative decoding for MiMoV2 model.")
         overrides["enable_multi_layer_eagle"] = True
