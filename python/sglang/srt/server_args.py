@@ -6495,6 +6495,15 @@ class ServerArgs:
                 not self.enable_mixed_chunk
             ), "enable_mixed_chunk is required for speculative decoding"
 
+        # Check page_size alignment for Ascend FIA attention backend
+        if self.device == "npu" and self.attention_backend == "ascend":
+            if self.page_size % 16 != 0:
+                raise ValueError(
+                    f"Ascend FIA attention requires page_size to be aligned to 16, "
+                    f"but got page_size={self.page_size}. "
+                    f"Please set --page-size to a multiple of 16 (e.g. 16, 128, 256)."
+                )
+
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
         # Skip validation if disaggregation mode is decode.
