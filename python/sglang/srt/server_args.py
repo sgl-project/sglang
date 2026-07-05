@@ -3996,7 +3996,10 @@ class ServerArgs:
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
-                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                # DeepGEMM tf32 hc-prenorm is used for prefill only (large M);
+                # decode falls back to the torch impl via the M-gate in
+                # deepseek_v4.hc_pre (deepgemm dispatch cost dominates small M).
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(True)
                 # SM120: use the CUDA paged-MQA-logits path (DeepGEMM metadata
                 # kernel) instead of the torch fallback. The torch fallback
                 # computes the indexer logits in eager torch ops and dominates
