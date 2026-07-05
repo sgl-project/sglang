@@ -3529,17 +3529,28 @@ class ServerArgs:
         if self.mem_fraction_static is None:
             # Constant meta data (e.g., from attention backend)
             reserved_mem = 512
-            # For activation during large prefill
-            if self.chunked_prefill_size > 0:
+            # For activation slack
+            if self.disaggregation_mode == "decode":
+                # Decode nodes do no prefill; size activation to the decode batch.
+                running_requests = (
+                    self.max_running_requests or decode_cuda_graph_config.max_bs or 1
+                )
+                draft_tokens = self.speculative_num_draft_tokens or 1
+                reserved_mem += max(running_requests * draft_tokens, 2048) * 1.5
+            elif self.chunked_prefill_size > 0:
                 reserved_mem += max(self.chunked_prefill_size, 2048) * 1.5
             else:
                 reserved_mem += max(self.max_prefill_tokens, 2048) * 1.5
-            # For cuda graphs
-            reserved_mem += decode_cuda_graph_config.max_bs * 2
+            # For decode cuda graphs (skip on prefill-only nodes)
+            if (
+                self.disaggregation_mode != "prefill"
+                and decode_cuda_graph_config.backend != Backend.DISABLED
+            ):
+                reserved_mem += decode_cuda_graph_config.max_bs * 2
             # Some adjustments for large parallel size
             reserved_mem += self.tp_size * self.pp_size / 8 * 1024
 
-            if self.enable_dp_attention:
+            if self.enable_dp_attention and self.disaggregation_mode != "prefill":
                 # DP attention needs more padding for some operations
                 reserved_mem += decode_cuda_graph_config.max_bs * self.dp_size * 3
 
@@ -3549,8 +3560,11 @@ class ServerArgs:
                 if decode_cuda_graph_config.max_bs > 300:
                     reserved_mem += decode_cuda_graph_config.max_bs * self.dp_size * 1.5
 
-            # For piecewise cuda graphs
-            if prefill_cuda_graph_config.backend != Backend.DISABLED:
+            # For prefill piecewise cuda graphs (skip on decode-only nodes)
+            if (
+                self.disaggregation_mode != "decode"
+                and prefill_cuda_graph_config.backend != Backend.DISABLED
+            ):
                 if not self.use_mla_backend():
                     # Only calculate the memory overhead for Non-Torch Memory use since the Torch Memory can be reused with Cuda Graph Capture
                     reserved_mem += len(prefill_cuda_graph_config.bs) * 8
@@ -3560,6 +3574,15 @@ class ServerArgs:
 
             if gpu_mem is not None and gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
+
+            # DeepEP all-to-all buffers captured in the decode graph are real
+            # extra allocations, so reserve them on top of the floor.
+            if (
+                self.disaggregation_mode != "prefill"
+                and decode_cuda_graph_config.backend != Backend.DISABLED
+                and self.moe_a2a_backend == "deepep"
+            ):
+                reserved_mem += 2 * 1024
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
