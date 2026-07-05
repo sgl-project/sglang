@@ -772,27 +772,36 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # reclaimed lazily: a slot absent from a decode batch cannot resume without re-prefilling
         # (retraction re-extends; disable_radix_cache => no state resume), and _seed overwrites the
         # row unconditionally, so a reused slot inheriting a stale row is harmless.
+        # Two independent sizes. ARENA ROWS hold the expensive per-slot recurrent state
+        # (boundary + cached prep/T/v_new, ~0.5 GB/row across all GDN layers): bounded by the number
+        # of slots that decode CONCURRENTLY, i.e. cuda_graph_max_bs (decode batch is capped there
+        # under graphs; eager decode never runs more distinct slots than fit the graph batch). A
+        # 1425-row arena (full mamba pool) would be ~700 GB, infeasible. BATCH BUFFERS (row_map /
+        # valid / out) are cheap [B]-shaped tensors indexed by batch row and must span the largest
+        # decode batch the runner can dispatch (the whole mamba pool -- the kernel_warmup dummy run
+        # decodes at pool size with req_pool_indices all-zero, so 1425 batch rows map to ONE slot ->
+        # one arena row, but out[bt] is still written for every bt up to 1424).
         cg_max_bs = getattr(model_runner.server_args, "cuda_graph_max_bs", None) or 0
-        max_running = getattr(model_runner.server_args, "max_running_requests", None) or 0
-        # Size for the largest decode batch that can actually run (eager can exceed cuda_graph_max_bs
-        # if max_running_requests is larger); assert in decode so an overflow fails loudly.
-        self.gdn_arena_max_bs = max(cg_max_bs, max_running, 1)
+        self.gdn_arena_max_bs = max(cg_max_bs, 1)
         self.gdn_arena_rows = self.gdn_arena_max_bs + 1  # +1 pad row
         self.gdn_pad_row = self.gdn_arena_rows - 1
         self.gdn_arena = {}  # layer_id -> dict of [R, ...] state tensors (lazily allocated)
         self.gdn_slot_to_row = {}  # slot (int) -> arena row (int), across layers (shared batch)
         self.gdn_free_rows = list(range(self.gdn_arena_max_bs))  # rows [0, max_bs), pad row excluded
+        # Largest decode batch the runner can dispatch (full req/mamba pool). Sizes the batch buffers.
+        self.gdn_max_batch = int(self.req_to_token_pool.size)
         # Persistent GPU batch->row map + validity mask (written each step from pinned host memory,
         # so they are stable-pointer graph inputs). Filled by _gdn_write_row_map once per decode step.
         dev = model_runner.device
-        self._gdn_row_map = torch.zeros(self.gdn_arena_max_bs, dtype=torch.int32, device=dev)
+        self._gdn_row_map = torch.zeros(self.gdn_max_batch, dtype=torch.int32, device=dev)
         self._gdn_row_map_host = torch.zeros(
-            self.gdn_arena_max_bs, dtype=torch.int32, device="cpu"
+            self.gdn_max_batch, dtype=torch.int32, device="cpu"
         ).pin_memory()
-        self._gdn_valid = torch.zeros(self.gdn_arena_max_bs, dtype=torch.float32, device=dev)
+        self._gdn_valid = torch.zeros(self.gdn_max_batch, dtype=torch.float32, device=dev)
         self._gdn_valid_host = torch.zeros(
-            self.gdn_arena_max_bs, dtype=torch.float32, device="cpu"
+            self.gdn_max_batch, dtype=torch.float32, device="cpu"
         ).pin_memory()
+        self._gdn_out = None  # [gdn_max_batch, HV, Dv] fp32 core scratch, shared across layers
         self._gdn_cur_row_map = None  # [B] view set per decode step
         self._gdn_cur_valid = None    # [B] view set per decode step
 
@@ -830,7 +839,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             "qn": z(C, HV, Dk), "kn": z(C, HV, Dk), "kb": z(C, HV, Dk), "vb": z(C, HV, Dv),
             "g": z(HV, C), "gcum": z(HV, C), "A_row": z(HV, C),
             "T": z(HV, C, C), "vnew": z(HV, C, Dv),
-            "out": z(HV, Dv),  # fp32 core scratch, indexed by BATCH row (bt), reused each layer
             # GPU-resident per-row width double-buffer: kernel reads i_buf[ar], writes next width to
             # inext_buf[ar]; python rolls i_buf<-inext_buf between launches (in-place, capturable).
             "i_buf": torch.zeros(R, device=dev, dtype=torch.int32),
@@ -843,6 +851,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
             arena = self._alloc_gdn_arena(layer)
             self.gdn_arena[layer.layer_id] = arena
         return arena
+
+    def _gdn_out_for(self, layer):
+        """Lazily allocate the shared [gdn_max_batch, HV, Dv] fp32 core-output scratch (batch-indexed
+        by the kernel, reused across all GDN layers within a step). Sized to the full pool so the
+        pool-size warmup dummy decode writes out[bt] in bounds for every bt."""
+        if self._gdn_out is None:
+            self._gdn_out = torch.zeros(
+                self.gdn_max_batch, layer.num_v_heads, layer.head_v_dim,
+                device=self.device, dtype=torch.float32,
+            )
+        return self._gdn_out
 
     def _gdn_get_row(self, slot, active_slots):
         """Return the arena row for `slot`, assigning one if new. Lazily reclaims a row from a slot
@@ -869,10 +888,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         the persistent GPU row-map/valid tensors via pinned copies and stashes the [B] views for the
         layer hot path. PAD slots map to the pad row and get masked to zero in the output."""
         B = len(cidx_cpu)
-        assert B <= self.gdn_arena_max_bs, (
-            f"GDN decode batch {B} exceeds arena size {self.gdn_arena_max_bs}"
+        assert B <= self.gdn_max_batch, (
+            f"GDN decode batch {B} exceeds pool size {self.gdn_max_batch}"
         )
+        # The arena has only gdn_arena_max_bs rows; the number of DISTINCT active slots in a step
+        # (not the batch length -- duplicates, eg the all-zero warmup dummy batch, share one row)
+        # must fit. Distinct slots are bounded by cuda_graph_max_bs in real decode.
         active = {s for s in cidx_cpu if s != PAD_SLOT_ID}
+        assert len(active) <= self.gdn_arena_max_bs, (
+            f"GDN decode distinct slots {len(active)} exceed arena rows {self.gdn_arena_max_bs}"
+        )
         rm_host, va_host = self._gdn_row_map_host, self._gdn_valid_host
         for j, slot in enumerate(cidx_cpu):
             if slot == PAD_SLOT_ID:
@@ -884,11 +909,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._gdn_cur_row_map = self._gdn_row_map[:B]
         self._gdn_cur_valid = self._gdn_valid[:B]
 
-    def _gdn_launch_step(self, arena, layer, q_tok, k_tok, v_tok, a_tok, b_tok, row_map, B):
+    def _gdn_launch_step(self, arena, layer, q_tok, k_tok, v_tok, a_tok, b_tok, row_map, B, out):
         """Advance `B` slots by one token in ONE launch over a (B*HV,) grid, indexing the arena via
         row_map (batch->arena row). Bit-for-bit reproduces row w-1 of torch_chunk_gated_delta_rule
         per slot (only indexing differs from the old per-slot launch). q/k_tok [B,HK,Dk], v_tok
-        [B,HV,Dv], a/b_tok [B,HV]. Writes fp32 core rows to arena['out'][:B] (batch-indexed)."""
+        [B,HV,Dv], a/b_tok [B,HV]. Writes fp32 core rows to out[:B] (batch-indexed)."""
         C = FLA_CHUNK_SIZE
         HV, HK = layer.num_v_heads, layer.num_k_heads
         Dk, Dv = layer.head_k_dim, layer.head_v_dim
@@ -896,7 +921,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         _gdn_step_kernel[(B * HV,)](
             q_tok, k_tok, v_tok, a_tok, b_tok, layer.A_log, layer.dt_bias,
             arena["qn"], arena["kn"], arena["kb"], arena["vb"], arena["g"], arena["gcum"],
-            arena["A_row"], arena["T"], arena["vnew"], arena["boundary"], arena["out"],
+            arena["A_row"], arena["T"], arena["vnew"], arena["boundary"], out,
             arena["i_buf"], arena["inext_buf"], row_map,
             scale, HV=HV, HK=HK, Dk=Dk, Dv=Dv, CS=C, QR=16, num_warps=8,
         )
@@ -937,10 +962,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         a = a.contiguous()
         b = b.contiguous()
         arena = self._gdn_arena_for(layer)
+        out = self._gdn_out_for(layer)
         row_map, valid = self._gdn_cur_row_map, self._gdn_cur_valid
-        self._gdn_launch_step(arena, layer, q_tok, k_tok, v_tok, a, b, row_map, B)
+        self._gdn_launch_step(arena, layer, q_tok, k_tok, v_tok, a, b, row_map, B, out)
         # Cast fp32 core to the io dtype and zero PAD rows via the validity mask (no per-row branch).
-        outputs = (arena["out"][:B] * valid[:, None, None]).to(mixed_qkv.dtype)
+        outputs = (out[:B] * valid[:, None, None]).to(mixed_qkv.dtype)
         return outputs.unsqueeze(0)
 
     def _seed_gdn_replay_cache(
@@ -974,6 +1000,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         zero_cidx = torch.zeros(1, dtype=torch.long, device=mixed_qkv.device)
         C = FLA_CHUNK_SIZE
         arena = self._gdn_arena_for(layer)
+        out = self._gdn_out_for(layer)  # seeding core output is discarded; write row 0
         active = {s for s in cidx_cpu if s != PAD_SLOT_ID}
         for i in range(len(qsl_cpu) - 1):
             slot = cidx_cpu[i]
@@ -1037,7 +1064,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     arena, layer,
                     q_all[t : t + 1].contiguous(), k_all[t : t + 1].contiguous(),
                     v_all[t : t + 1].contiguous(), a[t : t + 1].contiguous(),
-                    b[t : t + 1].contiguous(), row_map, 1,
+                    b[t : t + 1].contiguous(), row_map, 1, out,
                 )
 
     def forward_decode(

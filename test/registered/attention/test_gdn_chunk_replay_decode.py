@@ -56,10 +56,14 @@ class TestGDNChunkReplayDecode(unittest.TestCase):
         be.gdn_arena = {}
         be.gdn_slot_to_row = {}
         be.gdn_free_rows = list(range(max_bs))
-        be._gdn_row_map = torch.zeros(max_bs, dtype=torch.int32, device="cuda")
-        be._gdn_row_map_host = torch.zeros(max_bs, dtype=torch.int32, device="cpu").pin_memory()
-        be._gdn_valid = torch.zeros(max_bs, dtype=torch.float32, device="cuda")
-        be._gdn_valid_host = torch.zeros(max_bs, dtype=torch.float32, device="cpu").pin_memory()
+        # Batch buffers span the largest dispatchable decode batch (>= arena rows). Use a value
+        # bigger than max_bs so the split of "arena rows" vs "batch length" is actually exercised.
+        be.gdn_max_batch = max_bs + 4
+        be._gdn_row_map = torch.zeros(be.gdn_max_batch, dtype=torch.int32, device="cuda")
+        be._gdn_row_map_host = torch.zeros(be.gdn_max_batch, dtype=torch.int32, device="cpu").pin_memory()
+        be._gdn_valid = torch.zeros(be.gdn_max_batch, dtype=torch.float32, device="cuda")
+        be._gdn_valid_host = torch.zeros(be.gdn_max_batch, dtype=torch.float32, device="cpu").pin_memory()
+        be._gdn_out = None
         be._gdn_cur_row_map = None
         be._gdn_cur_valid = None
         return be
@@ -207,6 +211,7 @@ class TestGDNChunkReplayDecode(unittest.TestCase):
 
                 be = self._make_backend()
                 arena = be._gdn_arena_for(layer)
+                out = be._gdn_out_for(layer)
                 ar = 3  # arbitrary non-zero arena row to exercise row indexing
                 arena["boundary"][ar].copy_(S[0])
                 arena["i_buf"][ar].zero_()
@@ -218,9 +223,9 @@ class TestGDNChunkReplayDecode(unittest.TestCase):
                         arena, layer,
                         qh[i : i + 1].contiguous(), kh[i : i + 1].contiguous(),
                         vh[i : i + 1].contiguous(), a[i : i + 1].contiguous(),
-                        b[i : i + 1].contiguous(), row_map, 1,
+                        b[i : i + 1].contiguous(), row_map, 1, out,
                     )
-                    core = arena["out"][0].clone()
+                    core = out[0].clone()
                     commit = w == C
 
                     # bf16 vs torch_chunk public output at this width
