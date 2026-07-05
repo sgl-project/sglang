@@ -833,17 +833,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
         R = self.gdn_arena_rows
         HV, Dk, Dv = layer.num_v_heads, layer.head_k_dim, layer.head_v_dim
         dev = self.device
-        z = lambda *s: torch.zeros(R, *s, device=dev, dtype=torch.float32)
-        return {
-            "boundary": z(HV, Dk, Dv),  # [R,HV,Dk,Dv] recurrent state entering the partial chunk
-            "qn": z(C, HV, Dk), "kn": z(C, HV, Dk), "kb": z(C, HV, Dk), "vb": z(C, HV, Dv),
-            "g": z(HV, C), "gcum": z(HV, C), "A_row": z(HV, C),
-            "T": z(HV, C, C), "vnew": z(HV, C, Dv),
-            # GPU-resident per-row width double-buffer: kernel reads i_buf[ar], writes next width to
-            # inext_buf[ar]; python rolls i_buf<-inext_buf between launches (in-place, capturable).
-            "i_buf": torch.zeros(R, device=dev, dtype=torch.int32),
-            "inext_buf": torch.zeros(R, device=dev, dtype=torch.int32),
-        }
+        # Allocate as NORMAL tensors even though the first touch may be the warmup dummy decode
+        # (which runs under torch.inference_mode). Inference tensors reject the in-place copy_/kernel
+        # writes the persistent arena needs from later non-inference contexts (prefill seeding).
+        with torch.inference_mode(False):
+            z = lambda *s: torch.zeros(R, *s, device=dev, dtype=torch.float32)
+            return {
+                "boundary": z(HV, Dk, Dv),  # [R,HV,Dk,Dv] recurrent state entering the partial chunk
+                "qn": z(C, HV, Dk), "kn": z(C, HV, Dk), "kb": z(C, HV, Dk), "vb": z(C, HV, Dv),
+                "g": z(HV, C), "gcum": z(HV, C), "A_row": z(HV, C),
+                "T": z(HV, C, C), "vnew": z(HV, C, Dv),
+                # GPU-resident per-row width double-buffer: kernel reads i_buf[ar], writes next width
+                # to inext_buf[ar]; python rolls i_buf<-inext_buf between launches (in-place, capturable).
+                "i_buf": torch.zeros(R, device=dev, dtype=torch.int32),
+                "inext_buf": torch.zeros(R, device=dev, dtype=torch.int32),
+            }
 
     def _gdn_arena_for(self, layer):
         arena = self.gdn_arena.get(layer.layer_id)
@@ -857,10 +861,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         by the kernel, reused across all GDN layers within a step). Sized to the full pool so the
         pool-size warmup dummy decode writes out[bt] in bounds for every bt."""
         if self._gdn_out is None:
-            self._gdn_out = torch.zeros(
-                self.gdn_max_batch, layer.num_v_heads, layer.head_v_dim,
-                device=self.device, dtype=torch.float32,
-            )
+            with torch.inference_mode(False):  # normal tensor: written in-place from any mode
+                self._gdn_out = torch.zeros(
+                    self.gdn_max_batch, layer.num_v_heads, layer.head_v_dim,
+                    device=self.device, dtype=torch.float32,
+                )
         return self._gdn_out
 
     def _gdn_get_row(self, slot, active_slots):
