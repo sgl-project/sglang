@@ -861,26 +861,25 @@ def fused_topk(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
         else:
-            assert num_fused_shared_experts <= 1
-            if routed_scaling_factor is None:
-                routed_scaling_factor = 1.0
-            # topk_sigmoid folds routed_scaling_factor into the weights, so a non-trivial
-            # factor requires apply_routed_scaling_factor_on_output.
-            if (
-                routed_scaling_factor != 1.0
-                and not apply_routed_scaling_factor_on_output
-            ):
+            if num_fused_shared_experts > 1:
                 raise ValueError(
-                    "apply_routed_scaling_factor_on_output must be True when "
-                    "scoring_func is sigmoid and routed_scaling_factor != 1.0"
+                    "sigmoid topk supports at most one fused shared expert"
                 )
+            scale = (
+                routed_scaling_factor
+                if (
+                    apply_routed_scaling_factor_on_output
+                    and routed_scaling_factor is not None
+                )
+                else 1.0
+            )
             topk_sigmoid(
                 topk_weights,
                 topk_ids,
                 gating_output,
                 renormalize,
                 correction_bias,
-                routed_scaling_factor,
+                scale,
                 num_fused_shared_experts,
             )
     else:
