@@ -802,6 +802,42 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(_dllm_page_size(_view(dllm_algorithm=None)), {})
         self.assertEqual(_dllm_page_size(_view(disable_radix_cache=True)), {})
 
+    def test_dual_apply_retired_field_mechanics(self):
+        from sglang.srt.arg_groups.overrides import run_post_process_pass
+
+        live = SimpleNamespace(x="user", y=None, _resolved_overrides=[])
+
+        def _resolve_x(view):
+            return {"x": "resolved"} if view.x == "user" else {}
+
+        def _read_x(view):
+            return {"y": view.x}
+
+        with patch.object(overrides_module, "DUAL_APPLY_RETIRED", frozenset({"x"})):
+            run_post_process_pass(live, _resolve_x)
+            # declaration recorded, but server_args stays pristine
+            self.assertEqual(
+                live._resolved_overrides, [(_resolve_x.__qualname__, {"x": "resolved"})]
+            )
+            self.assertEqual(live.x, "user")
+            # a later pass sees the resolved value through the view overlay
+            run_post_process_pass(live, _read_x)
+            self.assertEqual(live.y, "resolved")
+
+    def test_parity_skips_retired_fields(self):
+        from sglang.srt.arg_groups.overrides import assert_flag_parity
+        from sglang.srt.runtime_context import Flags
+
+        flags = Flags()
+        flags.page_size = 64
+        args = SimpleNamespace(page_size=1)  # pristine differs from the leaf
+        with patch.object(
+            overrides_module, "DUAL_APPLY_RETIRED", frozenset({"page_size"})
+        ):
+            assert_flag_parity(flags, args, {"page_size"})  # no raise
+        with self.assertRaises(AssertionError):
+            assert_flag_parity(flags, args, {"page_size"})
+
     def test_overlap_disable_passes(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,

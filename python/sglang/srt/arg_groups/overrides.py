@@ -162,14 +162,31 @@ def register_post_process(fn: Callable[..., dict]) -> Callable[..., dict]:
     return fn
 
 
+def _retired_field_overlay(server_args: Any) -> Dict[str, Any]:
+    """Accumulated declared values for dual-apply-retired fields: those no
+    longer live on ``server_args`` mid-resolution, so pass views overlay them
+    from the declaration stash (last writer wins, like the gate)."""
+    if not DUAL_APPLY_RETIRED:
+        return {}
+    overlay: Dict[str, Any] = {}
+    for _source, declared in getattr(server_args, "_resolved_overrides", None) or ():
+        for field, value in declared.items():
+            if field in DUAL_APPLY_RETIRED:
+                overlay[field] = value
+    return overlay
+
+
 def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
     """Transition-period invocation of one pass at its legacy handler slot.
 
-    Evaluates the pass on the live state (through a read-only view), appends
+    Evaluates the pass on the live state (through a read-only view; fields
+    with retired dual-apply are overlaid from the declaration stash), appends
     its declaration to the declaration stash, and dual-applies it in place —
     byte-identical to the imperative handler write this replaces.
     """
-    declared = fn(ResolvedView(server_args))
+    declared = fn(
+        ResolvedView(server_args, overlay=_retired_field_overlay(server_args))
+    )
     if not isinstance(declared, dict):
         raise TypeError(
             f"post-process pass {fn.__qualname__} must return a dict, "
@@ -187,6 +204,13 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
             stash = server_args._resolved_overrides = []
         stash.append(entry)
         apply_declarations_to_server_args(server_args, [entry])
+
+
+def resolved_view(server_args: Any) -> ResolvedView:
+    """Transition helper for mid-resolution code that is not a pass: a
+    read-only view of the resolving configuration (dual-apply-retired fields
+    overlaid from the declaration stash)."""
+    return ResolvedView(server_args, overlay=_retired_field_overlay(server_args))
 
 
 def declare_load_time_override(source: str, declared: Dict[str, Any]) -> None:
@@ -1937,6 +1961,14 @@ def apply_model_overrides(
     return records
 
 
+# Fields whose transition dual-apply is retired: every reader of the resolved
+# value goes through the flags tier (post-publish reads) or the pass view
+# (mid-resolution reads), so declarations no longer mutate server_args and
+# the field stays pristine user input. Grown per field as reader sweeps
+# complete; the publish parity assert skips these fields.
+DUAL_APPLY_RETIRED: frozenset = frozenset()
+
+
 def apply_declarations_to_server_args(
     server_args: Any,
     declarations: Sequence[Tuple[str, Dict[str, Any]]],
@@ -1967,6 +1999,8 @@ def apply_declarations_to_server_args(
                 )
     for _source, decl in list(declarations) + list(terminal):
         for field, value in decl.items():
+            if field in DUAL_APPLY_RETIRED:
+                continue
             setattr(server_args, field, value)
 
 
@@ -2002,6 +2036,10 @@ def assert_flag_parity(
     (dual-applied) ``server_args`` value."""
     mismatches = []
     for field in fields:
+        if field in DUAL_APPLY_RETIRED:
+            # server_args stays pristine for retired fields; the leaf alone
+            # carries the resolved value.
+            continue
         owner, leaf = resolve_flag_leaf(flags, field, leaf_map=leaf_map)
         flag_value = getattr(owner, leaf)
         args_value = getattr(server_args, field)
