@@ -19,7 +19,12 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.gemm.kv_b_lora_absorbed import step_a_q_fwd, step_a_v_fwd, step_b_q_fwd, step_b_v_fwd
+from sglang.kernels.ops.gemm.kv_b_lora_absorbed import (
+    step_a_q_fwd,
+    step_a_v_fwd,
+    step_b_q_fwd,
+    step_b_v_fwd,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.lora.utils import LoRABatchInfo

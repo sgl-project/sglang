@@ -24,11 +24,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.kernels.ops.memory.allocator import (
     alloc_decode_kernel,
     alloc_extend_kernel,
 )
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.utils import (
     get_bool_env_var,
     get_num_new_pages,

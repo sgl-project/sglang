@@ -58,6 +58,9 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
         trtllm_fp8_block_scale_routed_moe_lora,
     )
     from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
+        merged_experts_fused_moe_lora_add,
+    )
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,
@@ -70,7 +73,6 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
     from sglang.srt.lora.trtllm_lora_temp.shared_add_overlap import (
         maybe_overlap_staged_shared_add,
     )
-    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import merged_experts_fused_moe_lora_add
     from sglang.srt.utils.common import next_power_of_2
 
     assert runner_config.activation == "silu" and runner_config.is_gated, (
@@ -360,6 +362,9 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream(
         trtllm_fp4_block_scale_routed_moe_lora,
     )
     from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
+        merged_experts_fused_moe_lora_add,
+    )
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,
@@ -367,7 +372,6 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream(
     from sglang.srt.layers.dp_attention import is_allocation_symmetric
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
-    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import merged_experts_fused_moe_lora_add
 
     assert (
         runner_config.activation == "silu" and runner_config.is_gated
@@ -604,6 +608,9 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora_two_stream(
     # ---- two-stream fast path ----
     from sglang.jit_kernel.trtllm_lora_temp import trtllm_bf16_routed_moe_lora
     from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
+        merged_experts_fused_moe_lora_add,
+    )
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,
@@ -615,7 +622,6 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora_two_stream(
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
-    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import merged_experts_fused_moe_lora_add
 
     assert (
         runner_config.activation == "silu" and runner_config.is_gated

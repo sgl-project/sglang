@@ -56,7 +56,7 @@ class PlatformInfo(msgspec.Struct, frozen=True):
         return self.device_type == "hip"
 
     @classmethod
-    def detect(cls) -> "PlatformInfo":
+    def detect(cls) -> PlatformInfo:
         """Build a :class:`PlatformInfo` from the current process.
 
         Never raises: if ``torch`` is missing or no accelerator is visible the

@@ -32,7 +32,9 @@ def merged_column_lora_forward(self, input_: torch.Tensor):
     if not self.set_lora or not is_two_stream_active(input_):
         return get_original_merged_column_forward()(self, input_)
 
-    from sglang.kernels.ops.gemm.trtllm_lora_temp.gate_up_lora_b import gate_up_lora_b_fwd
+    from sglang.kernels.ops.gemm.trtllm_lora_temp.gate_up_lora_b import (
+        gate_up_lora_b_fwd,
+    )
     from sglang.kernels.ops.gemm.trtllm_lora_temp.qkv_lora_b import qkv_lora_b_fwd
     from sglang.kernels.ops.gemm.trtllm_lora_temp.sgemm_lora_a import sgemm_lora_a_fwd
 

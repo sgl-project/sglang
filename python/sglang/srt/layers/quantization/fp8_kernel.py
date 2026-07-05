@@ -55,11 +55,10 @@ _is_sm120_supported = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda or _is_musa:
-    from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
-
     from sglang.jit_kernel.per_tensor_quant_fp8 import (
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
+    from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
 
     # Temporary
     try:

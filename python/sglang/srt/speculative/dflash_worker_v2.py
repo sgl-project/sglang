@@ -4,6 +4,11 @@ from typing import List, Optional
 
 import torch
 
+from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+from sglang.kernels.ops.speculative.dflash import (
+    _compute_dflash_accept_bonus_triton_unchecked,
+    _prepare_dflash_draft_block_unchecked,
+)
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -28,11 +33,6 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
-from sglang.kernels.ops.speculative.dflash import (
-    _compute_dflash_accept_bonus_triton_unchecked,
-    _prepare_dflash_draft_block_unchecked,
-)
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()

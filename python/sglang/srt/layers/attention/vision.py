@@ -61,14 +61,14 @@ if _is_npu:
 if _is_xpu:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
+from sglang.kernels.ops.attention.prefill_attention import (
+    context_attention_fwd,
+)
 from sglang.srt.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.distributed import utils as dist_utils
-from sglang.kernels.ops.attention.prefill_attention import (
-    context_attention_fwd,
-)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,

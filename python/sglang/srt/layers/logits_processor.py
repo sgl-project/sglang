@@ -21,6 +21,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+from sglang.kernels.ops.activation.softcap import (
+    softcap_inplace_logits as fused_softcap,
+)
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -33,7 +36,6 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
-from sglang.kernels.ops.activation.softcap import softcap_inplace_logits as fused_softcap
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
     get_token_ids_logprobs_chunk,

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
@@ -66,7 +67,6 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_for_v2_verify,
     select_top_k_tokens,
 )
-from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,

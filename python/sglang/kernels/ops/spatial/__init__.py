@@ -2,21 +2,20 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import FormatSignature, KernelBackend, KernelSpec
-
-if TYPE_CHECKING:
-    pass
 
 register_kernel(
     KernelSpec(
         op="spatial.get_sm_available",
         backend=KernelBackend.CUDA_AOT,
         target="sgl_kernel.spatial:get_sm_available",
-        format_signature=FormatSignature(description="number of SMs available on device"),
+        format_signature=FormatSignature(
+            description="number of SMs available on device"
+        ),
         description="Query available SM count (sgl_kernel wheel).",
     )
 )

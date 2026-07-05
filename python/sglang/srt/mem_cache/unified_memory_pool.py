@@ -32,6 +32,7 @@ import torch
 import triton
 from torch.profiler import record_function
 
+from sglang.kernels.ops.kvcache.cache_move import store_cache_4d_kernel
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
@@ -45,7 +46,6 @@ from sglang.srt.mem_cache.memory_pool import (
     unwrap_write_loc,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.kernels.ops.kvcache.cache_move import store_cache_4d_kernel
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
