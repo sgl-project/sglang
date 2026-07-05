@@ -1,6 +1,7 @@
 import ctypes
 import os
 import unittest
+from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.utils.numa_utils import (
@@ -10,6 +11,7 @@ from sglang.srt.utils.numa_utils import (
     _numactl_cpu_mem_args,
     _probe_numactl_args,
     _query_numa_node_for_gpu,
+    configure_subprocess,
     get_numa_node_if_available,
     numa_bind_to_node,
 )
@@ -367,10 +369,12 @@ class TestNumaBindIntersection(unittest.TestCase):
             _handle_numa_bind_failure(0, {72, 73})
 
 
-def _run_result(returncode):
-    """Build a fake subprocess.CompletedProcess-like object with a returncode."""
+def _run_result(returncode, stderr=b""):
+    """Build a fake subprocess.CompletedProcess-like object with a returncode
+    and captured stderr (bytes, as subprocess.run(..., stderr=PIPE) returns)."""
     result = MagicMock()
     result.returncode = returncode
+    result.stderr = stderr
     return result
 
 
@@ -426,6 +430,91 @@ class TestProbeNumactlArgs(unittest.TestCase):
         # numactl not installed / raises: probe must not propagate, returns None.
         mock_run.side_effect = FileNotFoundError("numactl")
         self.assertIsNone(_probe_numactl_args("--cpunodebind=0 --membind=0"))
+
+    @patch("sglang.srt.utils.numa_utils.subprocess.run")
+    def test_rejection_stderr_surfaces_in_fallback_warning(self, mock_run):
+        # numactl prints the precise rejection reason to stderr (e.g.
+        # "setting membind: Invalid argument"); the fallback warning must
+        # surface it so operators can tell seccomp vs cpuset apart.
+        mock_run.side_effect = [
+            _run_result(1, stderr=b"numactl: setting membind: Invalid argument"),
+            _run_result(0),
+        ]
+        with self.assertLogs("sglang.srt.utils.numa_utils", level="WARNING") as cm:
+            result = _probe_numactl_args("--cpunodebind=0 --membind=0")
+        self.assertEqual(result, "--cpunodebind=0 --preferred=0")
+        self.assertTrue(
+            any("Invalid argument" in msg for msg in cm.output),
+            f"expected numactl stderr in warning, got {cm.output}",
+        )
+
+
+class TestConfigureSubprocessProbeFailure(unittest.TestCase):
+    """Tests the wiring in configure_subprocess when _probe_numactl_args gives up
+    (returns None): the worker must start unbound (warn-and-yield) by default, or
+    raise before yielding when SGLANG_CRASH_ON_NUMA_BIND_FAILURE=1.
+
+    get_numa_node_if_available / _numactl_cpu_mem_args / _probe_numactl_args are
+    mocked to drive the probe-failure branch directly; _create_numactl_executable
+    and _mp_set_executable are mocked to assert the failure path never installs a
+    numactl executable. No real numactl or GPU is required."""
+
+    def _common_patches(self):
+        return [
+            patch(
+                "sglang.srt.utils.numa_utils.get_numa_node_if_available",
+                return_value=0,
+            ),
+            patch(
+                "sglang.srt.utils.numa_utils._numactl_cpu_mem_args",
+                return_value="--cpunodebind=0 --membind=0",
+            ),
+            patch(
+                "sglang.srt.utils.numa_utils._probe_numactl_args",
+                return_value=None,
+            ),
+            patch("sglang.srt.utils.numa_utils._create_numactl_executable"),
+            patch("sglang.srt.utils.numa_utils._mp_set_executable"),
+        ]
+
+    @patch.dict(
+        os.environ,
+        {"SGLANG_NUMA_BIND_V2": "1", "SGLANG_CRASH_ON_NUMA_BIND_FAILURE": "0"},
+    )
+    def test_probe_none_warns_and_yields_unbound(self):
+        with ExitStack() as stack:
+            mocks = [stack.enter_context(p) for p in self._common_patches()]
+            _mock_get, _mock_args, _mock_probe, mock_create, mock_mp = mocks
+            server_args = MagicMock()
+            with self.assertLogs("sglang.srt.utils.numa_utils", level="WARNING") as cm:
+                with configure_subprocess(server_args, 0):
+                    pass  # worker would start unbound here
+            # The probe-failure path reuses #26983's failure helper (warn) and
+            # must NOT install a numactl executable.
+            self.assertTrue(
+                any("could not apply NUMA binding" in msg for msg in cm.output),
+                f"expected probe-failure warning, got {cm.output}",
+            )
+            mock_create.assert_not_called()
+            mock_mp.assert_not_called()
+
+    @patch.dict(
+        os.environ,
+        {"SGLANG_NUMA_BIND_V2": "1", "SGLANG_CRASH_ON_NUMA_BIND_FAILURE": "1"},
+    )
+    def test_probe_none_raises_before_yield_when_crash_enabled(self):
+        with ExitStack() as stack:
+            mocks = [stack.enter_context(p) for p in self._common_patches()]
+            _mock_get, _mock_args, _mock_probe, mock_create, mock_mp = mocks
+            server_args = MagicMock()
+            with self.assertRaises(RuntimeError) as cm:
+                with configure_subprocess(server_args, 0):
+                    self.fail(
+                        "contextmanager must not yield when crash-on-failure is set"
+                    )
+            self.assertIn("could not apply NUMA binding", str(cm.exception))
+            mock_create.assert_not_called()
+            mock_mp.assert_not_called()
 
 
 if __name__ == "__main__":

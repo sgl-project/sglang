@@ -28,8 +28,7 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
     if envs.SGLANG_NUMA_BIND_V2.get():
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:
-            # _numactl_cpu_mem_args already returns None (after warning / optional
-            # raise) when there is no allowed-CPU intersection (#26983).
+            # _numactl_cpu_mem_args returns None (warn/raise) on empty CPU intersection (#26983).
             numactl_args = _numactl_cpu_mem_args(numa_node, gpu_id)
             if numactl_args is not None:
                 # Verify numactl can actually apply the binding before we exec it
@@ -41,8 +40,17 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
                     # get_mempolicy(2) probe in _can_set_mempolicy cannot detect).
                     # Reuse #26983's failure semantics: warn and start without
                     # binding, or raise when SGLANG_CRASH_ON_NUMA_BIND_FAILURE.
+                    # Pass an explicit reason: the CPU intersection already
+                    # succeeded on this path, so the default "no CPU cores allowed"
+                    # message would mislead operators toward the wrong cause.
                     _handle_numa_bind_failure(
-                        numa_node, os.sched_getaffinity(0), gpu_id
+                        numa_node,
+                        reason=(
+                            f"numactl could not apply NUMA binding for node "
+                            f"{numa_node} (e.g. set_mempolicy blocked by seccomp, "
+                            f"or cpuset mems_allowed rejects the memory policy); "
+                            f"skipping NUMA binding for GPU {gpu_id}."
+                        ),
                     )
                     yield
                     return
@@ -210,12 +218,10 @@ def _numactl_cpu_mem_args(node: int, gpu_id: int) -> Optional[str]:
 
 
 def _strip_memory_args(numactl_args: str) -> str:
-    """Return ``numactl_args`` with the memory-policy segment removed, keeping
+    """Return ``numactl_args`` with the ``--membind`` segment removed, keeping
     only the CPU binding (``--cpunodebind`` / ``--physcpubind``)."""
     return " ".join(
-        token
-        for token in numactl_args.split()
-        if not token.startswith(("--membind", "--preferred"))
+        token for token in numactl_args.split() if not token.startswith("--membind")
     )
 
 
@@ -239,24 +245,36 @@ def _probe_numactl_args(numactl_args: str) -> Optional[str]:
     binding fails (or ``numactl`` is missing / errors out).
     """
 
-    def _probe(args: str) -> bool:
+    def _probe(args: str):
+        """Run ``numactl <args> true``; return ``(succeeded, stderr_text)``.
+
+        stderr is captured (not discarded) so the fallback warnings can report
+        *why* numactl rejected the binding (e.g. ``setting membind: Invalid
+        argument``) -- the actionable detail this PR exists to surface. On timeout
+        / missing numactl / other errors, the exception text stands in for stderr.
+        """
         try:
-            return (
-                subprocess.run(
-                    ["numactl", *args.split(), "true"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=10,
-                ).returncode
-                == 0
+            proc = subprocess.run(
+                ["numactl", *args.split(), "true"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=10,
             )
+            stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+            if proc.returncode != 0:
+                logger.debug(f"numactl probe for {args!r} rejected: {stderr!r}")
+            return proc.returncode == 0, stderr
         except Exception as e:
             # Missing numactl, timeout, etc. Treat as "this binding does not work".
             logger.debug(f"numactl probe for {args!r} failed: {e}")
-            return False
+            return False, str(e)
+
+    def _suffix(err: str) -> str:
+        return f": {err}" if err else ""
 
     # 1. Strongest binding: exactly what was requested.
-    if _probe(numactl_args):
+    ok, membind_err = _probe(numactl_args)
+    if ok:
         return numactl_args
 
     # 2. Relax a hard --membind=N to a soft --preferred=N. The memory segment here
@@ -264,37 +282,57 @@ def _probe_numactl_args(numactl_args: str) -> Optional[str]:
     #    only). MPOL_PREFERRED is a hint and can succeed where MPOL_BIND is denied.
     if "--membind=" in numactl_args:
         preferred_args = numactl_args.replace("--membind=", "--preferred=")
-        if _probe(preferred_args):
+        ok, _ = _probe(preferred_args)
+        if ok:
             logger.warning(
-                f"numactl rejected hard memory binding ({numactl_args!r}); "
-                f"falling back to soft preferred policy ({preferred_args!r})."
+                f"numactl rejected hard memory binding ({numactl_args!r})"
+                f"{_suffix(membind_err)}; falling back to soft preferred policy "
+                f"({preferred_args!r})."
             )
             return preferred_args
 
     # 3. Drop the memory segment entirely, keep only the CPU binding.
     cpu_only_args = _strip_memory_args(numactl_args)
-    if cpu_only_args and cpu_only_args != numactl_args and _probe(cpu_only_args):
-        logger.warning(
-            f"numactl rejected memory binding ({numactl_args!r}); falling back "
-            f"to CPU-only binding ({cpu_only_args!r})."
-        )
-        return cpu_only_args
+    if cpu_only_args and cpu_only_args != numactl_args:
+        ok, _ = _probe(cpu_only_args)
+        if ok:
+            logger.warning(
+                f"numactl rejected memory binding ({numactl_args!r})"
+                f"{_suffix(membind_err)}; falling back to CPU-only binding "
+                f"({cpu_only_args!r})."
+            )
+            return cpu_only_args
 
     # 4. Nothing worked.
     return None
 
 
 def _handle_numa_bind_failure(
-    node: int, allowed_cpus, gpu_id: Optional[int] = None
+    node: int,
+    allowed_cpus=None,
+    gpu_id: Optional[int] = None,
+    *,
+    reason: Optional[str] = None,
 ) -> None:
-    gpu_str = f" for GPU {gpu_id}" if gpu_id is not None else ""
-    msg = (
-        f"NUMA node {node} has no CPU cores allowed by the current affinity "
-        f"{sorted(allowed_cpus)}, skipping NUMA binding{gpu_str}."
-    )
-    logger.warning(msg)
+    """Emit the NUMA-bind failure warning, or raise it when
+    ``SGLANG_CRASH_ON_NUMA_BIND_FAILURE`` is set.
+
+    Two call modes:
+      * ``reason is None`` (default): the failure is an empty CPU intersection,
+        so the message reports ``allowed_cpus`` (which must be provided).
+      * ``reason`` provided: the failure is something else (e.g. numactl rejected
+        the binding at runtime); the caller supplies the exact message and
+        ``allowed_cpus`` / ``gpu_id`` are not needed.
+    """
+    if reason is None:
+        gpu_str = f" for GPU {gpu_id}" if gpu_id is not None else ""
+        reason = (
+            f"NUMA node {node} has no CPU cores allowed by the current affinity "
+            f"{sorted(allowed_cpus)}, skipping NUMA binding{gpu_str}."
+        )
+    logger.warning(reason)
     if envs.SGLANG_CRASH_ON_NUMA_BIND_FAILURE.get():
-        raise RuntimeError(msg)
+        raise RuntimeError(reason)
 
 
 def _can_set_mempolicy() -> bool:
