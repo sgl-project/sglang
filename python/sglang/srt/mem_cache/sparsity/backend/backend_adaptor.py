@@ -129,7 +129,12 @@ class FlashAttentionAdaptor(BackendAdaptor):
         valid_mask = torch.arange(max_selected, device=physical_pages.device).unsqueeze(
             0
         ) < valid_lengths.unsqueeze(1)
-        update_mask = sparse_mask.unsqueeze(1) & valid_mask
+        # Only sparsify requests that actually selected pages. When
+        # valid_lengths == 0 (e.g. seq shorter than num_recent_pages) keep the
+        # original dense metadata, otherwise cache_seqlens would become 0/negative
+        # and break the attention kernel.
+        active = sparse_mask & (valid_lengths > 0)
+        update_mask = active.unsqueeze(1) & valid_mask
 
         current_metadata.page_table[:, :max_selected] = torch.where(
             update_mask, physical_pages, current_metadata.page_table[:, :max_selected]
@@ -141,7 +146,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
         sparse_seq_lens = (valid_lengths * page_size - diff).to(torch.int32)
 
         current_metadata.cache_seqlens_int32 = torch.where(
-            sparse_mask, sparse_seq_lens, self._original_metadata["cache_seqlens_int32"]
+            active, sparse_seq_lens, self._original_metadata["cache_seqlens_int32"]
         )
 
         current_metadata.cu_seqlens_k = torch.nn.functional.pad(

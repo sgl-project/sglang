@@ -241,6 +241,9 @@ class FlashAttentionBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        # Experimental sparse attention: bound to THIS runner (None when disabled),
+        # so the sparse path is only taken when this runner enabled it.
+        self.sparse_coordinator = getattr(model_runner, "sparse_coordinator", None)
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.page_size = model_runner.page_size
@@ -1450,6 +1453,15 @@ class FlashAttentionBackend(AttentionBackend):
                     else:
                         o = result
 
+        # Experimental sparse attention: build initial page representations from
+        # the prompt KV during prefill (construct_representations runs on extend).
+        if (
+            self.sparse_coordinator is not None
+            and not self.use_mla
+            and forward_batch.forward_mode.is_extend()
+        ):
+            self.sparse_coordinator.attention_end(o, layer, forward_batch)
+
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
@@ -1512,6 +1524,18 @@ class FlashAttentionBackend(AttentionBackend):
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
         window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
+
+        # --- experimental query-aware sparse attention (e.g. Quest) ---
+        # Only the plain non-MLA, non-SWA, non-cascade decode path is supported.
+        sparse_coordinator = self.sparse_coordinator
+        sparse_active = (
+            sparse_coordinator is not None
+            and not self.use_mla
+            and not use_local_attn
+            and not is_swa_layer
+            and not use_cascade_attn
+            and forward_batch.forward_mode.is_decode()
+        )
 
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
@@ -1617,14 +1641,31 @@ class FlashAttentionBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
 
+                if sparse_active:
+                    # Let the sparse algorithm select important KV pages and rewrite
+                    # the FA metadata (page_table / cache_seqlens) in place so this
+                    # decode step only attends over the selected pages.
+                    sparse_coordinator.attention_begin(
+                        query=q_reshaped,
+                        key=k,
+                        value=v,
+                        layer=layer,
+                        forward_batch=forward_batch,
+                        attn_metadata=metadata,
+                    )
+                    page_table = metadata.page_table
+                    cache_seqlens = metadata.cache_seqlens_int32
+
                 # Default: single-token self-attention
                 # Use precomputed scheduler_metadata when available and applicable.
                 # scheduler_metadata is only valid for non-SWA, non-cascade decode.
+                # It is also invalid once sparse selection rewrites cache_seqlens.
                 sched_meta = None
                 if (
                     metadata.scheduler_metadata is not None
                     and not is_swa_layer
                     and not use_cascade_attn
+                    and not sparse_active
                     and not pa_swa_active
                 ):
                     sched_meta = metadata.scheduler_metadata
@@ -1756,6 +1797,10 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 o = result
+
+        if sparse_active:
+            # Update page representations for newly generated KV pages this step.
+            sparse_coordinator.attention_end(o, layer, forward_batch)
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

@@ -27,6 +27,9 @@ _ALGORITHM_REGISTRY = {
     ),
 }
 
+# Attention backends the experimental --enable-sparse-attention path supports.
+_SUPPORTED_SPARSE_BACKENDS = {"fa3", "flashattention"}
+
 
 def _create_sparse_algorithm(
     config: SparseConfig,
@@ -116,6 +119,76 @@ def parse_hisparse_config(server_args) -> SparseConfig:
     return _parse_sparse_config(server_args)
 
 
+def parse_sparse_attention_config(server_args) -> SparseConfig:
+    """Parse the experimental --sparse-attention-config JSON into a SparseConfig.
+
+    Distinct from parse_hisparse_config (which reads --hisparse-config for the
+    DeepSeek/DSA host-offload path). Fills sensible defaults so the coordinator is
+    safe to construct for a non-MLA FlashAttention model. Recognized top-level
+    keys: algorithm, backend, page_size, min_sparse_prompt_len, top_k,
+    device_buffer_size, host_to_device_ratio. Any other keys (e.g. sparsity_ratio,
+    num_recent_pages) -- or a nested "algorithm_config" dict -- become
+    sparse_extra_config, consumed by the algorithm implementation.
+    """
+    raw = getattr(server_args, "sparse_attention_config", None)
+    cfg = {}
+    if raw:
+        try:
+            cfg = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse sparse_attention_config: {e}") from e
+
+    algorithm = str(cfg.pop("algorithm", "quest")).lower()
+    if algorithm not in _ALGORITHM_REGISTRY:
+        raise ValueError(
+            f"Unknown sparse-attention algorithm '{algorithm}'. "
+            f"Available: {sorted(_ALGORITHM_REGISTRY)}"
+        )
+
+    backend = (
+        cfg.pop("backend", None)
+        or getattr(server_args, "attention_backend", None)
+        or "fa3"
+    )
+    if backend not in _SUPPORTED_SPARSE_BACKENDS:
+        raise ValueError(
+            f"Sparse attention does not support attention backend '{backend}'. "
+            f"Supported: {sorted(_SUPPORTED_SPARSE_BACKENDS)} "
+            f"(run with --attention-backend fa3)."
+        )
+
+    page_size = (
+        cfg.pop("page_size", None) or getattr(server_args, "page_size", None) or 1
+    )
+    min_sparse_prompt_len = int(cfg.pop("min_sparse_prompt_len", 0))
+    if min_sparse_prompt_len < 0:
+        raise ValueError(
+            f"min_sparse_prompt_len must be >= 0, got {min_sparse_prompt_len}"
+        )
+    top_k = cfg.pop("top_k", 2048)
+    device_buffer_size = cfg.pop("device_buffer_size", 2 * top_k)
+    host_to_device_ratio = cfg.pop("host_to_device_ratio", 2)
+
+    extra = dict(cfg.pop("algorithm_config", {}) or {})
+    # remaining flat keys (e.g. sparsity_ratio, num_recent_pages) -> extra config
+    extra.update(cfg)
+
+    sparsity_ratio = extra.get("sparsity_ratio")
+    if sparsity_ratio is not None and not 0.0 <= float(sparsity_ratio) < 1.0:
+        raise ValueError(f"sparsity_ratio must be in [0, 1), got {sparsity_ratio}")
+
+    return SparseConfig(
+        top_k=top_k,
+        device_buffer_size=device_buffer_size,
+        host_to_device_ratio=host_to_device_ratio,
+        algorithm=algorithm,
+        backend=backend,
+        page_size=page_size,
+        min_sparse_prompt_len=min_sparse_prompt_len,
+        sparse_extra_config=extra,
+    )
+
+
 def create_sparse_coordinator(
     device: torch.device,
     req_to_token_pool,
@@ -123,9 +196,16 @@ def create_sparse_coordinator(
     start_layer: int,
     end_layer: int,
     server_args,
+    config: Optional[SparseConfig] = None,
     **kwargs,
 ) -> SparseCoordinator:
-    config = _parse_sparse_config(server_args)
+    # `config` lets callers (e.g. the experimental --enable-sparse-attention path)
+    # pass a SparseConfig parsed from their own flag. Falls back to the hisparse
+    # config parser for backward compatibility.
+    if config is None:
+        config = _parse_sparse_config(server_args)
+    if not config.page_size:
+        config.page_size = getattr(server_args, "page_size", None) or 1
     algorithm = _create_sparse_algorithm(config, device, **kwargs)
     backend_adaptor = _create_backend_adaptor(
         config.backend, device, algorithm, req_to_token_pool
