@@ -16,4 +16,45 @@ export const benchmarks = [
     accuracy: { gsm8k_pct: 97.5, mmmu_pct: 97.8 },
     notes: "GSM8K via benchmark/gsm8k/bench_sglang.py (200 questions); MMMU via benchmark/mmmu/bench_sglang.py (91-sample val subset).",
   },
+
+  // MI300X Qwen3.5-4B (BF16, TP=1) — measured on tw023 (8×MI300X).
+  // Server: sglang v0.5.13.post1, --attention-backend triton.
+  // Low-latency cell uses EAGLE speculative decoding (built-in head).
+  // Workload: random ISL=1024, OSL=1024, --warmup-requests 64.
+  {
+    match: { hw: "mi300x", variant: "4b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      {
+        workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 108,
+        tpot_ms: 2.36,
+        tokens_per_sec_per_gpu: 380,
+      },
+      {
+        workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 178,
+        tpot_ms: 5.61,
+        tokens_per_sec_per_gpu: 2578,
+      },
+    ],
+  },
+  {
+    match: { hw: "mi300x", variant: "4b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      {
+        workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 166965,
+        tpot_ms: 10.55,
+        tokens_per_sec_per_gpu: 2314,
+      },
+      {
+        workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 4096 },
+        ttft_ms: 445790,
+        tpot_ms: 10.13,
+        tokens_per_sec_per_gpu: 2405,
+      },
+    ],
+  },
 ];
