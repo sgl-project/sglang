@@ -58,8 +58,14 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     ):
         server_args.speculative_draft_model_revision = "main"
 
-    if server_args.speculative_moe_runner_backend is None:
-        server_args.speculative_moe_runner_backend = server_args.moe_runner_backend
+    # Moved to the resolution pipeline (arg_groups/overrides.py:
+    # _speculative_moe_runner_default), invoked here at its legacy slot.
+    from sglang.srt.arg_groups.overrides import (
+        _speculative_moe_runner_default,
+        run_post_process_pass,
+    )
+
+    run_post_process_pass(server_args, _speculative_moe_runner_default)
 
     if server_args.speculative_algorithm is not None:
         server_args.speculative_algorithm = server_args.speculative_algorithm.upper()
