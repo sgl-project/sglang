@@ -98,6 +98,18 @@ apt-get install -y --no-install-recommends libfabric-dev || {
 # Install DeepEP
 DEEPEP_DIR=/root/.cache/deepep
 rm -rf ${DEEPEP_DIR}
+
+# Runner images may carry a DeepEP from a previous bake installed via
+# `setup.py install`, i.e. an egg + easy-install.pth entry that `pip/uv
+# uninstall` cannot remove and that shadows the fresh install at import time
+# (eggs are prepended to sys.path). Scrub stale deep_ep eggs explicitly.
+for _site in /usr/local/lib/python3*/dist-packages /usr/lib/python3*/dist-packages; do
+    [ -d "${_site}" ] || continue
+    rm -rf "${_site}"/deep_ep-*.egg
+    if [ -f "${_site}/easy-install.pth" ]; then
+        sed -i "/deep_ep-/d" "${_site}/easy-install.pth"
+    fi
+done
 if [ "$GRACE_BLACKWELL" = "1" ]; then
     GRACE_BLACKWELL_DEEPEP_BRANCH=hybrid-ep
     git clone https://github.com/deepseek-ai/DeepEP.git -b ${GRACE_BLACKWELL_DEEPEP_BRANCH} ${DEEPEP_DIR} && \
