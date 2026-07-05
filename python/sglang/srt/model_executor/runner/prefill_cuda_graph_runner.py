@@ -80,6 +80,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
+from sglang.srt.runtime_context import mamba_extra_buffer_enabled
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -340,7 +341,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _is_mamba_track_enabled(self) -> bool:
         return (
-            self.model_runner.server_args.enable_mamba_extra_buffer()
+            mamba_extra_buffer_enabled()
             and not self.model_runner.server_args.disable_radix_cache
             and self.model_runner.spec_algorithm.is_none()
         )

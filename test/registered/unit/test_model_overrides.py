@@ -1607,7 +1607,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _get_default_attn_backend=lambda **_: default_backend,
                 use_mla_backend=lambda: False,
                 get_model_config=lambda: None,
-                enable_mamba_extra_buffer=lambda: False,
+                mamba_radix_cache_strategy="auto",
                 disable_radix_cache=False,
                 speculative_algorithm=None,
             )
@@ -1633,6 +1633,24 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     _args("trtllm_mha", attention_backend="fa3"), None
                 ),
                 {},
+            )
+            # the mamba pass ran before this dispatch and stashed the
+            # extra-buffer strategy: the callable must see it through the
+            # view (SM100 hybrid keeps trtllm_mha + page 64)
+            self.assertEqual(
+                _qwen3_5_hybrid_overrides(
+                    _args(
+                        "trtllm_mha",
+                        _resolved_overrides=[
+                            (
+                                "_mamba_radix_cache_declarations",
+                                {"mamba_radix_cache_strategy": "extra_buffer"},
+                            )
+                        ],
+                    ),
+                    None,
+                ),
+                {"attention_backend": "trtllm_mha", "page_size": 64},
             )
         with patch.object(overrides_module, "is_sm100_supported", return_value=False):
             self.assertEqual(_qwen3_5_hybrid_overrides(_args("fa3"), None), {})
@@ -1801,7 +1819,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(
             _intel_xpu_page_constraint(
                 _view(
-                    get_attention_backends=lambda: (None, "intel_xpu"),
+                    decode_attention_backend="intel_xpu",
                     use_mla_backend=lambda: False,
                 )
             ),
@@ -1810,7 +1828,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(
             _intel_xpu_page_constraint(
                 _view(
-                    get_attention_backends=lambda: (None, "intel_xpu"),
+                    decode_attention_backend="intel_xpu",
                     use_mla_backend=lambda: True,
                     page_size=16,  # MLA decode accepts 16
                 )

@@ -547,6 +547,36 @@ def get_flags() -> Flags:
     return _CONTEXT.flags
 
 
+def mamba_extra_buffer_enabled() -> bool:
+    """Resolved-semantics helper: whether the hybrid-mamba radix cache runs
+    the extra-buffer strategy (pristine radix switch + resolved strategy)."""
+    return (
+        get_server_args().disable_radix_cache is False
+        and get_flags().mamba_radix_cache_strategy
+        in (
+            "extra_buffer",
+            "extra_buffer_lazy",
+        )
+    )
+
+
+def mamba_extra_buffer_lazy_enabled() -> bool:
+    return (
+        get_server_args().disable_radix_cache is False
+        and get_flags().mamba_radix_cache_strategy == "extra_buffer_lazy"
+    )
+
+
+def resolved_attention_backends() -> tuple:
+    """Resolved (prefill, decode) attention backends from the flags tier
+    (split leaves fall back to the base backend leaf)."""
+    attn = get_flags().attn
+    return (
+        attn.prefill_backend if attn.prefill_backend else attn.backend,
+        attn.decode_backend if attn.decode_backend else attn.backend,
+    )
+
+
 def reset_context() -> None:
     """Clear the context-owned store (unit-test teardown): drop the published
     ``server_args`` and install a fresh, unfrozen ``Flags``.

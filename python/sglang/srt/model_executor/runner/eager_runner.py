@@ -49,6 +49,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     enable_tc_piecewise_cuda_graph,
     set_tc_piecewise_forward_context,
 )
+from sglang.srt.runtime_context import mamba_extra_buffer_enabled
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import ceil_align, require_mlp_sync
 
@@ -122,7 +123,7 @@ class EagerRunner(BaseRunner):
             max_num_token=max_num_token,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=(
-                sa.enable_mamba_extra_buffer() and mr.spec_algorithm.is_none()
+                mamba_extra_buffer_enabled() and mr.spec_algorithm.is_none()
             ),
             is_encoder_decoder=is_encoder_decoder,
             encoder_len_fill_value=(

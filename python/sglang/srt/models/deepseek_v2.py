@@ -175,7 +175,11 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import (
+    get_flags,
+    get_parallel,
+    resolved_attention_backends,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -1791,7 +1795,7 @@ class DeepseekV2AttentionMLA(
         # name stamped per-runner on the backend object, else resolve from server args.
         backend = get_attn_backend()
         server_args = get_global_server_args()
-        default_prefill_str, default_decode_str = server_args.get_attention_backends()
+        default_prefill_str, default_decode_str = resolved_attention_backends()
         prefill_backend_str = (
             backend.prefill_attention_backend_str or default_prefill_str
         )

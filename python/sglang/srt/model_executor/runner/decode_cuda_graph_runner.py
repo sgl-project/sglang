@@ -93,7 +93,7 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import get_flags, mamba_extra_buffer_enabled
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -298,8 +298,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         enable_mamba_track = (
-            self.model_runner.server_args.enable_mamba_extra_buffer()
-            and self.model_runner.spec_algorithm.is_none()
+            mamba_extra_buffer_enabled() and self.model_runner.spec_algorithm.is_none()
         )
 
         if self.require_gathered_buffer:

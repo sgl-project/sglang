@@ -3345,7 +3345,7 @@ class ServerArgs:
             not in self.get_model_config().hf_config.architectures
         ):
             return
-        prefill_attention_backend, _ = self.get_attention_backends()
+        prefill_attention_backend, _ = self._resolved_attention_backends()
         if prefill_attention_backend != "trtllm_mla":
             return
         logger.warning(
@@ -3392,7 +3392,7 @@ class ServerArgs:
             logger.warning("Chunked prefill is disabled because --enable-mis is set.")
             self.chunked_prefill_size = -1
 
-        prefill_backend, decode_backend = self.get_attention_backends()
+        prefill_backend, decode_backend = self._resolved_attention_backends()
         assert prefill_backend == "flashinfer" and decode_backend == "flashinfer", (
             "Multi-item scoring requires flashinfer attention backend for custom attention mask support. "
             f"Please set --attention-backend flashinfer when using --enable-mis. "
@@ -3943,7 +3943,9 @@ class ServerArgs:
                 "intel_xpu",
                 "aiter",
             ]
-            prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
+            prefill_attn_backend, decode_attn_backend = (
+                self._resolved_attention_backends()
+            )
             assert (
                 prefill_attn_backend in supported_backends
                 and decode_attn_backend in supported_backends
@@ -4049,7 +4051,7 @@ class ServerArgs:
         ):
             # Default attention backend selection moved to the override registry
             # (arg_groups/overrides.py: _gemma4_overrides).
-            prefill_backend, decode_backend = self.get_attention_backends()
+            prefill_backend, decode_backend = self._resolved_attention_backends()
             accepted_backends = ("trtllm_mha", "triton", "ascend", "intel_xpu")
             assert (
                 prefill_backend in accepted_backends
@@ -4164,29 +4166,31 @@ class ServerArgs:
 
         return supports_mamba_cache_extra_buffer(self, model_arch)
 
-    def _validate_mamba_no_buffer(self, model_arch: str):
-        assert self.page_size in (1, None), "no_buffer only supports page_size=1."
+    def _validate_mamba_no_buffer(self, view, model_arch: str):
+        assert view.page_size in (1, None), "no_buffer only supports page_size=1."
         assert (
-            self.disable_overlap_schedule
+            view.disable_overlap_schedule
         ), "no_buffer do not support overlap schedule. Try to set disable_overlap_schedule=True."
         assert (
-            self.attention_backend != "trtllm_mha"
+            view.attention_backend != "trtllm_mha"
         ), "no_buffer do not support trtllm_mha attention backend."
 
-    def _validate_mamba_extra_buffer(self, model_arch: str):
-        assert self._support_mamba_cache_extra_buffer(
-            model_arch
+    def _validate_mamba_extra_buffer(self, view, model_arch: str):
+        from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
+
+        assert supports_mamba_cache_extra_buffer(
+            view, model_arch
         ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
         assert (
             is_cuda() or is_musa() or is_npu()
         ), "extra_buffer needs CUDA/MUSA/NPU (FLA)."
-        if self.speculative_num_draft_tokens is not None:
+        if view.speculative_num_draft_tokens is not None:
             assert (
-                not self.enable_mamba_extra_buffer_lazy()
+                view.mamba_radix_cache_strategy != "extra_buffer_lazy"
             ), "extra_buffer_lazy unsupported with spec."
-            assert self.mamba_track_interval >= self.speculative_num_draft_tokens
-        if self.page_size is not None:
-            assert self.mamba_track_interval % self.page_size == 0
+            assert view.mamba_track_interval >= view.speculative_num_draft_tokens
+        if view.page_size is not None:
+            assert view.mamba_track_interval % view.page_size == 0
             assert self.mamba_cache_chunk_size is not None
 
     def _handle_mamba_radix_cache(self, model_arch: str):
@@ -4195,17 +4199,20 @@ class ServerArgs:
         # slot; this handler keeps the validation.
         from sglang.srt.arg_groups.overrides import (
             _mamba_radix_cache_resolution,
+            mamba_extra_buffer_of,
+            resolved_view,
             run_post_process_pass,
         )
 
         run_post_process_pass(self, _mamba_radix_cache_resolution)
-        if not self.uses_mamba_radix_cache:
+        view = resolved_view(self)
+        if not view.uses_mamba_radix_cache:
             return
 
-        if self.enable_mamba_extra_buffer():
-            self._validate_mamba_extra_buffer(model_arch)
+        if mamba_extra_buffer_of(view):
+            self._validate_mamba_extra_buffer(view, model_arch)
         else:
-            self._validate_mamba_no_buffer(model_arch)
+            self._validate_mamba_no_buffer(view, model_arch)
 
     def _handle_sampling_backend(self):
         # Moved to the resolution pipeline (arg_groups/overrides.py:
@@ -4353,28 +4360,12 @@ class ServerArgs:
 
         run_post_process_pass(self, _cutedsl_prefill_backend_fill)
 
-        if (
-            self.attention_backend == "trtllm_mha"
-            or self.decode_attention_backend == "trtllm_mha"
-            or self.prefill_attention_backend == "trtllm_mha"
-        ):
-            # Check prefill backend
-            prefill_backend = (
-                self.prefill_attention_backend
-                if self.prefill_attention_backend is not None
-                else self.attention_backend
-            )
+        prefill_backend, decode_backend = self._resolved_attention_backends()
+        if "trtllm_mha" in (prefill_backend, decode_backend):
             if prefill_backend == "trtllm_mha" and not is_sm100_supported():
                 raise ValueError(
                     "TRTLLM MHA backend for prefill is only supported on Blackwell GPUs (SM100). Please use a different prefill backend."
                 )
-
-            # Check decode backend
-            decode_backend = (
-                self.decode_attention_backend
-                if self.decode_attention_backend is not None
-                else self.attention_backend
-            )
             if decode_backend == "trtllm_mha" and not (
                 is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
             ):
@@ -4394,7 +4385,7 @@ class ServerArgs:
         # Other platforms backends
         run_post_process_pass(self, _attention_backend_platform_fallbacks)
 
-        prefill_backend, decode_backend = self.get_attention_backends()
+        prefill_backend, decode_backend = self._resolved_attention_backends()
         if self.use_mla_backend() and prefill_backend == "intel_xpu":
             raise ValueError(
                 "intel_xpu backend is only supported on decode for MLA models, please set --decode-attention-backend to intel_xpu and do not set --attention-backend or --prefill-attention-backend to intel_xpu for prefill instead use triton."
@@ -4417,35 +4408,28 @@ class ServerArgs:
             return
 
         use_mla_backend = self.use_mla_backend()
-        # self.attention_backend didn't overwrite self.prefill/decode_attention_backend yet
-        self.prefill_attention_backend_str, self.decode_attention_backend_str = (
-            self.get_attention_backends()
-        )
+        prefill_backend, decode_backend = self._resolved_attention_backends()
 
         if is_cuda():
             if (
-                self.prefill_attention_backend_str != self.decode_attention_backend_str
-                and self.prefill_attention_backend_str != "fa4"
+                prefill_backend != decode_backend and prefill_backend != "fa4"
             ):  # Take care of prefill=fa4 later
                 logger.warning(
-                    f"Attention: Using KV4 with PREFILL = {self.prefill_attention_backend_str} "
-                    f"and DECODE = {self.decode_attention_backend_str}. "
+                    f"Attention: Using KV4 with PREFILL = {prefill_backend} "
+                    f"and DECODE = {decode_backend}. "
                     f"Compatibility issues are unlikely, but may occur in rare edge cases."
                 )
             else:
-                if self.prefill_attention_backend_str == "fa4":
+                if prefill_backend == "fa4":
                     if use_mla_backend:  # FA4 + MLA
                         KV4_FA4_MLA_BACKEND_CHOICES = [
                             "cutlass_mla",
                             "flashinfer",
                             "trtllm_mla",
                         ]
-                        assert (
-                            self.decode_attention_backend_str
-                            in KV4_FA4_MLA_BACKEND_CHOICES
-                        ), (
+                        assert decode_backend in KV4_FA4_MLA_BACKEND_CHOICES, (
                             f"KV4 FA4 MLA expects decode_attention_backend to be one of "
-                            f"{KV4_FA4_MLA_BACKEND_CHOICES}, but got {self.decode_attention_backend_str}"
+                            f"{KV4_FA4_MLA_BACKEND_CHOICES}, but got {decode_backend}"
                         )
                     else:  # FA4 + MHA
                         KV4_FA4_MHA_BACKEND_CHOICES = [
@@ -4453,12 +4437,9 @@ class ServerArgs:
                             "torch_native",
                             "flex_attention",
                         ]
-                        assert (
-                            self.decode_attention_backend_str
-                            in KV4_FA4_MHA_BACKEND_CHOICES
-                        ), (
+                        assert decode_backend in KV4_FA4_MHA_BACKEND_CHOICES, (
                             f"KV4 FA4 MHA expects decode_attention_backend to be one of "
-                            f"{KV4_FA4_MHA_BACKEND_CHOICES}, but got {self.decode_attention_backend_str}"
+                            f"{KV4_FA4_MHA_BACKEND_CHOICES}, but got {decode_backend}"
                         )
                 else:
                     if use_mla_backend:  # !FA4 + MLA
@@ -4676,7 +4657,12 @@ class ServerArgs:
                     "linear-attn decode backend, got "
                     f"--linear-attn-decode-backend={decode!r}."
                 )
-            if self.enable_mamba_extra_buffer():
+            from sglang.srt.arg_groups.overrides import (
+                mamba_extra_buffer_of,
+                resolved_view,
+            )
+
+            if mamba_extra_buffer_of(resolved_view(self)):
                 raise ValueError(
                     "--enable-linear-replayssm requires --mamba-scheduler-strategy "
                     "no_buffer (the default); the extra_buffer ping-pong "
@@ -5254,7 +5240,7 @@ class ServerArgs:
             "_handle_attention_backend_compatibility() so the prefill backend is resolved."
         )
 
-        prefill_backend, _ = self.get_attention_backends()
+        prefill_backend, _ = self._resolved_attention_backends()
         if prefill_backend not in ("fa3", "fa4"):
             raise ValueError(
                 "--prefill-only-disable-kv-cache currently requires the FA prefill backend "
@@ -5849,11 +5835,7 @@ class ServerArgs:
             return
         # Only the Triton attention kernels read the strided 4-D envelope K/V
         # views; FA3 / FlashInfer do not.
-        backends = {
-            self.attention_backend,
-            self.prefill_attention_backend,
-            self.decode_attention_backend,
-        }
+        backends = set(self._resolved_attention_backends())
         backends.discard(None)
         assert backends <= {"triton"}, (
             "--enable-page-major-kv-layout requires the Triton attention backend "
@@ -5957,6 +5939,8 @@ class ServerArgs:
             )
 
     def _handle_other_validations(self):
+        from sglang.srt.arg_groups.overrides import resolved_view
+
         # Handle optimistic prefill validation
         if (
             self.optimistic_prefill_retries > 0
@@ -5968,7 +5952,7 @@ class ServerArgs:
             elif self.enable_hierarchical_cache:
                 logger.warning("Optimistic prefill does not support hierarchical cache")
                 self.optimistic_prefill_retries = 0
-            elif getattr(self, "uses_mamba_radix_cache", False):
+            elif resolved_view(self).uses_mamba_radix_cache:
                 logger.warning(
                     "Optimistic prefill does not support models that use "
                     "mamba radix cache."
@@ -6360,6 +6344,17 @@ class ServerArgs:
             return self.model_config
         self.model_config = ModelConfig.from_server_args(self)
         return self.model_config
+
+    def _resolved_attention_backends(self):
+        """Mid-resolution (prefill, decode) backends: reads through the pass
+        view so dual-apply-retired fields resolve from the declaration
+        stash."""
+        from sglang.srt.arg_groups.overrides import (
+            attention_backends_of,
+            resolved_view,
+        )
+
+        return attention_backends_of(resolved_view(self))
 
     def get_attention_backends(self):
         prefill_attention_backend_str = (

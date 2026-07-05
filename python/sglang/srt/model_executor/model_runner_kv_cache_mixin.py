@@ -50,7 +50,11 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import (
+    get_flags,
+    mamba_extra_buffer_enabled,
+    mamba_extra_buffer_lazy_enabled,
+)
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -296,17 +300,17 @@ class ModelRunnerKVCacheMixin:
             return 1
 
         additional_ratio = 0
-        if self.server_args.enable_mamba_extra_buffer():
+        if mamba_extra_buffer_enabled():
             # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
             # Lazy mode saves 1 slot (2 → 1) for overlap; non-overlap already uses 1.
             if not self.server_args.disable_overlap_schedule:
-                if self.server_args.enable_mamba_extra_buffer_lazy():
+                if mamba_extra_buffer_lazy_enabled():
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY
                 else:
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
             else:
                 assert (
-                    not self.server_args.enable_mamba_extra_buffer_lazy()
+                    not mamba_extra_buffer_lazy_enabled()
                 ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
 
@@ -400,7 +404,7 @@ class ModelRunnerKVCacheMixin:
             max_mamba_cache_size=self.server_args.max_mamba_cache_size,
             max_num_reqs=max_num_reqs,
             enable_memory_saver=self.server_args.enable_memory_saver,
-            enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+            enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             need_sort=self.server_args.disaggregation_mode in ("decode", "prefill"),
@@ -559,7 +563,7 @@ class ModelRunnerKVCacheMixin:
                         ),
                         speculative_num_draft_tokens=max_spec_draft_tokens,
                         speculative_eagle_topk=self.server_args.speculative_eagle_topk,
-                        enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+                        enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
                         pre_alloc_size=pre_alloc_size,
                         enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                         mamba_size=self.server_args.max_mamba_cache_size,
@@ -591,8 +595,8 @@ class ModelRunnerKVCacheMixin:
                             if self.start_layer <= i < self.end_layer
                         ]
                     ),
-                    enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
-                    enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
+                    enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
+                    enable_mamba_extra_buffer_lazy=mamba_extra_buffer_lazy_enabled(),
                     speculative_num_draft_tokens=max_spec_draft_tokens,
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,

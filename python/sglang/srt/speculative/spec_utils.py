@@ -15,6 +15,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
+from sglang.srt.runtime_context import mamba_extra_buffer_enabled
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.triton_ops.cache_locs import (
     align_evict_mask_to_page_size as align_evict_mask_to_page_size,
@@ -588,7 +589,7 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     tracking during TARGET_VERIFY; tracking is done in
     commit_mamba_states_after_verify instead.
     """
-    if not get_global_server_args().enable_mamba_extra_buffer():
+    if not mamba_extra_buffer_enabled():
         return
     set_mamba_track_indices_from_reqs(batch)
     batch.mamba_track_mask = None

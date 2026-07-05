@@ -180,7 +180,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import get_flags, resolved_attention_backends
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
@@ -2542,7 +2542,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         (
             self.prefill_attention_backend_str,
             self.decode_attention_backend_str,
-        ) = self.server_args.get_attention_backends()
+        ) = resolved_attention_backends()
 
         if self.decode_attention_backend_str != self.prefill_attention_backend_str:
             from sglang.srt.layers.attention.hybrid_attn_backend import (

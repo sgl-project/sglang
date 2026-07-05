@@ -19,6 +19,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import mamba_extra_buffer_enabled
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
@@ -691,7 +692,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
 
-        if model_runner.server_args.enable_mamba_extra_buffer():
+        if mamba_extra_buffer_enabled():
             assert (
                 self.conv_states_shape[-1] < self.mamba_chunk_size
             ), f"{self.conv_states_shape[-1]=} should be less than {self.mamba_chunk_size}"

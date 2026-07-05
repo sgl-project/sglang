@@ -213,6 +213,32 @@ def resolved_view(server_args: Any) -> ResolvedView:
     return ResolvedView(server_args, overlay=_retired_field_overlay(server_args))
 
 
+def attention_backends_of(cfg: Any) -> tuple:
+    """(prefill, decode) attention backends of a config-shaped object (a
+    ResolvedView mid-resolution, or pristine server_args at dispatch time):
+    split fields fall back to the base backend."""
+    prefill = (
+        cfg.prefill_attention_backend
+        if cfg.prefill_attention_backend
+        else cfg.attention_backend
+    )
+    decode = (
+        cfg.decode_attention_backend
+        if cfg.decode_attention_backend
+        else cfg.attention_backend
+    )
+    return prefill, decode
+
+
+def mamba_extra_buffer_of(cfg: Any) -> bool:
+    """Mid-resolution equivalent of runtime_context.mamba_extra_buffer_enabled:
+    reads the (possibly overlaid) strategy from a config-shaped object."""
+    return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
+        "extra_buffer",
+        "extra_buffer_lazy",
+    )
+
+
 def declare_load_time_override(source: str, declared: Dict[str, Any]) -> None:
     """Transition helper for load-time resolved fields (model-file config
     overrides, weight-resolved dtypes): dual-apply the declaration onto the
@@ -765,8 +791,11 @@ def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
         use_mla_backend=server_args.use_mla_backend(),
         model_config=server_args.get_model_config(),
     )
+    # The mamba radix-cache pass runs before this dispatch: read the
+    # declared strategy through the view (the legacy branch observed the
+    # already-written field here).
     if default_attn_backend == "trtllm_mha" and not (
-        not server_args.enable_mamba_extra_buffer()
+        not mamba_extra_buffer_of(resolved_view(server_args))
         and not server_args.disable_radix_cache
         and server_args.speculative_algorithm is None
     ):
@@ -1679,7 +1708,7 @@ def _attention_backend_platform_fallbacks(view: Any) -> dict:
 
 @register_post_process
 def _intel_xpu_page_constraint(view: Any) -> dict:
-    _, decode_backend = view.get_attention_backends()
+    _, decode_backend = attention_backends_of(view)
     if decode_backend == "intel_xpu":
         if view.use_mla_backend():
             supported_page_sizes = [16, 32, 64, 128]
@@ -2060,6 +2089,19 @@ DUAL_APPLY_RETIRED: frozenset = frozenset(
         # methods read the tier; hisparse validation reads the view.
         "dsa_prefill_backend",
         "dsa_decode_backend",
+        # ModelRunner / sarvam forward dispatch / frozen-KV draft selection
+        # read resolved_attention_backends(); every mid-resolution consumer
+        # goes through _resolved_attention_backends() (view-reading); the
+        # registry dispatch callables read the pristine input by design; the
+        # NPU early defaults are pre-resolution input synthesis.
+        "prefill_attention_backend",
+        "decode_attention_backend",
+        # KV-cache builder / runners / schedule-batch hot path read the
+        # mamba_extra_buffer_* helpers on the tier; the mamba validators and
+        # the optimistic-prefill gate read the view; the __post_init__ False
+        # reset writes the pristine default.
+        "uses_mamba_radix_cache",
+        "mamba_radix_cache_strategy",
     }
 )
 

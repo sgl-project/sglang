@@ -34,7 +34,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, resolved_attention_backends
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -121,7 +121,7 @@ def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
 def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
     attn_backend = get_attn_backend()
     server_args = get_global_server_args()
-    prefill_backend, decode_backend = server_args.get_attention_backends()
+    prefill_backend, decode_backend = resolved_attention_backends()
     prefill_backend = (
         getattr(attn_backend, "prefill_attention_backend_str", None) or prefill_backend
     )

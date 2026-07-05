@@ -30,6 +30,10 @@ from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
+from sglang.srt.runtime_context import (
+    mamba_extra_buffer_enabled,
+    mamba_extra_buffer_lazy_enabled,
+)
 
 if TYPE_CHECKING:
 
@@ -219,8 +223,8 @@ def build_kv_cache(
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         enable_session_radix_cache=server_args.enable_session_radix_cache,
-        enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
-        enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
+        enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
+        enable_mamba_extra_buffer_lazy=mamba_extra_buffer_lazy_enabled(),
         pp_rank=ps.pp_rank,
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,

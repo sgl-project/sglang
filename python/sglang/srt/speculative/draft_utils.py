@@ -23,13 +23,14 @@ class DraftBackendFactory:
     def _create_backend(
         self, backend_name: str, backend_map: dict, error_template: str
     ):
-        backend_type = (
-            self.draft_attn_backend
-            if self.draft_attn_backend
-            else getattr(self.server_args, backend_name)
+        from sglang.srt.runtime_context import resolved_attention_backends
+
+        prefill_backend, decode_backend = resolved_attention_backends()
+        backend_type = self.draft_attn_backend or (
+            decode_backend
+            if backend_name == "decode_attention_backend"
+            else prefill_backend
         )
-        if backend_type is None:
-            backend_type = self.server_args.attention_backend
 
         if backend_type not in backend_map:
             raise ValueError(error_template.format(backend_type=backend_type))
