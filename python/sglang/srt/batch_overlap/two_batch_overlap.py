@@ -27,6 +27,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.token_dispatcher import (
     DeepEPDispatcher,
+    DeepEPV2Dispatcher,
     MooncakeEPDispatcher,
     MoriEPDispatcher,
     NixlEPDispatcher,
@@ -1058,6 +1059,10 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         if get_moe_a2a_backend().is_deepep():
             self._inners = [
                 DeepEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+            ]
+        elif get_moe_a2a_backend().is_deepep_v2():
+            self._inners = [
+                DeepEPV2Dispatcher(**kwargs) for _ in range(num_inner_dispatchers)
             ]
         elif get_moe_a2a_backend().is_mooncake():
             self._inners = [

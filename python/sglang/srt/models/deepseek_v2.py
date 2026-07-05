@@ -702,6 +702,7 @@ class DeepseekV2MoE(nn.Module):
             # not divisible by the global TP size.
             _shared_expert_use_tp1 = (
                 get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_deepep_v2()
                 or get_moe_a2a_backend().is_mooncake()
                 or get_moe_a2a_backend().is_nixl()
                 or get_moe_a2a_backend().is_mori()
@@ -784,6 +785,7 @@ class DeepseekV2MoE(nn.Module):
 
         if (
             get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_nixl()
             or get_moe_a2a_backend().is_mori()
@@ -806,6 +808,7 @@ class DeepseekV2MoE(nn.Module):
 
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_nixl()
             or get_moe_a2a_backend().is_mori()
@@ -2446,7 +2449,11 @@ class DeepseekV2Model(nn.Module):
                 )
             )
         self.layers_to_capture = []
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_deepep_v2()
+            or get_moe_a2a_backend().is_mooncake()
+        ):
             self.enable_a2a_moe = True
         else:
             self.enable_a2a_moe = False
