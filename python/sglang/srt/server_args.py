@@ -537,6 +537,36 @@ class ServerArgs:
     ] = False
 
     # -------------------------------------------------------------------------
+    # HTTP server tuning
+    # -------------------------------------------------------------------------
+    # Operator-facing knobs for uvicorn / Granian that are otherwise hidden
+    # behind the embedded server defaults. None means "use server default".
+    timeout_keep_alive: A[
+        Optional[int],
+        "(uvicorn only) Override SGLANG_TIMEOUT_KEEP_ALIVE for the public HTTP listener (seconds). Defaults to the env var (5s); raise to ~65s when fronting clients with long-idle pool keep-alive (Go, reqwest, Node) to avoid pool-reuse races. Has no effect with --enable-http2 (Granian) — Granian's HTTP/1.1 idle timeout is not exposed and HTTP/2 uses stream-level keep-alive instead.",
+    ] = None
+    http_backlog: A[
+        int,
+        "TCP listen-queue depth for the public HTTP listener. At high RPS bursts the kernel accept queue overflows and clients see connect-refused; raise this for sustained >5k RPS.",
+    ] = 2048
+    http_limit_concurrency: A[
+        Optional[int],
+        "(uvicorn only) Max concurrent ASGI handlers. Unbounded by default. Set when fronting an embedding endpoint or any path that allows large client-controlled concurrency, to bound memory pressure.",
+    ] = None
+    http_timeout_graceful_shutdown: A[
+        Optional[int],
+        "(uvicorn only) Drain time on SIGTERM in seconds. None = abrupt drop of in-flight requests. Set this for LLM workloads with long-running streaming responses so connections drain rather than die.",
+    ] = None
+    http2_max_concurrent_streams: A[
+        Optional[int],
+        "(Granian only, --enable-http2) Cap on concurrent HTTP/2 streams per connection. None = Granian default (~100). Raise for clients that multiplex aggressively.",
+    ] = None
+    http2_max_frame_size: A[
+        Optional[int],
+        "(Granian only, --enable-http2) HTTP/2 frame size in bytes. None = Granian default. Larger frames reduce overhead for chunky JSON request/response bodies.",
+    ] = None
+
+    # -------------------------------------------------------------------------
     # SSL/TLS
     # -------------------------------------------------------------------------
     ssl_keyfile: A[Optional[str], "The file path to the SSL key file."] = None
@@ -2891,6 +2921,52 @@ class ServerArgs:
                     "Granian does not support SSL certificate hot-reloading. "
                     "Use Uvicorn (the default) or handle certificate rotation externally."
                 )
+
+            uvicorn_only_flags = [
+                ("--timeout-keep-alive", self.timeout_keep_alive),
+                ("--http-limit-concurrency", self.http_limit_concurrency),
+                (
+                    "--http-timeout-graceful-shutdown",
+                    self.http_timeout_graceful_shutdown,
+                ),
+            ]
+            ignored = [name for name, val in uvicorn_only_flags if val is not None]
+            if ignored:
+                logger.warning(
+                    f"{', '.join(ignored)} only affect Uvicorn and have no effect "
+                    "with --enable-http2 (Granian); ignoring."
+                )
+
+            # RFC 7540 §6.5.2 (SETTINGS_MAX_FRAME_SIZE): valid range is
+            # 2^14..2^24-1. Granian's HTTP2Settings dataclass does not
+            # validate this itself -- an out-of-range value would otherwise
+            # only surface as a protocol error deep in Granian's Rust HTTP/2
+            # layer, after model weights have already loaded. Check here so
+            # a bad flag value fails immediately.
+            if self.http2_max_frame_size is not None and not (
+                16384 <= self.http2_max_frame_size <= 16777215
+            ):
+                raise ValueError(
+                    "--http2-max-frame-size must be between 16384 and 16777215 "
+                    "bytes (RFC 7540 SETTINGS_MAX_FRAME_SIZE range), got "
+                    f"{self.http2_max_frame_size}."
+                )
+            if (
+                self.http2_max_concurrent_streams is not None
+                and self.http2_max_concurrent_streams <= 0
+            ):
+                raise ValueError(
+                    "--http2-max-concurrent-streams must be a positive integer, "
+                    f"got {self.http2_max_concurrent_streams}."
+                )
+        elif (
+            self.http2_max_concurrent_streams is not None
+            or self.http2_max_frame_size is not None
+        ):
+            logger.warning(
+                "--http2-max-concurrent-streams/--http2-max-frame-size only affect "
+                "Granian and have no effect without --enable-http2; ignoring."
+            )
 
     def _handle_multimodal(self):
         """Validate mm_process_config structure before model loading."""
