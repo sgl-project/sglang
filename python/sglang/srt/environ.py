@@ -290,6 +290,28 @@ class Envs:
     SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
 
+    # Scheduler: TP request broadcast fast path.  When enabled, rank-0 pulls
+    # raw pickle frames off the tokenizer socket and broadcasts those bytes to
+    # peer TP ranks (single serialization), instead of unpickling then
+    # re-pickling in broadcast_pyobj.  Only fast-paths the common
+    # TokenizedGenerateReqInput work-request stream; falls back otherwise.
+    SGLANG_TP_RAW_FRAME_BROADCAST = EnvBool(False)
+
+    # Scheduler: TP request transfer via a /dev/shm ring buffer instead of a
+    # per-iteration gloo broadcast (PROTOTYPE, intra-node TP only).  Peers poll
+    # a monotonic sequence counter (one cache-line read when idle) and only read
+    # + deserialize when it advances; gloo is untouched for the tensor path.
+    # Requires SGLANG_TP_RAW_FRAME_BROADCAST-style gating (no DP-attention,
+    # tp>1, no input_blocker).  See tp_req_shm_ring.py for the correctness
+    # contract; overrun (a peer stalling for > ring capacity batches) is
+    # detected and logged.
+    SGLANG_TP_REQ_SHM_RING = EnvBool(False)
+    # The ring does not keep request admission lock-step across TP ranks, so it
+    # can desync the NCCL forward and hang.  It is inert unless this ack is set.
+    SGLANG_TP_REQ_SHM_RING_ACK_UNSAFE = EnvBool(False)
+    SGLANG_TP_REQ_SHM_RING_SLOTS = EnvInt(1024)
+    SGLANG_TP_REQ_SHM_RING_SLOT_KB = EnvInt(256)
+
     # Scheduler: recv interval
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DECODE = EnvInt(1)
