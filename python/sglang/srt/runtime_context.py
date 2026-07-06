@@ -448,10 +448,8 @@ class RuntimeContext:
         load-time stages) and
         atomically re-resolve the flags tier.
 
-        Target-worker only, and only before ``freeze_flags()``. During the
-        dual-apply transition the call sites keep their imperative
-        ``server_args`` writes; the recorded declarations must match them —
-        parity is re-asserted on every declared field. On failure the
+        Target-worker only, and only before ``freeze_flags()``. The
+        declarations never touch ``server_args``; on a failed re-resolve the
         recorded entries are rolled back and the previous flags stay
         installed.
         """
@@ -501,10 +499,7 @@ class RuntimeContext:
                 return
             declarations = ()
         declarations = list(declarations or ()) + self._runtime_overrides
-        from sglang.srt.arg_groups.overrides import (
-            apply_model_overrides,
-            assert_flag_parity,
-        )
+        from sglang.srt.arg_groups.overrides import apply_model_overrides
 
         # Resolve into a fresh container and only install it once everything
         # passed: a failed resolution (gate validation or the parity assert)
@@ -513,13 +508,6 @@ class RuntimeContext:
         # reset_context()).
         flags = Flags()
         apply_model_overrides(flags, server_args, declarations)
-        # Transition-period drift guard: dual-apply keeps the declared fields
-        # on server_args byte-identical to the resolved flag leaves.
-        assert_flag_parity(
-            flags,
-            server_args,
-            {field for _source, decl in declarations for field in decl},
-        )
         # The capture tier is not part of the static resolution: carry it
         # across re-resolves so runtime-stage recording cannot clobber a
         # capture-time write (set_server_args re-seeds it per lifecycle).

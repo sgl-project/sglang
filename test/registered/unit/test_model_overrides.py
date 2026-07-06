@@ -19,11 +19,10 @@ from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
 from sglang.srt.arg_groups.overrides import (
     OverrideRecord,
-    apply_declarations_to_server_args,
     apply_model_overrides,
-    assert_flag_parity,
     collect_model_override_declarations,
     register_model_override,
+    validate_declarations,
 )
 from sglang.srt.runtime_context import (
     _StaticFlags,
@@ -207,7 +206,7 @@ class TestResolvedViewAndPasses(CustomTestCase):
         self.assertEqual(view.a, 10)
         self.assertEqual(view.b, 2)
 
-    def test_run_pass_appends_stash_and_dual_applies(self):
+    def test_run_pass_appends_stash_and_stays_pristine(self):
         from sglang.srt.arg_groups.overrides import run_post_process_pass
 
         live = SimpleNamespace(x=None, _resolved_overrides=[])
@@ -216,11 +215,12 @@ class TestResolvedViewAndPasses(CustomTestCase):
             return {"x": "filled"} if view.x is None else {}
 
         run_post_process_pass(live, _fill_x)
-        self.assertEqual(live.x, "filled")  # dual-applied in place
+        self.assertIsNone(live.x)  # never applied in place
         self.assertEqual(
             live._resolved_overrides, [(_fill_x.__qualname__, {"x": "filled"})]
         )
-        run_post_process_pass(live, _fill_x)  # now a no-op
+        # the next invocation sees the declared value through the overlay
+        run_post_process_pass(live, _fill_x)
         self.assertEqual(len(live._resolved_overrides), 1)
 
     def test_run_pass_rejects_non_dict(self):
@@ -823,7 +823,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         self.assertEqual(_dllm_page_size(_view(dllm_algorithm=None)), {})
 
-    def test_dual_apply_retired_field_mechanics(self):
+    def test_declaration_overlay_mechanics(self):
         from sglang.srt.arg_groups.overrides import run_post_process_pass
 
         live = SimpleNamespace(x="user", y=None, _resolved_overrides=[])
@@ -834,31 +834,18 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         def _read_x(view):
             return {"y": view.x}
 
-        with patch.object(overrides_module, "DUAL_APPLY_RETIRED", frozenset({"x"})):
-            run_post_process_pass(live, _resolve_x)
-            # declaration recorded, but server_args stays pristine
-            self.assertEqual(
-                live._resolved_overrides, [(_resolve_x.__qualname__, {"x": "resolved"})]
-            )
-            self.assertEqual(live.x, "user")
-            # a later pass sees the resolved value through the view overlay
-            run_post_process_pass(live, _read_x)
-            self.assertEqual(live.y, "resolved")
-
-    def test_parity_skips_retired_fields(self):
-        from sglang.srt.arg_groups.overrides import assert_flag_parity
-        from sglang.srt.runtime_context import Flags
-
-        flags = Flags()
-        flags.page_size = 64
-        args = SimpleNamespace(page_size=1)  # pristine differs from the leaf
-        with patch.object(
-            overrides_module, "DUAL_APPLY_RETIRED", frozenset({"page_size"})
-        ):
-            assert_flag_parity(flags, args, {"page_size"})  # no raise
-        with patch.object(overrides_module, "DUAL_APPLY_RETIRED", frozenset()):
-            with self.assertRaises(AssertionError):
-                assert_flag_parity(flags, args, {"page_size"})
+        run_post_process_pass(live, _resolve_x)
+        # declaration recorded, but server_args stays pristine
+        self.assertEqual(
+            live._resolved_overrides, [(_resolve_x.__qualname__, {"x": "resolved"})]
+        )
+        self.assertEqual(live.x, "user")
+        # a later pass sees the resolved value through the view overlay
+        run_post_process_pass(live, _read_x)
+        self.assertEqual(
+            live._resolved_overrides[-1], (_read_x.__qualname__, {"y": "resolved"})
+        )
+        self.assertIsNone(live.y)  # never applied in place
 
     def test_initialize_moe_config_reads_resolving_state_prepublish(self):
         # Scheduler.init_moe_gemm_config runs before the model worker
@@ -2194,22 +2181,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(_step3p_overrides(_args(), None), {})
 
 
-class TestDualApplyParity(CustomTestCase):
-    def test_dual_apply_replays_and_parity_holds(self):
+class TestDeclarationValidation(CustomTestCase):
+    def test_declarations_never_mutate_server_args(self):
         flags, args = _FakeFlags(), _FakeArgs()
         declarations = [("src", {"resolved_by_model": "dsv4", "also_resolved": 7})]
         apply_model_overrides(flags, args, declarations)
-        apply_declarations_to_server_args(args, declarations)
-        self.assertEqual(args.resolved_by_model, "dsv4")
-        self.assertEqual(args.also_resolved, 7)
-        assert_flag_parity(flags, args, ["resolved_by_model", "also_resolved"])
+        validate_declarations(args, declarations)
+        # the leaves carry the declared values; the fields stay pristine
+        self.assertEqual(flags.resolved_by_model, "dsv4")
+        self.assertEqual(flags.also_resolved, 7)
+        self.assertEqual(args.resolved_by_model, _FakeArgs.resolved_by_model)
+        self.assertEqual(args.also_resolved, _FakeArgs.also_resolved)
 
-    def test_parity_detects_drift(self):
-        flags, args = _FakeFlags(), _FakeArgs()
-        apply_model_overrides(flags, args, [("src", {"resolved_by_model": "x"})])
-        # dual-apply skipped -> server_args still pristine -> drift is caught
-        with self.assertRaises(AssertionError):
-            assert_flag_parity(flags, args, ["resolved_by_model"])
+    def test_validation_rejects_unknown_fields(self):
+        args = _FakeArgs()
+        with self.assertRaises(ValueError):
+            validate_declarations(args, [("src", {"nope": 1})])
 
 
 if __name__ == "__main__":

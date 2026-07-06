@@ -3776,21 +3776,20 @@ class ServerArgs:
             self._handle_mamba_radix_cache(model_arch=model_arch)
 
         # Collect the declarative model overrides (registry) on the
-        # pristine config and stash them for publish-time flags resolution.
-        # Transition dual-apply: the same declarations are applied to
-        # server_args right here, byte-identical to the imperative arch
-        # branches this dispatch gradually replaces (dual-apply is retired
-        # per field once that field's readers migrate to the flags tier).
+        # pristine config and stash them for publish-time flags resolution;
+        # server_args is never mutated — mid-resolution readers see the
+        # declared values through resolved_view, runtime readers through the
+        # flags tier.
         from sglang.srt.arg_groups.overrides import (
-            apply_declarations_to_server_args,
             collect_model_override_declarations,
             resolved_view,
+            validate_declarations,
         )
 
         self._resolved_overrides = collect_model_override_declarations(
             model_arch, self, hf_config
         )
-        apply_declarations_to_server_args(self, self._resolved_overrides)
+        validate_declarations(self, self._resolved_overrides)
 
         if model_arch in [
             "DeepseekV4ForCausalLM",
@@ -6389,16 +6388,15 @@ class ServerArgs:
         return self.model_config
 
     def _resolved(self):
-        """Read-only view of the resolving configuration: dual-apply-retired
-        fields resolve from the declaration stash."""
+        """Read-only view of the resolving configuration: declared fields
+        resolve from the declaration stash."""
         from sglang.srt.arg_groups.overrides import resolved_view
 
         return resolved_view(self)
 
     def _resolved_attention_backends(self):
         """Mid-resolution (prefill, decode) backends: reads through the pass
-        view so dual-apply-retired fields resolve from the declaration
-        stash."""
+        view so declared fields resolve from the declaration stash."""
         from sglang.srt.arg_groups.overrides import (
             attention_backends_of,
             resolved_view,

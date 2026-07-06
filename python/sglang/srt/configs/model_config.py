@@ -491,7 +491,7 @@ class ModelConfig:
         # dtype / quantization / disable_hybrid_swa_memory are pipeline-
         # resolved: read them through the view so every construction —
         # mid-resolution, scheduler-process post-publish, or launcher-side —
-        # captures the declared values (dual-apply retired).
+        # captures the declared values.
         view = resolved_view(server_args)
         quantization = (
             server_args.speculative_draft_model_quantization

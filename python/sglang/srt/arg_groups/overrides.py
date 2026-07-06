@@ -117,14 +117,10 @@ def _invoke_provider(
 
 class ResolvedView:
     """Read-only view of the resolving configuration handed to post-process
-    passes.
-
-    During the dual-apply transition the view forwards every read to the live
-    ``server_args`` — the pristine input plus the declarations replayed so far
-    plus any residual imperative writes — which is exactly the state the
-    legacy handler at the same slot observed. In the end state (dual-apply
-    retired) the same type overlays the accumulated declarations on the
-    pristine object. Writes are rejected: passes return declarations.
+    passes: the accumulated declarations overlaid on the pristine
+    ``server_args`` (residual imperative writes of non-resolved fields show
+    through the fallthrough) — exactly the state the legacy handler at the
+    same slot observed. Writes are rejected: passes return declarations.
     """
 
     __slots__ = ("_server_args", "_overlay")
@@ -162,31 +158,25 @@ def register_post_process(fn: Callable[..., dict]) -> Callable[..., dict]:
     return fn
 
 
-def _retired_field_overlay(server_args: Any) -> Dict[str, Any]:
-    """Accumulated declared values for dual-apply-retired fields: those no
-    longer live on ``server_args`` mid-resolution, so pass views overlay them
-    from the declaration stash (last writer wins, like the gate)."""
-    if not DUAL_APPLY_RETIRED:
-        return {}
+def _declaration_overlay(server_args: Any) -> Dict[str, Any]:
+    """Accumulated declared values: declarations never mutate
+    ``server_args``, so mid-resolution readers overlay them from the
+    declaration stash (last writer wins, like the gate)."""
     overlay: Dict[str, Any] = {}
     for _source, declared in getattr(server_args, "_resolved_overrides", None) or ():
-        for field, value in declared.items():
-            if field in DUAL_APPLY_RETIRED:
-                overlay[field] = value
+        overlay.update(declared)
     return overlay
 
 
 def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
-    """Transition-period invocation of one pass at its legacy handler slot.
+    """Invoke one pass at its legacy handler slot.
 
-    Evaluates the pass on the live state (through a read-only view; fields
-    with retired dual-apply are overlaid from the declaration stash), appends
-    its declaration to the declaration stash, and dual-applies it in place —
-    byte-identical to the imperative handler write this replaces.
+    Evaluates the pass on the resolving state (a read-only view with the
+    accumulated declarations overlaid from the stash) and appends its
+    declaration to the stash; ``server_args`` itself is never mutated — the
+    flags tier materializes the declared values at publish.
     """
-    declared = fn(
-        ResolvedView(server_args, overlay=_retired_field_overlay(server_args))
-    )
+    declared = fn(ResolvedView(server_args, overlay=_declaration_overlay(server_args)))
     if not isinstance(declared, dict):
         raise TypeError(
             f"post-process pass {fn.__qualname__} must return a dict, "
@@ -203,14 +193,14 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
             # must sit at or after it in __post_init__ order.
             stash = server_args._resolved_overrides = []
         stash.append(entry)
-        apply_declarations_to_server_args(server_args, [entry])
+        validate_declarations(server_args, [entry])
 
 
 def resolved_view(server_args: Any) -> ResolvedView:
-    """Transition helper for mid-resolution code that is not a pass: a
-    read-only view of the resolving configuration (dual-apply-retired fields
-    overlaid from the declaration stash)."""
-    return ResolvedView(server_args, overlay=_retired_field_overlay(server_args))
+    """Read-only view of the resolving configuration for code that is not a
+    pass: the accumulated declarations are overlaid from the stash. Valid in
+    any process and at any timing — the stash rides the instance."""
+    return ResolvedView(server_args, overlay=_declaration_overlay(server_args))
 
 
 def attention_backends_of(cfg: Any) -> tuple:
@@ -240,16 +230,12 @@ def mamba_extra_buffer_of(cfg: Any) -> bool:
 
 
 def declare_load_time_override(source: str, declared: Dict[str, Any]) -> None:
-    """Transition helper for load-time resolved fields (model-file config
-    overrides, weight-resolved dtypes): dual-apply the declaration onto the
-    published ``server_args`` — byte-identical to the imperative write this
-    replaces — and record it into the flags tier through the runtime gate."""
+    """Record a load-time resolved field (model-file config overrides,
+    weight-resolved dtypes) into the flags tier through the runtime gate;
+    ``server_args`` stays pristine."""
     from sglang.srt.runtime_context import get_context
 
-    ctx = get_context()
-    entry = (source, dict(declared))
-    apply_declarations_to_server_args(ctx.server_args, [entry])
-    ctx.record_runtime_overrides([entry])
+    get_context().record_runtime_overrides([(source, dict(declared))])
 
 
 def collect_model_override_declarations(
@@ -1576,7 +1562,7 @@ def _mla_backend_page_constraints(view: Any) -> dict:
 def _mla_kv_cache_dtype_checks(view: Any) -> dict:
     """Read-only validation pass in the attention-backend compatibility
     handler: the TRT-LLM and tokenspeed MLA backends constrain the resolved
-    kv-cache dtype (the field is dual-apply-retired, so the checks must read
+    kv-cache dtype (declarations never reach the field, so the checks read
     the view)."""
     if (
         view.attention_backend == "trtllm_mla"
@@ -1622,7 +1608,7 @@ def _cutedsl_prefill_backend_fill(view: Any) -> dict:
     """Slot pass in the attention-backend compatibility handler: CuteDSL MLA
     is decode-only, so validate the combination and default the prefill side
     to trtllm_mla. The trtllm_mha check that follows at the legacy slot reads
-    the dual-applied value."""
+    the resolved value through the view."""
     if not (
         view.attention_backend == "cutedsl_mla"
         or view.decode_attention_backend == "cutedsl_mla"
@@ -1775,8 +1761,7 @@ def _data_parallelism_defaults(view: Any) -> dict:
 @register_post_process
 def _dp_lm_head_validation(view: Any) -> dict:
     """Read-only validation pass: dp-attention is a prerequisite for the
-    dp LM head. Reads the mid-resolution values through the view (the field
-    is dual-apply-retired)."""
+    dp LM head. Reads the mid-resolution values through the view."""
     if view.enable_dp_lm_head:
         assert (
             view.enable_dp_attention
@@ -2099,150 +2084,27 @@ def apply_model_overrides(
     return records
 
 
-# Fields whose transition dual-apply is retired: every reader of the resolved
-# value goes through the flags tier (post-publish reads) or the pass view
-# (mid-resolution reads), so declarations no longer mutate server_args and
-# the field stays pristine user input. Grown per field as reader sweeps
-# complete; the publish parity assert skips these fields.
-DUAL_APPLY_RETIRED: frozenset = frozenset(
-    {
-        # All readers flipped: model LM-head constructions + the logits
-        # processor read get_flags(); require_mlp_tp_gather reads the leaf;
-        # the dp-attention prerequisite check is a view-reading validation
-        # pass.
-        "enable_dp_lm_head",
-        # Sole production reader is the ModelRunner tf32 toggle, on the tier.
-        "enable_tf32_matmul",
-        # Model-file readers and the routed-experts capturer read the tier;
-        # the remaining __post_init__ writers are earlier imperative writes,
-        # captured by publish-time materialization.
-        "disable_shared_experts_fusion",
-        # Sampler construction, the deterministic force and the token-oracle
-        # gate all read the tier; the hpu/cpu early writers stay imperative.
-        "sampling_backend",
-        # Pool configurator reads the tier; the range check in
-        # _handle_cache_compatibility validates the pristine user input.
-        "swa_full_tokens_ratio",
-        # Communicator and capture-time runner read the tier; the
-        # deprecated-alias fill runs pre-declaration on pristine input.
-        "flashinfer_allreduce_fusion_backend",
-        # initialize_moe_config reads the tier for the draft MoE fields.
-        "speculative_moe_runner_backend",
-        "speculative_moe_a2a_backend",
-        # TBO / communicator / dp-attention init / the require_* helpers read
-        # the tier; check_server_args validates the pristine user input.
-        "moe_dense_tp_size",
-        # Attention backends / disagg handshake / configure_kv_cache_dtype /
-        # model init read the tier; the MLA and hisparse validations are
-        # view-reading passes; the kv4/prefill-only gates key on values no
-        # declaration produces.
-        "kv_cache_dtype",
-        # DSA backend init, the kv-cache mixin and the DeepSeek forward
-        # methods read the tier; hisparse validation reads the view.
-        "dsa_prefill_backend",
-        "dsa_decode_backend",
-        # ModelRunner / sarvam forward dispatch / frozen-KV draft selection
-        # read resolved_attention_backends(); every mid-resolution consumer
-        # goes through _resolved_attention_backends() (view-reading); the
-        # registry dispatch callables read the pristine input by design; the
-        # NPU early defaults are pre-resolution input synthesis.
-        "prefill_attention_backend",
-        "decode_attention_backend",
-        # KV-cache builder / runners / schedule-batch hot path read the
-        # mamba_extra_buffer_* helpers on the tier; the mamba validators and
-        # the optimistic-prefill gate read the view; the __post_init__ False
-        # reset writes the pristine default.
-        "uses_mamba_radix_cache",
-        "mamba_radix_cache_strategy",
-        # Runtime readers are on the mapped leaf (flags.attn.backend) or
-        # resolved_attention_backends(); every mid-resolution consumer reads
-        # a pass view; the hpu/cpu/npu early defaults are pre-resolution
-        # input synthesis; the HRM-Text runner force is a load-time
-        # declaration; the engine flashinfer preflight and the registry
-        # dispatch callables read the pristine input by design.
-        "attention_backend",
-        # KV sizing, workers and attention backends read the leaf; the
-        # scheduler / ModelRunner pre-publish captures, the
-        # mamba_cache_chunk_size property, the chunked-prefill divisibility
-        # check, the kv-events describe (launcher-side) and the
-        # default-backend spec gate read the view; the dllm scheduler-init
-        # page fallback is folded into the _dllm_page_size pass; the npu
-        # early default is pre-resolution input synthesis.
-        "page_size",
-        # initialize_moe_config, the eplb recorder, the autotune runner and
-        # init-MoE wiring read the leaves; the kernel-config and a2a chains
-        # read views, with their fusion writes converted to the
-        # _moe_runner_fusion_disable / _a2a_fusion_adjustments passes; the
-        # cuda-graph compat lambdas and the TBO / budget validators read
-        # views; the registry dispatch callables read the pristine input.
-        "moe_runner_backend",
-        "moe_a2a_backend",
-        # Scheduler / TpWorker pre-publish captures read views; workers,
-        # pool sizing, the kv mixin, dp-attn wiring, the prefill delayer and
-        # the spec registry read the leaf; the pp / pdmux asserts read
-        # views; the mps early disable is pre-resolution input synthesis.
-        "disable_overlap_schedule",
-        # Every ModelConfig construction (mid-resolution cached, scheduler
-        # post-publish, launcher-side) captures these through the view in
-        # from_server_args — which also removes the timing skew between the
-        # pre- and post-declaration constructions; the sm<80 float16 force
-        # is a load-time declaration; MoE / DSA / gguf mid-resolution reads
-        # go through views; the runtime quantization readers are on the
-        # tier; the unquant normalization and the draft-quantization copy
-        # run pre-declaration on pristine input.
-        "dtype",
-        "quantization",
-        "disable_hybrid_swa_memory",
-        # ModelConfig captures through the view; the spec hook / adaptive
-        # gates and the worker-shape helpers read views; the disagg draft
-        # builder and the eager runner read the leaf; the two dispatch
-        # declarers (MiMoV2, Step3p5/3p7) read the pristine input.
-        "enable_multi_layer_eagle",
-        # The launcher / tokenizer / ray-controller processes (where no
-        # publish exists) and the pre-publish scheduler/runner captures read
-        # views over the instance-carried declaration stash; scheduler-
-        # process runtime readers are on the leaves; the __post_init__
-        # validation chains read views at their slots.
-        "enable_dp_attention",
-        "ep_size",
-        "attn_cp_size",
-    }
-)
-
-
-def apply_declarations_to_server_args(
+def validate_declarations(
     server_args: Any,
     declarations: Sequence[Tuple[str, Dict[str, Any]]],
-    *,
-    terminal: Sequence[Tuple[str, Dict[str, Any]]] = (),
 ) -> None:
-    """Transition-period dual-apply: replay declarations onto ``server_args``
-    in gate order, byte-identical to the legacy imperative writes.
-
-    Retired per field once that field's readers have all flipped to the flags
-    tier (at which point the server_args field returns to pristine).
-
-    Validates against the same whitelist as the publish gate BEFORE any write:
-    a registry typo or a not-yet-resolvable field must fail fast here, not
-    mutate ``server_args`` and only be rejected at publish time.
+    """Fail-fast whitelist check at declaration time: a registry typo or a
+    not-yet-resolvable field must be rejected at its slot, not only at
+    publish time. Declarations never mutate ``server_args``.
     """
     # Non-dataclass fixtures carry no Arg metadata (mirrors the
     # resolvable_fields escape); only real ServerArgs is validated.
-    if dataclasses.is_dataclass(type(server_args)):
-        whitelist = resolvable_fields(type(server_args))
-        for source, decl in list(declarations) + list(terminal):
-            unknown = set(decl) - whitelist
-            if unknown:
-                raise ValueError(
-                    f"{source}: {sorted(unknown)} not model-overridable; the "
-                    "transition dual-apply refuses fields the publish gate "
-                    "would reject."
-                )
-    for _source, decl in list(declarations) + list(terminal):
-        for field, value in decl.items():
-            if field in DUAL_APPLY_RETIRED:
-                continue
-            setattr(server_args, field, value)
+    if not dataclasses.is_dataclass(type(server_args)):
+        return
+    whitelist = resolvable_fields(type(server_args))
+    for source, decl in declarations:
+        unknown = set(decl) - whitelist
+        if unknown:
+            raise ValueError(
+                f"{source}: {sorted(unknown)} not model-overridable; "
+                "declarations are limited to the fields the publish gate "
+                "accepts."
+            )
 
 
 def _hrm_text_attention_force(view: Any) -> dict:
@@ -2257,29 +2119,3 @@ def _hrm_text_attention_force(view: Any) -> dict:
             "attention."
         )
     return {"attention_backend": "triton"}
-
-
-def assert_flag_parity(
-    flags: Any,
-    server_args: Any,
-    fields: Iterable[str],
-    *,
-    leaf_map: Optional[Dict[str, str]] = None,
-) -> None:
-    """Dual-apply drift guard: each migrated field's flag leaf must equal the
-    (dual-applied) ``server_args`` value."""
-    mismatches = []
-    for field in fields:
-        if field in DUAL_APPLY_RETIRED:
-            # server_args stays pristine for retired fields; the leaf alone
-            # carries the resolved value.
-            continue
-        owner, leaf = resolve_flag_leaf(flags, field, leaf_map=leaf_map)
-        flag_value = getattr(owner, leaf)
-        args_value = getattr(server_args, field)
-        if flag_value != args_value:
-            mismatches.append(
-                f"{field}: flags={flag_value!r} server_args={args_value!r}"
-            )
-    if mismatches:
-        raise AssertionError("flag/server_args parity broken: " + "; ".join(mismatches))

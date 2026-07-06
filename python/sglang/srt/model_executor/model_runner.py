@@ -2437,10 +2437,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return result[1] if result else None
 
     def _record_kv_cache_dtype(self, resolved: str) -> None:
-        # Load-time resolution transition: the weight-resolved kv-cache dtype
-        # is declared into the flags tier; the dual-apply inside the helper
-        # replaces the legacy in-place write. Mock runners whose server_args
-        # is not the published object keep the plain write.
+        # The weight-resolved kv-cache dtype is declared into the flags
+        # tier. Mock runners whose server_args is not the published object
+        # keep the plain write (their readers go through the runner-local
+        # view).
         from sglang.srt.runtime_context import get_context
 
         if get_context()._server_args is self.server_args:

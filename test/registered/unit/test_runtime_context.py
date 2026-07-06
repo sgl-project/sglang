@@ -339,19 +339,6 @@ class TestRuntimeResolutionStages(_IsolatedServerArgs):
         self.assertEqual(get_flags().sampling_backend, "pytorch")
         self.assertEqual(get_flags().page_size, 64)  # earlier stage survives
 
-    def test_record_parity_failure_rolls_back(self):
-        import sglang.srt.arg_groups.overrides as overrides_module
-
-        self._publish(page_size=1)
-        flags_before = get_flags()
-        # pin an empty retired set so parity still compares page_size
-        with patch.object(overrides_module, "DUAL_APPLY_RETIRED", frozenset()):
-            with self.assertRaises(AssertionError):
-                # declared value diverges from the live server_args (no dual-apply)
-                get_context().record_runtime_overrides([("bad", {"page_size": 64})])
-        self.assertIs(get_flags(), flags_before)  # previous flags intact
-        self.assertEqual(get_context()._runtime_overrides, [])  # rolled back
-
     def test_record_whitelist_violation_rolls_back(self):
         self._publish()
         with self.assertRaises(ValueError):
