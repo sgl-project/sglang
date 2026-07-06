@@ -13,9 +13,10 @@ Covers:
 """
 
 import asyncio
-import dataclasses
 import unittest
-from unittest.mock import MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
+
+import msgspec
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -35,7 +36,7 @@ _NOT_FINISHED = object()  # Sentinel: request has not finished yet
 # Categorised by value shape so that _make_batch_str_output can assign
 # type-appropriate defaults without hardcoding every field name.
 # When a field is renamed upstream, the old name simply won't appear in
-# dataclasses.fields() and the new name will fall through to the
+# msgspec.structs.fields() and the new name will fall through to the
 # pattern-matching or safe fallback — no test breakage.
 # ---------------------------------------------------------------------------
 
@@ -145,7 +146,7 @@ def _make_abort_req(rid: str, abort_message: str = "Aborted") -> AbortReq:
 def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
     """Create a minimal BatchStrOutput for a single request.
 
-    Uses dataclass field introspection so that new or renamed fields in
+    Uses struct field introspection so that new or renamed fields in
     BatchStrOutput don't break this test.  Only the fields that matter for
     test logic (rids, finished_reasons, output_strs) are set explicitly;
     all others receive type-appropriate defaults based on naming patterns.
@@ -159,7 +160,7 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
         fr = finished_reason
 
     kwargs = {}
-    for f in dataclasses.fields(BatchStrOutput):
+    for f in msgspec.structs.fields(BatchStrOutput):
         if f.name == "rids":
             kwargs[f.name] = [rid]
         elif f.name == "finished_reasons":
@@ -176,8 +177,8 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
             kwargs[f.name] = [None]
         # Fields with class defaults — skip, let the default be used
         elif (
-            f.default is not dataclasses.MISSING
-            or f.default_factory is not dataclasses.MISSING
+            f.default is not msgspec.NODEFAULT
+            or f.default_factory is not msgspec.NODEFAULT
         ):
             continue
         # Unknown required field — provide a safe per-request default.
@@ -384,6 +385,135 @@ class TestResubmitAfterCompletion(CustomTestCase):
         tm._init_req_state(obj)
 
         self.assertIn(rid, tm.rid_to_state)
+
+
+class _DummyAsyncCM:
+    """Reusable no-op async context manager (stands in for an RW lock)."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _make_tm_for_generate() -> TokenizerManager:
+    """Augment the mocked TokenizerManager with what generate_request needs."""
+    tm = _make_tokenizer_manager()
+    tm.server_args.language_only = False
+    tm.server_args.tokenizer_worker_num = 1
+    tm.auto_create_handle_loop = Mock()
+    tm._set_default_priority = Mock()
+    tm.request_logger = Mock()
+    tm.tokenizer = None
+    tm.is_pause = False
+    tm.is_pause_cond = asyncio.Condition()
+    tm.model_update_lock = Mock()
+    tm.model_update_lock.reader_lock = _DummyAsyncCM()
+    tm._validate_and_resolve_lora = AsyncMock(return_value=None)
+    return tm
+
+
+def _make_generate_obj(rid, is_single):
+    obj = MagicMock(spec=GenerateReqInput)
+    obj.routed_dp_rank = None
+    obj.is_single = is_single
+    obj.rid = rid
+    obj.received_time = 0.0
+    obj.external_trace_header = None
+    obj.bootstrap_room = None
+    obj.normalize_batch_and_arguments = Mock()
+    if not is_single:
+        obj.__getitem__.side_effect = lambda i: Mock()
+    return obj
+
+
+class TestDiscardPendingReqStates(CustomTestCase):
+    """Direct tests for _discard_pending_req_states."""
+
+    def test_discard_single(self):
+        tm = _make_tokenizer_manager()
+        rid = "d_single"
+        tm.rid_to_state[rid] = _make_req_state(rid)
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = True
+        obj.rid = rid
+        tm._discard_pending_req_states(obj)
+        self.assertNotIn(rid, tm.rid_to_state)
+
+    def test_discard_batch_removes_all(self):
+        tm = _make_tokenizer_manager()
+        rids = ["d0", "d1", "d2"]
+        for r in rids:
+            tm.rid_to_state[r] = _make_req_state(r)
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = False
+        obj.rid = list(rids)
+        tm._discard_pending_req_states(obj)
+        for r in rids:
+            self.assertNotIn(r, tm.rid_to_state)
+
+    def test_discard_ignores_already_removed(self):
+        """Popping a rid that is no longer present must not raise."""
+        tm = _make_tokenizer_manager()
+        tm.rid_to_state["p1"] = _make_req_state("p1")
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = False
+        obj.rid = ["p1", "already_gone"]
+        tm._discard_pending_req_states(obj)  # must not raise
+        self.assertNotIn("p1", tm.rid_to_state)
+
+
+class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
+    """generate_request must not leak rid_to_state when dispatch fails.
+
+    Regression guard: _init_req_state creates rid_to_state entries up front,
+    and the only remover is the scheduler-response path. A failure before the
+    request reaches the scheduler (e.g. input-length validation rejecting an
+    over-context request) used to leak those entries permanently.
+    """
+
+    def test_single_failure_before_dispatch_cleans_up(self):
+        tm = _make_tm_for_generate()
+        rid = "single_overlen"
+        obj = _make_generate_obj(rid, is_single=True)
+        # Simulate over-length rejection during tokenization/validation.
+        tm._tokenize_one_request = AsyncMock(side_effect=ValueError("input too long"))
+        tm._send_one_request = Mock()
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaises(ValueError):
+            asyncio.run(drive())
+
+        # Got past _init_req_state (which created the entry) ...
+        tm._tokenize_one_request.assert_awaited_once()
+        tm._send_one_request.assert_not_called()
+        # ... and the entry was cleaned up rather than leaked.
+        self.assertNotIn(rid, tm.rid_to_state)
+
+    def test_batch_failure_before_dispatch_cleans_up_all(self):
+        tm = _make_tm_for_generate()
+        rids = ["b0", "b1", "b2"]
+        obj = _make_generate_obj(list(rids), is_single=False)
+
+        # One over-length sub-request makes the whole batch dispatch raise.
+        async def _boom(*args, **kwargs):
+            raise ValueError("input too long")
+            yield  # pragma: no cover  (marks this an async generator)
+
+        tm._handle_batch_request = _boom
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaises(ValueError):
+            asyncio.run(drive())
+
+        # All sub-request entries created by _init_req_state are cleaned up.
+        for r in rids:
+            self.assertNotIn(r, tm.rid_to_state)
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsClient
 from sglang.srt.observability.metrics_collector import StorageMetrics
 

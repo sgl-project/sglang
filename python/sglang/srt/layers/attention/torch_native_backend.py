@@ -7,6 +7,8 @@ from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
@@ -23,10 +25,38 @@ class TorchNativeAttnBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.use_sliding_window_kv_pool = (
+            isinstance(self.token_to_kv_pool, SWAKVPool)
+            and self.token_to_kv_pool.swa_layer_nums > 0
+        )
+        # full->SWA translated out_cache_loc, computed once per forward
+        self.swa_out_cache_loc = None
+
+    @staticmethod
+    def _make_sliding_window_mask(
+        *,
+        q_len: int,
+        kv_len: int,
+        sliding_window_size: int,
+        device: torch.device,
+        query_offset: int = 0,
+    ) -> torch.Tensor:
+        q_pos = torch.arange(
+            query_offset, query_offset + q_len, device=device
+        ).unsqueeze(1)
+        k_pos = torch.arange(kv_len, device=device).unsqueeze(0)
+        return (k_pos <= q_pos) & (k_pos >= q_pos - sliding_window_size)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
-        pass
+        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+            self.swa_out_cache_loc = (
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
+            )
+        else:
+            self.swa_out_cache_loc = None
 
     def _run_sdpa_forward_extend(
         self,
@@ -44,6 +74,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         enable_gqa=False,
         causal=False,
         is_cross_attn=False,
+        sliding_window_size: Optional[int] = None,
     ):
         """Run the extend forward by using torch native sdpa op.
 
@@ -114,14 +145,26 @@ class TorchNativeAttnBackend(AttentionBackend):
                 per_req_key = per_req_key.to(per_req_query.dtype)
                 per_req_value = per_req_value.to(per_req_query.dtype)
 
+            attn_mask = None
+            is_causal = causal
+            if sliding_window_size is not None and sliding_window_size > -1:
+                attn_mask = self._make_sliding_window_mask(
+                    q_len=seq_len_kv,
+                    kv_len=seq_len_kv,
+                    sliding_window_size=sliding_window_size,
+                    device=per_req_query.device,
+                )
+                is_causal = False
+
             per_req_out_redudant = (
                 scaled_dot_product_attention(
                     per_req_query_redudant.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
+                    attn_mask=attn_mask,
                     enable_gqa=enable_gqa,
                     scale=scaling,
-                    is_causal=causal,
+                    is_causal=is_causal,
                 )
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
@@ -144,6 +187,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         enable_gqa=False,
         causal=False,
         is_cross_attn=False,
+        sliding_window_size: Optional[int] = None,
     ):
         """Run the decode forward by using torch native sdpa op.
 
@@ -202,14 +246,27 @@ class TorchNativeAttnBackend(AttentionBackend):
                 per_req_key = per_req_key.to(per_req_query.dtype)
                 per_req_value = per_req_value.to(per_req_query.dtype)
 
+            attn_mask = None
+            is_causal = causal
+            if sliding_window_size is not None and sliding_window_size > -1:
+                attn_mask = self._make_sliding_window_mask(
+                    q_len=seq_len_q,
+                    kv_len=seq_len_kv,
+                    sliding_window_size=sliding_window_size,
+                    device=per_req_query.device,
+                    query_offset=seq_len_kv - seq_len_q,
+                )
+                is_causal = False
+
             per_req_out = (
                 scaled_dot_product_attention(
                     per_req_query.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
+                    attn_mask=attn_mask,
                     enable_gqa=enable_gqa,
                     scale=scaling,
-                    is_causal=causal,
+                    is_causal=is_causal,
                 )
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
@@ -239,7 +296,9 @@ class TorchNativeAttnBackend(AttentionBackend):
             cache_loc = forward_batch.out_cache_loc
 
         if save_kv_cache and k is not None and v is not None:
-            self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            self.token_to_kv_pool.set_kv_buffer(
+                layer, KVWriteLoc(cache_loc, self.swa_out_cache_loc), k, v
+            )
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -265,6 +324,14 @@ class TorchNativeAttnBackend(AttentionBackend):
             enable_gqa=use_gqa,
             causal=causal,
             is_cross_attn=layer.is_cross_attention,
+            sliding_window_size=(
+                layer.sliding_window_size
+                if causal
+                and not layer.is_cross_attention
+                and layer.sliding_window_size is not None
+                and layer.sliding_window_size > -1
+                else None
+            ),
         )
         return o
 
@@ -297,7 +364,9 @@ class TorchNativeAttnBackend(AttentionBackend):
             cache_loc = forward_batch.out_cache_loc
 
         if save_kv_cache and k is not None and v is not None:
-            self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            self.token_to_kv_pool.set_kv_buffer(
+                layer, KVWriteLoc(cache_loc, self.swa_out_cache_loc), k, v
+            )
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -317,6 +386,13 @@ class TorchNativeAttnBackend(AttentionBackend):
             enable_gqa=use_gqa,
             causal=False,
             is_cross_attn=layer.is_cross_attention,
+            sliding_window_size=(
+                layer.sliding_window_size
+                if not layer.is_cross_attention
+                and layer.sliding_window_size is not None
+                and layer.sliding_window_size > -1
+                else None
+            ),
         )
 
         return o

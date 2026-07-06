@@ -90,6 +90,7 @@ class _FakeRunner:
         prefix_slot_ids,
         new_slot_ids,
         req_pool_idx,
+        req=None,
     ):
         self.calls.append(("prefill", req_id))
         return 3000
@@ -110,6 +111,7 @@ class _FakeRunner:
         prefix_slot_ids,
         new_slot_ids,
         req_pool_idx,
+        req=None,
     ):
         import mlx.core as mx
 
@@ -138,6 +140,9 @@ class _FakeReq:
         self.prefix_indices = torch.empty(0, dtype=torch.long)
         self.fill_ids = [0]
         self.req_pool_idx = req_pool_idx
+
+    def get_fill_ids(self):
+        return self.fill_ids
 
 
 class _FakeBatch:

@@ -1,13 +1,20 @@
-include(FetchContent)
-
 # flash_mla
+# sm90 dense decode HEAD_DIM_K=512 support (sgl-project/FlashMLA#9, merged).
 FetchContent_Declare(
     repo-flashmla
-    GIT_REPOSITORY https://github.com/sgl-project/FlashMLA
-    GIT_TAG abb54777d4e08c8054c238f59889b52d4e9f0896
-    GIT_SHALLOW OFF
+    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/05e26647fe840b8baedae486c2d86d5ce4efeb7c.tar.gz
+    URL_HASH SHA256=ce369489bbfc42cdfbba9aa949de0270e64469d530748dea9f4f60b3c69dea9b
 )
 FetchContent_Populate(repo-flashmla)
+
+# flashmla submodule pin: NVIDIA/cutlass @ 147f5673d0c1c3dcf66f78d677fd647e4a020219
+FetchContent_Declare(
+    repo-flashmla-cutlass
+    URL      https://${GITHUB_ARTIFACTORY}/NVIDIA/cutlass/archive/147f5673d0c1c3dcf66f78d677fd647e4a020219.tar.gz
+    URL_HASH SHA256=9f6c53320a85b4a570975e557918cde65168cd311f081920446c238437347dc6
+    SOURCE_DIR ${repo-flashmla_SOURCE_DIR}/csrc/cutlass
+)
+FetchContent_Populate(repo-flashmla-cutlass)
 
 set(FLASHMLA_CUDA_FLAGS
     "--expt-relaxed-constexpr"
@@ -150,6 +157,16 @@ target_compile_options(flashmla_ops PRIVATE
 if(FLASHMLA_ENABLE_SM100)
     target_compile_definitions(flashmla_ops PRIVATE FLASHMLA_ENABLE_SM100)
 endif()
+
+# CUDA 13 moved cuda/std/* under cccl/cuda/std/*. The vendored cutlass routes
+# <cuda/std/...> to <cccl/cuda/std/...> when __CUDACC_VER_MAJOR__ >= 13, so the
+# host C++ TU (compiled by g++, where that macro is unset for the legacy path)
+# needs the cccl include root on the search path.
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0")
+    find_path(FLASHMLA_CCCL_INCLUDE NAMES cuda/std/utility
+        HINTS ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+              ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/cccl)
+endif()
 target_include_directories(flashmla_ops PRIVATE
     ${repo-flashmla_SOURCE_DIR}/csrc
     ${repo-flashmla_SOURCE_DIR}/csrc/kerutils/include
@@ -157,6 +174,7 @@ target_include_directories(flashmla_ops PRIVATE
     ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/
     ${repo-flashmla_SOURCE_DIR}/csrc/cutlass/include
     ${repo-flashmla_SOURCE_DIR}/csrc/cutlass/tools/util/include
+    ${FLASHMLA_CCCL_INCLUDE}
 )
 
 target_link_libraries(flashmla_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)

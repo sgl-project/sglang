@@ -27,7 +27,6 @@ from einops import rearrange
 from transformers.activations import ACT2FN
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import (
@@ -38,8 +37,6 @@ from sglang.srt.layers.attention.vision import (
 )
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -71,6 +68,7 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -96,6 +94,10 @@ logger = logging.getLogger(__name__)
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
+# Below this image count the per-image loop beats the vectorized path (which has a
+# fixed setup cost; measured crossover ~6 on H20); both give the same result.
+_VECTORIZED_VL_POS_EMBED_MIN_IMAGES = 6
+
 
 class Qwen3_VisionMLP(nn.Module):
 
@@ -110,8 +112,8 @@ class Qwen3_VisionMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
+        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
+        self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
         self.linear_fc1 = ColumnParallelLinear(
             in_features,
             hidden_features,
@@ -270,8 +272,8 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         self.norm = norm_layer(
             self.hidden_size if use_postshuffle_norm else context_dim
         )
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
+        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
+        self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
         self.linear_fc1 = ColumnParallelLinear(
             self.hidden_size,
             self.padded_context_dim,
@@ -348,8 +350,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         else:
             self.pos_embed = PPMissingLayer()
 
-        norm_layer = partial(nn.LayerNorm, eps=norm_eps)
-        if is_cpu() and hasattr(vision_config, "original_num_heads"):
+        if _is_cpu and _is_cpu_amx_available:
+            from sglang.srt.layers.layernorm import LayerNorm
+
+            norm_layer = partial(LayerNorm, eps=norm_eps, dtype=self.dtype)
+        else:
+            norm_layer = partial(nn.LayerNorm, eps=norm_eps)
+        if _is_cpu and hasattr(vision_config, "original_num_heads"):
             head_dim = self.hidden_size // vision_config.original_num_heads
         else:
             head_dim = self.hidden_size // self.num_heads
@@ -418,9 +425,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             ]
         )
 
-        self.tp_size = (
-            1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
+        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
         self.graph_runners = graph_runners_dict[self.device.type](self)
 
     @property
@@ -596,6 +601,131 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         return torch.cat(outputs, dim=0)
 
+    def _use_vectorized_pos_embed(self, num_images: int) -> bool:
+        """Use the vectorized path only past a few images.
+
+        It drops the per-image loop but has a fixed setup cost, so the loop is
+        faster for a handful of images. Both give the same result.
+        """
+        return (
+            envs.SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED.get()
+            and num_images >= _VECTORIZED_VL_POS_EMBED_MIN_IMAGES
+        )
+
+    def fast_pos_embed_interpolate_vectorized(self, grid_thw):
+        """Vectorized fast_pos_embed_interpolate_from_list (no per-image loop).
+
+        Same result as the loop version; the cost no longer scales with the number
+        of images.
+        """
+        num_grid_per_side = self.num_grid_per_side
+        m = self.spatial_merge_size
+        dtype = self.dtype
+        device = self.device
+
+        grid_list = grid_thw if isinstance(grid_thw, list) else grid_thw.tolist()
+        ts = [int(g[0]) for g in grid_list]
+        hs = [int(g[1]) for g in grid_list]
+        ws = [int(g[2]) for g in grid_list]
+        num_images = len(grid_list)
+
+        hw_list = [h * w for h, w in zip(hs, ws)]  # base tokens / frame / image
+        thw_list = [t * s for t, s in zip(ts, hw_list)]  # output tokens / image
+        total_hw = sum(hw_list)
+        total_out = sum(thw_list)
+
+        def _exclusive_prefix(sizes):
+            out, acc = [], 0
+            for s in sizes:
+                out.append(acc)
+                acc += s
+            return torch.tensor(out, device=device, dtype=torch.long)
+
+        hw_off = _exclusive_prefix(hw_list)  # image offset in the base layout
+        thw_off = _exclusive_prefix(thw_list)  # image offset in the output layout
+        image_arange = torch.arange(num_images, device=device)
+
+        # --- 1. per base-token image id + local (row, col) (single frame) ---
+        base_image_id = torch.repeat_interleave(
+            image_arange, torch.tensor(hw_list, device=device)
+        )
+        base_local = torch.arange(total_hw, device=device) - hw_off[base_image_id]
+        w_of = torch.tensor(ws, device=device)[base_image_id]
+        row = base_local // w_of
+        col = base_local % w_of
+
+        # per-size linspace LUT (one entry per unique h/w), so images of the same
+        # size share coords without the per-image loop
+        uniq_h, inv_h = torch.unique(
+            torch.tensor(hs, device=device), return_inverse=True
+        )
+        uniq_w, inv_w = torch.unique(
+            torch.tensor(ws, device=device), return_inverse=True
+        )
+        h_luts = [
+            torch.linspace(0, num_grid_per_side - 1, int(h), device=device)
+            for h in uniq_h.tolist()
+        ]
+        w_luts = [
+            torch.linspace(0, num_grid_per_side - 1, int(w), device=device)
+            for w in uniq_w.tolist()
+        ]
+        h_lut_off = _exclusive_prefix([len(x) for x in h_luts])
+        w_lut_off = _exclusive_prefix([len(x) for x in w_luts])
+        h_idxs = torch.cat(h_luts)[h_lut_off[inv_h[base_image_id]] + row]
+        w_idxs = torch.cat(w_luts)[w_lut_off[inv_w[base_image_id]] + col]
+
+        h_floor = h_idxs.to(torch.long)
+        w_floor = w_idxs.to(torch.long)
+        h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
+        w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
+        dh = h_idxs - h_floor
+        dw = w_idxs - w_floor
+        # bilinear weights (same form as ..._from_list)
+        w11 = dh * dw
+        w10 = dh - w11
+        w01 = dw - w11
+        w00 = 1 - dh - w01
+
+        base_h = h_floor * num_grid_per_side
+        base_h_ceil = h_ceil * num_grid_per_side
+        indices = torch.stack(
+            [
+                base_h + w_floor,
+                base_h + w_ceil,
+                base_h_ceil + w_floor,
+                base_h_ceil + w_ceil,
+            ],
+            dim=0,
+        )
+        weights = torch.stack([w00, w01, w10, w11], dim=0).to(dtype=dtype)
+        embeds = self.pos_embed(indices) * weights[:, :, None]
+        base_embeds = embeds.sum(dim=0)  # [total_hw, C]
+
+        # --- 2. temporal repeat (gather) ---
+        out_image_id = torch.repeat_interleave(
+            image_arange, torch.tensor(thw_list, device=device)
+        )
+        pos_in_image = torch.arange(total_out, device=device) - thw_off[out_image_id]
+        hw_of_out = torch.tensor(hw_list, device=device)[out_image_id]
+        frame_idx = pos_in_image // hw_of_out
+        local_idx = pos_in_image % hw_of_out
+        patch = base_embeds[hw_off[out_image_id] + local_idx]  # [total_out, C]
+
+        # --- 3. spatial-merge reorder (scatter) ---
+        all_w = torch.tensor(ws, device=device)[out_image_id]
+        rows = local_idx // all_w
+        cols = local_idx % all_w
+        out_within = (
+            frame_idx * hw_of_out
+            + ((rows // m) * (all_w // m) + (cols // m)) * m * m
+            + (rows % m) * m
+            + (cols % m)
+        )
+        merged = torch.empty_like(patch)
+        merged[out_within + thw_off[out_image_id]] = patch
+        return merged
+
     def add_padding_to_fi_seqlens(
         self, seq: np.ndarray, batch_size: int, padding_value: int
     ) -> np.ndarray:
@@ -766,7 +896,10 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             grid_thw_list = grid_thw.tolist()
             grid_thw = grid_thw.cpu().numpy()
 
-        pos_embeds = self.fast_pos_embed_interpolate_from_list(grid_thw_list)
+        if self._use_vectorized_pos_embed(len(grid_thw_list)):
+            pos_embeds = self.fast_pos_embed_interpolate_vectorized(grid_thw_list)
+        else:
+            pos_embeds = self.fast_pos_embed_interpolate_from_list(grid_thw_list)
         x += pos_embeds
 
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
@@ -947,7 +1080,14 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         else:
             grid_thw_list = grid_thw.tolist()
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        if self.align_corners and self._use_vectorized_pos_embed(len(grid_thw_list)):
+            # The vectorized implementation uses linspace coordinates. In graph mode
+            # the legacy fallback honors enable_precise_embedding_interpolation, so
+            # only use the vectorized path when the active graph interpolation mode
+            # is also linspace; otherwise image count would change the output.
+            pos_embeds = self.fast_pos_embed_interpolate_vectorized(grid_thw_list)
+        else:
+            pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         x += pos_embeds
 
         # rotary embedding -> (cos, sin)
@@ -1138,7 +1278,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                         self.config.vocab_size,
                         self.config.hidden_size,
                         quant_config=quant_config,
-                        use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                        use_attn_tp_group=get_flags().enable_dp_lm_head,
                         prefix=add_prefix("lm_head", prefix),
                     )
             else:

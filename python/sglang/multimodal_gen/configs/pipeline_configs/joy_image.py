@@ -93,7 +93,6 @@ class JoyImageEditPipelineConfig(ImagePipelineConfig):
 
         while height >= step_height:
             if max(height, width) / min(height, width) <= max_ratio:
-                ratio = height / width
                 buckets.append((1, 1, 1, height, width))
             # Try to increase width or decrease height
             if height * (width + step_width) <= target_pixels:

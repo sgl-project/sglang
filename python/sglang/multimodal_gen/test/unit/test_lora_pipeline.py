@@ -27,6 +27,7 @@ def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     pipeline.lora_initialized = True
     pipeline.lora_adapters = defaultdict(dict)
     pipeline.loaded_adapter_paths = {"adapter": "/adapter"}
+    pipeline.loaded_adapter_alphas = {"adapter": None}
     pipeline.cur_adapter_name = {}
     pipeline.cur_adapter_path = {}
     pipeline.cur_adapter_strength = {}
