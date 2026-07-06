@@ -9,12 +9,13 @@ from sgl_kernel import concat_mla_k as aot_k
 from sglang.jit_kernel.benchmark.utils import run_benchmark
 from sglang.jit_kernel.concat_mla import concat_mla_absorb_q as jit_absorb_q
 from sglang.jit_kernel.concat_mla import concat_mla_k as jit_k
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.utils import is_in_ci
 
 register_cuda_ci(
     est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
+register_amd_ci(est_time=6, suite="jit-kernel-unit-test-amd")
 
 IS_CI = is_in_ci()
 

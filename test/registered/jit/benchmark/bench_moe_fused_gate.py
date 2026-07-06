@@ -3,11 +3,12 @@ import torch
 from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.benchmark.utils import create_random
 from sglang.jit_kernel.moe_fused_gate import moe_fused_gate, moe_fused_gate_jit
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=20, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
+register_amd_ci(est_time=20, suite="jit-kernel-unit-test-amd")
 
 
 TOPK = 8
