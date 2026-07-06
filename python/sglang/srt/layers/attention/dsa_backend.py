@@ -630,16 +630,16 @@ class DeepseekSparseAttnBackend(
             metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
 
     def _build_topk_v2_plan(
-        self, seqlens_expanded: torch.Tensor, cache_seqlens_int32: torch.Tensor
+        self, seqlens_expanded: torch.Tensor
     ) -> Optional[torch.Tensor]:
-        # Plan the folded top-k v2 transform once per forward (shared by all
-        # layers), at metadata-build time. The plan is consumed only by the
-        # decode fold (one score row per batch, the shape
-        # `_topk_transform_v2_paged` is dispatched for), so skip other shapes
-        # (prefill / target-verify) and when the fold is disabled.
+        # Preprocess the folded top-k v2 plan once per forward (shared across
+        # layers), at metadata-build time, from the same seqlens the transform
+        # receives as `lengths` (dsa_seqlens_expanded). This must cover EVERY shape
+        # that dispatches to `_topk_transform_v2_paged` -- decode AND MTP
+        # target-verify / draft-extend, whose expanded row count is exactly what v2
+        # sees -- otherwise the helper's plan-present assertion fires. None only
+        # when the fold is disabled; such metadata is never dispatched to v2.
         if not envs.SGLANG_OPT_USE_TOPK_V2.get():
-            return None
-        if seqlens_expanded.shape[0] != cache_seqlens_int32.shape[0]:
             return None
         from sglang.jit_kernel.dsv4.topk import plan_topk_v2
 
@@ -1002,9 +1002,7 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
-            topk_v2_plan=self._build_topk_v2_plan(
-                seqlens_expanded, cache_seqlens_int32
-            ),
+            topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
         )
         self.forward_metadata = metadata
 
@@ -1327,9 +1325,7 @@ class DeepseekSparseAttnBackend(
             dsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
-            topk_v2_plan=self._build_topk_v2_plan(
-                seqlens_expanded, cache_seqlens_int32
-            ),
+            topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
         )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
