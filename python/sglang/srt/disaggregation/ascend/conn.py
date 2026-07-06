@@ -1,4 +1,5 @@
 import concurrent.futures
+import enum
 import logging
 from typing import List, Tuple
 
@@ -16,6 +17,21 @@ from sglang.srt.disaggregation.mooncake.conn import (
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
+
+
+class AscendStateType(str, enum.Enum):
+    """DSV4-on-NPU per-pool PD components, kept out of the cross-hardware
+    StateType enum. Sent via the same page-indexed path as SWA."""
+
+    DSV4_SWA = "dsv4_swa"
+    DSV4_C4 = "dsv4_c4"
+    DSV4_C128 = "dsv4_c128"
+    DSV4_INDEXER = "dsv4_indexer"
+    DSV4_C4_STATE = "dsv4_c4_state"
+    DSV4_C128_STATE = "dsv4_c128_state"
+
+
+_DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
 
 
 class AscendKVManager(MooncakeKVManager):
@@ -42,10 +58,12 @@ class AscendKVManager(MooncakeKVManager):
             self.engine.batch_register(component_ptrs, component_lens)
 
     def get_mla_kv_ptrs_with_pp(
-        self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
+        self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int], state_type=None
     ) -> Tuple[List[int], List[int], int]:
         # src_kv_ptrs: k_data, v_data, index_k_data(optional)
         # dst_kv_ptrs: k_data, v_data, index_k_data(optional)
+        # state_type is accepted for parity with the common disaggregation path;
+        # the NPU kv_buf_groups slicing below is state-type agnostic.
         start_layer = self.kv_args.prefill_start_layer
         kv_buf_groups = getattr(self.kv_args, "kv_buf_groups", 1)
         total_kv_layers = getattr(self.kv_args, "total_kv_layers", 0)
@@ -177,6 +195,13 @@ class AscendKVManager(MooncakeKVManager):
             return process_layers(layers_params)
 
         return 0
+
+    def _is_generic_kvcache_state_type(self, st) -> bool:
+        # DSV4 per-pool components also use the page-indexed send path.
+        return (
+            super()._is_generic_kvcache_state_type(st)
+            or st in _DSV4_KVCACHE_STATE_TYPES
+        )
 
 
 class AscendKVSender(MooncakeKVSender):

@@ -584,9 +584,32 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             last_loc,
             extend_num_tokens,
         )
+        return self._wrap_full_alloc(
+            out_full_loc,
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc.dtype,
+            req_pool_indices,
+            dsv4_state_lens,
+        )
+
+    def _wrap_full_alloc(
+        self,
+        out_full_loc,
+        prefix_lens,
+        prefix_lens_cpu,
+        seq_lens,
+        seq_lens_cpu,
+        loc_dtype,
+        req_pool_indices,
+        dsv4_state_lens,
+    ) -> Optional[DSV4OutCacheLoc]:
+        # Shared tail of alloc_extend / alloc_extend_swa_tail: translate the full
+        # loc to swa, then add the c4/c128(+state) pools into a DSV4OutCacheLoc.
         if out_full_loc is None:
             return None
-
         out_swa_loc = self.translate_loc_from_full_to_swa(out_full_loc)
         assert out_swa_loc is not None, (
             "translate_loc_from_full_to_swa returned None — "
@@ -599,7 +622,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             prefix_lens_cpu,
             seq_lens,
             seq_lens_cpu,
-            last_loc.dtype,
+            loc_dtype,
             req_pool_indices,
             dsv4_state_lens,
         )
@@ -627,6 +650,43 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         return self._alloc_c_and_state(
             out_full_loc,
             out_swa_loc,
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc.dtype,
+            req_pool_indices,
+            dsv4_state_lens,
+        )
+
+    def alloc_extend_swa_tail(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        swa_tail_len: int,
+        *,
+        req_pool_indices: Optional[torch.Tensor] = None,
+        dsv4_state_lens: Optional[DSV4StateLens] = None,
+        req_to_token_pool=None,
+    ) -> Optional[DSV4OutCacheLoc]:
+        """Disagg-decode prealloc variant of :meth:`alloc_extend`: super() does
+        full+swa-tail, then _alloc_c_and_state adds c4/c128(+state) → DSV4OutCacheLoc."""
+        self._cur_req_to_token_pool = req_to_token_pool
+        out_full_loc = super().alloc_extend_swa_tail(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            swa_tail_len,
+        )
+        return self._wrap_full_alloc(
+            out_full_loc,
             prefix_lens,
             prefix_lens_cpu,
             seq_lens,
