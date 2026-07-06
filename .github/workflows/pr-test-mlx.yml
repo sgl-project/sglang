@@ -110,13 +110,7 @@ jobs:
       - name: Run model-free MLX unit tests
         timeout-minutes: 15
         run: |
-          # Explicit file list, intentional. Do not glob: skip guarded tests in
-          # this directory would fake green.
-          uv run python -m pytest -v \
-            test/registered/unit/hardware_backend/mlx/test_runner_init_contract.py \
-            test/registered/unit/hardware_backend/mlx/test_metal_profiler.py \
-            test/registered/unit/hardware_backend/mlx/test_attention_patching.py \
-            "test/registered/unit/hardware_backend/mlx/test_quantization.py::TestMlxQuantizationOverride"
+          uv run python test/run_suite.py --hw mlx --suite stage-a-unit-test-mlx
 
   stage-b-e2e-test-mlx:
     needs: [check-changes, pr-gate]
