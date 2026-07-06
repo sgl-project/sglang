@@ -42,7 +42,8 @@ pub enum RequestState {
 /// Outcome of validation, selecting the ingress branch.
 #[derive(Debug, Clone, Copy)]
 pub enum ValidationOutcome {
-    /// Has multimodal inputs → Encoding (deferred this iteration).
+    /// Has multimodal inputs → Encoding. Deferred: no encoder yet.
+    #[allow(dead_code)]
     HasMultimodal,
     /// Plain text → Tokenizing.
     NeedsTokenize,
@@ -57,17 +58,14 @@ pub enum ValidationOutcome {
 pub enum Event {
     // --- ingress ---
     Validated(ValidationOutcome),
-    /// Generate request's sampling params normalized: Validating → Normalizing.
-    Normalized,
+    NeedsNormalize,
     EncodeDone,
     TokenizeDone,
     /// The pre-send checks passed; the request may be pushed to the ring.
     PreSendValidated,
     SchedulerPicked,
     // --- egress ---
-    Chunk {
-        finish: bool,
-    },
+    Chunk { finish: bool },
     FinalFrameSent,
     // --- terminal (valid from any state) ---
     Error(Error),
@@ -121,7 +119,7 @@ impl RequestState {
             (Received, Validated(_)) => Validating,
             // Generate requests pass through Normalizing (sampling-param
             // normalize/verify); control requests skip straight to Queued.
-            (Validating, Normalized) => Normalizing,
+            (Validating, NeedsNormalize) => Normalizing,
             (Validating, Validated(AlreadyTokenized)) => Queued,
             (Normalizing, Validated(HasMultimodal)) => Encoding,
             (Normalizing, Validated(NeedsTokenize)) => Tokenizing,
