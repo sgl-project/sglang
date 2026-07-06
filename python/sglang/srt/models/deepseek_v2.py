@@ -175,7 +175,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -550,7 +550,7 @@ class DeepseekV2MoE(nn.Module):
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
-        _fusion_disabled = get_global_server_args().disable_shared_experts_fusion
+        _fusion_disabled = get_flags().disable_shared_experts_fusion
 
         # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
         # mlp.shared_experts → mlp.experts.256 when > 0.
@@ -888,7 +888,7 @@ class DeepseekV2MoE(nn.Module):
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
                 and not (
-                    server_args.enable_torch_compile
+                    get_flags().capture.enable_torch_compile
                     and hidden_states.shape[0]
                     <= server_args.torch_compile_max_bs
                     * (server_args.speculative_num_draft_tokens or 1)
@@ -1454,6 +1454,14 @@ class DeepseekV2MoE(nn.Module):
         router_logits = state.pop("router_logits")
         hidden_states = state.hidden_states_mlp_input
 
+        # Hash MoE layers (e.g. DeepSeek-V4) route on input_ids; forward_deepep
+        # passes them as a topk kwarg. The per-ubatch forward_batch.input_ids is
+        # already sliced+padded to match hidden_states rows (and equals the
+        # global ids under EP dp-attention). No-op for non-hash models.
+        topk_kwargs = {}
+        if getattr(self, "is_hash", False):
+            topk_kwargs["input_ids"] = state.forward_batch.input_ids
+
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
@@ -1465,6 +1473,7 @@ class DeepseekV2MoE(nn.Module):
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
                     ),
+                    **topk_kwargs,
                 )
         else:
             state.topk_output = self.topk.empty_topk_output(
@@ -2668,7 +2677,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_flags().enable_dp_lm_head,
                 )
         else:
             # ranks other than the last rank will have a placeholder layer
@@ -2707,7 +2716,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.num_fused_shared_experts = 0
         server_args = get_global_server_args()
 
-        if server_args.disable_shared_experts_fusion:
+        if get_flags().disable_shared_experts_fusion:
             return
 
         disable_reason = None
@@ -2758,7 +2767,12 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
 
         if disable_reason is not None:
-            server_args.disable_shared_experts_fusion = True
+            from sglang.srt.arg_groups.overrides import declare_load_time_override
+
+            declare_load_time_override(
+                "DeepseekV2ForCausalLM.determine_num_fused_shared_experts",
+                {"disable_shared_experts_fusion": True},
+            )
             self.num_fused_shared_experts = 0
             log_info_on_rank0(
                 logger,
