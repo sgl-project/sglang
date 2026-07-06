@@ -170,6 +170,18 @@ class ServerArgs(DisaggServerArgsMixin):
     # number of GPUs in each CFG parallel group (None = auto, 1 = disabled, N > 1 = enabled)
     cfg_parallel_degree: Optional[int] = None
 
+    # How to parallelize replicated text/image encoders across a multi-rank
+    # single replica (tp==1, dp==1). Folding shards the encoder weights
+    # (model-parallel); dp/replicate keep a full copy per rank -- mutually
+    # exclusive at load time. See finalize_encoder_folding / _text_encode_dp_group.
+    #   "auto"      - fold encoders wide enough to benefit (best single-request
+    #                 latency); replicate the rest and data-parallel the batch
+    #                 when batch>1 (best batched throughput).
+    #   "fold"      - force tensor-parallel folding wherever dims divide the group.
+    #   "dp"        - force replicate + data-parallel the batch (suppresses folding).
+    #   "replicate" - force replicate, no data-parallel (redundant; debugging).
+    encoder_parallel: str = "auto"
+
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
     dist_timeout: int | None = 3600  # 1 hour
@@ -438,6 +450,10 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def adjust_pipeline_config(self):
         # 1. adjust for encoder parallel folding
+        # dp/replicate never fold: leave every encoder replicated (mode=None) and
+        # let the encode stage data-parallel (dp) or redundantly encode (replicate).
+        if getattr(self, "encoder_parallel", "auto") in ("dp", "replicate"):
+            return
         tp_size = self.tp_size or 1
         dp_size = self.dp_size or 1
         sp_degree = self.sp_degree or 1
@@ -1261,6 +1277,19 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=ServerArgs.ring_degree,
             help="Ring sequence parallel degree. Used in attention layer.",
+        )
+        parser.add_argument(
+            "--encoder-parallel",
+            type=str,
+            choices=["auto", "fold", "dp", "replicate"],
+            default=ServerArgs.encoder_parallel,
+            help=(
+                "How to parallelize replicated text/image encoders across a "
+                "multi-rank single replica. 'auto' (default) folds wide encoders "
+                "and data-parallels the rest at batch>1; 'fold' forces "
+                "model-parallel folding; 'dp' forces replicate + data-parallel; "
+                "'replicate' keeps a redundant full copy per rank."
+            ),
         )
         parser.add_argument(
             "--enable-cfg-parallel",

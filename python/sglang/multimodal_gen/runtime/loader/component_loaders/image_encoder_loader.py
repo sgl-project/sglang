@@ -50,9 +50,9 @@ class ImageEncoderLoader(TextEncoderLoader):
 
         encoder_config = server_args.pipeline_config.image_encoder_config
         encoder_config.update_model_arch(model_config)
-        # Keep the proposed fold group only if the encoder is wide enough
-        # (image encoders are small, so this normally reverts to replicated).
-        finalize_encoder_folding(encoder_config)
+        # Resolve fold vs replicate for the encoder_parallel policy (image
+        # encoders are small, so "auto" normally reverts to replicated).
+        finalize_encoder_folding(encoder_config, server_args.encoder_parallel)
 
         # Always start with local device; load_model will adjust for offload if needed
         # TODO(will): add support for other dtypes
