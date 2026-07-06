@@ -566,7 +566,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    @torch.compile(disable=current_platform.is_npu())
+    @torch.compile(disable=current_platform.is_npu() or current_platform.is_hip())
     def forward_native(
         self,
         residual: torch.Tensor,
@@ -734,7 +734,7 @@ class _NormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    @torch.compile(disable=current_platform.is_npu())
+    @torch.compile(disable=current_platform.is_npu() or current_platform.is_hip())
     def forward_native(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
@@ -831,7 +831,7 @@ class _NormTanhMulAdd(CustomOp):
         # Fallback to native because ROCm does not support CuTeDSL.
         return self.forward_native(*args, **kwargs)
 
-    @torch.compile(disable=current_platform.is_npu())
+    @torch.compile(disable=current_platform.is_npu() or current_platform.is_hip())
     def forward_native(
         self, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
     ) -> torch.Tensor:
