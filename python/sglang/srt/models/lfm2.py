@@ -477,6 +477,10 @@ class Lfm2ForCausalLM(nn.Module):
         elif module_name == "in_proj":
             # ShortConv in_proj: hidden -> 3*hidden (B, C, x gates stacked)
             return config.hidden_size, 3 * config.hidden_size
+        elif module_name == "embed_tokens":
+            return config.vocab_size, config.hidden_size
+        elif module_name == "lm_head":
+            return config.hidden_size, config.vocab_size
         else:
             raise NotImplementedError(
                 f"get_hidden_dim not implemented for {module_name}"
