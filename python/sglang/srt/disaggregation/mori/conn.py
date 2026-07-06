@@ -325,6 +325,15 @@ class MoriKVManager(CommonKVManager):
         self._debug_register_transfer_windows = _is_env_enabled(
             "SGLANG_MORI_DEBUG_REGISTER_TRANSFER_WINDOWS"
         )
+        self._debug_register_remote_kv_windows = _is_env_enabled(
+            "SGLANG_MORI_DEBUG_REGISTER_REMOTE_KV_WINDOWS"
+        )
+        self._debug_transfer_window_offset = int(
+            os.getenv("SGLANG_MORI_DEBUG_TRANSFER_WINDOW_OFFSET", "262144")
+        )
+        self._debug_transfer_window_len = int(
+            os.getenv("SGLANG_MORI_DEBUG_TRANSFER_WINDOW_LEN", "65536")
+        )
         self._debug_transfer_window_descs: List[MemoryDesc] = []
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -398,10 +407,23 @@ class MoriKVManager(CommonKVManager):
         for i, (ptr, length) in enumerate(
             zip(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
         ):
+            register_ptr = ptr
+            register_len = length
+            if (
+                self._debug_register_remote_kv_windows
+                and self.disaggregation_mode == DisaggregationMode.DECODE
+                and self._debug_transfer_window_offset < length
+            ):
+                register_ptr = ptr + self._debug_transfer_window_offset
+                register_len = min(
+                    self._debug_transfer_window_len,
+                    length - self._debug_transfer_window_offset,
+                )
             if trace_kv_pd:
                 logger.warning(
                     "[dsv4-kv-pd] mori register local kv mode=%s idx=%s "
-                    "name=%s ptr=0x%x len=%s item=%s gpu=%s",
+                    "name=%s ptr=0x%x len=%s item=%s gpu=%s "
+                    "registered_ptr=0x%x registered_len=%s",
                     self.disaggregation_mode.value,
                     i,
                     kv_names[i] if i < len(kv_names) else f"idx{i}",
@@ -409,10 +431,12 @@ class MoriKVManager(CommonKVManager):
                     length,
                     kv_item_lens[i] if i < len(kv_item_lens) else None,
                     self.kv_args.gpu_id,
+                    register_ptr,
+                    register_len,
                 )
             mem_desc = self.engine.register_memory(
-                ptr,
-                length,
+                register_ptr,
+                register_len,
                 self.kv_args.gpu_id,
                 MemoryLocationType.GPU,
             )
@@ -456,18 +480,18 @@ class MoriKVManager(CommonKVManager):
 
     def _maybe_register_debug_transfer_window(
         self, src_desc: MemoryDesc, plan: BatchTransferPlan
-    ) -> tuple[MemoryDesc, List[int]]:
+    ) -> tuple[MemoryDesc, List[int], List[int]]:
         if not self._debug_register_transfer_windows:
-            return src_desc, plan.local_offsets
+            return src_desc, plan.local_offsets, plan.remote_offsets
 
         src_idx = self._local_kv_desc_index(src_desc)
         if src_idx is None or not plan.local_offsets:
-            return src_desc, plan.local_offsets
+            return src_desc, plan.local_offsets, plan.remote_offsets
 
         data_ptrs = list(getattr(self.kv_args, "kv_data_ptrs", []) or [])
         data_lens = list(getattr(self.kv_args, "kv_data_lens", []) or [])
         if src_idx >= len(data_ptrs) or src_idx >= len(data_lens):
-            return src_desc, plan.local_offsets
+            return src_desc, plan.local_offsets, plan.remote_offsets
 
         window_start = min(plan.local_offsets)
         window_end = max(
@@ -480,7 +504,7 @@ class MoriKVManager(CommonKVManager):
         aligned_end = min(aligned_end, data_lens[src_idx])
         window_len = aligned_end - aligned_start
         if window_len <= 0:
-            return src_desc, plan.local_offsets
+            return src_desc, plan.local_offsets, plan.remote_offsets
 
         window_desc = self.engine.register_memory(
             data_ptrs[src_idx] + aligned_start,
@@ -493,10 +517,30 @@ class MoriKVManager(CommonKVManager):
         local_offsets = [
             local_offset - aligned_start for local_offset in plan.local_offsets
         ]
+        if self._debug_register_remote_kv_windows:
+            remote_base = self._debug_transfer_window_offset
+            remote_offsets = [
+                remote_offset - remote_base for remote_offset in plan.remote_offsets
+            ]
+            min_remote = min(remote_offsets) if remote_offsets else None
+            max_remote_end = (
+                max(
+                    remote_offset + size
+                    for remote_offset, size in zip(remote_offsets, plan.sizes)
+                )
+                if remote_offsets
+                else None
+            )
+        else:
+            remote_base = None
+            remote_offsets = plan.remote_offsets
+            min_remote = None
+            max_remote_end = None
         logger.warning(
             "[dsv4-kv-pd] mori debug transfer window mode=%s src_idx=%s "
             "src_name=%s base=0x%x len=%s original_len=%s "
             "window_start=%s window_end=%s aligned_start=%s aligned_end=%s "
+            "remote_base=%s remote_min=%s remote_max_end=%s "
             "chunks=%s transfer_bytes=%s",
             self.disaggregation_mode.value,
             src_idx,
@@ -508,10 +552,13 @@ class MoriKVManager(CommonKVManager):
             window_end,
             aligned_start,
             aligned_end,
+            remote_base,
+            min_remote,
+            max_remote_end,
             len(plan.sizes),
             sum(plan.sizes),
         )
-        return window_desc, local_offsets
+        return window_desc, local_offsets, remote_offsets
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
         current = self.request_status.get(bootstrap_room)
@@ -867,14 +914,14 @@ class MoriKVManager(CommonKVManager):
                 transfer_uid,
             )
 
-        batch_src_desc, batch_local_offsets = (
+        batch_src_desc, batch_local_offsets, batch_remote_offsets = (
             self._maybe_register_debug_transfer_window(src_desc, plan)
         )
         statuses = self.engine.batch_write(
             [batch_src_desc],
             [batch_local_offsets],
             [dst_desc],
-            [plan.remote_offsets],
+            [batch_remote_offsets],
             [plan.sizes],
             [transfer_uid],
         )

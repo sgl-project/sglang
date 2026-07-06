@@ -247,6 +247,9 @@ if [[ "$MODEL_PREFIX" == "dsv4flash" ]]; then
       -e SGLANG_DSV4_TRACE_KV_PD=1
       -e SGLANG_DSV4_TRACE_KV_PD_TARGET_LEN=7345537024
       -e SGLANG_MORI_DEBUG_REGISTER_TRANSFER_WINDOWS=1
+      -e SGLANG_MORI_DEBUG_REGISTER_REMOTE_KV_WINDOWS=1
+      -e SGLANG_MORI_DEBUG_TRANSFER_WINDOW_OFFSET=262144
+      -e SGLANG_MORI_DEBUG_TRANSFER_WINDOW_LEN=65536
       -e SGLANG_DSV4_DEBUG_PROBE_ONLY=1
     )
 fi
@@ -480,6 +483,7 @@ PIP=\$1; DIP=\$2
 docker rm -f mi355x_bench 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_bench \
   -e PIP=\$PIP -e DIP=\$DIP \
+  -e SGLANG_DSV4_DEBUG_PROBE_ONLY=$DSV4_DEBUG_PROBE_ONLY \
   $IMAGE bash -lc '
     CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
     bash \$CIDIR/install_checkout_sglang.sh
