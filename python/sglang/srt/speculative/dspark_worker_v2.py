@@ -3164,6 +3164,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         prefix_lens: torch.Tensor,
         fallback_tokens: torch.Tensor,
+        prefer_fallback_tokens: Optional[torch.Tensor] = None,
         bs: int,
         device: torch.device,
     ) -> torch.Tensor:
@@ -3181,14 +3182,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             if fallback_tokens.numel() == bs
             else None
         )
+        prefer_fallback_list = (
+            prefer_fallback_tokens.detach().cpu().tolist()
+            if prefer_fallback_tokens is not None
+            and prefer_fallback_tokens.numel() == bs
+            else [False] * bs
+        )
         anchors = []
         for i in range(bs):
             token = None
+            if bool(prefer_fallback_list[i]) and fallback_list is not None:
+                token = int(fallback_list[i])
             req = reqs[i] if i < len(reqs) else None
             prefix_len_i = (
                 int(prefix_lens_list[i]) if i < len(prefix_lens_list) else None
             )
-            if req is not None:
+            if token is None and req is not None:
                 try:
                     origin = getattr(req, "origin_input_ids", []) or []
                     output = getattr(req, "output_ids", []) or []
@@ -3466,10 +3475,30 @@ class DSparkWorkerV2(BaseSpecWorker):
         anchor_lens = (prefix_lens.to(torch.int64) - 1).clamp_min(0)
         req_pool_indices = model_worker_batch.req_pool_indices
 
+        prefill_tail_mask = getattr(draft_input, "prefill_tail_valid_mask", None)
+        if (
+            isinstance(prefill_tail_mask, torch.Tensor)
+            and prefill_tail_mask.ndim >= 2
+            and prefill_tail_mask.shape[0] == bs
+        ):
+            has_prefill_tail_payload = prefill_tail_mask.to(
+                device=device, dtype=torch.bool
+            ).any(dim=1)
+        else:
+            has_prefill_tail_payload = torch.zeros(
+                (bs,), dtype=torch.bool, device=device
+            )
+        if draft_input.bonus_tokens.numel() == bs:
+            prefer_fallback_anchor = ~has_prefill_tail_payload
+        else:
+            prefer_fallback_anchor = torch.zeros(
+                (bs,), dtype=torch.bool, device=device
+            )
         anchor_tokens = self._get_decode_anchor_tokens(
             batch=model_worker_batch,
             prefix_lens=prefix_lens,
             fallback_tokens=draft_input.bonus_tokens,
+            prefer_fallback_tokens=prefer_fallback_anchor,
             bs=bs,
             device=device,
         )
