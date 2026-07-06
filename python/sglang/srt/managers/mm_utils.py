@@ -562,7 +562,9 @@ def maybe_shard_items_for_dp_encoder(
         return None
 
     try:
-        server_args = get_global_server_args()
+        from sglang.srt.runtime_context import get_server_args
+
+        server_args = get_server_args()
     except Exception:
         return None
     if server_args is None or not getattr(server_args, "mm_enable_dp_encoder", False):

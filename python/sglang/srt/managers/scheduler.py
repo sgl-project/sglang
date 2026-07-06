@@ -1984,12 +1984,7 @@ class Scheduler(
         # DP-encoder CPU-side sharding: drop ``item.feature`` for items not
         # owned by this rank so the subsequent H2D only ships local data.
         if image_inputs is not None and image_inputs.mm_items:
-            try:
-                maybe_shard_items_for_dp_encoder(image_inputs.mm_items)
-            except Exception as e:
-                logger.warning(
-                    f"DP-encoder scheduler-side mm sharding skipped due to: {e}"
-                )
+            maybe_shard_items_for_dp_encoder(image_inputs.mm_items)
 
         return image_inputs
 

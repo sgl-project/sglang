@@ -534,67 +534,38 @@ def run_dp_sharded_mrope_vision_model(
     # patches_per_image = [0, 1000, 1100, 1300, 1350]
     cum_patches_per_image = [0, *itertools.accumulate(patches_per_image)]
 
-    if local_item_indices is not None:
-        # The caller already sharded pixel_values (e.g. scheduler-side early
-        # dispatch). Derive the full rank assignment directly from
-        # local_item_indices instead of recomputing the LB -- the scheduler may
-        # have used a different (larger) item set for its LB decision, so
-        # recomputing here on a subset would give inconsistent results.
-        all_indices = set(range(len(grid_thw_list)))
-        local_set = set(local_item_indices)
-        other_indices = sorted(all_indices - local_set)
+    # Always compute the deterministic LB assignment from the full
+    # grid_thw_list so every rank agrees on per-rank metadata (needed for
+    # all-gather padding and output reassembly).
+    image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len = (
+        get_dp_encoder_lb_assignment(patches_per_image, tp_size)
+    )
+    cum_gpu_sample_counts = [0, *itertools.accumulate(gpu_sample_counts)]
 
-        rank_image_order: list[list[int]] = [[] for _ in range(tp_size)]
-        rank_image_order[tp_rank_local] = list(local_item_indices)
-        if tp_size == 2:
-            other_rank = 1 - tp_rank_local
-            rank_image_order[other_rank] = other_indices
-        else:
-            # For tp_size > 2, distribute remaining items round-robin among
-            # other ranks (best-effort; exact match requires communication).
-            other_ranks = [r for r in range(tp_size) if r != tp_rank_local]
-            for i, idx in enumerate(other_indices):
-                rank_image_order[other_ranks[i % len(other_ranks)]].append(idx)
-
-        gpu_sample_counts = [len(rank_image_order[r]) for r in range(tp_size)]
-        grouped_pixel_values_len = [
-            sum(patches_per_image[i] for i in rank_image_order[r])
-            for r in range(tp_size)
+    rank_image_order: list[list[int]] = []
+    for rank in range(tp_size):
+        idxs = image_to_tp_rank[
+            cum_gpu_sample_counts[rank] : cum_gpu_sample_counts[rank + 1]
         ]
+        rank_image_order.append(sorted(idxs))
 
-        image_idxs_local = local_item_indices
+    image_idxs_local = rank_image_order[tp_rank_local]
+
+    if local_item_indices is not None:
         pixel_values_local = pixel_values
-    else:
-        # Legacy path: compute LB and slice pixel_values locally.
-        image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len = (
-            get_dp_encoder_lb_assignment(patches_per_image, tp_size)
-        )
-        cum_gpu_sample_counts = [0, *itertools.accumulate(gpu_sample_counts)]
-
-        rank_image_order: list[list[int]] = []
-        for rank in range(tp_size):
-            idxs = image_to_tp_rank[
-                cum_gpu_sample_counts[rank] : cum_gpu_sample_counts[rank + 1]
+    elif len(image_idxs_local) > 0:
+        pixel_values_local = torch.cat(
+            [
+                pixel_values[cum_patches_per_image[i] : cum_patches_per_image[i + 1]]
+                for i in image_idxs_local
             ]
-            rank_image_order.append(sorted(idxs))
-
-        image_idxs_local = rank_image_order[tp_rank_local]
-
-        if len(image_idxs_local) > 0:
-            pixel_values_local = torch.cat(
-                [
-                    pixel_values[
-                        cum_patches_per_image[i] : cum_patches_per_image[i + 1]
-                    ]
-                    for i in image_idxs_local
-                ]
-            )
-        else:
-            pixel_values_local = torch.empty(
-                (0, pixel_values.shape[1]),
-                device=pixel_values.device,
-                dtype=pixel_values.dtype,
-            )
+        )
+    else:
+        pixel_values_local = torch.empty(
+            (0, pixel_values.shape[1]),
+            device=pixel_values.device,
+            dtype=pixel_values.dtype,
+        )
     # embed_dim_reduction_factor = 2 * 2
     if rope_type == "rope_2d":
         embed_dim_reduction_factor = (
