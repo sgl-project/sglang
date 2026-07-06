@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::error::Error;
 use crate::fsm::Event;
-use crate::message::{EgressItem, Request, RequestKind};
+use crate::message::{Request, RequestKind};
 use crate::runtime::Runnable;
 use crate::runtime::channels::TmEvent;
 
@@ -26,17 +26,10 @@ pub trait TextTokenizer: Send + Sync {
     fn encode(&self, text: &str) -> Result<Vec<i32>, Error>;
 }
 
-/// Load the tokenizer shared by the tokenizer pool (encode) and the detok shards
-/// (decode). `None` under `skip_tokenizer_init`; otherwise a real tokenizer is
-/// required, so a missing path or a failed load is an `Err` (the detok backend
-/// defaults to `Dynamo` — `Skip` is reserved for skip mode). Loaded once and
-/// shared (it is `Clone`/Arc-backed) by both pools.
-///
-/// `tokenizer_path` may be:
-///   * a tokenizer file (`tokenizer.json` for HF, `.model`/`.tiktoken`),
-///   * a model directory containing `tokenizer.json`, or
-///   * an HF Hub repo id (e.g. `Qwen/Qwen3-0.6B-FP8`) — resolved to its
-///     already-downloaded local `tokenizer.json` via the HF cache (no network).
+/// Load the tokenizer shared (Arc-backed) by the encode pool and detok shards.
+/// `None` under `skip_tokenizer_init`, else required (missing/failed load → `Err`).
+/// `tokenizer_path` is a tokenizer file, a model dir, or an HF Hub repo id
+/// (resolved from the local cache — no network).
 pub fn load_tokenizer(
     tokenizer_path: Option<&str>,
     revision: Option<&str>,
@@ -58,10 +51,8 @@ pub fn load_tokenizer(
     Ok(Some(tokenizer))
 }
 
-/// Resolve a model file (`tokenizer.json`, `tokenizer_config.json`, …) given the
-/// configured tokenizer source: a directory → `dir/<file>`; a tokenizer file →
-/// its parent dir; otherwise an HF Hub repo id → the local HF cache. `None` when
-/// the file can't be located.
+/// Resolve a model file from the tokenizer source: a dir → `dir/<file>`, a file →
+/// its sibling, else an HF Hub repo id → the local cache. `None` if not found.
 pub fn resolve_model_file(path: &str, revision: Option<&str>, filename: &str) -> Option<String> {
     let p = Path::new(path);
     if p.is_dir() {
@@ -69,18 +60,16 @@ pub fn resolve_model_file(path: &str, revision: Option<&str>, filename: &str) ->
         return f.is_file().then(|| f.to_string_lossy().into_owned());
     }
     if p.is_file() {
-        // `path` is e.g. a `tokenizer.json`; look for the sibling next to it.
+        // `path` is a file (e.g. `tokenizer.json`); look for the sibling.
         let f = p.parent()?.join(filename);
         return f.is_file().then(|| f.to_string_lossy().into_owned());
     }
-    // Not a local path → treat as an HF Hub repo id (offline cache lookup).
+    // Not a local path → HF Hub repo id (offline cache lookup).
     resolve_from_hub_cache(path, revision, filename)
 }
 
-/// Locate a file for an HF Hub repo id in the local cache (shared with
-/// `huggingface_hub` via `HF_HOME`). The scheduler downloads the model before
-/// the server starts, so the file is already present — this does no network I/O
-/// and pulls no TLS/openssl deps. `None` if the file isn't cached.
+/// Locate a file for an HF Hub repo id in the local cache (`HF_HOME`). Offline —
+/// the scheduler pre-downloads the model. `None` if not cached.
 fn resolve_from_hub_cache(repo_id: &str, revision: Option<&str>, filename: &str) -> Option<String> {
     use hf_hub::{Cache, Repo, RepoType};
 
@@ -95,8 +84,7 @@ fn resolve_from_hub_cache(repo_id: &str, revision: Option<&str>, filename: &str)
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-/// Real tokenizer backed by dynamo-tokenizers, wrapping an already-loaded
-/// `Tokenizer` (Arc inside, cheap to clone into every worker).
+/// Real tokenizer over an already-loaded dynamo `Tokenizer` (Arc inside).
 pub struct DynamoTokenizer {
     inner: dynamo_tokenizers::Tokenizer,
 }
@@ -110,26 +98,21 @@ impl DynamoTokenizer {
 impl TextTokenizer for DynamoTokenizer {
     fn encode(&self, text: &str) -> Result<Vec<i32>, Error> {
         if text.is_empty() {
-            // Match Python sglang: an empty prompt is a client error on both
-            // `/generate` (`_tokenize_texts`: "texts cannot be empty") and
-            // `/v1/completions` ("Prompt cannot be empty"). It does NOT adopt
-            // OpenAI's empty→`<|endoftext|>` convention, so reject — but as a 400
-            // (`Validation`) rather than the misleading 500 a tokenize error gives.
+            // Match Python sglang: reject an empty prompt as a 400 (`Validation`),
+            // not the misleading 500 a tokenize error would give.
             return Err(Error::Validation("prompt cannot be empty".into()));
         }
         let encoding = self
             .inner
             .encode(text)
             .map_err(|e| Error::Tokenize(e.to_string()))?;
-        // Vocab ids are non-negative and fit in i32 for the msgpack payload.
+        // Vocab ids are non-negative and fit in i32.
         Ok(encoding.token_ids().iter().map(|&id| id as i32).collect())
     }
 }
 
-/// One tokenizer worker: pulls a `Request` off the shared MPMC inbox, fills its
-/// `input_ids`, and returns it to the TokenizerManager. Spawned (pinned) per
-/// worker as a [`Runnable`]; the `tokenizer` backend is shared read-only across
-/// all workers.
+/// One tokenizer worker: pulls a `Request` off the shared inbox, fills
+/// `input_ids`, returns it to the TokenizerManager. Pinned; backend shared.
 pub struct TokenizerWorker {
     rx: flume::Receiver<Request>,
     tm: flume::Sender<TmEvent>,
@@ -149,27 +132,28 @@ impl TokenizerWorker {
 impl Runnable for TokenizerWorker {
     fn run(self) {
         while let Ok(mut req) = self.rx.recv() {
-            // The tokenizer pool only ever receives generate requests (control
-            // requests skip tokenization in the ingress `classify`).
-            let RequestKind::Generate(g) = &mut req.kind else {
-                tracing::error!("tokenizer pool received a non-generate request");
-                continue;
-            };
-            match self
-                .tokenizer
-                .encode(g.payload.text.as_deref().unwrap_or(""))
-            {
-                Ok(ids) => {
-                    g.input_ids = Some(ids);
-                    if self.tm.send(TmEvent::Tokenized(req)).is_err() {
-                        tracing::error!("tm inbox closed; dropping tokenized request");
-                        break;
+            // The tokenizer pool only ever receives generate requests. Encode,
+            // then advance the FSM: `TokenizeDone` on success.
+            let event = {
+                let RequestKind::Generate(g) = &mut req.kind else {
+                    tracing::error!("tokenizer pool received a non-generate request");
+                    continue;
+                };
+                match self
+                    .tokenizer
+                    .encode(g.payload.text.as_deref().unwrap_or(""))
+                {
+                    Ok(ids) => {
+                        g.input_ids = Some(ids);
+                        Event::TokenizeDone
                     }
+                    Err(err) => Event::Error(err),
                 }
-                Err(e) => {
-                    let _ = req.state.apply(Event::Error(e.clone()));
-                    let _ = req.sink.try_send(EgressItem::Error(e));
-                }
+            };
+            let _ = req.state.apply(event);
+            if self.tm.send(TmEvent::Tokenized(req)).is_err() {
+                tracing::error!("tm inbox closed; dropping request");
+                break;
             }
         }
     }

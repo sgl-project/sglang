@@ -258,7 +258,8 @@ impl GeneratePayload {
     }
 
     /// Multimodal detection hook. Deferred this iteration (Encoder stubbed):
-    /// always false until mm fields are wired in.
+    /// always false until mm fields are wired in. Unused for now.
+    #[allow(dead_code)]
     pub fn has_multimodal(&self) -> bool {
         false
     }

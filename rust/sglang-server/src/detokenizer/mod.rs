@@ -162,6 +162,9 @@ impl Runnable for DetokenizerWorker {
                 DetokMsg::Chunk(ev) => handle_chunk(&mut table, ev, &self.backend),
                 DetokMsg::Result { id, payload } => handle_result(&mut table, id, payload),
                 DetokMsg::Fail { id, message } => handle_fail(&mut table, id, message),
+                DetokMsg::Deregister { id } => {
+                    table.remove(&id);
+                }
             }
         }
     }
