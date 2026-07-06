@@ -3,6 +3,13 @@ name: PR Test (MLX)
 on:
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      target_stage:
+        description: "Specific test stage to run (Optional)"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: pr-test-mlx-${{ github.ref }}
@@ -14,7 +21,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       changes_exist: ${{ steps.filter.outputs.main_package == 'true'
-        || steps.filter.outputs.sgl_kernel == 'true' }}
+        || steps.filter.outputs.sgl_kernel == 'true'
+        || inputs.target_stage != '' }}
       main_package: ${{ steps.filter.outputs.main_package }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
     steps:
@@ -25,6 +33,8 @@ jobs:
         id: filter
         uses: dorny/paths-filter@v3
         with:
+          # Ignored on pull_request; required on workflow_dispatch, which has no PR base to diff against.
+          base: main
           filters: |
             main_package:
               - "python/sglang/!(multimodal_gen)/**/!(*.md)"
@@ -41,9 +51,20 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
 
-  mlx-unit-test:
+  # ==================== Stage A ==================== #
+  stage-a-unit-test-mlx:
     needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true'
+    # !cancelled() lets workflow_dispatch reach this job even when pr-gate
+    # skips on the non-PR event; the pull_request path still requires pr-gate
+    # success, so the run-ci label gate stays intact.
+    if: |
+      !cancelled() && (
+        (needs.pr-gate.result == 'success' &&
+          (needs.check-changes.outputs.main_package == 'true' ||
+           needs.check-changes.outputs.sgl_kernel == 'true')) ||
+        (github.event_name == 'workflow_dispatch' &&
+         inputs.target_stage == 'stage-a-unit-test-mlx')
+      )
     runs-on: macos-26
     timeout-minutes: 60
     env:
@@ -91,6 +112,7 @@ jobs:
       - name: Run model-free MLX unit tests
         timeout-minutes: 15
         run: |
+          # Intentionally explicit file list; do not replace with a directory glob.
           uv run python -m pytest -v \
             test/registered/unit/hardware_backend/mlx/test_runner_init_contract.py \
             test/registered/unit/hardware_backend/mlx/test_metal_profiler.py \
@@ -98,16 +120,25 @@ jobs:
             "test/registered/unit/hardware_backend/mlx/test_quantization.py::TestMlxQuantizationOverride"
 
   pr-test-mlx-finish:
-    needs: [mlx-unit-test]
+    needs:
+      [
+        pr-gate,
+        check-changes,
+        stage-a-unit-test-mlx,
+      ]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Check dependent job status
+      - name: Check all dependent job statuses
         run: |
-          result="${{ needs.mlx-unit-test.result }}"
-          echo "mlx-unit-test: $result"
-          if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
-            echo "The MLX unit-test job failed."
-            exit 1
-          fi
+          json_needs='${{ toJson(needs) }}'
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+          for job in $job_names; do
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+            echo "$job: $result"
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "The above jobs failed."
+              exit 1
+            fi
+          done
           echo "All jobs completed successfully"
