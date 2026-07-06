@@ -1189,6 +1189,10 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
+    # Number of indexer layers, set when indexer_topk is non-empty. The
+    # rollout-indexer-replay consumer needs the layer count to reshape the
+    # flattened per-token topk back into (token, layer, topk).
+    indexer_topk_num_layers: Optional[int] = None
     # Multimodal prompt token counts (image/audio/video). None when not applicable.
     image_tokens: Optional[List[int]] = None
     audio_tokens: Optional[List[int]] = None
@@ -1257,6 +1261,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
+    # Number of indexer layers, set when indexer_topk is non-empty (see
+    # BatchTokenIDOutput.indexer_topk_num_layers).
+    indexer_topk_num_layers: Optional[int] = None
     # Multimodal prompt token counts (image/audio/video). None when not applicable.
     image_tokens: Optional[List[int]] = None
     audio_tokens: Optional[List[int]] = None

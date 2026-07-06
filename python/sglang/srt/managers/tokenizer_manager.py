@@ -1936,6 +1936,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if isinstance(val, torch.Tensor):
                         val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
                     meta_info["indexer_topk"] = val
+                    n = getattr(recv_obj, "indexer_topk_num_layers", None)
+                    if n is not None:
+                        meta_info["indexer_topk_num_layers"] = n
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 

@@ -506,6 +506,15 @@ class _GenerationStreamAccumulator:
         if not (has_reqs or is_idle_batch):
             return None
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
+        indexer_topk_num_layers = None
+        if self.return_indexer_topk:
+            from sglang.srt.state_capturer.indexer_topk import (
+                get_global_indexer_capturer,
+            )
+
+            _idx_cap = get_global_indexer_capturer()
+            if _idx_cap is not None:
+                indexer_topk_num_layers = _idx_cap.num_indexer_layers
         return BatchTokenIDOutput(
             rids=self.rids,
             http_worker_ipcs=self.http_worker_ipcs,
@@ -545,6 +554,7 @@ class _GenerationStreamAccumulator:
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,
+            indexer_topk_num_layers=indexer_topk_num_layers,
             customized_info=self.customized_info,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,

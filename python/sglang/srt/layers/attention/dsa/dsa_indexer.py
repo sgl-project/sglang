@@ -28,6 +28,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
+    get_global_indexer_capturer,
     maybe_capture_indexer_topk,
 )
 from sglang.srt.utils import (
@@ -725,7 +726,14 @@ class Indexer(MultiPlatformOp):
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        capture = get_global_indexer_capturer() is not None
+        if capture:
+            topk_result, raw_result = metadata.topk_transform(
+                logits, self.index_topk, return_raw_indices=True
+            )
+        else:
+            topk_result = metadata.topk_transform(logits, self.index_topk)
+            raw_result = None
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
@@ -736,7 +744,9 @@ class Indexer(MultiPlatformOp):
                 device=topk_result.device,
             )
             topk_result = torch.cat([topk_result, padding], dim=0)
-        return topk_result
+            if capture:
+                raw_result = torch.cat([raw_result, padding], dim=0)
+        return topk_result, raw_result
 
     def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:
         free_mem_fraction = self._mqa_logits_free_mem_fraction()
@@ -846,8 +856,10 @@ class Indexer(MultiPlatformOp):
             topk_result = torch.full(
                 (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
             )
+        capture = get_global_indexer_capturer() is not None
+        raw_result = torch.full_like(topk_result, -1) if capture else None
         if batch_size == 0:
-            return topk_result
+            return topk_result, raw_result
 
         ks, ke = metadata.get_indexer_kvcache_range()
 
@@ -900,9 +912,17 @@ class Indexer(MultiPlatformOp):
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
-            raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
-            topk_result[:q_offset] = raw_topk_result
-            return topk_result
+            if capture:
+                transformed, raw = metadata.topk_transform(
+                    logits, self.index_topk, ks=ks, return_raw_indices=True
+                )
+                topk_result[:q_offset] = transformed
+                raw_result[:q_offset] = raw
+            else:
+                topk_result[:q_offset] = metadata.topk_transform(
+                    logits, self.index_topk, ks=ks
+                )
+            return topk_result, raw_result
 
         bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
         max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
@@ -962,19 +982,32 @@ class Indexer(MultiPlatformOp):
                 cu_seqlens_q_chunk = cu_seqlens_q_full[start:end]
                 batch_idx_chunk = token_to_batch_idx[start:end]
 
-            raw_topk_chunk = metadata.topk_transform(
-                logits_chunk,
-                self.index_topk,
-                ks=ks[start:end],
-                cu_seqlens_q=cu_seqlens_q_chunk,
-                ke_offset=lengths_chunk,
-                batch_idx_list=batch_idx_chunk,
-                topk_indices_offset_override=topk_offset_chunk,
-            )
-            topk_result[start:end] = raw_topk_chunk
+            if capture:
+                transformed, raw = metadata.topk_transform(
+                    logits_chunk,
+                    self.index_topk,
+                    ks=ks[start:end],
+                    cu_seqlens_q=cu_seqlens_q_chunk,
+                    ke_offset=lengths_chunk,
+                    batch_idx_list=batch_idx_chunk,
+                    topk_indices_offset_override=topk_offset_chunk,
+                    return_raw_indices=True,
+                )
+                topk_result[start:end] = transformed
+                raw_result[start:end] = raw
+            else:
+                topk_result[start:end] = metadata.topk_transform(
+                    logits_chunk,
+                    self.index_topk,
+                    ks=ks[start:end],
+                    cu_seqlens_q=cu_seqlens_q_chunk,
+                    ke_offset=lengths_chunk,
+                    batch_idx_list=batch_idx_chunk,
+                    topk_indices_offset_override=topk_offset_chunk,
+                )
             start = end
 
-        return topk_result
+        return topk_result, raw_result
 
     def _forward_cuda_k_only(
         self,
@@ -1005,7 +1038,7 @@ class Indexer(MultiPlatformOp):
 
         # MHA doesn't need topk_indices
         if not return_indices:
-            return None
+            return None, None
 
         # MLA: use dummy logits with topk kernel's fast path to generate indices
         # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
@@ -1016,7 +1049,11 @@ class Indexer(MultiPlatformOp):
             dtype=torch.float32,
             device=x_meta.device,
         )
-        return metadata.topk_transform(dummy_logits, self.index_topk)
+        if get_global_indexer_capturer() is not None:
+            return metadata.topk_transform(
+                dummy_logits, self.index_topk, return_raw_indices=True
+            )
+        return metadata.topk_transform(dummy_logits, self.index_topk), None
 
     def _get_topk_ragged_with_cp(
         self,
@@ -1039,6 +1076,8 @@ class Indexer(MultiPlatformOp):
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
+        capture = get_global_indexer_capturer() is not None
+        raw_result = None
         k_fp8_list = []
         k_scale_list = []
         ks_list = []
@@ -1111,14 +1150,25 @@ class Indexer(MultiPlatformOp):
                     ke,
                     clean_logits=False,
                 )
-            topk_result = metadata.topk_transform(
-                logits,
-                self.index_topk,
-                ks=ks,
-                cu_seqlens_q=actual_seq_q,
-                ke_offset=ke_offset,
-                batch_idx_list=batch_idx_list,
-            )
+            if capture:
+                topk_result, raw_result = metadata.topk_transform(
+                    logits,
+                    self.index_topk,
+                    ks=ks,
+                    cu_seqlens_q=actual_seq_q,
+                    ke_offset=ke_offset,
+                    batch_idx_list=batch_idx_list,
+                    return_raw_indices=True,
+                )
+            else:
+                topk_result = metadata.topk_transform(
+                    logits,
+                    self.index_topk,
+                    ks=ks,
+                    cu_seqlens_q=actual_seq_q,
+                    ke_offset=ke_offset,
+                    batch_idx_list=batch_idx_list,
+                )
         else:
             kv_len = (
                 forward_batch.seq_lens_cpu[0].item()
@@ -1160,15 +1210,25 @@ class Indexer(MultiPlatformOp):
             actual_seq_q = torch.tensor([actual_seq_q], dtype=torch.int32).to(
                 device="cuda", non_blocking=True
             )
-            topk_result = metadata.topk_transform(
-                logits,
-                self.index_topk,
-                ks=ks,
-                cu_seqlens_q=actual_seq_q,
-                ke_offset=ke_offset,
-            )
+            if capture:
+                topk_result, raw_result = metadata.topk_transform(
+                    logits,
+                    self.index_topk,
+                    ks=ks,
+                    cu_seqlens_q=actual_seq_q,
+                    ke_offset=ke_offset,
+                    return_raw_indices=True,
+                )
+            else:
+                topk_result = metadata.topk_transform(
+                    logits,
+                    self.index_topk,
+                    ks=ks,
+                    cu_seqlens_q=actual_seq_q,
+                    ke_offset=ke_offset,
+                )
 
-        return topk_result
+        return topk_result, raw_result
 
     def forward_indexer(
         self,
@@ -1349,6 +1409,15 @@ class Indexer(MultiPlatformOp):
             x, q_lora, positions, forward_batch, layer_id, return_indices
         )
 
+    def _capture_and_return(self, layer_id, topk_result, raw_result):
+        # Capture the model's natural (sequence-relative) topk for rollout R3
+        # replay; the attention kernel still receives the transformed
+        # (paged/ragged kv-cache) indices in topk_result.
+        maybe_capture_indexer_topk(
+            layer_id, raw_result if raw_result is not None else topk_result
+        )
+        return topk_result
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -1400,7 +1469,7 @@ class Indexer(MultiPlatformOp):
 
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.dsa_enable_prefill_cp):
-            topk_result = self._forward_cuda_k_only(
+            topk_result, raw_result = self._forward_cuda_k_only(
                 x,
                 positions,
                 forward_batch,
@@ -1411,7 +1480,7 @@ class Indexer(MultiPlatformOp):
                 return_indices,
             )
             topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
-            return maybe_capture_indexer_topk(layer_id, topk_result)
+            return self._capture_and_return(layer_id, topk_result, raw_result)
 
         # When weights_proj is LoRA-wrapped, use an eager module call so the
         # wrapper owns base+delta and no LoRA kernel runs under torch.compile
@@ -1528,6 +1597,7 @@ class Indexer(MultiPlatformOp):
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
 
+        raw_result = None
         if _is_cuda or _is_hip:
             # In piecewise CUDA graph, any access to seq_lens_cpu creates a Dynamo shape guard.
             # Piecewise CUDA graph never has empty batches.
@@ -1546,14 +1616,14 @@ class Indexer(MultiPlatformOp):
                         device=x_meta.device,
                     )
                     topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
-                    return maybe_capture_indexer_topk(layer_id, topk_result)
+                    return self._capture_and_return(layer_id, topk_result, None)
 
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
-                topk_result = self._get_topk_paged(
+                topk_result, raw_result = self._get_topk_paged(
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )
             else:
@@ -1580,7 +1650,7 @@ class Indexer(MultiPlatformOp):
                     weights_prev, weights_next = torch.split(
                         weights, (weights.shape[0] + 1) // 2, dim=0
                     )
-                    topk_result_prev = self._get_topk_ragged_with_cp(
+                    topk_result_prev, raw_prev = self._get_topk_ragged_with_cp(
                         forward_batch,
                         layer_id,
                         q_fp8_prev,
@@ -1590,7 +1660,7 @@ class Indexer(MultiPlatformOp):
                         actual_seq_q_prev,
                     )
 
-                    topk_result_next = self._get_topk_ragged_with_cp(
+                    topk_result_next, raw_next = self._get_topk_ragged_with_cp(
                         forward_batch,
                         layer_id,
                         q_fp8_next,
@@ -1600,8 +1670,13 @@ class Indexer(MultiPlatformOp):
                         actual_seq_q_next,
                     )
                     topk_result = torch.cat([topk_result_prev, topk_result_next], dim=0)
+                    raw_result = (
+                        torch.cat([raw_prev, raw_next], dim=0)
+                        if raw_prev is not None
+                        else None
+                    )
                     topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
-                    return maybe_capture_indexer_topk(layer_id, topk_result)
+                    return self._capture_and_return(layer_id, topk_result, raw_result)
                 elif is_in_tc_piecewise_cuda_graph():
                     assert (
                         not enable_dual_stream
@@ -1624,7 +1699,7 @@ class Indexer(MultiPlatformOp):
                         topk_result=topk_result,
                     )
                 else:
-                    topk_result = self._get_topk_ragged(
+                    topk_result, raw_result = self._get_topk_ragged(
                         enable_dual_stream,
                         forward_batch,
                         layer_id,
@@ -1641,7 +1716,7 @@ class Indexer(MultiPlatformOp):
                 layer_id=layer_id,
             )
         topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
-        return maybe_capture_indexer_topk(layer_id, topk_result)
+        return self._capture_and_return(layer_id, topk_result, raw_result)
 
     def forward_npu(
         self,
