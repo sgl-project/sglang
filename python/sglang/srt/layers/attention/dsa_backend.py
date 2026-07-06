@@ -635,7 +635,7 @@ class DeepseekSparseAttnBackend(
         # Plan the folded top-k v2 transform once per forward (shared by all
         # layers), at metadata-build time. The plan is consumed only by the
         # decode fold (one score row per batch, the shape
-        # `_try_topk_transform_v2_paged` engages on), so skip other shapes
+        # `_topk_transform_v2_paged` is dispatched for), so skip other shapes
         # (prefill / target-verify) and when the fold is disabled.
         if not envs.SGLANG_OPT_USE_TOPK_V2.get():
             return None
@@ -649,8 +649,9 @@ class DeepseekSparseAttnBackend(
         # Refresh the plan in-place under CUDA graph replay so the captured
         # read sees fresh cluster metadata for the replay's decode seq lengths.
         # `copy_` preserves the buffer's data_ptr captured by the graph. None
-        # means it was not built (fold disabled / non-decode) and the helper
-        # falls back to an inline plan, so there is nothing to refresh.
+        # means it was not built (fold disabled / non-decode shape), and such a
+        # metadata object is never dispatched to the v2 helper, so there is
+        # nothing to refresh.
         if metadata.topk_v2_plan is None:
             return
         from sglang.jit_kernel.dsv4.topk import plan_topk_v2
@@ -1093,13 +1094,18 @@ class DeepseekSparseAttnBackend(
         to avoid memory allocations.
         """
         # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
-        # page table in the decode CUDA graph. It is dead weight there when top-k is
-        # fused (attention reads topk_indices, the indexer reads the compact
-        # real_page_table) and page_size>1. Excludes HIP (its indexer reads
-        # page_table_1), hisparse (needs page_size=1 loc translation), and spec
-        # decoding (the MTP precompute fast-path + target-verify/draft-extend graphs
-        # still consume the wide table). Computed once here from stable config; the
-        # graph is captured once per process.
+        # page table in the decode CUDA graph. It is dead weight there only when the
+        # decode top-k routes to the fused v2 kernel: attention reads topk_indices
+        # and the indexer reads the compact real_page_table, so nothing reads the
+        # page_size=1 table. This MUST match the exact condition under which
+        # `DSATopKBackend.topk_transform` dispatches decode PAGED to
+        # `_topk_transform_v2_paged` -- otherwise the legacy transform would read a
+        # dropped (None) table. Hence: fused top-k AND v2 enabled AND index_topk in
+        # the kernel's supported range, on CUDA with page_size>1. Excludes HIP (its
+        # indexer reads page_table_1), hisparse (needs page_size=1 loc translation),
+        # and spec decoding (MTP precompute fast-path + target-verify/draft-extend
+        # still consume the wide table). Computed once from stable config; the graph
+        # is captured once per process.
         self.dsa_drop_wide_page_table = (
             is_cuda()
             and not _is_hip
@@ -1107,6 +1113,9 @@ class DeepseekSparseAttnBackend(
             and self.hisparse_coordinator is None
             and not self.speculative_num_draft_tokens
             and envs.SGLANG_DSA_FUSE_TOPK.get()
+            and envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and self.dsa_index_topk is not None
+            and self.dsa_index_topk <= 2048
         )
 
         max_ctx_len = self.req_to_token.shape[1]
