@@ -3304,8 +3304,6 @@ class ServerArgs:
             ("LoRA", lambda: bool(self.lora_paths) or bool(self.enable_lora)),
             # BCG bucket sizes exceed FlashInfer MoE A2A's dispatch cap.
             ("MoE A2A backend", lambda: self.moe_a2a_backend != "none"),
-            # DP-attn × BCG capture/replay not yet validated.
-            ("DP attention", lambda: self.enable_dp_attention),
             # Multimodal prefill replay faults under BCG.
             ("multimodal model", lambda: self.get_model_config().is_multimodal),
         ]
