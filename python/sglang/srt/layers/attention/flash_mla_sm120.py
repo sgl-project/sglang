@@ -400,14 +400,19 @@ def _flash_mla_flashinfer(
     extra_indices,
     extra_topk_length,
 ):
-    """FlashInfer SM120 sparse MLA via sparse_mla_sm120_decode_dsv4.
+    """FlashInfer SM120 sparse MLA via the paged-attention dispatcher.
 
     SGLang SWA pool uses page_size=256 (footer format: 256*576 bytes data + 256*8 bytes scale).
     FlashInfer decode_dsv4 fast path requires page_block_size=64 (footer: 64*576 + 64*8).
     We split 256-token pages into 4 virtual 64-token pages.
     Token indices are invariant under page-split (identity mapping).
     """
-    from flashinfer.mla._sparse_mla_sm120 import sparse_mla_sm120_decode_dsv4
+    from flashinfer.mla._sparse_mla_sm120 import (
+        _DECODE_MAX_TOKENS as _FI_DECODE_MAX_TOKENS,
+    )
+    from flashinfer.mla._sparse_mla_sm120 import (
+        _sparse_mla_sm120_paged_attention,
+    )
 
     B, _, H, D = q.shape  # (batch, 1, num_heads, head_dim)
     dev = q.device
@@ -435,32 +440,43 @@ def _flash_mla_flashinfer(
     output = torch.empty(B, H, head_dim_v, dtype=torch.bfloat16, device=dev)
     out_lse = torch.empty(B, H, dtype=torch.float32, device=dev)
 
-    # Pre-allocate split-K scratch for decode-dsv4 fast path.
-    topk = idx.shape[-1]
-    extra_topk = extra_idx.shape[-1] if extra_idx is not None else 0
-    _BI = 64
-    num_splits = (topk + _BI - 1) // _BI + (
-        (extra_topk + _BI - 1) // _BI if extra_topk > 0 else 0
-    )
-    mid_out = torch.empty(
-        B, H, num_splits, head_dim_v, dtype=torch.bfloat16, device=dev
-    )
-    mid_lse = torch.empty(B, H, num_splits, dtype=torch.float32, device=dev)
+    # Route through FlashInfer's dispatching entry instead of hardwiring
+    # the split-K decode fast path: batches up to _DECODE_MAX_TOKENS take
+    # the fast path (caller-supplied scratch, bounded at 64 tokens), and
+    # larger extend batches take the generic paged-attention kernel,
+    # which needs no split-K scratch. The old direct decode call ran
+    # every prefill batch through the decode kernel with ~1 MB of scratch
+    # per extend token, which dominated prefill memory.
+    if B <= _FI_DECODE_MAX_TOKENS:
+        topk = idx.shape[-1]
+        extra_topk = extra_idx.shape[-1] if extra_idx is not None else 0
+        _BI = 64
+        num_splits = (topk + _BI - 1) // _BI + (
+            (extra_topk + _BI - 1) // _BI if extra_topk > 0 else 0
+        )
+        mid_out = torch.empty(
+            B, H, num_splits, head_dim_v, dtype=torch.bfloat16, device=dev
+        )
+        mid_lse = torch.empty(B, H, num_splits, dtype=torch.float32, device=dev)
+    else:
+        mid_out = None
+        mid_lse = None
 
-    sparse_mla_sm120_decode_dsv4(
-        q=q.squeeze(1) if q.ndim == 4 else q,
-        kv_cache=kv_64,
-        indices=idx,
-        mid_out=mid_out,
-        mid_lse=mid_lse,
-        output=output,
-        out_lse=out_lse,
-        sm_scale=softmax_scale,
+    _sparse_mla_sm120_paged_attention(
+        q.squeeze(1) if q.ndim == 4 else q,
+        kv_64,
+        idx,
+        output,
+        out_lse,
+        softmax_scale,
+        d_v=head_dim_v,
         topk_length=topk_length,
         attn_sink=attn_sink,
         extra_kv_cache=extra_kv_64,
         extra_indices=extra_idx,
         extra_topk_length=extra_topk_length,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
     )
 
     return (output.unsqueeze(1), None)
