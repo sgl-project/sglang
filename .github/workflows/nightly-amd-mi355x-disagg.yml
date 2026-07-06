@@ -162,7 +162,7 @@ jobs:
 
           mapfile -d '' LOG_FILES < <(
             find "$LOG_DIR" -maxdepth 1 -type f \
-              \( -name '*.log' -o -name 'server_exit_*' -o -name 'bench_exit' \) \
+              \( -name '*.log' -o -name '*.sh' -o -name 'server_exit_*' -o -name 'bench_exit' \) \
               -printf '%P\0' | sort -z
           )
           if [ "${#LOG_FILES[@]}" -eq 0 ]; then
@@ -222,11 +222,22 @@ jobs:
       - name: Clean up MI355X scratch
         if: always()
         continue-on-error: true
+        env:
+          IMAGE_CLEANUP: ${{ inputs.image != '' && inputs.image || needs.setup.outputs.image }}
         run: |
           LOG_DIR="$HOME/.mi355x_ci/${MATRIX_CONFIG_NAME}"
           if [ -d "$LOG_DIR" ]; then
             echo "Removing MI355X scratch directory: $LOG_DIR"
-            rm -rf "$LOG_DIR"
+            rm -rf "$LOG_DIR" 2>/dev/null || {
+              if [ -n "${IMAGE_CLEANUP:-}" ]; then
+                docker run --rm --user 0 \
+                  -e TARGET="$(basename "$LOG_DIR")" \
+                  -v "$(dirname "$LOG_DIR"):/mnt" \
+                  "$IMAGE_CLEANUP" bash -lc 'rm -rf -- "/mnt/$TARGET"'
+              else
+                echo "WARN: normal scratch cleanup failed and IMAGE_CLEANUP is empty"
+              fi
+            }
           fi
 
   collect-results:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import random
 from collections import deque
@@ -14,6 +15,8 @@ import torch.distributed as dist
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_npu
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -654,6 +657,66 @@ def append_state_component(
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
 
 
+def _is_env_enabled(name: str) -> bool:
+    return os.getenv(name, "").lower() in ("1", "true", "yes", "on")
+
+
+def _state_type_name(state_type) -> str:
+    return getattr(state_type, "value", str(state_type))
+
+
+def _drop_state_component(kv_args: KVArgs, state_type: StateType) -> int:
+    keep_indices = [
+        i for i, current in enumerate(kv_args.state_types) if current != state_type
+    ]
+    if len(keep_indices) == len(kv_args.state_types):
+        return 0
+
+    removed = len(kv_args.state_types) - len(keep_indices)
+    state_types = list(kv_args.state_types)
+    kv_args.state_types = [state_types[i] for i in keep_indices]
+    for attr in (
+        "state_data_ptrs",
+        "state_data_lens",
+        "state_item_lens",
+        "state_dim_per_tensor",
+    ):
+        values = list(getattr(kv_args, attr, []) or [])
+        if len(values) == len(state_types):
+            setattr(kv_args, attr, [values[i] for i in keep_indices])
+        else:
+            logger.warning(
+                "[dsv4-c128-ab] skip trimming %s: len=%s state_types=%s",
+                attr,
+                len(values),
+                len(state_types),
+            )
+
+    return removed
+
+
+def _log_state_components(kv_args: KVArgs, prefix: str) -> None:
+    summary = []
+    for i, state_type in enumerate(kv_args.state_types):
+        data_lens = (
+            kv_args.state_data_lens[i] if i < len(kv_args.state_data_lens) else []
+        )
+        item_lens = (
+            kv_args.state_item_lens[i] if i < len(kv_args.state_item_lens) else []
+        )
+        summary.append(
+            "%s(count=%s,total=%s,first_len=%s,first_item=%s)"
+            % (
+                _state_type_name(state_type),
+                len(data_lens),
+                sum(data_lens),
+                data_lens[0] if data_lens else None,
+                item_lens[0] if item_lens else None,
+            )
+        )
+    logger.warning("%s%s", prefix, ", ".join(summary) if summary else "<none>")
+
+
 def setup_state_kv_args(
     kv_args: KVArgs,
     token_to_kv_pool,
@@ -772,6 +835,18 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
             )
+
+    if _is_env_enabled("SGLANG_DSV4_DISABLE_C128_STATE_PD"):
+        removed = _drop_state_component(kv_args, StateType.C128_STATE)
+        logger.warning(
+            "[dsv4-c128-ab] SGLANG_DSV4_DISABLE_C128_STATE_PD=1 removed=%s",
+            removed,
+        )
+
+    if _is_env_enabled("SGLANG_DSV4_TRACE_STATE_PD") or _is_env_enabled(
+        "SGLANG_DSV4_DISABLE_C128_STATE_PD"
+    ):
+        _log_state_components(kv_args, "[dsv4-c128-ab] PD state components: ")
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

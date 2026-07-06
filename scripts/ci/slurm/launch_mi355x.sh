@@ -170,7 +170,16 @@ echo "recipe: image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP 
 # lands here; the launcher normalizes it into GITHUB_WORKSPACE afterwards.
 # ---------------------------------------------------------------------------
 WORKDIR="$HOME/.mi355x_ci/${MATRIX_CONFIG_NAME}"
-rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
+if [[ -d "$WORKDIR" ]]; then
+    rm -rf "$WORKDIR" 2>/dev/null || {
+        echo "WARN: normal scratch cleanup failed, retrying in root docker: $WORKDIR" >&2
+        docker run --rm --user 0 \
+            -e TARGET="$(basename "$WORKDIR")" \
+            -v "$(dirname "$WORKDIR"):/mnt" \
+            "$IMAGE" bash -lc 'rm -rf -- "/mnt/$TARGET"'
+    }
+fi
+mkdir -p "$WORKDIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Stage the workflow checkout on shared NFS so Slurm compute-node containers can
@@ -215,6 +224,7 @@ else
     FP4_EXPERTS=false
 fi
 DSV4_ENV=(
+  -e PYTHONUNBUFFERED=1
   -e SGLANG_DEFAULT_THINKING=1 -e SGLANG_DSV4_REASONING_EFFORT=max
   -e SGLANG_OPT_DEEPGEMM_HC_PRENORM=false -e SGLANG_USE_AITER=1
   -e SGLANG_USE_ROCM700A=1 -e SGLANG_OPT_USE_FUSED_COMPRESS=true
@@ -227,6 +237,13 @@ DSV4_ENV=(
   -e SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=false -e SGLANG_ROCM_USE_MULTI_STREAM=false
   -e AITER_BF16_FP8_MOE_BOUND=0 -e SGLANG_DSV4_FP4_EXPERTS=$FP4_EXPERTS
 )
+if [[ "$MODEL_PREFIX" == "dsv4flash" ]]; then
+    echo "Enabling DSV4 Flash PD C128 state-transfer A/B diagnostics"
+    DSV4_ENV+=(
+      -e SGLANG_DSV4_DISABLE_C128_STATE_PD=1
+      -e SGLANG_DSV4_TRACE_STATE_PD=1
+    )
+fi
 DSV4_ENV_STR="${DSV4_ENV[*]}"
 # A recipe carrying a `model:` block supplies its OWN docker env (below), so the
 # DSV4 env must not leak into it; the DSV4 recipes keep the string above.
