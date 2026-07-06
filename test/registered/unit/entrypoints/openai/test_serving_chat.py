@@ -1247,6 +1247,79 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(req.messages[0].role, "latest_reminder")
         self.assertEqual(req.messages[1].role, "user")
 
+    # ------------- _validate_request tests -------------
+
+    def test_validate_rejects_empty_assistant_content(self):
+        """Empty assistant content is rejected (can trigger garbled output)."""
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": ""},
+            ],
+        )
+        error = self.chat._validate_request(req)
+        self.assertIsNotNone(error)
+        self.assertIn("cannot be empty", error)
+
+    def test_validate_rejects_whitespace_assistant_content(self):
+        """Whitespace-only assistant content is also rejected."""
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "assistant", "content": "   "}],
+        )
+        error = self.chat._validate_request(req)
+        self.assertIsNotNone(error)
+        self.assertIn("cannot be empty", error)
+
+    def test_validate_allows_assistant_with_tool_calls_and_null_content(self):
+        """Assistant message with tool_calls and null content should pass."""
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "What's the weather?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "content": "Sunny", "tool_call_id": "call_1"},
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        )
+        error = self.chat._validate_request(req)
+        self.assertIsNone(error)
+
+    def test_validate_allows_non_empty_assistant_content(self):
+        """Non-empty assistant content should pass."""
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "Hello!"},
+            ],
+        )
+        error = self.chat._validate_request(req)
+        self.assertIsNone(error)
+
     def test_attach_task_to_last_user_message(self):
         """Helper attaches task to the nearest user/developer message."""
         from sglang.srt.entrypoints.openai import encoding_dsv4

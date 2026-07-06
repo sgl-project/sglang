@@ -480,6 +480,19 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        # Assistant messages with empty/whitespace-only content are invalid
+        # unless they carry tool calls (where None content is expected).
+        for i, message in enumerate(request.messages):
+            if getattr(message, "role", None) != "assistant":
+                continue
+            content = getattr(message, "content", None)
+            if (
+                isinstance(content, str)
+                and not content.strip()
+                and not getattr(message, "tool_calls", None)
+            ):
+                return f"Assistant message content at index {i} cannot be empty."
+
         if (
             isinstance(request.tool_choice, str)
             and request.tool_choice.lower() == "required"
